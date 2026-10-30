@@ -41,10 +41,12 @@ Crate names use snake_case, like Zed. Key decisions live in [`docs/adr/`](adr/).
 
 ### Agent harness
 
-Every agent terminal gets `SWARM_SOCKET`, `SWARM_AGENT_ID` and `SWARM_TASK`.
+Every agent terminal gets `SWARM_SOCKET`, `SWARM_AGENT_ID`, `SWARM_TASK` and its own `SWARM_TOKEN`, and finds `swarm` on its `PATH`.
 
-- Orchestrator: `swarm spawn`, `swarm send`, `swarm read`, `swarm wait`, `swarm merge`, `swarm notify` (asks the user for attention), `swarm pr draft` (only after the user approved the review).
-- Workers: `swarm ask orchestrator`, `swarm report`.
+- Orchestrator: `swarm spawn`, `swarm send`, `swarm agents`, `swarm merge`, `swarm notify` (asks the user for attention), `swarm confirm` (the brief is understood), `swarm pr draft` (phase 6, only after the user approved the review).
+- Workers: `swarm ask`, `swarm report`.
+- Every agent: `swarm read` and `swarm wait` take the caller's unread messages. A message the agent has not read is pasted into its terminal the next time it is idle.
+- The daemon checks the caller's role on every call; a worker cannot message another worker.
 - The same calls are exposed as MCP tools. Task calls (`task.*`) and terminal calls (`terminal.*`) are listed below.
 - If the user types into a worker terminal, Swarm tells the orchestrator (ADR 0002).
 

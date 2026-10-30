@@ -44,6 +44,10 @@ _Avoid_: Engine, LLM
 Text sent between the orchestrator and a worker through Swarm.
 _Avoid_: Event, ping, prompt
 
+**Brief**:
+The first message a worker or a task's orchestrator starts with: what to do and what done means.
+_Avoid_: Prompt, instructions, ticket
+
 **Worktree**:
 A separate checkout of the project where one worker makes its changes.
 _Avoid_: Sandbox, copy, clone
