@@ -65,8 +65,8 @@ Each phase ends with a pull request into `main`. A phase is done when every box 
 **Done when:**
 
 - [ ] Open a project; **New task** creates branch, worktree and tab and runs the setup script
-- [ ] A user terminal works; quitting and reopening the app shows it unchanged
-- [ ] Killing the daemon leaves no leftover processes after restart
+- [x] A user terminal works; quitting and reopening the app shows it unchanged
+- [x] Killing the daemon leaves no leftover processes after restart
 - [x] Terminal speed matches spike 1 (`seq 1 200000` about 0.3 s)
 - [x] The gallery shows a real terminal preview: `swarm_term`'s grid inside a `TileFrame`, running a short colour and text test
 
