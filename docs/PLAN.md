@@ -24,7 +24,7 @@ Cargo workspace:
 |---|---|
 | `swarm-ui` | Design tokens, themes and components on raw GPUI |
 | `swarm-term` | PTY + `libghostty-vt` + GPUI grid renderer |
-| `swarm-core` | Projects, tasks, agents, worktrees, mailbox, state store |
+| `swarm-core` | Projects, tasks, agents, worktrees, mailbox, state store (SQLite) |
 | `swarm-daemon` | Background process that owns PTYs and runs `swarm-core` |
 | `swarm-harness` | Unix socket JSON-RPC, `swarm` CLI and MCP server |
 | `swarm-app` | Windows, layouts (Focus, Grid, Swarm), Review, PR panel, settings |
@@ -51,6 +51,19 @@ Every agent terminal gets `SWARM_SOCKET`, `SWARM_AGENT_ID` and `SWARM_TASK`.
 Layers, later wins: built-in → `~/.config/swarm/prompts/` → `.swarm/prompts/`.
 Files: `orchestrator.md`, `worker.md`, `review.md`, `pr.md`, `commit.md`.
 The harness block is always added first and is not editable.
+
+### Agent lifecycle
+
+Every agent belongs to a task. The daemon tracks every agent in SQLite (ADR 0005), so none are lost; the goal is that none are forgotten.
+
+- **Task done or archived**: its agents stop and their worktrees are removed. Unmerged changes ask for confirmation first.
+- **Quit**: with running agents, ask once: keep running or stop all. Option to remember the choice.
+- **Idle stop**: a done or idle agent stops after 30 minutes (setting). Its session ID is kept, so it resumes with `claude --resume`.
+- **Menu bar**: shows the running agent count and **Stop all**, also when the app is closed.
+- **Daemon exit**: when no agents run and no app is attached.
+- **Limit**: maximum concurrent agents, globally and per task (setting). Spawning past it returns an error to the orchestrator.
+- **Daemon crash**: closing the PTYs sends SIGHUP to agents. On restart, the daemon reads the PIDs from SQLite, stops processes it no longer manages, and marks those agents "stopped, resumable".
+- **Reboot**: same as a crash; agents come back through resume.
 
 ### Review
 
