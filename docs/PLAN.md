@@ -42,9 +42,67 @@ Every agent terminal gets `SWARM_SOCKET`, `SWARM_AGENT_ID` and `SWARM_TASK`.
 
 ### Agent state
 
-- Claude Code: hooks (`Stop`, `Notification`, `UserPromptSubmit`) report to the daemon.
-- Codex: to be decided in spike 3.
-- Screen matching is the fallback.
+- **OSC 7501 (Program Status Protocol)** is the main source. Claude Code emits it since 2.1.295 and Codex emits it (`codex-rs/tui/src/terminal_program_status.rs`). States: `idle`, `working`, `done`, `blocked` (`kind=permission|question|auth`), `error`, plus `clear`. The daemon reads it from the PTY stream. `libghostty-vt` 0.2.2 has no API for it, so the daemon parses this OSC itself before feeding bytes to the terminal. Spike 3 checks how Codex decides to turn it on.
+- Claude Code hooks add what OSC 7501 lacks: session ID (for resume), `StopFailure` reasons.
+- Screen matching is the last fallback.
+- Process terminals that emit OSC 7501 (e.g. a test runner) show their state the same way.
+
+### How work starts
+
+**Opening a project.** The project opens on a **Start** tab with a **dispatcher**: a Claude Code (or Codex) session in the project root on the base branch.
+
+1. The user says what they want.
+2. The dispatcher splits it into tasks. One request can become one task or several.
+3. For each task it calls `task.create`: Swarm makes the task worktree and branch, runs the setup script, opens a tab and starts that task's orchestrator with the dispatcher's brief as its first message.
+4. When every orchestrator confirms its brief, the dispatcher exits and the Start tab closes. Focus moves to the first task tab.
+
+**Adding a task by hand.** The **+** in the tab bar opens a New task sheet: name, branch from (default: base branch; option: current tab's branch), orchestrator agent, optional first message, run setup script. Swarm creates the worktree and tab and starts an empty or briefed orchestrator.
+
+The Start tab can be reopened from the tab bar at any time.
+
+Harness calls for the dispatcher:
+
+| Call | What |
+|---|---|
+| `task.create {name, from?, brief, agent?}` | Creates task worktree, branch, tab and orchestrator; sends `brief` as its first message. Returns the task ID. |
+| `task.list` | Lists tasks in the project with status. |
+| `task.wait {ids, until: briefed\|done}` | Waits until orchestrators confirm their brief, or finish. |
+| `agent.exit` | Ends the caller's own session (used by the dispatcher when done). |
+
+### Workspace layout
+
+- **Sidebar**: projects, then the agents and terminals of the open tab.
+- **Tabs**: one tab per task, at the top of the window, plus the Start tab while a dispatcher runs. A tab shows the task name and its status. Each task runs in its own task worktree; worker worktrees are not tabs.
+- **Right panel**: **Files** (file tree of the task worktree, changed files marked) or **Changes** (changed files grouped by worker, with a **Review** button). The Changes toggle shows the diff count.
+- **Views**: Terminals (default), Swarm graph or Review.
+
+### Terminals
+
+Four kinds:
+
+| Kind | Who types | Who resizes | Who kills |
+|---|---|---|---|
+| **Orchestrator** | user | layout | user |
+| **Worker** | output view; user can type in v1 (setting, may be off by default later) | its agent | orchestrator, user |
+| **Process** (dev server, tests, any command an agent starts) | nobody by default | the agent that started it | that agent, orchestrator, user |
+| **User** | user only | user only | user only |
+
+- **User terminals are off-limits to agents** (ADR 0006): agents cannot read, type into, resize or kill them. The layout treats them as fixed islands.
+- **Process terminals**: started with `swarm terminal spawn`. When the process exits or is killed, the terminal closes after a short delay (to show the exit code) and the owner agent and the orchestrator get a `terminal.exited` event with who stopped it (`agent`, `user`, `process`) and the exit code or signal.
+- **Layout engine**: tiles fill the space. Priority: user terminals (fixed size), orchestrator, terminals that need attention (`blocked`, `error`), working agents, process terminals, done or idle agents. Each tile has a minimum size; tiles that don't fit move to the **tray**: chips on the left of the status bar, each with a restore icon. A tile that needs attention is promoted out of the tray. The user can pin or minimize any tile.
+- When the user resizes a user terminal, the other tiles reflow around it.
+
+### Terminal harness (CLI + MCP)
+
+| Call | Who | What |
+|---|---|---|
+| `terminal.spawn {cmd, cwd?, size?, name?}` | any agent | Starts a process terminal. `size` is `{cols, rows}` or `small` / `medium` / `large`. Returns an ID. |
+| `terminal.resize {id, size}` | owner agent | Asks for a new size. The layout grants the closest size that fits and returns it. |
+| `terminal.read {id, lines?}` | owner agent, orchestrator | Reads the screen or the last lines of output. |
+| `terminal.wait {id, until: exit\|output-match, pattern?}` | owner agent, orchestrator | Waits for exit or for a line such as `ready in`. |
+| `terminal.kill {id, signal?}` | owner agent, orchestrator | Stops the process; the terminal closes. |
+| `terminal.list` | any agent | Lists terminals the caller may see (never user terminals). |
+| event `terminal.exited {id, by, code\|signal}` | to owner + orchestrator | Sent when a process terminal ends for any reason. |
 
 ### Prompts
 
@@ -67,12 +125,12 @@ Every agent belongs to a task. The daemon tracks every agent in SQLite (ADR 0005
 
 ### Review
 
-Full-screen view of the task branch diff against the base branch. Ways in:
+A third view next to Terminals and Swarm in the header switch (**Terminals | Swarm | Review**). It fills the main area; the sidebar and tabs stay. Left: changed files grouped by worker or folder. Right: the diff with inline comments. Ways in:
 
-- **Review +N −N** button in the task header in every layout: one control for the diff count and the way into Review (⌘⇧R, shown in the command palette, not on the button); it becomes the primary button when all workers are done
-- The **+N −N** chip on a worker's pane header opens Review filtered to that worker
+- **Review** in the view switch (⌘⇧R)
+- **Review** button and any file in the Changes panel (the **Changes +N −N** header button opens that panel)
 - **Review** action on the "ready for review" notification
-- **View diff** on a worker in the Swarm view
+- **View diff** on a worker in the Swarm view (Review filtered to that worker)
 - Command palette
 
 Two sources:
@@ -128,7 +186,7 @@ Each spike is a throwaway program in `spikes/` and ends with a pass or fail note
 ## Remaining design screens
 
 - Create-worktree sheet and `.swarm/config.toml` scripts
-- Settings, including Prompts and Notifications
+- Settings: Terminals, Prompts, Worktrees pages (Agents and Notifications are done)
 - Menu bar usage popover
 - New task / start orchestrator
 - Command palette (⌘K)

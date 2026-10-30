@@ -21,8 +21,12 @@ One Claude Code or Codex process running in its own terminal.
 _Avoid_: Bot, session, pane
 
 **Orchestrator**:
-The single agent that leads a swarm: it splits the task, spawns workers and is the only one that talks to them.
+The single agent that leads one task's swarm: it splits the task, spawns workers and is the only one that talks to them.
 _Avoid_: Lead, manager, conductor
+
+**Dispatcher**:
+The short-lived agent a project opens with: it turns the user's request into tasks, briefs each task's orchestrator, then exits.
+_Avoid_: Initial orchestrator, project orchestrator, planner
 
 **Worker**:
 An agent spawned by the orchestrator to do one part of the task.
@@ -51,6 +55,26 @@ _Avoid_: Integration branch, feature branch
 **Review**:
 The step where a person reads the combined diff of a task and approves it or requests changes.
 _Avoid_: Code review session, check
+
+**Task worktree**:
+The worktree that holds a task branch; each tab in the window shows one.
+_Avoid_: Space, workspace
+
+**Terminal**:
+A window in Swarm showing one running program: the orchestrator, a worker, a process or the user's own shell.
+_Avoid_: Pane, tile, shell
+
+**Process terminal**:
+A terminal running a command an agent started, such as a dev server or a test run.
+_Avoid_: Job, task terminal, background terminal
+
+**User terminal**:
+A terminal the user opened that no agent can see or touch.
+_Avoid_: God mode terminal, private terminal
+
+**Tray**:
+The strip of chips where terminals go when they don't fit on screen.
+_Avoid_: Dock, minimized bar
 
 **Daemon**:
 The background process that keeps agents running when the app is closed.
