@@ -2,8 +2,10 @@
 
 mod agent_socket;
 mod agents;
+mod calls;
 mod connection;
 mod hub;
+mod messages;
 mod recovery;
 mod tasks;
 
@@ -25,7 +27,9 @@ use swarm_core::store::Store;
 use swarm_protocol::{Paths, check_private_dir};
 
 use crate::agents::{AgentConfig, Agents};
+use crate::calls::Calls;
 use crate::hub::{Clients, Terminals};
+use crate::messages::Messages;
 use crate::recovery::System;
 
 /// What every client connection works with.
@@ -34,6 +38,8 @@ pub(crate) struct Services {
     pub(crate) projects: Arc<Projects>,
     pub(crate) agents: Arc<Agents>,
     pub(crate) clients: Arc<Clients>,
+    pub(crate) messages: Arc<Messages>,
+    pub(crate) store: Arc<Mutex<Store>>,
 }
 
 /// Where the daemon is told to keep its files and read its settings.
@@ -126,6 +132,7 @@ fn run() -> Result<()> {
     let projects = Arc::new(Projects::new(Arc::clone(&store)));
     let terminals = Terminals::new(Arc::clone(&store));
     let clients = Arc::new(Clients::default());
+    let messages = Messages::new(Arc::clone(&store), Arc::clone(&clients));
     let agents = Agents::new(
         AgentConfig {
             data_dir: paths.data.clone(),
@@ -133,15 +140,11 @@ fn run() -> Result<()> {
             settings: arguments.settings.or_else(swarm_settings::default_path),
             swarm,
         },
-        store,
+        Arc::clone(&store),
         Arc::clone(&terminals),
         Arc::clone(&clients),
+        Arc::clone(&messages),
     );
-
-    let agent_server = Arc::clone(&agents);
-    thread::Builder::new()
-        .name("agent-socket".into())
-        .spawn(move || agent_socket::serve(&agent_listener, &agent_server))?;
 
     watch_signals(
         Arc::clone(&terminals),
@@ -153,7 +156,15 @@ fn run() -> Result<()> {
         projects,
         agents,
         clients,
+        messages,
+        store,
     });
+
+    let calls = Arc::new(Calls::new(Arc::clone(&services)));
+    thread::Builder::new()
+        .name("agent-socket".into())
+        .spawn(move || agent_socket::serve(&agent_listener, &calls))?;
+
     serve(&listener, &services);
 
     Ok(())

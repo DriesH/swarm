@@ -1,7 +1,7 @@
 //! The agent socket (ADR 0008): the only socket agents may use.
 //!
 //! One JSON object per line. Every request names the agent and carries its token. The
-//! socket never lists or touches terminals, and it does not understand app requests.
+//! socket never lists or touches user terminals, and it does not understand app requests.
 
 use std::collections::HashMap;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
@@ -14,11 +14,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
-use serde::Deserialize;
-use serde_json::{Value, json};
-use swarm_protocol::AgentId;
+use swarm_protocol::agent::{AgentRequest, Reply};
 
-use crate::agents::Agents;
+use crate::calls::Calls;
 
 /// Longest request line.
 const MAX_LINE: u64 = 4 << 20;
@@ -32,20 +30,12 @@ const WARN_INTERVAL: Duration = Duration::from_secs(60);
 /// Most agents the warning limiter remembers.
 const MAX_TRACKED_AGENTS: usize = 1024;
 
-/// A connection that sends nothing for this long is closed.
+/// A connection that sends nothing for this long is closed. The time a call takes to
+/// answer does not count: only the wait for the next request does.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Pause after a failed `accept`, so a persistent error does not spin.
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
-
-#[derive(Deserialize)]
-struct Request {
-    method: String,
-    agent: u64,
-    token: String,
-    #[serde(default)]
-    event: Value,
-}
 
 /// Replaces a stale socket file and makes the new one private (mode 0600).
 pub(crate) fn bind(path: &Path) -> Result<UnixListener> {
@@ -110,7 +100,7 @@ impl RefusalLog {
     }
 }
 
-pub(crate) fn serve(listener: &UnixListener, agents: &Arc<Agents>) {
+pub(crate) fn serve(listener: &UnixListener, calls: &Arc<Calls>) {
     let open = Arc::new(AtomicUsize::new(0));
     let refusals = Arc::new(RefusalLog::default());
 
@@ -130,13 +120,13 @@ pub(crate) fn serve(listener: &UnixListener, agents: &Arc<Agents>) {
             continue;
         };
 
-        let agents = Arc::clone(agents);
+        let calls = Arc::clone(calls);
         let refusals = Arc::clone(&refusals);
         let spawned = thread::Builder::new()
             .name("agent-client".into())
             .spawn(move || {
                 let _slot = slot;
-                if let Err(error) = connection(stream, &agents, &refusals) {
+                if let Err(error) = connection(stream, &calls, &refusals, IDLE_TIMEOUT) {
                     log::debug!("agent connection ended: {error:#}");
                 }
             });
@@ -146,8 +136,13 @@ pub(crate) fn serve(listener: &UnixListener, agents: &Arc<Agents>) {
     }
 }
 
-fn connection(stream: UnixStream, agents: &Agents, refusals: &RefusalLog) -> Result<()> {
-    stream.set_read_timeout(Some(IDLE_TIMEOUT))?;
+fn connection(
+    stream: UnixStream,
+    calls: &Calls,
+    refusals: &RefusalLog,
+    idle_timeout: Duration,
+) -> Result<()> {
+    stream.set_read_timeout(Some(idle_timeout))?;
     let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
 
@@ -159,46 +154,49 @@ fn connection(stream: UnixStream, agents: &Agents, refusals: &RefusalLog) -> Res
             return Ok(());
         }
         if !line.ends_with('\n') {
-            writeln!(writer, "{}", failure("the request is too long"))?;
+            writeln!(
+                writer,
+                "{}",
+                encode(&Reply::failure("the request is too long"))
+            )?;
 
             return Ok(());
         }
 
-        writeln!(writer, "{}", answer(agents, refusals, line.trim()))?;
+        writeln!(writer, "{}", encode(&answer(calls, refusals, line.trim())))?;
     }
 }
 
-fn answer(agents: &Agents, refusals: &RefusalLog, line: &str) -> Value {
-    let request: Request = match serde_json::from_str(line) {
-        Ok(request) => request,
-        Err(_) => return failure("the request is not valid"),
+fn answer(calls: &Calls, refusals: &RefusalLog, line: &str) -> Reply {
+    let Ok(request) = serde_json::from_str::<AgentRequest>(line) else {
+        return Reply::failure("the request is not valid");
     };
+    let agent = request.agent;
 
-    match request.method.as_str() {
-        "hook" => {
-            let result = agents.hook(AgentId(request.agent), &request.token, &request.event);
-            if result.is_ok() {
-                return json!({ "ok": true });
-            }
-
-            if refusals.should_warn(request.agent, Instant::now()) {
-                log::warn!("agent socket refused agent {}", request.agent);
-            } else {
-                log::debug!("agent socket refused agent {}", request.agent);
-            }
-
-            failure("refused")
-        }
-        _ => failure("unknown method"),
+    if let Ok(reply) = calls.handle(request) {
+        return reply;
     }
+
+    if refusals.should_warn(agent.0, Instant::now()) {
+        log::warn!("agent socket refused agent {}", agent.0);
+    } else {
+        log::debug!("agent socket refused agent {}", agent.0);
+    }
+
+    Reply::failure("refused")
 }
 
-fn failure(message: &str) -> Value {
-    json!({ "ok": false, "error": message })
+fn encode(reply: &Reply) -> String {
+    serde_json::to_string(reply)
+        .unwrap_or_else(|_| r#"{"ok":false,"error":"cannot encode the reply"}"#.to_owned())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use serde_json::{Value, json};
+
     use super::*;
 
     #[test]
@@ -227,5 +225,128 @@ mod tests {
         assert!(!log.should_warn(1, start + Duration::from_secs(30)));
         assert!(log.should_warn(2, start + Duration::from_secs(30)));
         assert!(log.should_warn(1, start + WARN_INTERVAL));
+    }
+    /// Everything the socket needs, with one registered orchestrator.
+    fn calls_with_an_agent() -> (Arc<Calls>, u64, String) {
+        use std::sync::Mutex;
+
+        use swarm_core::Projects;
+        use swarm_core::store::{NewTask, Store};
+        use swarm_protocol::{AgentKind, AgentRole};
+
+        use crate::Services;
+        use crate::agents::{AgentConfig, Agents, Place};
+        use crate::hub::{Clients, Terminals};
+        use crate::messages::Messages;
+
+        let store = Store::open_in_memory().expect("store");
+        let project = store
+            .add_project(Path::new("/repo"), "repo")
+            .expect("project");
+        let task = store
+            .add_task(&NewTask {
+                project: project.id,
+                name: "Task",
+                branch: "swarm/task",
+                base: "main",
+                worktree: Path::new("/repo/.worktrees/task"),
+                ports: &[],
+            })
+            .expect("task");
+        let store = Arc::new(Mutex::new(store));
+        let clients = Arc::new(Clients::default());
+        let terminals = Terminals::new(Arc::clone(&store));
+        let messages = Messages::new(Arc::clone(&store), Arc::clone(&clients));
+        let agents = Agents::new(
+            AgentConfig {
+                data_dir: std::env::temp_dir(),
+                socket: PathBuf::from("/tmp/none.sock"),
+                settings: None,
+                swarm: PathBuf::from("/tmp/swarm"),
+            },
+            Arc::clone(&store),
+            Arc::clone(&terminals),
+            Arc::clone(&clients),
+            Arc::clone(&messages),
+        );
+        let plan = agents
+            .plan(AgentKind::ClaudeCode, AgentRole::Orchestrator)
+            .expect("plan");
+        let agent = agents
+            .register(&Place::of_task(&task), plan)
+            .expect("register");
+        let token = agents.token_for_test(agent.id).expect("token");
+
+        let services = Arc::new(Services {
+            terminals,
+            projects: Arc::new(Projects::new(Arc::clone(&store))),
+            agents,
+            clients,
+            messages,
+            store,
+        });
+
+        (Arc::new(Calls::new(services)), agent.id.0, token)
+    }
+
+    fn ask(stream: &mut UnixStream, reader: &mut BufReader<UnixStream>, line: &str) -> Value {
+        writeln!(stream, "{line}").expect("write");
+        let mut answer = String::new();
+        reader.read_line(&mut answer).expect("answer");
+
+        serde_json::from_str(&answer).expect("json")
+    }
+
+    #[test]
+    fn a_wait_longer_than_the_idle_time_is_not_cut_off() {
+        let (calls, agent, token) = calls_with_an_agent();
+        let (server_end, mut client) = UnixStream::pair().expect("pair");
+        let serving = thread::spawn(move || {
+            connection(
+                server_end,
+                &calls,
+                &RefusalLog::default(),
+                Duration::from_millis(300),
+            )
+        });
+        let mut reader = BufReader::new(client.try_clone().expect("clone"));
+        let wait = format!(
+            r#"{{"agent":{agent},"token":"{token}","method":"wait","params":{{"timeout_secs":1}}}}"#
+        );
+        let read = format!(r#"{{"agent":{agent},"token":"{token}","method":"read"}}"#);
+
+        let start = Instant::now();
+        let waited = ask(&mut client, &mut reader, &wait);
+        let waited_for = start.elapsed();
+        let after = ask(&mut client, &mut reader, &read);
+
+        assert_eq!(waited, json!({ "ok": true, "result": [] }));
+        assert!(waited_for >= Duration::from_millis(900), "{waited_for:?}");
+        assert_eq!(after["ok"], true, "the connection stayed open");
+
+        let ended = serving.join().expect("join");
+        assert!(ended.is_err(), "an idle connection is closed");
+    }
+
+    #[test]
+    fn a_request_with_a_wrong_token_is_refused() {
+        let (calls, agent, _token) = calls_with_an_agent();
+        let reply = answer(
+            &calls,
+            &RefusalLog::default(),
+            &format!(r#"{{"agent":{agent},"token":"wrong","method":"read"}}"#),
+        );
+
+        assert!(!reply.ok);
+        assert_eq!(reply.error.as_deref(), Some("refused"));
+    }
+
+    #[test]
+    fn a_garbled_request_is_not_valid() {
+        let (calls, _, _) = calls_with_an_agent();
+
+        let reply = answer(&calls, &RefusalLog::default(), "{nope");
+
+        assert_eq!(reply.error.as_deref(), Some("the request is not valid"));
     }
 }

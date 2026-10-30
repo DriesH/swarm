@@ -138,9 +138,12 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
             }
         }
         Request::Input { id, input } => match terminals.get(id) {
-            Some(hub) if hub.send_input(input) => {}
+            Some(hub) if hub.send_input(input) => services.agents.app_input(id),
             _ => send_missing(sink, id),
         },
+        Request::StartOrchestrator { call, .. } => {
+            send_error(sink, call, &"not available yet");
+        }
         Request::ListProjects { call } => match projects.list() {
             Ok(projects) => {
                 sink.send_event(&Event::Projects { call, projects });

@@ -14,9 +14,9 @@ use std::time::{Duration, Instant};
 
 use swarm_core::store::Store;
 use swarm_protocol::{
-    AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentStatus, CallId, CreateTask, CreateTerminal,
-    Event, ProjectInfo, Request, TaskInfo, TerminalId, TerminalInfo, TerminalKind, VERSION, read,
-    write,
+    AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, CallId, CreateTask,
+    CreateTerminal, Event, MessageKind, ProjectInfo, Request, TaskInfo, TerminalId, TerminalInfo,
+    TerminalKind, VERSION, read, write,
 };
 use swarm_term::{
     BlockedKind, ExitStatus, Palette, ProgramState, Rgb, Row, Size, TerminalInput, TerminalOutput,
@@ -1265,19 +1265,22 @@ sleep 30",
 
 /// Sends one line to the agent socket and returns the parsed answer.
 fn agent_request(daemon: &Daemon, line: &[u8]) -> serde_json::Value {
+    try_agent_request(daemon, line).expect("json answer")
+}
+
+/// As [`agent_request`], but `None` when the socket closed without an answer.
+fn try_agent_request(daemon: &Daemon, line: &[u8]) -> Option<serde_json::Value> {
     let mut stream = UnixStream::connect(daemon.agent_socket()).expect("connect");
     stream
         .set_read_timeout(Some(READ_TIMEOUT))
         .expect("timeout");
-    stream.write_all(line).expect("write");
-    stream.write_all(b"\n").expect("write");
+    stream.write_all(line).ok()?;
+    stream.write_all(b"\n").ok()?;
 
     let mut answer = String::new();
-    BufReader::new(stream)
-        .read_line(&mut answer)
-        .expect("answer");
+    BufReader::new(stream).read_line(&mut answer).ok()?;
 
-    serde_json::from_str(&answer).expect("json answer")
+    serde_json::from_str(&answer).ok()
 }
 
 #[test]
@@ -1295,13 +1298,13 @@ fn the_agent_socket_refuses_a_wrong_token_and_app_requests() {
     let wrong = agent_request(
         &daemon,
         format!(
-            r#"{{"method":"hook","agent":{agent},"token":"wrong","event":{{"hook_event_name":"Stop"}}}}"#
+            r#"{{"method":"hook","agent":{agent},"token":"wrong","params":{{"event":{{"hook_event_name":"Stop"}}}}}}"#
         )
         .as_bytes(),
     );
     let unknown_agent = agent_request(
         &daemon,
-        br#"{"method":"hook","agent":999,"token":"x","event":{}}"#,
+        br#"{"method":"hook","agent":999,"token":"x","params":{"event":{}}}"#,
     );
     let listing = agent_request(&daemon, br#"{"method":"list","agent":1,"token":"x"}"#);
     let garbage = agent_request(&daemon, &[0x05, 0x00, 0x00, 0x00, 0x00, 0x01]);
@@ -1511,6 +1514,7 @@ fn an_agent_folder_and_its_files_are_private() {
     assert_eq!(mode(&folder), 0o700);
     assert_eq!(mode(&folder.join("system-prompt.md")), 0o600);
     assert_eq!(mode(&folder.join("claude-settings.json")), 0o600);
+    assert_eq!(mode(&folder.join("mcp.json")), 0o600);
 }
 
 #[test]
@@ -1533,10 +1537,18 @@ fn the_agent_socket_serves_at_most_64_connections() {
     );
 
     drop(held);
-    let after = agent_request(
-        &daemon,
-        br#"{"method":"hook","agent":1,"token":"x","event":{}}"#,
-    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let after = loop {
+        let answer = try_agent_request(
+            &daemon,
+            br#"{"method":"hook","agent":1,"token":"x","params":{"event":{}}}"#,
+        );
+        match answer {
+            Some(answer) => break answer,
+            None => assert!(Instant::now() < deadline, "the slots never came back"),
+        }
+        thread::park_timeout(Duration::from_millis(50));
+    };
     assert_eq!(after["error"], "refused");
 }
 
@@ -1544,10 +1556,583 @@ fn the_agent_socket_serves_at_most_64_connections() {
 fn the_agent_socket_accepts_lines_over_one_mebibyte() {
     let daemon = Daemon::start();
     let padding = "x".repeat(2 << 20);
-    let line =
-        format!(r#"{{"method":"hook","agent":1,"token":"x","event":{{"pad":"{padding}"}}}}"#);
+    let line = format!(
+        r#"{{"method":"hook","agent":1,"token":"x","params":{{"event":{{"pad":"{padding}"}}}}}}"#
+    );
 
     let answer = agent_request(&daemon, line.as_bytes());
 
     assert_eq!(answer["error"], "refused");
+}
+
+/// Shell helpers for the fake agents of the harness tests.
+const HELPERS: &str = r#"
+idle() { printf '\033]7501;state=idle\007'; }
+working() { printf '\033]7501;state=working\007'; }
+commit() { git -c user.name=Test -c user.email=test@example.com commit -q -m "$1"; }
+"#;
+
+fn fixture_with_helpers(body: &str) -> Fixture {
+    Fixture::new(&format!("{HELPERS}\n{body}"))
+}
+
+/// A repository whose merge commits get an author.
+fn repo_for_merges() -> Repo {
+    let repo = Repo::new("");
+    repo.git(&["config", "user.name", "Test"]);
+    repo.git(&["config", "user.email", "test@example.com"]);
+
+    repo
+}
+
+/// Starts the task of a harness test: the orchestrator gets "lead the task".
+fn start_task(daemon: &Daemon, repo: &Repo) -> (Client, TaskInfo) {
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+
+    let mut request = orchestrator_task(project.id, false);
+    request.first_message = Some("lead the task".to_owned());
+    let task = client.create_task(request);
+
+    (client, task)
+}
+
+fn git_output(folder: &Path, arguments: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(folder)
+        .args(arguments)
+        .output()
+        .expect("run git");
+    assert!(output.status.success(), "git {arguments:?}");
+
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+#[test]
+fn an_orchestrator_and_a_worker_work_a_task_through_the_harness() {
+    let fixture = fixture_with_helpers(
+        r#"case "$SWARM_ROLE" in
+orchestrator)
+  idle
+  IFS= read -r line
+  printf '%s\n' "$line" > "$OUT/orchestrator-first"
+  working
+  swarm confirm > "$OUT/confirm.out" 2>&1
+  swarm spawn api --brief "build the api" > "$OUT/spawn.out" 2>&1
+  swarm wait --timeout 60 > "$OUT/question.out" 2>&1
+  swarm send api "use port 5173" > "$OUT/send.out" 2>&1
+  swarm wait --timeout 60 > "$OUT/report.out" 2>&1
+  swarm merge api > "$OUT/merge.out" 2>&1
+  echo $? > "$OUT/merge.code"
+  swarm agents > "$OUT/agents.out" 2>&1
+  idle
+  sleep 30
+  ;;
+worker)
+  idle
+  IFS= read -r line
+  printf '%s\n' "$line" > "$OUT/worker-brief"
+  printf '%s\n' "$PATH" > "$OUT/worker-path"
+  working
+  swarm ask "which port?" > "$OUT/ask.out" 2>&1
+  swarm wait --timeout 60 > "$OUT/answer.out" 2>&1
+  echo "port 5173" > api.txt
+  git add api.txt
+  commit "add api"
+  swarm report "api done" > "$OUT/report-sent.out" 2>&1
+  idle
+  sleep 30
+  ;;
+esac"#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, task) = start_task(&daemon, &repo);
+
+    let mut kinds = Vec::new();
+    let mut briefed = false;
+    let mut worker: Option<AgentInfo> = None;
+    client.wait_for(|event| {
+        match event {
+            Event::MessageSent { message } => kinds.push((message.kind, message.from.is_some())),
+            Event::TaskChanged { task } if task.briefed => briefed = true,
+            Event::AgentChanged { agent } if agent.role == AgentRole::Worker => {
+                worker = Some(agent.clone());
+            }
+            _ => {}
+        }
+
+        (kinds.len() == 4).then_some(())
+    });
+
+    assert_eq!(
+        kinds.iter().map(|(kind, _)| *kind).collect::<Vec<_>>(),
+        [
+            MessageKind::Brief,
+            MessageKind::Question,
+            MessageKind::Task,
+            MessageKind::Report
+        ]
+    );
+    assert!(kinds.iter().all(|(_, from_agent)| *from_agent));
+    assert!(briefed, "confirm broadcasts TaskChanged");
+    let worker = worker.expect("the worker was announced");
+    assert_eq!(worker.name, "api");
+    assert_eq!(worker.branch, "swarm/agent-task--api");
+    assert_eq!(worker.task, Some(task.id));
+    assert_eq!(worker.project, task.project);
+    assert!(worker.worktree.ends_with(".worktrees/agent-task--api"));
+    assert_eq!(worker.kind, AgentKind::ClaudeCode);
+    assert_eq!(worker.model, "sonnet");
+
+    assert_eq!(
+        fixture.read_when_written("orchestrator-first").trim(),
+        "lead the task"
+    );
+    assert_eq!(
+        fixture.read_when_written("worker-brief").trim(),
+        "build the api"
+    );
+    let path = fixture.read_when_written("worker-path");
+    let swarm_folder = swarm_binary().parent().expect("folder").to_owned();
+    assert!(
+        path.starts_with(&format!("{}:", swarm_folder.display())),
+        "{path}"
+    );
+
+    assert_eq!(fixture.read_when_written("confirm.out").trim(), "ok");
+    assert!(
+        fixture
+            .read_when_written("spawn.out")
+            .starts_with("started worker api (agent ")
+    );
+    let question = fixture.read_when_written("question.out");
+    assert!(question.contains("question from api"), "{question}");
+    assert!(question.contains("which port?"), "{question}");
+    assert!(
+        fixture
+            .read_when_written("answer.out")
+            .contains("use port 5173")
+    );
+    assert!(fixture.read_when_written("report.out").contains("api done"));
+
+    assert_eq!(fixture.read_when_written("merge.code").trim(), "0");
+    assert!(fixture.read_when_written("merge.out").starts_with("merged"));
+    assert!(task.worktree.join("api.txt").is_file());
+    assert_eq!(
+        git_output(&task.worktree, &["log", "--merges", "--format=%s"])
+            .lines()
+            .count(),
+        1
+    );
+    let agents = fixture.read_when_written("agents.out");
+    assert!(
+        agents.contains("api") && agents.contains("swarm/agent-task--api"),
+        "{agents}"
+    );
+
+    assert!(
+        !database(&daemon)
+            .has_unread(task.agents[0].id)
+            .expect("unread"),
+        "every message was taken"
+    );
+}
+
+#[test]
+fn a_merge_conflict_is_reported_and_left_for_the_orchestrator() {
+    let fixture = fixture_with_helpers(
+        r#"case "$SWARM_ROLE" in
+orchestrator)
+  idle
+  IFS= read -r line
+  working
+  swarm spawn api --brief "change the readme" > "$OUT/spawn.out" 2>&1
+  swarm wait --timeout 60 > "$OUT/report.out" 2>&1
+  echo "task text" > README.md
+  git add README.md
+  commit "task readme"
+  swarm merge api > "$OUT/merge.out" 2>&1
+  echo $? > "$OUT/merge.code"
+  git status --porcelain > "$OUT/status.out"
+  sleep 30
+  ;;
+worker)
+  idle
+  IFS= read -r line
+  working
+  echo "worker text" > README.md
+  git add README.md
+  commit "worker readme"
+  swarm report "readme changed" > "$OUT/report-sent.out" 2>&1
+  sleep 30
+  ;;
+esac"#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (_client, _task) = start_task(&daemon, &repo);
+
+    assert_eq!(fixture.read_when_written("merge.code").trim(), "1");
+    let merge = fixture.read_when_written("merge.out");
+    assert!(
+        merge.starts_with("conflict in 1 file:\n  README.md\n"),
+        "{merge}"
+    );
+    assert!(merge.contains("CONFLICT"), "{merge}");
+    assert!(
+        fixture
+            .read_when_written("status.out")
+            .contains("UU README.md")
+    );
+}
+
+#[test]
+fn a_message_is_pasted_when_the_agent_becomes_idle() {
+    let fixture = fixture_with_helpers(
+        r#"case "$SWARM_ROLE" in
+orchestrator)
+  idle
+  IFS= read -r line
+  working
+  swarm spawn api --brief "report at once" > "$OUT/spawn.out" 2>&1
+  while [ ! -f "$OUT/reported" ]; do sleep 0.1; done
+  if IFS= read -r -t 1 early; then printf '%s\n' "$early" > "$OUT/early"; fi
+  idle
+  IFS= read -r header
+  IFS= read -r body
+  printf '%s\n%s\n' "$header" "$body" > "$OUT/pasted"
+  sleep 30
+  ;;
+worker)
+  idle
+  IFS= read -r line
+  working
+  swarm report "all green" > "$OUT/report.out" 2>&1
+  echo yes > "$OUT/reported"
+  sleep 30
+  ;;
+esac"#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (_client, _task) = start_task(&daemon, &repo);
+
+    let pasted = fixture.read_when_written("pasted");
+    let mut lines = pasted.lines();
+
+    assert!(
+        lines
+            .next()
+            .expect("header")
+            .starts_with("[swarm] report from api (agent "),
+        "{pasted}"
+    );
+    assert_eq!(lines.next(), Some("all green"));
+    assert!(
+        !fixture.out.join("early").exists(),
+        "the message was pasted before the agent was idle"
+    );
+}
+
+#[test]
+fn the_daemon_refuses_what_a_role_may_not_do() {
+    let fixture = fixture_with_helpers(
+        r#"case "$SWARM_ROLE" in
+orchestrator)
+  idle
+  IFS= read -r line
+  working
+  swarm spawn a --brief "wait for go" > "$OUT/spawn-a.out" 2>&1
+  swarm spawn b --brief "stay idle" > "$OUT/spawn-b.out" 2>&1
+  swarm send a go > "$OUT/send-go.out" 2>&1
+  swarm wait --timeout 60 > "$OUT/wait.out" 2>&1
+  swarm ask "q" > "$OUT/orch-ask.out" 2>&1
+  swarm report "r" > "$OUT/orch-report.out" 2>&1
+  swarm send "$SWARM_AGENT_ID" "to myself" > "$OUT/orch-self.out" 2>&1
+  swarm spawn a --brief again > "$OUT/dup.out" 2>&1
+  swarm spawn "!!!" --brief again > "$OUT/bad-name.out" 2>&1
+  echo done > "$OUT/orchestrator-done"
+  sleep 30
+  ;;
+worker)
+  idle
+  IFS= read -r line
+  working
+  if [ "$line" = "wait for go" ]; then
+    swarm wait --timeout 60 > "$OUT/a-wait.out" 2>&1
+    OTHER=$((SWARM_AGENT_ID + 1))
+    swarm send "$OTHER" hi > "$OUT/a-send.out" 2>&1
+    swarm spawn x --brief y > "$OUT/a-spawn.out" 2>&1
+    swarm merge "$OTHER" > "$OUT/a-merge.out" 2>&1
+    swarm notify hi > "$OUT/a-notify.out" 2>&1
+    swarm agents > "$OUT/a-agents.out" 2>&1
+    swarm confirm > "$OUT/a-confirm.out" 2>&1
+    swarm report "refusals recorded" > "$OUT/a-report.out" 2>&1
+  fi
+  sleep 30
+  ;;
+esac"#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (_client, _task) = start_task(&daemon, &repo);
+    fixture.read_when_written("orchestrator-done");
+
+    let said = |name: &str| fixture.read_when_written(name);
+    assert_eq!(
+        said("a-send.out").trim(),
+        "swarm: workers can only message their orchestrator (use ask or report)"
+    );
+    assert_eq!(
+        said("a-spawn.out").trim(),
+        "swarm: only a task's orchestrator can spawn workers"
+    );
+    assert_eq!(
+        said("a-merge.out").trim(),
+        "swarm: only a task's orchestrator can merge a worker"
+    );
+    assert_eq!(
+        said("a-notify.out").trim(),
+        "swarm: only a task's orchestrator can notify the user"
+    );
+    assert_eq!(
+        said("a-agents.out").trim(),
+        "swarm: only a task's orchestrator can list its workers"
+    );
+    assert_eq!(
+        said("a-confirm.out").trim(),
+        "swarm: only a task's orchestrator can confirm a brief"
+    );
+    let not_a_worker =
+        "swarm: only workers can ask or report; an orchestrator messages its workers";
+    assert_eq!(said("orch-ask.out").trim(), not_a_worker);
+    assert_eq!(said("orch-report.out").trim(), not_a_worker);
+    assert!(
+        said("orch-self.out").contains("is not a worker of your task"),
+        "{}",
+        said("orch-self.out")
+    );
+    assert!(said("dup.out").contains("already has a worker named a"));
+    assert!(said("bad-name.out").contains("has no letters or digits"));
+}
+
+#[test]
+fn a_notice_blocks_the_agent_until_it_works_again() {
+    let fixture = fixture_with_helpers(
+        r#"idle
+IFS= read -r line
+swarm notify "Review needed" > "$OUT/notify.out" 2>&1
+sleep 2
+working
+sleep 30"#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, _task) = start_task(&daemon, &repo);
+
+    let blocked =
+        client.wait_for_agent(|agent| agent.status == AgentStatus::Blocked(BlockedKind::Other));
+    assert_eq!(blocked.message.as_deref(), Some("Review needed"));
+
+    let working = client.wait_for_agent(|agent| agent.status == AgentStatus::Working);
+    assert_eq!(working.message, None);
+    assert_eq!(fixture.read_when_written("notify.out").trim(), "ok");
+}
+
+#[test]
+fn input_from_the_app_clears_a_notice() {
+    let fixture = fixture_with_helpers(
+        r#"idle
+IFS= read -r line
+swarm notify "Review needed" > "$OUT/notify.out" 2>&1
+sleep 30"#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, _task) = start_task(&daemon, &repo);
+
+    let blocked =
+        client.wait_for_agent(|agent| agent.status == AgentStatus::Blocked(BlockedKind::Other));
+    client.send(&Request::Input {
+        id: blocked.terminal.expect("terminal"),
+        input: TerminalInput::Text("x".to_owned()),
+    });
+
+    let cleared = client.wait_for_agent(|agent| agent.status == AgentStatus::Idle);
+    assert_eq!(cleared.message, None);
+}
+
+#[test]
+fn the_mcp_server_serves_an_agent_through_the_daemon() {
+    let fixture = fixture_with_helpers(
+        r#"idle
+IFS= read -r line
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}' \
+  '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"confirm","arguments":{}}}' \
+  '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"agents","arguments":{}}}' \
+  '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"report","arguments":{"text":"x"}}}' \
+  | swarm mcp > "$OUT/mcp.out" 2> "$OUT/mcp.err"
+echo done > "$OUT/mcp.done"
+sleep 30"#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, _task) = start_task(&daemon, &repo);
+
+    fixture.read_when_written("mcp.done");
+    let replies: Vec<serde_json::Value> = fixture
+        .read_when_written("mcp.out")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("json line"))
+        .collect();
+
+    assert_eq!(replies.len(), 5);
+    let reply = |id: u64| {
+        replies
+            .iter()
+            .find(|reply| reply["id"] == id)
+            .expect("a reply for the id")
+    };
+    let tools: Vec<&str> = reply(2)["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    assert_eq!(
+        tools,
+        [
+            "spawn", "send", "read", "wait", "merge", "notify", "agents", "confirm"
+        ]
+    );
+    assert_eq!(reply(3)["result"]["isError"], false);
+    assert_eq!(reply(3)["result"]["content"][0]["text"], "ok");
+    assert_eq!(reply(4)["result"]["content"][0]["text"], "no workers");
+    assert_eq!(reply(5)["error"]["code"], -32602);
+    client.wait_for(|event| match event {
+        Event::TaskChanged { task } if task.briefed => Some(()),
+        _ => None,
+    });
+}
+
+#[test]
+fn calls_of_the_next_part_answer_not_available_yet() {
+    let fixture = fixture_with_helpers(
+        r#"idle
+IFS= read -r line
+swarm read > "$OUT/read.out" 2>&1
+sleep 30"#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (_client, task) = start_task(&daemon, &repo);
+    fixture.read_when_written("read.out");
+    let mcp = std::fs::read_to_string(
+        daemon
+            .home
+            .join("agents")
+            .join(task.agents[0].id.0.to_string())
+            .join("mcp.json"),
+    )
+    .expect("mcp file");
+    let token = serde_json::from_str::<serde_json::Value>(&mcp).expect("json")["mcpServers"]
+        ["swarm"]["env"]["SWARM_TOKEN"]
+        .as_str()
+        .expect("token")
+        .to_owned();
+
+    let answer = agent_request(
+        &daemon,
+        format!(
+            r#"{{"method":"task_list","agent":{},"token":"{token}"}}"#,
+            task.agents[0].id.0
+        )
+        .as_bytes(),
+    );
+
+    assert_eq!(answer["ok"], false);
+    assert_eq!(answer["error"], "not available yet");
+}
+
+#[test]
+fn claude_agents_get_the_mcp_file_the_flag_and_the_permission_rules() {
+    let fixture = fixture_with_helpers(
+        r#"printf '%s\n' "$@" > "$OUT/args"
+sleep 30"#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (_client, task) = start_task(&daemon, &repo);
+
+    let args = fixture.read_when_written("args");
+    let folder = daemon
+        .home
+        .join("agents")
+        .join(task.agents[0].id.0.to_string());
+
+    assert!(
+        args.contains(&format!(
+            "--mcp-config\n{}",
+            folder.join("mcp.json").display()
+        )),
+        "{args}"
+    );
+    let mcp: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(folder.join("mcp.json")).expect("file"))
+            .expect("json");
+    let server = &mcp["mcpServers"]["swarm"];
+    assert_eq!(server["command"], swarm_binary().display().to_string());
+    assert_eq!(server["env"]["SWARM_ROLE"], "orchestrator");
+    assert_eq!(
+        server["env"]["SWARM_AGENT_ID"],
+        task.agents[0].id.0.to_string()
+    );
+    let settings = std::fs::read_to_string(folder.join("claude-settings.json")).expect("file");
+    assert!(settings.contains("Bash(swarm *)") && settings.contains("mcp__swarm__*"));
+}
+
+#[test]
+fn nothing_is_pasted_before_the_first_message_went_in() {
+    let fixture = fixture_with_helpers(
+        r#"case "$SWARM_ROLE" in
+orchestrator)
+  idle
+  IFS= read -r line
+  working
+  swarm spawn api --brief "the brief" > "$OUT/spawn.out" 2>&1
+  swarm send api "early message" > "$OUT/send.out" 2>&1
+  sleep 30
+  ;;
+worker)
+  sleep 1
+  idle
+  IFS= read -r first
+  printf '%s\n' "$first" > "$OUT/first"
+  working
+  sleep 1
+  idle
+  IFS= read -r header
+  IFS= read -r body
+  printf '%s\n%s\n' "$header" "$body" > "$OUT/second"
+  sleep 30
+  ;;
+esac"#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (_client, _task) = start_task(&daemon, &repo);
+
+    assert_eq!(fixture.read_when_written("first").trim(), "the brief");
+    let second = fixture.read_when_written("second");
+    assert!(
+        second.starts_with("[swarm] task from orchestrator (agent "),
+        "{second}"
+    );
+    assert!(second.ends_with("early message\n"), "{second}");
 }
