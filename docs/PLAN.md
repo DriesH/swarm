@@ -7,7 +7,7 @@ Design canvas: https://claude.ai/artifact/6r2WfEmYoTDCWCTJckxVkt (direction **A 
 ## Goals
 
 - Fast and native: GPUI, 120 fps terminals.
-- Component library first: every screen is built from `swarm-ui` parts.
+- Component library first: every screen is built from `swarm_ui` parts.
 - Light and dark themes from one token set.
 - Accessible: every control has a role and label for VoiceOver, everything works from the keyboard, and colors meet WCAG AA contrast. GPUI support: see `docs/research/zed-architecture.md`.
 - Built the way Zed builds GPUI apps (crate split, `init(cx)` per crate, actions and keymaps, `ui` + `theme` style components).
@@ -15,6 +15,7 @@ Design canvas: https://claude.ai/artifact/6r2WfEmYoTDCWCTJckxVkt (direction **A 
 - Agents keep running when the app quits.
 - Menu bar icon with Claude and Codex subscription usage.
 - A full harness (CLI + MCP) so agents can drive Swarm.
+- Calm UI: screens show labels, values and status only. Explanations of how things work live on the docs website.
 
 ## Architecture
 
@@ -22,23 +23,25 @@ Cargo workspace:
 
 | Crate | Role |
 |---|---|
-| `swarm-ui` | Design tokens, themes and components on raw GPUI |
-| `swarm-term` | PTY + `libghostty-vt` + GPUI grid renderer |
-| `swarm-core` | Projects, tasks, agents, worktrees, mailbox, state store (SQLite) |
-| `swarm-daemon` | Background process that owns PTYs and runs `swarm-core` |
-| `swarm-harness` | Unix socket JSON-RPC, `swarm` CLI and MCP server |
-| `swarm-app` | Windows, layouts (Focus, Grid, Swarm), Review, PR panel, settings |
-| `swarm-usage` | Menu bar icon and usage polling |
+| `swarm_ui` | Theme tokens (Light / Dark / System), fonts, icons and components on raw GPUI |
+| `gallery` | Component gallery app (`swarm-gallery`) |
+| `swarm_term` | `libghostty-vt` behind our own types + GPUI grid element |
+| `swarm_core` | Projects, tasks, agents, worktrees, messages, state in SQLite |
+| `swarm_daemon` | Background process that owns PTYs and runs `swarm_core` |
+| `swarm_harness` | Unix socket API, `swarm` CLI and MCP server |
+| `swarm_app` | Window, sidebar, tabs, Terminals / Swarm / Review views, panels, settings |
+| `swarm_usage` | Menu bar icon, popover and usage polling |
 
-Key decisions live in [`docs/adr/`](adr/). Terms live in [`GLOSSARY.md`](../GLOSSARY.md).
+Crate names use snake_case, like Zed. Key decisions live in [`docs/adr/`](adr/). Terms live in [`GLOSSARY.md`](../GLOSSARY.md).
 
 ### Agent harness
 
 Every agent terminal gets `SWARM_SOCKET`, `SWARM_AGENT_ID` and `SWARM_TASK`.
 
-- Orchestrator: `swarm spawn`, `swarm send`, `swarm read`, `swarm wait`, `swarm merge`, `swarm pr draft`.
+- Orchestrator: `swarm spawn`, `swarm send`, `swarm read`, `swarm wait`, `swarm merge`, `swarm notify` (asks the user for attention), `swarm pr draft` (only after the user approved the review).
 - Workers: `swarm ask orchestrator`, `swarm report`.
-- The same calls are exposed as MCP tools.
+- The same calls are exposed as MCP tools. Task calls (`task.*`) and terminal calls (`terminal.*`) are listed below.
+- If the user types into a worker terminal, Swarm tells the orchestrator (ADR 0002).
 
 ### Agent state
 
@@ -78,10 +81,30 @@ Harness calls for the Start orchestrator:
 
 ### Workspace layout
 
-- **Sidebar**: projects, then the agents and terminals of the open tab.
-- **Tabs**: one tab per task, at the top of the window, plus the Start tab while its orchestrator runs. A tab shows the task name and its status. Each task runs in its own task worktree; worker worktrees are not tabs.
-- **Right panel**: **Files** (file tree of the task worktree, changed files marked) or **Changes** (changed files grouped by worker, with a **Review** button). The Changes toggle shows the diff count.
-- **Views**: Terminals (default), Swarm graph or Review.
+- **Sidebar**: projects (with "Needs you" and busy markers and a tab count), then the agents, processes and user terminals of the open tab.
+- **Tabs**: one tab per task, at the top of the window, plus the Start tab while its orchestrator runs. A tab shows the task name and its status ring. Each task runs in its own task worktree; worker worktrees are not tabs. **+** opens the New tab menu.
+- **Header, right side**: view switch **Terminals | Swarm | Review**, then panel toggles **Files**, **Changes +N −N** and, after approval, **Pull request** (later the live PR state, e.g. **#42 · checks running**).
+- **Right panel**: Files (file tree of the task worktree, changed files marked), Changes (changed files grouped by worker, with a **Review** button), or Pull request.
+- **Terminal tiles**: separate cards with 10 px gaps and rounded corners. Focus is a 2 px accent border, "needs attention" a 2 px amber border; both are drawn above the tile and never move the layout. Only the orchestrator tile has an input box.
+- **Status bar**: the tray chips and **+ Terminal** on the left; branch, agent count, process count, user terminal count (each with an icon), "permissions skipped" and ⌘K on the right.
+
+### Swarm view
+
+- Graph: the orchestrator on top, workers below. Edges are colored by message type (task, question, report); dots on an edge are messages in flight.
+- Timeline under the graph: one lane per agent.
+- Inspector for the selected agent: agent kind, worktree, branch, running time, changes, its message thread, a live terminal preview, **Focus** (switches to Terminals with that tile focused) and **View diff** (Review filtered to that agent).
+
+### Settings
+
+App settings: **General** (system check), **Agents** (per CLI: command, version, default model, skip permission prompts; orchestrator agent, typing in worker terminals, idle stop, agent limits), **Terminals**, **Prompts**, **Notifications**, **Appearance** (Light / Dark / System, accent, easter eggs), **Usage**, **Keyboard**.
+
+Per project, under **Projects**: everything in `.swarm/config.toml` (worktrees, setup script, files to copy, ports, checks before PR).
+
+### Brand and icons
+
+- Logo: a line-drawn bee. The menu bar uses it as a template image so macOS tints it.
+- Agent icons: the real Claude Code and Codex icons (Lobe Icons, MIT). Claude Code keeps its orange in both themes; Codex uses the text color.
+- Fonts: Geist and Geist Mono.
 
 ### Terminals
 
@@ -123,7 +146,7 @@ Every agent belongs to a task. The daemon tracks every agent in SQLite (ADR 0005
 
 - **Task done or archived**: its agents stop and their worktrees are removed. Unmerged changes ask for confirmation first.
 - **Quit**: with running agents, ask once: keep running or stop all. Option to remember the choice.
-- **Idle stop**: a done or idle agent stops after 30 minutes (setting). Its session ID is kept, so it resumes with `claude --resume`.
+- **Idle stop**: a done or idle agent stops after 30 minutes (setting). Its session ID is kept, so it resumes with `claude --resume <id>` or `codex resume <id>`.
 - **Menu bar**: shows the running agent count and **Stop all**, also when the app is closed.
 - **Daemon exit**: when no agents run and no app is attached.
 - **Limit**: maximum concurrent agents, globally and per task (setting). Spawning past it returns an error to the orchestrator.
@@ -170,7 +193,7 @@ Native macOS notifications through GPUI's `show_system_notification`. Only the o
 
 - Skip the notification when the app is focused on that task.
 - One notification per task: the task ID is the tag, so a new one replaces the old one.
-- Clicking opens the task: "needs you" opens Focus on the orchestrator, "ready for review" opens Review.
+- Clicking opens the task: "needs you" opens the Terminals view with the orchestrator focused, "ready for review" opens the Review view.
 - The same signal shows as a dot on the menu bar icon, the "Needs you" pill in the sidebar, and a dock bounce for urgent cases.
 - Settings: each trigger on or off, per-project overrides, sound.
 - Needs a real `.app` bundle: GPUI disables notifications under `cargo run`.
@@ -207,6 +230,11 @@ Small, rare and never in the way. All respect **Reduce Motion**, stay silent for
 - **⌘K "buzz"**: a few bees fly across the window once.
 - **Honey accent**: an amber accent color in Settings › Appearance.
 
+### Websites
+
+- **Product website**: one page (designed on the canvas, Website page): hero with a workspace preview, three steps with app screenshots, features, harness, download.
+- **Docs website**: every explanation that the app leaves out by design, plus the harness reference.
+
 ### Project config
 
 `.swarm/config.toml` per repo, edited by hand or in **Settings › Projects › <project>**:
@@ -239,13 +267,7 @@ required = true
 
 ## Phases
 
-0. **Plan, design, spikes** ← now
-1. `swarm-ui` component library + app shell + theming
-2. Daemon, terminals, projects, worktrees and scripts
-3. Harness: socket, CLI, MCP, hooks, orchestrator and prompts
-4. Layouts: Focus, Grid, Swarm view
-5. Review screen and PR panel
-6. Menu bar usage and notifications
+See [`ROADMAP.md`](ROADMAP.md) for the phases, their scope and what "done" means for each.
 
 ## Phase 0 spikes
 
@@ -297,11 +319,3 @@ Reports in `docs/spikes/`. Code in `spikes/` (throwaway).
 
 - Need a real `.app` bundle with a bundle ID.
 - macOS may deny permission without showing a prompt. The system check must detect "denied" and offer a button that opens System Settings › Notifications.
-
-## Remaining design screens
-
-- Create-worktree sheet and `.swarm/config.toml` scripts
-- Settings: Terminals, Prompts, Worktrees pages (Agents and Notifications are done)
-- Menu bar usage popover
-- New task / start orchestrator
-- Command palette (⌘K)
