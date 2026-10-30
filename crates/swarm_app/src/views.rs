@@ -157,15 +157,18 @@ pub(crate) fn tile_specs(workspace: &Workspace) -> Vec<TileSpec> {
     let task = workspace.active_task();
 
     if task.is_start {
-        return data
-            .agent(task.orchestrator)
+        return task
+            .orchestrator
+            .and_then(|id| data.agent(id))
             .and_then(|agent| data.terminal(agent.terminal))
             .map(|terminal| tile_spec(workspace, terminal, Activity::Working))
             .into_iter()
             .collect();
     }
 
-    let agents = std::iter::once(task.orchestrator)
+    let agents = task
+        .orchestrator
+        .into_iter()
         .chain(task.workers.iter().copied())
         .filter_map(|id| data.agent(id))
         .filter_map(|agent| {
@@ -217,15 +220,40 @@ fn start_layout(area: Size<Pixels>, specs: &[TileSpec]) -> Layout {
 
 impl Workspace {
     pub(crate) fn stop_process(&mut self, terminal: TerminalId, cx: &mut Context<Self>) {
-        let task = self.active_task().id;
+        self.close_process(terminal, cx);
+    }
+
+    /// Removes a process tile. A live process that still runs is killed.
+    pub(crate) fn close_process(&mut self, terminal: TerminalId, cx: &mut Context<Self>) {
+        let owner = self
+            .data
+            .tasks
+            .iter()
+            .find(|task| task.processes.contains(&terminal))
+            .map(|task| task.id);
+        let Some(task) = owner else {
+            return;
+        };
+
+        if let Some(live) = self.live_terminals.remove(&terminal) {
+            live.kill_if_running(cx);
+        }
 
         self.data.stop_process(task, terminal);
+        self.disconnected.remove(&terminal);
+        self.terminal_focus.remove(&terminal);
         self.minimized.remove(&terminal);
         if self.focused_terminal == Some(terminal) {
             self.focused_terminal = None;
         }
 
         cx.notify();
+    }
+
+    /// Removes the tile of a user or process terminal.
+    pub(crate) fn close_tile(&mut self, terminal: TerminalId, cx: &mut Context<Self>) {
+        self.close_user_terminal(terminal, cx);
+        self.close_process(terminal, cx);
     }
 
     /// The size a new user terminal tile starts with.
@@ -314,8 +342,9 @@ impl Workspace {
         }
 
         let orchestrator = self
-            .data
-            .agent(self.active_task().orchestrator)
+            .active_task()
+            .orchestrator
+            .and_then(|id| self.data.agent(id))
             .map(|agent| agent.terminal);
         let terminal =
             orchestrator.and_then(|id| self.data.terminals.iter_mut().find(|entry| entry.id == id));
@@ -445,6 +474,9 @@ fn tile(
 
     let frame = match terminal.kind {
         TerminalKind::User => user_frame(workspace, terminal, cx),
+        TerminalKind::Process if workspace.live_terminals.contains_key(&id) => {
+            live_process_frame(workspace, terminal, cx)
+        }
         _ => agent_frame(workspace, terminal, cx),
     };
 
@@ -584,6 +616,43 @@ fn agent_frame(
     }
 
     frame
+}
+
+fn live_process_frame(
+    workspace: &Workspace,
+    terminal: &Terminal,
+    cx: &mut Context<Workspace>,
+) -> TileFrame {
+    let id = terminal.id;
+    let name = terminal.title.clone();
+
+    let mut frame = TileFrame::new(("tile", id.0), IconName::Terminal, name.clone())
+        .accessible_label(format!("{name} process terminal"))
+        .focused(workspace.focused_terminal == Some(id))
+        .status(AgentStatus::Working);
+
+    if let Some(meta) = terminal.meta.clone() {
+        frame = frame.meta(meta);
+    }
+
+    frame = frame
+        .action(
+            IconButton::new(
+                ("minimize", id.0),
+                IconName::Minimize,
+                format!("Move {name} to tray"),
+            )
+            .on_click(cx.listener(move |workspace, _, _, cx| workspace.minimize(id, cx))),
+        )
+        .action(
+            IconButton::new(("stop", id.0), IconName::Close, format!("Stop {name}"))
+                .on_click(cx.listener(move |workspace, _, _, cx| workspace.stop_process(id, cx))),
+        );
+
+    match workspace.live_terminals.get(&id) {
+        Some(live) => frame.child(div().size_full().child(live.view.clone())),
+        None => frame,
+    }
 }
 
 fn user_frame(
@@ -919,7 +988,9 @@ mod tests {
         let (workspace, cx) = setup(cx);
         let count = |workspace: &Workspace| {
             let id = workspace.active_task().orchestrator;
-            let terminal = workspace.data.agent(id).map(|agent| agent.terminal);
+            let terminal = id
+                .and_then(|id| workspace.data.agent(id))
+                .map(|agent| agent.terminal);
             terminal
                 .and_then(|id| workspace.data.terminal(id))
                 .map(|terminal| terminal.lines.clone())

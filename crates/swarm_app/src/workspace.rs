@@ -15,9 +15,7 @@ use crate::actions::{
     ShowTerminals, ToggleChanges, ToggleCommandPalette, ToggleFiles,
 };
 use crate::daemon::{DaemonLaunch, LiveTerminal};
-use crate::model::{
-    AgentId, FakeData, ProjectId, Task, TaskId, TaskStatus, TerminalId, TerminalKind,
-};
+use crate::model::{FakeData, ProjectId, Task, TaskId, TaskStatus, TerminalId, TerminalKind};
 use crate::palette::Overlay;
 use crate::views::Resizing;
 use crate::{panels, sidebar, status_bar, tab_bar, views};
@@ -56,8 +54,14 @@ pub(crate) struct Workspace {
     pub(crate) live_terminals: HashMap<TerminalId, LiveTerminal>,
     /// Live tiles whose terminal lost its daemon connection.
     pub(crate) disconnected: HashSet<TerminalId>,
+    /// Tasks whose setup exit was already handled.
+    pub(crate) setup_exits_shown: HashSet<swarm_protocol::TaskId>,
     pub(crate) daemon_launch: Option<DaemonLaunch>,
     pub(crate) reconnecting: bool,
+    /// True once the projects come from the daemon instead of the sample.
+    pub(crate) live_data: bool,
+    /// The last failed sidebar action, shown until dismissed.
+    pub(crate) sidebar_error: Option<SharedString>,
     pub(crate) orchestrator_input: Entity<TextInput>,
     _orchestrator_subscription: Subscription,
 }
@@ -75,7 +79,8 @@ impl Workspace {
         let active_task = data.first_or_start_task(active_project);
         let focused_terminal = data
             .task(active_task)
-            .and_then(|task| data.agent(task.orchestrator))
+            .and_then(|task| task.orchestrator)
+            .and_then(|id| data.agent(id))
             .map(|agent| agent.terminal);
 
         let focus_handle = cx.focus_handle();
@@ -102,8 +107,11 @@ impl Workspace {
             daemon: None,
             live_terminals: HashMap::new(),
             disconnected: HashSet::new(),
+            setup_exits_shown: HashSet::new(),
             daemon_launch: None,
             reconnecting: false,
+            live_data: false,
+            sidebar_error: None,
             orchestrator_input,
             _orchestrator_subscription: orchestrator_subscription,
         }
@@ -141,9 +149,9 @@ impl Workspace {
 
         self.active_project = entry.project;
         self.active_task = task;
-        self.focused_terminal = self
-            .data
-            .agent(entry.orchestrator)
+        self.focused_terminal = entry
+            .orchestrator
+            .and_then(|id| self.data.agent(id))
             .map(|agent| agent.terminal);
         self.pending_focus = self.focused_terminal;
         cx.notify();
@@ -260,13 +268,14 @@ static NO_TASK: Task = Task {
     name: SharedString::new_static(""),
     branch: SharedString::new_static(""),
     status: TaskStatus::Idle,
-    orchestrator: AgentId(u32::MAX),
+    orchestrator: None,
     workers: Vec::new(),
     processes: Vec::new(),
     user_terminals: Vec::new(),
     additions: 0,
     deletions: 0,
     is_start: false,
+    daemon: None,
 };
 
 impl Focusable for Workspace {
@@ -413,7 +422,8 @@ mod tests {
     }
 
     fn orchestrator_terminal(workspace: &Workspace) -> TerminalId {
-        let agent = workspace.data.agent(workspace.active_task().orchestrator);
+        let id = workspace.active_task().orchestrator;
+        let agent = id.and_then(|id| workspace.data.agent(id));
         agent.map_or(TerminalId(u32::MAX), |agent| agent.terminal)
     }
 

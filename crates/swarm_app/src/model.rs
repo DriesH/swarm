@@ -1,16 +1,25 @@
 //! Fake data for the app shell. Plain data, no gpui entities.
 
+use std::path::PathBuf;
+
 use gpui::{Hsla, SharedString, rgb};
+use swarm_protocol::{ProjectInfo, TaskInfo, TerminalId as DaemonTerminalId};
+use swarm_term::ExitStatus;
 use swarm_ui::AgentStatus;
 use swarm_ui::prelude::Color;
 
 pub(crate) const START_TASK: &str = "Start";
 pub(crate) const PLAN_TASK: &str = "Plan";
 
-/// The key the daemon stores with a user terminal to find its task again after a
-/// restart: `<project name>/<task name>`, for example `swarm/terminal-renderer`.
+/// The key for a fake task: `<project name>/<task name>`, for example
+/// `swarm/terminal-renderer`. Real tasks use `TaskId::terminal_key`.
 pub(crate) fn task_key(project: &str, task: &str) -> String {
     format!("{project}/{task}")
+}
+
+/// The key for the Start tab of a real project. Unique per project, unlike [`task_key`].
+pub(crate) fn start_key(project: swarm_protocol::ProjectId) -> String {
+    format!("project:{}/start", project.0)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -32,6 +41,21 @@ pub(crate) struct Project {
     pub letter: char,
     pub tile_color: Hsla,
     pub base_branch: SharedString,
+    /// Set for a project the daemon knows.
+    pub daemon: Option<swarm_protocol::ProjectId>,
+    /// The repository root of a project the daemon knows.
+    pub root: Option<PathBuf>,
+    /// Why the project's config could not be read.
+    pub config_error: Option<SharedString>,
+}
+
+/// What links a task to the daemon.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DaemonTask {
+    pub id: swarm_protocol::TaskId,
+    pub setup_terminal: Option<DaemonTerminalId>,
+    pub setup_exit: Option<ExitStatus>,
+    pub worktree: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,7 +72,8 @@ pub(crate) struct Task {
     pub name: SharedString,
     pub branch: SharedString,
     pub status: TaskStatus,
-    pub orchestrator: AgentId,
+    /// A real task has no orchestrator until agents exist (phase 4).
+    pub orchestrator: Option<AgentId>,
     pub workers: Vec<AgentId>,
     pub processes: Vec<TerminalId>,
     pub user_terminals: Vec<TerminalId>,
@@ -56,6 +81,8 @@ pub(crate) struct Task {
     pub deletions: u32,
     /// A Start or Plan task: its orchestrator splits a request into tasks. It has no worktree.
     pub is_start: bool,
+    /// Set for a task the daemon knows.
+    pub daemon: Option<DaemonTask>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -232,6 +259,12 @@ pub(crate) struct FakeData {
     pub pull_request: Option<FakePullRequest>,
 }
 
+fn sample_usage() -> Vec<(SharedString, f32)> {
+    vec![("Claude · 5h".into(), 0.42), ("Codex · 5h".into(), 0.18)]
+}
+
+const PROJECT_TILES: [u32; 4] = [0x004f_46e5, 0x000d_7d70, 0x00c2_410c, 0x0015_803d];
+
 fn lines(items: &[(&str, Color)]) -> Vec<FakeLine> {
     items
         .iter()
@@ -273,6 +306,9 @@ impl Builder {
             letter,
             tile_color: rgb(tile).into(),
             base_branch: "main".into(),
+            daemon: None,
+            root: None,
+            config_error: None,
         });
 
         id
@@ -296,13 +332,14 @@ impl Builder {
             name: SharedString::new(name),
             branch: SharedString::from(format!("swarm/{name}")),
             status,
-            orchestrator,
+            orchestrator: Some(orchestrator),
             workers: Vec::new(),
             processes: Vec::new(),
             user_terminals: Vec::new(),
             additions: 0,
             deletions: 0,
             is_start: false,
+            daemon: None,
         });
 
         id
@@ -661,7 +698,7 @@ impl FakeData {
 
         let mut data = builder.data;
         data.file_tree = sample_file_tree();
-        data.usage = vec![("Claude · 5h".into(), 0.42), ("Codex · 5h".into(), 0.18)];
+        data.usage = sample_usage();
 
         if let Some(task) = data.tasks.iter_mut().find(|task| task.id == renderer) {
             task.additions = 312;
@@ -669,6 +706,123 @@ impl FakeData {
         }
 
         data
+    }
+
+    /// No projects yet. Usage and the file tree stay static for now.
+    pub(crate) fn live() -> Self {
+        Self {
+            usage: sample_usage(),
+            file_tree: sample_file_tree(),
+            ..Self::default()
+        }
+    }
+
+    /// Adds or updates the projects and their tasks. Known ones keep their ids.
+    pub(crate) fn sync_projects(&mut self, projects: &[ProjectInfo]) {
+        for info in projects {
+            self.sync_project(info);
+        }
+    }
+
+    pub(crate) fn sync_project(&mut self, info: &ProjectInfo) -> ProjectId {
+        let existing = self
+            .projects
+            .iter()
+            .find(|project| project.daemon == Some(info.id))
+            .map(|project| project.id);
+
+        let id = existing.unwrap_or_else(|| {
+            let id = ProjectId(
+                self.projects
+                    .iter()
+                    .map(|project| project.id.0 + 1)
+                    .max()
+                    .unwrap_or(0),
+            );
+            let tile = PROJECT_TILES[self.projects.len() % PROJECT_TILES.len()];
+
+            self.projects.push(Project {
+                id,
+                name: SharedString::new(&info.name),
+                letter: info
+                    .name
+                    .chars()
+                    .next()
+                    .map_or('?', |letter| letter.to_ascii_uppercase()),
+                tile_color: rgb(tile).into(),
+                base_branch: SharedString::new(&info.base_branch),
+                daemon: Some(info.id),
+                root: Some(info.path.clone()),
+                config_error: None,
+            });
+
+            id
+        });
+
+        if let Some(project) = self.projects.iter_mut().find(|project| project.id == id) {
+            project.base_branch = SharedString::new(&info.base_branch);
+            project.root = Some(info.path.clone());
+            project.config_error = info.config_error.as_deref().map(SharedString::new);
+        }
+
+        for task in &info.tasks {
+            self.sync_task(id, task);
+        }
+
+        id
+    }
+
+    /// Adds or updates a task the daemon runs. It has no agents, so no orchestrator.
+    pub(crate) fn sync_task(&mut self, project: ProjectId, info: &TaskInfo) -> TaskId {
+        let daemon = DaemonTask {
+            id: info.id,
+            setup_terminal: info.setup_terminal,
+            setup_exit: info.setup_exit.clone(),
+            worktree: info.worktree.clone(),
+        };
+        let existing = self.tasks.iter_mut().find(|task| {
+            task.daemon
+                .as_ref()
+                .is_some_and(|other| other.id == info.id)
+        });
+
+        if let Some(task) = existing {
+            task.name = SharedString::new(&info.name);
+            task.branch = SharedString::new(&info.branch);
+            let known = task.daemon.as_ref().and_then(|old| old.setup_terminal);
+            task.daemon = Some(DaemonTask {
+                setup_terminal: info.setup_terminal.or(known),
+                ..daemon
+            });
+
+            return task.id;
+        }
+
+        let id = TaskId(
+            self.tasks
+                .iter()
+                .map(|task| task.id.0 + 1)
+                .max()
+                .unwrap_or(0),
+        );
+
+        self.tasks.push(Task {
+            id,
+            project,
+            name: SharedString::new(&info.name),
+            branch: SharedString::new(&info.branch),
+            status: TaskStatus::Idle,
+            orchestrator: None,
+            workers: Vec::new(),
+            processes: Vec::new(),
+            user_terminals: Vec::new(),
+            additions: 0,
+            deletions: 0,
+            is_start: false,
+            daemon: Some(daemon),
+        });
+
+        id
     }
 
     pub(crate) fn project(&self, id: ProjectId) -> Option<&Project> {
@@ -722,6 +876,43 @@ impl FakeData {
         )
     }
 
+    /// Adds a process terminal that the daemon runs.
+    pub(crate) fn add_live_process(
+        &mut self,
+        task: TaskId,
+        title: &str,
+        meta: Option<SharedString>,
+    ) -> TerminalId {
+        let id = self.next_terminal_id();
+
+        self.terminals.push(Terminal {
+            id,
+            kind: TerminalKind::Process,
+            title: SharedString::new(title),
+            meta,
+            owner: None,
+            link: None,
+            requested_size: None,
+            lines: Vec::new(),
+        });
+
+        if let Some(entry) = self.tasks.iter_mut().find(|entry| entry.id == task) {
+            entry.processes.push(id);
+        }
+
+        id
+    }
+
+    fn next_terminal_id(&self) -> TerminalId {
+        TerminalId(
+            self.terminals
+                .iter()
+                .map(|terminal| terminal.id.0)
+                .max()
+                .map_or(0, |id| id + 1),
+        )
+    }
+
     fn push_user_terminal(
         &mut self,
         task: TaskId,
@@ -729,13 +920,7 @@ impl FakeData {
         meta: Option<SharedString>,
         lines: Vec<FakeLine>,
     ) -> TerminalId {
-        let id = TerminalId(
-            self.terminals
-                .iter()
-                .map(|terminal| terminal.id.0)
-                .max()
-                .map_or(0, |id| id + 1),
-        );
+        let id = self.next_terminal_id();
 
         self.terminals.push(Terminal {
             id,
@@ -761,10 +946,37 @@ impl FakeData {
         }
     }
 
-    /// The task's key for the daemon, see [`task_key`].
+    /// The task worktree of a real task, or the repository root for the Start tab of
+    /// a real project.
+    pub(crate) fn worktree_of(&self, task: TaskId) -> Option<PathBuf> {
+        let task = self.task(task)?;
+
+        if let Some(daemon) = &task.daemon {
+            return Some(daemon.worktree.clone());
+        }
+
+        if task.is_start {
+            return self.project(task.project)?.root.clone();
+        }
+
+        None
+    }
+
+    /// The key the daemon stores with the task's terminals, see [`task_key`].
     pub(crate) fn key_of_task(&self, task: TaskId) -> Option<String> {
         let task = self.task(task)?;
+
+        if let Some(daemon) = &task.daemon {
+            return Some(daemon.id.terminal_key());
+        }
+
         let project = self.project(task.project)?;
+
+        if task.is_start
+            && let Some(daemon) = project.daemon
+        {
+            return Some(start_key(daemon));
+        }
 
         Some(task_key(&project.name, &task.name))
     }
@@ -871,13 +1083,14 @@ impl FakeData {
             name: SharedString::new(name),
             branch: SharedString::from(format!("swarm/{name}")),
             status: TaskStatus::Working,
-            orchestrator: agent,
+            orchestrator: Some(agent),
             workers: Vec::new(),
             processes: Vec::new(),
             user_terminals: Vec::new(),
             additions: 0,
             deletions: 0,
             is_start: false,
+            daemon: None,
         });
 
         task
@@ -906,7 +1119,8 @@ mod tests {
         let data = FakeData::sample();
 
         assert!(data.tasks.iter().all(|task| {
-            data.agent(task.orchestrator)
+            task.orchestrator
+                .and_then(|id| data.agent(id))
                 .is_some_and(|agent| agent.task == task.id)
         }));
     }
@@ -1021,6 +1235,53 @@ mod tests {
                 .iter()
                 .filter_map(|terminal| terminal.owner)
                 .all(|owner| data.agent(owner).is_some())
+        );
+    }
+
+    fn project_info(id: u64, config_error: Option<&str>) -> ProjectInfo {
+        ProjectInfo {
+            id: swarm_protocol::ProjectId(id),
+            name: format!("demo{id}"),
+            path: PathBuf::from(format!("/repo/demo{id}")),
+            base_branch: "main".into(),
+            config_error: config_error.map(str::to_owned),
+            tasks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_config_error_is_kept_and_cleared_on_sync() {
+        let mut data = FakeData::live();
+
+        data.sync_project(&project_info(1, Some("bad toml")));
+        let shown = data.projects[0].config_error.clone();
+        data.sync_project(&project_info(1, None));
+
+        assert_eq!(shown.as_deref(), Some("bad toml"));
+        assert!(data.projects[0].config_error.is_none());
+    }
+
+    #[test]
+    fn the_start_tab_of_a_real_project_has_its_own_key_and_root() {
+        let mut data = FakeData::live();
+        let first = data.sync_project(&project_info(1, None));
+        let second = data.sync_project(&project_info(2, None));
+        let (start_one, start_two) = (
+            data.ensure_start_task(first),
+            data.ensure_start_task(second),
+        );
+
+        assert_eq!(
+            data.key_of_task(start_one).as_deref(),
+            Some("project:1/start")
+        );
+        assert_eq!(
+            data.key_of_task(start_two).as_deref(),
+            Some("project:2/start")
+        );
+        assert_eq!(
+            data.worktree_of(start_one),
+            Some(PathBuf::from("/repo/demo1"))
         );
     }
 }

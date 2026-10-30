@@ -1,25 +1,30 @@
-//! The daemon connection and the user terminals it runs.
+//! The daemon connection, its projects and the terminals it runs.
 //!
-//! Only user terminals are real. Agents, workers and process terminals stay fake.
+//! Projects, tasks, user terminals and process terminals of real tasks come from the
+//! daemon. Agents and workers do not exist yet.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use gpui::{AppContext as _, Context, Entity, Focusable as _, Size, Subscription, Window, px};
-use swarm_protocol::{
-    Client, ClientError, CreateTerminal, Paths, TerminalId as DaemonTerminalId, TerminalInfo,
-    TerminalKind as DaemonKind,
+use gpui::{
+    AppContext as _, Context, Entity, Focusable as _, PathPromptOptions, SharedString, Size,
+    Subscription, Window, px,
 };
-use swarm_term::{TerminalChannels, TerminalInput};
+use swarm_protocol::{
+    Client, ClientError, CreateTerminal, Paths, ProjectInfo, TaskInfo,
+    TerminalId as DaemonTerminalId, TerminalInfo, TerminalKind as DaemonKind,
+};
+use swarm_term::{ExitStatus, TerminalChannels, TerminalInput};
 use swarm_term_view::{TerminalEvent, TerminalView, palette_for};
 use swarm_ui::ActiveTheme as _;
 
-use crate::model::{TaskId, TerminalId};
+use crate::model::{FakeData, ProjectId, TaskId, TerminalId};
 use crate::workspace::Workspace;
 
 /// Scrollback lines requested when attaching.
 const ATTACH_HISTORY: u32 = 1_000;
+const SETUP_TITLE: &str = "Setup";
 const DAEMON_BINARY: &str = "swarm-daemon";
 /// The tile's header, border and body padding.
 const CHROME_WIDTH: f32 = 26.;
@@ -33,6 +38,8 @@ const RECONNECT_STEPS: [Duration; 3] = [
     Duration::from_secs(2),
 ];
 const RECONNECT_LONG: Duration = Duration::from_secs(5);
+/// How long an exited process terminal stays, so its exit code can be read.
+pub(crate) const PROCESS_LINGER: Duration = Duration::from_secs(3);
 
 /// The wait before reconnect attempt number `attempt`, counted from zero.
 fn reconnect_delay(attempt: usize) -> Duration {
@@ -49,7 +56,7 @@ pub(crate) struct DaemonLaunch {
     binary: PathBuf,
 }
 
-/// A user terminal tile backed by a terminal in the daemon.
+/// A user or process terminal tile backed by a terminal in the daemon.
 pub(crate) struct LiveTerminal {
     pub view: Entity<TerminalView>,
     daemon_id: DaemonTerminalId,
@@ -70,7 +77,7 @@ impl LiveTerminal {
     }
 }
 
-type Connected = (Client, Vec<TerminalInfo>);
+type Connected = (Client, Vec<TerminalInfo>, Vec<ProjectInfo>);
 
 impl Workspace {
     /// Connects on a background thread, starting the daemon when needed. On failure
@@ -98,9 +105,10 @@ impl Workspace {
         });
 
         cx.spawn_in(window, async move |this, cx| match connecting.await {
-            Ok((client, terminals)) => {
+            Ok((client, terminals, projects)) => {
                 let used = this.update_in(cx, |workspace, window, cx| {
                     workspace.daemon_launch = Some(launch);
+                    workspace.use_projects(&projects, cx);
                     workspace.use_daemon(client, &terminals, window, cx);
                     Self::watch_daemon(window, cx);
                 });
@@ -160,7 +168,7 @@ impl Workspace {
                     })
                     .await;
 
-                let (client, terminals) = match result {
+                let (client, terminals, projects) = match result {
                     Ok(connected) => connected,
                     Err(error) => {
                         log::warn!("reconnect attempt {} failed: {error}", attempt + 1);
@@ -170,6 +178,7 @@ impl Workspace {
 
                 let used = this.update_in(cx, |workspace, window, cx| {
                     workspace.reconnecting = false;
+                    workspace.use_projects(&projects, cx);
                     workspace.use_daemon(client, &terminals, window, cx);
                 });
 
@@ -183,8 +192,35 @@ impl Workspace {
         .detach();
     }
 
+    /// Takes the daemon's projects. The first time they replace the sample; later they
+    /// are merged, so tabs keep their ids.
+    pub(crate) fn use_projects(&mut self, projects: &[ProjectInfo], cx: &mut Context<Self>) {
+        if self.live_data {
+            self.data.sync_projects(projects);
+            cx.notify();
+            return;
+        }
+
+        self.live_data = true;
+        self.data = FakeData::live();
+        self.live_terminals.clear();
+        self.terminal_focus.clear();
+        self.user_sizes.clear();
+        self.minimized.clear();
+        self.disconnected.clear();
+        self.focused_terminal = None;
+        self.data.sync_projects(projects);
+
+        match self.data.projects.first().map(|project| project.id) {
+            Some(project) => self.select_project(project, cx),
+            None => self.active_project = ProjectId(u32::MAX),
+        }
+
+        cx.notify();
+    }
+
     /// Syncs the tiles with a fresh daemon connection: reattaches tiles whose terminal
-    /// still exists, removes the others, and adds tiles for new user terminals of known
+    /// still exists, removes the others, and adds tiles for new terminals of known
     /// tasks.
     pub(crate) fn use_daemon(
         &mut self,
@@ -195,11 +231,11 @@ impl Workspace {
     ) {
         self.daemon = Some(client.clone());
 
-        let users: Vec<&TerminalInfo> = terminals
+        let listed: HashSet<DaemonTerminalId> = terminals
             .iter()
-            .filter(|info| info.kind == DaemonKind::User)
+            .filter(|info| self.wants_tile(info).is_some())
+            .map(|info| info.id)
             .collect();
-        let listed: HashSet<DaemonTerminalId> = users.iter().map(|info| info.id).collect();
 
         let tiles: Vec<(TerminalId, DaemonTerminalId)> = self
             .live_terminals
@@ -210,13 +246,14 @@ impl Workspace {
         for (terminal, daemon_id) in tiles {
             if !listed.contains(&daemon_id) {
                 log::info!("terminal {} is gone, removing its tile", daemon_id.0);
-                self.close_user_terminal(terminal, cx);
+                self.close_tile(terminal, cx);
                 continue;
             }
 
             match client.attach(daemon_id, ATTACH_HISTORY) {
                 Ok(channels) => {
-                    let live = self.live_terminal(terminal, daemon_id, channels, window, cx);
+                    let name = self.accessible_name(terminal);
+                    let live = self.live_terminal(terminal, daemon_id, name, channels, window, cx);
                     self.live_terminals.insert(terminal, live);
                     self.disconnected.remove(&terminal);
                 }
@@ -224,7 +261,32 @@ impl Workspace {
             }
         }
 
-        for info in users {
+        self.attach_new_terminals(&client, terminals, window, cx);
+
+        cx.notify();
+    }
+
+    /// The task a listed terminal belongs on. User terminals fit any known task;
+    /// process terminals only fit real tasks.
+    fn wants_tile(&self, info: &TerminalInfo) -> Option<TaskId> {
+        let task = self.data.task_with_key(info.task.as_deref()?)?;
+
+        match info.kind {
+            DaemonKind::User => Some(task),
+            DaemonKind::Process => self.data.task(task)?.daemon.is_some().then_some(task),
+            DaemonKind::Agent => None,
+        }
+    }
+
+    /// Adds a tile for every listed terminal of a known task that has none yet.
+    pub(crate) fn attach_new_terminals(
+        &mut self,
+        client: &Client,
+        terminals: &[TerminalInfo],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for info in terminals {
             if self
                 .live_terminals
                 .values()
@@ -233,30 +295,199 @@ impl Workspace {
                 continue;
             }
 
-            let Some(task) = info
-                .task
-                .as_deref()
-                .and_then(|key| self.data.task_with_key(key))
-            else {
+            let Some(task) = self.wants_tile(info) else {
                 log::debug!("terminal {} belongs to no known task", info.id.0);
                 continue;
             };
 
-            match client.attach(info.id, ATTACH_HISTORY) {
-                Ok(channels) => {
-                    self.add_live_terminal(
-                        task,
-                        info.id,
-                        info.title.as_deref(),
-                        channels,
-                        window,
-                        cx,
-                    );
+            let channels = match client.attach(info.id, ATTACH_HISTORY) {
+                Ok(channels) => channels,
+                Err(error) => {
+                    log::warn!("cannot attach terminal {}: {error}", info.id.0);
+                    continue;
                 }
-                Err(error) => log::warn!("cannot attach terminal {}: {error}", info.id.0),
+            };
+
+            if info.kind == DaemonKind::Process {
+                let title = self.process_title(task, info);
+                let terminal = self.data.add_live_process(task, &title, None);
+                let name = SharedString::from(format!("{title} process terminal"));
+                let live = self.live_terminal(terminal, info.id, name, channels, window, cx);
+
+                self.live_terminals.insert(terminal, live);
+            } else {
+                self.add_live_terminal(task, info.id, info.title.as_deref(), channels, window, cx);
             }
         }
+    }
 
+    /// What a screen reader announces for a live view.
+    fn accessible_name(&self, terminal: TerminalId) -> SharedString {
+        let title = self
+            .data
+            .terminal(terminal)
+            .filter(|_| self.is_process(terminal))
+            .map(|entry| entry.title.clone());
+
+        match title {
+            Some(title) => SharedString::from(format!("{title} process terminal")),
+            None => "User terminal".into(),
+        }
+    }
+
+    fn is_process(&self, terminal: TerminalId) -> bool {
+        self.data
+            .tasks
+            .iter()
+            .any(|task| task.processes.contains(&terminal))
+    }
+
+    fn process_title(&self, task: TaskId, info: &TerminalInfo) -> String {
+        let is_setup = self
+            .data
+            .task(task)
+            .and_then(|task| task.daemon.as_ref())
+            .is_some_and(|daemon| daemon.setup_terminal == Some(info.id));
+
+        if is_setup {
+            SETUP_TITLE.to_owned()
+        } else {
+            info.title.clone().unwrap_or_else(|| "Process".to_owned())
+        }
+    }
+
+    /// Adds a real task to its project, attaches its terminals and opens it.
+    pub(crate) fn task_created(
+        &mut self,
+        info: &TaskInfo,
+        terminals: &[TerminalInfo],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let project = self
+            .data
+            .projects
+            .iter()
+            .find(|project| project.daemon == Some(info.project))
+            .map(|project| project.id);
+        let Some(project) = project else {
+            log::warn!("task {} belongs to an unknown project", info.id.0);
+            return;
+        };
+
+        let task = self.data.sync_task(project, info);
+
+        if let Some(client) = self.daemon.clone() {
+            self.attach_new_terminals(&client, terminals, window, cx);
+        }
+
+        self.show_setup_exit(task, cx);
+        self.select_task(task, cx);
+    }
+
+    /// Opens the system folder picker and adds the chosen folder as a project.
+    pub(crate) fn pick_project(window: &mut Window, cx: &mut Context<Self>) {
+        let picking = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Add project".into()),
+        });
+
+        cx.spawn_in(window, async move |this, cx| {
+            let path = match picking.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                Ok(Ok(None)) | Err(_) => None,
+                Ok(Err(error)) => {
+                    let reported = this.update(cx, |workspace, cx| {
+                        workspace.report_sidebar_error(error.to_string(), cx);
+                    });
+
+                    if let Err(error) = reported {
+                        log::debug!("the window closed before the picker answered: {error}");
+                    }
+
+                    None
+                }
+            };
+            let Some(path) = path else {
+                return;
+            };
+
+            let added = this.update_in(cx, |workspace, window, cx| {
+                workspace.add_project(path, window, cx);
+            });
+
+            if let Err(error) = added {
+                log::debug!("the window closed before the project was added: {error}");
+            }
+        })
+        .detach();
+    }
+
+    /// Asks the daemon to add the project, then opens it.
+    pub(crate) fn add_project(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.daemon.clone() else {
+            self.report_sidebar_error("The daemon is not running".to_owned(), cx);
+            return;
+        };
+
+        let adding = cx.background_spawn(async move {
+            let project = client.add_project(path)?;
+            let terminals = client.list().unwrap_or_else(|error| {
+                log::warn!("cannot list terminals after adding a project: {error}");
+                Vec::new()
+            });
+
+            Ok::<_, ClientError>((project, terminals))
+        });
+
+        cx.spawn_in(window, async move |this, cx| {
+            let result = adding.await;
+
+            let updated = this.update_in(cx, |workspace, window, cx| match result {
+                Ok((project, terminals)) => {
+                    workspace.project_added(&project, &terminals, window, cx);
+                }
+                Err(error) => workspace.report_sidebar_error(error.to_string(), cx),
+            });
+
+            if let Err(error) = updated {
+                log::debug!("the window closed before the project was added: {error}");
+            }
+        })
+        .detach();
+    }
+
+    pub(crate) fn project_added(
+        &mut self,
+        info: &ProjectInfo,
+        terminals: &[TerminalInfo],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let project = self.data.sync_project(info);
+
+        if let Some(client) = self.daemon.clone() {
+            self.attach_new_terminals(&client, terminals, window, cx);
+        }
+
+        self.select_project(project, cx);
+    }
+
+    pub(crate) fn report_sidebar_error(&mut self, message: String, cx: &mut Context<Self>) {
+        log::error!("{message}");
+        self.sidebar_error = Some(SharedString::from(message));
+        cx.notify();
+    }
+
+    pub(crate) fn dismiss_sidebar_error(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_error = None;
         cx.notify();
     }
 
@@ -275,8 +506,10 @@ impl Workspace {
         let request = CreateTerminal {
             kind: DaemonKind::User,
             command: None,
-            // Fake tasks have no worktree yet.
-            cwd: std::env::var_os("HOME").map(PathBuf::from),
+            cwd: self
+                .data
+                .worktree_of(task)
+                .or_else(|| std::env::var_os("HOME").map(PathBuf::from)),
             size: self.initial_grid(window, cx),
             palette: palette_for(cx.theme()),
             task: Some(key),
@@ -330,7 +563,14 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> TerminalId {
         let terminal = self.data.add_live_user_terminal(task, title);
-        let live = self.live_terminal(terminal, daemon_id, channels, window, cx);
+        let live = self.live_terminal(
+            terminal,
+            daemon_id,
+            "User terminal".into(),
+            channels,
+            window,
+            cx,
+        );
 
         self.user_sizes.insert(terminal, self.planned_user_size());
         self.live_terminals.insert(terminal, live);
@@ -344,12 +584,13 @@ impl Workspace {
         &mut self,
         terminal: TerminalId,
         daemon_id: DaemonTerminalId,
+        accessible_name: SharedString,
         channels: TerminalChannels,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> LiveTerminal {
         let input = channels.input.clone();
-        let view = cx.new(|cx| TerminalView::new(channels, "User terminal".into(), window, cx));
+        let view = cx.new(|cx| TerminalView::new(channels, accessible_name, window, cx));
 
         let subscription =
             cx.subscribe_in(&view, window, move |workspace, _, event, window, cx| {
@@ -366,6 +607,130 @@ impl Workspace {
         }
     }
 
+    fn on_exited(&mut self, terminal: TerminalId, status: &ExitStatus, cx: &mut Context<Self>) {
+        if !self.is_process(terminal) {
+            self.close_user_terminal(terminal, cx);
+            return;
+        }
+
+        self.data
+            .set_terminal_meta(terminal, Some(exit_text(status).into()));
+        cx.notify();
+
+        if !exit_failed(status) {
+            Self::close_after_linger(terminal, cx);
+        }
+    }
+
+    fn close_after_linger(terminal: TerminalId, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(PROCESS_LINGER).await;
+
+            let removed = this.update(cx, |workspace, cx| workspace.close_process(terminal, cx));
+
+            if let Err(error) = removed {
+                log::debug!("the window closed before the process tile went away: {error}");
+            }
+        })
+        .detach();
+    }
+
+    /// Shows the exit of a task's setup script when no tile of its own will, so a fast
+    /// script is never lost. A failure stays until the user closes the tile.
+    pub(crate) fn show_setup_exit(&mut self, task: TaskId, cx: &mut Context<Self>) {
+        let Some(daemon) = self.data.task(task).and_then(|task| task.daemon.clone()) else {
+            return;
+        };
+        let Some(status) = daemon.setup_exit else {
+            return;
+        };
+
+        if !self.setup_exits_shown.insert(daemon.id) {
+            return;
+        }
+
+        let has_tile = daemon.setup_terminal.is_some_and(|setup| {
+            self.live_terminals
+                .values()
+                .any(|live| live.daemon_id == setup)
+        });
+        if has_tile {
+            return;
+        }
+
+        let terminal =
+            self.data
+                .add_live_process(task, SETUP_TITLE, Some(exit_text(&status).into()));
+
+        if !exit_failed(&status) {
+            Self::close_after_linger(terminal, cx);
+        }
+
+        cx.notify();
+    }
+
+    /// A process tile lost its stream while the daemon is still there: the terminal
+    /// ended. Reads the task again for the setup script's exit, then shows it.
+    fn refresh_ended_process(&mut self, terminal: TerminalId, cx: &mut Context<Self>) {
+        let Some(client) = self.daemon.clone() else {
+            return;
+        };
+
+        let listing = cx.background_spawn(async move { client.list_projects() });
+
+        cx.spawn(async move |this, cx| {
+            let result = listing.await;
+
+            let updated = this.update(cx, |workspace, cx| {
+                match result {
+                    Ok(projects) => workspace.data.sync_projects(&projects),
+                    Err(error) => log::warn!("cannot refresh after a terminal ended: {error}"),
+                }
+
+                workspace.show_ended_process(terminal, cx);
+            });
+
+            if let Err(error) = updated {
+                log::debug!("the window closed before the terminal was refreshed: {error}");
+            }
+        })
+        .detach();
+    }
+
+    fn show_ended_process(&mut self, terminal: TerminalId, cx: &mut Context<Self>) {
+        let owner = self
+            .data
+            .tasks
+            .iter()
+            .find(|task| task.processes.contains(&terminal))
+            .and_then(|task| task.daemon.clone());
+        let Some(daemon) = owner else {
+            return;
+        };
+
+        let is_setup = self
+            .live_terminals
+            .get(&terminal)
+            .is_some_and(|live| daemon.setup_terminal == Some(live.daemon_id));
+        let status = daemon.setup_exit.filter(|_| is_setup);
+
+        if is_setup {
+            self.setup_exits_shown.insert(daemon.id);
+        }
+
+        let failed = status.as_ref().is_some_and(exit_failed);
+
+        if let Some(status) = status {
+            self.data
+                .set_terminal_meta(terminal, Some(exit_text(&status).into()));
+            cx.notify();
+        }
+
+        if !failed {
+            Self::close_after_linger(terminal, cx);
+        }
+    }
+
     fn on_terminal_event(
         &mut self,
         terminal: TerminalId,
@@ -374,7 +739,13 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         match event {
-            TerminalEvent::Exited(_) => self.close_user_terminal(terminal, cx),
+            TerminalEvent::Exited(status) => self.on_exited(terminal, status, cx),
+            TerminalEvent::Disconnected
+                if self.is_process(terminal)
+                    && self.daemon.as_ref().is_some_and(Client::is_connected) =>
+            {
+                self.refresh_ended_process(terminal, cx);
+            }
             TerminalEvent::Disconnected => {
                 self.disconnected.insert(terminal);
                 self.reconnect_daemon(window, cx);
@@ -390,11 +761,23 @@ impl Workspace {
     }
 }
 
+fn exit_text(status: &ExitStatus) -> String {
+    match status {
+        ExitStatus::Code(code) => format!("exit {code}"),
+        ExitStatus::Signal(signal) => format!("signal {signal}"),
+    }
+}
+
+fn exit_failed(status: &ExitStatus) -> bool {
+    !matches!(status, ExitStatus::Code(0))
+}
+
 fn connect(launch: &DaemonLaunch) -> Result<Connected, ClientError> {
     let client = Client::connect_or_spawn(&launch.paths, &launch.binary)?;
     let terminals = client.list()?;
+    let projects = client.list_projects()?;
 
-    Ok((client, terminals))
+    Ok((client, terminals, projects))
 }
 
 #[cfg(test)]
@@ -405,21 +788,28 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use gpui::{TestAppContext, VisualTestContext};
-    use swarm_protocol::{Event, Request, VERSION, read, write};
+    use swarm_protocol::{
+        Event, ProjectId as DaemonProjectId, Request, TaskId as DaemonTaskId, VERSION, read, write,
+    };
     use swarm_term_view::TerminalEvent;
 
     use super::*;
     use crate::actions::{self, NewTerminal};
+    use crate::new_task::NewTaskDialog;
+    use crate::palette::Overlay;
 
     static NEXT_SOCKET: AtomicU32 = AtomicU32::new(0);
 
     fn setup(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
         cx.update(|cx| {
-            swarm_ui::theme::init(cx);
+            swarm_ui::init(cx);
             actions::bind_keys(cx);
         });
 
-        cx.add_window_view(Workspace::new)
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        cx.run_until_parked();
+
+        (workspace, cx)
     }
 
     /// A daemon that accepts one connection, says hello and reads until the client leaves.
@@ -479,6 +869,87 @@ mod tests {
         });
 
         socket
+    }
+
+    /// A daemon that answers every request with what `reply` returns.
+    fn fake_daemon_replying(reply: impl Fn(Request) -> Option<Event> + Send + 'static) -> PathBuf {
+        let folder = PathBuf::from(format!(
+            "/tmp/swa-{}-{}",
+            std::process::id(),
+            NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&folder)
+            .expect("create the private folder");
+        let socket = folder.join("d.sock");
+        let listener = UnixListener::bind(&socket).expect("bind the fake socket");
+
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept()
+                && let Ok(clone) = stream.try_clone()
+            {
+                let mut reader = BufReader::new(clone);
+                let mut writer = BufWriter::new(stream);
+                let mut buffer = Vec::new();
+
+                let hello: Result<Request, _> = read(&mut reader, &mut buffer);
+                assert_eq!(hello.ok(), Some(Request::Hello { version: VERSION }));
+                write(
+                    &mut writer,
+                    &Event::Hello {
+                        version: VERSION,
+                        pid: 1,
+                    },
+                )
+                .ok();
+                writer.flush().ok();
+
+                while let Ok(request) = read::<Request>(&mut reader, &mut buffer) {
+                    if let Some(event) = reply(request) {
+                        write(&mut writer, &event).ok();
+                        writer.flush().ok();
+                    }
+                }
+            }
+
+            std::fs::remove_dir_all(&folder).ok();
+        });
+
+        socket
+    }
+
+    fn task_info(id: u64, project: u64, name: &str) -> TaskInfo {
+        TaskInfo {
+            id: DaemonTaskId(id),
+            project: DaemonProjectId(project),
+            name: name.into(),
+            branch: format!("swarm/{name}"),
+            base: "main".into(),
+            worktree: PathBuf::from("/tmp/worktree"),
+            ports: Vec::new(),
+            setup_terminal: Some(swarm_protocol::TerminalId(10)),
+            setup_exit: None,
+        }
+    }
+
+    fn project_info(id: u64, name: &str, tasks: Vec<TaskInfo>) -> ProjectInfo {
+        ProjectInfo {
+            id: DaemonProjectId(id),
+            name: name.into(),
+            path: PathBuf::from(format!("/tmp/{name}")),
+            base_branch: "main".into(),
+            config_error: None,
+            tasks,
+        }
+    }
+
+    fn use_projects(
+        workspace: &Entity<Workspace>,
+        projects: &[ProjectInfo],
+        cx: &mut VisualTestContext,
+    ) {
+        workspace.update(cx, |workspace, cx| workspace.use_projects(projects, cx));
     }
 
     fn info(id: u64, kind: DaemonKind, task: &str) -> TerminalInfo {
@@ -667,6 +1138,521 @@ mod tests {
             )
         });
         assert_eq!(state, (1, false));
+    }
+
+    #[gpui::test]
+    fn projects_from_the_daemon_replace_the_sample(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let projects = [project_info(5, "demo", vec![task_info(7, 5, "login")])];
+
+        use_projects(&workspace, &projects, cx);
+
+        let (names, tasks, active) = workspace.read_with(cx, |workspace, _| {
+            let names: Vec<String> = workspace
+                .data
+                .projects
+                .iter()
+                .map(|project| project.name.to_string())
+                .collect();
+            let task = workspace.active_task();
+
+            (
+                names,
+                workspace.data.tasks.len(),
+                (
+                    task.name.to_string(),
+                    task.branch.to_string(),
+                    task.orchestrator,
+                ),
+            )
+        });
+        assert_eq!(names, ["demo"]);
+        assert_eq!(tasks, 1);
+        assert_eq!(active, ("login".to_owned(), "swarm/login".to_owned(), None));
+    }
+
+    #[gpui::test]
+    fn a_live_project_without_tasks_opens_on_start(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+
+        use_projects(&workspace, &[project_info(5, "demo", Vec::new())], cx);
+
+        let is_start = workspace.read_with(cx, |workspace, _| workspace.active_task().is_start);
+        assert!(is_start);
+    }
+
+    #[gpui::test]
+    fn a_real_task_gets_tiles_for_its_process_and_user_terminals(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let client = Client::connect(&fake_daemon()).expect("connect to the fake daemon");
+        use_projects(
+            &workspace,
+            &[project_info(5, "demo", vec![task_info(7, 5, "login")])],
+            cx,
+        );
+        let listed = [
+            info(10, DaemonKind::Process, "task:7"),
+            info(11, DaemonKind::User, "task:7"),
+            info(12, DaemonKind::Process, "task:8"),
+        ];
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.use_daemon(client, &listed, window, cx);
+        });
+
+        let (processes, users, live, setup_title) = workspace.read_with(cx, |workspace, _| {
+            let task = workspace.active_task();
+            let title = task
+                .processes
+                .first()
+                .and_then(|id| workspace.data.terminal(*id))
+                .map(|terminal| terminal.title.to_string());
+
+            (
+                task.processes.len(),
+                task.user_terminals.len(),
+                workspace.live_terminals.len(),
+                title,
+            )
+        });
+        assert_eq!((processes, users, live), (1, 1, 2));
+        assert_eq!(setup_title.as_deref(), Some("Setup"));
+    }
+
+    #[gpui::test]
+    fn a_created_task_adds_and_selects_a_tab(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let client = Client::connect(&fake_daemon()).expect("connect to the fake daemon");
+        use_projects(&workspace, &[project_info(5, "demo", Vec::new())], cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.use_daemon(client, &[], window, cx);
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let created = task_info(8, 5, "signup");
+            let terminals = [info(10, DaemonKind::Process, "task:8")];
+            workspace.task_created(&created, &terminals, window, cx);
+        });
+
+        let (active, processes, tabs) = workspace.read_with(cx, |workspace, _| {
+            let task = workspace.active_task();
+
+            (
+                task.name.to_string(),
+                task.processes.len(),
+                workspace.data.tasks_of(workspace.active_project).count(),
+            )
+        });
+        assert_eq!(active, "signup");
+        assert_eq!(processes, 1);
+        assert_eq!(tabs, 2);
+    }
+
+    #[gpui::test]
+    fn a_create_error_keeps_the_sheet_open_with_the_message(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let socket = fake_daemon_replying(|request| match request {
+            Request::CreateTask { call, .. } => Some(Event::Error {
+                call: Some(call),
+                id: None,
+                message: "branch exists".into(),
+            }),
+            _ => None,
+        });
+        let client = Client::connect(&socket).expect("connect to the fake daemon");
+        use_projects(&workspace, &[project_info(5, "demo", Vec::new())], cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.use_daemon(client, &[], window, cx);
+        });
+
+        cx.simulate_keystrokes("cmd-t");
+        cx.simulate_input("login");
+        cx.simulate_keystrokes("enter");
+        cx.executor().allow_parking();
+        cx.run_until_parked();
+
+        let state = workspace.read_with(cx, |workspace, cx| match &workspace.overlay {
+            Some(Overlay::NewTask { view, .. }) => {
+                let dialog = view.read(cx);
+                Some((dialog.error_text().map(str::to_owned), dialog.is_busy()))
+            }
+            _ => None,
+        });
+        let (error, busy) = state.expect("the sheet is still open");
+        assert!(error.is_some_and(|error| error.contains("branch exists")));
+        assert!(!busy);
+    }
+
+    #[gpui::test]
+    fn a_successful_create_closes_the_sheet_and_opens_the_tab(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let socket = fake_daemon_replying(|request| match request {
+            Request::CreateTask { call, .. } => Some(Event::TaskCreated {
+                call,
+                task: task_info(8, 5, "login"),
+            }),
+            Request::List { call } => Some(Event::Terminals {
+                call,
+                terminals: vec![info(10, DaemonKind::Process, "task:8")],
+            }),
+            _ => None,
+        });
+        let client = Client::connect(&socket).expect("connect to the fake daemon");
+        use_projects(&workspace, &[project_info(5, "demo", Vec::new())], cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.use_daemon(client, &[], window, cx);
+        });
+
+        cx.simulate_keystrokes("cmd-t");
+        cx.simulate_input("login");
+        cx.simulate_keystrokes("enter");
+        cx.executor().allow_parking();
+        cx.run_until_parked();
+
+        let (closed, name, processes) = workspace.read_with(cx, |workspace, _| {
+            (
+                workspace.overlay.is_none(),
+                workspace.active_task().name.to_string(),
+                workspace.active_task().processes.len(),
+            )
+        });
+        assert!(closed);
+        assert_eq!(name, "login");
+        assert_eq!(processes, 1);
+    }
+
+    #[gpui::test]
+    fn a_create_error_after_the_sheet_closed_goes_to_the_sidebar(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let (release, gate) = flume::bounded::<()>(1);
+        let socket = fake_daemon_replying(move |request| match request {
+            Request::CreateTask { call, .. } => {
+                gate.recv().ok();
+
+                Some(Event::Error {
+                    call: Some(call),
+                    id: None,
+                    message: "branch exists".into(),
+                })
+            }
+            _ => None,
+        });
+        let client = Client::connect(&socket).expect("connect to the fake daemon");
+        use_projects(&workspace, &[project_info(5, "demo", Vec::new())], cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.use_daemon(client, &[], window, cx);
+        });
+
+        cx.simulate_keystrokes("cmd-t");
+        cx.simulate_input("login");
+        let dialog = workspace.read_with(cx, |workspace, _| match &workspace.overlay {
+            Some(Overlay::NewTask { view, .. }) => Some(view.clone()),
+            _ => None,
+        });
+        dialog
+            .expect("the sheet is open")
+            .update(cx, NewTaskDialog::create);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.close_overlay(window, cx);
+        });
+        release.send(()).expect("the fake daemon is waiting");
+        cx.executor().allow_parking();
+        cx.run_until_parked();
+
+        let error = workspace.read_with(cx, |workspace, _| workspace.sidebar_error.clone());
+        assert!(error.is_some_and(|message| message.contains("branch exists")));
+    }
+
+    #[gpui::test]
+    fn adding_a_project_selects_it(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let socket = fake_daemon_replying(|request| match request {
+            Request::AddProject { call, .. } => Some(Event::ProjectAdded {
+                call,
+                project: project_info(6, "extra", Vec::new()),
+            }),
+            Request::List { call } => Some(Event::Terminals {
+                call,
+                terminals: Vec::new(),
+            }),
+            _ => None,
+        });
+        let client = Client::connect(&socket).expect("connect to the fake daemon");
+        use_projects(&workspace, &[project_info(5, "demo", Vec::new())], cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.use_daemon(client, &[], window, cx);
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_project(PathBuf::from("/tmp/extra"), window, cx);
+        });
+        cx.executor().allow_parking();
+        cx.run_until_parked();
+
+        let active = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .data
+                .project(workspace.active_project)
+                .map(|project| project.name.to_string())
+        });
+        assert_eq!(active.as_deref(), Some("extra"));
+    }
+
+    #[gpui::test]
+    fn an_add_project_error_shows_a_dismissible_message(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let socket = fake_daemon_replying(|request| match request {
+            Request::AddProject { call, .. } => Some(Event::Error {
+                call: Some(call),
+                id: None,
+                message: "not a git repository".into(),
+            }),
+            _ => None,
+        });
+        let client = Client::connect(&socket).expect("connect to the fake daemon");
+        use_projects(&workspace, &[project_info(5, "demo", Vec::new())], cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.use_daemon(client, &[], window, cx);
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_project(PathBuf::from("/tmp/nothing"), window, cx);
+        });
+        cx.executor().allow_parking();
+        cx.run_until_parked();
+        let shown = workspace.read_with(cx, |workspace, _| workspace.sidebar_error.clone());
+        workspace.update(cx, Workspace::dismiss_sidebar_error);
+        let dismissed = workspace.read_with(cx, |workspace, _| workspace.sidebar_error.clone());
+
+        assert!(shown.is_some_and(|message| message.contains("not a git repository")));
+        assert!(dismissed.is_none());
+    }
+
+    #[gpui::test]
+    fn an_exited_process_tile_goes_away_after_three_seconds(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let client = Client::connect(&fake_daemon()).expect("connect to the fake daemon");
+        use_projects(
+            &workspace,
+            &[project_info(5, "demo", vec![task_info(7, 5, "login")])],
+            cx,
+        );
+        let listed = [info(10, DaemonKind::Process, "task:7")];
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.use_daemon(client, &listed, window, cx);
+        });
+        let tile = workspace
+            .read_with(cx, |workspace, _| {
+                workspace.live_terminals.keys().next().copied()
+            })
+            .expect("a process tile");
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let exited = TerminalEvent::Exited(ExitStatus::Code(0));
+            workspace.on_terminal_event(tile, &exited, window, cx);
+        });
+        let meta = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .data
+                .terminal(tile)
+                .and_then(|terminal| terminal.meta.clone())
+        });
+        cx.executor().advance_clock(Duration::from_millis(2900));
+        cx.run_until_parked();
+        let before =
+            workspace.read_with(cx, |workspace, _| workspace.active_task().processes.len());
+        cx.executor().advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+        let after = workspace.read_with(cx, |workspace, _| {
+            (
+                workspace.active_task().processes.len(),
+                workspace.live_terminals.len(),
+            )
+        });
+
+        assert_eq!(meta.as_deref(), Some("exit 0"));
+        assert_eq!(before, 1);
+        assert_eq!(after, (0, 0));
+    }
+
+    #[gpui::test]
+    fn a_failed_process_tile_stays_until_closed(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let client = Client::connect(&fake_daemon()).expect("connect to the fake daemon");
+        use_projects(
+            &workspace,
+            &[project_info(5, "demo", vec![task_info(7, 5, "login")])],
+            cx,
+        );
+        let listed = [info(10, DaemonKind::Process, "task:7")];
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.use_daemon(client, &listed, window, cx);
+        });
+        let tile = workspace
+            .read_with(cx, |workspace, _| {
+                workspace.live_terminals.keys().next().copied()
+            })
+            .expect("a process tile");
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let exited = TerminalEvent::Exited(ExitStatus::Code(2));
+            workspace.on_terminal_event(tile, &exited, window, cx);
+        });
+        let meta = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .data
+                .terminal(tile)
+                .and_then(|terminal| terminal.meta.clone())
+        });
+        cx.executor().advance_clock(Duration::from_millis(2900));
+        cx.run_until_parked();
+        let before =
+            workspace.read_with(cx, |workspace, _| workspace.active_task().processes.len());
+        cx.executor().advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+        let after = workspace.read_with(cx, |workspace, _| {
+            (
+                workspace.active_task().processes.len(),
+                workspace.live_terminals.len(),
+            )
+        });
+
+        assert_eq!(meta.as_deref(), Some("exit 2"));
+        assert_eq!(before, 1);
+        assert_eq!(after, (1, 1));
+    }
+
+    fn finished_setup(id: u64, status: ExitStatus) -> TaskInfo {
+        TaskInfo {
+            setup_exit: Some(status),
+            ..task_info(id, 5, "login")
+        }
+    }
+
+    fn setup_tile_state(workspace: &Entity<Workspace>, cx: &VisualTestContext) -> Vec<String> {
+        workspace.read_with(cx, |workspace, _| {
+            workspace
+                .active_task()
+                .processes
+                .iter()
+                .filter_map(|id| workspace.data.terminal(*id))
+                .map(|terminal| {
+                    let meta = terminal.meta.clone().unwrap_or_default();
+                    format!("{} {meta}", terminal.title)
+                })
+                .collect()
+        })
+    }
+
+    #[gpui::test]
+    fn a_setup_that_ended_before_its_tile_appeared_is_shown_then_removed(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let client = Client::connect(&fake_daemon()).expect("connect to the fake daemon");
+        use_projects(&workspace, &[project_info(5, "demo", Vec::new())], cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.use_daemon(client, &[], window, cx);
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let created = finished_setup(8, ExitStatus::Code(0));
+            workspace.task_created(&created, &[], window, cx);
+        });
+        let shown = setup_tile_state(&workspace, cx);
+        cx.executor()
+            .advance_clock(PROCESS_LINGER + Duration::from_millis(100));
+        cx.run_until_parked();
+        let later = setup_tile_state(&workspace, cx);
+
+        assert_eq!(shown, ["Setup exit 0"]);
+        assert!(later.is_empty());
+    }
+
+    #[gpui::test]
+    fn a_failed_setup_that_ended_early_stays_until_closed(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let client = Client::connect(&fake_daemon()).expect("connect to the fake daemon");
+        use_projects(&workspace, &[project_info(5, "demo", Vec::new())], cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.use_daemon(client, &[], window, cx);
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let created = finished_setup(8, ExitStatus::Code(3));
+            workspace.task_created(&created, &[], window, cx);
+        });
+        cx.executor().advance_clock(PROCESS_LINGER * 2);
+        cx.run_until_parked();
+        let kept = setup_tile_state(&workspace, cx);
+        let terminal = workspace.read_with(cx, |workspace, _| {
+            workspace.active_task().processes.first().copied()
+        });
+        workspace.update(cx, |workspace, cx| {
+            if let Some(terminal) = terminal {
+                workspace.close_process(terminal, cx);
+            }
+        });
+        let closed = setup_tile_state(&workspace, cx);
+
+        assert_eq!(kept, ["Setup exit 3"]);
+        assert!(closed.is_empty());
+    }
+
+    fn ended_process_state(
+        status: ExitStatus,
+        cx: &mut TestAppContext,
+    ) -> (Vec<String>, Vec<String>) {
+        let (workspace, cx) = setup(cx);
+        let task = finished_setup(7, status);
+        let socket = fake_daemon_replying(move |request| match request {
+            Request::ListProjects { call } => Some(Event::Projects {
+                call,
+                projects: vec![project_info(5, "demo", vec![task.clone()])],
+            }),
+            _ => None,
+        });
+        let client = Client::connect(&socket).expect("connect to the fake daemon");
+        use_projects(
+            &workspace,
+            &[project_info(5, "demo", vec![task_info(7, 5, "login")])],
+            cx,
+        );
+        let listed = [info(10, DaemonKind::Process, "task:7")];
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.use_daemon(client, &listed, window, cx);
+        });
+        let tile = workspace
+            .read_with(cx, |workspace, _| {
+                workspace.live_terminals.keys().next().copied()
+            })
+            .expect("a process tile");
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.on_terminal_event(tile, &TerminalEvent::Disconnected, window, cx);
+        });
+        cx.executor().allow_parking();
+        cx.run_until_parked();
+        let shown = setup_tile_state(&workspace, cx);
+        cx.executor()
+            .advance_clock(PROCESS_LINGER + Duration::from_millis(100));
+        cx.run_until_parked();
+
+        (shown, setup_tile_state(&workspace, cx))
+    }
+
+    #[gpui::test]
+    fn a_process_tile_that_ends_shows_the_setup_exit_then_goes_away(cx: &mut TestAppContext) {
+        let (shown, later) = ended_process_state(ExitStatus::Code(0), cx);
+
+        assert_eq!(shown, ["Setup exit 0"]);
+        assert!(later.is_empty());
+    }
+
+    #[gpui::test]
+    fn a_process_tile_that_ends_with_a_failure_stays(cx: &mut TestAppContext) {
+        let (shown, later) = ended_process_state(ExitStatus::Code(3), cx);
+
+        assert_eq!(shown, ["Setup exit 3"]);
+        assert_eq!(later, shown);
     }
 
     #[test]
