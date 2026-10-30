@@ -4,6 +4,7 @@ members = [
     "crates/gallery",
     "crates/swarm_app",
     "crates/swarm_layout",
+    "crates/swarm_protocol",
     "crates/swarm_term",
     "crates/swarm_term_view",
     "crates/swarm_term_vt",
@@ -18,6 +19,7 @@ publish = false
 
 [workspace.dependencies]
 swarm_layout = { path = "crates/swarm_layout" }
+swarm_protocol = { path = "crates/swarm_protocol" }
 swarm_term = { path = "crates/swarm_term" }
 swarm_term_view = { path = "crates/swarm_term_view" }
 swarm_term_vt = { path = "crates/swarm_term_vt" }
@@ -33,6 +35,7 @@ log = "0.4"
 # Same version gpui_macos uses at the pinned rev, so it is built once.
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSAccessibility", "NSWorkspace"] }
 portable-pty = "0.9"
+postcard = { version = "1.1", features = ["use-std"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 # One Zed rev for every GPUI crate. Bump it together with rust-toolchain.toml.
