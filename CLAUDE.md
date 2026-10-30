@@ -11,5 +11,6 @@ Native macOS app (Rust + GPUI) that runs a swarm of Claude Code and Codex agents
 
 - Build screens from `swarm-ui` components and theme tokens; add a component when one is missing.
 - Accessibility is required: every interactive element gets a role and label, is reachable by keyboard, and meets WCAG AA contrast.
+- UI text shows labels, values and status only. Explanations of how something works belong on the docs website.
 - Follow Zed's GPUI patterns: `docs/research/zed-architecture.md`.
 - Spikes in `spikes/` are throwaway. Record the result in `docs/spikes/<name>.md`.
