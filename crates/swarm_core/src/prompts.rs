@@ -11,11 +11,13 @@ use swarm_protocol::{AgentId, AgentRole, TaskId};
 
 const ORCHESTRATOR: &str = include_str!("../prompts/orchestrator.md");
 const WORKER: &str = include_str!("../prompts/worker.md");
+const START: &str = include_str!("../prompts/start.md");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptFile {
     Orchestrator,
     Worker,
+    Start,
 }
 
 impl PromptFile {
@@ -23,6 +25,7 @@ impl PromptFile {
         match role {
             AgentRole::Orchestrator => Self::Orchestrator,
             AgentRole::Worker => Self::Worker,
+            AgentRole::StartOrchestrator => Self::Start,
         }
     }
 
@@ -30,6 +33,7 @@ impl PromptFile {
         match self {
             Self::Orchestrator => "orchestrator.md",
             Self::Worker => "worker.md",
+            Self::Start => "start.md",
         }
     }
 
@@ -37,6 +41,7 @@ impl PromptFile {
         match self {
             Self::Orchestrator => ORCHESTRATOR,
             Self::Worker => WORKER,
+            Self::Start => START,
         }
     }
 }
@@ -45,29 +50,64 @@ impl PromptFile {
 #[derive(Debug, Clone, Copy)]
 pub struct Harness<'a> {
     pub agent: AgentId,
-    pub task: TaskId,
+    /// `None` for a Start orchestrator.
+    pub task: Option<TaskId>,
     pub task_name: &'a str,
     pub role: AgentRole,
     pub socket: &'a Path,
 }
 
+/// One line per command: the command, then what it does.
+const ORCHESTRATOR_COMMANDS: &[&str] = &[
+    "`swarm spawn <name> [--kind claude|codex] [--model M] [--brief TEXT]`: start a worker (the brief comes from stdin without `--brief`)",
+    "`swarm send <worker> <text>`: send a message to one of your workers",
+    "`swarm read`: take your unread messages",
+    "`swarm wait [--timeout SECS]`: wait for a message (default 120, at most 600)",
+    "`swarm merge <worker>`: merge a worker's branch into the task branch",
+    "`swarm agents`: list your workers",
+    "`swarm notify <text>`: ask the user for attention",
+    "`swarm confirm`: say that you understood your brief",
+];
+
+const WORKER_COMMANDS: &[&str] = &[
+    "`swarm ask <text>`: ask your orchestrator a question; the answer arrives as a message",
+    "`swarm report <text>`: send your orchestrator a progress or final report",
+    "`swarm read`: take your unread messages",
+    "`swarm wait [--timeout SECS]`: wait for a message (default 120, at most 600)",
+];
+
+const START_COMMANDS: &[&str] = &[
+    "`swarm read`: take your unread messages",
+    "`swarm wait [--timeout SECS]`: wait for a message (default 120, at most 600)",
+];
+
 impl Harness<'_> {
     fn block(&self) -> String {
-        let role = match self.role {
-            AgentRole::Orchestrator => "orchestrator",
-            AgentRole::Worker => "worker",
+        let (role, commands) = match self.role {
+            AgentRole::Orchestrator => ("orchestrator", ORCHESTRATOR_COMMANDS),
+            AgentRole::Worker => ("worker", WORKER_COMMANDS),
+            AgentRole::StartOrchestrator => ("start orchestrator", START_COMMANDS),
         };
+        let task = self.task.map_or_else(
+            || "none".to_owned(),
+            |task| format!("{} ({})", task.0, self.task_name),
+        );
+        let commands = commands
+            .iter()
+            .map(|command| format!("- {command}"))
+            .collect::<Vec<_>>()
+            .join("\n");
 
         format!(
             "# Swarm harness\n\n\
              - Agent: {agent}\n\
-             - Task: {task} ({name})\n\
+             - Task: {task}\n\
              - Role: {role}\n\
              - SWARM_SOCKET: {socket}\n\n\
-             Run `swarm --help` for the commands that talk to Swarm.",
+             Commands, also available as tools of the `swarm` MCP server:\n\n\
+             {commands}\n\n\
+             Run `swarm --help` for the details of each command.",
             agent = self.agent.0,
-            task = self.task.0,
-            name = self.task_name,
             socket = self.socket.display(),
         )
     }
@@ -143,7 +183,7 @@ mod tests {
     fn harness(socket: &Path) -> Harness<'_> {
         Harness {
             agent: AgentId(7),
-            task: TaskId(3),
+            task: Some(TaskId(3)),
             task_name: "Fix it",
             role: AgentRole::Orchestrator,
             socket,
@@ -263,5 +303,35 @@ mod tests {
         );
 
         assert!(prompt.starts_with("# Swarm harness"));
+    }
+    #[test]
+    fn each_role_lists_only_its_commands() {
+        let block = |role| {
+            Harness {
+                role,
+                ..harness(Path::new("/s"))
+            }
+            .block()
+        };
+
+        let orchestrator = block(AgentRole::Orchestrator);
+        let worker = block(AgentRole::Worker);
+        let start = Harness {
+            role: AgentRole::StartOrchestrator,
+            task: None,
+            ..harness(Path::new("/s"))
+        }
+        .block();
+
+        assert!(orchestrator.contains("- `swarm spawn "));
+        assert!(orchestrator.contains("- `swarm merge <worker>`"));
+        assert!(!orchestrator.contains("swarm ask"));
+        assert!(worker.contains("- `swarm ask <text>`"));
+        assert!(worker.contains("- `swarm report <text>`"));
+        assert!(!worker.contains("swarm spawn"));
+        assert!(!worker.contains("swarm send"));
+        assert!(start.contains("- `swarm wait "));
+        assert!(!start.contains("swarm spawn"));
+        assert!(start.contains("Task: none"));
     }
 }

@@ -21,6 +21,8 @@ pub struct HookOutcome {
     pub session_id: Option<String>,
     /// The event was `SessionStart`: the agent is up.
     pub session_started: bool,
+    /// The event was `Stop`: the agent finished its turn.
+    pub stopped: bool,
 }
 
 /// One agent's status. Before the first OSC 7501 report the hooks drive it. After that
@@ -32,6 +34,8 @@ pub struct StatusMerge {
     message: Option<String>,
     osc_seen: bool,
     hook_seen: bool,
+    /// Set by `notify`: the agent shows as blocked with this text over `status`.
+    notice: Option<String>,
 }
 
 impl Default for StatusMerge {
@@ -41,17 +45,43 @@ impl Default for StatusMerge {
             message: None,
             osc_seen: false,
             hook_seen: false,
+            notice: None,
         }
     }
 }
 
 impl StatusMerge {
     pub fn status(&self) -> AgentStatus {
+        if self.notice.is_some() {
+            return AgentStatus::Blocked(BlockedKind::Other);
+        }
+
         self.status
     }
 
     pub fn message(&self) -> Option<&str> {
-        self.message.as_deref()
+        self.notice.as_deref().or(self.message.as_deref())
+    }
+
+    /// Shows the agent as blocked with `text` until it works again or the app sends
+    /// input to its terminal. Returns true when the status or message changed.
+    pub fn notify(&mut self, text: &str) -> bool {
+        let before = self.visible();
+        self.notice = Some(text.to_owned());
+
+        before != self.visible()
+    }
+
+    /// The app sent input to the agent's terminal: a notice no longer applies.
+    pub fn app_input(&mut self) -> bool {
+        let before = self.visible();
+        self.notice = None;
+
+        before != self.visible()
+    }
+
+    fn visible(&self) -> (AgentStatus, Option<String>) {
+        (self.status(), self.message().map(str::to_owned))
     }
 
     /// Nothing reported yet, so the screen is the only thing that can tell more.
@@ -72,6 +102,10 @@ impl StatusMerge {
             ProgramState::Clear => (AgentStatus::Unknown, None),
         };
 
+        if matches!(report.state, ProgramState::Working | ProgramState::Error) {
+            self.notice = None;
+        }
+
         self.set(status, message)
     }
 
@@ -91,7 +125,13 @@ impl StatusMerge {
 
         let applies = !self.osc_seen || name == "StopFailure";
         let changed = match hook_state(name, event) {
-            Some((status, message)) if applies => self.set(status, message),
+            Some((status, message)) if applies => {
+                if status == AgentStatus::Working {
+                    self.notice = None;
+                }
+
+                self.set(status, message)
+            }
             _ => false,
         };
 
@@ -99,27 +139,29 @@ impl StatusMerge {
             changed,
             session_id,
             session_started: name == "SessionStart",
+            stopped: name == "Stop",
         }
     }
 
     /// Applies the process exit. `Done` and `Error` stay, `Working` and `Blocked` are
     /// stale and become `Unknown`, and a non-zero exit code is an error.
     pub fn process_exited(&mut self, exit: Option<&ExitStatus>) -> bool {
+        let had_notice = self.notice.take().is_some();
         let code = match exit {
             Some(ExitStatus::Code(code)) => Some(*code),
             _ => None,
         };
 
         let (status, message) = match (self.status, code) {
-            (AgentStatus::Done | AgentStatus::Error, _) => return false,
+            (AgentStatus::Done | AgentStatus::Error, _) => return had_notice,
             (_, Some(code)) if code != 0 => {
                 (AgentStatus::Error, Some(format!("Exited with code {code}")))
             }
             (AgentStatus::Working | AgentStatus::Blocked(_), _) => (AgentStatus::Unknown, None),
-            _ => return false,
+            _ => return had_notice,
         };
 
-        self.set(status, message)
+        self.set(status, message) | had_notice
     }
 
     /// Marks the agent as waiting for the user's answer to the folder trust dialog.
@@ -137,15 +179,17 @@ impl StatusMerge {
 
     /// For an agent that could not start.
     pub fn fail(&mut self, message: &str) -> bool {
+        self.notice = None;
+
         self.set(AgentStatus::Error, Some(message.to_owned()))
     }
 
     fn set(&mut self, status: AgentStatus, message: Option<String>) -> bool {
-        let changed = self.status != status || self.message != message;
+        let before = self.visible();
         self.status = status;
         self.message = message;
 
-        changed
+        before != self.visible()
     }
 }
 
@@ -613,5 +657,94 @@ mod tests {
         assert_eq!(first.len(), 64);
         assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert_ne!(first, second);
+    }
+    #[test]
+    fn a_notice_shows_the_agent_as_blocked_with_the_text() {
+        let mut merge = StatusMerge::default();
+        merge.program_status(&osc(ProgramState::Idle));
+
+        let changed = merge.notify("Review needed");
+
+        assert!(changed);
+        assert_eq!(merge.status(), AgentStatus::Blocked(BlockedKind::Other));
+        assert_eq!(merge.message(), Some("Review needed"));
+    }
+
+    #[test]
+    fn a_notice_stays_through_idle_and_done_reports() {
+        let mut merge = StatusMerge::default();
+        merge.notify("Review needed");
+
+        let idle = merge.program_status(&osc(ProgramState::Idle));
+        let done = merge.program_status(&osc(ProgramState::Done));
+
+        assert!(!idle && !done);
+        assert_eq!(merge.status(), AgentStatus::Blocked(BlockedKind::Other));
+        assert_eq!(merge.message(), Some("Review needed"));
+    }
+
+    #[test]
+    fn working_clears_a_notice() {
+        let mut merge = StatusMerge::default();
+        merge.program_status(&osc(ProgramState::Idle));
+        merge.notify("Review needed");
+
+        let changed = merge.program_status(&osc(ProgramState::Working));
+
+        assert!(changed);
+        assert_eq!(merge.status(), AgentStatus::Working);
+        assert_eq!(merge.message(), None);
+    }
+
+    #[test]
+    fn a_working_hook_clears_a_notice_before_any_osc_report() {
+        let mut merge = StatusMerge::default();
+        merge.notify("Review needed");
+
+        hook(&mut merge, &json!({"hook_event_name": "UserPromptSubmit"}));
+
+        assert_eq!(merge.status(), AgentStatus::Working);
+    }
+
+    #[test]
+    fn app_input_clears_a_notice_and_shows_the_real_status() {
+        let mut merge = StatusMerge::default();
+        merge.program_status(&osc(ProgramState::Idle));
+        merge.notify("Review needed");
+        merge.program_status(&osc(ProgramState::Done));
+
+        let changed = merge.app_input();
+
+        assert!(changed);
+        assert_eq!(merge.status(), AgentStatus::Done);
+        assert_eq!(merge.message(), None);
+        assert!(!merge.app_input());
+    }
+
+    #[test]
+    fn notifying_twice_with_the_same_text_changes_nothing() {
+        let mut merge = StatusMerge::default();
+        merge.notify("Review needed");
+
+        assert!(!merge.notify("Review needed"));
+        assert!(merge.notify("Another"));
+    }
+
+    #[test]
+    fn the_process_exit_clears_a_notice() {
+        let mut merge = StatusMerge::default();
+        merge.program_status(&osc(ProgramState::Idle));
+        merge.notify("Review needed");
+
+        assert!(merge.process_exited(Some(&ExitStatus::Code(0))));
+        assert_eq!(merge.status(), AgentStatus::Idle);
+    }
+
+    #[test]
+    fn a_stop_hook_is_flagged() {
+        let mut merge = StatusMerge::default();
+
+        assert!(hook(&mut merge, &json!({"hook_event_name": "Stop"})).stopped);
+        assert!(!hook(&mut merge, &json!({"hook_event_name": "SessionStart"})).stopped);
     }
 }

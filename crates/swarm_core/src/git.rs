@@ -204,6 +204,79 @@ pub fn worktree_remove(root: &Path, path: &Path) -> Result<(), Error> {
     Ok(())
 }
 
+/// The git folders a commit in `worktree` writes: the shared one, and for a linked
+/// worktree its own folder inside it.
+pub fn writable_git_dirs(worktree: &Path) -> Result<Vec<PathBuf>, Error> {
+    let shared = run(
+        worktree,
+        ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let own = run(
+        worktree,
+        ["rev-parse", "--path-format=absolute", "--git-dir"],
+    )?;
+
+    let mut folders = vec![PathBuf::from(&shared)];
+    if own != shared {
+        folders.push(PathBuf::from(own));
+    }
+
+    Ok(folders)
+}
+
+/// How a merge ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeOutcome {
+    /// False when git stopped on conflicts and left the merge for the caller.
+    pub merged: bool,
+    pub conflicts: Vec<PathBuf>,
+    /// What git printed.
+    pub output: String,
+}
+
+/// Merges `branch` into the branch checked out in `worktree`, always with a merge commit.
+/// A conflict is an outcome; any other git failure is an error.
+pub fn merge_branch(worktree: &Path, branch: &str) -> Result<MergeOutcome, Error> {
+    let (arguments, output) = execute(
+        worktree,
+        ["merge", "--no-ff", "--no-edit", "--end-of-options", branch],
+    )?;
+    let printed = [output.stdout.as_str(), output.stderr.as_str()]
+        .iter()
+        .filter(|part| !part.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if output.success {
+        return Ok(MergeOutcome {
+            merged: true,
+            conflicts: Vec::new(),
+            output: printed,
+        });
+    }
+
+    let conflicts: Vec<PathBuf> = run(worktree, ["diff", "--name-only", "--diff-filter=U"])?
+        .lines()
+        .map(PathBuf::from)
+        .collect();
+    if conflicts.is_empty() {
+        let command = arguments
+            .iter()
+            .map(|argument| argument.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        return Err(Error::Invalid(format!("git {command} failed: {printed}")));
+    }
+
+    Ok(MergeOutcome {
+        merged: false,
+        conflicts,
+        output: printed,
+    })
+}
+
 pub fn branch_delete(root: &Path, branch: &str) -> Result<(), Error> {
     run(root, ["branch", "-D", "--end-of-options", branch])?;
 
