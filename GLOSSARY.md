@@ -57,8 +57,12 @@ The worktree that holds a task branch; each tab in the window shows one.
 _Avoid_: Space, workspace
 
 **Terminal**:
-A window in Swarm showing one running program: the orchestrator, a worker, a process or the user's own shell.
-_Avoid_: Pane, tile, shell
+One running program shown in Swarm: the orchestrator, a worker, a process (dev server, tests) or the user's own shell.
+_Avoid_: Pane, shell
+
+**Tile**:
+A terminal's place in the workspace layout: its position, size and frame. The layout engine arranges tiles; tiles that don't fit go to the tray.
+_Avoid_: Pane, window, panel
 
 **Process terminal**:
 A terminal running a command an agent started, such as a dev server or a test run.
@@ -69,7 +73,7 @@ A terminal the user opened that no agent can see or touch.
 _Avoid_: God mode terminal, private terminal
 
 **Tray**:
-The strip of chips where terminals go when they don't fit on screen.
+The strip of chips in the status bar where tiles go when they don't fit on screen.
 _Avoid_: Dock, minimized bar
 
 **Daemon**:
