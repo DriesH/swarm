@@ -1,7 +1,7 @@
 //! The app's connection to the daemon: one reader thread, one writer thread, and one
 //! forwarder thread per attached terminal. There is no GPUI here.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufReader, BufWriter, Write};
 use std::os::unix::fs::DirBuilderExt as _;
 use std::os::unix::net::UnixStream;
@@ -16,8 +16,9 @@ use std::time::{Duration, Instant};
 use swarm_term::{TerminalChannels, TerminalInput, TerminalOutput};
 
 use crate::{
-    AgentInfo, CallId, CreateTask, CreateTerminal, Event, FrameError, Paths, ProjectInfo, Request,
-    TaskInfo, TerminalId, TerminalInfo, VERSION, check_private_dir, read, write,
+    AgentInfo, AgentKind, CallId, CreateTask, CreateTerminal, Event, FrameError, MessageInfo,
+    Paths, ProjectId, ProjectInfo, Request, TaskInfo, TerminalId, TerminalInfo, VERSION,
+    check_private_dir, read, write,
 };
 
 const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -78,6 +79,11 @@ struct Shared {
     closing: AtomicBool,
     next_generation: AtomicU64,
     agents: flume::Sender<AgentInfo>,
+    tasks: flume::Sender<TaskInfo>,
+    terminals: flume::Sender<TerminalInfo>,
+    messages: flume::Sender<MessageInfo>,
+    /// Terminals whose size an agent owns: their `Resize` input is dropped.
+    size_locked: Mutex<HashSet<TerminalId>>,
 }
 
 impl Shared {
@@ -120,6 +126,9 @@ struct Inner {
     shared: Arc<Shared>,
     daemon_pid: u32,
     agent_events: flume::Receiver<AgentInfo>,
+    task_events: flume::Receiver<TaskInfo>,
+    terminal_events: flume::Receiver<TerminalInfo>,
+    message_events: flume::Receiver<MessageInfo>,
 }
 
 impl Drop for Inner {
@@ -208,6 +217,9 @@ impl Client {
         };
 
         let (agent_sender, agent_receiver) = flume::unbounded();
+        let (task_sender, task_receiver) = flume::unbounded();
+        let (terminal_sender, terminal_receiver) = flume::unbounded();
+        let (message_sender, message_receiver) = flume::unbounded();
         let shared = Arc::new(Shared {
             routes: Mutex::new(HashMap::new()),
             waiters: Mutex::new(HashMap::new()),
@@ -216,6 +228,10 @@ impl Client {
             closing: AtomicBool::new(false),
             next_generation: AtomicU64::new(0),
             agents: agent_sender,
+            tasks: task_sender,
+            terminals: terminal_sender,
+            messages: message_sender,
+            size_locked: Mutex::new(HashSet::new()),
         });
         let (request_sender, request_receiver) = flume::unbounded();
 
@@ -247,6 +263,9 @@ impl Client {
                 shared,
                 daemon_pid,
                 agent_events: agent_receiver,
+                task_events: task_receiver,
+                terminal_events: terminal_receiver,
+                message_events: message_receiver,
             }),
             reply_timeout: REPLY_TIMEOUT,
         })
@@ -260,6 +279,35 @@ impl Client {
     /// so use one consumer.
     pub fn agent_events(&self) -> flume::Receiver<AgentInfo> {
         self.inner.agent_events.clone()
+    }
+
+    /// Locks or unlocks the size of a terminal. While locked, the client drops the
+    /// `Resize` input of its views, so the size an agent asked for stays.
+    pub fn set_size_locked(&self, id: TerminalId, locked: bool) {
+        let mut set = Shared::lock(&self.inner.shared.size_locked);
+
+        if locked {
+            set.insert(id);
+        } else {
+            set.remove(&id);
+        }
+    }
+
+    /// Every `TaskChanged` the daemon sends: a task was added, also by an agent, or
+    /// changed. Use one consumer.
+    pub fn task_events(&self) -> flume::Receiver<TaskInfo> {
+        self.inner.task_events.clone()
+    }
+
+    /// Every `TerminalChanged` the daemon sends: an agent started a process terminal
+    /// or resized it. Use one consumer.
+    pub fn terminal_events(&self) -> flume::Receiver<TerminalInfo> {
+        self.inner.terminal_events.clone()
+    }
+
+    /// Every `MessageSent` the daemon sends. Use one consumer.
+    pub fn message_events(&self) -> flume::Receiver<MessageInfo> {
+        self.inner.message_events.clone()
     }
 
     /// Changes how long calls wait (`create_task` waits at least 60 s) for the daemon.
@@ -304,6 +352,28 @@ impl Client {
         match reply {
             Event::TaskCreated { task, .. } => Ok(task),
             other => Err(unexpected("CreateTask", &other)),
+        }
+    }
+
+    /// Starts the project's Start orchestrator, or returns the one that runs. `kind`
+    /// `None` uses the default from the daemon's settings.
+    pub fn start_orchestrator(
+        &self,
+        project: ProjectId,
+        kind: Option<AgentKind>,
+    ) -> Result<AgentInfo, ClientError> {
+        let reply = self.call(
+            |call| Request::StartOrchestrator {
+                call,
+                project,
+                kind,
+            },
+            None,
+        )?;
+
+        match reply {
+            Event::AgentStarted { agent, .. } => Ok(agent),
+            other => Err(unexpected("StartOrchestrator", &other)),
         }
     }
 
@@ -447,6 +517,12 @@ impl Client {
             .name(format!("daemon-input-{}", id.0))
             .spawn(move || {
                 while let Ok(input) = input.recv() {
+                    let locked = matches!(input, TerminalInput::Resize(_))
+                        && Shared::lock(&shared.size_locked).contains(&id);
+                    if locked {
+                        continue;
+                    }
+
                     if writer.send(Request::Input { id, input }).is_err() {
                         return;
                     }
@@ -563,6 +639,24 @@ fn read_events(
             Event::AgentChanged { agent } => {
                 if shared.agents.send(agent).is_err() {
                     log::debug!("agent event has no listener");
+                }
+            }
+            Event::AgentStarted { call, agent } => {
+                deliver(shared, call, Event::AgentStarted { call, agent });
+            }
+            Event::TaskChanged { task } => {
+                if shared.tasks.send(task).is_err() {
+                    log::debug!("task event has no listener");
+                }
+            }
+            Event::TerminalChanged { terminal } => {
+                if shared.terminals.send(terminal).is_err() {
+                    log::debug!("terminal event has no listener");
+                }
+            }
+            Event::MessageSent { message } => {
+                if shared.messages.send(message).is_err() {
+                    log::debug!("message event has no listener");
                 }
             }
         }

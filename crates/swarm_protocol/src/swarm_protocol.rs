@@ -14,12 +14,13 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use swarm_term::{Palette, Size, TerminalInput, TerminalOutput};
 
+pub mod agent;
 mod client;
 
 pub use client::{Client, ClientError};
 
 /// Bumped on every incompatible change; the daemon refuses other versions.
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 
 /// Guards against a corrupt length prefix allocating gigabytes.
 const MAX_FRAME: usize = 256 << 20;
@@ -37,6 +38,13 @@ pub enum TerminalKind {
     User,
     Process,
     Agent,
+}
+
+/// A terminal size in cells.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GridSize {
+    pub cols: u16,
+    pub rows: u16,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -76,6 +84,8 @@ pub struct ProjectInfo {
     /// Why `.swarm/config.toml` could not be read; defaults apply meanwhile.
     pub config_error: Option<String>,
     pub tasks: Vec<TaskInfo>,
+    /// The project's Start orchestrator while it has not stopped.
+    pub start: Option<AgentInfo>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -92,6 +102,8 @@ pub enum AgentKind {
 pub enum AgentRole {
     Orchestrator,
     Worker,
+    /// Splits a request into tasks in the project root, then exits. Has no task.
+    StartOrchestrator,
 }
 
 /// What an agent is doing, merged from OSC 7501, hooks and the process exit.
@@ -118,10 +130,17 @@ pub enum AgentLifecycle {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct AgentInfo {
     pub id: AgentId,
-    pub task: TaskId,
+    pub project: ProjectId,
+    /// `None` for a Start orchestrator.
+    pub task: Option<TaskId>,
     pub role: AgentRole,
     pub kind: AgentKind,
     pub model: String,
+    /// "orchestrator", "start" or the worker's name; unique within its task.
+    pub name: String,
+    /// Where it works: a worker worktree, the task worktree or the project root.
+    pub worktree: PathBuf,
+    pub branch: String,
     /// The agent's terminal while it runs.
     pub terminal: Option<TerminalId>,
     pub status: AgentStatus,
@@ -149,6 +168,10 @@ pub struct TaskInfo {
     /// How the setup script ended, so a fast or failed setup is never missed.
     pub setup_exit: Option<swarm_term::ExitStatus>,
     pub agents: Vec<AgentInfo>,
+    /// The Start orchestrator that made the task, if one did.
+    pub created_by: Option<AgentId>,
+    /// The task's orchestrator confirmed the brief it started with.
+    pub briefed: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -169,10 +192,61 @@ pub struct TerminalInfo {
     pub id: TerminalId,
     pub kind: TerminalKind,
     pub task: Option<String>,
+    /// The agent that started this process terminal.
+    pub owner: Option<AgentId>,
+    /// A label the owner gave, such as "dev server".
+    pub name: Option<String>,
+    /// Set by the owner agent; the app never resizes such a terminal.
+    pub fixed_size: Option<GridSize>,
     pub title: Option<String>,
     pub cwd: Option<PathBuf>,
     /// `None` while the process runs.
     pub exit: Option<swarm_term::ExitStatus>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MessageId(pub u64);
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MessageKind {
+    /// The first message of a worker or a task orchestrator.
+    Brief,
+    /// From the orchestrator to a worker after the brief.
+    Task,
+    Question,
+    Report,
+    /// From Swarm: a process terminal the recipient owns or oversees ended.
+    TerminalExited,
+    /// From Swarm: the user typed into a worker's terminal (ADR 0002).
+    UserInput,
+}
+
+impl MessageKind {
+    /// The words people and agents read: "brief", "question", "user input".
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Brief => "brief",
+            Self::Task => "task",
+            Self::Question => "question",
+            Self::Report => "report",
+            Self::TerminalExited => "terminal exited",
+            Self::UserInput => "user input",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct MessageInfo {
+    pub id: MessageId,
+    pub project: ProjectId,
+    pub task: Option<TaskId>,
+    /// `None` when Swarm itself sends it.
+    pub from: Option<AgentId>,
+    pub to: AgentId,
+    pub kind: MessageKind,
+    pub text: String,
+    /// Milliseconds since the Unix epoch.
+    pub sent_at: u64,
 }
 
 /// Matches a reply to its request, so a late reply never answers a newer call.
@@ -223,6 +297,14 @@ pub enum Request {
         call: CallId,
         task: CreateTask,
     },
+    /// Starts the project's Start orchestrator in the project root, or returns the
+    /// one that runs. Answered with [`Event::AgentStarted`].
+    StartOrchestrator {
+        call: CallId,
+        project: ProjectId,
+        /// `None` uses the default from the settings.
+        kind: Option<AgentKind>,
+    },
 }
 
 /// Daemon → client. `Hello` stays first, as in [`Request`].
@@ -266,9 +348,25 @@ pub enum Event {
         call: CallId,
         task: TaskInfo,
     },
-    /// Sent to every client whenever an agent starts, ends or changes status.
+    /// Sent to every client whenever an agent is added, starts, ends or changes status.
     AgentChanged {
         agent: AgentInfo,
+    },
+    AgentStarted {
+        call: CallId,
+        agent: AgentInfo,
+    },
+    /// Sent to every client when a task is added (also by an agent) or changes.
+    TaskChanged {
+        task: TaskInfo,
+    },
+    /// Sent to every client when an agent starts a process terminal or resizes it.
+    TerminalChanged {
+        terminal: TerminalInfo,
+    },
+    /// Sent to every client for each message between agents.
+    MessageSent {
+        message: MessageInfo,
     },
 }
 
