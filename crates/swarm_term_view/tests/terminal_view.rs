@@ -451,3 +451,41 @@ fn outputs_emit_events_and_update_getters(cx: &mut TestAppContext) {
     assert_eq!(directory.as_deref(), Some("/home"));
     assert_eq!(status, Some(ExitStatus::Code(2)));
 }
+
+#[gpui::test]
+fn ending_the_output_without_an_exit_emits_disconnected(cx: &mut TestAppContext) {
+    let setup = setup(cx);
+    let events: Rc<RefCell<Vec<TerminalEvent>>> = Rc::default();
+    let sink = Rc::clone(&events);
+    let _subscription = setup.cx.update(|_, cx| {
+        cx.subscribe(&setup.terminal, move |_, event: &TerminalEvent, _| {
+            sink.borrow_mut().push(event.clone());
+        })
+    });
+
+    drop(setup.emulator);
+    setup.cx.run_until_parked();
+
+    assert_eq!(*events.borrow(), [TerminalEvent::Disconnected]);
+}
+
+#[gpui::test]
+fn an_exit_is_not_followed_by_disconnected(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    let events: Rc<RefCell<Vec<TerminalEvent>>> = Rc::default();
+    let sink = Rc::clone(&events);
+    let _subscription = setup.cx.update(|_, cx| {
+        cx.subscribe(&setup.terminal, move |_, event: &TerminalEvent, _| {
+            sink.borrow_mut().push(event.clone());
+        })
+    });
+
+    setup.send(TerminalOutput::Exited(ExitStatus::Code(0)));
+    drop(setup.emulator);
+    setup.cx.run_until_parked();
+
+    assert_eq!(
+        *events.borrow(),
+        [TerminalEvent::Exited(ExitStatus::Code(0))]
+    );
+}

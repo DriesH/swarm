@@ -8,6 +8,22 @@ The Swarm app (`swarm` binary). Right now it shows the window layout with fake d
 cargo run -p swarm_app
 ```
 
+## Run with the daemon
+
+User terminals are real when `swarm-daemon` runs. Agents, workers and process terminals are still fake.
+
+```sh
+cargo build -p swarm_daemon && cargo run -p swarm_app
+```
+
+Both binaries land in `target/debug`. The app starts `swarm-daemon` from its own folder when nothing listens, and connects to it. If it cannot connect, user terminals stay fake.
+
+- **Files:** `~/Library/Application Support/Swarm` holds `daemon.sock`, `swarm.db` and `daemon.log`. When that path is too long for a socket, the socket sits in `$TMPDIR/swarm`.
+- **Quit the app:** user terminals keep running. Open the app again and they come back.
+- **Stop the daemon:** `pkill -x swarm-daemon`. This ends every terminal.
+- **Task key:** the daemon stores `<project name>/<task name>` (for example `swarm/terminal-renderer`) with each user terminal. The app uses it to show the terminal in the same task again.
+- Snapshot and frame-stats runs never connect.
+
 ## Snapshot
 
 Saves `workspace-light.png` and `workspace-dark.png`, then exits:

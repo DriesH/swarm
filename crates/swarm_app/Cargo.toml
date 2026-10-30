@@ -14,11 +14,15 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 env_logger.workspace = true
+flume.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 image = { workspace = true, optional = true }
 log.workspace = true
 swarm_layout.workspace = true
+swarm_protocol.workspace = true
+swarm_term.workspace = true
+swarm_term_view.workspace = true
 swarm_ui.workspace = true
 
 [dev-dependencies]

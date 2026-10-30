@@ -1,6 +1,7 @@
 //! `swarm`: the Swarm app.
 
 mod actions;
+mod daemon;
 mod model;
 mod new_task;
 mod palette;
@@ -41,9 +42,18 @@ fn window_options(cx: &App) -> WindowOptions {
 fn open_workspace(cx: &mut App) -> anyhow::Result<gpui::WindowHandle<Workspace>> {
     let options = window_options(cx);
 
-    cx.open_window(options, |window, cx| {
+    let handle = cx.open_window(options, |window, cx| {
         cx.new(|cx| Workspace::new(window, cx))
-    })
+    })?;
+
+    // Snapshot and frame-stats runs keep the fake terminals.
+    if !cfg!(any(feature = "snapshot", feature = "frame-stats")) {
+        handle.update(cx, |_, window, cx| {
+            Workspace::connect_daemon(window, cx);
+        })?;
+    }
+
+    Ok(handle)
 }
 
 #[cfg(not(feature = "frame-stats"))]

@@ -374,7 +374,7 @@ mod tests {
     #[gpui::test]
     fn processes_nest_under_the_agent_that_started_them(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
-        workspace.update(cx, Workspace::new_user_terminal);
+        workspace.update_in(cx, Workspace::new_user_terminal);
 
         let outline: Vec<(String, usize)> = workspace.read_with(cx, |workspace, _| {
             rows(workspace)

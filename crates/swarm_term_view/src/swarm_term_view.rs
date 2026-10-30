@@ -32,6 +32,8 @@ pub enum TerminalEvent {
     WorkingDirectoryChanged(String),
     Bell,
     Exited(ExitStatus),
+    /// The output ended without an exit, for example when the daemon went away.
+    Disconnected,
 }
 
 pub struct TerminalView {
@@ -108,6 +110,10 @@ impl TerminalView {
             }
 
             log::debug!("terminal output channel closed");
+
+            if let Err(error) = this.update(cx, |_, cx| cx.emit(TerminalEvent::Disconnected)) {
+                log::debug!("the terminal view is gone: {error}");
+            }
         });
 
         let mut view = Self {

@@ -15,8 +15,8 @@ use crate::workspace::Workspace;
 
 type OpenOverlay = fn(&mut Workspace, &mut Window, &mut Context<Workspace>);
 
-fn open_island(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
-    workspace.new_user_terminal(cx);
+fn open_island(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    workspace.new_user_terminal(window, cx);
 }
 
 fn open_start(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
