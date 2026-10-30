@@ -1,0 +1,20 @@
+# Standalone workspace: not part of any other workspace.
+[workspace]
+resolver = "3"
+members = ["crates/proto", "crates/daemon", "crates/app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1"
+flume = "0.12"
+postcard = { version = "1.1", features = ["use-std"] }
+serde = { version = "1", features = ["derive"] }
+proto = { path = "crates/proto" }
+
+# Zed patches these crates in its own workspace; patches don't carry over to git deps.
+[patch.crates-io]
+async-task = { git = "https://github.com/zed-industries/async-task.git", rev = "015845a19fc31752c02367567d3b8900a406f9da" }
