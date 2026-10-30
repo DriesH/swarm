@@ -26,7 +26,9 @@ Cargo workspace:
 | `swarm_ui` | Theme tokens (Light / Dark / System), fonts, icons and components on raw GPUI |
 | `gallery` | Component gallery app (`swarm-gallery`) |
 | `swarm_layout` | Tile layout engine: where each tile goes, what goes to the tray (pure, no GPUI) |
-| `swarm_term` | `libghostty-vt` behind our own types + GPUI grid element |
+| `swarm_term` | Screen rows, input and the channel pair between emulator and view (plain data, no GPUI, no libghostty) |
+| `swarm_term_vt` | Emulator: PTY + `libghostty-vt` on their own threads, turns output into rows. Only the daemon and the gallery link it |
+| `swarm_term_view` | GPUI view and grid element that paint the rows and send keys, IME text and resizes |
 | `swarm_core` | Projects, tasks, agents, worktrees, messages, state in SQLite |
 | `swarm_daemon` | Background process that owns PTYs and runs `swarm_core` |
 | `swarm_harness` | Unix socket API, `swarm` CLI and MCP server |
