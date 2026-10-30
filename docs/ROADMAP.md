@@ -7,8 +7,8 @@ Each phase ends with a pull request into `main`. A phase is done when every box 
 | 0 | Plan, design, spikes | Done ([PR #1](https://github.com/DriesH/swarm/pull/1)) |
 | 1 | Foundation: workspace, `swarm_ui`, gallery | Done ([PR #2](https://github.com/DriesH/swarm/pull/2)) |
 | 2 | App shell with fake data | Done ([PR #3](https://github.com/DriesH/swarm/pull/3)) |
-| 3 | Daemon, terminals and worktrees | In review |
-| 4 | Agents and harness | Not started |
+| 3 | Daemon, terminals and worktrees | Done ([#4](https://github.com/DriesH/swarm/pull/4), [#5](https://github.com/DriesH/swarm/pull/5), [#6](https://github.com/DriesH/swarm/pull/6)) |
+| 4 | Agents and harness | In progress |
 | 5 | Swarm view | Not started |
 | 6 | Review and pull requests | Not started |
 | 7 | Menu bar, usage and notifications | Not started |
@@ -74,7 +74,7 @@ Each phase ends with a pull request into `main`. A phase is done when every box 
 
 **Goal:** both ways of starting work run end to end with real agents.
 
-**Scope:** Claude Code and Codex adapters (flags, skip permissions, resume, session IDs, hooks, update check off), OSC 7501 status, `swarm_harness` (socket API, `swarm` CLI, MCP server: `spawn`, `send`, `ask`, `report`, `task.*`, `terminal.*`, `agent.exit`), orchestrator-only messaging, prompt layers, Start orchestrator, process terminals with sizes, kill and `terminal.exited` events.
+**Scope:** Claude Code and Codex adapters (flags, skip permissions, resume, session IDs, hooks, update check off), OSC 7501 status, `swarm_cli` (agent socket, `swarm` CLI, MCP server: `spawn`, `send`, `ask`, `report`, `task.*`, `terminal.*`, `agent.exit`), orchestrator-only messaging, prompt layers, Start orchestrator, process terminals with sizes, kill and `terminal.exited` events.
 
 **Done when:**
 
