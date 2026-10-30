@@ -1,0 +1,21 @@
+[package]
+name = "swarm_term_vt"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/swarm_term_vt.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+flume.workspace = true
+libc.workspace = true
+libghostty-vt.workspace = true
+log.workspace = true
+portable-pty.workspace = true
+swarm_term.workspace = true
+thiserror.workspace = true
