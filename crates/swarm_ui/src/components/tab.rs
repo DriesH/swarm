@@ -116,7 +116,7 @@ impl Component for Tab {
         let selected = *state.read(cx);
         let tabs = [
             ("terminal-renderer", AgentStatus::Working),
-            ("menu-bar-usage", AgentStatus::Waiting),
+            ("menu-bar-usage", AgentStatus::Blocked),
             ("worktree-scripts", AgentStatus::Idle),
             ("ui-tokens", AgentStatus::Done),
         ];

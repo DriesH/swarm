@@ -2,11 +2,15 @@
 
 mod pages;
 
+use std::path::PathBuf;
+use std::time::Duration;
+
 use gpui::{
     App, Bounds, Context, Entity, FocusHandle, Global, KeyBinding, Pixels, Role, SharedString,
     Size, Subscription, TitlebarOptions, Window, WindowBounds, WindowHandle, WindowOptions,
     actions, div, px, size,
 };
+use swarm_settings::{CliSettings, Settings};
 use swarm_ui::fonts::UI_FONT;
 use swarm_ui::prelude::*;
 use swarm_ui::theme;
@@ -20,6 +24,9 @@ actions!(swarm_app, [CloseSettings]);
 const SETTINGS_CONTEXT: &str = "Settings";
 const NAV_CONTEXT: &str = "SettingsNav";
 
+/// Edits are saved once typing pauses this long.
+const SAVE_DELAY: Duration = Duration::from_millis(300);
+
 const WINDOW_SIZE: Size<Pixels> = size(px(1280.), px(900.));
 const MIN_WINDOW_SIZE: Size<Pixels> = size(px(900.), px(600.));
 
@@ -27,7 +34,6 @@ pub(crate) struct AgentInfo {
     pub name: &'static str,
     pub version: &'static str,
     pub icon: IconName,
-    pub models: &'static [&'static str],
 }
 
 pub(crate) const AGENTS: [AgentInfo; 2] = [
@@ -35,13 +41,11 @@ pub(crate) const AGENTS: [AgentInfo; 2] = [
         name: "Claude Code",
         version: "2.1.314",
         icon: IconName::ClaudeCode,
-        models: &["Opus 5.5", "Sonnet 5.5"],
     },
     AgentInfo {
         name: "Codex",
         version: "0.154.0",
         icon: IconName::Codex,
-        models: &["Default"],
     },
 ];
 
@@ -61,13 +65,6 @@ pub(crate) const DELIVERY: [&str; 4] = [
 pub(crate) const PROJECT_NOTIFICATIONS: [&str; 3] = ["All", "Errors only", "Off"];
 
 #[derive(Clone, Debug)]
-pub(crate) struct AgentSettings {
-    pub command: String,
-    pub model: usize,
-    pub skip_permissions: bool,
-}
-
-#[derive(Clone, Debug)]
 pub(crate) struct ProjectSettings {
     pub project: Project,
     pub base_branches: Vec<String>,
@@ -82,11 +79,35 @@ pub(crate) struct ProjectSettings {
     pub notifications: usize,
 }
 
-/// Settings shared by every page. In memory only for now.
-#[derive(Clone, Debug)]
+/// The agent settings of CLI number `index`, in the order of [`AGENTS`].
+pub(crate) fn cli(agents: &swarm_settings::AgentSettings, index: usize) -> &CliSettings {
+    if index == 0 {
+        &agents.claude_code
+    } else {
+        &agents.codex
+    }
+}
+
+fn cli_mut(agents: &mut swarm_settings::AgentSettings, index: usize) -> &mut CliSettings {
+    if index == 0 {
+        &mut agents.claude_code
+    } else {
+        &mut agents.codex
+    }
+}
+
+/// Settings shared by every page. The agent settings live in `settings.toml`; the rest
+/// is in memory only for now.
 pub(crate) struct SettingsState {
-    pub agents: [AgentSettings; 2],
-    pub orchestrator: usize,
+    pub settings: Settings,
+    path: Option<PathBuf>,
+    /// Why the settings file could not be read or written.
+    pub save_error: Option<SharedString>,
+    /// The last load failed. Nothing is saved until a load works, so the file stays as it is.
+    load_failed: bool,
+    /// The agent settings last loaded or queued for saving.
+    queued: swarm_settings::AgentSettings,
+    pending_save: Option<gpui::Task<()>>,
     pub allow_worker_typing: bool,
     pub idle_stop: usize,
     pub max_agents_per_task: String,
@@ -97,13 +118,9 @@ pub(crate) struct SettingsState {
 }
 
 impl SettingsState {
-    pub(crate) fn sample() -> Self {
-        let agent = |command: &str| AgentSettings {
-            command: command.to_owned(),
-            model: 0,
-            skip_permissions: true,
-        };
-
+    /// Sample data for the pages that are not real yet. `path` is the settings file; with
+    /// `None` the agent settings stay the defaults and nothing is read or written.
+    pub(crate) fn sample(path: Option<PathBuf>) -> Self {
         let projects = FakeData::sample()
             .projects
             .into_iter()
@@ -134,8 +151,12 @@ impl SettingsState {
             .collect();
 
         Self {
-            agents: [agent("claude"), agent("codex")],
-            orchestrator: 0,
+            settings: Settings::default(),
+            path,
+            save_error: None,
+            load_failed: false,
+            queued: swarm_settings::AgentSettings::default(),
+            pending_save: None,
             allow_worker_typing: true,
             idle_stop: 1,
             max_agents_per_task: "6".to_owned(),
@@ -143,6 +164,68 @@ impl SettingsState {
             notify_when: [true; 4],
             delivery: [false, true, true, true],
             projects,
+        }
+    }
+
+    /// Reads the settings file again. A file that cannot be read keeps the current values
+    /// and shows why.
+    pub(crate) fn reload(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = &self.path else {
+            return;
+        };
+
+        match swarm_settings::load(path) {
+            Ok(settings) => {
+                self.settings = settings;
+                self.save_error = None;
+                self.load_failed = false;
+            }
+            Err(error) => {
+                self.save_error = Some(error.to_string().into());
+                self.load_failed = true;
+            }
+        }
+
+        self.queued = self.settings.agents.clone();
+        self.pending_save = None;
+        cx.notify();
+    }
+
+    /// Saves the agent settings after a pause in editing.
+    fn queue_save(&mut self, cx: &mut Context<Self>) {
+        if self.path.is_none() || self.load_failed || self.settings.agents == self.queued {
+            return;
+        }
+
+        self.queued = self.settings.agents.clone();
+        self.pending_save = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SAVE_DELAY).await;
+
+            if let Err(error) = this.update(cx, SettingsState::save) {
+                log::debug!("the settings closed before they were saved: {error}");
+            }
+        }));
+    }
+
+    fn save(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = &self.path else {
+            return;
+        };
+
+        if self.load_failed {
+            return;
+        }
+
+        self.save_error = swarm_settings::save(path, &self.settings)
+            .err()
+            .map(|error| error.to_string().into());
+        cx.notify();
+    }
+
+    pub(crate) fn orchestrator_index(&self) -> usize {
+        match self.settings.agents.orchestrator {
+            swarm_settings::AgentKindSetting::ClaudeCode => 0,
+            swarm_settings::AgentKindSetting::Codex => 1,
         }
     }
 
@@ -268,8 +351,14 @@ struct ProjectInputs {
     checks: Vec<Entity<TextInput>>,
 }
 
+struct CliInputs {
+    command: Entity<TextInput>,
+    orchestrator_model: Entity<TextInput>,
+    worker_model: Entity<TextInput>,
+}
+
 struct Inputs {
-    agent_commands: [Entity<TextInput>; 2],
+    agents: [CliInputs; 2],
     max_agents_per_task: Entity<TextInput>,
     max_agents_total: Entity<TextInput>,
     projects: Vec<ProjectInputs>,
@@ -334,6 +423,30 @@ fn bind_text(
     );
 }
 
+/// Writes the input's text into the agent settings.
+fn bind_agent_text(
+    subscriptions: &mut Vec<Subscription>,
+    input: &Entity<TextInput>,
+    state: &Entity<SettingsState>,
+    apply: impl Fn(&mut swarm_settings::AgentSettings, String) + 'static,
+    cx: &mut Context<SettingsWindow>,
+) {
+    let state = state.clone();
+
+    subscriptions.push(
+        cx.subscribe(input, move |_, _, event: &TextInputEvent, cx| {
+            let TextInputEvent::Changed(text) = event else {
+                return;
+            };
+
+            state.update(cx, |state, cx| {
+                apply(&mut state.settings.agents, text.to_string());
+                cx.notify();
+            });
+        }),
+    );
+}
+
 impl SettingsWindow {
     fn new(
         state: Entity<SettingsState>,
@@ -342,26 +455,56 @@ impl SettingsWindow {
         cx: &mut Context<Self>,
     ) -> Self {
         let mut subscriptions = vec![
-            cx.observe(&state, |_, _, cx| cx.notify()),
+            cx.observe(&state, |_, state, cx| {
+                state.update(cx, SettingsState::queue_save);
+                cx.notify();
+            }),
             theme::follow_system_appearance(window, cx),
         ];
 
-        let settings = state.read(cx).clone();
+        let agents = state.read(cx).settings.agents.clone();
+        let settings = state.read(cx);
+        let (max_agents_per_task, max_agents_total) = (
+            settings.max_agents_per_task.clone(),
+            settings.max_agents_total.clone(),
+        );
+        let projects = settings.projects.clone();
 
-        let agent_commands = [0, 1].map(|index| {
-            let input = field("Command", &settings.agents[index].command, true, cx);
-            bind_text(
-                &mut subscriptions,
-                &input,
-                &state,
-                move |state, text| state.agents[index].command = text,
-                cx,
-            );
-            input
+        let agent_inputs = [0, 1].map(|index| {
+            let current = cli(&agents, index);
+            let mut input = |label: &str,
+                             text: &str,
+                             apply: fn(&mut CliSettings) -> &mut String,
+                             cx: &mut Context<Self>| {
+                let input = field(label.to_owned(), text, true, cx);
+                bind_agent_text(
+                    &mut subscriptions,
+                    &input,
+                    &state,
+                    move |agents, text| *apply(cli_mut(agents, index)) = text,
+                    cx,
+                );
+                input
+            };
+
+            CliInputs {
+                command: input("Command", &current.command, |cli| &mut cli.command, cx),
+                orchestrator_model: input(
+                    "Orchestrator model",
+                    &current.orchestrator_model,
+                    |cli| &mut cli.orchestrator_model,
+                    cx,
+                ),
+                worker_model: input(
+                    "Worker model",
+                    &current.worker_model,
+                    |cli| &mut cli.worker_model,
+                    cx,
+                ),
+            }
         });
 
-        let max_agents_per_task =
-            numeric_field("Max agents per task", &settings.max_agents_per_task, cx);
+        let max_agents_per_task = numeric_field("Max agents per task", &max_agents_per_task, cx);
         bind_text(
             &mut subscriptions,
             &max_agents_per_task,
@@ -370,7 +513,7 @@ impl SettingsWindow {
             cx,
         );
 
-        let max_agents_total = numeric_field("Max agents in total", &settings.max_agents_total, cx);
+        let max_agents_total = numeric_field("Max agents in total", &max_agents_total, cx);
         bind_text(
             &mut subscriptions,
             &max_agents_total,
@@ -382,11 +525,11 @@ impl SettingsWindow {
         let mut this = Self {
             state: state.clone(),
             page,
-            nav_focus: (0..Page::SECTIONS.len() + settings.projects.len())
+            nav_focus: (0..Page::SECTIONS.len() + projects.len())
                 .map(|_| cx.focus_handle().tab_stop(true))
                 .collect(),
             inputs: Inputs {
-                agent_commands,
+                agents: agent_inputs,
                 max_agents_per_task,
                 max_agents_total,
                 projects: Vec::new(),
@@ -394,7 +537,7 @@ impl SettingsWindow {
             subscriptions,
         };
 
-        for (index, project) in settings.projects.iter().enumerate() {
+        for (index, project) in projects.iter().enumerate() {
             let inputs = this.project_inputs(index, project, cx);
             this.inputs.projects.push(inputs);
         }
@@ -745,12 +888,12 @@ fn bind_keys(cx: &mut App) {
     ]);
 }
 
-fn shared_state(cx: &mut App) -> Entity<SettingsState> {
+fn shared_state(path: Option<PathBuf>, cx: &mut App) -> Entity<SettingsState> {
     if let Some(registry) = cx.try_global::<Registry>() {
         return registry.state.clone();
     }
 
-    let state = cx.new(|_| SettingsState::sample());
+    let state = cx.new(|_| SettingsState::sample(path));
     cx.set_global(Registry {
         state: state.clone(),
         window: None,
@@ -784,9 +927,12 @@ fn create_window(
     })
 }
 
-fn open_window(cx: &mut App) -> anyhow::Result<WindowHandle<SettingsWindow>> {
+fn open_window(
+    path: Option<PathBuf>,
+    cx: &mut App,
+) -> anyhow::Result<WindowHandle<SettingsWindow>> {
     bind_keys(cx);
-    let state = shared_state(cx);
+    let state = shared_state(path, cx);
 
     let open = cx
         .try_global::<Registry>()
@@ -799,6 +945,8 @@ fn open_window(cx: &mut App) -> anyhow::Result<WindowHandle<SettingsWindow>> {
         return Ok(handle);
     }
 
+    state.update(cx, SettingsState::reload);
+
     let handle = create_window(state, Page::Agents, WINDOW_SIZE, cx)?;
     cx.global_mut::<Registry>().window = Some(handle);
 
@@ -806,14 +954,14 @@ fn open_window(cx: &mut App) -> anyhow::Result<WindowHandle<SettingsWindow>> {
 }
 
 /// Opens the settings window, or focuses it when it is already open.
-pub(crate) fn open(_window: &mut Window, cx: &mut App) {
-    if let Err(error) = open_window(cx) {
+pub(crate) fn open(path: Option<PathBuf>, _window: &mut Window, cx: &mut App) {
+    if let Err(error) = open_window(path, cx) {
         log::error!("could not open the settings window: {error:#}");
     }
 }
 
 #[cfg(feature = "snapshot")]
-pub(crate) fn snapshot(directory: std::path::PathBuf, cx: &mut App) {
+pub(crate) fn snapshot(directory: PathBuf, cx: &mut App) {
     use std::time::Duration;
 
     use gpui::{AnyWindowHandle, AsyncApp};
@@ -845,7 +993,7 @@ pub(crate) fn snapshot(directory: std::path::PathBuf, cx: &mut App) {
                 let path = directory.join(format!("settings-{name}-{suffix}.png"));
 
                 let opened = cx.update(|cx| {
-                    let state = cx.new(|_| SettingsState::sample());
+                    let state = cx.new(|_| SettingsState::sample(None));
                     create_window(state, page, window_size, cx)
                 });
                 let window: AnyWindowHandle = match opened {
@@ -898,7 +1046,7 @@ mod tests {
     }
 
     fn open_settings(cx: &mut TestAppContext) -> WindowHandle<SettingsWindow> {
-        cx.update(open_window).expect("window opens")
+        cx.update(|cx| open_window(None, cx)).expect("window opens")
     }
 
     #[gpui::test]
@@ -951,6 +1099,128 @@ mod tests {
             .read_with(&visual, |settings, _| settings.page())
             .expect("window is open");
         assert_eq!(page, Page::Terminals);
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("swarm-settings-{name}-{}.toml", std::process::id()))
+    }
+
+    fn open_with(path: &std::path::Path, cx: &mut TestAppContext) -> Entity<SettingsState> {
+        setup(cx);
+        let window = cx
+            .update(|cx| open_window(Some(path.to_path_buf()), cx))
+            .expect("window opens");
+
+        window
+            .read_with(cx, |settings, _| settings.state.clone())
+            .expect("window is open")
+    }
+
+    #[gpui::test]
+    fn the_window_loads_the_settings_file(cx: &mut TestAppContext) {
+        let path = temp_path("load");
+        let mut saved = Settings::default();
+        saved.agents.orchestrator = swarm_settings::AgentKindSetting::Codex;
+        saved.agents.codex.worker_model = "gpt-6-sol".to_owned();
+        swarm_settings::save(&path, &saved).expect("write the settings");
+
+        let state = open_with(&path, cx);
+
+        let loaded = state.read_with(cx, |state, _| state.settings.clone());
+        std::fs::remove_file(&path).ok();
+        assert_eq!(loaded, saved);
+    }
+
+    #[gpui::test]
+    fn an_edit_is_saved_after_the_pause(cx: &mut TestAppContext) {
+        let path = temp_path("save");
+        let state = open_with(&path, cx);
+
+        state.update(cx, |state, cx| {
+            state.settings.agents.skip_permissions = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+        let early = swarm_settings::load(&path).expect("read the settings");
+
+        state.update(cx, |state, cx| {
+            state.settings.agents.claude_code.worker_model = "haiku".to_owned();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+        let restarted = swarm_settings::load(&path).expect("read the settings");
+
+        cx.executor().advance_clock(Duration::from_millis(150));
+        cx.run_until_parked();
+        let saved = swarm_settings::load(&path).expect("read the settings");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(early, Settings::default());
+        assert_eq!(restarted, Settings::default());
+        assert!(saved.agents.skip_permissions);
+        assert_eq!(saved.agents.claude_code.worker_model, "haiku");
+    }
+
+    #[gpui::test]
+    fn a_file_that_cannot_be_read_shows_an_error(cx: &mut TestAppContext) {
+        let path = temp_path("invalid");
+        std::fs::write(&path, "agents = [").expect("write the file");
+
+        let state = open_with(&path, cx);
+
+        let error = state.read_with(cx, |state, _| state.save_error.clone());
+        std::fs::remove_file(&path).ok();
+        assert!(error.is_some());
+    }
+
+    #[gpui::test]
+    fn a_file_that_cannot_be_read_is_never_overwritten(cx: &mut TestAppContext) {
+        let path = temp_path("keep-invalid");
+        std::fs::write(&path, "agents = [").expect("write the file");
+        let state = open_with(&path, cx);
+
+        state.update(cx, |state, cx| {
+            state.settings.agents.skip_permissions = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(500));
+        cx.run_until_parked();
+        state.update(cx, SettingsState::save);
+
+        let text = std::fs::read_to_string(&path).expect("read the file");
+        let error = state.read_with(cx, |state, _| state.save_error.clone());
+        std::fs::remove_file(&path).ok();
+        assert_eq!(text, "agents = [");
+        assert!(error.is_some());
+    }
+
+    #[gpui::test]
+    fn typing_in_the_command_input_changes_the_setting(cx: &mut TestAppContext) {
+        cx.update(swarm_ui::init);
+        let path = temp_path("typing");
+        let state = open_with(&path, cx);
+        let window = cx.windows()[0]
+            .downcast::<SettingsWindow>()
+            .expect("settings window");
+        let input = window
+            .read_with(cx, |settings, _| settings.inputs.agents[1].command.clone())
+            .expect("window is open");
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        input.update(&mut visual, |input, cx| input.set_text("", cx));
+        let focus = input.read_with(&visual, Focusable::focus_handle);
+        visual.update(|window, cx| window.focus(&focus, cx));
+
+        visual.simulate_input("codex-dev");
+
+        let command = state.read_with(&visual, |state, _| {
+            state.settings.agents.codex.command.clone()
+        });
+        assert_eq!(command, "codex-dev");
     }
 
     #[gpui::test]

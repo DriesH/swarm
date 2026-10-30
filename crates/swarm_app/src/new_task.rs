@@ -57,6 +57,7 @@ impl NewTaskDialog {
     pub(crate) fn new(
         project: ProjectId,
         branches: Vec<SharedString>,
+        default_kind: AgentKind,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -89,7 +90,10 @@ impl NewTaskDialog {
             project,
             branches,
             branch: 0,
-            orchestrator: 0,
+            orchestrator: ORCHESTRATORS
+                .iter()
+                .position(|(_, kind)| *kind == default_kind)
+                .unwrap_or(0),
             run_setup: true,
             busy: false,
             error: None,
@@ -107,6 +111,24 @@ impl NewTaskDialog {
     #[cfg(test)]
     pub(crate) fn error_text(&self) -> Option<&str> {
         self.error.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn orchestrator_kind(&self) -> AgentKind {
+        ORCHESTRATORS[self.orchestrator].1
+    }
+
+    #[cfg(test)]
+    pub(crate) fn choose_orchestrator(&mut self, kind: AgentKind) {
+        if let Some(index) = ORCHESTRATORS.iter().position(|(_, other)| *other == kind) {
+            self.orchestrator = index;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn type_message(&self, text: &str, cx: &mut Context<Self>) {
+        self.message
+            .update(cx, |area, cx| area.set_text(text.to_owned(), cx));
     }
 
     #[cfg(test)]
@@ -280,7 +302,8 @@ impl Workspace {
         branches.dedup();
 
         let project = self.active_project;
-        let view = cx.new(|cx| NewTaskDialog::new(project, branches, window, cx));
+        let default_kind = self.default_orchestrator();
+        let view = cx.new(|cx| NewTaskDialog::new(project, branches, default_kind, window, cx));
         let subscription =
             cx.subscribe_in(&view, window, |this, view, event, window, cx| match event {
                 NewTaskEvent::Dismissed => this.close_overlay(window, cx),
@@ -294,6 +317,21 @@ impl Workspace {
             _subscription: subscription,
         });
         cx.notify();
+    }
+
+    /// The orchestrator kind from the settings file, Claude Code when there is none.
+    fn default_orchestrator(&self) -> AgentKind {
+        let Some(path) = &self.settings_path else {
+            return AgentKind::ClaudeCode;
+        };
+
+        match swarm_settings::load(path) {
+            Ok(settings) => swarm_protocol::AgentKind::from(settings.agents.orchestrator).into(),
+            Err(error) => {
+                log::warn!("cannot read the settings: {error}");
+                AgentKind::ClaudeCode
+            }
+        }
     }
 
     /// With a daemon the task is real and the sheet stays open until it answers.
@@ -327,6 +365,9 @@ impl Workspace {
             name: request.name.to_string(),
             from: request.from.as_ref().map(ToString::to_string),
             run_setup: request.run_setup,
+            orchestrator: Some(request.kind.into()),
+            first_message: Some(request.first_message.trim().to_owned())
+                .filter(|message| !message.is_empty()),
         };
 
         dialog.update(cx, |dialog, cx| dialog.set_busy(true, cx));

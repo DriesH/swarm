@@ -11,7 +11,7 @@ use swarm_ui::prelude::*;
 use swarm_ui::styles::focus_ring;
 use swarm_ui::{FocusStyle, TextFieldSize, TileRing};
 
-use crate::model::{AgentKind, FakeLine, Terminal, TerminalId, TerminalKind};
+use crate::model::{Agent, AgentKind, FakeLine, Terminal, TerminalId, TerminalKind};
 use crate::workspace::{DataSource, View, Workspace};
 
 const CHAR_WIDTH: f32 = 7.2;
@@ -140,10 +140,10 @@ fn cells(size: Size<Pixels>) -> (u32, u32) {
 
 fn activity_of(status: AgentStatus) -> Activity {
     match status {
-        AgentStatus::Waiting => Activity::Attention,
+        AgentStatus::Blocked | AgentStatus::Error => Activity::Attention,
         AgentStatus::Working => Activity::Working,
         AgentStatus::Done => Activity::Done,
-        AgentStatus::Idle => Activity::Idle,
+        AgentStatus::Idle | AgentStatus::Unknown => Activity::Idle,
     }
 }
 
@@ -588,18 +588,26 @@ fn agent_frame(
         (_, Some(AgentKind::Codex)) => IconName::Codex,
         _ => IconName::ClaudeCode,
     };
-    let meta = agent
-        .map(|agent| agent.model.clone())
-        .or_else(|| terminal.meta.clone());
+    let meta = agent.map(Agent::meta).or_else(|| terminal.meta.clone());
+    let live = workspace.live_terminals.get(&id);
+    let is_live_agent = agent.is_some_and(|agent| agent.daemon.is_some());
 
     let mut frame = TileFrame::new(("tile", id.0), icon, name.clone())
         .focused(focused)
-        .attention(agent.is_some_and(|agent| agent.status == AgentStatus::Waiting));
+        .attention(agent.is_some_and(|agent| {
+            matches!(agent.status, AgentStatus::Blocked | AgentStatus::Error)
+        }));
 
+    // A live view tracks its own focus handle.
     if terminal.kind != TerminalKind::Orchestrator
+        && live.is_none()
         && let Some(handle) = workspace.terminal_focus.get(&id)
     {
         frame = frame.track_focus(handle);
+    }
+
+    if is_live_agent && let Some(agent) = agent {
+        frame = frame.accessible_label(agent.accessible_label());
     }
 
     if terminal.kind == TerminalKind::Process {
@@ -641,9 +649,13 @@ fn agent_frame(
         );
     }
 
+    if let Some(live) = live {
+        return frame.child(div().size_full().child(live.view.clone()));
+    }
+
     frame = frame.children(lines(terminal, cx));
 
-    if terminal.kind == TerminalKind::Orchestrator {
+    if terminal.kind == TerminalKind::Orchestrator && !is_live_agent {
         frame = frame.footer(div().m(px(10.)).child(workspace.orchestrator_input.clone()));
     }
 
@@ -864,8 +876,8 @@ mod tests {
     }
 
     #[test]
-    fn waiting_agents_need_attention() {
-        assert_eq!(activity_of(AgentStatus::Waiting), Activity::Attention);
+    fn blocked_agents_need_attention() {
+        assert_eq!(activity_of(AgentStatus::Blocked), Activity::Attention);
     }
 
     #[test]

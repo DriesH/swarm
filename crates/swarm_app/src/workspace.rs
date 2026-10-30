@@ -1,6 +1,7 @@
 //! The main window's root view.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use gpui::{
     Bounds, Context, Entity, FocusHandle, Focusable, Pixels, SharedString, Size, Subscription,
@@ -66,6 +67,10 @@ pub(crate) struct Workspace {
     pub(crate) live_terminals: HashMap<TerminalId, LiveTerminal>,
     /// Live tiles whose terminal lost its daemon connection.
     pub(crate) disconnected: HashSet<TerminalId>,
+    /// Agents of tasks the app does not know yet, applied when the task arrives.
+    pub(crate) pending_agents: HashMap<swarm_protocol::AgentId, swarm_protocol::AgentInfo>,
+    /// Where `settings.toml` lives. `None` keeps the defaults and never touches a file.
+    pub(crate) settings_path: Option<PathBuf>,
     /// Tasks whose setup exit was already handled.
     pub(crate) setup_exits_shown: HashSet<swarm_protocol::TaskId>,
     pub(crate) daemon_launch: Option<DaemonLaunch>,
@@ -133,6 +138,8 @@ impl Workspace {
             daemon: None,
             live_terminals: HashMap::new(),
             disconnected: HashSet::new(),
+            pending_agents: HashMap::new(),
+            settings_path: None,
             setup_exits_shown: HashSet::new(),
             daemon_launch: None,
             reconnecting: false,
@@ -274,7 +281,8 @@ impl Workspace {
         let is_orchestrator = self
             .data
             .terminal(terminal)
-            .is_some_and(|entry| entry.kind == TerminalKind::Orchestrator);
+            .is_some_and(|entry| entry.kind == TerminalKind::Orchestrator)
+            && !self.live_terminals.contains_key(&terminal);
         let handle = if is_orchestrator {
             self.orchestrator_input.focus_handle(cx)
         } else {
@@ -393,8 +401,8 @@ impl Render for Workspace {
                 .on_action(cx.listener(|this, _: &NewTerminal, window, cx| {
                     this.new_user_terminal(window, cx);
                 }))
-                .on_action(cx.listener(|_, _: &OpenSettings, window, cx| {
-                    crate::settings::open(window, cx);
+                .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
+                    crate::settings::open(this.settings_path.clone(), window, cx);
                 }))
                 .on_action(cx.listener(|this, _: &ToggleCommandPalette, window, cx| {
                     this.toggle_palette(window, cx);

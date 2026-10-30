@@ -3,8 +3,11 @@
 use std::path::PathBuf;
 
 use gpui::{Hsla, SharedString, rgb};
-use swarm_protocol::{ProjectInfo, TaskInfo, TerminalId as DaemonTerminalId};
-use swarm_term::ExitStatus;
+use swarm_protocol::{
+    AgentId as DaemonAgentId, AgentInfo, AgentLifecycle, AgentRole,
+    AgentStatus as DaemonAgentStatus, ProjectInfo, TaskInfo, TerminalId as DaemonTerminalId,
+};
+use swarm_term::{BlockedKind, ExitStatus};
 use swarm_ui::AgentStatus;
 use swarm_ui::prelude::Color;
 
@@ -72,7 +75,7 @@ pub(crate) struct Task {
     pub name: SharedString,
     pub branch: SharedString,
     pub status: TaskStatus,
-    /// A real task has no orchestrator until agents exist (phase 4).
+    /// A real task has one once the daemon reports its orchestrator.
     pub orchestrator: Option<AgentId>,
     pub workers: Vec<AgentId>,
     pub processes: Vec<TerminalId>,
@@ -91,6 +94,68 @@ pub(crate) enum AgentKind {
     Codex,
 }
 
+impl AgentKind {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "Claude Code",
+            Self::Codex => "Codex",
+        }
+    }
+}
+
+impl From<swarm_protocol::AgentKind> for AgentKind {
+    fn from(kind: swarm_protocol::AgentKind) -> Self {
+        match kind {
+            swarm_protocol::AgentKind::ClaudeCode => Self::ClaudeCode,
+            swarm_protocol::AgentKind::Codex => Self::Codex,
+        }
+    }
+}
+
+impl From<AgentKind> for swarm_protocol::AgentKind {
+    fn from(kind: AgentKind) -> Self {
+        match kind {
+            AgentKind::ClaudeCode => Self::ClaudeCode,
+            AgentKind::Codex => Self::Codex,
+        }
+    }
+}
+
+/// What links an agent to the daemon.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DaemonAgent {
+    pub id: DaemonAgentId,
+    pub task: swarm_protocol::TaskId,
+    /// The agent's terminal while it runs.
+    pub terminal: Option<DaemonTerminalId>,
+    pub status: DaemonAgentStatus,
+    pub message: Option<SharedString>,
+    pub lifecycle: AgentLifecycle,
+    /// Of the daemon's last report. An older report is dropped.
+    pub revision: u64,
+}
+
+/// The sidebar and tile visuals for a daemon status.
+pub(crate) fn ui_status(status: DaemonAgentStatus) -> AgentStatus {
+    match status {
+        DaemonAgentStatus::Unknown => AgentStatus::Unknown,
+        DaemonAgentStatus::Idle => AgentStatus::Idle,
+        DaemonAgentStatus::Working => AgentStatus::Working,
+        DaemonAgentStatus::Blocked(_) => AgentStatus::Blocked,
+        DaemonAgentStatus::Done => AgentStatus::Done,
+        DaemonAgentStatus::Error => AgentStatus::Error,
+    }
+}
+
+fn blocked_label(kind: BlockedKind) -> &'static str {
+    match kind {
+        BlockedKind::Permission => "permission",
+        BlockedKind::Question => "question",
+        BlockedKind::Auth => "login",
+        BlockedKind::Other => "blocked",
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Agent {
     pub id: AgentId,
@@ -100,6 +165,72 @@ pub(crate) struct Agent {
     pub model: SharedString,
     pub status: AgentStatus,
     pub terminal: TerminalId,
+    /// Set for an agent the daemon runs.
+    pub daemon: Option<DaemonAgent>,
+}
+
+impl Agent {
+    /// What a real agent shows next to its name: kind, model, then why it is blocked
+    /// or has stopped. A fake agent shows its model only.
+    pub(crate) fn meta(&self) -> SharedString {
+        let Some(daemon) = &self.daemon else {
+            return self.model.clone();
+        };
+
+        let mut parts = vec![self.kind.label().to_owned(), self.model.to_string()];
+
+        match daemon.lifecycle {
+            AgentLifecycle::Stopped => parts.push("stopped".to_owned()),
+            AgentLifecycle::Resumable => parts.push("resumable".to_owned()),
+            AgentLifecycle::Starting | AgentLifecycle::Running => {}
+        }
+        if let DaemonAgentStatus::Blocked(kind) = daemon.status {
+            parts.push(blocked_label(kind).to_owned());
+        }
+        if matches!(
+            daemon.status,
+            DaemonAgentStatus::Blocked(_) | DaemonAgentStatus::Error
+        ) && let Some(message) = &daemon.message
+        {
+            parts.push(message.to_string());
+        }
+
+        SharedString::from(parts.join(" \u{b7} "))
+    }
+
+    /// The status word for screen readers, for example "needs you, permission".
+    pub(crate) fn status_text(&self) -> String {
+        let Some(daemon) = &self.daemon else {
+            return self.status.label().to_lowercase();
+        };
+
+        match daemon.status {
+            DaemonAgentStatus::Blocked(kind) => format!("needs you, {}", blocked_label(kind)),
+            _ => self.status.label().to_lowercase(),
+        }
+    }
+
+    /// The name a screen reader announces, for example
+    /// "orchestrator, Claude Code, opus, needs you, permission".
+    pub(crate) fn accessible_label(&self) -> String {
+        let mut parts = vec![self.name.to_string(), self.kind.label().to_owned()];
+
+        if self.daemon.is_some() {
+            parts.push(self.model.to_string());
+        }
+        parts.push(self.status_text());
+
+        if let Some(daemon) = &self.daemon {
+            match daemon.lifecycle {
+                AgentLifecycle::Stopped => parts.push("stopped".to_owned()),
+                AgentLifecycle::Resumable => parts.push("resumable".to_owned()),
+                AgentLifecycle::Starting | AgentLifecycle::Running => {}
+            }
+            parts.extend(daemon.message.iter().map(ToString::to_string));
+        }
+
+        parts.join(", ")
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -372,6 +503,7 @@ impl Builder {
             model: SharedString::new(spec.model),
             status: spec.status,
             terminal,
+            daemon: None,
         });
 
         id
@@ -553,7 +685,7 @@ impl FakeData {
                 name: "pty-io",
                 kind: AgentKind::Codex,
                 model: "codex",
-                status: AgentStatus::Waiting,
+                status: AgentStatus::Blocked,
                 lines: lines(&[
                     ("• Ran cargo test -p swarm-term", Color::Default),
                     ("  └ 14 passed · 0 failed", Color::Ok),
@@ -768,7 +900,7 @@ impl FakeData {
         id
     }
 
-    /// Adds or updates a task the daemon runs. It has no agents, so no orchestrator.
+    /// Adds or updates a task the daemon runs, with its agents.
     pub(crate) fn sync_task(&mut self, project: ProjectId, info: &TaskInfo) -> TaskId {
         let daemon = DaemonTask {
             id: info.id,
@@ -790,8 +922,11 @@ impl FakeData {
                 setup_terminal: info.setup_terminal.or(known),
                 ..daemon
             });
+            let id = task.id;
 
-            return task.id;
+            self.sync_agents(info);
+
+            return id;
         }
 
         let id = TaskId(
@@ -818,7 +953,149 @@ impl FakeData {
             daemon: Some(daemon),
         });
 
+        self.sync_agents(info);
+
         id
+    }
+
+    fn sync_agents(&mut self, info: &TaskInfo) {
+        for agent in &info.agents {
+            self.sync_agent(agent);
+        }
+    }
+
+    /// Adds or updates an agent the daemon runs. Returns the agent and its tile's terminal,
+    /// or `None` when its task is unknown.
+    pub(crate) fn sync_agent(&mut self, info: &AgentInfo) -> Option<(AgentId, TerminalId)> {
+        let task = self
+            .tasks
+            .iter()
+            .find(|task| {
+                task.daemon
+                    .as_ref()
+                    .is_some_and(|daemon| daemon.id == info.task)
+            })
+            .map(|task| task.id)?;
+
+        let daemon = DaemonAgent {
+            id: info.id,
+            task: info.task,
+            terminal: info.terminal,
+            status: info.status,
+            message: info.message.as_deref().map(SharedString::new),
+            lifecycle: info.lifecycle,
+            revision: info.revision,
+        };
+
+        let existing = self.agents.iter_mut().find(|agent| {
+            agent
+                .daemon
+                .as_ref()
+                .is_some_and(|other| other.id == info.id)
+        });
+
+        let ids = if let Some(agent) = existing {
+            let stale = agent
+                .daemon
+                .as_ref()
+                .is_some_and(|known| known.revision >= info.revision);
+            if stale {
+                return Some((agent.id, agent.terminal));
+            }
+
+            agent.model = SharedString::new(&info.model);
+            agent.status = ui_status(info.status);
+            agent.daemon = Some(daemon);
+
+            (agent.id, agent.terminal)
+        } else {
+            self.add_daemon_agent(task, info, daemon)
+        };
+
+        self.refresh_task_status(task);
+
+        Some(ids)
+    }
+
+    fn add_daemon_agent(
+        &mut self,
+        task: TaskId,
+        info: &AgentInfo,
+        daemon: DaemonAgent,
+    ) -> (AgentId, TerminalId) {
+        let id = AgentId(
+            self.agents
+                .iter()
+                .map(|agent| agent.id.0 + 1)
+                .max()
+                .unwrap_or(0),
+        );
+        let terminal = self.next_terminal_id();
+        let (name, kind) = match info.role {
+            AgentRole::Orchestrator => (
+                SharedString::new("orchestrator"),
+                TerminalKind::Orchestrator,
+            ),
+            AgentRole::Worker => (
+                SharedString::from(format!("worker {}", info.id.0)),
+                TerminalKind::Worker,
+            ),
+        };
+
+        self.terminals.push(Terminal {
+            id: terminal,
+            kind,
+            title: name.clone(),
+            meta: None,
+            owner: None,
+            link: None,
+            requested_size: None,
+            lines: Vec::new(),
+        });
+        self.agents.push(Agent {
+            id,
+            task,
+            name,
+            kind: info.kind.into(),
+            model: SharedString::new(&info.model),
+            status: ui_status(info.status),
+            terminal,
+            daemon: Some(daemon),
+        });
+
+        if let Some(entry) = self.tasks.iter_mut().find(|entry| entry.id == task) {
+            match info.role {
+                AgentRole::Orchestrator => entry.orchestrator = Some(id),
+                AgentRole::Worker => entry.workers.push(id),
+            }
+        }
+
+        (id, terminal)
+    }
+
+    /// A real task needs you when any agent is blocked or in error, and works when any agent works.
+    fn refresh_task_status(&mut self, task: TaskId) {
+        let statuses: Vec<DaemonAgentStatus> = self
+            .agents_of(task)
+            .filter_map(|agent| agent.daemon.as_ref().map(|daemon| daemon.status))
+            .collect();
+
+        let status = if statuses.iter().any(|status| {
+            matches!(
+                status,
+                DaemonAgentStatus::Blocked(_) | DaemonAgentStatus::Error
+            )
+        }) {
+            TaskStatus::NeedsYou
+        } else if statuses.contains(&DaemonAgentStatus::Working) {
+            TaskStatus::Working
+        } else {
+            TaskStatus::Idle
+        };
+
+        if let Some(entry) = self.tasks.iter_mut().find(|entry| entry.id == task) {
+            entry.status = status;
+        }
     }
 
     pub(crate) fn project(&self, id: ProjectId) -> Option<&Project> {
@@ -1072,6 +1349,7 @@ impl FakeData {
             model: model.into(),
             status: AgentStatus::Working,
             terminal,
+            daemon: None,
         });
         self.tasks.push(Task {
             id: task,
@@ -1279,5 +1557,112 @@ mod tests {
             data.worktree_of(start_one),
             Some(PathBuf::from("/repo/demo1"))
         );
+    }
+
+    fn task_with(agents: Vec<AgentInfo>) -> TaskInfo {
+        TaskInfo {
+            id: swarm_protocol::TaskId(7),
+            project: swarm_protocol::ProjectId(1),
+            name: "login".into(),
+            branch: "swarm/login".into(),
+            base: "main".into(),
+            worktree: PathBuf::from("/tmp/worktree"),
+            ports: Vec::new(),
+            setup_terminal: None,
+            setup_exit: None,
+            agents,
+        }
+    }
+
+    fn agent_with(status: DaemonAgentStatus, revision: u64) -> AgentInfo {
+        AgentInfo {
+            id: DaemonAgentId(1),
+            task: swarm_protocol::TaskId(7),
+            role: AgentRole::Orchestrator,
+            kind: swarm_protocol::AgentKind::ClaudeCode,
+            model: "opus".into(),
+            terminal: (status != DaemonAgentStatus::Unknown).then_some(DaemonTerminalId(3)),
+            status,
+            message: None,
+            lifecycle: AgentLifecycle::Running,
+            revision,
+        }
+    }
+
+    fn live_task(data: &mut FakeData, agents: Vec<AgentInfo>) -> TaskId {
+        let project = data.sync_project(&project_info(1, None));
+
+        data.sync_task(project, &task_with(agents))
+    }
+
+    fn orchestrator(data: &FakeData, task: TaskId) -> &Agent {
+        let id = data.task(task).and_then(|task| task.orchestrator);
+
+        id.and_then(|id| data.agent(id)).expect("an orchestrator")
+    }
+
+    #[test]
+    fn an_older_listing_does_not_replace_a_newer_event() {
+        let mut data = FakeData::live();
+        let task = live_task(&mut data, Vec::new());
+        data.sync_agent(&agent_with(DaemonAgentStatus::Working, 5));
+
+        data.sync_task(
+            data.task(task).expect("task").project,
+            &task_with(vec![agent_with(DaemonAgentStatus::Unknown, 3)]),
+        );
+
+        let agent = orchestrator(&data, task);
+        let daemon = agent.daemon.as_ref().expect("daemon agent");
+        assert_eq!(daemon.status, DaemonAgentStatus::Working);
+        assert_eq!(daemon.terminal, Some(DaemonTerminalId(3)));
+        assert_eq!(data.task(task).expect("task").status, TaskStatus::Working);
+    }
+
+    #[test]
+    fn a_newer_listing_replaces_an_older_event() {
+        let mut data = FakeData::live();
+        let task = live_task(&mut data, Vec::new());
+        data.sync_agent(&agent_with(DaemonAgentStatus::Unknown, 3));
+
+        data.sync_task(
+            data.task(task).expect("task").project,
+            &task_with(vec![agent_with(DaemonAgentStatus::Working, 5)]),
+        );
+
+        let daemon = orchestrator(&data, task).daemon.as_ref().expect("daemon");
+        assert_eq!(daemon.status, DaemonAgentStatus::Working);
+        assert_eq!(daemon.revision, 5);
+    }
+
+    #[test]
+    fn an_older_event_does_not_replace_a_newer_one() {
+        let mut data = FakeData::live();
+        let task = live_task(&mut data, Vec::new());
+        data.sync_agent(&agent_with(DaemonAgentStatus::Done, 6));
+
+        data.sync_agent(&agent_with(DaemonAgentStatus::Working, 6));
+        data.sync_agent(&agent_with(DaemonAgentStatus::Working, 4));
+
+        let agent = orchestrator(&data, task);
+        assert_eq!(agent.status, AgentStatus::Done);
+    }
+
+    #[test]
+    fn an_agent_in_error_makes_the_task_need_you() {
+        let mut data = FakeData::live();
+        let task = live_task(&mut data, vec![agent_with(DaemonAgentStatus::Error, 1)]);
+
+        assert_eq!(data.task(task).expect("task").status, TaskStatus::NeedsYou);
+    }
+
+    #[test]
+    fn an_unknown_status_has_its_own_look_and_word() {
+        let mut data = FakeData::live();
+        let task = live_task(&mut data, vec![agent_with(DaemonAgentStatus::Unknown, 1)]);
+
+        let agent = orchestrator(&data, task);
+        assert_eq!(agent.status, AgentStatus::Unknown);
+        assert_eq!(agent.status_text(), "unknown");
     }
 }

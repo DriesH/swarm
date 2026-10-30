@@ -57,6 +57,7 @@ fn open_workspace(cx: &mut App) -> anyhow::Result<gpui::WindowHandle<Workspace>>
 
     if !sample {
         handle.update(cx, |workspace, window, cx| {
+            workspace.settings_path = swarm_settings::default_path();
             workspace.connect_daemon(window, cx);
         })?;
     }

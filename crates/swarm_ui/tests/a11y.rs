@@ -139,13 +139,13 @@ fn segmented_control_is_a_radio_group() {
 fn tab_reports_name_status_and_selection() {
     with_window(|window, cx| {
         let info = a11y_info(
-            Tab::new("t", "menu-bar-usage", AgentStatus::Waiting).toggle_state(true),
+            Tab::new("t", "menu-bar-usage", AgentStatus::Blocked).toggle_state(true),
             window,
             cx,
         );
 
         assert_eq!(info.role, Some(Role::Tab));
-        assert_eq!(info.node.label(), Some("menu-bar-usage, Waiting"));
+        assert_eq!(info.node.label(), Some("menu-bar-usage, Blocked"));
         assert_eq!(info.node.is_selected(), Some(true));
     });
 }
@@ -155,14 +155,14 @@ fn list_row_is_a_selectable_list_item() {
     with_window(|window, cx| {
         let info = a11y_info(
             ListRow::new("r", "pty-io")
-                .accessible_label("pty-io, Waiting")
+                .accessible_label("pty-io, Blocked")
                 .toggle_state(true),
             window,
             cx,
         );
 
         assert_eq!(info.role, Some(Role::ListItem));
-        assert_eq!(info.node.label(), Some("pty-io, Waiting"));
+        assert_eq!(info.node.label(), Some("pty-io, Blocked"));
         assert_eq!(info.node.is_selected(), Some(true));
     });
 }

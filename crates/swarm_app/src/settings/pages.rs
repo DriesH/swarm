@@ -1,6 +1,7 @@
 //! One render function per settings page.
 
 use gpui::{AnyElement, ElementId, Entity, FontWeight, Role, SharedString, Stateful, div, px};
+use swarm_settings::AgentKindSetting;
 use swarm_ui::prelude::*;
 use swarm_ui::styles::focus_ring;
 use swarm_ui::theme::{self, Appearance};
@@ -175,7 +176,7 @@ impl SettingsWindow {
         let settings = state.read(cx);
 
         let cards = AGENTS.iter().enumerate().map(|(index, info)| {
-            let agent = &settings.agents[index];
+            let inputs = &self.inputs.agents[index];
             let icon_color = if index == 0 {
                 Color::Claude
             } else {
@@ -193,26 +194,13 @@ impl SettingsWindow {
 
             let card = Panel::new()
                 .row(header)
+                .row(input_row("Command", &inputs.command, 160.))
                 .row(input_row(
-                    "Command",
-                    &self.inputs.agent_commands[index],
-                    120.,
+                    "Orchestrator model",
+                    &inputs.orchestrator_model,
+                    160.,
                 ))
-                .row(dropdown_row(
-                    state,
-                    ("agent-model", index),
-                    "Default model",
-                    options(info.models),
-                    agent.model,
-                    move |state, value| state.agents[index].model = value,
-                ))
-                .row(switch_row(
-                    state,
-                    ("agent-skip", index),
-                    "Skip permission prompts",
-                    agent.skip_permissions,
-                    move |state, on| state.agents[index].skip_permissions = on,
-                ));
+                .row(input_row("Worker model", &inputs.worker_model, 160.));
 
             section(info.name, card)
         });
@@ -225,8 +213,21 @@ impl SettingsWindow {
                 "orchestrator",
                 "Orchestrator agent",
                 options(&agent_names),
-                settings.orchestrator,
-                |state, value| state.orchestrator = value,
+                settings.orchestrator_index(),
+                |state, value| {
+                    state.settings.agents.orchestrator = if value == 0 {
+                        AgentKindSetting::ClaudeCode
+                    } else {
+                        AgentKindSetting::Codex
+                    };
+                },
+            ))
+            .row(switch_row(
+                state,
+                "agent-skip",
+                "Skip permission prompts",
+                settings.settings.agents.skip_permissions,
+                |state, on| state.settings.agents.skip_permissions = on,
             ))
             .row(switch_row(
                 state,
@@ -254,9 +255,20 @@ impl SettingsWindow {
                 64.,
             ));
 
+        let error = settings.save_error.clone().map(|message| {
+            div()
+                .id("settings-save-error")
+                .role(Role::Alert)
+                .aria_label(message.clone())
+                .text_size(px(12.))
+                .text_color(Color::Del.hsla(cx))
+                .child(message)
+        });
+
         v_flex()
             .gap(px(26.))
             .child(page_title("Agents"))
+            .children(error)
             .children(cards)
             .child(section("Workers", workers))
             .into_any_element()

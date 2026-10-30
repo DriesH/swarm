@@ -10,7 +10,7 @@ cargo run -p swarm_app
 
 ## Run with the daemon
 
-Projects, tasks, user terminals and the setup terminal are real when `swarm-daemon` runs. Agents and workers do not exist yet, so a real task has no orchestrator tile.
+Projects, tasks, agents, user terminals and the setup terminal are real when `swarm-daemon` runs. A real task shows its orchestrator as a live terminal tile; its status ring and the project's "Needs you" marker follow the agents' status.
 
 ```sh
 cargo build -p swarm_daemon && cargo run -p swarm_app

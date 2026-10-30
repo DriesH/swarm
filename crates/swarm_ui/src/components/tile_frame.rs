@@ -277,7 +277,7 @@ impl Component for TileFrame {
                         tile("attention-wrap").child(
                             TileFrame::new("pty-io", IconName::Codex, "pty-io")
                                 .meta("codex")
-                                .status(AgentStatus::Waiting)
+                                .status(AgentStatus::Blocked)
                                 .attention(true)
                                 .action(IconButton::new(
                                     "minimize",

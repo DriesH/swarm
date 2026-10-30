@@ -12,20 +12,32 @@ use crate::prelude::*;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AgentStatus {
     Working,
-    Waiting,
+    Blocked,
     Done,
     Idle,
+    Error,
+    /// The daemon has not reported a status.
+    Unknown,
 }
 
 impl AgentStatus {
-    pub const ALL: [Self; 4] = [Self::Working, Self::Waiting, Self::Done, Self::Idle];
+    pub const ALL: [Self; 6] = [
+        Self::Working,
+        Self::Blocked,
+        Self::Done,
+        Self::Idle,
+        Self::Error,
+        Self::Unknown,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Working => "Working",
-            Self::Waiting => "Waiting",
+            Self::Blocked => "Blocked",
             Self::Done => "Done",
             Self::Idle => "Idle",
+            Self::Error => "Error",
+            Self::Unknown => "Unknown",
         }
     }
 
@@ -35,9 +47,11 @@ impl AgentStatus {
 
         match self {
             Self::Working => colors.accent,
-            Self::Waiting => colors.warn,
+            Self::Blocked => colors.warn,
             Self::Done => colors.ok,
             Self::Idle => colors.faint,
+            Self::Error => colors.del,
+            Self::Unknown => colors.muted,
         }
     }
 
@@ -46,9 +60,10 @@ impl AgentStatus {
 
         match self {
             Self::Working => (colors.accent, colors.accent_bg),
-            Self::Waiting => (colors.warn, colors.warn_bg),
+            Self::Blocked => (colors.warn, colors.warn_bg),
             Self::Done => (colors.ok, colors.ok_bg),
-            Self::Idle => (colors.muted, colors.soft),
+            Self::Idle | Self::Unknown => (colors.muted, colors.soft),
+            Self::Error => (colors.del, colors.del_bg),
         }
     }
 }
@@ -138,13 +153,13 @@ fn status_mark(status: AgentStatus, size: Pixels, cx: &App) -> AnyElement {
                 |mark, delta| mark.with_transformation(Transformation::rotate(percentage(delta))),
             )
             .into_any_element(),
-        AgentStatus::Waiting | AgentStatus::Done => svg()
+        AgentStatus::Blocked | AgentStatus::Done | AgentStatus::Error => svg()
             .data(circle_svg(size_f32, STROKE, true).as_bytes())
             .size(size)
             .flex_none()
             .text_color(color)
             .into_any_element(),
-        AgentStatus::Idle => svg()
+        AgentStatus::Idle | AgentStatus::Unknown => svg()
             .data(circle_svg(size_f32, STROKE, false).as_bytes())
             .size(size)
             .flex_none()
@@ -154,7 +169,7 @@ fn status_mark(status: AgentStatus, size: Pixels, cx: &App) -> AnyElement {
 }
 
 /// 10px status ring for tabs and tile headers. Working spins (static when
-/// reduce motion is on), waiting and done are filled, idle is an empty ring.
+/// reduce motion is on), blocked, done and error are filled, idle and unknown are empty rings.
 #[derive(IntoElement)]
 #[must_use]
 pub struct StatusRing {
@@ -206,7 +221,7 @@ impl StatusDot {
 
 impl RenderOnce for StatusDot {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let filled = self.status != AgentStatus::Idle;
+        let filled = !matches!(self.status, AgentStatus::Idle | AgentStatus::Unknown);
 
         svg()
             .data(circle_svg(f32::from(self.size), STROKE, filled).as_bytes())
@@ -252,7 +267,7 @@ impl Component for StatusPill {
                 "Custom label",
                 [example(
                     "Needs you",
-                    StatusPill::new(AgentStatus::Waiting).label("Needs you"),
+                    StatusPill::new(AgentStatus::Blocked).label("Needs you"),
                 )],
             ))
             .into_any_element()

@@ -113,8 +113,8 @@ impl Component for TrayChip {
                         TrayChip::new("bench", IconName::Codex, "bench", AgentStatus::Idle),
                     ),
                     example(
-                        "Waiting",
-                        TrayChip::new("pty-io", IconName::Codex, "pty-io", AgentStatus::Waiting),
+                        "Blocked",
+                        TrayChip::new("pty-io", IconName::Codex, "pty-io", AgentStatus::Blocked),
                     ),
                 ],
             ))
