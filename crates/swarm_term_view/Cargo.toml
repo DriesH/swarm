@@ -1,0 +1,22 @@
+[package]
+name = "swarm_term_view"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/swarm_term_view.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+flume.workspace = true
+gpui.workspace = true
+log.workspace = true
+swarm_term.workspace = true
+swarm_ui.workspace = true
+unicode-segmentation.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
