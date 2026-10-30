@@ -88,6 +88,16 @@ Harness calls for the Start orchestrator:
 - **Terminal tiles**: separate cards with 10 px gaps and rounded corners. Focus is a 2 px accent border, "needs attention" a 2 px amber border; both are drawn above the tile and never move the layout. Only the orchestrator tile has an input box.
 - **Status bar**: the tray chips and **+ Terminal** on the left; branch, agent count, process count, user terminal count (each with an icon), "permissions skipped" and ⌘K on the right.
 
+### Command palette
+
+⌘K opens a palette over the window: one search field, then grouped results.
+
+- **Suggested**: the most likely next actions for the open task (Review changes ⌘⇧R, Focus orchestrator ⌘1, New task ⌘T, Plan with orchestrator ⌘⇧T).
+- **Tasks**: switch tab; shows each task's status.
+- **Agents**: focus an agent's tile (⌘1–⌘9); shows each agent's status.
+- **Swarm**: New terminal ⌘⌥T, Settings ⌘, and every other action.
+- Typing filters all groups. Shortcuts are shown here, not on buttons. Esc closes. The field is a combobox and the results a listbox for VoiceOver.
+
 ### Swarm view
 
 - Graph: the orchestrator on top, workers below. Edges are colored by message type (task, question, report); dots on an edge are messages in flight.

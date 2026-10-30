@@ -139,4 +139,3 @@ Each phase ends with a pull request into `main`. A phase is done when every box 
 
 - Settings › Terminals and Prompts (phase 8)
 - Menu bar usage popover (phase 7)
-- Command palette (phase 2)
