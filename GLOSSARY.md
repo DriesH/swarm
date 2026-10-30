@@ -21,12 +21,8 @@ One Claude Code or Codex process running in its own terminal.
 _Avoid_: Bot, session, pane
 
 **Orchestrator**:
-The single agent that leads one task's swarm: it splits the task, spawns workers and is the only one that talks to them.
-_Avoid_: Lead, manager, conductor
-
-**Dispatcher**:
-The short-lived agent a project opens with: it turns the user's request into tasks, briefs each task's orchestrator, then exits.
-_Avoid_: Initial orchestrator, project orchestrator, planner
+The single agent that leads one task's swarm: it splits the task, spawns workers and is the only one that talks to them. The project's **Start orchestrator** instead splits a request into tasks, briefs each task's orchestrator, then exits.
+_Avoid_: Dispatcher, lead, manager, conductor
 
 **Worker**:
 An agent spawned by the orchestrator to do one part of the task.

@@ -42,37 +42,44 @@ Every agent terminal gets `SWARM_SOCKET`, `SWARM_AGENT_ID` and `SWARM_TASK`.
 
 ### Agent state
 
-- **OSC 7501 (Program Status Protocol)** is the main source. Claude Code emits it since 2.1.295 and Codex emits it (`codex-rs/tui/src/terminal_program_status.rs`). States: `idle`, `working`, `done`, `blocked` (`kind=permission|question|auth`), `error`, plus `clear`. The daemon reads it from the PTY stream. `libghostty-vt` 0.2.2 has no API for it, so the daemon parses this OSC itself before feeding bytes to the terminal. Spike 3 checks how Codex decides to turn it on.
+- **OSC 7501 (Program Status Protocol)** is the main source. Claude Code emits it since 2.1.295 and Codex emits it (`codex-rs/tui/src/terminal_program_status.rs`). States: `idle`, `working`, `done`, `blocked` (`kind=permission|question|auth`), `error`, plus `clear`. The daemon reads it from the PTY stream. `libghostty-vt` 0.2.2 has no API for it, so the daemon parses this OSC itself before feeding bytes to the terminal. Claude Code only sends it after the terminal answers its support query, so the daemon answers that query. Codex (0.163.0+) sends it to any terminal. Details: `docs/spikes/agent-status.md`.
 - Claude Code hooks add what OSC 7501 lacks: session ID (for resume), `StopFailure` reasons.
 - Screen matching is the last fallback.
 - Process terminals that emit OSC 7501 (e.g. a test runner) show their state the same way.
 
 ### How work starts
 
-**Opening a project.** The project opens on a **Start** tab with a **dispatcher**: a Claude Code (or Codex) session in the project root on the base branch.
+**Opening a project.** The project opens on a **Start** tab with an **orchestrator**: a Claude Code (or Codex) session in the project root on the base branch.
 
 1. The user says what they want.
-2. The dispatcher splits it into tasks. One request can become one task or several.
-3. For each task it calls `task.create`: Swarm makes the task worktree and branch, runs the setup script, opens a tab and starts that task's orchestrator with the dispatcher's brief as its first message.
-4. When every orchestrator confirms its brief, the dispatcher exits and the Start tab closes. Focus moves to the first task tab.
+2. The Start orchestrator splits it into tasks. One request can become one task or several.
+3. For each task it calls `task.create`: Swarm makes the task worktree and branch, runs the setup script, opens a tab and starts that task's orchestrator with the Start orchestrator's brief as its first message.
+4. When every orchestrator confirms its brief, the Start orchestrator exits and the Start tab closes. Focus moves to the first task tab.
 
-**Adding a task by hand.** The **+** in the tab bar opens a New task sheet: name, branch from (default: base branch; option: current tab's branch), orchestrator agent, optional first message, run setup script. Swarm creates the worktree and tab and starts an empty or briefed orchestrator.
+**When the Start tab shows.**
 
-The Start tab can be reopened from the tab bar at any time.
+- A project with no active tasks opens on the Start tab.
+- A project with active tasks opens on the tab used last. There is no Start tab.
+- The Start tab closes itself once every task orchestrator has confirmed its brief. If the request is unclear, the Start orchestrator asks first and the tab stays open until it is done.
 
-Harness calls for the dispatcher:
+**Starting new work later.** The **+** in the tab bar opens a menu with two choices:
+
+- **New task**: a sheet with name, branch from (default: base branch; option: current tab's branch), orchestrator agent, optional first message, run setup script. Swarm creates the worktree and tab and starts one orchestrator.
+- **Plan with orchestrator**: opens a Start tab for a bigger request that should be split into several tasks. Only one Start tab can be open per project.
+
+Harness calls for the Start orchestrator:
 
 | Call | What |
 |---|---|
 | `task.create {name, from?, brief, agent?}` | Creates task worktree, branch, tab and orchestrator; sends `brief` as its first message. Returns the task ID. |
 | `task.list` | Lists tasks in the project with status. |
 | `task.wait {ids, until: briefed\|done}` | Waits until orchestrators confirm their brief, or finish. |
-| `agent.exit` | Ends the caller's own session (used by the dispatcher when done). |
+| `agent.exit` | Ends the caller's own session (used by the Start orchestrator when done). |
 
 ### Workspace layout
 
 - **Sidebar**: projects, then the agents and terminals of the open tab.
-- **Tabs**: one tab per task, at the top of the window, plus the Start tab while a dispatcher runs. A tab shows the task name and its status. Each task runs in its own task worktree; worker worktrees are not tabs.
+- **Tabs**: one tab per task, at the top of the window, plus the Start tab while its orchestrator runs. A tab shows the task name and its status. Each task runs in its own task worktree; worker worktrees are not tabs.
 - **Right panel**: **Files** (file tree of the task worktree, changed files marked) or **Changes** (changed files grouped by worker, with a **Review** button). The Changes toggle shows the diff count.
 - **Views**: Terminals (default), Swarm graph or Review.
 
@@ -140,6 +147,16 @@ Two sources:
 
 Live comments are anchored to the code text, not line numbers. If the agent rewrites those lines, the comment is marked outdated.
 
+### Pull requests
+
+A PR can only be created after the task is approved in Review. This makes the user read the code first.
+
+1. **Review → Approve.** The Approve button turns into **Create PR**.
+2. **Create PR** opens the PR panel on the right (a header toggle next to Files and Changes): title and description drafted by the orchestrator (`pr.md` prompt), **local checks** from `.swarm/config.toml` (run in the task worktree; the PR can only be created when they pass), open as draft. Uses `gh`; pushes the branch first.
+3. **After creation** the header button shows the live PR state, e.g. **#42 · checks running** or **#42 · ready to merge**. Its panel shows **GitHub checks** (CI on the pushed branch, read through `gh`), reviewers, Ready for review, Merge, and after-merge options (remove agent worktrees, close the tab).
+
+Other ways in: ⌘K "Create pull request"; `swarm pr draft` from the orchestrator opens the panel with its draft (still only after approval).
+
 ### Notifications
 
 Native macOS notifications through GPUI's `show_system_notification`. Only the orchestrator notifies the user.
@@ -159,9 +176,66 @@ Native macOS notifications through GPUI's `show_system_notification`. Only the o
 - Needs a real `.app` bundle: GPUI disables notifications under `cargo run`.
 - No inline reply in v1: GPUI supports action buttons, not text input.
 
+### System check
+
+Swarm depends on tools it does not ship. It checks them on first launch (welcome screen) and in **Settings › General › System**:
+
+| Tool | Check | Fix |
+|---|---|---|
+| Git | `git --version` | Point to Xcode Command Line Tools install |
+| Claude Code | `claude --version`, signed in | Install / sign in in a user terminal |
+| Codex | `codex --version`, signed in | Install / sign in in a user terminal |
+| GitHub CLI | `gh --version` | Install: `brew install gh` if Homebrew exists, else download the official release into `~/Library/Application Support/Swarm/bin/` (Swarm-only, nothing system-wide) |
+| GitHub account | `gh auth status` | `gh auth login --web` in a user terminal |
+| Notifications | macOS authorization status | Ask for permission |
+
+- Never install silently: every fix is a button, and installs run in a visible user terminal (agents can't see it, ADR 0006).
+- Missing optional tools disable only their features: no `gh` means Review and Approve work, and **Create PR** becomes **Set up GitHub**.
+- PR features show only when `origin` is on GitHub. GitLab (`glab`) later.
+- Agents get the same `gh` on their `PATH`.
+
+### Easter eggs
+
+Small, rare and never in the way. All respect **Reduce Motion**, stay silent for VoiceOver, and can be turned off in Settings › Appearance.
+
+- **Buzzing menu bar bee**: the wings flicker while agents work; still when idle.
+- **Honeycomb**: a faint hex pattern on the welcome screen and empty states, and as an option for the Swarm view background.
+- **Welcome bee**: a single small bee on the welcome screen.
+- **"Honey's ready"**: the toast when all workers of a task finish shows a tiny honeycomb filling up.
+- **Queen bee**: after the 100th merged PR, the Start orchestrator gets a crown in the sidebar for a day.
+- **`swarm buzz`**: hidden CLI command that prints an ASCII bee and the swarm's live stats.
+- **⌘K "buzz"**: a few bees fly across the window once.
+- **Honey accent**: an amber accent color in Settings › Appearance.
+
 ### Project config
 
-`.swarm/config.toml` per repo: setup and teardown scripts, files to copy into worktrees (`.env`, `CLAUDE.local.md`), port range per worktree, PR checks.
+`.swarm/config.toml` per repo, edited by hand or in **Settings › Projects › <project>**:
+
+```toml
+[worktrees]
+base_branch = "main"
+folder = ".worktrees"
+ports = { range = "5170-5199", per_worktree = 3 }
+copy = [".env", "CLAUDE.local.md"]
+setup = """
+cargo fetch
+pnpm --dir docs install --frozen-lockfile
+"""
+teardown = ""
+
+[checks]
+before_pr = ["cargo test --workspace", "cargo clippy -- -D warnings", "cargo fmt --check"]
+required = true
+```
+
+**Checks before PR**
+
+- Run in the task worktree when the user clicks Create PR; shown as "Local checks" in the PR panel.
+- `required = true`: the PR can only be created when all pass. `false`: failures warn and **Create PR anyway** asks for confirmation.
+- No checks configured: the section is hidden and Create PR goes straight through.
+- An existing git `pre-push` hook (husky, lefthook, plain) is detected and shown; Swarm does not duplicate it. It still runs during the push, and its output is shown if it fails.
+- The orchestrator runs the same checks before it reports a task done.
+- **Run checks now** in project settings runs them on the current tab's worktree.
 
 ## Phases
 
