@@ -1,6 +1,14 @@
 [workspace]
 resolver = "3"
-members = ["crates/gallery", "crates/swarm_app", "crates/swarm_layout", "crates/swarm_ui"]
+members = [
+    "crates/gallery",
+    "crates/swarm_app",
+    "crates/swarm_layout",
+    "crates/swarm_term",
+    "crates/swarm_term_view",
+    "crates/swarm_term_vt",
+    "crates/swarm_ui",
+]
 default-members = ["crates/gallery", "crates/swarm_ui"]
 
 [workspace.package]
@@ -10,14 +18,23 @@ publish = false
 
 [workspace.dependencies]
 swarm_layout = { path = "crates/swarm_layout" }
+swarm_term = { path = "crates/swarm_term" }
+swarm_term_view = { path = "crates/swarm_term_view" }
+swarm_term_vt = { path = "crates/swarm_term_vt" }
 swarm_ui = { path = "crates/swarm_ui" }
 
 anyhow = "1"
 env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
+flume = "0.12"
 image = { version = "0.25", default-features = false, features = ["png"] }
+libc = "0.2"
+libghostty-vt = "0.2.2"
 log = "0.4"
 # Same version gpui_macos uses at the pinned rev, so it is built once.
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSAccessibility", "NSWorkspace"] }
+portable-pty = "0.9"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
 # One Zed rev for every GPUI crate. Bump it together with rust-toolchain.toml.
 gpui = { git = "https://github.com/zed-industries/zed", rev = "70b1b91b73ee12930b4e3375d68657e9591b1921" }
 # font-kit: without it GPUI draws no text on macOS.

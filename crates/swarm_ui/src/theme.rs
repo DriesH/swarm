@@ -105,7 +105,14 @@ pub struct ThemeColors {
     pub claude: Hsla,
     /// Letter on a project tile, which has a saturated per-project color.
     pub on_tile: Hsla,
+    /// Terminal colors 0-7 (black to white), then the bright 8-15.
+    pub ansi: [Hsla; 16],
 }
+
+const ANSI_NAMES: [&str; 16] = [
+    "ansi_0", "ansi_1", "ansi_2", "ansi_3", "ansi_4", "ansi_5", "ansi_6", "ansi_7", "ansi_8",
+    "ansi_9", "ansi_10", "ansi_11", "ansi_12", "ansi_13", "ansi_14", "ansi_15",
+];
 
 impl ThemeColors {
     /// Every token with its name. Destructuring makes this fail to compile
@@ -142,9 +149,10 @@ impl ThemeColors {
             scrim,
             claude,
             on_tile,
+            ansi,
         } = self;
 
-        vec![
+        let mut tokens = vec![
             ("ground", *ground),
             ("panel", *panel),
             ("raised", *raised),
@@ -175,7 +183,11 @@ impl ThemeColors {
             ("scrim", *scrim),
             ("claude", *claude),
             ("on_tile", *on_tile),
-        ]
+        ];
+
+        tokens.extend(ANSI_NAMES.into_iter().zip(ansi.iter().copied()));
+
+        tokens
     }
 }
 
@@ -227,6 +239,24 @@ impl Theme {
                 scrim: rgba(0x0000008c).into(),
                 claude: rgb(0xd97757).into(),
                 on_tile: rgb(0xffffff).into(),
+                ansi: [
+                    rgb(0x2a2a2e).into(),
+                    rgb(0xff6369).into(),
+                    rgb(0x4ccd7a).into(),
+                    rgb(0xf2c55c).into(),
+                    rgb(0x6e9bff).into(),
+                    rgb(0xc792ea).into(),
+                    rgb(0x5ccfe6).into(),
+                    rgb(0xc8c8cf).into(),
+                    rgb(0x797984).into(),
+                    rgb(0xff8a8f).into(),
+                    rgb(0x7ee2a0).into(),
+                    rgb(0xffd98a).into(),
+                    rgb(0x9bbcff).into(),
+                    rgb(0xdcb3f5).into(),
+                    rgb(0x8ce3f2).into(),
+                    rgb(0xf4f4f6).into(),
+                ],
             },
         }
     }
@@ -270,6 +300,24 @@ impl Theme {
                 scrim: rgba(0x00000066).into(),
                 claude: rgb(0xd97757).into(),
                 on_tile: rgb(0xffffff).into(),
+                ansi: [
+                    rgb(0x1f1f23).into(),
+                    rgb(0xb63128).into(),
+                    rgb(0x176f30).into(),
+                    rgb(0x8c5408).into(),
+                    rgb(0x285acb).into(),
+                    rgb(0x8a3fb8).into(),
+                    rgb(0x0f6f80).into(),
+                    rgb(0x6b6b73).into(),
+                    rgb(0x5c5c66).into(),
+                    rgb(0xd43c33).into(),
+                    rgb(0x1e853b).into(),
+                    rgb(0xa06812).into(),
+                    rgb(0x3a6ee0).into(),
+                    rgb(0x9f4fd0).into(),
+                    rgb(0x137f94).into(),
+                    rgb(0x8e8e98).into(),
+                ],
             },
         }
     }
@@ -518,6 +566,35 @@ mod tests {
                 ("ground", colors.ground),
                 &[("fg", colors.fg)],
             );
+        }
+
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn ansi_text_colors_meet_wcag_aa_on_the_terminal_background() {
+        let mut failures = Vec::new();
+
+        for theme in themes() {
+            let colors = theme.colors();
+            let background = [("term", colors.term)];
+
+            // Dark ansi_0 and light ansi_15 are background-like colors, used for
+            // fills and selections rather than text, so they are exempt.
+            let range = match theme.kind() {
+                ThemeKind::Dark => 1..16,
+                ThemeKind::Light => 1..15,
+            };
+
+            for index in range {
+                check(
+                    &mut failures,
+                    &theme,
+                    TEXT_AA,
+                    (ANSI_NAMES[index], colors.ansi[index]),
+                    &background,
+                );
+            }
         }
 
         assert!(failures.is_empty(), "{}", failures.join("\n"));

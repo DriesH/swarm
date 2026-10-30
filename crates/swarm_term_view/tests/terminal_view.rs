@@ -1,0 +1,453 @@
+//! Drives a `TerminalView` in a test window through the channel types, the way an
+//! emulator would.
+
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use gpui::{
+    AppContext as _, ClipboardItem, Context, Entity, EntityInputHandler as _,
+    InteractiveElement as _, IntoElement, Modifiers, ParentElement, Render, ScrollDelta,
+    ScrollEvent, ScrollSource, Styled as _, TestAppContext, TouchPhase, VisualContext as _,
+    VisualTestContext, Window, div, point, px,
+};
+use swarm_term::{
+    BgSpan, Colors, Cursor, CursorStyle, EmulatorChannels, ExitStatus, History, Palette, Rgb, Row,
+    Screen, Snapshot, TerminalInput, TerminalOutput, TextFlags, TextSpan, Update,
+};
+use swarm_term_view::{TerminalEvent, TerminalView, palette_for};
+use swarm_ui::{Appearance, Theme};
+
+type Seen = Rc<RefCell<Vec<String>>>;
+
+/// Records the keys that bubble past the terminal.
+struct Harness {
+    terminal: Entity<TerminalView>,
+    seen: Seen,
+}
+
+impl Render for Harness {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let seen = Rc::clone(&self.seen);
+
+        div()
+            .size_full()
+            .on_key_down(move |event, _, _| seen.borrow_mut().push(event.keystroke.key.clone()))
+            .child(self.terminal.clone())
+    }
+}
+
+struct Setup<'a> {
+    terminal: Entity<TerminalView>,
+    emulator: EmulatorChannels,
+    seen: Seen,
+    cx: &'a mut VisualTestContext,
+}
+
+fn setup(cx: &mut TestAppContext) -> Setup<'_> {
+    cx.update(swarm_ui::init);
+
+    let (channels, emulator) = swarm_term::channels();
+    let seen = Seen::default();
+    let harness_seen = Rc::clone(&seen);
+
+    let (harness, cx) = cx.add_window_view(|window, cx| {
+        let terminal =
+            cx.new(|cx| TerminalView::new(channels, "Agent terminal".into(), window, cx));
+
+        Harness {
+            terminal,
+            seen: harness_seen,
+        }
+    });
+    let terminal = harness.read_with(cx, |harness, _| harness.terminal.clone());
+    cx.update(|window, _| window.activate_window());
+    cx.run_until_parked();
+
+    Setup {
+        terminal,
+        emulator,
+        seen,
+        cx,
+    }
+}
+
+fn screen(rows: u16, history: History) -> Screen {
+    Screen {
+        cols: 80,
+        rows,
+        colors: Colors {
+            fg: Rgb(255, 255, 255),
+            bg: Rgb(0, 0, 0),
+            cursor: None,
+        },
+        cursor: Cursor {
+            col: 3,
+            row: 1,
+            style: CursorStyle::Block,
+            visible: true,
+        },
+        alternate: false,
+        history,
+    }
+}
+
+fn row(text: &str) -> Row {
+    Row {
+        bgs: vec![BgSpan {
+            col: 0,
+            len: 2,
+            color: Rgb(10, 20, 30),
+        }],
+        texts: vec![TextSpan {
+            col: 0,
+            cells: u16::try_from(text.chars().count()).unwrap_or(0),
+            text: text.to_owned(),
+            fg: Rgb(200, 200, 200),
+            flags: TextFlags::default(),
+        }],
+    }
+}
+
+fn snapshot(rows: &[&str], history: History) -> TerminalOutput {
+    TerminalOutput::Snapshot(Snapshot {
+        screen: screen(u16::try_from(rows.len()).unwrap_or(0), history),
+        rows: rows.iter().map(|text| row(text)).collect(),
+        history_rows: Vec::new(),
+        title: None,
+        working_directory: None,
+    })
+}
+
+impl Setup<'_> {
+    fn send(&mut self, output: TerminalOutput) {
+        assert!(self.emulator.output.send(output).is_ok());
+        self.cx.run_until_parked();
+    }
+
+    fn focus(&mut self) {
+        self.cx.focus(&self.terminal);
+        self.cx.update(|window, _| window.refresh());
+        self.cx.run_until_parked();
+    }
+
+    fn inputs(&self) -> Vec<TerminalInput> {
+        self.emulator.input.try_iter().collect()
+    }
+
+    fn keys(&self) -> Vec<swarm_term::Key> {
+        self.inputs()
+            .into_iter()
+            .filter_map(|input| match input {
+                TerminalInput::Key(key) => Some(key),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+#[gpui::test]
+fn snapshot_renders_and_title_updates(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+
+    setup.send(snapshot(&["hello", "world"], History::default()));
+    setup.send(TerminalOutput::Title("zsh".to_owned()));
+
+    let (text, title) = setup.terminal.read_with(setup.cx, |view, _| {
+        (view.visible_text(), view.title().map(str::to_owned))
+    });
+    assert!(text.starts_with("hello\nworld\n"), "{text:?}");
+    assert_eq!(title.as_deref(), Some("zsh"));
+}
+
+#[gpui::test]
+fn view_sends_its_palette_and_grid_size(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+
+    setup.send(snapshot(&["a"], History::default()));
+
+    let inputs = setup.inputs();
+    let palettes: Vec<&Palette> = inputs
+        .iter()
+        .filter_map(|input| match input {
+            TerminalInput::Palette(palette) => Some(palette),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(palettes.len(), 1);
+    assert!(
+        inputs
+            .iter()
+            .any(|input| matches!(input, TerminalInput::Resize(_)))
+    );
+}
+
+#[gpui::test]
+fn key_press_sends_the_key_name_and_modifiers(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    setup.focus();
+    setup.inputs();
+
+    setup.cx.simulate_keystrokes("a shift-up");
+
+    let keys = setup.keys();
+    assert_eq!(keys.len(), 2);
+    assert_eq!(keys[0].name, "a");
+    assert_eq!(keys[0].text.as_deref(), Some("a"));
+    assert_eq!(keys[1].name, "up");
+    assert!(keys[1].modifiers.shift);
+    assert!(!keys[1].modifiers.command);
+}
+
+#[gpui::test]
+fn handled_keys_do_not_reach_the_parent(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    setup.focus();
+
+    setup.cx.simulate_keystrokes("a");
+
+    assert!(setup.seen.borrow().is_empty());
+}
+
+#[gpui::test]
+fn cmd_shortcuts_are_not_consumed(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    setup.focus();
+    setup.inputs();
+
+    setup.cx.simulate_keystrokes("cmd-k cmd-c");
+
+    assert!(setup.keys().is_empty());
+    assert_eq!(*setup.seen.borrow(), ["k", "c"]);
+}
+
+#[gpui::test]
+fn cmd_v_pastes_the_clipboard(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    setup.focus();
+    setup.inputs();
+    setup
+        .cx
+        .write_to_clipboard(ClipboardItem::new_string("pasted text".to_owned()));
+
+    setup.cx.simulate_keystrokes("cmd-v");
+
+    assert!(
+        setup
+            .inputs()
+            .contains(&TerminalInput::Paste("pasted text".to_owned()))
+    );
+    assert!(setup.seen.borrow().is_empty());
+}
+
+#[gpui::test]
+fn focus_in_and_out_are_reported(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    setup.inputs();
+
+    setup.focus();
+    let got = setup.inputs();
+    assert!(got.contains(&TerminalInput::Focus(true)), "{got:?}");
+
+    setup.cx.update(Window::blur);
+    setup.cx.run_until_parked();
+    assert!(setup.inputs().contains(&TerminalInput::Focus(false)));
+}
+
+#[gpui::test]
+fn scrolling_up_fetches_missing_history(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    setup.send(snapshot(
+        &["a", "b", "c"],
+        History {
+            start: 0,
+            len: 1_000,
+        },
+    ));
+    setup.inputs();
+
+    setup.cx.simulate_event(ScrollEvent {
+        position: point(px(100.), px(100.)),
+        delta: ScrollDelta::Lines(point(0., 3.)),
+        modifiers: Modifiers::default(),
+        touch_phase: TouchPhase::Moved,
+        source: ScrollSource::Pointer,
+    });
+
+    // The view now shows lines 997..1000, none cached; 200 lines of margin go before.
+    assert!(setup.inputs().contains(&TerminalInput::FetchHistory {
+        from: 797,
+        count: 203
+    }));
+}
+
+#[gpui::test]
+fn typing_scrolls_back_to_the_bottom(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    setup.send(snapshot(
+        &["a", "b", "c"],
+        History {
+            start: 0,
+            len: 1_000,
+        },
+    ));
+    setup.focus();
+    setup.cx.simulate_event(ScrollEvent {
+        position: point(px(100.), px(100.)),
+        delta: ScrollDelta::Lines(point(0., 3.)),
+        modifiers: Modifiers::default(),
+        touch_phase: TouchPhase::Moved,
+        source: ScrollSource::Pointer,
+    });
+
+    setup.cx.simulate_keystrokes("x");
+
+    let text = setup
+        .terminal
+        .read_with(setup.cx, |view, _| view.visible_text());
+    assert!(text.starts_with("a\nb\nc\n"), "{text:?}");
+}
+
+#[gpui::test]
+fn theme_change_sends_a_new_palette(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    setup.send(snapshot(&["a"], History::default()));
+    setup
+        .cx
+        .update(|_, cx| swarm_ui::theme::set_appearance(Appearance::Dark, cx));
+    setup.cx.run_until_parked();
+    setup.inputs();
+
+    setup
+        .cx
+        .update(|_, cx| swarm_ui::theme::set_appearance(Appearance::Light, cx));
+    setup.cx.run_until_parked();
+
+    assert!(
+        setup
+            .inputs()
+            .contains(&TerminalInput::Palette(palette_for(&Theme::light())))
+    );
+}
+
+#[gpui::test]
+fn composition_marks_text_and_commits_it_as_text(cx: &mut TestAppContext) {
+    let setup = setup(cx);
+    setup.inputs();
+    let terminal = setup.terminal.clone();
+
+    setup.cx.update(|window, cx| {
+        terminal.update(cx, |view, cx| {
+            view.replace_and_mark_text_in_range(None, "か", None, window, cx);
+        });
+    });
+    let marked = setup
+        .cx
+        .update(|window, cx| terminal.update(cx, |view, cx| view.marked_text_range(window, cx)));
+    assert_eq!(marked, Some(0..1));
+    assert!(setup.inputs().is_empty());
+
+    setup.cx.update(|window, cx| {
+        terminal.update(cx, |view, cx| {
+            view.replace_text_in_range(None, "漢", window, cx);
+        });
+    });
+    let marked = setup
+        .cx
+        .update(|window, cx| terminal.update(cx, |view, cx| view.marked_text_range(window, cx)));
+    assert_eq!(marked, None);
+    assert_eq!(setup.inputs(), [TerminalInput::Text("漢".to_owned())]);
+}
+
+#[gpui::test]
+fn updates_after_a_snapshot_change_rows(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    setup.send(snapshot(&["a", "b"], History::default()));
+
+    setup.send(TerminalOutput::Update(Update {
+        screen: screen(2, History::default()),
+        rows: vec![(1, row("B"))],
+        history_reset: false,
+    }));
+
+    let text = setup
+        .terminal
+        .read_with(setup.cx, |view, _| view.visible_text());
+    assert!(text.starts_with("a\nB\n"), "{text:?}");
+}
+
+#[gpui::test]
+fn hidden_cursor_still_places_the_input_method_window(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    let TerminalOutput::Snapshot(mut hidden) = snapshot(&["a", "b"], History::default()) else {
+        unreachable!("snapshot builds a snapshot");
+    };
+    hidden.screen.cursor.visible = false;
+    setup.send(TerminalOutput::Snapshot(hidden));
+    let terminal = setup.terminal.clone();
+
+    let bounds = setup.cx.update(|window, cx| {
+        terminal.update(cx, |view, cx| {
+            view.bounds_for_range(0..0, gpui::Bounds::default(), window, cx)
+        })
+    });
+
+    let bounds = bounds.expect("the cursor cell has bounds");
+    assert!(bounds.size.width > px(0.));
+    assert!(bounds.origin.x > px(0.));
+}
+
+#[gpui::test]
+fn snapshot_sets_title_and_working_directory(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    let TerminalOutput::Snapshot(mut snapshot) = snapshot(&["a"], History::default()) else {
+        unreachable!("snapshot builds a snapshot");
+    };
+    snapshot.title = Some("vim".to_owned());
+    snapshot.working_directory = Some("/tmp".to_owned());
+
+    setup.send(TerminalOutput::Snapshot(snapshot));
+
+    let (title, directory) = setup.terminal.read_with(setup.cx, |view, _| {
+        (
+            view.title().map(str::to_owned),
+            view.working_directory().map(str::to_owned),
+        )
+    });
+    assert_eq!(title.as_deref(), Some("vim"));
+    assert_eq!(directory.as_deref(), Some("/tmp"));
+}
+
+#[gpui::test]
+fn outputs_emit_events_and_update_getters(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    let events: Rc<RefCell<Vec<TerminalEvent>>> = Rc::default();
+    let sink = Rc::clone(&events);
+    let _subscription = setup.cx.update(|_, cx| {
+        cx.subscribe(&setup.terminal, move |_, event: &TerminalEvent, _| {
+            sink.borrow_mut().push(event.clone());
+        })
+    });
+
+    setup.send(TerminalOutput::Title("zsh".to_owned()));
+    setup.send(TerminalOutput::WorkingDirectory("/home".to_owned()));
+    setup.send(TerminalOutput::Bell);
+    setup.send(TerminalOutput::Exited(ExitStatus::Code(2)));
+
+    assert_eq!(
+        *events.borrow(),
+        [
+            TerminalEvent::TitleChanged("zsh".to_owned()),
+            TerminalEvent::WorkingDirectoryChanged("/home".to_owned()),
+            TerminalEvent::Bell,
+            TerminalEvent::Exited(ExitStatus::Code(2)),
+        ]
+    );
+    let (directory, status) = setup.terminal.read_with(setup.cx, |view, _| {
+        (
+            view.working_directory().map(str::to_owned),
+            view.exit_status().cloned(),
+        )
+    });
+    assert_eq!(directory.as_deref(), Some("/home"));
+    assert_eq!(status, Some(ExitStatus::Code(2)));
+}

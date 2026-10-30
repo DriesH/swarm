@@ -42,7 +42,7 @@ pub(crate) fn run(directory: PathBuf, cx: &mut App) {
             return;
         }
 
-        let names: Vec<&'static str> = swarm_ui::all_components()
+        let names: Vec<&'static str> = crate::all_components()
             .iter()
             .map(swarm_ui::component::ComponentEntry::name)
             .collect();
