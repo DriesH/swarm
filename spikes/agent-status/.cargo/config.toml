@@ -1,0 +1,3 @@
+[env]
+# Without this, any build with debuginfo compiles Ghostty in Zig Debug mode, which is far too slow.
+LIBGHOSTTY_VT_SYS_OPTIMIZE = "ReleaseFast"
