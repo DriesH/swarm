@@ -54,7 +54,7 @@ Each phase ends with a pull request into `main`. A phase is done when every box 
 - [x] Layout engine moves tiles to the tray when they don't fit and keeps user terminals at their size
 - [x] Everything works from the keyboard; ⌘K opens the palette; each window focuses an element when it opens (Tab does nothing until something has focus)
 - [ ] VoiceOver can reach and name every control
-- [ ] Frames stay under 8 ms with fake content
+- [x] Frames stay under 8 ms with fake content
 
 ## 3. Daemon, terminals and worktrees
 
