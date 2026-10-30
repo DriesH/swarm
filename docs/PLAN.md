@@ -249,13 +249,54 @@ required = true
 
 ## Phase 0 spikes
 
-Each spike is a throwaway program in `spikes/` and ends with a pass or fail note in `docs/spikes/`.
+Reports in `docs/spikes/`. Code in `spikes/` (throwaway).
 
-1. **Terminal in GPUI**: `libghostty-vt` + PTY + GPUI renderer running `claude`. Pass: smooth scrolling and typing, correct colors, cursor, resize. Fallback: `alacritty_terminal`.
-2. **Daemon reattach**: daemon owns the PTY; quit and reopen the app, the agent is still running with its screen intact.
-3. **Agent state**: Claude Code hooks report working / waiting / idle to the daemon. Find the Codex equivalent.
-4. **Menu bar and notifications**: status item from a GPUI app; read the usage endpoint; show a system notification with an action from a bundled `.app`.
-5. **Codex facts**: skip-permissions flag, resume, passing `developer_instructions`.
+| Spike | Result | Report |
+|---|---|---|
+| 1. Terminal in GPUI (`libghostty-vt` + PTY + GPUI element) | Pass | `terminal.md` |
+| 2. Daemon owns PTYs, app reattaches, crash recovery | Pass | `daemon.md` |
+| 3. Agent status (OSC 7501 + hooks), resume, Codex facts | Pass | `agent-status.md` |
+| 4. Menu bar, usage, notifications | Mostly pass; notification actions untested (permission) | `menubar.md` |
+
+## Lessons for the real build
+
+**Build**
+
+- `libghostty-vt` 0.2.2 needs Zig 0.15 (not 0.17). Set `LIBGHOSTTY_VT_SYS_OPTIMIZE=ReleaseFast` in `.cargo/config.toml`, or Ghostty builds in Debug mode and is far too slow.
+- `gpui_platform` needs the `font-kit` feature or no text is drawn. Use `runtime_shaders` when the Metal toolchain is missing.
+- Pin `gpui` and `gpui_platform` to one Zed git rev for the whole workspace.
+
+**Terminal and daemon**
+
+- Batch PTY output: one shared buffer and one wake-up; send the first change at once, then at most one update per 8 ms.
+- Ghostty's `max_scrollback` is in bytes, not lines.
+- Preload about 1,000 scrollback lines on attach; fetch older lines on scroll (about 6.5 µs per line to read).
+- Support the Kitty keyboard protocol (fish 4 turns it on).
+- Open the daemon socket before crash recovery, so the app never waits.
+- Start agents with an allow-listed environment; strip inherited `CLAUDE_CODE_*` and similar variables.
+- macOS socket paths must stay under 104 bytes.
+- Apps started from Finder get a minimal `PATH`: look up `claude`, `codex`, `gh` and `git` in known install folders.
+
+**Agents**
+
+- OSC 7501 is the main status source. Claude Code only sends it after the terminal answers its support query; the daemon answers. Codex (0.163.0+) always sends it.
+- Hooks miss events (Esc in Claude Code fires none; Codex has no error hook), so they only add session IDs and failure reasons.
+- Claude Code: pick the session ID up front with `--session-id`; resume with `--resume <id>`. Hooks via `--settings <file>`, never by editing the user's settings.
+- Codex: `--dangerously-bypass-approvals-and-sandbox` to skip approvals; `-c developer_instructions=…` adds to AGENTS.md; `codex resume <id>` (pass `-m` again for `codex exec resume`); the session ID only arrives at the first prompt; hooks passed with `-c` need their trust hash passed too.
+- Start Codex with `-c check_for_update_on_startup=false`. Never type into an agent before it reports `idle`: startup prompts swallow input (a spike accepted a Codex update this way).
+
+**Usage and menu bar**
+
+- Claude usage: read `rate_limits` from the Claude Code status line data of agents Swarm runs. Fall back to `/api/oauth/usage` at most every 5 minutes, honor `Retry-After` and store it on disk. The endpoint shares a budget with the user's own sessions and returns 429 often.
+- Claude token (fallback only): Keychain item `Claude Code-credentials`, read through `/usr/bin/security`; never logged or stored.
+- Codex usage: `codex app-server` → `account/rateLimits/read`. Codex keeps its own token.
+- Menu bar popover is a GPUI window under an `NSStatusItem`. Compute its position before opening it.
+- With no main window open, switch to no Dock icon; the menu bar keeps working.
+
+**Notifications**
+
+- Need a real `.app` bundle with a bundle ID.
+- macOS may deny permission without showing a prompt. The system check must detect "denied" and offer a button that opens System Settings › Notifications.
 
 ## Remaining design screens
 
