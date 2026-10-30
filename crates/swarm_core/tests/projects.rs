@@ -131,6 +131,8 @@ fn request(project: ProjectId, name: &str) -> CreateTask {
         name: name.to_owned(),
         from: None,
         run_setup: true,
+        orchestrator: None,
+        first_message: None,
     }
 }
 
