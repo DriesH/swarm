@@ -74,6 +74,8 @@ struct Shared {
     waiters: Mutex<HashMap<CallId, Waiter>>,
     next_call: AtomicU32,
     connected: AtomicBool,
+    /// Set when this side hangs up, so the reader's end of stream is not a warning.
+    closing: AtomicBool,
     next_generation: AtomicU64,
 }
 
@@ -120,6 +122,8 @@ struct Inner {
 
 impl Drop for Inner {
     fn drop(&mut self) {
+        self.shared.closing.store(true, Ordering::Release);
+
         if let Err(error) = self.stream.shutdown(std::net::Shutdown::Both) {
             log::debug!("daemon socket was already closed: {error}");
         }
@@ -206,6 +210,7 @@ impl Client {
             waiters: Mutex::new(HashMap::new()),
             next_call: AtomicU32::new(0),
             connected: AtomicBool::new(true),
+            closing: AtomicBool::new(false),
             next_generation: AtomicU64::new(0),
         });
         let (request_sender, request_receiver) = flume::unbounded();
@@ -484,6 +489,10 @@ fn read_events(
     loop {
         let event: Event = match read(reader, buffer) {
             Ok(event) => event,
+            Err(error) if shared.closing.load(Ordering::Acquire) => {
+                log::debug!("daemon connection closed by this app: {error}");
+                break;
+            }
             Err(error) => {
                 log::warn!("daemon connection closed: {error}");
                 break;
