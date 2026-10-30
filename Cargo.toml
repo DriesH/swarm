@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/gallery", "crates/swarm_layout", "crates/swarm_ui"]
+members = ["crates/gallery", "crates/swarm_app", "crates/swarm_layout", "crates/swarm_ui"]
 default-members = ["crates/gallery", "crates/swarm_ui"]
 
 [workspace.package]
