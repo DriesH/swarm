@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/gallery", "crates/swarm_ui"]
+members = ["crates/gallery", "crates/swarm_layout", "crates/swarm_ui"]
 default-members = ["crates/gallery", "crates/swarm_ui"]
 
 [workspace.package]
@@ -9,6 +9,7 @@ edition = "2024"
 publish = false
 
 [workspace.dependencies]
+swarm_layout = { path = "crates/swarm_layout" }
 swarm_ui = { path = "crates/swarm_ui" }
 
 anyhow = "1"

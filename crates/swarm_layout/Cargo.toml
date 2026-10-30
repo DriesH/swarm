@@ -1,0 +1,11 @@
+[package]
+name = "swarm_layout"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/swarm_layout.rs"
+
+[lints]
+workspace = true
