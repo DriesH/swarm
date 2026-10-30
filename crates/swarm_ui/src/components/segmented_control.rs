@@ -22,6 +22,7 @@ pub struct SegmentedControl {
     label: SharedString,
     segments: Vec<SharedString>,
     selected: usize,
+    debug_selector: Option<String>,
     on_select: Option<SelectHandler>,
 }
 
@@ -37,12 +38,19 @@ impl SegmentedControl {
             label: label.into(),
             segments: segments.into_iter().map(Into::into).collect(),
             selected: 0,
+            debug_selector: None,
             on_select: None,
         }
     }
 
     pub fn selected(mut self, index: usize) -> Self {
         self.selected = index;
+        self
+    }
+
+    /// Name for `VisualTestContext::debug_bounds`. Only recorded in test builds.
+    pub fn debug_selector(mut self, selector: impl FnOnce() -> String) -> Self {
+        self.debug_selector = Some(selector());
         self
     }
 
@@ -352,6 +360,9 @@ impl RenderOnce for SegmentedControl {
             .bg(raised)
             .border_1()
             .border_color(line)
+            .when_some(self.debug_selector, |group, selector| {
+                group.debug_selector(move || selector)
+            })
             .when_some(on_key_down, |group, handler| group.on_key_down(handler))
             .children(pill)
             .child(row)

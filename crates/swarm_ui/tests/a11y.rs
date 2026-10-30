@@ -190,3 +190,99 @@ fn tile_frame_is_a_named_group() {
         assert_eq!(info.node.label(), Some("pty-io terminal"));
     });
 }
+
+#[test]
+fn checkbox_reports_its_state() {
+    with_window(|window, cx| {
+        let checked = a11y_info(
+            Checkbox::new("c", "Open as draft").toggle_state(true),
+            window,
+            cx,
+        );
+
+        assert_eq!(checked.role, Some(Role::CheckBox));
+        assert_eq!(checked.node.label(), Some("Open as draft"));
+        assert_eq!(checked.node.toggled(), Some(Toggled::True));
+
+        let unchecked = a11y_info(Checkbox::new("c", "Open as draft"), window, cx);
+
+        assert_eq!(unchecked.node.toggled(), Some(Toggled::False));
+    });
+}
+
+#[test]
+fn dialog_is_a_labelled_dialog() {
+    with_window(|_, cx| {
+        let focus = cx.new(|cx| cx.focus_handle());
+        let focus = focus.read(cx).clone();
+        let panel = Dialog::new("d", "New task", &focus).panel(cx);
+        let role = panel.a11y_role();
+        let mut node = Node::new(role.unwrap_or(Role::Unknown));
+        panel.write_a11y_info(&mut node);
+        let info = A11yInfo { role, node };
+
+        assert_eq!(info.role, Some(Role::Dialog));
+        assert_eq!(info.node.label(), Some("New task"));
+    });
+}
+
+#[test]
+fn menu_is_a_labelled_menu_of_items() {
+    with_window(|window, cx| {
+        let menu = Menu::new("m", "New tab")
+            .item(MenuItem::new("a", "New task"))
+            .separator()
+            .item(MenuItem::new("b", "Plan with orchestrator").checked(true));
+        let info = a11y_info(menu, window, cx);
+
+        assert_eq!(info.role, Some(Role::Menu));
+        assert_eq!(info.node.label(), Some("New tab"));
+    });
+}
+
+fn view_a11y_info<V: Render>(
+    view: &gpui::Entity<V>,
+    window: &mut Window,
+    cx: &mut App,
+) -> A11yInfo {
+    view.update(cx, |view, cx| {
+        let element = view.render(window, cx).into_element();
+        let role = element.a11y_role();
+        let mut node = Node::new(role.unwrap_or(Role::Unknown));
+        element.write_a11y_info(&mut node);
+
+        A11yInfo { role, node }
+    })
+}
+
+#[test]
+fn text_input_reports_its_label_and_text() {
+    with_window(|window, cx| {
+        let input = cx.new(|cx| {
+            let mut input = TextInput::new(cx);
+            input.set_label("Name", cx);
+            input.set_text("docs-site", cx);
+            input
+        });
+        let info = view_a11y_info(&input, window, cx);
+
+        assert_eq!(info.role, Some(Role::TextInput));
+        assert_eq!(info.node.label(), Some("Name"));
+        assert_eq!(info.node.value(), Some("docs-site"));
+    });
+}
+
+#[test]
+fn text_area_is_a_multiline_text_input() {
+    with_window(|window, cx| {
+        let area = cx.new(|cx| {
+            let mut area = TextArea::new(cx);
+            area.set_label("First message", cx);
+            area
+        });
+        let info = view_a11y_info(&area, window, cx);
+
+        assert_eq!(info.role, Some(Role::MultilineTextInput));
+        assert_eq!(info.node.label(), Some("First message"));
+    });
+}

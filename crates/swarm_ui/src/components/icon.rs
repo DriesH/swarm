@@ -18,14 +18,18 @@ pub enum IconName {
     Close,
     Codex,
     Diff,
+    ExternalLink,
     File,
     Lock,
     Minimize,
     Plus,
+    PlusSquare,
     PullRequest,
     Restore,
     Search,
+    Settings,
     Sidebar,
+    Tab,
     Terminal,
     User,
 }
@@ -53,7 +57,7 @@ macro_rules! fill_icon {
 }
 
 impl IconName {
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 24] = [
         Self::Agent,
         Self::Bee,
         Self::Branch,
@@ -64,14 +68,18 @@ impl IconName {
         Self::Close,
         Self::Codex,
         Self::Diff,
+        Self::ExternalLink,
         Self::File,
         Self::Lock,
         Self::Minimize,
         Self::Plus,
+        Self::PlusSquare,
         Self::PullRequest,
         Self::Restore,
         Self::Search,
+        Self::Settings,
         Self::Sidebar,
+        Self::Tab,
         Self::Terminal,
         Self::User,
     ];
@@ -88,14 +96,18 @@ impl IconName {
             Self::Close => "close",
             Self::Codex => "codex",
             Self::Diff => "diff",
+            Self::ExternalLink => "external_link",
             Self::File => "file",
             Self::Lock => "lock",
             Self::Minimize => "minimize",
             Self::Plus => "plus",
+            Self::PlusSquare => "plus_square",
             Self::PullRequest => "pull_request",
             Self::Restore => "restore",
             Self::Search => "search",
+            Self::Settings => "settings",
             Self::Sidebar => "sidebar",
+            Self::Tab => "tab",
             Self::Terminal => "terminal",
             Self::User => "user",
         }
@@ -129,6 +141,10 @@ impl IconName {
                 "1.8",
                 r#"<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M12 11v6M9 14h6"/>"#
             ),
+            Self::ExternalLink => stroke_icon!(
+                "1.8",
+                r#"<path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/>"#
+            ),
             Self::File => stroke_icon!(
                 "1.8",
                 r#"<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/>"#
@@ -139,6 +155,10 @@ impl IconName {
             ),
             Self::Minimize => stroke_icon!("2", r#"<path d="M5 18h14"/>"#),
             Self::Plus => stroke_icon!("1.8", r#"<path d="M12 5v14M5 12h14"/>"#),
+            Self::PlusSquare => stroke_icon!(
+                "1.8",
+                r#"<rect x="3" y="3" width="18" height="18" rx="4"/><path d="M12 8v8M8 12h8"/>"#
+            ),
             Self::PullRequest => stroke_icon!(
                 "1.8",
                 r#"<circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="M6 8.5v7M18 15.5V11a3 3 0 0 0-3-3h-4"/><path d="m13 5-2 3 2 3"/>"#
@@ -148,9 +168,17 @@ impl IconName {
                 "1.8",
                 r#"<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>"#
             ),
+            Self::Settings => stroke_icon!(
+                "1.8",
+                r#"<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1 7 17M17 7l2.1-2.1"/>"#
+            ),
             Self::Sidebar => stroke_icon!(
                 "1.7",
                 r#"<rect x="3" y="4" width="18" height="16" rx="3"/><path d="M9 4v16"/>"#
+            ),
+            Self::Tab => stroke_icon!(
+                "1.8",
+                r#"<rect x="3" y="5" width="18" height="14" rx="3"/><path d="M3 9h7V5"/>"#
             ),
             Self::Terminal => stroke_icon!(
                 "1.8",

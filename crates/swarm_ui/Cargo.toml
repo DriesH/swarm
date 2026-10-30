@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 gpui.workspace = true
 log.workspace = true
+unicode-segmentation.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-app-kit.workspace = true

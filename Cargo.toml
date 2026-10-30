@@ -22,6 +22,8 @@ gpui = { git = "https://github.com/zed-industries/zed", rev = "70b1b91b73ee12930
 # font-kit: without it GPUI draws no text on macOS.
 # runtime_shaders: compiles Metal shaders at startup, so builds work without the Metal Toolchain.
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "70b1b91b73ee12930b4e3375d68657e9591b1921", features = ["font-kit", "runtime_shaders"] }
+# Same version gpui uses at the pinned rev.
+unicode-segmentation = "1.13"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

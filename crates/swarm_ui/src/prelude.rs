@@ -4,9 +4,10 @@ pub use gpui::prelude::*;
 pub use gpui::{App, IntoElement, Window};
 
 pub use crate::components::{
-    AgentStatus, Button, ButtonSize, ButtonVariant, Icon, IconButton, IconButtonSize, IconName,
-    IconSize, Label, LabelSize, ListRow, Panel, PanelRow, SegmentedControl, StatusDot, StatusPill,
-    StatusRing, Switch, Tab, TileFrame, TrayChip,
+    AgentStatus, Button, ButtonSize, ButtonVariant, Checkbox, Dialog, Dropdown, Icon, IconButton,
+    IconButtonSize, IconName, IconSize, Kbd, Label, LabelSize, ListRow, Menu, MenuItem, Panel,
+    PanelRow, PopoverMenu, ProjectTile, SegmentedControl, StatusDot, StatusPill, StatusRing,
+    Switch, Tab, TextArea, TextInput, TextInputEvent, TileFrame, TrayChip,
 };
 pub use crate::styles::{Color, h_flex, v_flex};
 pub use crate::theme::ActiveTheme;

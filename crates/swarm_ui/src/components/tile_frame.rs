@@ -7,6 +7,16 @@ use crate::component::{Component, example, example_group};
 use crate::fonts::MONO_FONT;
 use crate::prelude::*;
 
+/// The color of the ring on a focused tile.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TileRing {
+    /// The accent color, for agent tiles.
+    #[default]
+    Accent,
+    /// The text color, for the user's own terminal.
+    Fg,
+}
+
 /// The frame around a terminal: a header with icon, name, meta, status and
 /// actions, and a body slot for the terminal itself.
 #[derive(IntoElement)]
@@ -21,6 +31,9 @@ pub struct TileFrame {
     spinner: bool,
     actions: Vec<AnyElement>,
     body: Vec<AnyElement>,
+    footer: Option<AnyElement>,
+    name_suffix: Option<AnyElement>,
+    ring: TileRing,
     focused: bool,
     attention: bool,
     focus_handle: Option<FocusHandle>,
@@ -38,6 +51,9 @@ impl TileFrame {
             spinner: false,
             actions: Vec::new(),
             body: Vec::new(),
+            footer: None,
+            name_suffix: None,
+            ring: TileRing::default(),
             focused: false,
             attention: false,
             focus_handle: None,
@@ -75,7 +91,25 @@ impl TileFrame {
         self
     }
 
-    /// The tile the user is working in: 2px accent ring.
+    /// Fixed content below the body, such as the orchestrator's input.
+    pub fn footer(mut self, footer: impl IntoElement) -> Self {
+        self.footer = Some(footer.into_any_element());
+        self
+    }
+
+    /// Shown right after the name, before the meta.
+    pub fn name_suffix(mut self, suffix: impl IntoElement) -> Self {
+        self.name_suffix = Some(suffix.into_any_element());
+        self
+    }
+
+    /// The color of the focus ring.
+    pub fn ring(mut self, ring: TileRing) -> Self {
+        self.ring = ring;
+        self
+    }
+
+    /// The tile the user is working in: 2px ring, accent unless set with `ring`.
     pub fn focused(mut self, focused: bool) -> Self {
         self.focused = focused;
         self
@@ -105,7 +139,10 @@ impl RenderOnce for TileFrame {
         let colors = cx.theme().colors();
 
         let ring: Option<Hsla> = if self.focused {
-            Some(colors.accent)
+            Some(match self.ring {
+                TileRing::Accent => colors.accent,
+                TileRing::Fg => colors.fg,
+            })
         } else if self.attention {
             Some(colors.warn)
         } else {
@@ -134,6 +171,7 @@ impl RenderOnce for TileFrame {
             .border_color(line)
             .child(Icon::new(self.icon).size(IconSize::Large).color(icon_color))
             .child(Label::new(self.name).weight(FontWeight::MEDIUM))
+            .children(self.name_suffix)
             .when_some(self.meta, |header, meta| {
                 header.child(
                     div().min_w_0().flex().child(
@@ -187,6 +225,7 @@ impl RenderOnce for TileFrame {
                     .overflow_hidden()
                     .children(self.body),
             )
+            .children(self.footer.map(|footer| div().flex_none().child(footer)))
             // Drawn last, above the header, as an overlay so the ring never
             // moves the layout.
             .when_some(ring, |tile, ring| {
@@ -248,6 +287,39 @@ impl Component for TileFrame {
                                 .child(line("• Ran cargo test -p swarm-term", Color::Default))
                                 .child(line("  └ 14 passed · 0 failed", Color::Ok))
                                 .child(line("◦ Waiting for orchestrator", Color::Warn)),
+                        ),
+                    ),
+                    example(
+                        "User terminal",
+                        tile("user-wrap").child(
+                            TileFrame::new("user-terminal", IconName::User, "zsh")
+                                .name_suffix(
+                                    Label::new("You")
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Faint),
+                                )
+                                .meta("~/swarm")
+                                .ring(TileRing::Fg)
+                                .focused(true)
+                                .child(line("$ cargo build", Color::Default)),
+                        ),
+                    ),
+                    example(
+                        "With footer",
+                        tile("footer-wrap").child(
+                            TileFrame::new(
+                                "orchestrator-footer",
+                                IconName::ClaudeCode,
+                                "orchestrator",
+                            )
+                            .meta("opus 5.5")
+                            .status_ring(AgentStatus::Working)
+                            .footer(
+                                div().px(px(12.)).py(px(8.)).child(
+                                    Label::new("Message the orchestrator").color(Color::Faint),
+                                ),
+                            )
+                            .child(line("› split the renderer work", Color::Default)),
                         ),
                     ),
                 ],
