@@ -34,6 +34,18 @@ pub(crate) enum RightPanel {
     PullRequest,
 }
 
+/// Where the workspace's projects come from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DataSource {
+    /// Fake data for snapshots and tests.
+    Sample,
+    Connecting,
+    Live,
+    Unavailable {
+        reason: SharedString,
+    },
+}
+
 pub(crate) struct Workspace {
     pub data: FakeData,
     pub active_project: ProjectId,
@@ -58,8 +70,7 @@ pub(crate) struct Workspace {
     pub(crate) setup_exits_shown: HashSet<swarm_protocol::TaskId>,
     pub(crate) daemon_launch: Option<DaemonLaunch>,
     pub(crate) reconnecting: bool,
-    /// True once the projects come from the daemon instead of the sample.
-    pub(crate) live_data: bool,
+    pub(crate) source: DataSource,
     /// The last failed sidebar action, shown until dismissed.
     pub(crate) sidebar_error: Option<SharedString>,
     pub(crate) orchestrator_input: Entity<TextInput>,
@@ -67,16 +78,31 @@ pub(crate) struct Workspace {
 }
 
 impl Workspace {
+    /// The real app: no projects until the daemon answers.
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let mut data = FakeData::sample();
+        Self::with_data(DataSource::Connecting, FakeData::live(), window, cx)
+    }
 
+    /// Fake projects, tasks and agents for snapshots and tests.
+    pub(crate) fn with_sample(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::with_data(DataSource::Sample, FakeData::sample(), window, cx)
+    }
+
+    fn with_data(
+        source: DataSource,
+        mut data: FakeData,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let active_project = data
             .tasks
             .first()
             .map(|task| task.project)
-            .or_else(|| data.projects.first().map(|project| project.id))
-            .unwrap_or(ProjectId(0));
-        let active_task = data.first_or_start_task(active_project);
+            .or_else(|| data.projects.first().map(|project| project.id));
+        let active_task = active_project.map_or(TaskId(u32::MAX), |project| {
+            data.first_or_start_task(project)
+        });
+        let active_project = active_project.unwrap_or(ProjectId(u32::MAX));
         let focused_terminal = data
             .task(active_task)
             .and_then(|task| task.orchestrator)
@@ -110,10 +136,24 @@ impl Workspace {
             setup_exits_shown: HashSet::new(),
             daemon_launch: None,
             reconnecting: false,
-            live_data: false,
+            source,
             sidebar_error: None,
             orchestrator_input,
             _orchestrator_subscription: orchestrator_subscription,
+        }
+    }
+
+    /// True when no project is shown, so the main area shows the empty state.
+    pub(crate) fn has_no_projects(&self) -> bool {
+        self.data.projects.is_empty()
+    }
+
+    /// True when New task, Plan and "+ Terminal" may act: fake data, or a live task.
+    pub(crate) fn can_work(&self) -> bool {
+        match self.source {
+            DataSource::Sample => true,
+            DataSource::Live => self.data.task(self.active_task).is_some(),
+            DataSource::Connecting | DataSource::Unavailable { .. } => false,
         }
     }
 
@@ -136,6 +176,11 @@ impl Workspace {
 
     /// Opens the project's Start or Plan task, or makes it when there is none.
     pub(crate) fn open_start_task(&mut self, cx: &mut Context<Self>) {
+        if !self.can_work() {
+            log::debug!("no task is open, cannot plan with the orchestrator");
+            return;
+        }
+
         let task = self.data.ensure_start_task(self.active_project);
 
         self.overlay = None;
@@ -254,7 +299,7 @@ impl Workspace {
 
     /// The right panel to show. A Start or Plan task has none, but the choice is kept.
     pub(crate) fn visible_panel(&self) -> Option<RightPanel> {
-        if self.active_task().is_start {
+        if self.has_no_projects() || self.active_task().is_start {
             None
         } else {
             self.right_panel
@@ -418,7 +463,7 @@ mod tests {
             actions::bind_keys(cx);
         });
 
-        cx.add_window_view(Workspace::new)
+        cx.add_window_view(Workspace::with_sample)
     }
 
     fn orchestrator_terminal(workspace: &Workspace) -> TerminalId {

@@ -261,6 +261,11 @@ impl Render for NewTaskDialog {
 
 impl Workspace {
     pub(crate) fn open_new_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_work() {
+            log::debug!("no task is open, cannot open the new task sheet");
+            return;
+        }
+
         let Some(project) = self.data.project(self.active_project) else {
             return;
         };

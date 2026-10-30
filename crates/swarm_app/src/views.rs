@@ -12,7 +12,7 @@ use swarm_ui::styles::focus_ring;
 use swarm_ui::{FocusStyle, TextFieldSize, TileRing};
 
 use crate::model::{AgentKind, FakeLine, Terminal, TerminalId, TerminalKind};
-use crate::workspace::{View, Workspace};
+use crate::workspace::{DataSource, View, Workspace};
 
 const CHAR_WIDTH: f32 = 7.2;
 const ROW_HEIGHT: f32 = 17.;
@@ -47,11 +47,35 @@ pub(crate) fn render(
     _window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> AnyElement {
+    if workspace.has_no_projects() {
+        return empty_state(workspace, cx).into_any_element();
+    }
+
     match workspace.view {
         View::Terminals => terminals(workspace, cx).into_any_element(),
         View::Swarm => centered("Swarm").into_any_element(),
         View::Review => centered("Review").into_any_element(),
     }
+}
+
+fn empty_state(workspace: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement + use<> {
+    let live = workspace.source == DataSource::Live;
+
+    v_flex()
+        .id("empty-state")
+        .role(Role::Group)
+        .aria_label("No projects")
+        .size_full()
+        .items_center()
+        .justify_center()
+        .gap(px(12.))
+        .child(Label::new("No projects").color(Color::Faint))
+        .child(
+            Button::new("empty-add-project", "Add project")
+                .icon(IconName::Plus)
+                .disabled(!live)
+                .on_click(cx.listener(|_, _, window, cx| Workspace::pick_project(window, cx))),
+        )
 }
 
 fn centered(text: &'static str) -> Div {
@@ -268,6 +292,11 @@ impl Workspace {
 
     /// Opens a real terminal once the app has reached a daemon, else a fake one.
     pub(crate) fn new_user_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_work() {
+            log::debug!("no task is open, cannot open a terminal");
+            return;
+        }
+
         let task = self.active_task().id;
 
         if let Some(client) = self.daemon.clone() {
@@ -280,7 +309,10 @@ impl Workspace {
             return;
         }
 
-        log::debug!("the app never reached a daemon, opening a fake user terminal");
+        if self.source != DataSource::Sample {
+            log::warn!("the daemon is not connected, cannot open a terminal");
+            return;
+        }
 
         let terminal = self.data.add_user_terminal(task);
         self.user_sizes.insert(terminal, self.planned_user_size());
@@ -805,7 +837,7 @@ mod tests {
             actions::bind_keys(cx);
         });
 
-        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        let (workspace, cx) = cx.add_window_view(Workspace::with_sample);
         cx.run_until_parked();
 
         (workspace, cx)

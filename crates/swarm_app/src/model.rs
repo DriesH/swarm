@@ -708,13 +708,9 @@ impl FakeData {
         data
     }
 
-    /// No projects yet. Usage and the file tree stay static for now.
+    /// No projects yet. Usage and the file tree stay empty until they are real.
     pub(crate) fn live() -> Self {
-        Self {
-            usage: sample_usage(),
-            file_tree: sample_file_tree(),
-            ..Self::default()
-        }
+        Self::default()
     }
 
     /// Adds or updates the projects and their tasks. Known ones keep their ids.

@@ -6,7 +6,7 @@ use swarm_ui::prelude::*;
 use crate::actions::ToggleCommandPalette;
 use crate::model::{Agent, AgentKind, Project, Task, TaskStatus, Terminal};
 use crate::window_drag::drag_region;
-use crate::workspace::Workspace;
+use crate::workspace::{DataSource, Workspace};
 
 pub(crate) fn render(
     workspace: &Workspace,
@@ -35,11 +35,53 @@ pub(crate) fn render(
             ),
         )
         .children(projects)
+        .children(daemon_status(workspace, cx))
         .children(error_message(workspace, cx))
-        .child(heading("Agents", 18.))
-        .children(agent_rows(workspace, cx))
+        .when(!workspace.has_no_projects(), |sidebar| {
+            sidebar
+                .child(heading("Agents", 18.))
+                .children(agent_rows(workspace, cx))
+        })
         .child(div().flex_1())
-        .child(usage_card(workspace, cx))
+        .when(!workspace.data.usage.is_empty(), |sidebar| {
+            sidebar.child(usage_card(workspace, cx))
+        })
+}
+
+fn daemon_status(workspace: &Workspace, cx: &mut Context<Workspace>) -> Option<gpui::AnyElement> {
+    match &workspace.source {
+        DataSource::Connecting => Some(
+            h_flex()
+                .id("daemon-status")
+                .role(Role::Status)
+                .aria_label("Connecting")
+                .h(px(28.))
+                .gap(px(8.))
+                .px(px(8.))
+                .child(StatusRing::new(AgentStatus::Working))
+                .child(Label::new("Connecting").color(Color::Muted))
+                .into_any_element(),
+        ),
+        DataSource::Unavailable { reason } => Some(
+            h_flex()
+                .id("daemon-status")
+                .role(Role::Status)
+                .aria_label(format!("Daemon not running: {reason}"))
+                .min_h(px(28.))
+                .gap(px(8.))
+                .px(px(8.))
+                .child(
+                    div()
+                        .flex_1()
+                        .child(Label::new("Daemon not running").color(Color::Muted)),
+                )
+                .child(Button::new("retry-daemon", "Retry").on_click(
+                    cx.listener(|workspace, _, window, cx| workspace.retry_daemon(window, cx)),
+                ))
+                .into_any_element(),
+        ),
+        DataSource::Sample | DataSource::Live => None,
+    }
 }
 
 fn error_message(workspace: &Workspace, cx: &mut Context<Workspace>) -> Option<impl IntoElement> {
@@ -408,7 +450,7 @@ mod tests {
     fn setup(cx: &mut TestAppContext) -> (gpui::Entity<Workspace>, &mut VisualTestContext) {
         cx.update(swarm_ui::theme::init);
 
-        cx.add_window_view(Workspace::new)
+        cx.add_window_view(Workspace::with_sample)
     }
 
     #[gpui::test]

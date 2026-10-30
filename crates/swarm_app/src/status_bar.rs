@@ -11,7 +11,21 @@ pub(crate) fn render(
     workspace: &Workspace,
     _window: &mut Window,
     cx: &mut Context<Workspace>,
-) -> impl IntoElement + use<> {
+) -> gpui::AnyElement {
+    if workspace.has_no_projects() {
+        return h_flex()
+            .size_full()
+            .px(px(10.))
+            .child(gpui::div().flex_1())
+            .child(
+                Label::new("⌘K")
+                    .mono()
+                    .size(LabelSize::XSmall)
+                    .color(Color::Faint),
+            )
+            .into_any_element();
+    }
+
     let task = workspace.active_task();
     let agents = workspace.data.agents_of(task.id).count();
     let (processes, user_terminals) = (task.processes.len(), task.user_terminals.len());
@@ -95,6 +109,7 @@ pub(crate) fn render(
                 )
                 .child(mono("⌘K".into())),
         )
+        .into_any_element()
 }
 
 fn count(number: usize, one: &str, many: &str) -> SharedString {

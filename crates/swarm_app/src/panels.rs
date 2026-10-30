@@ -759,7 +759,7 @@ mod tests {
             actions::bind_keys(cx);
         });
 
-        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        let (workspace, cx) = cx.add_window_view(Workspace::with_sample);
         cx.run_until_parked();
 
         (workspace, cx)

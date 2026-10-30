@@ -20,7 +20,7 @@ use swarm_term_view::{TerminalEvent, TerminalView, palette_for};
 use swarm_ui::ActiveTheme as _;
 
 use crate::model::{FakeData, ProjectId, TaskId, TerminalId};
-use crate::workspace::Workspace;
+use crate::workspace::{DataSource, Workspace};
 
 /// Scrollback lines requested when attaching.
 const ATTACH_HISTORY: u32 = 1_000;
@@ -56,6 +56,18 @@ pub(crate) struct DaemonLaunch {
     binary: PathBuf,
 }
 
+impl DaemonLaunch {
+    fn detect() -> Result<Self, String> {
+        let paths =
+            Paths::new().map_err(|error| format!("cannot find the daemon folder: {error}"))?;
+        let binary = std::env::current_exe()
+            .map_err(|error| format!("cannot find the app binary: {error}"))?
+            .with_file_name(DAEMON_BINARY);
+
+        Ok(Self { paths, binary })
+    }
+}
+
 /// A user or process terminal tile backed by a terminal in the daemon.
 pub(crate) struct LiveTerminal {
     pub view: Entity<TerminalView>,
@@ -80,44 +92,56 @@ impl LiveTerminal {
 type Connected = (Client, Vec<TerminalInfo>, Vec<ProjectInfo>);
 
 impl Workspace {
-    /// Connects on a background thread, starting the daemon when needed. On failure
-    /// user terminals stay fake.
-    pub(crate) fn connect_daemon(window: &mut Window, cx: &mut Context<Self>) {
-        let paths = match Paths::new() {
-            Ok(paths) => paths,
-            Err(error) => {
-                log::warn!("cannot find the daemon folder: {error}");
-                return;
-            }
-        };
-        let binary = match std::env::current_exe() {
-            Ok(path) => path.with_file_name(DAEMON_BINARY),
-            Err(error) => {
-                log::warn!("cannot find the app binary: {error}");
-                return;
-            }
-        };
+    /// Connects on a background thread, starting the daemon when needed.
+    pub(crate) fn connect_daemon(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match DaemonLaunch::detect() {
+            Ok(launch) => self.start_connect(launch, window, cx),
+            Err(reason) => self.daemon_unavailable(reason, cx),
+        }
+    }
 
-        let launch = DaemonLaunch { paths, binary };
-        let connecting = cx.background_spawn({
-            let launch = launch.clone();
-            async move { connect(&launch) }
-        });
+    /// Runs the connect again after it failed.
+    pub(crate) fn retry_daemon(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.source, DataSource::Unavailable { .. }) {
+            return;
+        }
 
-        cx.spawn_in(window, async move |this, cx| match connecting.await {
-            Ok((client, terminals, projects)) => {
-                let used = this.update_in(cx, |workspace, window, cx| {
-                    workspace.daemon_launch = Some(launch);
+        match self.daemon_launch.clone() {
+            Some(launch) => self.start_connect(launch, window, cx),
+            None => self.connect_daemon(window, cx),
+        }
+    }
+
+    pub(crate) fn daemon_unavailable(&mut self, reason: String, cx: &mut Context<Self>) {
+        log::warn!("no daemon: {reason}");
+        self.source = DataSource::Unavailable {
+            reason: reason.into(),
+        };
+        cx.notify();
+    }
+
+    fn start_connect(&mut self, launch: DaemonLaunch, window: &mut Window, cx: &mut Context<Self>) {
+        self.daemon_launch = Some(launch.clone());
+        self.source = DataSource::Connecting;
+        cx.notify();
+
+        let connecting = cx.background_spawn(async move { connect(&launch) });
+
+        cx.spawn_in(window, async move |this, cx| {
+            let result = connecting.await;
+
+            let used = this.update_in(cx, |workspace, window, cx| match result {
+                Ok((client, terminals, projects)) => {
                     workspace.use_projects(&projects, cx);
                     workspace.use_daemon(client, &terminals, window, cx);
                     Self::watch_daemon(window, cx);
-                });
-
-                if let Err(error) = used {
-                    log::debug!("the window closed before the daemon answered: {error}");
                 }
+                Err(error) => workspace.daemon_unavailable(error.to_string(), cx),
+            });
+
+            if let Err(error) = used {
+                log::debug!("the window closed before the daemon answered: {error}");
             }
-            Err(error) => log::warn!("no daemon, user terminals stay fake: {error}"),
         })
         .detach();
     }
@@ -195,13 +219,13 @@ impl Workspace {
     /// Takes the daemon's projects. The first time they replace the sample; later they
     /// are merged, so tabs keep their ids.
     pub(crate) fn use_projects(&mut self, projects: &[ProjectInfo], cx: &mut Context<Self>) {
-        if self.live_data {
+        if self.source == DataSource::Live {
             self.data.sync_projects(projects);
             cx.notify();
             return;
         }
 
-        self.live_data = true;
+        self.source = DataSource::Live;
         self.data = FakeData::live();
         self.live_terminals.clear();
         self.terminal_focus.clear();
@@ -211,9 +235,11 @@ impl Workspace {
         self.focused_terminal = None;
         self.data.sync_projects(projects);
 
-        match self.data.projects.first().map(|project| project.id) {
-            Some(project) => self.select_project(project, cx),
-            None => self.active_project = ProjectId(u32::MAX),
+        if let Some(project) = self.data.projects.first().map(|project| project.id) {
+            self.select_project(project, cx);
+        } else {
+            self.active_project = ProjectId(u32::MAX);
+            self.active_task = TaskId(u32::MAX);
         }
 
         cx.notify();
@@ -806,7 +832,7 @@ mod tests {
             actions::bind_keys(cx);
         });
 
-        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        let (workspace, cx) = cx.add_window_view(Workspace::with_sample);
         cx.run_until_parked();
 
         (workspace, cx)
@@ -961,6 +987,130 @@ mod tests {
             cwd: None,
             exit: None,
         }
+    }
+
+    fn setup_real(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
+        cx.update(|cx| {
+            swarm_ui::init(cx);
+            actions::bind_keys(cx);
+        });
+
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        cx.run_until_parked();
+
+        (workspace, cx)
+    }
+
+    /// A launch that can never reach a daemon: no socket and no binary to start.
+    fn unreachable_launch() -> DaemonLaunch {
+        let folder = PathBuf::from(format!("/tmp/swa-{}-none", std::process::id()));
+
+        DaemonLaunch {
+            paths: Paths::in_dir(folder),
+            binary: PathBuf::from("/nonexistent/swarm-daemon"),
+        }
+    }
+
+    fn source_of(workspace: &Entity<Workspace>, cx: &VisualTestContext) -> DataSource {
+        workspace.read_with(cx, |workspace, _| workspace.source.clone())
+    }
+
+    #[gpui::test]
+    fn the_real_app_starts_connecting_with_no_projects_or_tasks(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup_real(cx);
+
+        let (source, projects, tasks, agents) = workspace.read_with(cx, |workspace, _| {
+            (
+                workspace.source.clone(),
+                workspace.data.projects.len(),
+                workspace.data.tasks.len(),
+                workspace.data.agents.len(),
+            )
+        });
+
+        assert_eq!(source, DataSource::Connecting);
+        assert_eq!((projects, tasks, agents), (0, 0, 0));
+    }
+
+    #[gpui::test]
+    fn a_failed_connect_makes_the_daemon_unavailable_with_the_reason(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup_real(cx);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.start_connect(unreachable_launch(), window, cx);
+        });
+        cx.run_until_parked();
+
+        let source = source_of(&workspace, cx);
+        assert!(
+            matches!(&source, DataSource::Unavailable { reason } if !reason.is_empty()),
+            "{source:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn retry_starts_a_new_connect(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup_real(cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.daemon_launch = Some(unreachable_launch());
+            workspace.daemon_unavailable("no daemon".to_owned(), cx);
+            workspace.retry_daemon(window, cx);
+        });
+
+        let during = source_of(&workspace, cx);
+        cx.run_until_parked();
+        let after = source_of(&workspace, cx);
+
+        assert_eq!(during, DataSource::Connecting);
+        assert!(matches!(after, DataSource::Unavailable { .. }));
+    }
+
+    #[gpui::test]
+    fn zero_projects_from_the_daemon_make_the_workspace_live_and_empty(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup_real(cx);
+
+        use_projects(&workspace, &[], cx);
+
+        let (source, empty) = workspace.read_with(cx, |workspace, _| {
+            (workspace.source.clone(), workspace.has_no_projects())
+        });
+        assert_eq!(source, DataSource::Live);
+        assert!(empty);
+    }
+
+    #[gpui::test]
+    fn projects_from_the_daemon_show_in_the_real_app(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup_real(cx);
+
+        use_projects(&workspace, &[project_info(5, "demo", Vec::new())], cx);
+
+        let (source, names) = workspace.read_with(cx, |workspace, _| {
+            let names: Vec<String> = workspace
+                .data
+                .projects
+                .iter()
+                .map(|project| project.name.to_string())
+                .collect();
+
+            (workspace.source.clone(), names)
+        });
+        assert_eq!(source, DataSource::Live);
+        assert_eq!(names, ["demo"]);
+    }
+
+    #[gpui::test]
+    fn a_new_terminal_while_unavailable_adds_no_tile(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup_real(cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.daemon_unavailable("no daemon".to_owned(), cx);
+        });
+
+        cx.dispatch_action(NewTerminal);
+
+        let (terminals, tasks) = workspace.read_with(cx, |workspace, _| {
+            (workspace.data.terminals.len(), workspace.data.tasks.len())
+        });
+        assert_eq!((terminals, tasks), (0, 0));
     }
 
     #[gpui::test]
