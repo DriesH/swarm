@@ -11,8 +11,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use swarm_protocol::{
-    Client, ClientError, CreateTerminal, Event, Request, TerminalId, TerminalInfo, TerminalKind,
-    VERSION, read, write,
+    Client, ClientError, CreateTask, CreateTerminal, Event, ProjectId, ProjectInfo, Request,
+    TaskId, TaskInfo, TerminalId, TerminalInfo, TerminalKind, VERSION, read, write,
 };
 use swarm_term::{Palette, Rgb, Size, TerminalInput, TerminalOutput};
 
@@ -463,4 +463,149 @@ fn connect_refuses_a_socket_folder_others_can_open() {
         Err(ClientError::UnsafeSocketDir { dir, .. }) if dir == folder
     ));
     std::fs::remove_dir_all(&folder).ok();
+}
+
+fn task_info() -> TaskInfo {
+    TaskInfo {
+        id: TaskId(4),
+        project: ProjectId(2),
+        name: "login".into(),
+        branch: "swarm/login".into(),
+        base: "main".into(),
+        worktree: PathBuf::from("/tmp/wt"),
+        ports: vec![3000],
+        setup_terminal: Some(TerminalId(9)),
+        setup_exit: None,
+    }
+}
+
+fn project_info() -> ProjectInfo {
+    ProjectInfo {
+        id: ProjectId(2),
+        name: "demo".into(),
+        path: PathBuf::from("/tmp/demo"),
+        base_branch: "main".into(),
+        config_error: None,
+        tasks: vec![task_info()],
+    }
+}
+
+#[test]
+fn list_projects_returns_what_the_daemon_sends() {
+    let sent = vec![project_info()];
+    let socket = serve(move |fake| {
+        fake.handshake(VERSION);
+        let Some(Request::ListProjects { call }) = fake.request() else {
+            panic!("expected a ListProjects request");
+        };
+        fake.send(&Event::Projects {
+            call,
+            projects: sent,
+        });
+        fake.drain();
+    });
+    let client = Client::connect(&socket).expect("connect");
+
+    let projects = client.list_projects().expect("list projects");
+
+    assert_eq!(projects, vec![project_info()]);
+}
+
+#[test]
+fn add_project_sends_the_path_and_returns_the_project() {
+    let socket = serve(|fake| {
+        fake.handshake(VERSION);
+        let Some(Request::AddProject { call, path }) = fake.request() else {
+            panic!("expected an AddProject request");
+        };
+        assert_eq!(path, PathBuf::from("/tmp/demo/src"));
+        fake.send(&Event::ProjectAdded {
+            call,
+            project: project_info(),
+        });
+        fake.drain();
+    });
+    let client = Client::connect(&socket).expect("connect");
+
+    let project = client
+        .add_project(PathBuf::from("/tmp/demo/src"))
+        .expect("add project");
+
+    assert_eq!(project, project_info());
+}
+
+#[test]
+fn add_project_reports_a_daemon_error() {
+    let socket = serve(|fake| {
+        fake.handshake(VERSION);
+        let Some(Request::AddProject { call, .. }) = fake.request() else {
+            panic!("expected an AddProject request");
+        };
+        fake.send(&Event::Error {
+            call: Some(call),
+            id: None,
+            message: "not a git repository".into(),
+        });
+        fake.drain();
+    });
+    let client = Client::connect(&socket).expect("connect");
+
+    let result = client.add_project(PathBuf::from("/tmp"));
+
+    assert!(
+        matches!(result, Err(ClientError::Daemon(message)) if message == "not a git repository")
+    );
+}
+
+fn create_task_request() -> CreateTask {
+    CreateTask {
+        project: ProjectId(2),
+        name: "login".into(),
+        from: None,
+        run_setup: true,
+    }
+}
+
+#[test]
+fn create_task_sends_the_request_and_returns_the_task() {
+    let socket = serve(|fake| {
+        fake.handshake(VERSION);
+        let Some(Request::CreateTask { call, task }) = fake.request() else {
+            panic!("expected a CreateTask request");
+        };
+        assert_eq!(task, create_task_request());
+        fake.send(&Event::TaskCreated {
+            call,
+            task: task_info(),
+        });
+        fake.drain();
+    });
+    let client = Client::connect(&socket).expect("connect");
+
+    let task = client
+        .create_task(create_task_request())
+        .expect("create task");
+
+    assert_eq!(task, task_info());
+}
+
+#[test]
+fn create_task_reports_a_daemon_error() {
+    let socket = serve(|fake| {
+        fake.handshake(VERSION);
+        let Some(Request::CreateTask { call, .. }) = fake.request() else {
+            panic!("expected a CreateTask request");
+        };
+        fake.send(&Event::Error {
+            call: Some(call),
+            id: None,
+            message: "branch exists".into(),
+        });
+        fake.drain();
+    });
+    let client = Client::connect(&socket).expect("connect");
+
+    let result = client.create_task(create_task_request());
+
+    assert!(matches!(result, Err(ClientError::Daemon(message)) if message == "branch exists"));
 }

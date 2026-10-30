@@ -5210,6 +5210,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "swarm_core"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "swarm_protocol",
+ "swarm_term",
+ "thiserror 2.0.21",
+ "toml 1.1.8+spec-1.1.0",
+]
+
+[[package]]
 name = "swarm_daemon"
 version = "0.1.0"
 dependencies = [
@@ -5218,8 +5232,7 @@ dependencies = [
  "flume",
  "libc",
  "log",
- "rusqlite",
- "serde_json",
+ "swarm_core",
  "swarm_protocol",
  "swarm_term",
  "swarm_term_vt",

@@ -23,6 +23,18 @@ fn open_start(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Worksp
     workspace.open_start_task(cx);
 }
 
+fn show_empty(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
+    workspace.use_projects(&[], cx);
+}
+
+fn show_unavailable(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
+    workspace.use_projects(&[], cx);
+    workspace.daemon_unavailable(
+        "the daemon speaks protocol version 1; stop it with `pkill -x swarm-daemon`".to_owned(),
+        cx,
+    );
+}
+
 const SETTLE: Duration = Duration::from_millis(700);
 
 pub(crate) fn run(directory: PathBuf, cx: &mut App) {
@@ -75,6 +87,26 @@ pub(crate) fn run(directory: PathBuf, cx: &mut App) {
                 Appearance::Dark,
                 "workspace-new-task-dark.png",
                 Some(Workspace::open_new_task),
+            ),
+            (
+                Appearance::Light,
+                "workspace-empty-light.png",
+                Some(show_empty),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-empty-dark.png",
+                Some(show_empty),
+            ),
+            (
+                Appearance::Light,
+                "workspace-unavailable-light.png",
+                Some(show_unavailable),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-unavailable-dark.png",
+                Some(show_unavailable),
             ),
         ] {
             cx.update(|cx| theme::set_appearance(appearance, cx));

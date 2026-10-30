@@ -42,14 +42,22 @@ fn window_options(cx: &App) -> WindowOptions {
 fn open_workspace(cx: &mut App) -> anyhow::Result<gpui::WindowHandle<Workspace>> {
     let options = window_options(cx);
 
+    // Snapshot and frame-stats runs keep the sample data and never connect.
+    let sample = cfg!(any(feature = "snapshot", feature = "frame-stats"));
+
     let handle = cx.open_window(options, |window, cx| {
-        cx.new(|cx| Workspace::new(window, cx))
+        cx.new(|cx| {
+            if sample {
+                Workspace::with_sample(window, cx)
+            } else {
+                Workspace::new(window, cx)
+            }
+        })
     })?;
 
-    // Snapshot and frame-stats runs keep the fake terminals.
-    if !cfg!(any(feature = "snapshot", feature = "frame-stats")) {
-        handle.update(cx, |_, window, cx| {
-            Workspace::connect_daemon(window, cx);
+    if !sample {
+        handle.update(cx, |workspace, window, cx| {
+            workspace.connect_daemon(window, cx);
         })?;
     }
 

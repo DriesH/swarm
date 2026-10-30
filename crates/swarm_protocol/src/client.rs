@@ -16,11 +16,13 @@ use std::time::{Duration, Instant};
 use swarm_term::{TerminalChannels, TerminalInput, TerminalOutput};
 
 use crate::{
-    CallId, CreateTerminal, Event, FrameError, Paths, Request, TerminalId, TerminalInfo, VERSION,
-    check_private_dir, read, write,
+    CallId, CreateTask, CreateTerminal, Event, FrameError, Paths, ProjectInfo, Request, TaskInfo,
+    TerminalId, TerminalInfo, VERSION, check_private_dir, read, write,
 };
 
 const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Creating a task runs git and copies files.
+const CREATE_TASK_TIMEOUT: Duration = Duration::from_secs(60);
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(3);
 const SPAWN_POLL: Duration = Duration::from_millis(50);
 
@@ -72,6 +74,8 @@ struct Shared {
     waiters: Mutex<HashMap<CallId, Waiter>>,
     next_call: AtomicU32,
     connected: AtomicBool,
+    /// Set when this side hangs up, so the reader's end of stream is not a warning.
+    closing: AtomicBool,
     next_generation: AtomicU64,
 }
 
@@ -118,6 +122,8 @@ struct Inner {
 
 impl Drop for Inner {
     fn drop(&mut self) {
+        self.shared.closing.store(true, Ordering::Release);
+
         if let Err(error) = self.stream.shutdown(std::net::Shutdown::Both) {
             log::debug!("daemon socket was already closed: {error}");
         }
@@ -204,6 +210,7 @@ impl Client {
             waiters: Mutex::new(HashMap::new()),
             next_call: AtomicU32::new(0),
             connected: AtomicBool::new(true),
+            closing: AtomicBool::new(false),
             next_generation: AtomicU64::new(0),
         });
         let (request_sender, request_receiver) = flume::unbounded();
@@ -244,7 +251,7 @@ impl Client {
         self.inner.daemon_pid
     }
 
-    /// Changes how long `list` and `create` wait for the daemon.
+    /// Changes how long calls wait (`create_task` waits at least 60 s) for the daemon.
     #[must_use]
     pub fn with_reply_timeout(mut self, timeout: Duration) -> Self {
         self.reply_timeout = timeout;
@@ -260,6 +267,32 @@ impl Client {
         match self.call(|call| Request::List { call }, None)? {
             Event::Terminals { terminals, .. } => Ok(terminals),
             other => Err(unexpected("List", &other)),
+        }
+    }
+
+    pub fn list_projects(&self) -> Result<Vec<ProjectInfo>, ClientError> {
+        match self.call(|call| Request::ListProjects { call }, None)? {
+            Event::Projects { projects, .. } => Ok(projects),
+            other => Err(unexpected("ListProjects", &other)),
+        }
+    }
+
+    /// `path` may be any folder inside a git repository.
+    pub fn add_project(&self, path: PathBuf) -> Result<ProjectInfo, ClientError> {
+        match self.call(|call| Request::AddProject { call, path }, None)? {
+            Event::ProjectAdded { project, .. } => Ok(project),
+            other => Err(unexpected("AddProject", &other)),
+        }
+    }
+
+    pub fn create_task(&self, task: CreateTask) -> Result<TaskInfo, ClientError> {
+        let timeout = self.reply_timeout.max(CREATE_TASK_TIMEOUT);
+        let reply =
+            self.call_with_timeout(|call| Request::CreateTask { call, task }, None, timeout)?;
+
+        match reply {
+            Event::TaskCreated { task, .. } => Ok(task),
+            other => Err(unexpected("CreateTask", &other)),
         }
     }
 
@@ -336,6 +369,15 @@ impl Client {
         build: impl FnOnce(CallId) -> Request,
         route: Option<Route>,
     ) -> Result<Event, ClientError> {
+        self.call_with_timeout(build, route, self.reply_timeout)
+    }
+
+    fn call_with_timeout(
+        &self,
+        build: impl FnOnce(CallId) -> Request,
+        route: Option<Route>,
+        timeout: Duration,
+    ) -> Result<Event, ClientError> {
         let shared = &self.inner.shared;
         let call = CallId(shared.next_call.fetch_add(1, Ordering::Relaxed));
         let (reply_sender, replies) = flume::bounded(1);
@@ -359,7 +401,7 @@ impl Client {
             return Err(error);
         }
 
-        let event = match replies.recv_timeout(self.reply_timeout) {
+        let event = match replies.recv_timeout(timeout) {
             Ok(event) => event,
             Err(flume::RecvTimeoutError::Disconnected) => return Err(ClientError::Disconnected),
             Err(flume::RecvTimeoutError::Timeout) => {
@@ -447,6 +489,10 @@ fn read_events(
     loop {
         let event: Event = match read(reader, buffer) {
             Ok(event) => event,
+            Err(error) if shared.closing.load(Ordering::Acquire) => {
+                log::debug!("daemon connection closed by this app: {error}");
+                break;
+            }
             Err(error) => {
                 log::warn!("daemon connection closed: {error}");
                 break;
@@ -479,6 +525,15 @@ fn read_events(
             Event::Created { call, id } => deliver_created(shared, requests, call, id),
             Event::Terminals { call, terminals } => {
                 deliver(shared, call, Event::Terminals { call, terminals });
+            }
+            Event::Projects { call, projects } => {
+                deliver(shared, call, Event::Projects { call, projects });
+            }
+            Event::ProjectAdded { call, project } => {
+                deliver(shared, call, Event::ProjectAdded { call, project });
+            }
+            Event::TaskCreated { call, task } => {
+                deliver(shared, call, Event::TaskCreated { call, task });
             }
             Event::Error {
                 call: Some(call),

@@ -6,7 +6,7 @@ use swarm_ui::prelude::*;
 use crate::actions::ToggleCommandPalette;
 use crate::model::{Agent, AgentKind, Project, Task, TaskStatus, Terminal};
 use crate::window_drag::drag_region;
-use crate::workspace::Workspace;
+use crate::workspace::{DataSource, Workspace};
 
 pub(crate) fn render(
     workspace: &Workspace,
@@ -31,14 +31,86 @@ pub(crate) fn render(
         .child(
             heading("Projects", 14.).child(
                 IconButton::new("add-project", IconName::Plus, "Add project")
-                    .on_click(|_, _, _| log::info!("Add project is not built yet")),
+                    .on_click(cx.listener(|_, _, window, cx| Workspace::pick_project(window, cx))),
             ),
         )
         .children(projects)
-        .child(heading("Agents", 18.))
-        .children(agent_rows(workspace, cx))
+        .children(daemon_status(workspace, cx))
+        .children(error_message(workspace, cx))
+        .when(!workspace.has_no_projects(), |sidebar| {
+            sidebar
+                .child(heading("Agents", 18.))
+                .children(agent_rows(workspace, cx))
+        })
         .child(div().flex_1())
-        .child(usage_card(workspace, cx))
+        .when(!workspace.data.usage.is_empty(), |sidebar| {
+            sidebar.child(usage_card(workspace, cx))
+        })
+}
+
+fn daemon_status(workspace: &Workspace, cx: &mut Context<Workspace>) -> Option<gpui::AnyElement> {
+    match &workspace.source {
+        DataSource::Connecting => Some(
+            h_flex()
+                .id("daemon-status")
+                .role(Role::Status)
+                .aria_label("Connecting")
+                .h(px(28.))
+                .gap(px(8.))
+                .px(px(8.))
+                .child(StatusRing::new(AgentStatus::Working))
+                .child(Label::new("Connecting").color(Color::Muted))
+                .into_any_element(),
+        ),
+        DataSource::Unavailable { reason } => Some(
+            h_flex()
+                .id("daemon-status")
+                .role(Role::Status)
+                .aria_label(format!("Daemon not running: {reason}"))
+                .min_h(px(28.))
+                .gap(px(8.))
+                .px(px(8.))
+                .child(
+                    div()
+                        .flex_1()
+                        .child(Label::new("Daemon not running").color(Color::Muted)),
+                )
+                .child(Button::new("retry-daemon", "Retry").on_click(
+                    cx.listener(|workspace, _, window, cx| workspace.retry_daemon(window, cx)),
+                ))
+                .into_any_element(),
+        ),
+        DataSource::Sample | DataSource::Live => None,
+    }
+}
+
+fn error_message(workspace: &Workspace, cx: &mut Context<Workspace>) -> Option<impl IntoElement> {
+    let message = workspace.sidebar_error.clone()?;
+    let color = Color::Del.hsla(cx);
+
+    Some(
+        h_flex()
+            .id("sidebar-error")
+            .role(Role::Alert)
+            .aria_label(message.clone())
+            .items_start()
+            .gap(px(6.))
+            .mx(px(8.))
+            .mt(px(6.))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(12.))
+                    .text_color(color)
+                    .child(message),
+            )
+            .child(
+                IconButton::new("dismiss-error", IconName::Close, "Dismiss message").on_click(
+                    cx.listener(|workspace, _, _, cx| workspace.dismiss_sidebar_error(cx)),
+                ),
+            ),
+    )
 }
 
 fn window_row(window: &mut Window, cx: &mut App) -> impl IntoElement {
@@ -127,12 +199,24 @@ fn project_row(
         ""
     };
     let plural = if tasks.len() == 1 { "task" } else { "tasks" };
-    let accessible = format!("{}, {} {plural}{summary}", project.name, tasks.len());
+    let config_error = project
+        .config_error
+        .as_ref()
+        .map(|error| format!(", config error: {error}"))
+        .unwrap_or_default();
+    let accessible = format!(
+        "{}, {} {plural}{summary}{config_error}",
+        project.name,
+        tasks.len()
+    );
 
     let tile = ProjectTile::new(project.letter, project.tile_color);
 
     let end = h_flex()
         .gap(px(8.))
+        .when(project.config_error.is_some(), |end| {
+            end.child(StatusPill::new(AgentStatus::Waiting).label("Config error"))
+        })
         .when(needs_you, |end| {
             end.child(StatusPill::new(AgentStatus::Waiting).label("Needs you"))
         })
@@ -172,7 +256,9 @@ fn rows(workspace: &Workspace) -> Vec<Row<'_>> {
     let data = &workspace.data;
     let mut rows = Vec::new();
 
-    let agents = std::iter::once(task.orchestrator)
+    let agents = task
+        .orchestrator
+        .into_iter()
         .chain(task.workers.iter().copied())
         .filter_map(|id| data.agent(id));
 
@@ -184,9 +270,17 @@ fn rows(workspace: &Workspace) -> Vec<Row<'_>> {
             .processes
             .iter()
             .filter_map(|id| data.terminal(*id))
-            .filter(|terminal| terminal.owner.unwrap_or(task.orchestrator) == agent.id);
+            .filter(|terminal| terminal.owner.or(task.orchestrator) == Some(agent.id));
         rows.extend(owned.map(|terminal| Row::Process(terminal, agent.name.as_ref(), indent + 1)));
     }
+
+    rows.extend(
+        task.processes
+            .iter()
+            .filter_map(|id| data.terminal(*id))
+            .filter(|terminal| terminal.owner.or(task.orchestrator).is_none())
+            .map(|terminal| Row::Process(terminal, "", 0)),
+    );
 
     rows.extend(
         task.user_terminals
@@ -219,9 +313,14 @@ fn process_row(
     cx: &mut Context<Workspace>,
 ) -> gpui::AnyElement {
     let id = terminal.id;
+    let accessible = if owner.is_empty() {
+        format!("{}, process terminal", terminal.title)
+    } else {
+        format!("{}, started by {owner}, running", terminal.title)
+    };
 
     ListRow::new(("process", id.0 as usize), terminal.title.clone())
-        .accessible_label(format!("{}, started by {owner}, running", terminal.title))
+        .accessible_label(accessible)
         .compact(true)
         .indent(indent)
         .toggle_state(workspace.focused_terminal == Some(id))
@@ -351,7 +450,7 @@ mod tests {
     fn setup(cx: &mut TestAppContext) -> (gpui::Entity<Workspace>, &mut VisualTestContext) {
         cx.update(swarm_ui::theme::init);
 
-        cx.add_window_view(Workspace::new)
+        cx.add_window_view(Workspace::with_sample)
     }
 
     #[gpui::test]

@@ -18,7 +18,7 @@ pub(crate) fn render(
     workspace: &Workspace,
     window: &mut Window,
     cx: &mut Context<Workspace>,
-) -> impl IntoElement + use<> {
+) -> gpui::AnyElement {
     let tabs: Vec<_> = workspace
         .data
         .tasks_of(workspace.active_project)
@@ -41,6 +41,14 @@ pub(crate) fn render(
 
             workspace_handle.update(cx, |workspace, cx| workspace.set_view(*view, cx));
         });
+
+    if workspace.has_no_projects() {
+        return h_flex()
+            .size_full()
+            .px(px(10.))
+            .child(drag_region("tab-bar-drag", window, cx).flex_1().h_full())
+            .into_any_element();
+    }
 
     let task = workspace.active_task();
     let panel = workspace.visible_panel();
@@ -81,6 +89,7 @@ pub(crate) fn render(
                 .end_slot(changes_count(task.additions, task.deletions)),
             )
         })
+        .into_any_element()
 }
 
 fn ring_status(status: TaskStatus) -> AgentStatus {
@@ -172,7 +181,7 @@ mod tests {
     fn setup(cx: &mut TestAppContext) -> (gpui::Entity<Workspace>, &mut VisualTestContext) {
         cx.update(swarm_ui::theme::init);
 
-        cx.add_window_view(Workspace::new)
+        cx.add_window_view(Workspace::with_sample)
     }
 
     fn click(selector: &'static str, cx: &mut VisualTestContext) {

@@ -1,6 +1,6 @@
 # swarm_app
 
-The Swarm app (`swarm` binary). Right now it shows the window layout with fake data.
+The Swarm app (`swarm` binary). It shows the daemon's projects and tasks. Snapshot and frame-stats builds show fake sample data instead.
 
 ## Run
 
@@ -10,18 +10,19 @@ cargo run -p swarm_app
 
 ## Run with the daemon
 
-User terminals are real when `swarm-daemon` runs. Agents, workers and process terminals are still fake.
+Projects, tasks, user terminals and the setup terminal are real when `swarm-daemon` runs. Agents and workers do not exist yet, so a real task has no orchestrator tile.
 
 ```sh
 cargo build -p swarm_daemon && cargo run -p swarm_app
 ```
 
-Both binaries land in `target/debug`. The app starts `swarm-daemon` from its own folder when nothing listens, and connects to it. If it cannot connect, user terminals stay fake.
+Both binaries land in `target/debug`. The app starts `swarm-daemon` from its own folder when nothing listens, and connects to it. If it cannot connect, the sidebar shows "Daemon not running" with a Retry button, and no project or task appears.
 
 - **Files:** `~/Library/Application Support/Swarm` holds `daemon.sock`, `swarm.db` and `daemon.log`. When that path is too long for a socket, the socket sits in `$TMPDIR/swarm`.
 - **Quit the app:** user terminals keep running. Open the app again and they come back.
 - **Stop the daemon:** `pkill -x swarm-daemon`. This ends every terminal.
-- **Task key:** the daemon stores `<project name>/<task name>` (for example `swarm/terminal-renderer`) with each user terminal. The app uses it to show the terminal in the same task again.
+- **Task key:** real tasks use `task:<id>` as the terminal key. Fake sample tasks use `<project name>/<task name>`.
+- **Add project:** the `+` next to Projects opens a folder picker. Errors show in the sidebar until dismissed.
 - Snapshot and frame-stats runs never connect.
 
 ## Snapshot

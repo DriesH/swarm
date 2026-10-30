@@ -19,7 +19,7 @@ mod client;
 pub use client::{Client, ClientError};
 
 /// Bumped on every incompatible change; the daemon refuses other versions.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 /// Guards against a corrupt length prefix allocating gigabytes.
 const MAX_FRAME: usize = 256 << 20;
@@ -49,6 +49,60 @@ pub struct CreateTerminal {
     pub palette: Palette,
     /// Opaque key the app uses to find the terminal's task again after a restart.
     pub task: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ProjectId(pub u64);
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TaskId(pub u64);
+
+impl TaskId {
+    /// The `task` key of the terminals that belong to this task.
+    pub fn terminal_key(self) -> String {
+        format!("task:{}", self.0)
+    }
+}
+
+/// A git repository the user added to Swarm.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ProjectInfo {
+    pub id: ProjectId,
+    /// The repository folder's name.
+    pub name: String,
+    /// The repository root.
+    pub path: PathBuf,
+    pub base_branch: String,
+    /// Why `.swarm/config.toml` could not be read; defaults apply meanwhile.
+    pub config_error: Option<String>,
+    pub tasks: Vec<TaskInfo>,
+}
+
+/// One task: its own branch and task worktree.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct TaskInfo {
+    pub id: TaskId,
+    pub project: ProjectId,
+    pub name: String,
+    pub branch: String,
+    /// The branch it started from.
+    pub base: String,
+    pub worktree: PathBuf,
+    /// Ports reserved for this task worktree, from `[worktrees] ports`.
+    pub ports: Vec<u16>,
+    /// The process terminal running the setup script, while it runs.
+    pub setup_terminal: Option<TerminalId>,
+    /// How the setup script ended, so a fast or failed setup is never missed.
+    pub setup_exit: Option<swarm_term::ExitStatus>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct CreateTask {
+    pub project: ProjectId,
+    pub name: String,
+    /// Branch to start from; `None` uses the project's base branch.
+    pub from: Option<String>,
+    pub run_setup: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -94,6 +148,22 @@ pub enum Request {
         id: TerminalId,
         input: TerminalInput,
     },
+    /// Answered with [`Event::Projects`].
+    ListProjects {
+        call: CallId,
+    },
+    /// `path` may be any folder inside a git repository. Answered with
+    /// [`Event::ProjectAdded`]; adding a project twice returns the existing one.
+    AddProject {
+        call: CallId,
+        path: PathBuf,
+    },
+    /// Creates the task branch and task worktree, copies files, reserves ports and
+    /// starts the setup script in a process terminal. Answered with [`Event::TaskCreated`].
+    CreateTask {
+        call: CallId,
+        task: CreateTask,
+    },
 }
 
 /// Daemon → client. `Hello` stays first, as in [`Request`].
@@ -124,6 +194,18 @@ pub enum Event {
         call: Option<CallId>,
         id: Option<TerminalId>,
         message: String,
+    },
+    Projects {
+        call: CallId,
+        projects: Vec<ProjectInfo>,
+    },
+    ProjectAdded {
+        call: CallId,
+        project: ProjectInfo,
+    },
+    TaskCreated {
+        call: CallId,
+        task: TaskInfo,
     },
 }
 

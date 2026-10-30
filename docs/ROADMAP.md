@@ -7,7 +7,7 @@ Each phase ends with a pull request into `main`. A phase is done when every box 
 | 0 | Plan, design, spikes | Done ([PR #1](https://github.com/DriesH/swarm/pull/1)) |
 | 1 | Foundation: workspace, `swarm_ui`, gallery | Done ([PR #2](https://github.com/DriesH/swarm/pull/2)) |
 | 2 | App shell with fake data | Done ([PR #3](https://github.com/DriesH/swarm/pull/3)) |
-| 3 | Daemon, terminals and worktrees | In progress |
+| 3 | Daemon, terminals and worktrees | In review |
 | 4 | Agents and harness | Not started |
 | 5 | Swarm view | Not started |
 | 6 | Review and pull requests | Not started |
@@ -64,7 +64,7 @@ Each phase ends with a pull request into `main`. A phase is done when every box 
 
 **Done when:**
 
-- [ ] Open a project; **New task** creates branch, worktree and tab and runs the setup script
+- [x] Open a project; **New task** creates branch, worktree and tab and runs the setup script
 - [x] A user terminal works; quitting and reopening the app shows it unchanged
 - [x] Killing the daemon leaves no leftover processes after restart
 - [x] Terminal speed matches spike 1 (`seq 1 200000` about 0.3 s)

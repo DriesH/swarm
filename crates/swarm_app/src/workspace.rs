@@ -15,9 +15,7 @@ use crate::actions::{
     ShowTerminals, ToggleChanges, ToggleCommandPalette, ToggleFiles,
 };
 use crate::daemon::{DaemonLaunch, LiveTerminal};
-use crate::model::{
-    AgentId, FakeData, ProjectId, Task, TaskId, TaskStatus, TerminalId, TerminalKind,
-};
+use crate::model::{FakeData, ProjectId, Task, TaskId, TaskStatus, TerminalId, TerminalKind};
 use crate::palette::Overlay;
 use crate::views::Resizing;
 use crate::{panels, sidebar, status_bar, tab_bar, views};
@@ -34,6 +32,18 @@ pub(crate) enum RightPanel {
     Files,
     Changes,
     PullRequest,
+}
+
+/// Where the workspace's projects come from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DataSource {
+    /// Fake data for snapshots and tests.
+    Sample,
+    Connecting,
+    Live,
+    Unavailable {
+        reason: SharedString,
+    },
 }
 
 pub(crate) struct Workspace {
@@ -56,26 +66,47 @@ pub(crate) struct Workspace {
     pub(crate) live_terminals: HashMap<TerminalId, LiveTerminal>,
     /// Live tiles whose terminal lost its daemon connection.
     pub(crate) disconnected: HashSet<TerminalId>,
+    /// Tasks whose setup exit was already handled.
+    pub(crate) setup_exits_shown: HashSet<swarm_protocol::TaskId>,
     pub(crate) daemon_launch: Option<DaemonLaunch>,
     pub(crate) reconnecting: bool,
+    pub(crate) source: DataSource,
+    /// The last failed sidebar action, shown until dismissed.
+    pub(crate) sidebar_error: Option<SharedString>,
     pub(crate) orchestrator_input: Entity<TextInput>,
     _orchestrator_subscription: Subscription,
 }
 
 impl Workspace {
+    /// The real app: no projects until the daemon answers.
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let mut data = FakeData::sample();
+        Self::with_data(DataSource::Connecting, FakeData::live(), window, cx)
+    }
 
+    /// Fake projects, tasks and agents for snapshots and tests.
+    pub(crate) fn with_sample(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::with_data(DataSource::Sample, FakeData::sample(), window, cx)
+    }
+
+    fn with_data(
+        source: DataSource,
+        mut data: FakeData,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let active_project = data
             .tasks
             .first()
             .map(|task| task.project)
-            .or_else(|| data.projects.first().map(|project| project.id))
-            .unwrap_or(ProjectId(0));
-        let active_task = data.first_or_start_task(active_project);
+            .or_else(|| data.projects.first().map(|project| project.id));
+        let active_task = active_project.map_or(TaskId(u32::MAX), |project| {
+            data.first_or_start_task(project)
+        });
+        let active_project = active_project.unwrap_or(ProjectId(u32::MAX));
         let focused_terminal = data
             .task(active_task)
-            .and_then(|task| data.agent(task.orchestrator))
+            .and_then(|task| task.orchestrator)
+            .and_then(|id| data.agent(id))
             .map(|agent| agent.terminal);
 
         let focus_handle = cx.focus_handle();
@@ -102,10 +133,27 @@ impl Workspace {
             daemon: None,
             live_terminals: HashMap::new(),
             disconnected: HashSet::new(),
+            setup_exits_shown: HashSet::new(),
             daemon_launch: None,
             reconnecting: false,
+            source,
+            sidebar_error: None,
             orchestrator_input,
             _orchestrator_subscription: orchestrator_subscription,
+        }
+    }
+
+    /// True when no project is shown, so the main area shows the empty state.
+    pub(crate) fn has_no_projects(&self) -> bool {
+        self.data.projects.is_empty()
+    }
+
+    /// True when New task, Plan and "+ Terminal" may act: fake data, or a live task.
+    pub(crate) fn can_work(&self) -> bool {
+        match self.source {
+            DataSource::Sample => true,
+            DataSource::Live => self.data.task(self.active_task).is_some(),
+            DataSource::Connecting | DataSource::Unavailable { .. } => false,
         }
     }
 
@@ -128,6 +176,11 @@ impl Workspace {
 
     /// Opens the project's Start or Plan task, or makes it when there is none.
     pub(crate) fn open_start_task(&mut self, cx: &mut Context<Self>) {
+        if !self.can_work() {
+            log::debug!("no task is open, cannot plan with the orchestrator");
+            return;
+        }
+
         let task = self.data.ensure_start_task(self.active_project);
 
         self.overlay = None;
@@ -141,9 +194,9 @@ impl Workspace {
 
         self.active_project = entry.project;
         self.active_task = task;
-        self.focused_terminal = self
-            .data
-            .agent(entry.orchestrator)
+        self.focused_terminal = entry
+            .orchestrator
+            .and_then(|id| self.data.agent(id))
             .map(|agent| agent.terminal);
         self.pending_focus = self.focused_terminal;
         cx.notify();
@@ -246,7 +299,7 @@ impl Workspace {
 
     /// The right panel to show. A Start or Plan task has none, but the choice is kept.
     pub(crate) fn visible_panel(&self) -> Option<RightPanel> {
-        if self.active_task().is_start {
+        if self.has_no_projects() || self.active_task().is_start {
             None
         } else {
             self.right_panel
@@ -260,13 +313,14 @@ static NO_TASK: Task = Task {
     name: SharedString::new_static(""),
     branch: SharedString::new_static(""),
     status: TaskStatus::Idle,
-    orchestrator: AgentId(u32::MAX),
+    orchestrator: None,
     workers: Vec::new(),
     processes: Vec::new(),
     user_terminals: Vec::new(),
     additions: 0,
     deletions: 0,
     is_start: false,
+    daemon: None,
 };
 
 impl Focusable for Workspace {
@@ -409,11 +463,12 @@ mod tests {
             actions::bind_keys(cx);
         });
 
-        cx.add_window_view(Workspace::new)
+        cx.add_window_view(Workspace::with_sample)
     }
 
     fn orchestrator_terminal(workspace: &Workspace) -> TerminalId {
-        let agent = workspace.data.agent(workspace.active_task().orchestrator);
+        let id = workspace.active_task().orchestrator;
+        let agent = id.and_then(|id| workspace.data.agent(id));
         agent.map_or(TerminalId(u32::MAX), |agent| agent.terminal)
     }
 

@@ -12,7 +12,7 @@ use swarm_ui::styles::focus_ring;
 use swarm_ui::{FocusStyle, TextFieldSize, TileRing};
 
 use crate::model::{AgentKind, FakeLine, Terminal, TerminalId, TerminalKind};
-use crate::workspace::{View, Workspace};
+use crate::workspace::{DataSource, View, Workspace};
 
 const CHAR_WIDTH: f32 = 7.2;
 const ROW_HEIGHT: f32 = 17.;
@@ -47,11 +47,35 @@ pub(crate) fn render(
     _window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> AnyElement {
+    if workspace.has_no_projects() {
+        return empty_state(workspace, cx).into_any_element();
+    }
+
     match workspace.view {
         View::Terminals => terminals(workspace, cx).into_any_element(),
         View::Swarm => centered("Swarm").into_any_element(),
         View::Review => centered("Review").into_any_element(),
     }
+}
+
+fn empty_state(workspace: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement + use<> {
+    let live = workspace.source == DataSource::Live;
+
+    v_flex()
+        .id("empty-state")
+        .role(Role::Group)
+        .aria_label("No projects")
+        .size_full()
+        .items_center()
+        .justify_center()
+        .gap(px(12.))
+        .child(Label::new("No projects").color(Color::Faint))
+        .child(
+            Button::new("empty-add-project", "Add project")
+                .icon(IconName::Plus)
+                .disabled(!live)
+                .on_click(cx.listener(|_, _, window, cx| Workspace::pick_project(window, cx))),
+        )
 }
 
 fn centered(text: &'static str) -> Div {
@@ -157,15 +181,18 @@ pub(crate) fn tile_specs(workspace: &Workspace) -> Vec<TileSpec> {
     let task = workspace.active_task();
 
     if task.is_start {
-        return data
-            .agent(task.orchestrator)
+        return task
+            .orchestrator
+            .and_then(|id| data.agent(id))
             .and_then(|agent| data.terminal(agent.terminal))
             .map(|terminal| tile_spec(workspace, terminal, Activity::Working))
             .into_iter()
             .collect();
     }
 
-    let agents = std::iter::once(task.orchestrator)
+    let agents = task
+        .orchestrator
+        .into_iter()
         .chain(task.workers.iter().copied())
         .filter_map(|id| data.agent(id))
         .filter_map(|agent| {
@@ -217,15 +244,40 @@ fn start_layout(area: Size<Pixels>, specs: &[TileSpec]) -> Layout {
 
 impl Workspace {
     pub(crate) fn stop_process(&mut self, terminal: TerminalId, cx: &mut Context<Self>) {
-        let task = self.active_task().id;
+        self.close_process(terminal, cx);
+    }
+
+    /// Removes a process tile. A live process that still runs is killed.
+    pub(crate) fn close_process(&mut self, terminal: TerminalId, cx: &mut Context<Self>) {
+        let owner = self
+            .data
+            .tasks
+            .iter()
+            .find(|task| task.processes.contains(&terminal))
+            .map(|task| task.id);
+        let Some(task) = owner else {
+            return;
+        };
+
+        if let Some(live) = self.live_terminals.remove(&terminal) {
+            live.kill_if_running(cx);
+        }
 
         self.data.stop_process(task, terminal);
+        self.disconnected.remove(&terminal);
+        self.terminal_focus.remove(&terminal);
         self.minimized.remove(&terminal);
         if self.focused_terminal == Some(terminal) {
             self.focused_terminal = None;
         }
 
         cx.notify();
+    }
+
+    /// Removes the tile of a user or process terminal.
+    pub(crate) fn close_tile(&mut self, terminal: TerminalId, cx: &mut Context<Self>) {
+        self.close_user_terminal(terminal, cx);
+        self.close_process(terminal, cx);
     }
 
     /// The size a new user terminal tile starts with.
@@ -240,6 +292,11 @@ impl Workspace {
 
     /// Opens a real terminal once the app has reached a daemon, else a fake one.
     pub(crate) fn new_user_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_work() {
+            log::debug!("no task is open, cannot open a terminal");
+            return;
+        }
+
         let task = self.active_task().id;
 
         if let Some(client) = self.daemon.clone() {
@@ -252,7 +309,10 @@ impl Workspace {
             return;
         }
 
-        log::debug!("the app never reached a daemon, opening a fake user terminal");
+        if self.source != DataSource::Sample {
+            log::warn!("the daemon is not connected, cannot open a terminal");
+            return;
+        }
 
         let terminal = self.data.add_user_terminal(task);
         self.user_sizes.insert(terminal, self.planned_user_size());
@@ -314,8 +374,9 @@ impl Workspace {
         }
 
         let orchestrator = self
-            .data
-            .agent(self.active_task().orchestrator)
+            .active_task()
+            .orchestrator
+            .and_then(|id| self.data.agent(id))
             .map(|agent| agent.terminal);
         let terminal =
             orchestrator.and_then(|id| self.data.terminals.iter_mut().find(|entry| entry.id == id));
@@ -445,6 +506,9 @@ fn tile(
 
     let frame = match terminal.kind {
         TerminalKind::User => user_frame(workspace, terminal, cx),
+        TerminalKind::Process if workspace.live_terminals.contains_key(&id) => {
+            live_process_frame(workspace, terminal, cx)
+        }
         _ => agent_frame(workspace, terminal, cx),
     };
 
@@ -584,6 +648,43 @@ fn agent_frame(
     }
 
     frame
+}
+
+fn live_process_frame(
+    workspace: &Workspace,
+    terminal: &Terminal,
+    cx: &mut Context<Workspace>,
+) -> TileFrame {
+    let id = terminal.id;
+    let name = terminal.title.clone();
+
+    let mut frame = TileFrame::new(("tile", id.0), IconName::Terminal, name.clone())
+        .accessible_label(format!("{name} process terminal"))
+        .focused(workspace.focused_terminal == Some(id))
+        .status(AgentStatus::Working);
+
+    if let Some(meta) = terminal.meta.clone() {
+        frame = frame.meta(meta);
+    }
+
+    frame = frame
+        .action(
+            IconButton::new(
+                ("minimize", id.0),
+                IconName::Minimize,
+                format!("Move {name} to tray"),
+            )
+            .on_click(cx.listener(move |workspace, _, _, cx| workspace.minimize(id, cx))),
+        )
+        .action(
+            IconButton::new(("stop", id.0), IconName::Close, format!("Stop {name}"))
+                .on_click(cx.listener(move |workspace, _, _, cx| workspace.stop_process(id, cx))),
+        );
+
+    match workspace.live_terminals.get(&id) {
+        Some(live) => frame.child(div().size_full().child(live.view.clone())),
+        None => frame,
+    }
 }
 
 fn user_frame(
@@ -736,7 +837,7 @@ mod tests {
             actions::bind_keys(cx);
         });
 
-        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        let (workspace, cx) = cx.add_window_view(Workspace::with_sample);
         cx.run_until_parked();
 
         (workspace, cx)
@@ -919,7 +1020,9 @@ mod tests {
         let (workspace, cx) = setup(cx);
         let count = |workspace: &Workspace| {
             let id = workspace.active_task().orchestrator;
-            let terminal = workspace.data.agent(id).map(|agent| agent.terminal);
+            let terminal = id
+                .and_then(|id| workspace.data.agent(id))
+                .map(|agent| agent.terminal);
             terminal
                 .and_then(|id| workspace.data.terminal(id))
                 .map(|terminal| terminal.lines.clone())
