@@ -11,6 +11,7 @@ use std::time::Duration;
 use gpui::{AnyWindowHandle, App, AsyncApp, Context, Window};
 use swarm_ui::theme::{self, Appearance};
 
+use crate::model::ProjectId;
 use crate::workspace::Workspace;
 
 type OpenOverlay = fn(&mut Workspace, &mut Window, &mut Context<Workspace>);
@@ -21,6 +22,10 @@ fn open_island(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<
 
 fn open_start(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
     workspace.open_start_task(cx);
+}
+
+fn open_start_empty(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
+    workspace.select_project(ProjectId(3), cx);
 }
 
 fn show_empty(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
@@ -67,6 +72,16 @@ pub(crate) fn run(directory: PathBuf, cx: &mut App) {
                 Appearance::Dark,
                 "workspace-start-dark.png",
                 Some(open_start),
+            ),
+            (
+                Appearance::Light,
+                "workspace-start-empty-light.png",
+                Some(open_start_empty),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-start-empty-dark.png",
+                Some(open_start_empty),
             ),
             (
                 Appearance::Light,

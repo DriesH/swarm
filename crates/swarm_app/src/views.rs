@@ -11,9 +11,12 @@ use swarm_ui::prelude::*;
 use swarm_ui::styles::focus_ring;
 use swarm_ui::{FocusStyle, TextFieldSize, TileRing};
 
+use crate::daemon::{CHROME_HEIGHT, CHROME_WIDTH};
 use crate::model::{Agent, AgentKind, FakeLine, Terminal, TerminalId, TerminalKind};
 use crate::workspace::{DataSource, View, Workspace};
 
+/// The padding a terminal view leaves around its grid.
+const VIEW_PADDING: f32 = 8.;
 const CHAR_WIDTH: f32 = 7.2;
 const ROW_HEIGHT: f32 = 17.;
 const HEADER_HEIGHT: f32 = 34.;
@@ -123,6 +126,17 @@ fn process_size(columns: u16, rows: u16) -> swarm_layout::Size {
     )
 }
 
+/// Size of a tile for a process terminal that an agent fixed at `columns` × `rows`,
+/// from the terminal view's cell size when it is known.
+fn fixed_size(cell: Option<(f32, f32)>, columns: u16, rows: u16) -> swarm_layout::Size {
+    let (cell_width, cell_height) = cell.unwrap_or((CHAR_WIDTH, ROW_HEIGHT));
+
+    swarm_layout::Size::new(
+        f32::from(columns) * cell_width + 2. * VIEW_PADDING + CHROME_WIDTH,
+        f32::from(rows) * cell_height + 2. * VIEW_PADDING + CHROME_HEIGHT,
+    )
+}
+
 /// Cells that fit in a tile of this size.
 fn cells(size: Size<Pixels>) -> (u32, u32) {
     let columns = (f32::from(size.width) / CHAR_WIDTH).floor().max(0.);
@@ -159,9 +173,12 @@ fn tile_kind(kind: TerminalKind) -> TileKind {
 fn tile_spec(workspace: &Workspace, terminal: &Terminal, activity: Activity) -> TileSpec {
     let mut spec = TileSpec::new(TileId(terminal.id.0), tile_kind(terminal.kind), activity);
     spec.minimized = workspace.minimized.contains(&terminal.id);
-    spec.requested = terminal
-        .requested_size
-        .map(|(columns, rows)| process_size(columns, rows));
+    spec.requested = match terminal.fixed_size {
+        Some((columns, rows)) => Some(fixed_size(workspace.cell_size, columns, rows)),
+        None => terminal
+            .requested_size
+            .map(|(columns, rows)| process_size(columns, rows)),
+    };
 
     if terminal.kind == TerminalKind::User {
         spec.fixed = workspace
@@ -261,6 +278,7 @@ impl Workspace {
 
         if let Some(live) = self.live_terminals.remove(&terminal) {
             live.kill_if_running(cx);
+            self.dismissed_terminals.insert(live.daemon_id());
         }
 
         self.data.stop_process(task, terminal);

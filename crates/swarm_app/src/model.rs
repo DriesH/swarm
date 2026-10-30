@@ -1,11 +1,13 @@
 //! Fake data for the app shell. Plain data, no gpui entities.
 
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 
 use gpui::{Hsla, SharedString, rgb};
 use swarm_protocol::{
     AgentId as DaemonAgentId, AgentInfo, AgentLifecycle, AgentRole,
-    AgentStatus as DaemonAgentStatus, ProjectInfo, TaskInfo, TerminalId as DaemonTerminalId,
+    AgentStatus as DaemonAgentStatus, MessageInfo, ProjectInfo, TaskInfo,
+    TerminalId as DaemonTerminalId, TerminalInfo,
 };
 use swarm_term::{BlockedKind, ExitStatus};
 use swarm_ui::AgentStatus;
@@ -52,10 +54,17 @@ pub(crate) struct Project {
     pub config_error: Option<SharedString>,
 }
 
+/// The newest messages kept for each task.
+pub(crate) const MESSAGES_PER_TASK: usize = 500;
+
 /// What links a task to the daemon.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DaemonTask {
     pub id: swarm_protocol::TaskId,
+    /// The Start orchestrator that made the task, if one did.
+    pub created_by: Option<DaemonAgentId>,
+    /// The task's orchestrator confirmed its brief.
+    pub briefed: bool,
     pub setup_terminal: Option<DaemonTerminalId>,
     pub setup_exit: Option<ExitStatus>,
     pub worktree: PathBuf,
@@ -125,7 +134,9 @@ impl From<AgentKind> for swarm_protocol::AgentKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DaemonAgent {
     pub id: DaemonAgentId,
-    pub task: swarm_protocol::TaskId,
+    pub project: swarm_protocol::ProjectId,
+    /// `None` for a Start orchestrator.
+    pub task: Option<swarm_protocol::TaskId>,
     /// The agent's terminal while it runs.
     pub terminal: Option<DaemonTerminalId>,
     pub status: DaemonAgentStatus,
@@ -254,9 +265,14 @@ pub(crate) struct Terminal {
     pub title: SharedString,
     pub meta: Option<SharedString>,
     pub owner: Option<AgentId>,
+    /// The daemon agent that started a process terminal. `owner` follows once the app
+    /// knows that agent.
+    pub daemon_owner: Option<DaemonAgentId>,
     pub link: Option<SharedString>,
     /// Columns and rows.
     pub requested_size: Option<(u16, u16)>,
+    /// Columns and rows an agent fixed. The app never resizes such a terminal.
+    pub fixed_size: Option<(u16, u16)>,
     pub lines: Vec<FakeLine>,
 }
 
@@ -388,6 +404,10 @@ pub(crate) struct FakeData {
     pub usage: Vec<(SharedString, f32)>,
     pub file_tree: Vec<TreeEntry>,
     pub pull_request: Option<FakePullRequest>,
+    /// The last [`MESSAGES_PER_TASK`] messages of each task, oldest first. A Start
+    /// orchestrator's messages sit under its project with no task.
+    pub messages:
+        HashMap<(swarm_protocol::ProjectId, Option<swarm_protocol::TaskId>), VecDeque<MessageInfo>>,
 }
 
 fn sample_usage() -> Vec<(SharedString, f32)> {
@@ -493,6 +513,8 @@ impl Builder {
             owner: None,
             link: None,
             requested_size: None,
+            daemon_owner: None,
+            fixed_size: None,
             lines: spec.lines,
         });
         data.agents.push(Agent {
@@ -549,6 +571,8 @@ impl Builder {
             owner: Some(owner),
             link: link.map(SharedString::new),
             requested_size: Some(size),
+            daemon_owner: None,
+            fixed_size: None,
             lines: output,
         });
 
@@ -897,6 +921,10 @@ impl FakeData {
             self.sync_task(id, task);
         }
 
+        if let Some(start) = &info.start {
+            self.sync_agent(start);
+        }
+
         id
     }
 
@@ -904,6 +932,8 @@ impl FakeData {
     pub(crate) fn sync_task(&mut self, project: ProjectId, info: &TaskInfo) -> TaskId {
         let daemon = DaemonTask {
             id: info.id,
+            created_by: info.created_by,
+            briefed: info.briefed,
             setup_terminal: info.setup_terminal,
             setup_exit: info.setup_exit.clone(),
             worktree: info.worktree.clone(),
@@ -965,20 +995,17 @@ impl FakeData {
     }
 
     /// Adds or updates an agent the daemon runs. Returns the agent and its tile's terminal,
-    /// or `None` when its task is unknown.
+    /// or `None` when its task or project is unknown. A copy with a lower revision than
+    /// the one known is dropped, whether it comes from a listing or an event.
     pub(crate) fn sync_agent(&mut self, info: &AgentInfo) -> Option<(AgentId, TerminalId)> {
-        let task = self
-            .tasks
-            .iter()
-            .find(|task| {
-                task.daemon
-                    .as_ref()
-                    .is_some_and(|daemon| daemon.id == info.task)
-            })
-            .map(|task| task.id)?;
+        let task = match info.task {
+            Some(id) => self.task_with_daemon_id(id)?,
+            None => self.start_tab_for(info)?,
+        };
 
         let daemon = DaemonAgent {
             id: info.id,
+            project: info.project,
             task: info.task,
             terminal: info.terminal,
             status: info.status,
@@ -1031,15 +1058,10 @@ impl FakeData {
                 .unwrap_or(0),
         );
         let terminal = self.next_terminal_id();
-        let (name, kind) = match info.role {
-            AgentRole::Orchestrator => (
-                SharedString::new("orchestrator"),
-                TerminalKind::Orchestrator,
-            ),
-            AgentRole::Worker => (
-                SharedString::from(format!("worker {}", info.id.0)),
-                TerminalKind::Worker,
-            ),
+        let name = SharedString::new(&info.name);
+        let kind = match info.role {
+            AgentRole::Orchestrator | AgentRole::StartOrchestrator => TerminalKind::Orchestrator,
+            AgentRole::Worker => TerminalKind::Worker,
         };
 
         self.terminals.push(Terminal {
@@ -1050,6 +1072,8 @@ impl FakeData {
             owner: None,
             link: None,
             requested_size: None,
+            daemon_owner: None,
+            fixed_size: None,
             lines: Vec::new(),
         });
         self.agents.push(Agent {
@@ -1065,12 +1089,230 @@ impl FakeData {
 
         if let Some(entry) = self.tasks.iter_mut().find(|entry| entry.id == task) {
             match info.role {
-                AgentRole::Orchestrator => entry.orchestrator = Some(id),
+                AgentRole::Orchestrator | AgentRole::StartOrchestrator => {
+                    entry.orchestrator = Some(id);
+                }
                 AgentRole::Worker => entry.workers.push(id),
             }
         }
 
+        for entry in &mut self.terminals {
+            if entry.daemon_owner == Some(info.id) {
+                entry.owner = Some(id);
+            }
+        }
+
         (id, terminal)
+    }
+
+    pub(crate) fn has_daemon_task(&self, id: swarm_protocol::TaskId) -> bool {
+        self.task_with_daemon_id(id).is_some()
+    }
+
+    fn task_with_daemon_id(&self, id: swarm_protocol::TaskId) -> Option<TaskId> {
+        self.tasks
+            .iter()
+            .find(|task| task.daemon.as_ref().is_some_and(|daemon| daemon.id == id))
+            .map(|task| task.id)
+    }
+
+    pub(crate) fn project_with_daemon_id(
+        &self,
+        id: swarm_protocol::ProjectId,
+    ) -> Option<ProjectId> {
+        self.projects
+            .iter()
+            .find(|project| project.daemon == Some(id))
+            .map(|project| project.id)
+    }
+
+    pub(crate) fn agent_with_daemon_id(&self, id: DaemonAgentId) -> Option<&Agent> {
+        self.agents
+            .iter()
+            .find(|agent| agent.daemon.as_ref().is_some_and(|daemon| daemon.id == id))
+    }
+
+    /// The tab of a Start orchestrator: its project's Start tab, made when missing. An
+    /// orchestrator that already ended gets no tab of its own.
+    fn start_tab_for(&mut self, info: &AgentInfo) -> Option<TaskId> {
+        let project = self.project_with_daemon_id(info.project)?;
+        let ended = matches!(
+            info.lifecycle,
+            AgentLifecycle::Stopped | AgentLifecycle::Resumable
+        );
+
+        match self.start_task(project) {
+            Some(task) => {
+                let known = self.start_agent_of(task);
+
+                (!ended || known == Some(info.id)).then_some(task)
+            }
+            None if ended => None,
+            None => Some(self.ensure_start_task(project)),
+        }
+    }
+
+    /// The project's Start or Plan tab.
+    pub(crate) fn start_task(&self, project: ProjectId) -> Option<TaskId> {
+        self.tasks_of(project)
+            .find(|task| task.is_start)
+            .map(|task| task.id)
+    }
+
+    /// The daemon id of the Start orchestrator on a Start tab.
+    pub(crate) fn start_agent_of(&self, task: TaskId) -> Option<DaemonAgentId> {
+        self.task(task)?
+            .orchestrator
+            .and_then(|id| self.agent(id))
+            .and_then(|agent| agent.daemon.as_ref())
+            .map(|daemon| daemon.id)
+    }
+
+    /// True while the Start orchestrator of the project's Start tab runs.
+    pub(crate) fn start_runs(&self, project: ProjectId) -> bool {
+        self.start_task(project)
+            .and_then(|task| self.task(task)?.orchestrator)
+            .and_then(|id| self.agent(id)?.daemon.as_ref())
+            .is_some_and(|daemon| {
+                matches!(
+                    daemon.lifecycle,
+                    AgentLifecycle::Starting | AgentLifecycle::Running
+                )
+            })
+    }
+
+    /// What a tab shows as its name. A Start tab is "Start" while every task of the
+    /// project came from its orchestrator, else "Plan".
+    pub(crate) fn tab_label(&self, task: &Task) -> SharedString {
+        if !task.is_start {
+            return task.name.clone();
+        }
+
+        let start = self.start_agent_of(task.id);
+        let only_its_tasks =
+            self.tasks_of(task.project)
+                .filter(|other| !other.is_start)
+                .all(|other| {
+                    other.daemon.as_ref().is_some_and(|daemon| {
+                        daemon.created_by.is_some() && daemon.created_by == start
+                    })
+                });
+
+        SharedString::new_static(if only_its_tasks {
+            START_TASK
+        } else {
+            PLAN_TASK
+        })
+    }
+
+    /// The daemon task with the lowest id that a Start orchestrator made.
+    pub(crate) fn first_task_made_by(
+        &self,
+        project: ProjectId,
+        agent: DaemonAgentId,
+    ) -> Option<TaskId> {
+        self.tasks_of(project)
+            .filter_map(|task| {
+                let daemon = task.daemon.as_ref()?;
+
+                (daemon.created_by == Some(agent)).then_some((daemon.id, task.id))
+            })
+            .min_by_key(|(daemon_id, _)| *daemon_id)
+            .map(|(_, task)| task)
+    }
+
+    /// Removes the agents of a tab and their terminals. Returns the terminals.
+    pub(crate) fn remove_agents_of(&mut self, task: TaskId) -> Vec<TerminalId> {
+        let gone: Vec<TerminalId> = self
+            .agents
+            .iter()
+            .filter(|agent| agent.task == task)
+            .map(|agent| agent.terminal)
+            .collect();
+
+        self.agents.retain(|agent| agent.task != task);
+        self.terminals
+            .retain(|terminal| !gone.contains(&terminal.id));
+
+        if let Some(entry) = self.tasks.iter_mut().find(|entry| entry.id == task) {
+            entry.orchestrator = None;
+            entry.workers.clear();
+        }
+
+        gone
+    }
+
+    /// Removes a tab with its agents and terminals. Returns the terminals.
+    pub(crate) fn remove_task(&mut self, task: TaskId) -> Vec<TerminalId> {
+        let mut gone = self.remove_agents_of(task);
+
+        if let Some(entry) = self.task(task) {
+            let others: Vec<TerminalId> = entry
+                .processes
+                .iter()
+                .chain(&entry.user_terminals)
+                .copied()
+                .collect();
+
+            self.terminals
+                .retain(|terminal| !others.contains(&terminal.id));
+            gone.extend(others);
+        }
+
+        self.tasks.retain(|entry| entry.id != task);
+
+        gone
+    }
+
+    /// Keeps a message, up to the last [`MESSAGES_PER_TASK`] of its task.
+    pub(crate) fn record_message(&mut self, message: &MessageInfo) {
+        let log = self
+            .messages
+            .entry((message.project, message.task))
+            .or_default();
+
+        if log.iter().any(|known| known.id == message.id) {
+            return;
+        }
+
+        log.push_back(message.clone());
+
+        while log.len() > MESSAGES_PER_TASK {
+            log.pop_front();
+        }
+    }
+
+    /// The kept messages of a task, oldest first. `None` is a Start orchestrator's.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the Swarm view reads them in phase 5")
+    )]
+    pub(crate) fn messages_of(
+        &self,
+        project: swarm_protocol::ProjectId,
+        task: Option<swarm_protocol::TaskId>,
+    ) -> impl Iterator<Item = &MessageInfo> {
+        self.messages.get(&(project, task)).into_iter().flatten()
+    }
+
+    /// Applies what the daemon says about a process terminal an agent started.
+    pub(crate) fn update_process(
+        &mut self,
+        terminal: TerminalId,
+        title: &str,
+        info: &TerminalInfo,
+    ) {
+        let owner = info
+            .owner
+            .and_then(|owner| self.agent_with_daemon_id(owner))
+            .map(|agent| agent.id);
+
+        if let Some(entry) = self.terminals.iter_mut().find(|entry| entry.id == terminal) {
+            entry.title = SharedString::new(title);
+            entry.daemon_owner = info.owner;
+            entry.owner = owner;
+            entry.fixed_size = info.fixed_size.map(|size| (size.cols, size.rows));
+        }
     }
 
     /// A real task needs you when any agent is blocked or in error, and works when any agent works.
@@ -1166,6 +1408,8 @@ impl FakeData {
             owner: None,
             link: None,
             requested_size: None,
+            daemon_owner: None,
+            fixed_size: None,
             lines: Vec::new(),
         });
 
@@ -1203,6 +1447,8 @@ impl FakeData {
             owner: None,
             link: None,
             requested_size: None,
+            daemon_owner: None,
+            fixed_size: None,
             lines,
         });
 
@@ -1298,16 +1544,53 @@ impl FakeData {
         } else {
             START_TASK
         };
-        let lines = vec![FakeLine {
-            text: "\u{203a} ready".into(),
-            color: Color::Muted,
-        }];
-        let task = self.add_task(project, name, AgentKind::ClaudeCode, lines);
+        let live = self
+            .project(project)
+            .is_some_and(|project| project.daemon.is_some());
+        let task = if live {
+            self.add_empty_task(project, name)
+        } else {
+            let lines = vec![FakeLine {
+                text: "\u{203a} ready".into(),
+                color: Color::Muted,
+            }];
+
+            self.add_task(project, name, AgentKind::ClaudeCode, lines)
+        };
 
         if let Some(entry) = self.tasks.iter_mut().find(|entry| entry.id == task) {
             entry.is_start = true;
             entry.branch = SharedString::default();
         }
+
+        task
+    }
+
+    /// Adds a task with no agent yet, for a Start tab whose orchestrator the daemon runs.
+    fn add_empty_task(&mut self, project: ProjectId, name: &str) -> TaskId {
+        let task = TaskId(
+            self.tasks
+                .iter()
+                .map(|task| task.id.0 + 1)
+                .max()
+                .unwrap_or(0),
+        );
+
+        self.tasks.push(Task {
+            id: task,
+            project,
+            name: SharedString::new(name),
+            branch: SharedString::from(format!("swarm/{name}")),
+            status: TaskStatus::Idle,
+            orchestrator: None,
+            workers: Vec::new(),
+            processes: Vec::new(),
+            user_terminals: Vec::new(),
+            additions: 0,
+            deletions: 0,
+            is_start: false,
+            daemon: None,
+        });
 
         task
     }
@@ -1339,6 +1622,8 @@ impl FakeData {
             owner: None,
             link: None,
             requested_size: None,
+            daemon_owner: None,
+            fixed_size: None,
             lines: terminal_lines,
         });
         self.agents.push(Agent {
@@ -1457,14 +1742,9 @@ mod tests {
         let start = data.ensure_start_task(ProjectId(3));
         let plan = data.ensure_start_task(ProjectId(0));
 
-        assert_eq!(
-            data.task(start).map(|task| task.name.as_ref()),
-            Some(START_TASK)
-        );
-        assert_eq!(
-            data.task(plan).map(|task| task.name.as_ref()),
-            Some(PLAN_TASK)
-        );
+        let label = |task: TaskId| data.task(task).map(|task| data.tab_label(task));
+        assert_eq!(label(start).as_deref(), Some(START_TASK));
+        assert_eq!(label(plan).as_deref(), Some(PLAN_TASK));
         assert!(data.task(plan).is_some_and(|task| task.branch.is_empty()));
     }
 
@@ -1520,6 +1800,7 @@ mod tests {
             base_branch: "main".into(),
             config_error: config_error.map(str::to_owned),
             tasks: Vec::new(),
+            start: None,
         }
     }
 
@@ -1571,16 +1852,22 @@ mod tests {
             setup_terminal: None,
             setup_exit: None,
             agents,
+            created_by: None,
+            briefed: false,
         }
     }
 
     fn agent_with(status: DaemonAgentStatus, revision: u64) -> AgentInfo {
         AgentInfo {
             id: DaemonAgentId(1),
-            task: swarm_protocol::TaskId(7),
+            project: swarm_protocol::ProjectId(1),
+            task: Some(swarm_protocol::TaskId(7)),
             role: AgentRole::Orchestrator,
             kind: swarm_protocol::AgentKind::ClaudeCode,
             model: "opus".into(),
+            name: "orchestrator".into(),
+            worktree: PathBuf::from("/tmp/worktree"),
+            branch: "swarm/login".into(),
             terminal: (status != DaemonAgentStatus::Unknown).then_some(DaemonTerminalId(3)),
             status,
             message: None,
@@ -1664,5 +1951,199 @@ mod tests {
         let agent = orchestrator(&data, task);
         assert_eq!(agent.status, AgentStatus::Unknown);
         assert_eq!(agent.status_text(), "unknown");
+    }
+
+    fn start_with(status: DaemonAgentStatus, revision: u64) -> AgentInfo {
+        AgentInfo {
+            id: DaemonAgentId(9),
+            task: None,
+            role: AgentRole::StartOrchestrator,
+            name: "start".into(),
+            ..agent_with(status, revision)
+        }
+    }
+
+    #[test]
+    fn a_start_orchestrator_belongs_to_the_project_start_tab_not_a_task() {
+        let mut data = FakeData::live();
+        let project = data.sync_project(&project_info(1, None));
+        let task = data.sync_task(project, &task_with(Vec::new()));
+
+        data.sync_agent(&start_with(DaemonAgentStatus::Idle, 1));
+
+        let start = data.start_task(project).expect("a Start tab");
+        assert_ne!(start, task);
+        assert!(data.task(start).is_some_and(|tab| tab.is_start));
+        assert_eq!(data.agents_of(start).count(), 1);
+        assert_eq!(data.agents_of(task).count(), 0);
+        assert!(data.start_runs(project));
+    }
+
+    #[test]
+    fn the_start_tab_of_a_live_project_has_no_fake_orchestrator() {
+        let mut data = FakeData::live();
+        let project = data.sync_project(&project_info(1, None));
+
+        let start = data.ensure_start_task(project);
+
+        assert_eq!(data.agents_of(start).count(), 0);
+        assert!(!data.start_runs(project));
+    }
+
+    #[test]
+    fn an_older_start_listing_does_not_replace_a_newer_event() {
+        let mut data = FakeData::live();
+        let project = data.sync_project(&project_info(1, None));
+        data.sync_agent(&start_with(DaemonAgentStatus::Working, 5));
+
+        let listed = ProjectInfo {
+            start: Some(start_with(DaemonAgentStatus::Idle, 3)),
+            ..project_info(1, None)
+        };
+        data.sync_project(&listed);
+
+        let tab = data.start_task(project).expect("a Start tab");
+        let agent = data.agent_with_daemon_id(DaemonAgentId(9)).expect("agent");
+        assert_eq!(agent.status, AgentStatus::Working);
+        assert_eq!(data.agents_of(tab).count(), 1);
+    }
+
+    #[test]
+    fn an_ended_start_orchestrator_makes_no_tab() {
+        let mut data = FakeData::live();
+        let project = data.sync_project(&project_info(1, None));
+        let mut ended = start_with(DaemonAgentStatus::Done, 2);
+        ended.lifecycle = AgentLifecycle::Resumable;
+
+        let synced = data.sync_agent(&ended);
+
+        assert!(synced.is_none());
+        assert!(data.start_task(project).is_none());
+    }
+
+    #[test]
+    fn a_worker_takes_its_name_from_the_daemon() {
+        let mut data = FakeData::live();
+        let task = live_task(&mut data, Vec::new());
+        let worker = AgentInfo {
+            id: DaemonAgentId(4),
+            role: AgentRole::Worker,
+            name: "api".into(),
+            ..agent_with(DaemonAgentStatus::Working, 1)
+        };
+
+        data.sync_agent(&worker);
+
+        let entry = data.task(task).expect("task");
+        let agent = entry.workers.first().and_then(|id| data.agent(*id));
+        assert_eq!(
+            agent.map(|agent| agent.name.to_string()).as_deref(),
+            Some("api")
+        );
+    }
+
+    fn message(id: u64) -> MessageInfo {
+        MessageInfo {
+            id: swarm_protocol::MessageId(id),
+            project: swarm_protocol::ProjectId(1),
+            task: Some(swarm_protocol::TaskId(7)),
+            from: None,
+            to: DaemonAgentId(1),
+            kind: swarm_protocol::MessageKind::Task,
+            text: format!("message {id}"),
+            sent_at: id,
+        }
+    }
+
+    #[test]
+    fn the_last_500_messages_of_a_task_are_kept() {
+        let mut data = FakeData::live();
+
+        for id in 0..520 {
+            data.record_message(&message(id));
+        }
+        data.record_message(&message(519));
+
+        let kept: Vec<u64> = data
+            .messages_of(
+                swarm_protocol::ProjectId(1),
+                Some(swarm_protocol::TaskId(7)),
+            )
+            .map(|message| message.id.0)
+            .collect();
+        assert_eq!(kept.len(), MESSAGES_PER_TASK);
+        assert_eq!((kept.first(), kept.last()), (Some(&20), Some(&519)));
+    }
+
+    #[test]
+    fn messages_are_kept_per_task() {
+        let mut data = FakeData::live();
+        data.record_message(&message(1));
+        data.record_message(&MessageInfo {
+            task: None,
+            ..message(2)
+        });
+
+        let count = |task| data.messages_of(swarm_protocol::ProjectId(1), task).count();
+        assert_eq!(count(Some(swarm_protocol::TaskId(7))), 1);
+        assert_eq!(count(None), 1);
+        assert_eq!(count(Some(swarm_protocol::TaskId(8))), 0);
+    }
+
+    #[test]
+    fn a_tab_is_start_only_while_the_start_orchestrator_made_every_task() {
+        let mut data = FakeData::live();
+        let project = data.sync_project(&project_info(1, None));
+        data.sync_agent(&start_with(DaemonAgentStatus::Idle, 1));
+        let start = data.start_task(project).expect("a Start tab");
+        let label = |data: &FakeData| {
+            data.task(start)
+                .map(|tab| data.tab_label(tab).to_string())
+                .unwrap_or_default()
+        };
+        let none = label(&data);
+
+        let made = TaskInfo {
+            created_by: Some(DaemonAgentId(9)),
+            ..task_with(Vec::new())
+        };
+        data.sync_task(project, &made);
+        let one = label(&data);
+
+        let other = TaskInfo {
+            id: swarm_protocol::TaskId(8),
+            created_by: None,
+            ..task_with(Vec::new())
+        };
+        data.sync_task(project, &other);
+
+        assert_eq!((none.as_str(), one.as_str()), (START_TASK, START_TASK));
+        assert_eq!(label(&data), PLAN_TASK);
+    }
+
+    #[test]
+    fn an_agent_process_is_owned_by_the_agent_that_started_it() {
+        let mut data = FakeData::live();
+        let task = live_task(&mut data, vec![agent_with(DaemonAgentStatus::Idle, 1)]);
+        let terminal = data.add_live_process(task, "Process", None);
+        let info = TerminalInfo {
+            id: DaemonTerminalId(30),
+            kind: swarm_protocol::TerminalKind::Process,
+            task: Some("task:7".into()),
+            owner: Some(DaemonAgentId(1)),
+            name: Some("dev server".into()),
+            fixed_size: Some(swarm_protocol::GridSize { cols: 80, rows: 12 }),
+            title: None,
+            cwd: None,
+            exit: None,
+        };
+
+        data.update_process(terminal, "dev server", &info);
+
+        let entry = data.terminal(terminal).expect("terminal");
+        let orchestrator = data.task(task).and_then(|task| task.orchestrator);
+        assert_eq!(entry.title.as_ref(), "dev server");
+        assert_eq!(entry.owner, orchestrator);
+        assert_eq!(entry.fixed_size, Some((80, 12)));
     }
 }

@@ -320,7 +320,7 @@ impl Workspace {
     }
 
     /// The orchestrator kind from the settings file, Claude Code when there is none.
-    fn default_orchestrator(&self) -> AgentKind {
+    pub(crate) fn default_orchestrator(&self) -> AgentKind {
         let Some(path) = &self.settings_path else {
             return AgentKind::ClaudeCode;
         };
