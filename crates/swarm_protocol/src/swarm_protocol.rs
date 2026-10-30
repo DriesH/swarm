@@ -19,7 +19,7 @@ mod client;
 pub use client::{Client, ClientError};
 
 /// Bumped on every incompatible change; the daemon refuses other versions.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 /// Guards against a corrupt length prefix allocating gigabytes.
 const MAX_FRAME: usize = 256 << 20;
@@ -78,6 +78,60 @@ pub struct ProjectInfo {
     pub tasks: Vec<TaskInfo>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AgentId(pub u64);
+
+/// Which CLI an agent runs.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AgentKind {
+    ClaudeCode,
+    Codex,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AgentRole {
+    Orchestrator,
+    Worker,
+}
+
+/// What an agent is doing, merged from OSC 7501, hooks and the process exit.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentStatus {
+    Unknown,
+    Idle,
+    Working,
+    Done,
+    Blocked(swarm_term::BlockedKind),
+    Error,
+}
+
+/// Whether the agent's process runs. Separate from [`AgentStatus`].
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentLifecycle {
+    Starting,
+    Running,
+    /// Ended; it can start again from its session.
+    Resumable,
+    Stopped,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AgentInfo {
+    pub id: AgentId,
+    pub task: TaskId,
+    pub role: AgentRole,
+    pub kind: AgentKind,
+    pub model: String,
+    /// The agent's terminal while it runs.
+    pub terminal: Option<TerminalId>,
+    pub status: AgentStatus,
+    /// The program's own status text, or an error reason.
+    pub message: Option<String>,
+    pub lifecycle: AgentLifecycle,
+    /// Goes up with every change, so a client can drop a copy older than the one it has.
+    pub revision: u64,
+}
+
 /// One task: its own branch and task worktree.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct TaskInfo {
@@ -94,6 +148,7 @@ pub struct TaskInfo {
     pub setup_terminal: Option<TerminalId>,
     /// How the setup script ended, so a fast or failed setup is never missed.
     pub setup_exit: Option<swarm_term::ExitStatus>,
+    pub agents: Vec<AgentInfo>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -103,6 +158,10 @@ pub struct CreateTask {
     /// Branch to start from; `None` uses the project's base branch.
     pub from: Option<String>,
     pub run_setup: bool,
+    /// Starts an orchestrator of this kind once setup is done; `None` starts none.
+    pub orchestrator: Option<AgentKind>,
+    /// Typed into the orchestrator once it reports that it is ready.
+    pub first_message: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -206,6 +265,10 @@ pub enum Event {
     TaskCreated {
         call: CallId,
         task: TaskInfo,
+    },
+    /// Sent to every client whenever an agent starts, ends or changes status.
+    AgentChanged {
+        agent: AgentInfo,
     },
 }
 
