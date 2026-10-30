@@ -9,14 +9,21 @@ use std::sync::Arc;
 use std::thread;
 
 use anyhow::Result;
-use swarm_protocol::{Event, FrameError, Request, TerminalId, VERSION, read, write};
+use swarm_core::Projects;
+use swarm_protocol::{CallId, Event, FrameError, Request, TerminalId, VERSION, read, write};
 
 use crate::hub::{CREATE_HISTORY_LINES, ClientSink, Frame, QUEUE_FRAMES, Terminals};
+use crate::tasks;
 
 /// Longest parent chain the peer check follows.
 const MAX_ANCESTORS: usize = 256;
 
-pub(crate) fn serve(terminals: &Arc<Terminals>, client: u64, mut stream: UnixStream) -> Result<()> {
+pub(crate) fn serve(
+    terminals: &Arc<Terminals>,
+    projects: &Arc<Projects>,
+    client: u64,
+    mut stream: UnixStream,
+) -> Result<()> {
     if let Some(reason) = refusal(&stream) {
         log::warn!("client {client} refused: {reason}");
         write(
@@ -45,7 +52,7 @@ pub(crate) fn serve(terminals: &Arc<Terminals>, client: u64, mut stream: UnixStr
     if handshake(&sink, &mut reader, &mut buffer) {
         loop {
             match read::<Request>(&mut reader, &mut buffer) {
-                Ok(request) => handle(terminals, &sink, request),
+                Ok(request) => handle(terminals, projects, &sink, request),
                 Err(FrameError::Io(error)) if error.kind() == ErrorKind::UnexpectedEof => break,
                 Err(error) => {
                     log::info!("client {client} ended: {error}");
@@ -96,7 +103,12 @@ fn handshake(sink: &ClientSink, reader: &mut BufReader<UnixStream>, buffer: &mut
     accepted
 }
 
-fn handle(terminals: &Arc<Terminals>, sink: &Arc<ClientSink>, request: Request) {
+fn handle(
+    terminals: &Arc<Terminals>,
+    projects: &Arc<Projects>,
+    sink: &Arc<ClientSink>,
+    request: Request,
+) {
     match request {
         Request::Hello { .. } => {
             sink.send_event(&Event::Hello {
@@ -117,13 +129,7 @@ fn handle(terminals: &Arc<Terminals>, sink: &Arc<ClientSink>, request: Request) 
                     send_missing(sink, hub.id());
                 }
             }
-            Err(error) => {
-                sink.send_event(&Event::Error {
-                    call: Some(call),
-                    id: None,
-                    message: format!("{error:#}"),
-                });
-            }
+            Err(error) => send_error(sink, call, &error),
         },
         Request::Attach { id, history } => match terminals.get(id) {
             Some(hub) if hub.attach(sink, history) => {}
@@ -138,7 +144,61 @@ fn handle(terminals: &Arc<Terminals>, sink: &Arc<ClientSink>, request: Request) 
             Some(hub) if hub.send_input(input) => {}
             _ => send_missing(sink, id),
         },
+        Request::ListProjects { call } => match projects.list() {
+            Ok(projects) => {
+                sink.send_event(&Event::Projects { call, projects });
+            }
+            Err(error) => send_error(sink, call, &error),
+        },
+        Request::AddProject { call, path } => {
+            let projects = Arc::clone(projects);
+            run_slow(sink, "add-project", call, move |sink| {
+                match projects.add(&path) {
+                    Ok(project) => {
+                        sink.send_event(&Event::ProjectAdded { call, project });
+                    }
+                    Err(error) => send_error(sink, call, &error),
+                }
+            });
+        }
+        Request::CreateTask { call, task } => {
+            let (terminals, projects) = (Arc::clone(terminals), Arc::clone(projects));
+            run_slow(sink, "create-task", call, move |sink| {
+                match tasks::create(&terminals, &projects, &task) {
+                    Ok(task) => {
+                        sink.send_event(&Event::TaskCreated { call, task });
+                    }
+                    Err(error) => send_error(sink, call, &error),
+                }
+            });
+        }
     }
+}
+
+/// Runs a request that waits on git or the disk on its own thread, so the
+/// connection keeps answering other requests.
+fn run_slow(
+    sink: &Arc<ClientSink>,
+    name: &str,
+    call: CallId,
+    work: impl FnOnce(&ClientSink) + Send + 'static,
+) {
+    let worker_sink = Arc::clone(sink);
+    let spawned = thread::Builder::new()
+        .name(format!("{name}-{}", call.0))
+        .spawn(move || work(&worker_sink));
+
+    if let Err(error) = spawned {
+        send_error(sink, call, &error);
+    }
+}
+
+fn send_error(sink: &ClientSink, call: CallId, error: &dyn std::fmt::Display) {
+    sink.send_event(&Event::Error {
+        call: Some(call),
+        id: None,
+        message: format!("{error:#}"),
+    });
 }
 
 fn send_missing(sink: &ClientSink, id: TerminalId) {

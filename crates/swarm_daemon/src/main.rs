@@ -3,7 +3,7 @@
 mod connection;
 mod hub;
 mod recovery;
-mod store;
+mod tasks;
 
 use std::fs::{DirBuilder, File, Permissions};
 use std::io::Read as _;
@@ -18,11 +18,12 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
+use swarm_core::Projects;
+use swarm_core::store::Store;
 use swarm_protocol::{Paths, check_private_dir};
 
 use crate::hub::Terminals;
 use crate::recovery::System;
-use crate::store::Store;
 
 /// How long terminals get to exit on SIGTERM before the daemon leaves anyway.
 /// Pause after a failed `accept`, so a persistent error does not spin.
@@ -35,6 +36,11 @@ static SHUTDOWN_PIPE: AtomicI32 = AtomicI32::new(-1);
 
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    if let Err(error) = unblock_signals() {
+        log::error!("{error:#}");
+        return ExitCode::FAILURE;
+    }
 
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -80,6 +86,7 @@ fn run() -> Result<()> {
 
     let store = Store::open(&paths.database)?;
     let leftovers = store.leftovers()?;
+    store.clear_setup_terminals()?;
     let store = Arc::new(Mutex::new(store));
 
     let recovery_store = Arc::clone(&store);
@@ -87,10 +94,11 @@ fn run() -> Result<()> {
         .name("recovery".into())
         .spawn(move || recovery::recover(&recovery_store, &leftovers, &System))?;
 
+    let projects = Arc::new(Projects::new(Arc::clone(&store)));
     let terminals = Terminals::new(store);
     watch_signals(Arc::clone(&terminals), paths.socket.clone())?;
 
-    serve(&listener, &terminals);
+    serve(&listener, &terminals, &projects);
 
     Ok(())
 }
@@ -136,6 +144,24 @@ fn take_lock(path: &Path) -> Result<Option<File>> {
 }
 
 /// The app's terminal may hang up; that must not end the daemon.
+/// A process started from a GCD thread (the app's background work) inherits a mask
+/// that blocks every signal, so SIGTERM would never arrive. Runs before any thread
+/// starts, because threads copy the mask they are created with.
+fn unblock_signals() -> Result<()> {
+    // SAFETY: the set is initialised by sigemptyset before pthread_sigmask reads it.
+    let result = unsafe {
+        let mut none = std::mem::zeroed::<libc::sigset_t>();
+        libc::sigemptyset(&raw mut none);
+        libc::pthread_sigmask(libc::SIG_SETMASK, &raw const none, std::ptr::null_mut())
+    };
+
+    if result != 0 {
+        return Err(std::io::Error::from_raw_os_error(result)).context("cannot unblock signals");
+    }
+
+    Ok(())
+}
+
 fn ignore_hangup() -> Result<()> {
     // SAFETY: ignoring a signal installs no handler code.
     if unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) } == libc::SIG_ERR {
@@ -145,7 +171,7 @@ fn ignore_hangup() -> Result<()> {
     Ok(())
 }
 
-fn serve(listener: &UnixListener, terminals: &Arc<Terminals>) {
+fn serve(listener: &UnixListener, terminals: &Arc<Terminals>, projects: &Arc<Projects>) {
     let next_client = AtomicU64::new(1);
 
     for stream in listener.incoming() {
@@ -160,10 +186,11 @@ fn serve(listener: &UnixListener, terminals: &Arc<Terminals>) {
 
         let client = next_client.fetch_add(1, Ordering::Relaxed);
         let terminals = Arc::clone(terminals);
+        let projects = Arc::clone(projects);
         let spawned = thread::Builder::new()
             .name(format!("client-{client}"))
             .spawn(move || {
-                if let Err(error) = connection::serve(&terminals, client, stream) {
+                if let Err(error) = connection::serve(&terminals, &projects, client, stream) {
                     log::warn!("client {client}: {error:#}");
                 }
             });

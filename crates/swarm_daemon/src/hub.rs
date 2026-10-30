@@ -12,12 +12,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
+use swarm_core::store::Store;
 use swarm_protocol::{CreateTerminal, Event, TerminalId, TerminalInfo, TerminalKind, encode};
 use swarm_term::{ExitStatus, TerminalInput, TerminalOutput, channels};
 use swarm_term_vt::{DEFAULT_SCROLLBACK_BYTES, LocalTerminal, SpawnOptions};
 
 use crate::recovery::process_info;
-use crate::store::Store;
 
 /// One encoded frame, shared by every client that receives it.
 pub(crate) type Frame = Arc<Vec<u8>>;
@@ -29,6 +29,15 @@ pub(crate) const QUEUE_FRAMES: usize = 4096;
 pub(crate) const CREATE_HISTORY_LINES: u32 = 1000;
 
 const EXIT_POLL: Duration = Duration::from_millis(25);
+
+/// What a terminal needs beyond the client's [`CreateTerminal`].
+#[derive(Default)]
+pub(crate) struct Extras {
+    pub(crate) env: Vec<(String, String)>,
+    /// Runs once the process runs, before the daemon can notice its exit.
+    pub(crate) on_started: Option<Box<dyn FnOnce(TerminalId) + Send>>,
+    pub(crate) on_exit: Option<Box<dyn FnOnce(Option<ExitStatus>) + Send>>,
+}
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -247,6 +256,7 @@ impl Hub {
         outputs: &flume::Receiver<TerminalOutput>,
         terminals: &Terminals,
         store: &Mutex<Store>,
+        on_exit: Option<Box<dyn FnOnce(Option<ExitStatus>) + Send>>,
     ) {
         let mut exit = None;
         while let Ok(output) = outputs.recv() {
@@ -271,7 +281,11 @@ impl Hub {
             }
         }
 
-        self.finish(exit, terminals, store);
+        self.finish(exit.clone(), terminals, store);
+
+        if let Some(on_exit) = on_exit {
+            on_exit(exit);
+        }
     }
 
     fn finish(&self, exit: Option<ExitStatus>, terminals: &Terminals, store: &Mutex<Store>) {
@@ -340,13 +354,21 @@ impl Terminals {
     /// Writes the row, starts the process and its hub thread. The row exists before
     /// the process does (ADR 0005).
     pub(crate) fn create(self: &Arc<Self>, request: CreateTerminal) -> Result<Arc<Hub>> {
+        self.create_with(request, Extras::default())
+    }
+
+    pub(crate) fn create_with(
+        self: &Arc<Self>,
+        request: CreateTerminal,
+        extras: Extras,
+    ) -> Result<Arc<Hub>> {
         let id = lock(&self.store).insert_starting(&request)?;
 
         let (terminal_channels, emulator_channels) = channels();
         let options = SpawnOptions {
             command: request.command.clone(),
             cwd: request.cwd.clone(),
-            env: Vec::new(),
+            env: extras.env,
             size: request.size,
             palette: request.palette,
             scrollback_bytes: DEFAULT_SCROLLBACK_BYTES,
@@ -370,6 +392,10 @@ impl Terminals {
             .map(|info| info.started_us);
         lock(&self.store).mark_running(id, pid, started_us)?;
 
+        if let Some(on_started) = extras.on_started {
+            on_started(id);
+        }
+
         let hub = Arc::new(Hub {
             id,
             kind: request.kind,
@@ -388,7 +414,7 @@ impl Terminals {
         let spawned = thread::Builder::new()
             .name(format!("hub-{}", id.0))
             .spawn(move || {
-                runner.run(&outputs, &terminals, &terminals.store);
+                runner.run(&outputs, &terminals, &terminals.store, extras.on_exit);
                 drop(terminal);
             });
         if let Err(error) = spawned {
