@@ -21,6 +21,7 @@ pub struct ListRow {
     compact: bool,
     indent: usize,
     focus_handle: Option<FocusHandle>,
+    debug_selector: Option<String>,
     on_click: Option<ClickHandler>,
 }
 
@@ -36,8 +37,15 @@ impl ListRow {
             compact: false,
             indent: 0,
             focus_handle: None,
+            debug_selector: None,
             on_click: None,
         }
+    }
+
+    /// Name for `VisualTestContext::debug_bounds`. Only recorded in test builds.
+    pub fn debug_selector(mut self, selector: impl FnOnce() -> String) -> Self {
+        self.debug_selector = Some(selector());
+        self
     }
 
     pub fn start_slot(mut self, element: impl IntoElement) -> Self {
@@ -102,6 +110,9 @@ impl RenderOnce for ListRow {
 
         div()
             .id(self.id)
+            .when_some(self.debug_selector, |row, selector| {
+                row.debug_selector(move || selector)
+            })
             .role(Role::ListItem)
             .aria_label(self.accessible_label.unwrap_or_else(|| self.label.clone()))
             .aria_selected(self.selected)

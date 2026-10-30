@@ -45,6 +45,7 @@ pub struct IconButton {
     icon: IconName,
     label: SharedString,
     size: IconButtonSize,
+    debug_selector: Option<String>,
     color: Color,
     toggle_state: Option<bool>,
     disabled: bool,
@@ -60,6 +61,7 @@ impl IconButton {
             size: IconButtonSize::default(),
             color: Color::Faint,
             toggle_state: None,
+            debug_selector: None,
             disabled: false,
             on_click: None,
         }
@@ -72,6 +74,12 @@ impl IconButton {
 
     pub fn color(mut self, color: Color) -> Self {
         self.color = color;
+        self
+    }
+
+    /// Name for `VisualTestContext::debug_bounds`. Only recorded in test builds.
+    pub fn debug_selector(mut self, selector: impl FnOnce() -> String) -> Self {
+        self.debug_selector = Some(selector());
         self
     }
 }
@@ -109,6 +117,9 @@ impl RenderOnce for IconButton {
 
         div()
             .id(self.id)
+            .when_some(self.debug_selector, |element, selector| {
+                element.debug_selector(move || selector)
+            })
             .role(Role::Button)
             .aria_label(self.label)
             .when_some(self.toggle_state, |button, on| {

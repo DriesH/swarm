@@ -5,8 +5,8 @@ Each phase ends with a pull request into `main`. A phase is done when every box 
 | Phase | Name | Status |
 |---|---|---|
 | 0 | Plan, design, spikes | Done ([PR #1](https://github.com/DriesH/swarm/pull/1)) |
-| 1 | Foundation: workspace, `swarm_ui`, gallery | In review |
-| 2 | App shell with fake data | Not started |
+| 1 | Foundation: workspace, `swarm_ui`, gallery | Done ([PR #2](https://github.com/DriesH/swarm/pull/2)) |
+| 2 | App shell with fake data | In review |
 | 3 | Daemon, terminals and worktrees | Not started |
 | 4 | Agents and harness | Not started |
 | 5 | Swarm view | Not started |
@@ -50,11 +50,11 @@ Each phase ends with a pull request into `main`. A phase is done when every box 
 
 **Done when:**
 
-- [ ] Start, Workspace, user terminal island and New task screens match the designs
-- [ ] Layout engine moves tiles to the tray when they don't fit and keeps user terminals at their size
-- [ ] Everything works from the keyboard; ⌘K opens the palette; each window focuses an element when it opens (Tab does nothing until something has focus)
+- [x] Start, Workspace, user terminal island and New task screens match the designs
+- [x] Layout engine moves tiles to the tray when they don't fit and keeps user terminals at their size
+- [x] Everything works from the keyboard; ⌘K opens the palette; each window focuses an element when it opens (Tab does nothing until something has focus)
 - [ ] VoiceOver can reach and name every control
-- [ ] Frames stay under 8 ms with fake content
+- [x] Frames stay under 8 ms with fake content
 
 ## 3. Daemon, terminals and worktrees
 
@@ -139,4 +139,3 @@ Each phase ends with a pull request into `main`. A phase is done when every box 
 
 - Settings › Terminals and Prompts (phase 8)
 - Menu bar usage popover (phase 7)
-- Command palette (phase 2)

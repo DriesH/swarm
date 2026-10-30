@@ -1,0 +1,149 @@
+//! Accessibility checks for Button, Kbd, Dropdown and `PopoverMenu`.
+
+use gpui::accesskit::{Node, Role, Toggled};
+use gpui::{
+    App, Context, Element as _, Render, RenderOnce, TestAppContext, VisualTestContext, Window, div,
+    px,
+};
+use swarm_ui::prelude::*;
+
+struct A11yInfo {
+    role: Option<Role>,
+    node: Node,
+}
+
+fn a11y_info<C: RenderOnce>(component: C, window: &mut Window, cx: &mut App) -> A11yInfo {
+    let element = component.render(window, cx).into_element();
+    let role = element.a11y_role();
+    let mut node = Node::new(role.unwrap_or(Role::Unknown));
+    element.write_a11y_info(&mut node);
+
+    A11yInfo { role, node }
+}
+
+type Check = Box<dyn FnOnce(&mut Window, &mut App)>;
+
+struct Probe {
+    check: Option<Check>,
+}
+
+impl Render for Probe {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(check) = self.check.take() {
+            check(window, cx);
+        }
+
+        div()
+    }
+}
+
+fn with_window(check: impl FnOnce(&mut Window, &mut App) + 'static) {
+    let mut app = TestAppContext::single();
+    app.update(swarm_ui::theme::init);
+
+    let window = app.add_window(|_, _| Probe {
+        check: Some(Box::new(check)),
+    });
+    app.run_until_parked();
+
+    let ran = app.update(|cx| window.read(cx).map(|probe| probe.check.is_none()));
+    assert!(matches!(ran, Ok(true)), "the probe view never rendered");
+}
+
+#[test]
+fn button_without_toggle_state_reports_no_toggled() {
+    with_window(|window, cx| {
+        let info = a11y_info(Button::new("plain", "Changes"), window, cx);
+
+        assert_eq!(info.node.toggled(), None);
+    });
+}
+
+#[test]
+fn button_toggled_off_reports_false() {
+    with_window(|window, cx| {
+        let info = a11y_info(
+            Button::new("off", "Changes").toggle_state(false),
+            window,
+            cx,
+        );
+
+        assert_eq!(info.node.toggled(), Some(Toggled::False));
+    });
+}
+
+#[test]
+fn button_toggled_on_reports_true() {
+    with_window(|window, cx| {
+        let info = a11y_info(Button::new("on", "Changes").toggle_state(true), window, cx);
+
+        assert_eq!(info.node.toggled(), Some(Toggled::True));
+    });
+}
+
+#[test]
+fn kbd_is_a_label_with_a_spoken_name() {
+    with_window(|window, cx| {
+        let info = a11y_info(Kbd::new("kbd", ["\u{2318}", "\u{21e7}", "R"]), window, cx);
+
+        assert_eq!(info.role, Some(Role::Label));
+        assert_eq!(info.node.label(), Some("Command Shift R"));
+    });
+}
+
+struct Harness {
+    dropdown: bool,
+}
+
+impl Render for Harness {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        if self.dropdown {
+            div()
+                .debug_selector(|| "dropdown-host".to_owned())
+                .size(px(200.))
+                .child(Dropdown::new(
+                    "dropdown",
+                    "Branch from",
+                    vec!["main".into(), "terminal-renderer".into()],
+                    1,
+                ))
+                .into_any_element()
+        } else {
+            PopoverMenu::new(
+                "popover",
+                Button::new("trigger", "Open").debug_selector(|| "trigger".to_owned()),
+                |_, _| Menu::new("menu", "Test menu").item(MenuItem::new("a", "A")),
+            )
+            .into_any_element()
+        }
+    }
+}
+
+fn harness(dropdown: bool) -> (TestAppContext, gpui::WindowHandle<Harness>) {
+    let mut app = TestAppContext::single();
+    app.update(swarm_ui::theme::init);
+
+    let window = app.add_window(move |_, _| Harness { dropdown });
+
+    (app, window)
+}
+
+#[test]
+fn popover_menu_renders_its_trigger() {
+    let (app, window) = harness(false);
+    let mut cx = VisualTestContext::from_window(window.into(), &app);
+    cx.run_until_parked();
+
+    assert!(cx.debug_bounds("trigger").is_some());
+}
+
+#[test]
+fn dropdown_renders_closed_with_its_trigger() {
+    let (app, window) = harness(true);
+    let mut cx = VisualTestContext::from_window(window.into(), &app);
+    cx.run_until_parked();
+
+    let host = cx.debug_bounds("dropdown-host");
+
+    assert!(host.is_some_and(|bounds| bounds.size.height > px(0.)));
+}

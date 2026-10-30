@@ -25,6 +25,7 @@ Cargo workspace:
 |---|---|
 | `swarm_ui` | Theme tokens (Light / Dark / System), fonts, icons and components on raw GPUI |
 | `gallery` | Component gallery app (`swarm-gallery`) |
+| `swarm_layout` | Tile layout engine: where each tile goes, what goes to the tray (pure, no GPUI) |
 | `swarm_term` | `libghostty-vt` behind our own types + GPUI grid element |
 | `swarm_core` | Projects, tasks, agents, worktrees, messages, state in SQLite |
 | `swarm_daemon` | Background process that owns PTYs and runs `swarm_core` |
@@ -68,7 +69,7 @@ Every agent terminal gets `SWARM_SOCKET`, `SWARM_AGENT_ID` and `SWARM_TASK`.
 **Starting new work later.** The **+** in the tab bar opens a menu with two choices:
 
 - **New task**: a sheet with name, branch from (default: base branch; option: current tab's branch), orchestrator agent, optional first message, run setup script. Swarm creates the worktree and tab and starts one orchestrator.
-- **Plan with orchestrator**: opens a Start tab for a bigger request that should be split into several tasks. Only one Start tab can be open per project.
+- **Plan with orchestrator**: opens a Plan tab for a bigger request that should be split into several tasks. It is the Start tab under another name, because the project already has tasks. Only one Start or Plan tab can be open per project.
 
 Harness calls for the Start orchestrator:
 
@@ -82,11 +83,21 @@ Harness calls for the Start orchestrator:
 ### Workspace layout
 
 - **Sidebar**: projects (with "Needs you" and busy markers and a tab count), then the agents, processes and user terminals of the open tab.
-- **Tabs**: one tab per task, at the top of the window, plus the Start tab while its orchestrator runs. A tab shows the task name and its status ring. Each task runs in its own task worktree; worker worktrees are not tabs. **+** opens the New tab menu.
+- **Tabs**: one tab per task, at the top of the window, plus the Start or Plan tab while its orchestrator runs. That tab has no worktree, so it shows no branch, Files or Changes. A tab shows the task name and its status ring. Each task runs in its own task worktree; worker worktrees are not tabs. **+** opens the New tab menu.
 - **Header, right side**: view switch **Terminals | Swarm | Review**, then panel toggles **Files**, **Changes +N −N** and, after approval, **Pull request** (later the live PR state, e.g. **#42 · checks running**).
 - **Right panel**: Files (file tree of the task worktree, changed files marked), Changes (changed files grouped by worker, with a **Review** button), or Pull request.
 - **Terminal tiles**: separate cards with 10 px gaps and rounded corners. Focus is a 2 px accent border, "needs attention" a 2 px amber border; both are drawn above the tile and never move the layout. Only the orchestrator tile has an input box.
 - **Status bar**: the tray chips and **+ Terminal** on the left; branch, agent count, process count, user terminal count (each with an icon), "permissions skipped" and ⌘K on the right.
+
+### Command palette
+
+⌘K opens a palette over the window: one search field, then grouped results.
+
+- **Suggested**: the most likely next actions for the open task (Review changes ⌘⇧R, Focus orchestrator ⌘1, New task ⌘T, Plan with orchestrator ⌘⇧T).
+- **Tasks**: switch tab; shows each task's status.
+- **Agents**: focus an agent's tile (⌘1–⌘9); shows each agent's status.
+- **Swarm**: New terminal ⌘⌥T, Settings ⌘, and every other action.
+- Typing filters all groups. Shortcuts are shown here, not on buttons. Esc closes. The field is a combobox and the results a listbox for VoiceOver.
 
 ### Swarm view
 

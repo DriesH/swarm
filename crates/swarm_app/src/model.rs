@@ -1,0 +1,942 @@
+//! Fake data for the app shell. Plain data, no gpui entities.
+
+use gpui::{Hsla, SharedString, rgb};
+use swarm_ui::AgentStatus;
+use swarm_ui::prelude::Color;
+
+pub(crate) const START_TASK: &str = "Start";
+pub(crate) const PLAN_TASK: &str = "Plan";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ProjectId(pub u32);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct TaskId(pub u32);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct AgentId(pub u32);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct TerminalId(pub u32);
+
+#[derive(Clone, Debug)]
+pub(crate) struct Project {
+    pub id: ProjectId,
+    pub name: SharedString,
+    pub letter: char,
+    pub tile_color: Hsla,
+    pub base_branch: SharedString,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TaskStatus {
+    Working,
+    NeedsYou,
+    Idle,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct Task {
+    pub id: TaskId,
+    pub project: ProjectId,
+    pub name: SharedString,
+    pub branch: SharedString,
+    pub status: TaskStatus,
+    pub orchestrator: AgentId,
+    pub workers: Vec<AgentId>,
+    pub processes: Vec<TerminalId>,
+    pub user_terminals: Vec<TerminalId>,
+    pub additions: u32,
+    pub deletions: u32,
+    /// A Start or Plan task: its orchestrator splits a request into tasks. It has no worktree.
+    pub is_start: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AgentKind {
+    ClaudeCode,
+    Codex,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct Agent {
+    pub id: AgentId,
+    pub task: TaskId,
+    pub name: SharedString,
+    pub kind: AgentKind,
+    pub model: SharedString,
+    pub status: AgentStatus,
+    pub terminal: TerminalId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TerminalKind {
+    Orchestrator,
+    Worker,
+    Process,
+    User,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FakeLine {
+    pub text: SharedString,
+    pub color: Color,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct Terminal {
+    pub id: TerminalId,
+    pub kind: TerminalKind,
+    pub title: SharedString,
+    pub meta: Option<SharedString>,
+    pub owner: Option<AgentId>,
+    pub link: Option<SharedString>,
+    /// Columns and rows.
+    pub requested_size: Option<(u16, u16)>,
+    pub lines: Vec<FakeLine>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ChangedFile {
+    pub task: TaskId,
+    pub path: SharedString,
+    pub worker: AgentId,
+    pub additions: u32,
+    pub deletions: u32,
+    pub editing: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FileMark {
+    Modified,
+    Added,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TreeEntry {
+    pub path: SharedString,
+    pub depth: u8,
+    pub is_dir: bool,
+    pub expanded: bool,
+    pub mark: Option<FileMark>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CheckState {
+    Running,
+    Passed,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FakePullRequest {
+    pub number: u32,
+    pub title: SharedString,
+    pub base: SharedString,
+    pub head: SharedString,
+    /// Name, state and duration.
+    pub checks: Vec<(SharedString, CheckState, SharedString)>,
+}
+
+pub(crate) const PULL_REQUEST_TITLE: &str =
+    "feat(term): render terminals with libghostty-vt in GPUI";
+
+pub(crate) const PULL_REQUEST_DESCRIPTION: &str = "## What
+
+- added a GPUI terminal element on libghostty-vt
+- added PTY I/O with portable-pty
+- added 38 theme tokens for light and dark
+
+## Why
+
+- agents need a fast, native terminal
+
+## Notes for reviewers
+
+- check the frame bench in crates/swarm-term/benches";
+
+/// The `PRStatus` mockup's pull request.
+pub(crate) fn sample_pull_request() -> FakePullRequest {
+    let check = |name: &str, state: CheckState, duration: &str| {
+        (SharedString::new(name), state, SharedString::new(duration))
+    };
+
+    FakePullRequest {
+        number: 42,
+        title: PULL_REQUEST_TITLE.into(),
+        base: "main".into(),
+        head: "swarm/terminal-renderer".into(),
+        checks: vec![
+            check("build-macos", CheckState::Running, "2m 10s"),
+            check("cargo test --workspace", CheckState::Running, "1m 02s"),
+            check("cargo clippy", CheckState::Passed, "41s"),
+            check("cargo fmt --check", CheckState::Passed, "12s"),
+        ],
+    }
+}
+
+fn sample_file_tree() -> Vec<TreeEntry> {
+    let dir = |path: &str, depth: u8, expanded: bool| TreeEntry {
+        path: SharedString::new(path),
+        depth,
+        is_dir: true,
+        expanded,
+        mark: None,
+    };
+    let file = |path: &str, depth: u8, mark: Option<FileMark>| TreeEntry {
+        path: SharedString::new(path),
+        depth,
+        is_dir: false,
+        expanded: false,
+        mark,
+    };
+    let (modified, added) = (Some(FileMark::Modified), Some(FileMark::Added));
+
+    vec![
+        dir("crates", 0, true),
+        dir("swarm-term", 1, true),
+        dir("src", 2, true),
+        file("element.rs", 3, modified),
+        file("font.rs", 3, added),
+        file("grid.rs", 3, modified),
+        file("lib.rs", 3, None),
+        file("pty.rs", 3, modified),
+        file("Cargo.toml", 2, modified),
+        dir("swarm-ui", 1, true),
+        dir("src", 2, true),
+        file("lib.rs", 3, modified),
+        file("theme.rs", 3, modified),
+        file("tokens.rs", 3, added),
+        dir("swarm-core", 1, false),
+        dir("docs", 0, false),
+        dir("spikes", 0, false),
+        file("CLAUDE.md", 1, None),
+        file("Cargo.toml", 1, None),
+    ]
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FakeData {
+    pub projects: Vec<Project>,
+    pub tasks: Vec<Task>,
+    pub agents: Vec<Agent>,
+    pub terminals: Vec<Terminal>,
+    pub changes: Vec<ChangedFile>,
+    pub usage: Vec<(SharedString, f32)>,
+    pub file_tree: Vec<TreeEntry>,
+    pub pull_request: Option<FakePullRequest>,
+}
+
+fn lines(items: &[(&str, Color)]) -> Vec<FakeLine> {
+    items
+        .iter()
+        .map(|(text, color)| FakeLine {
+            text: SharedString::new(*text),
+            color: *color,
+        })
+        .collect()
+}
+
+#[derive(Default)]
+struct Builder {
+    data: FakeData,
+    next_agent: u32,
+    next_terminal: u32,
+    next_task: u32,
+}
+
+struct AgentSpec<'a> {
+    name: &'a str,
+    kind: AgentKind,
+    model: &'a str,
+    status: AgentStatus,
+    lines: Vec<FakeLine>,
+}
+
+impl Builder {
+    fn data(&mut self) -> &mut FakeData {
+        &mut self.data
+    }
+
+    fn project(&mut self, id: u32, name: &str, tile: u32) -> ProjectId {
+        let id = ProjectId(id);
+        let letter = name.chars().next().map_or('?', |c| c.to_ascii_uppercase());
+
+        self.data().projects.push(Project {
+            id,
+            name: SharedString::new(name),
+            letter,
+            tile_color: rgb(tile).into(),
+            base_branch: "main".into(),
+        });
+
+        id
+    }
+
+    fn task(
+        &mut self,
+        project: ProjectId,
+        name: &str,
+        status: TaskStatus,
+        orchestrator: AgentSpec<'_>,
+    ) -> TaskId {
+        let id = TaskId(self.next_task);
+        self.next_task += 1;
+
+        let orchestrator = self.agent(id, orchestrator, TerminalKind::Orchestrator);
+
+        self.data().tasks.push(Task {
+            id,
+            project,
+            name: SharedString::new(name),
+            branch: SharedString::from(format!("swarm/{name}")),
+            status,
+            orchestrator,
+            workers: Vec::new(),
+            processes: Vec::new(),
+            user_terminals: Vec::new(),
+            additions: 0,
+            deletions: 0,
+            is_start: false,
+        });
+
+        id
+    }
+
+    fn agent(&mut self, task: TaskId, spec: AgentSpec<'_>, kind: TerminalKind) -> AgentId {
+        let id = AgentId(self.next_agent);
+        self.next_agent += 1;
+        let terminal = TerminalId(self.next_terminal);
+        self.next_terminal += 1;
+
+        let meta = (kind == TerminalKind::Worker).then(|| SharedString::new(spec.model));
+
+        let data = self.data();
+        data.terminals.push(Terminal {
+            id: terminal,
+            kind,
+            title: SharedString::new(spec.name),
+            meta,
+            owner: None,
+            link: None,
+            requested_size: None,
+            lines: spec.lines,
+        });
+        data.agents.push(Agent {
+            id,
+            task,
+            name: SharedString::new(spec.name),
+            kind: spec.kind,
+            model: SharedString::new(spec.model),
+            status: spec.status,
+            terminal,
+        });
+
+        id
+    }
+
+    fn worker(&mut self, task: TaskId, spec: AgentSpec<'_>) -> AgentId {
+        let id = self.agent(task, spec, TerminalKind::Worker);
+
+        if let Some(entry) = self.data().tasks.iter_mut().find(|entry| entry.id == task) {
+            entry.workers.push(id);
+        }
+
+        id
+    }
+
+    fn process(
+        &mut self,
+        task: TaskId,
+        owner: AgentId,
+        title: &str,
+        size: (u16, u16),
+        link: Option<&str>,
+        output: Vec<FakeLine>,
+    ) {
+        let id = TerminalId(self.next_terminal);
+        self.next_terminal += 1;
+
+        let data = self.data();
+        let owner_name = data
+            .agents
+            .iter()
+            .find(|agent| agent.id == owner)
+            .map_or_else(String::new, |agent| agent.name.to_string());
+
+        data.terminals.push(Terminal {
+            id,
+            kind: TerminalKind::Process,
+            title: SharedString::new(title),
+            meta: Some(SharedString::from(format!(
+                "{owner_name} · {}×{}",
+                size.0, size.1
+            ))),
+            owner: Some(owner),
+            link: link.map(SharedString::new),
+            requested_size: Some(size),
+            lines: output,
+        });
+
+        if let Some(entry) = data.tasks.iter_mut().find(|entry| entry.id == task) {
+            entry.processes.push(id);
+        }
+    }
+
+    fn change(
+        &mut self,
+        task: TaskId,
+        worker: AgentId,
+        path: &str,
+        (additions, deletions): (u32, u32),
+        editing: bool,
+    ) {
+        self.data().changes.push(ChangedFile {
+            task,
+            path: SharedString::new(path),
+            worker,
+            additions,
+            deletions,
+            editing,
+        });
+    }
+}
+
+fn user_terminal_lines() -> Vec<FakeLine> {
+    let prompt = "swarm terminal-renderer $ ";
+
+    lines(&[
+        (&format!("{prompt}git log --oneline -3"), Color::Default),
+        (
+            "6cfe305 task(spikes): added terminal spike with libghostty-vt",
+            Color::Muted,
+        ),
+        (
+            "c7d3f19 task(docs): added zed architecture research",
+            Color::Muted,
+        ),
+        (
+            "cccf36a task(docs): added review and notification plans",
+            Color::Muted,
+        ),
+        (&format!("{prompt}pnpm --dir docs dev"), Color::Default),
+        ("  VITE  ready in 398 ms", Color::Ok),
+        ("  ➜  Local:   http://localhost:5173/", Color::Default),
+        ("^C", Color::Faint),
+        (
+            &format!("{prompt}cargo clippy -p swarm-term"),
+            Color::Default,
+        ),
+        ("    Checking swarm-term v0.1.0", Color::Muted),
+        ("    Finished `dev` profile in 3.42s", Color::Muted),
+        (prompt, Color::Default),
+    ])
+}
+
+fn minimal_orchestrator(model: &str) -> AgentSpec<'_> {
+    AgentSpec {
+        name: "orchestrator",
+        kind: AgentKind::ClaudeCode,
+        model,
+        status: AgentStatus::Idle,
+        lines: lines(&[("› ready", Color::Muted)]),
+    }
+}
+
+impl FakeData {
+    /// The Workspace mockup's data.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one flat list of fake data reads best in one place"
+    )]
+    pub(crate) fn sample() -> Self {
+        let mut builder = Builder::default();
+
+        let swarm = builder.project(0, "swarm", 0x004f_46e5);
+        let website = builder.project(1, "website", 0x000d_7d70);
+        let billing = builder.project(2, "billing-api", 0x00c2_410c);
+        builder.project(3, "extensions", 0x0015_803d);
+
+        let renderer = builder.task(
+            swarm,
+            "terminal-renderer",
+            TaskStatus::Working,
+            AgentSpec {
+                name: "orchestrator",
+                kind: AgentKind::ClaudeCode,
+                model: "opus 5.5",
+                status: AgentStatus::Working,
+                lines: lines(&[
+                    ("› split the renderer work across the swarm", Color::Default),
+                    ("● swarm spawn term-render --agent claude", Color::Default),
+                    ("  └ worktree ready · setup ✓ 8.2s", Color::Muted),
+                    ("● swarm spawn pty-io --agent codex", Color::Default),
+                    ("  └ worktree ready · setup ✓ 7.9s", Color::Muted),
+                    ("● swarm wait --any", Color::Default),
+                    ("  └ ui-tokens done · +186 −12", Color::Muted),
+                    ("● pty-io asks: portable-pty or openpty?", Color::Default),
+                    ("  portable-pty. Replying now.", Color::Muted),
+                    ("● swarm send pty-io \"Use portable-pty.\"", Color::Default),
+                    ("◆ term-render started cargo test · 90×12", Color::Muted),
+                    ("◆ ui-tokens started pnpm dev · 80×10", Color::Muted),
+                    (
+                        "✻ Orchestrating… (2m 14s · esc to interrupt)",
+                        Color::Claude,
+                    ),
+                ]),
+            },
+        );
+
+        let term_render = builder.worker(
+            renderer,
+            AgentSpec {
+                name: "term-render",
+                kind: AgentKind::ClaudeCode,
+                model: "sonnet 5.5",
+                status: AgentStatus::Working,
+                lines: lines(&[
+                    ("● Update(src/element.rs)", Color::Default),
+                    ("  88 + shape_line(row, &font, cx)", Color::Add),
+                    ("  88 - paint_cell(cell, cx)", Color::Del),
+                    ("● swarm terminal spawn", Color::Default),
+                    ("  \"cargo test -p swarm-term\" 90x14", Color::Muted),
+                    ("● swarm terminal wait --exit", Color::Default),
+                    ("✻ Working… 4m 02s", Color::Claude),
+                ]),
+            },
+        );
+        let pty_io = builder.worker(
+            renderer,
+            AgentSpec {
+                name: "pty-io",
+                kind: AgentKind::Codex,
+                model: "codex",
+                status: AgentStatus::Waiting,
+                lines: lines(&[
+                    ("• Ran cargo test -p swarm-term", Color::Default),
+                    ("  └ 14 passed · 0 failed", Color::Ok),
+                    ("• swarm ask orchestrator", Color::Default),
+                    ("  └ portable-pty or openpty?", Color::Muted),
+                    ("◦ Waiting for orchestrator", Color::Warn),
+                ]),
+            },
+        );
+        let ui_tokens = builder.worker(
+            renderer,
+            AgentSpec {
+                name: "ui-tokens",
+                kind: AgentKind::ClaudeCode,
+                model: "sonnet 5.5",
+                status: AgentStatus::Done,
+                lines: lines(&[
+                    ("● Update(src/tokens.rs)", Color::Default),
+                    ("✓ Done · +186 −12", Color::Ok),
+                ]),
+            },
+        );
+        builder.worker(
+            renderer,
+            AgentSpec {
+                name: "bench",
+                kind: AgentKind::Codex,
+                model: "codex",
+                status: AgentStatus::Idle,
+                lines: lines(&[("◦ Idle", Color::Faint)]),
+            },
+        );
+
+        builder.process(
+            renderer,
+            term_render,
+            "cargo test",
+            (90, 12),
+            None,
+            lines(&[
+                ("running 22 tests", Color::Default),
+                ("test pty::spawn ... ok", Color::Muted),
+                ("test pty::resize ... ok", Color::Muted),
+                ("test grid::shape_line ... ok", Color::Muted),
+                ("test grid::scrollback ... ok", Color::Muted),
+                ("test element::paint_cursor ...", Color::Default),
+            ]),
+        );
+        builder.process(
+            renderer,
+            ui_tokens,
+            "pnpm dev",
+            (80, 10),
+            Some("localhost:5173"),
+            lines(&[
+                ("  VITE  ready in 412 ms", Color::Ok),
+                ("", Color::Muted),
+                ("  ➜  Local:   http://localhost:5173/", Color::Default),
+                ("  ➜  Network: use --host to expose", Color::Muted),
+                ("10:41:07 [vite] hmr update /tokens.css", Color::Faint),
+            ]),
+        );
+
+        let src = "crates/swarm-term/src";
+        builder.change(
+            renderer,
+            term_render,
+            &format!("{src}/element.rs"),
+            (48, 12),
+            true,
+        );
+        builder.change(
+            renderer,
+            term_render,
+            &format!("{src}/grid.rs"),
+            (22, 9),
+            false,
+        );
+        builder.change(
+            renderer,
+            term_render,
+            &format!("{src}/font.rs"),
+            (18, 0),
+            false,
+        );
+        builder.change(renderer, term_render, "benches/grid.rs", (6, 0), false);
+        builder.change(renderer, pty_io, &format!("{src}/pty.rs"), (31, 6), false);
+        builder.change(
+            renderer,
+            pty_io,
+            "crates/swarm-term/Cargo.toml",
+            (2, 0),
+            false,
+        );
+        let ui = "crates/swarm-ui/src";
+        builder.change(
+            renderer,
+            ui_tokens,
+            &format!("{ui}/tokens.rs"),
+            (142, 0),
+            false,
+        );
+        builder.change(
+            renderer,
+            ui_tokens,
+            &format!("{ui}/theme.rs"),
+            (38, 12),
+            false,
+        );
+        builder.change(renderer, ui_tokens, &format!("{ui}/lib.rs"), (6, 0), false);
+
+        builder.task(
+            swarm,
+            "menu-bar-usage",
+            TaskStatus::NeedsYou,
+            minimal_orchestrator("opus 5.5"),
+        );
+        builder.task(
+            swarm,
+            "worktree-scripts",
+            TaskStatus::Idle,
+            minimal_orchestrator("opus 5.5"),
+        );
+        builder.task(
+            website,
+            "landing-page",
+            TaskStatus::NeedsYou,
+            minimal_orchestrator("opus 5.5"),
+        );
+        builder.task(
+            billing,
+            "invoice-export",
+            TaskStatus::Working,
+            minimal_orchestrator("opus 5.5"),
+        );
+        builder.task(
+            billing,
+            "tax-rates",
+            TaskStatus::Working,
+            minimal_orchestrator("opus 5.5"),
+        );
+
+        let mut data = builder.data;
+        data.file_tree = sample_file_tree();
+        data.usage = vec![("Claude · 5h".into(), 0.42), ("Codex · 5h".into(), 0.18)];
+
+        if let Some(task) = data.tasks.iter_mut().find(|task| task.id == renderer) {
+            task.additions = 312;
+            task.deletions = 48;
+        }
+
+        data
+    }
+
+    pub(crate) fn project(&self, id: ProjectId) -> Option<&Project> {
+        self.projects.iter().find(|project| project.id == id)
+    }
+
+    pub(crate) fn task(&self, id: TaskId) -> Option<&Task> {
+        self.tasks.iter().find(|task| task.id == id)
+    }
+
+    pub(crate) fn agent(&self, id: AgentId) -> Option<&Agent> {
+        self.agents.iter().find(|agent| agent.id == id)
+    }
+
+    pub(crate) fn terminal(&self, id: TerminalId) -> Option<&Terminal> {
+        self.terminals.iter().find(|terminal| terminal.id == id)
+    }
+
+    pub(crate) fn tasks_of(&self, project: ProjectId) -> impl Iterator<Item = &Task> {
+        self.tasks
+            .iter()
+            .filter(move |task| task.project == project)
+    }
+
+    pub(crate) fn agents_of(&self, task: TaskId) -> impl Iterator<Item = &Agent> {
+        self.agents.iter().filter(move |agent| agent.task == task)
+    }
+
+    /// Adds a user terminal to the task. It starts with the Island mockup's lines.
+    pub(crate) fn add_user_terminal(&mut self, task: TaskId) -> TerminalId {
+        let id = TerminalId(
+            self.terminals
+                .iter()
+                .map(|terminal| terminal.id.0)
+                .max()
+                .map_or(0, |id| id + 1),
+        );
+
+        self.terminals.push(Terminal {
+            id,
+            kind: TerminalKind::User,
+            title: "zsh".into(),
+            meta: Some("~/personal/swarm".into()),
+            owner: None,
+            link: None,
+            requested_size: None,
+            lines: user_terminal_lines(),
+        });
+
+        if let Some(entry) = self.tasks.iter_mut().find(|entry| entry.id == task) {
+            entry.user_terminals.push(id);
+        }
+
+        id
+    }
+
+    /// Removes a user terminal from the task.
+    pub(crate) fn close_user_terminal(&mut self, task: TaskId, terminal: TerminalId) {
+        if let Some(entry) = self.tasks.iter_mut().find(|entry| entry.id == task) {
+            entry.user_terminals.retain(|id| *id != terminal);
+        }
+    }
+
+    /// Stops a process terminal and removes it from the task.
+    pub(crate) fn stop_process(&mut self, task: TaskId, terminal: TerminalId) {
+        if let Some(entry) = self.tasks.iter_mut().find(|entry| entry.id == task) {
+            entry.processes.retain(|id| *id != terminal);
+        }
+    }
+
+    /// The project's first task. A project without tasks gets a Start task.
+    pub(crate) fn first_or_start_task(&mut self, project: ProjectId) -> TaskId {
+        let first = self.tasks_of(project).next().map(|task| task.id);
+
+        first.unwrap_or_else(|| self.ensure_start_task(project))
+    }
+
+    /// The project's Start task, or Plan task when it has other tasks. Makes it when missing.
+    pub(crate) fn ensure_start_task(&mut self, project: ProjectId) -> TaskId {
+        let existing = self
+            .tasks_of(project)
+            .find(|task| task.is_start)
+            .map(|task| task.id);
+
+        if let Some(task) = existing {
+            return task;
+        }
+
+        let name = if self.tasks_of(project).next().is_some() {
+            PLAN_TASK
+        } else {
+            START_TASK
+        };
+        let lines = vec![FakeLine {
+            text: "\u{203a} ready".into(),
+            color: Color::Muted,
+        }];
+        let task = self.add_task(project, name, AgentKind::ClaudeCode, lines);
+
+        if let Some(entry) = self.tasks.iter_mut().find(|entry| entry.id == task) {
+            entry.is_start = true;
+            entry.branch = SharedString::default();
+        }
+
+        task
+    }
+
+    /// Adds a working task with one orchestrator and its terminal.
+    pub(crate) fn add_task(
+        &mut self,
+        project: ProjectId,
+        name: &str,
+        kind: AgentKind,
+        terminal_lines: Vec<FakeLine>,
+    ) -> TaskId {
+        let next = |ids: &mut dyn Iterator<Item = u32>| ids.max().map_or(0, |id| id + 1);
+
+        let task = TaskId(next(&mut self.tasks.iter().map(|task| task.id.0)));
+        let agent = AgentId(next(&mut self.agents.iter().map(|agent| agent.id.0)));
+        let terminal = TerminalId(next(&mut self.terminals.iter().map(|entry| entry.id.0)));
+
+        let model = match kind {
+            AgentKind::ClaudeCode => "opus 5.5",
+            AgentKind::Codex => "codex",
+        };
+
+        self.terminals.push(Terminal {
+            id: terminal,
+            kind: TerminalKind::Orchestrator,
+            title: "orchestrator".into(),
+            meta: None,
+            owner: None,
+            link: None,
+            requested_size: None,
+            lines: terminal_lines,
+        });
+        self.agents.push(Agent {
+            id: agent,
+            task,
+            name: "orchestrator".into(),
+            kind,
+            model: model.into(),
+            status: AgentStatus::Working,
+            terminal,
+        });
+        self.tasks.push(Task {
+            id: task,
+            project,
+            name: SharedString::new(name),
+            branch: SharedString::from(format!("swarm/{name}")),
+            status: TaskStatus::Working,
+            orchestrator: agent,
+            workers: Vec::new(),
+            processes: Vec::new(),
+            user_terminals: Vec::new(),
+            additions: 0,
+            deletions: 0,
+            is_start: false,
+        });
+
+        task
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::*;
+
+    #[test]
+    fn every_agent_terminal_exists() {
+        let data = FakeData::sample();
+
+        assert!(
+            data.agents
+                .iter()
+                .all(|agent| data.terminal(agent.terminal).is_some())
+        );
+    }
+
+    #[test]
+    fn every_orchestrator_belongs_to_its_task() {
+        let data = FakeData::sample();
+
+        assert!(data.tasks.iter().all(|task| {
+            data.agent(task.orchestrator)
+                .is_some_and(|agent| agent.task == task.id)
+        }));
+    }
+
+    #[test]
+    fn ids_are_unique() {
+        let data = FakeData::sample();
+
+        let agents: HashSet<_> = data.agents.iter().map(|agent| agent.id).collect();
+        let terminals: HashSet<_> = data.terminals.iter().map(|terminal| terminal.id).collect();
+        let tasks: HashSet<_> = data.tasks.iter().map(|task| task.id).collect();
+        let projects: HashSet<_> = data.projects.iter().map(|project| project.id).collect();
+
+        assert_eq!(agents.len(), data.agents.len());
+        assert_eq!(terminals.len(), data.terminals.len());
+        assert_eq!(tasks.len(), data.tasks.len());
+        assert_eq!(projects.len(), data.projects.len());
+    }
+
+    #[test]
+    fn terminal_renderer_has_four_workers_and_two_processes() {
+        let data = FakeData::sample();
+        let task = data.tasks.first();
+
+        assert_eq!(task.map(|task| task.workers.len()), Some(4));
+        assert_eq!(task.map(|task| task.processes.len()), Some(2));
+    }
+
+    #[test]
+    fn file_tree_depths_match_the_mockup() {
+        let data = FakeData::sample();
+        let depths: Vec<u8> = data.file_tree.iter().map(|entry| entry.depth).collect();
+
+        assert_eq!(
+            depths,
+            [0, 1, 2, 3, 3, 3, 3, 3, 2, 1, 2, 3, 3, 3, 1, 0, 0, 1, 1]
+        );
+    }
+
+    #[test]
+    fn there_is_no_pull_request_at_first() {
+        assert!(FakeData::sample().pull_request.is_none());
+    }
+
+    #[test]
+    fn ensure_start_task_is_idempotent() {
+        let mut data = FakeData::sample();
+
+        let first = data.ensure_start_task(ProjectId(3));
+        let second = data.ensure_start_task(ProjectId(3));
+
+        assert_eq!(first, second);
+        assert_eq!(data.tasks_of(ProjectId(3)).count(), 1);
+    }
+
+    #[test]
+    fn a_start_task_is_named_after_whether_the_project_has_tasks() {
+        let mut data = FakeData::sample();
+
+        let start = data.ensure_start_task(ProjectId(3));
+        let plan = data.ensure_start_task(ProjectId(0));
+
+        assert_eq!(
+            data.task(start).map(|task| task.name.as_ref()),
+            Some(START_TASK)
+        );
+        assert_eq!(
+            data.task(plan).map(|task| task.name.as_ref()),
+            Some(PLAN_TASK)
+        );
+        assert!(data.task(plan).is_some_and(|task| task.branch.is_empty()));
+    }
+
+    #[test]
+    fn the_sample_has_no_start_task() {
+        assert!(FakeData::sample().tasks.iter().all(|task| !task.is_start));
+    }
+
+    #[test]
+    fn process_owners_exist() {
+        let data = FakeData::sample();
+
+        assert!(
+            data.terminals
+                .iter()
+                .filter_map(|terminal| terminal.owner)
+                .all(|owner| data.agent(owner).is_some())
+        );
+    }
+}

@@ -76,6 +76,8 @@ pub struct ThemeColors {
     /// Working status, links, focus ring.
     pub accent: Hsla,
     pub accent_bg: Hsla,
+    /// Selected text in a text field.
+    pub selection: Hsla,
     /// Done status and success.
     pub ok: Hsla,
     pub ok_bg: Hsla,
@@ -97,8 +99,12 @@ pub struct ThemeColors {
     pub switch_off: Hsla,
     pub knob_on: Hsla,
     pub knob_off: Hsla,
+    /// Dimmed backdrop behind a dialog.
+    pub scrim: Hsla,
     /// Claude Code brand mark. Same in both themes.
     pub claude: Hsla,
+    /// Letter on a project tile, which has a saturated per-project color.
+    pub on_tile: Hsla,
 }
 
 impl ThemeColors {
@@ -117,6 +123,7 @@ impl ThemeColors {
             faint,
             accent,
             accent_bg,
+            selection,
             ok,
             ok_bg,
             warn,
@@ -132,7 +139,9 @@ impl ThemeColors {
             switch_off,
             knob_on,
             knob_off,
+            scrim,
             claude,
+            on_tile,
         } = self;
 
         vec![
@@ -147,6 +156,7 @@ impl ThemeColors {
             ("faint", *faint),
             ("accent", *accent),
             ("accent_bg", *accent_bg),
+            ("selection", *selection),
             ("ok", *ok),
             ("ok_bg", *ok_bg),
             ("warn", *warn),
@@ -162,7 +172,9 @@ impl ThemeColors {
             ("switch_off", *switch_off),
             ("knob_on", *knob_on),
             ("knob_off", *knob_off),
+            ("scrim", *scrim),
             ("claude", *claude),
+            ("on_tile", *on_tile),
         ]
     }
 }
@@ -196,6 +208,7 @@ impl Theme {
                 faint: rgb(0x878790).into(),
                 accent: rgb(0x6e9bff).into(),
                 accent_bg: rgba(0x6e9bff21).into(),
+                selection: rgba(0x6e9bff59).into(),
                 ok: rgb(0x4ac26b).into(),
                 ok_bg: rgba(0x4ac26b1f).into(),
                 warn: rgb(0xe8a838).into(),
@@ -211,7 +224,9 @@ impl Theme {
                 switch_off: rgb(0x3a3a40).into(),
                 knob_on: rgb(0x111113).into(),
                 knob_off: rgb(0xa1a1aa).into(),
+                scrim: rgba(0x0000008c).into(),
                 claude: rgb(0xd97757).into(),
+                on_tile: rgb(0xffffff).into(),
             },
         }
     }
@@ -234,6 +249,7 @@ impl Theme {
                 faint: rgb(0x696971).into(),  // #6b6b74
                 accent: rgb(0x285acb).into(), // #2f6bf0
                 accent_bg: rgba(0x2f6bf017).into(),
+                selection: rgba(0x285acb40).into(),
                 ok: rgb(0x176f30).into(), // #1a7f36
                 ok_bg: rgba(0x1a7f361a).into(),
                 warn: rgb(0x8c5408).into(), // #a8650a
@@ -251,7 +267,9 @@ impl Theme {
                 switch_off: rgb(0x92929d).into(),
                 knob_on: rgb(0xffffff).into(),
                 knob_off: rgb(0xffffff).into(),
+                scrim: rgba(0x00000066).into(),
                 claude: rgb(0xd97757).into(),
+                on_tile: rgb(0xffffff).into(),
             },
         }
     }
@@ -436,7 +454,7 @@ mod tests {
     fn only_tint_tokens_are_translucent() {
         for theme in themes() {
             for (name, color) in theme.colors().tokens() {
-                let tint = name.ends_with("_bg");
+                let tint = name.ends_with("_bg") || name == "scrim" || name == "selection";
                 assert_eq!(
                     color.a < 1.0,
                     tint,

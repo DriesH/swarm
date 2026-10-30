@@ -1,6 +1,6 @@
 use gpui::{
-    AnyElement, App, ClickEvent, ElementId, FontWeight, Hsla, Pixels, Role, SharedString, Window,
-    div, px,
+    AnyElement, App, ClickEvent, ElementId, FontWeight, Hsla, Pixels, Role, SharedString, Toggled,
+    Window, div, px,
 };
 
 use crate::component::{Component, example, example_group};
@@ -112,6 +112,10 @@ pub struct Button {
     variant: ButtonVariant,
     size: ButtonSize,
     icon: Option<IconName>,
+    end_slot: Option<AnyElement>,
+    toggle_state: Option<bool>,
+    full_width: bool,
+    debug_selector: Option<String>,
     disabled: bool,
     on_click: Option<ClickHandler>,
 }
@@ -124,6 +128,10 @@ impl Button {
             variant: ButtonVariant::default(),
             size: ButtonSize::default(),
             icon: None,
+            end_slot: None,
+            toggle_state: None,
+            full_width: false,
+            debug_selector: None,
             disabled: false,
             on_click: None,
         }
@@ -144,6 +152,32 @@ impl Button {
         self.icon = Some(icon);
         self
     }
+
+    /// Content after the label, for example a diff count.
+    pub fn end_slot(mut self, end_slot: impl IntoElement) -> Self {
+        self.end_slot = Some(end_slot.into_any_element());
+        self
+    }
+
+    /// Fills the container width and centers the content.
+    pub fn full_width(mut self) -> Self {
+        self.full_width = true;
+        self
+    }
+
+    /// Name for `VisualTestContext::debug_bounds`. Only recorded in test builds.
+    pub fn debug_selector(mut self, selector: impl FnOnce() -> String) -> Self {
+        self.debug_selector = Some(selector());
+        self
+    }
+}
+
+/// On or off state, for toggle buttons.
+impl Toggleable for Button {
+    fn toggle_state(mut self, toggled: bool) -> Self {
+        self.toggle_state = Some(toggled);
+        self
+    }
 }
 
 impl Clickable for Button {
@@ -162,9 +196,10 @@ impl Disableable for Button {
 
 impl RenderOnce for Button {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let colors = self.variant.colors(cx);
+        let mut colors = self.variant.colors(cx);
         let (accent, ground) = (cx.theme().colors().accent, cx.theme().colors().ground);
         let filled = self.variant == ButtonVariant::Primary;
+        let toggled = self.toggle_state == Some(true);
 
         let weight = if self.variant == ButtonVariant::Primary && self.size == ButtonSize::Medium {
             FontWeight::SEMIBOLD
@@ -172,14 +207,35 @@ impl RenderOnce for Button {
             FontWeight::MEDIUM
         };
 
+        if toggled {
+            let theme_colors = cx.theme().colors();
+
+            colors.background = theme_colors.active;
+            colors.border = theme_colors.line;
+            colors.text = Color::Default.hsla(cx);
+            colors.hover_text = colors.text;
+        }
+
         let size = self.size;
 
         div()
             .id(self.id)
             .role(Role::Button)
             .aria_label(self.label.clone())
+            .when_some(self.toggle_state, |button, on| {
+                button.aria_toggled(if on { Toggled::True } else { Toggled::False })
+            })
+            .when_some(self.debug_selector, |button, selector| {
+                button.debug_selector(move || selector)
+            })
             .flex()
-            .flex_none()
+            .map(|button| {
+                if self.full_width {
+                    button.w_full()
+                } else {
+                    button.flex_none()
+                }
+            })
             .items_center()
             .justify_center()
             .gap(px(6.))
@@ -204,6 +260,9 @@ impl RenderOnce for Button {
                     .weight(weight)
                     .inherit_color(),
             )
+            .when_some(self.end_slot, |button, end_slot| {
+                button.child(div().ml(px(2.)).child(end_slot))
+            })
             .map(|button| {
                 if self.disabled {
                     button.opacity(0.5).cursor_default()
@@ -290,6 +349,37 @@ impl Component for Button {
                             .icon(IconName::PullRequest),
                     ),
                 ],
+            ))
+            .child(example_group(
+                "Toggle",
+                [
+                    example(
+                        "Off",
+                        Button::new("toggle-off", "Changes").toggle_state(false),
+                    ),
+                    example("On", Button::new("toggle-on", "Changes").toggle_state(true)),
+                ],
+            ))
+            .child(example_group(
+                "Full width",
+                [example(
+                    "Secondary",
+                    div()
+                        .w(px(240.))
+                        .child(Button::new("full-width", "Open a project").full_width()),
+                )],
+            ))
+            .child(example_group(
+                "With end slot",
+                [example(
+                    "Diff counts",
+                    Button::new("end-slot", "Changes").end_slot(
+                        h_flex()
+                            .gap(px(4.))
+                            .child(Label::new("+12").mono().color(Color::Ok))
+                            .child(Label::new("\u{2212}3").mono().color(Color::Warn)),
+                    ),
+                )],
             ))
             .child(example_group(
                 "Disabled",

@@ -1,0 +1,81 @@
+# swarm_layout
+
+The layout engine for terminal tiles. It decides where each tile goes and which tiles go to the tray.
+
+It is a pure function with no GPUI dependency. The same input always gives the same output. `swarm_app` converts the rects to GPUI pixels.
+
+## Use
+
+```rust
+use swarm_layout::{layout, Activity, LayoutStyle, Rect, TileId, TileKind, TileSpec};
+
+let tiles = [
+    TileSpec::new(TileId(0), TileKind::Orchestrator, Activity::Working),
+    TileSpec::new(TileId(1), TileKind::Worker, Activity::Attention),
+];
+let result = layout(Rect::new(0.0, 0.0, 1030.0, 790.0), &tiles, &LayoutStyle::default());
+// result.placed: (id, rect) pairs. result.tray: ids of tiles in the tray.
+```
+
+## Rules
+
+**Who stays on screen.** When space is short, tiles go to the tray in this order, last first:
+
+1. User terminals
+2. The orchestrator
+3. Pinned tiles
+4. Tiles that need attention (blocked or error)
+5. Working tiles
+6. Running process terminals
+7. Done tiles
+8. Idle tiles
+
+Tiles with the same priority keep their input order. A minimized tile always goes to the tray.
+
+**User terminals.** A user terminal with a fixed size is an island. The layout never resizes it. Islands go at the top right, side by side from right to left. When a row is full, the next island starts a new row below. An island goes to the tray only when it does not fit in the area. A user terminal without a fixed size is placed like any other tile, with the highest priority.
+
+**Orchestrator.** The orchestrator gets a full-height column on the left, `orchestrator_width` wide (400 px). Before any other tile goes to the tray, the column gets narrower, down to `min_orchestrator.width` (320 px). It gets only as narrow as it needs to. When no other tile is on screen, the column fills all the width left of the islands. The orchestrator goes to the tray only when the area is smaller than `min_orchestrator`.
+
+**Other tiles.** All other tiles fill a grid in the space that is left: beside the islands (to their left) and below them.
+
+- Every tile is at least `min_tile` (260 × 160 px). If a tile does not fit, the tile with the lowest priority goes to the tray.
+- Tiles in one row share its width equally.
+- A row of process terminals gets the tallest requested height of its processes when that fits. If it does not fit, the row gets what the other rows leave, but at least `min_tile.height`. Other rows share the rest of the height.
+- Priority picks which tiles are on screen. The grid order is the input order, with agents before process terminals. So a tile does not move when its activity changes.
+
+**Done and idle tiles.** They are on screen only when no other tile in the grid is active (needs attention, working, running or pinned). So they never take space from a tile that is doing work. Pin a done tile to keep it on screen.
+
+**Spacing.** All tiles stay inside the area minus `padding` (10 px). Neighbors are `gap` (10 px) apart. No two tiles overlap.
+
+**Stability.** Adding a tile that goes to the tray changes nothing else. Adding a lower-priority tile never sends a higher-priority tile to the tray.
+
+## Mockup layouts
+
+Workspace (area 1030 × 790): orchestrator, two active workers, two processes. The done and idle workers are in the tray.
+
+```
++--------------+----------------+----------------+
+|              | term-render    | pty-io         |
+|              | (working)      | (attention)    |
+| orchestrator |                |                |
+|   400 px     |                |                |
+|              +----------------+----------------+
+|              | cargo test     | pnpm dev       |
+|              | (process)      | (process)      |
++--------------+----------------+----------------+
+tray: ui-tokens (done), bench (idle)
+```
+
+Island (area 1060 × 790, `orchestrator_width` 380): the user terminal is 650 × 470 at the top right. Two tiles fit below it.
+
+```
++--------------+---------------------------------+
+|              | your terminal (zsh)             |
+|              | fixed 650 x 470                 |
+| orchestrator |                                 |
+|   380 px     +----------------+----------------+
+|              | term-render    | cargo test     |
+|              | (working)      | (process)      |
++--------------+----------------+----------------+
+tray: pty-io (working), ui-tokens (done), bench (idle)
+```

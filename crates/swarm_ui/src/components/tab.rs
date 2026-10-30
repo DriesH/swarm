@@ -15,6 +15,7 @@ pub struct Tab {
     label: SharedString,
     status: AgentStatus,
     selected: bool,
+    debug_selector: Option<String>,
     on_click: Option<ClickHandler>,
 }
 
@@ -29,8 +30,15 @@ impl Tab {
             label: label.into(),
             status,
             selected: false,
+            debug_selector: None,
             on_click: None,
         }
+    }
+
+    /// Name for `VisualTestContext::debug_bounds`. Only recorded in test builds.
+    pub fn debug_selector(mut self, selector: impl FnOnce() -> String) -> Self {
+        self.debug_selector = Some(selector());
+        self
     }
 }
 
@@ -58,6 +66,9 @@ impl RenderOnce for Tab {
 
         div()
             .id(self.id)
+            .when_some(self.debug_selector, |element, selector| {
+                element.debug_selector(move || selector)
+            })
             .role(Role::Tab)
             .aria_label(accessible_label)
             .aria_selected(self.selected)
