@@ -72,7 +72,7 @@ impl TerminalLoop {
     /// Sends the first snapshot, runs until the process exits, then reports it.
     pub(crate) fn run(mut self, commands: &flume::Receiver<Command>) {
         let result = self
-            .send_snapshot()
+            .send_snapshot(SNAPSHOT_HISTORY_LINES)
             .and_then(|()| self.event_loop(commands));
         let status = match result {
             Ok(status) => status,
@@ -86,8 +86,11 @@ impl TerminalLoop {
         self.output.close();
     }
 
-    fn send_snapshot(&mut self) -> Result<()> {
-        let snapshot = self.emulator.snapshot(SNAPSHOT_HISTORY_LINES)?;
+    fn send_snapshot(&mut self, history: u32) -> Result<()> {
+        let (update, snapshot) = self.emulator.snapshot(history)?;
+        if let Some(update) = update {
+            self.send(TerminalOutput::Update(update));
+        }
         self.send(TerminalOutput::Snapshot(snapshot));
         // Reading history moved the viewport; the next flush absorbs it.
         self.dirty = true;
@@ -233,6 +236,7 @@ impl TerminalLoop {
                     self.pty.write(bytes);
                 }
             }
+            TerminalInput::Snapshot { history } => self.send_snapshot(history)?,
             TerminalInput::Kill => self.terminate(),
         }
 

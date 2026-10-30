@@ -191,9 +191,10 @@ async fn run_pass(
     }
 
     if first_round {
-        let apply = |workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>| {
-            workspace.new_user_terminal(cx);
-        };
+        let apply =
+            |workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>| {
+                workspace.new_user_terminal(window, cx);
+            };
         recorder.step("new user terminal", apply, cx).await?;
     }
 

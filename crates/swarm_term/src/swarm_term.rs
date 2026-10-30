@@ -199,6 +199,11 @@ pub enum TerminalInput {
     },
     /// Reported to the program when it asked for focus events (mode 1004).
     Focus(bool),
+    /// Asks for a fresh [`TerminalOutput::Snapshot`] with up to `history` scrollback
+    /// lines, for a view that attaches late. Pending changes go out first as an update.
+    Snapshot {
+        history: u32,
+    },
     Kill,
 }
 

@@ -228,24 +228,58 @@ impl Workspace {
         cx.notify();
     }
 
-    pub(crate) fn new_user_terminal(&mut self, cx: &mut Context<Self>) {
-        let task = self.active_task().id;
-        let terminal = self.data.add_user_terminal(task);
-
+    /// The size a new user terminal tile starts with.
+    pub(crate) fn planned_user_size(&self) -> Size<Pixels> {
         let size = self.terminal_area.map_or(DEFAULT_USER_SIZE, |bounds| Size {
             width: DEFAULT_USER_SIZE.width.min(bounds.size.width - px(350.)),
             height: DEFAULT_USER_SIZE.height.min(bounds.size.height - px(20.)),
         });
-        self.user_sizes.insert(terminal, size.max(&MIN_TILE));
+
+        size.max(&MIN_TILE)
+    }
+
+    /// Opens a real terminal once the app has reached a daemon, else a fake one.
+    pub(crate) fn new_user_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let task = self.active_task().id;
+
+        if let Some(client) = self.daemon.clone() {
+            if client.is_connected() {
+                self.create_live_terminal(client, task, window, cx);
+            } else {
+                log::warn!("the daemon is disconnected, cannot open a terminal");
+            }
+
+            return;
+        }
+
+        log::debug!("the app never reached a daemon, opening a fake user terminal");
+
+        let terminal = self.data.add_user_terminal(task);
+        self.user_sizes.insert(terminal, self.planned_user_size());
         self.focused_terminal = Some(terminal);
 
         cx.notify();
     }
 
+    /// Closes the tile. A live terminal that still runs is killed.
     pub(crate) fn close_user_terminal(&mut self, terminal: TerminalId, cx: &mut Context<Self>) {
-        let task = self.active_task().id;
+        let owner = self
+            .data
+            .tasks
+            .iter()
+            .find(|task| task.user_terminals.contains(&terminal))
+            .map(|task| task.id);
+        let Some(task) = owner else {
+            return;
+        };
+
+        if let Some(live) = self.live_terminals.remove(&terminal) {
+            live.kill_if_running(cx);
+        }
 
         self.data.close_user_terminal(task, terminal);
+        self.disconnected.remove(&terminal);
+        self.terminal_focus.remove(&terminal);
         self.user_sizes.remove(&terminal);
         self.minimized.remove(&terminal);
         if self.focused_terminal == Some(terminal) {
@@ -589,11 +623,23 @@ fn user_frame(
         .focused(focused)
         .name_suffix(you);
 
-    if let Some(handle) = workspace.terminal_focus.get(&id) {
+    let live = workspace.live_terminals.get(&id);
+
+    // A live tile's focus handle belongs to its view, which tracks it itself.
+    if live.is_none()
+        && let Some(handle) = workspace.terminal_focus.get(&id)
+    {
         frame = frame.track_focus(handle);
     }
 
-    if let Some(path) = terminal.meta.clone() {
+    if workspace.disconnected.contains(&id) {
+        frame = frame.action(
+            Label::new("disconnected")
+                .mono()
+                .size(LabelSize::XSmall)
+                .color(Color::Warn),
+        );
+    } else if let Some(path) = terminal.meta.clone() {
         frame = frame.action(
             Label::new(path)
                 .mono()
@@ -602,15 +648,18 @@ fn user_frame(
         );
     }
 
-    frame
-        .action(
-            IconButton::new(("close", id.0), IconName::Close, "Close your terminal").on_click(
-                cx.listener(move |workspace, _, _, cx| {
-                    workspace.close_user_terminal(id, cx);
-                }),
-            ),
-        )
-        .children(lines(terminal, cx))
+    let frame = frame.action(
+        IconButton::new(("close", id.0), IconName::Close, "Close your terminal").on_click(
+            cx.listener(move |workspace, _, _, cx| {
+                workspace.close_user_terminal(id, cx);
+            }),
+        ),
+    );
+
+    match live {
+        Some(live) => frame.child(div().size_full().child(live.view.clone())),
+        None => frame.children(lines(terminal, cx)),
+    }
 }
 
 fn resize_handle(id: TerminalId, dragging: bool, cx: &mut Context<Workspace>) -> AnyElement {

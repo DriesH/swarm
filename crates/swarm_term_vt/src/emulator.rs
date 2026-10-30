@@ -231,22 +231,25 @@ impl Emulator {
         Ok(Some(until))
     }
 
-    /// The whole screen plus up to `history_limit` lines of scrollback.
-    pub(crate) fn snapshot(&mut self, history_limit: u32) -> Result<Snapshot> {
-        self.flush()?;
+    /// The whole screen plus up to `history_limit` lines of scrollback. The update
+    /// that was pending is returned too, so the caller can send it first.
+    pub(crate) fn snapshot(&mut self, history_limit: u32) -> Result<(Option<Update>, Snapshot)> {
+        let update = self.flush()?;
 
         let screen = self.screen.clone().context("no screen after flush")?;
         let count = u64::from(history_limit).min(self.history.len);
         let from = self.history.end() - count;
         let (_, history_rows) = self.history_rows(from, history_limit)?;
 
-        Ok(Snapshot {
+        let snapshot = Snapshot {
             screen,
             rows: self.rows.clone(),
             history_rows,
             title: non_empty(self.terminal.title()?),
             working_directory: non_empty(self.terminal.pwd()?),
-        })
+        };
+
+        Ok((update, snapshot))
     }
 
     /// The rows that changed since the last call, or `None` when nothing did.
@@ -827,11 +830,23 @@ mod tests {
                 .write(format!("line {line}\r\n").as_bytes());
         }
 
-        let snapshot = harness.emulator.snapshot(1000).expect("snapshot");
+        let (_, snapshot) = harness.emulator.snapshot(1000).expect("snapshot");
 
         assert_eq!(snapshot.rows.len(), 10);
         assert_eq!(snapshot.history_rows.len(), 6);
         assert_eq!(snapshot.screen.history.len, 6);
+    }
+
+    #[test]
+    fn snapshot_returns_the_pending_update_with_the_text() {
+        let mut harness = harness();
+        harness.emulator.write(b"pending text");
+
+        let (update, snapshot) = harness.emulator.snapshot(10).expect("snapshot");
+
+        let update = update.expect("update");
+        assert_eq!(row_text(&update.rows[0].1), "pending text");
+        assert_eq!(row_text(&snapshot.rows[0]), "pending text");
     }
 
     #[test]
@@ -1002,7 +1017,7 @@ mod tests {
             .emulator
             .write(b"\x1b]2;my title\x07\x1b]7;file://host/tmp/dir\x07");
 
-        let snapshot = harness.emulator.snapshot(10).expect("snapshot");
+        let (_, snapshot) = harness.emulator.snapshot(10).expect("snapshot");
 
         assert_eq!(snapshot.title.as_deref(), Some("my title"));
         assert!(

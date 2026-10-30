@@ -30,6 +30,7 @@ Cargo workspace:
 | `swarm_term_vt` | Emulator: PTY + `libghostty-vt` on their own threads, turns output into rows. Only the daemon and the gallery link it |
 | `swarm_term_view` | GPUI view and grid element that paint the rows and send keys, IME text and resizes |
 | `swarm_core` | Projects, tasks, agents, worktrees, messages, state in SQLite |
+| `swarm_protocol` | Socket protocol between daemon and app (postcard frames) and the app's client. No libghostty |
 | `swarm_daemon` | Background process that owns PTYs and runs `swarm_core` |
 | `swarm_harness` | Unix socket API, `swarm` CLI and MCP server |
 | `swarm_app` | Window, sidebar, tabs, Terminals / Swarm / Review views, panels, settings |

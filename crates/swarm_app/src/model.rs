@@ -7,6 +7,12 @@ use swarm_ui::prelude::Color;
 pub(crate) const START_TASK: &str = "Start";
 pub(crate) const PLAN_TASK: &str = "Plan";
 
+/// The key the daemon stores with a user terminal to find its task again after a
+/// restart: `<project name>/<task name>`, for example `swarm/terminal-renderer`.
+pub(crate) fn task_key(project: &str, task: &str) -> String {
+    format!("{project}/{task}")
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ProjectId(pub u32);
 
@@ -691,8 +697,38 @@ impl FakeData {
         self.agents.iter().filter(move |agent| agent.task == task)
     }
 
-    /// Adds a user terminal to the task. It starts with the Island mockup's lines.
+    /// Adds a fake user terminal to the task. It starts with the Island mockup's lines.
     pub(crate) fn add_user_terminal(&mut self, task: TaskId) -> TerminalId {
+        self.push_user_terminal(
+            task,
+            "zsh".into(),
+            Some("~/personal/swarm".into()),
+            user_terminal_lines(),
+        )
+    }
+
+    /// Adds a user terminal that the daemon runs. The tile shows the live view, so it
+    /// has no fake lines.
+    pub(crate) fn add_live_user_terminal(
+        &mut self,
+        task: TaskId,
+        title: Option<&str>,
+    ) -> TerminalId {
+        self.push_user_terminal(
+            task,
+            "Terminal".into(),
+            title.map(SharedString::new),
+            Vec::new(),
+        )
+    }
+
+    fn push_user_terminal(
+        &mut self,
+        task: TaskId,
+        title: SharedString,
+        meta: Option<SharedString>,
+        lines: Vec<FakeLine>,
+    ) -> TerminalId {
         let id = TerminalId(
             self.terminals
                 .iter()
@@ -704,12 +740,12 @@ impl FakeData {
         self.terminals.push(Terminal {
             id,
             kind: TerminalKind::User,
-            title: "zsh".into(),
-            meta: Some("~/personal/swarm".into()),
+            title,
+            meta,
             owner: None,
             link: None,
             requested_size: None,
-            lines: user_terminal_lines(),
+            lines,
         });
 
         if let Some(entry) = self.tasks.iter_mut().find(|entry| entry.id == task) {
@@ -717,6 +753,27 @@ impl FakeData {
         }
 
         id
+    }
+
+    pub(crate) fn set_terminal_meta(&mut self, terminal: TerminalId, meta: Option<SharedString>) {
+        if let Some(entry) = self.terminals.iter_mut().find(|entry| entry.id == terminal) {
+            entry.meta = meta;
+        }
+    }
+
+    /// The task's key for the daemon, see [`task_key`].
+    pub(crate) fn key_of_task(&self, task: TaskId) -> Option<String> {
+        let task = self.task(task)?;
+        let project = self.project(task.project)?;
+
+        Some(task_key(&project.name, &task.name))
+    }
+
+    pub(crate) fn task_with_key(&self, key: &str) -> Option<TaskId> {
+        self.tasks
+            .iter()
+            .find(|task| self.key_of_task(task.id).is_some_and(|other| other == key))
+            .map(|task| task.id)
     }
 
     /// Removes a user terminal from the task.
@@ -926,6 +983,33 @@ mod tests {
     #[test]
     fn the_sample_has_no_start_task() {
         assert!(FakeData::sample().tasks.iter().all(|task| !task.is_start));
+    }
+
+    #[test]
+    fn a_task_key_is_the_project_and_task_name() {
+        assert_eq!(
+            task_key("swarm", "terminal-renderer"),
+            "swarm/terminal-renderer"
+        );
+    }
+
+    #[test]
+    fn a_task_is_found_again_by_its_key() {
+        let data = FakeData::sample();
+
+        let found = data.task_with_key("billing-api/tax-rates");
+
+        assert_eq!(
+            found
+                .and_then(|task| data.task(task))
+                .map(|task| task.name.as_ref()),
+            Some("tax-rates")
+        );
+    }
+
+    #[test]
+    fn an_unknown_key_finds_no_task() {
+        assert_eq!(FakeData::sample().task_with_key("swarm/nope"), None);
     }
 
     #[test]

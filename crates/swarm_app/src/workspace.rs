@@ -6,6 +6,7 @@ use gpui::{
     Bounds, Context, Entity, FocusHandle, Focusable, Pixels, SharedString, Size, Subscription,
     Window, div, px,
 };
+use swarm_protocol::Client;
 use swarm_ui::fonts::UI_FONT;
 use swarm_ui::prelude::*;
 
@@ -13,6 +14,7 @@ use crate::actions::{
     FocusAgent, NewTask, NewTerminal, OpenSettings, PlanWithOrchestrator, ShowReview, ShowSwarm,
     ShowTerminals, ToggleChanges, ToggleCommandPalette, ToggleFiles,
 };
+use crate::daemon::{DaemonLaunch, LiveTerminal};
 use crate::model::{
     AgentId, FakeData, ProjectId, Task, TaskId, TaskStatus, TerminalId, TerminalKind,
 };
@@ -50,6 +52,12 @@ pub(crate) struct Workspace {
     pub(crate) layout: swarm_layout::Layout,
     pub(crate) user_sizes: HashMap<TerminalId, Size<Pixels>>,
     pub(crate) resizing: Option<Resizing>,
+    pub(crate) daemon: Option<Client>,
+    pub(crate) live_terminals: HashMap<TerminalId, LiveTerminal>,
+    /// Live tiles whose terminal lost its daemon connection.
+    pub(crate) disconnected: HashSet<TerminalId>,
+    pub(crate) daemon_launch: Option<DaemonLaunch>,
+    pub(crate) reconnecting: bool,
     pub(crate) orchestrator_input: Entity<TextInput>,
     _orchestrator_subscription: Subscription,
 }
@@ -91,6 +99,11 @@ impl Workspace {
             layout: swarm_layout::Layout::default(),
             user_sizes: HashMap::new(),
             resizing: None,
+            daemon: None,
+            live_terminals: HashMap::new(),
+            disconnected: HashSet::new(),
+            daemon_launch: None,
+            reconnecting: false,
             orchestrator_input,
             _orchestrator_subscription: orchestrator_subscription,
         }
@@ -323,8 +336,8 @@ impl Render for Workspace {
                 .on_action(cx.listener(|this, _: &PlanWithOrchestrator, _, cx| {
                     this.open_start_task(cx);
                 }))
-                .on_action(cx.listener(|this, _: &NewTerminal, _, cx| {
-                    this.new_user_terminal(cx);
+                .on_action(cx.listener(|this, _: &NewTerminal, window, cx| {
+                    this.new_user_terminal(window, cx);
                 }))
                 .on_action(cx.listener(|_, _: &OpenSettings, window, cx| {
                     crate::settings::open(window, cx);

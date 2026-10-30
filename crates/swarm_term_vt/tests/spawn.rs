@@ -200,3 +200,55 @@ fn seq_200000_speed() {
     println!("seq 1 200000 took {:?}", start.elapsed());
     assert_eq!(status, ExitStatus::Code(0));
 }
+
+#[test]
+fn snapshot_request_answers_with_the_current_screen() {
+    let (terminal, emulator) = channels();
+    let _local = LocalTerminal::spawn(
+        options(&["/bin/sh", "-c", "printf 'hello'; sleep 30"]),
+        emulator,
+    )
+    .expect("spawn");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen_text = false;
+    while !seen_text {
+        match terminal.output.recv_deadline(deadline).expect("output") {
+            TerminalOutput::Update(update) => {
+                seen_text = update
+                    .rows
+                    .iter()
+                    .any(|(_, row)| row_text(row).contains("hello"));
+            }
+            TerminalOutput::Snapshot(snapshot) => {
+                seen_text = snapshot
+                    .rows
+                    .iter()
+                    .any(|row| row_text(row).contains("hello"));
+            }
+            _ => {}
+        }
+    }
+
+    terminal
+        .input
+        .send(swarm_term::TerminalInput::Snapshot { history: 10 })
+        .expect("send");
+    let snapshot = loop {
+        if let TerminalOutput::Snapshot(snapshot) =
+            terminal.output.recv_deadline(deadline).expect("snapshot")
+        {
+            break snapshot;
+        }
+    };
+
+    assert!(
+        snapshot
+            .rows
+            .iter()
+            .any(|row| row_text(row).contains("hello"))
+    );
+    terminal
+        .input
+        .send(swarm_term::TerminalInput::Kill)
+        .expect("send");
+}
