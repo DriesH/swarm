@@ -13,6 +13,8 @@ mod views;
 mod window_drag;
 mod workspace;
 
+#[cfg(feature = "frame-stats")]
+mod frame_stats;
 #[cfg(feature = "snapshot")]
 mod snapshot;
 
@@ -44,6 +46,17 @@ fn open_workspace(cx: &mut App) -> anyhow::Result<gpui::WindowHandle<Workspace>>
     })
 }
 
+#[cfg(not(feature = "frame-stats"))]
+fn open_main_window(cx: &mut App) {
+    if let Err(error) = open_workspace(cx) {
+        log::error!("could not open the main window: {error:#}");
+        cx.quit();
+        return;
+    }
+
+    cx.activate(true);
+}
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -63,12 +76,10 @@ fn main() {
             return;
         }
 
-        if let Err(error) = open_workspace(cx) {
-            log::error!("could not open the main window: {error:#}");
-            cx.quit();
-            return;
-        }
+        #[cfg(feature = "frame-stats")]
+        frame_stats::run(cx);
 
-        cx.activate(true);
+        #[cfg(not(feature = "frame-stats"))]
+        open_main_window(cx);
     });
 }

@@ -27,3 +27,5 @@ gpui = { workspace = true, features = ["test-support"] }
 [features]
 # Saves rendered frames as PNGs (no screen-recording permission needed).
 snapshot = ["gpui_platform/test-support", "dep:image"]
+# Logs frame timings from a scripted session, or shows GPUI's live frame overlay.
+frame-stats = ["gpui/profiler"]
