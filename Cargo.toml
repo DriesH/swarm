@@ -1,0 +1,62 @@
+[workspace]
+resolver = "3"
+members = ["crates/gallery", "crates/swarm_ui"]
+default-members = ["crates/gallery", "crates/swarm_ui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+swarm_ui = { path = "crates/swarm_ui" }
+
+anyhow = "1"
+env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+log = "0.4"
+# Same version gpui_macos uses at the pinned rev, so it is built once.
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSAccessibility", "NSWorkspace"] }
+# One Zed rev for every GPUI crate. Bump it together with rust-toolchain.toml.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "70b1b91b73ee12930b4e3375d68657e9591b1921" }
+# font-kit: without it GPUI draws no text on macOS.
+# runtime_shaders: compiles Metal shaders at startup, so builds work without the Metal Toolchain.
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "70b1b91b73ee12930b4e3375d68657e9591b1921", features = ["font-kit", "runtime_shaders"] }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+# Part of rust_2018_idioms. GPUI handlers take `Context<Self>`; `Context<'_, Self>` everywhere is noise.
+elided_lifetimes_in_paths = "allow"
+unused_qualifications = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Restriction picks.
+unwrap_used = "deny"
+expect_used = "warn"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+print_stdout = "warn"
+print_stderr = "warn"
+undocumented_unsafe_blocks = "deny"
+let_underscore_must_use = "deny"
+let_underscore_untyped = "warn"
+allow_attributes_without_reason = "warn"
+clone_on_ref_ptr = "warn"
+str_to_string = "warn"
+rc_buffer = "warn"
+# Pedantic lints that fight GPUI-style code.
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+# GPUI passes Window/App handles and builder args by value.
+needless_pass_by_value = "allow"
+
+# Zed patches these crates in its own workspace; patches don't carry over to git deps.
+[patch.crates-io]
+async-task = { git = "https://github.com/zed-industries/async-task.git", rev = "015845a19fc31752c02367567d3b8900a406f9da" }
