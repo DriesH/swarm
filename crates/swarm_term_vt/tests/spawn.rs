@@ -1,6 +1,8 @@
 use std::time::{Duration, Instant};
 
-use swarm_term::{ExitStatus, Palette, Rgb, Row, Size, TerminalChannels, TerminalOutput, channels};
+use swarm_term::{
+    ExitStatus, Palette, ProgramState, Rgb, Row, Size, TerminalChannels, TerminalOutput, channels,
+};
 use swarm_term_vt::{DEFAULT_SCROLLBACK_BYTES, LocalTerminal, SpawnError, SpawnOptions};
 
 fn options(command: &[&str]) -> SpawnOptions {
@@ -71,6 +73,27 @@ fn printf_output_reaches_the_view() {
 
     assert_eq!(status, ExitStatus::Code(0));
     assert!(texts.iter().any(|text| text.contains("hello")), "{texts:?}");
+}
+
+#[test]
+fn program_status_reports_arrive_in_order_before_exit() {
+    let (terminal, emulator) = channels();
+    let script =
+        "printf '\\033]7501;state=working:app=test\\033\\\\'; printf '\\033]7501;state=done\\007'";
+    let _local =
+        LocalTerminal::spawn(options(&["/bin/sh", "-c", script]), emulator).expect("spawn");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen = Vec::new();
+    loop {
+        match terminal.output.recv_deadline(deadline).expect("output") {
+            TerminalOutput::ProgramStatus(status) => seen.push(status.state),
+            TerminalOutput::Exited(_) => break,
+            _ => {}
+        }
+    }
+
+    assert_eq!(seen, vec![ProgramState::Working, ProgramState::Done]);
 }
 
 #[test]

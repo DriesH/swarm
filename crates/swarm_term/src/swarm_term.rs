@@ -212,11 +212,43 @@ pub enum TerminalInput {
 pub enum TerminalOutput {
     Snapshot(Snapshot),
     Update(Update),
-    History { from: u64, rows: Vec<Row> },
+    History {
+        from: u64,
+        rows: Vec<Row>,
+    },
     Title(String),
     WorkingDirectory(String),
     Bell,
+    /// A program reported its status through OSC 7501 (Program Status Protocol).
+    ProgramStatus(ProgramStatus),
     Exited(ExitStatus),
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ProgramStatus {
+    pub state: ProgramState,
+    /// The decoded `msg`, when the program sent one.
+    pub message: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgramState {
+    Idle,
+    Working,
+    Done,
+    Blocked(BlockedKind),
+    Error,
+    /// The program withdrew its status, for example on exit.
+    Clear,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockedKind {
+    Permission,
+    Question,
+    Auth,
+    /// `blocked` without a kind we know.
+    Other,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

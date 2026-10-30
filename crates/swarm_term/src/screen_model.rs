@@ -78,6 +78,7 @@ impl ScreenModel {
             TerminalOutput::Title(_)
             | TerminalOutput::WorkingDirectory(_)
             | TerminalOutput::Bell
+            | TerminalOutput::ProgramStatus(_)
             | TerminalOutput::Exited(_) => Changed::Nothing,
         }
     }

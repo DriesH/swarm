@@ -191,6 +191,18 @@ impl TerminalLoop {
 
     fn take_output(&mut self) {
         let bytes = self.output.take();
+
+        let statuses = self.emulator.scan_status(&bytes);
+        if !statuses.is_empty() {
+            // The screen the earlier output drew goes out before the status.
+            if let Err(error) = self.flush() {
+                log::warn!("flush before a status failed: {error:#}");
+            }
+            for status in statuses {
+                self.send(TerminalOutput::ProgramStatus(status));
+            }
+        }
+
         self.emulator.write(&bytes);
         self.dirty = true;
     }

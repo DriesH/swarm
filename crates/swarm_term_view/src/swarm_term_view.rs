@@ -205,6 +205,7 @@ impl TerminalView {
                 cx.emit(TerminalEvent::WorkingDirectoryChanged(directory));
             }
             TerminalOutput::Bell => cx.emit(TerminalEvent::Bell),
+            TerminalOutput::ProgramStatus(_) => {}
             TerminalOutput::Exited(status) => {
                 log::info!("terminal exited: {status:?}");
 
