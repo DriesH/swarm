@@ -3,6 +3,7 @@
 Native macOS app (Rust + GPUI) that runs a swarm of Claude Code and Codex agents in terminals.
 
 - Plan: `docs/PLAN.md`. Phases and "done when": `docs/ROADMAP.md`
+- Code conventions: `docs/CONVENTIONS.md`. Follow them in every Rust change.
 - Terms: `GLOSSARY.md`. Use its words in code, UI copy and docs.
 - Decisions: `docs/adr/`. Read before changing architecture.
 - Design reference: direction A on the canvas linked in `docs/PLAN.md`.
