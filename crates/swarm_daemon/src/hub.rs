@@ -30,6 +30,9 @@ pub(crate) const CREATE_HISTORY_LINES: u32 = 1000;
 
 const EXIT_POLL: Duration = Duration::from_millis(25);
 
+/// Sees each output on the hub thread.
+pub(crate) type OutputObserver = Box<dyn FnMut(&TerminalOutput) + Send>;
+
 /// What a terminal needs beyond the client's [`CreateTerminal`].
 #[derive(Default)]
 pub(crate) struct Extras {
@@ -37,6 +40,8 @@ pub(crate) struct Extras {
     /// Runs once the process runs, before the daemon can notice its exit.
     pub(crate) on_started: Option<Box<dyn FnOnce(TerminalId) + Send>>,
     pub(crate) on_exit: Option<Box<dyn FnOnce(Option<ExitStatus>) + Send>>,
+    /// Sees every output on the hub thread before clients get it.
+    pub(crate) on_output: Option<OutputObserver>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -71,7 +76,7 @@ impl ClientSink {
     }
 
     /// Returns false when the client is gone or too slow.
-    fn send(&self, frame: &Frame) -> bool {
+    pub(crate) fn send(&self, frame: &Frame) -> bool {
         match self.frames.try_send(Frame::clone(frame)) {
             Ok(()) => true,
             Err(flume::TrySendError::Full(_)) => {
@@ -90,6 +95,31 @@ impl ClientSink {
 
     pub(crate) fn send_event(&self, event: &Event) -> bool {
         encode_event(event).is_some_and(|frame| self.send(&frame))
+    }
+}
+
+/// Every connected app client, for events that are not about one terminal.
+#[derive(Default)]
+pub(crate) struct Clients {
+    sinks: Mutex<Vec<Arc<ClientSink>>>,
+}
+
+impl Clients {
+    pub(crate) fn add(&self, sink: &Arc<ClientSink>) {
+        lock(&self.sinks).push(Arc::clone(sink));
+    }
+
+    pub(crate) fn remove(&self, client: u64) {
+        lock(&self.sinks).retain(|sink| sink.id() != client);
+    }
+
+    /// Sends the event to every client; clients that are gone or too slow are dropped.
+    pub(crate) fn broadcast(&self, event: &Event) {
+        let Some(frame) = encode_event(event) else {
+            return;
+        };
+
+        lock(&self.sinks).retain(|sink| sink.send(&frame));
     }
 }
 
@@ -134,7 +164,10 @@ impl HubState {
                 }
             }
             TerminalOutput::Exited(status) => self.exit = Some(status.clone()),
-            TerminalOutput::Update(_) | TerminalOutput::History { .. } | TerminalOutput::Bell => {}
+            TerminalOutput::Update(_)
+            | TerminalOutput::History { .. }
+            | TerminalOutput::Bell
+            | TerminalOutput::ProgramStatus(_) => {}
         }
     }
 
@@ -257,10 +290,14 @@ impl Hub {
         terminals: &Terminals,
         store: &Mutex<Store>,
         on_exit: Option<Box<dyn FnOnce(Option<ExitStatus>) + Send>>,
+        mut on_output: Option<OutputObserver>,
     ) {
         let mut exit = None;
         while let Ok(output) = outputs.recv() {
             lock(&self.state).observe(&output);
+            if let Some(on_output) = &mut on_output {
+                on_output(&output);
+            }
 
             if let TerminalOutput::Exited(status) = output {
                 exit = Some(status);
@@ -414,7 +451,13 @@ impl Terminals {
         let spawned = thread::Builder::new()
             .name(format!("hub-{}", id.0))
             .spawn(move || {
-                runner.run(&outputs, &terminals, &terminals.store, extras.on_exit);
+                runner.run(
+                    &outputs,
+                    &terminals,
+                    &terminals.store,
+                    extras.on_exit,
+                    extras.on_output,
+                );
                 drop(terminal);
             });
         if let Err(error) = spawned {
@@ -553,5 +596,43 @@ mod tests {
     #[test]
     fn a_plain_path_is_kept_as_it_is() {
         assert_eq!(path_from_osc7("/tmp/a b"), PathBuf::from("/tmp/a b"));
+    }
+
+    #[test]
+    fn a_broadcast_reaches_every_client() {
+        let clients = Clients::default();
+        let (first, first_frames) = sink(1, 8);
+        let (second, second_frames) = sink(2, 8);
+        clients.add(&first);
+        clients.add(&second);
+
+        clients.broadcast(&Event::Closed { id: TerminalId(1) });
+
+        assert_eq!(first_frames.try_iter().count(), 1);
+        assert_eq!(second_frames.try_iter().count(), 1);
+    }
+
+    #[test]
+    fn a_removed_client_gets_no_broadcast() {
+        let clients = Clients::default();
+        let (client, frames) = sink(1, 8);
+        clients.add(&client);
+
+        clients.remove(1);
+        clients.broadcast(&Event::Closed { id: TerminalId(1) });
+
+        assert_eq!(frames.try_iter().count(), 0);
+    }
+
+    #[test]
+    fn a_broadcast_drops_a_client_that_is_gone() {
+        let clients = Clients::default();
+        let (client, frames) = sink(1, 8);
+        clients.add(&client);
+        drop(frames);
+
+        clients.broadcast(&Event::Closed { id: TerminalId(1) });
+
+        assert!(lock(&clients.sinks).is_empty());
     }
 }

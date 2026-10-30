@@ -1,23 +1,28 @@
-//! Starting a task: the work in `swarm_core`, then the setup script as a terminal.
+//! Starting a task: the work in `swarm_core`, then the setup script as a terminal,
+//! then the orchestrator.
 
 use std::sync::Arc;
+use std::thread;
 
 use anyhow::{Context as _, Result};
 use swarm_core::{PreparedTask, Projects};
-use swarm_protocol::{CreateTask, CreateTerminal, TaskInfo, TerminalId, TerminalKind};
-use swarm_term::{Palette, Rgb, Size};
+use swarm_protocol::{AgentRole, CreateTask, CreateTerminal, TaskInfo, TerminalId, TerminalKind};
+use swarm_term::{ExitStatus, Palette, Rgb, Size};
 
+use crate::Services;
+use crate::agents::{CommandNotFound, Start};
 use crate::hub::{Extras, Terminals};
 
-/// Default size and colors of a setup terminal; the app resizes it when it attaches.
-const SETUP_SIZE: Size = Size {
+/// Default size and colors of a setup or agent terminal; the app resizes it when it
+/// attaches.
+pub(crate) const TERMINAL_SIZE: Size = Size {
     cols: 100,
     rows: 30,
     cell_width: 8,
     cell_height: 16,
 };
 
-const SETUP_PALETTE: Palette = Palette {
+pub(crate) const TERMINAL_PALETTE: Palette = Palette {
     fg: Rgb(230, 230, 230),
     bg: Rgb(10, 10, 12),
     cursor: Rgb(255, 255, 255),
@@ -41,26 +46,125 @@ const SETUP_PALETTE: Palette = Palette {
     ],
 };
 
-/// Makes the task, then starts its setup script without waiting for it to finish.
+/// How the setup script went, as the orchestrator needs to know it.
+enum Setup {
+    None,
+    /// The script could not even start.
+    Failed,
+    Running(flume::Receiver<Option<ExitStatus>>),
+}
+
+/// Makes the task and starts its setup script without waiting for it. `reply` gets
+/// the task first; the orchestrator starts after it, once the setup has ended.
 pub(crate) fn create(
-    terminals: &Arc<Terminals>,
-    projects: &Arc<Projects>,
+    services: &Services,
     request: &CreateTask,
-) -> Result<TaskInfo> {
+    reply: impl FnOnce(&TaskInfo),
+) -> Result<()> {
+    let plan = request
+        .orchestrator
+        .map(|kind| services.agents.plan(kind, AgentRole::Orchestrator))
+        .transpose()?;
+
     let PreparedTask {
         mut task,
         setup,
         env,
-    } = projects.create_task(request)?;
+    } = services.projects.create_task(request)?;
 
-    if let Some(script) = setup {
-        match start_setup(terminals, projects, &task, script, env) {
-            Ok(terminal) => task.setup_terminal = Some(terminal),
-            Err(error) => log::error!("cannot start the setup of task {}: {error:#}", task.id.0),
+    let agent = plan.and_then(|plan| match services.agents.register(&task, plan) {
+        Ok(info) => {
+            task.agents.push(info.clone());
+
+            Some(info.id)
         }
+        Err(error) => {
+            log::error!(
+                "cannot record the orchestrator of task {}: {error:#}",
+                task.id.0
+            );
+
+            None
+        }
+    });
+
+    let setup = match setup {
+        None => Setup::None,
+        Some(script) => match start_setup(
+            &services.terminals,
+            &services.projects,
+            &task,
+            script,
+            env.clone(),
+        ) {
+            Ok((terminal, done)) => {
+                task.setup_terminal = Some(terminal);
+
+                Setup::Running(done)
+            }
+            Err(error) => {
+                log::error!("cannot start the setup of task {}: {error:#}", task.id.0);
+
+                Setup::Failed
+            }
+        },
+    };
+
+    reply(&task);
+
+    if let Some(agent) = agent {
+        let start = Start {
+            agent,
+            task,
+            env,
+            first_message: request.first_message.clone(),
+        };
+        start_orchestrator(services, start, setup);
     }
 
-    Ok(task)
+    Ok(())
+}
+
+/// Waits for the setup on its own thread, then starts the orchestrator or marks it failed.
+fn start_orchestrator(services: &Services, start: Start, setup: Setup) {
+    let agents = Arc::clone(&services.agents);
+    let agent = start.agent;
+
+    let spawned = thread::Builder::new()
+        .name(format!("start-agent-{}", agent.0))
+        .spawn(move || {
+            let setup_worked = match setup {
+                Setup::None => true,
+                Setup::Failed => false,
+                Setup::Running(done) => {
+                    matches!(done.recv(), Ok(Some(ExitStatus::Code(0))))
+                }
+            };
+            if !setup_worked {
+                agents.fail(agent, "Setup failed");
+
+                return;
+            }
+
+            if let Err(error) = agents.start(start) {
+                log::error!("cannot start agent {}: {error:#}", agent.0);
+                agents.fail(agent, start_failure(&error));
+            }
+        });
+
+    if let Err(error) = spawned {
+        log::error!("cannot start a thread for agent {}: {error}", agent.0);
+        services.agents.fail(agent, "Cannot start the agent");
+    }
+}
+
+/// The short text the status shows; the full error goes to the log.
+fn start_failure(error: &anyhow::Error) -> &'static str {
+    if error.downcast_ref::<CommandNotFound>().is_some() {
+        "Command not found"
+    } else {
+        "Cannot start"
+    }
 }
 
 fn start_setup(
@@ -69,17 +173,18 @@ fn start_setup(
     task: &TaskInfo,
     script: String,
     env: Vec<(String, String)>,
-) -> Result<TerminalId> {
+) -> Result<(TerminalId, flume::Receiver<Option<ExitStatus>>)> {
     let request = CreateTerminal {
         kind: TerminalKind::Process,
         command: Some(vec!["/bin/sh".to_owned(), "-lc".to_owned(), script]),
         cwd: Some(task.worktree.clone()),
-        size: SETUP_SIZE,
-        palette: SETUP_PALETTE,
+        size: TERMINAL_SIZE,
+        palette: TERMINAL_PALETTE,
         task: Some(task.id.terminal_key()),
     };
 
     let (started, finished) = (Arc::clone(projects), Arc::clone(projects));
+    let (done, ended) = flume::bounded(1);
     let task_id = task.id;
     let extras = Extras {
         env,
@@ -92,12 +197,35 @@ fn start_setup(
             if let Err(error) = finished.finish_setup(task_id, exit.as_ref()) {
                 log::error!("cannot record the end of the setup: {error}");
             }
+            if done.send(exit).is_err() {
+                log::debug!("nobody waits for the setup of task {}", task_id.0);
+            }
         })),
+        on_output: None,
     };
 
     let hub = terminals
         .create_with(request, extras)
         .context("cannot start the setup terminal")?;
 
-    Ok(hub.id())
+    Ok((hub.id(), ended))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_command_gets_a_short_message() {
+        let error = anyhow::Error::new(CommandNotFound("claude".to_owned())).context("outer");
+
+        assert_eq!(start_failure(&error), "Command not found");
+    }
+
+    #[test]
+    fn another_error_gets_the_generic_message() {
+        let error = anyhow::anyhow!("cannot write /some/long/path").context("more");
+
+        assert_eq!(start_failure(&error), "Cannot start");
+    }
 }
