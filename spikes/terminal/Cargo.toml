@@ -1,0 +1,28 @@
+[package]
+name = "terminal-spike"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Standalone: not part of any workspace.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+# Only for the `snapshot` feature (PNG of the rendered frame, no screen-recording permission needed).
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+flume = "0.12"
+gpui = { git = "https://github.com/zed-industries/zed", rev = "70b1b91b73ee12930b4e3375d68657e9591b1921" }
+# font-kit: without it GPUI renders no text on macOS (only logs a warning).
+# runtime_shaders: compile Metal shaders at startup, so the build does not need the Metal Toolchain.
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "70b1b91b73ee12930b4e3375d68657e9591b1921", features = ["font-kit", "runtime_shaders"] }
+libghostty-vt = "0.2.2"
+log = "0.4"
+portable-pty = "0.9"
+
+[features]
+snapshot = ["gpui_platform/test-support", "dep:image"]
+
+# Zed patches these crates in its own workspace; patches don't carry over to git deps.
+[patch.crates-io]
+async-task = { git = "https://github.com/zed-industries/async-task.git", rev = "015845a19fc31752c02367567d3b8900a406f9da" }
