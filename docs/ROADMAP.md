@@ -5,7 +5,7 @@ Each phase ends with a pull request into `main`. A phase is done when every box 
 | Phase | Name | Status |
 |---|---|---|
 | 0 | Plan, design, spikes | Done ([PR #1](https://github.com/DriesH/swarm/pull/1)) |
-| 1 | Foundation: workspace, `swarm_ui`, gallery | In progress |
+| 1 | Foundation: workspace, `swarm_ui`, gallery | In review |
 | 2 | App shell with fake data | Not started |
 | 3 | Daemon, terminals and worktrees | Not started |
 | 4 | Agents and harness | Not started |
@@ -35,12 +35,12 @@ Each phase ends with a pull request into `main`. A phase is done when every box 
 
 **Done when:**
 
-- [ ] Workspace builds; `cargo test`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check` pass
-- [ ] Theme tokens match direction A in light and dark; System follows macOS live
-- [ ] Contrast tests pass (WCAG AA) for every text token in both themes
-- [ ] Components: icon, label, button, icon button, switch, segmented control, tab, status pill and dot, list row, tray chip, panel, tile frame
-- [ ] Every interactive component has a VoiceOver role and label, keyboard focus and a visible focus ring
-- [ ] Gallery shows every component in both themes and is fully keyboard navigable
+- [x] Workspace builds; `cargo test`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check` pass
+- [x] Theme tokens match direction A in light and dark; System follows macOS live
+- [x] Contrast tests pass (WCAG AA) for every text token in both themes
+- [x] Components: icon, label, button, icon button, switch, segmented control, tab, status pill and dot, list row, tray chip, panel, tile frame
+- [x] Every interactive component has a VoiceOver role and label, keyboard focus and a visible focus ring
+- [x] Gallery shows every component in both themes and is fully keyboard navigable
 
 ## 2. App shell with fake data
 
@@ -52,7 +52,7 @@ Each phase ends with a pull request into `main`. A phase is done when every box 
 
 - [ ] Start, Workspace, user terminal island and New task screens match the designs
 - [ ] Layout engine moves tiles to the tray when they don't fit and keeps user terminals at their size
-- [ ] Everything works from the keyboard; ⌘K opens the palette
+- [ ] Everything works from the keyboard; ⌘K opens the palette; each window focuses an element when it opens (Tab does nothing until something has focus)
 - [ ] VoiceOver can reach and name every control
 - [ ] Frames stay under 8 ms with fake content
 
@@ -68,6 +68,7 @@ Each phase ends with a pull request into `main`. A phase is done when every box 
 - [ ] A user terminal works; quitting and reopening the app shows it unchanged
 - [ ] Killing the daemon leaves no leftover processes after restart
 - [ ] Terminal speed matches spike 1 (`seq 1 200000` about 0.3 s)
+- [ ] The gallery shows a real terminal preview: `swarm_term`'s grid inside a `TileFrame`, running a short colour and text test
 
 ## 4. Agents and harness
 
@@ -128,7 +129,9 @@ Each phase ends with a pull request into `main`. A phase is done when every box 
 **Done when:**
 
 - [ ] First launch guides through the system check
-- [ ] VoiceOver audit passes on every screen
+- [ ] VoiceOver audit passes on every screen (checklist in `crates/swarm_ui/README.md`)
+- [ ] Reduce Motion reaches GPUI and stops spinners and easter-egg animations
+- [ ] Disabled controls and plain text are announced by VoiceOver (needs GPUI support or a contribution upstream)
 - [ ] Signed and notarized build installs on a clean Mac
 - [ ] Docs website and product website are live
 
