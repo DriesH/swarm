@@ -2,6 +2,7 @@
 
 #[cfg(feature = "snapshot")]
 mod snapshot;
+mod terminal_preview;
 
 use gpui::{
     App, Bounds, Context, FocusHandle, FontWeight, KeyBinding, Role, SharedString, Subscription,
@@ -13,6 +14,13 @@ use swarm_ui::prelude::*;
 use swarm_ui::theme::{self, Appearance};
 
 actions!(gallery, [SelectNext, SelectPrevious, Quit]);
+
+fn all_components() -> Vec<ComponentEntry> {
+    let mut entries = swarm_ui::all_components();
+    entries.push(ComponentEntry::of::<terminal_preview::TerminalPreview>());
+
+    entries
+}
 
 const COMPONENT_LIST: &str = "ComponentList";
 
@@ -26,7 +34,7 @@ struct Gallery {
 
 impl Gallery {
     fn new(selected: usize, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let entries = swarm_ui::all_components();
+        let entries = all_components();
         let row_focus: Vec<FocusHandle> = entries.iter().map(|_| cx.focus_handle()).collect();
         let selected = selected.min(entries.len().saturating_sub(1));
 

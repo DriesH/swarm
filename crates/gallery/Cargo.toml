@@ -18,6 +18,9 @@ gpui.workspace = true
 gpui_platform.workspace = true
 image = { workspace = true, optional = true }
 log.workspace = true
+swarm_term.workspace = true
+swarm_term_view.workspace = true
+swarm_term_vt.workspace = true
 swarm_ui.workspace = true
 
 [features]
