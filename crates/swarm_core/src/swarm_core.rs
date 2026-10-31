@@ -721,12 +721,16 @@ impl Projects {
                 .saturating_add(git::uncommitted_files(&worktree)?);
         }
 
+        if let Some(root) = self.project_root(task.project) {
+            check.merged_branches = merged_branches(&root, &task)?;
+        }
+
         Ok(check)
     }
 
     /// Runs the teardown script, removes the task worktree and the workers' own
-    /// worktrees (uncommitted changes go with them), keeps every branch and marks the
-    /// task closed. The caller stopped the task's processes first. A failure leaves the
+    /// worktrees (uncommitted changes go with them), deletes the branches merged into
+    /// the base branch and marks the task closed. The caller stopped the task's processes first. A failure leaves the
     /// task marked as closing, so a retry or the next daemon start finishes it.
     pub fn close_task(&self, id: TaskId) -> Result<ClosedTask, Error> {
         self.finish_close(id, true)
@@ -794,6 +798,18 @@ impl Projects {
         }
         if let Err(error) = git::worktree_prune(&root) {
             log::warn!("cannot prune the worktrees of {}: {error}", root.display());
+        }
+
+        // Checked again now: a branch merged since the check loses nothing either.
+        match merged_branches(&root, &task) {
+            Ok(branches) => {
+                for branch in branches {
+                    if let Err(error) = git::branch_delete(&root, &branch) {
+                        log::warn!("cannot delete the merged branch {branch}: {error}");
+                    }
+                }
+            }
+            Err(error) => log::warn!("cannot find the merged branches of {}: {error}", id.0),
         }
 
         let stopped = lock(&self.store).close_task(id)?;
@@ -916,6 +932,33 @@ fn unique_names(agents: &[AgentInfo]) -> HashMap<&str, Option<AgentId>> {
 
 /// Runs the script with `sh -c` in the task worktree, with the setup script's
 /// environment. Kills it after [`TEARDOWN_TIMEOUT`].
+/// The task branch and workers' own branches whose tip is in the base branch, so
+/// deleting them loses no commit.
+fn merged_branches(root: &Path, task: &TaskInfo) -> Result<Vec<String>, Error> {
+    let base = format!("refs/heads/{}", task.base);
+    if !git::branch_exists(root, &task.base)? {
+        return Ok(Vec::new());
+    }
+
+    let own = task
+        .agents
+        .iter()
+        .filter(|agent| agent.role == AgentRole::Worker && agent.worktree != task.worktree)
+        .map(|agent| agent.branch.as_str());
+
+    let mut merged = Vec::new();
+    for branch in [task.branch.as_str()].into_iter().chain(own) {
+        if merged.iter().any(|known| known == branch) || !git::branch_exists(root, branch)? {
+            continue;
+        }
+        if git::is_ancestor(root, &format!("refs/heads/{branch}"), &base)? {
+            merged.push(branch.to_owned());
+        }
+    }
+
+    Ok(merged)
+}
+
 fn run_teardown(script: &str, task: &TaskInfo) -> Result<(), Error> {
     let io_error = |action: &str| {
         let action = action.to_owned();

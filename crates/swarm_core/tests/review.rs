@@ -719,9 +719,13 @@ fn the_close_check_counts_running_agents_changes_and_unmerged_workers() {
 }
 
 #[test]
-fn closing_removes_the_worktrees_keeps_the_branches_and_frees_the_ports() {
+fn closing_removes_the_worktrees_keeps_unmerged_branches_and_frees_the_ports() {
     let setup = setup("[worktrees]\nports = { range = \"5170-5175\", per_worktree = 3 }\n");
     let ui = setup.worker("ui", true);
+    setup.write("done.txt", "committed\n");
+    setup.commit_all();
+    std::fs::write(ui.worktree.join("b.rs"), "1\n").expect("file");
+    commit("ui", &ui.worktree, &["b.rs"]);
     setup.write("a.txt", "uncommitted\n");
     let branches = git_in(&setup.repo.root, &["branch", "--format=%(refname:short)"]);
     let used_before = setup
@@ -776,6 +780,37 @@ fn closing_removes_the_worktrees_keeps_the_branches_and_frees_the_ports() {
     assert!(setup.projects.close_task(setup.task.id).is_err(), "twice");
     let again = setup.projects.close_task(TaskIdOf::unknown());
     assert!(again.is_err());
+}
+
+#[test]
+fn closing_deletes_only_the_branches_merged_into_the_base_branch() {
+    let setup = setup("");
+    let idle = setup.worker("idle", true);
+    let busy = setup.worker("busy", true);
+    std::fs::write(busy.worktree.join("c.rs"), "1\n").expect("file");
+    commit("busy", &busy.worktree, &["c.rs"]);
+
+    let check = setup.projects.close_check(setup.task.id).expect("check");
+    assert_eq!(
+        check.merged_branches,
+        [setup.task.branch.clone(), idle.branch.clone()]
+    );
+
+    setup.projects.close_task(setup.task.id).expect("close");
+
+    let branches = git_in(&setup.repo.root, &["branch", "--format=%(refname:short)"]);
+    assert!(
+        !branches.lines().any(|line| line == setup.task.branch),
+        "{branches}"
+    );
+    assert!(
+        !branches.lines().any(|line| line == idle.branch),
+        "{branches}"
+    );
+    assert!(
+        branches.lines().any(|line| line == busy.branch),
+        "{branches}"
+    );
 }
 
 struct TaskIdOf;

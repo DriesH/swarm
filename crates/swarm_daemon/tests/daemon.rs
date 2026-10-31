@@ -3757,8 +3757,8 @@ fn closing_a_task_stops_everything_removes_worktrees_and_survives_a_restart() {
     assert!(!task.worktree.exists());
     let branches = git_output(&repo.root, &["branch", "--format=%(refname:short)"]);
     assert!(
-        branches.lines().any(|branch| branch == task.branch),
-        "{branches}"
+        !branches.lines().any(|branch| branch == task.branch),
+        "the task branch has no commits of its own, so it is merged and deleted: {branches}"
     );
     assert!(branches.lines().any(|branch| branch == "unrelated"));
     assert!(client.projects()[0].tasks.is_empty());
