@@ -36,6 +36,10 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Creating a task runs git and copies files.
 const CREATE_TASK_TIMEOUT: Duration = Duration::from_secs(60);
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(3);
+/// Diffs, approvals and close checks run git over the whole task.
+const GIT_TIMEOUT: Duration = Duration::from_secs(60);
+/// Closing waits for agents to stop, then runs the teardown script (60 s at most).
+const CLOSE_TASK_TIMEOUT: Duration = Duration::from_secs(180);
 const SPAWN_POLL: Duration = Duration::from_millis(50);
 
 /// The only variables the daemon inherits from the app.
@@ -427,7 +431,8 @@ impl Client {
         source: ReviewSource,
         known: Option<u64>,
     ) -> Result<Option<TaskDiff>, ClientError> {
-        let reply = self.call(
+        let timeout = self.reply_timeout.max(GIT_TIMEOUT);
+        let reply = self.call_with_timeout(
             |call| Request::TaskDiff {
                 call,
                 task,
@@ -435,6 +440,7 @@ impl Client {
                 known,
             },
             None,
+            timeout,
         )?;
 
         match reply {
@@ -446,13 +452,15 @@ impl Client {
     /// Approves the Merged diff with this fingerprint. The new task arrives through
     /// [`Client::task_events`].
     pub fn approve_task(&self, task: TaskId, fingerprint: u64) -> Result<(), ClientError> {
-        let reply = self.call(
+        let timeout = self.reply_timeout.max(GIT_TIMEOUT);
+        let reply = self.call_with_timeout(
             |call| Request::ApproveTask {
                 call,
                 task,
                 fingerprint,
             },
             None,
+            timeout,
         )?;
 
         match reply {
@@ -463,15 +471,25 @@ impl Client {
 
     /// What closing the task would throw away.
     pub fn check_close(&self, task: TaskId) -> Result<CloseCheck, ClientError> {
-        match self.call(|call| Request::CheckClose { call, task }, None)? {
+        let timeout = self.reply_timeout.max(GIT_TIMEOUT);
+
+        match self.call_with_timeout(|call| Request::CheckClose { call, task }, None, timeout)? {
             Event::CloseCheck { check, .. } => Ok(check),
             other => Err(unexpected("CheckClose", &other)),
         }
     }
 
-    /// Closes the task. The closed task arrives through [`Client::task_events`].
-    pub fn close_task(&self, task: TaskId) -> Result<(), ClientError> {
-        match self.call(|call| Request::CloseTask { call, task }, None)? {
+    /// Closes the task, refused when it would now lose more than `confirmed`. The
+    /// closed task arrives through [`Client::task_events`].
+    pub fn close_task(&self, task: TaskId, confirmed: CloseCheck) -> Result<(), ClientError> {
+        let timeout = self.reply_timeout.max(CLOSE_TASK_TIMEOUT);
+        let request = |call| Request::CloseTask {
+            call,
+            task,
+            confirmed,
+        };
+
+        match self.call_with_timeout(request, None, timeout)? {
             Event::Done { .. } => Ok(()),
             other => Err(unexpected("CloseTask", &other)),
         }

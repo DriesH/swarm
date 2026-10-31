@@ -319,7 +319,8 @@ pub enum ReviewSource {
     /// The task worktree against the base branch, plus each worker with its own
     /// worktree that is not merged yet, against the commit it started from.
     Live,
-    /// The task worktree against the base branch: what the pull request would hold.
+    /// The commits of the task branch since it left the base branch: what the pull
+    /// request would hold. Uncommitted work is left out.
     Merged,
 }
 
@@ -335,6 +336,9 @@ pub enum DiffLineKind {
     Context,
     Added,
     Deleted,
+    /// The line before has no line end (git's `\ No newline at end of file`). Its
+    /// text is empty.
+    NoNewline,
 }
 
 /// One line of a hunk, without the leading `+`, `-` or space and without the line end.
@@ -367,11 +371,16 @@ pub struct FileDiff {
     /// the worktree. `None` when no agent commit touched it.
     pub agent: Option<AgentId>,
     pub change: FileChange,
+    /// The old and new file mode (for example `0o100644` and `0o100755`) when the mode
+    /// changed.
+    pub mode_change: Option<(u32, u32)>,
     pub additions: u32,
     pub deletions: u32,
     pub binary: bool,
     pub hunks: Vec<DiffHunk>,
-    /// Lines were left out because of [`DIFF_LINES_PER_FILE`] or [`DIFF_LINES`].
+    /// Lines were left out because of [`DIFF_LINES_PER_FILE`] or [`DIFF_LINES`], or
+    /// the whole file because it is too large to read. A file left out whole has no
+    /// hunks and is not binary.
     pub truncated: bool,
 }
 
@@ -380,8 +389,8 @@ pub struct FileDiff {
 pub struct TaskDiff {
     pub task: TaskId,
     pub source: ReviewSource,
-    /// A hash of every changed line, also of lines left out by the caps. Equal
-    /// fingerprints mean equal changes. Stable across daemon restarts.
+    /// A hash of every changed line, file mode and blob, also of lines left out by
+    /// the caps. Equal fingerprints mean equal changes. Stable across daemon restarts.
     pub fingerprint: u64,
     /// Totals over every changed file, also files past [`DIFF_FILES`].
     pub stat: DiffStat,
@@ -394,6 +403,8 @@ pub struct TaskDiff {
 pub struct CloseCheck {
     /// Agents of the task whose process runs.
     pub running_agents: u32,
+    /// The user's own terminals in the task. Closing stops them.
+    pub user_terminals: u32,
     /// Files with changes that are not committed, in the task worktree and in workers'
     /// own worktrees. Closing deletes them.
     pub uncommitted_files: u32,
@@ -491,13 +502,16 @@ pub enum Request {
         call: CallId,
         task: TaskId,
     },
-    /// Stops the task's agents and process terminals, runs the teardown script, and
+    /// Stops the task's agents and all its terminals, runs the teardown script, and
     /// removes the task worktree and workers' own worktrees, uncommitted changes
-    /// included. Branches stay. Answered with a `TaskChanged` with `closed: true` to
-    /// every client, then [`Event::Done`].
+    /// included. Branches stay. Once the agents stopped, the daemon checks again and
+    /// refuses when closing would lose more than `confirmed`, the check the user saw.
+    /// Answered with a `TaskChanged` with `closed: true` to every client, then
+    /// [`Event::Done`].
     CloseTask {
         call: CallId,
         task: TaskId,
+        confirmed: CloseCheck,
     },
 }
 
