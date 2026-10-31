@@ -11,10 +11,12 @@ mod menu;
 mod panel;
 mod popover_menu;
 mod project_tile;
+mod resize_handle;
 mod segmented_control;
 mod status;
 mod switch;
 mod tab;
+mod tab_strip;
 pub(crate) mod text_input;
 mod tile_frame;
 mod tray_chip;
@@ -32,10 +34,12 @@ pub use menu::*;
 pub use panel::*;
 pub use popover_menu::*;
 pub use project_tile::*;
+pub use resize_handle::*;
 pub use segmented_control::*;
 pub use status::*;
 pub use switch::*;
 pub use tab::*;
+pub use tab_strip::*;
 pub use text_input::*;
 pub use tile_frame::*;
 pub use tray_chip::*;
@@ -56,6 +60,8 @@ pub fn all_components() -> Vec<ComponentEntry> {
         ComponentEntry::of::<Checkbox>(),
         ComponentEntry::of::<SegmentedControl>(),
         ComponentEntry::of::<Tab>(),
+        ComponentEntry::of::<TabStrip>(),
+        ComponentEntry::of::<ResizeHandle>(),
         ComponentEntry::of::<Menu>(),
         ComponentEntry::of::<PopoverMenu>(),
         ComponentEntry::of::<Dropdown>(),

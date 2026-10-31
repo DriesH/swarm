@@ -286,3 +286,38 @@ fn text_area_is_a_multiline_text_input() {
         assert_eq!(info.node.label(), Some("First message"));
     });
 }
+
+#[test]
+fn tab_strip_is_a_labelled_tab_list() {
+    with_window(|window, cx| {
+        let info = a11y_info(
+            TabStrip::new("strip", "Inspector")
+                .tab_with_count("Messages", "3")
+                .tab("Terminal"),
+            window,
+            cx,
+        );
+
+        assert_eq!(info.role, Some(Role::TabList));
+        assert_eq!(info.node.label(), Some("Inspector"));
+    });
+}
+
+#[test]
+fn resize_handle_is_a_splitter_with_its_width() {
+    with_window(|window, cx| {
+        let focus = cx.focus_handle();
+        let info = a11y_info(
+            ResizeHandle::new("split", "Resize inspector", &focus).value(400., 320., 640.),
+            window,
+            cx,
+        );
+
+        assert_eq!(info.role, Some(Role::Splitter));
+        assert_eq!(info.node.label(), Some("Resize inspector"));
+        assert_eq!(info.node.value(), Some("400 pixels"));
+        assert_eq!(info.node.numeric_value(), Some(400.));
+        assert_eq!(info.node.min_numeric_value(), Some(320.));
+        assert_eq!(info.node.max_numeric_value(), Some(640.));
+    });
+}
