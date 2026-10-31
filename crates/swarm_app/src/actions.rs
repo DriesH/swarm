@@ -20,6 +20,21 @@ actions!(
     ]
 );
 
+actions!(
+    review,
+    [
+        /// Selects the next changed file.
+        NextFile,
+        /// Selects the previous changed file.
+        PreviousFile,
+        /// Marks the selected file viewed, or not viewed.
+        ToggleViewed
+    ]
+);
+
+/// Key context of the Review view.
+pub(crate) const REVIEW_CONTEXT: &str = "Review";
+
 /// Focuses the agent at `index` in the open task (the orchestrator is 0).
 #[derive(Clone, PartialEq, Action)]
 #[action(namespace = swarm_app, no_json)]
@@ -50,6 +65,13 @@ pub(crate) fn bind_keys(cx: &mut App) {
             .enumerate()
             .map(|(index, key)| KeyBinding::new(key, FocusAgent { index }, root)),
     );
+
+    let review = Some(REVIEW_CONTEXT);
+    bindings.extend([
+        KeyBinding::new("j", NextFile, review),
+        KeyBinding::new("k", PreviousFile, review),
+        KeyBinding::new("v", ToggleViewed, review),
+    ]);
 
     cx.bind_keys(bindings);
     cx.on_action(|_: &Quit, cx: &mut App| cx.quit());

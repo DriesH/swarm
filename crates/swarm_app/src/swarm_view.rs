@@ -368,7 +368,9 @@ impl Workspace {
     /// Switches to Review, filtered to the agent and opened at one of its files.
     pub(crate) fn view_file_diff(&mut self, agent: AgentId, path: PathBuf, cx: &mut Context<Self>) {
         self.view_agent_diff(agent, cx);
-        self.review_file = Some(path);
+        self.review_sources
+            .insert(self.active_task, swarm_protocol::ReviewSource::Live);
+        self.request_review_file(path, None);
     }
 
     /// Switches to Terminals with a process terminal's tile focused.
@@ -965,7 +967,7 @@ impl Render for DotGrid {
     }
 }
 
-fn full_size() -> StyleRefinement {
+pub(crate) fn full_size() -> StyleRefinement {
     StyleRefinement::default().size_full()
 }
 

@@ -14,8 +14,8 @@ use gpui::{
 };
 use swarm_protocol::{
     AgentChange, AgentId as DaemonAgentId, AgentInfo, AgentLifecycle, Client, ClientError,
-    CreateTerminal, MessageEvent, Paths, ProjectInfo, TaskInfo, TerminalId as DaemonTerminalId,
-    TerminalInfo, TerminalKind as DaemonKind,
+    CreateTerminal, MessageEvent, Paths, ProjectInfo, ReviewSource, TaskDiff, TaskInfo,
+    TerminalId as DaemonTerminalId, TerminalInfo, TerminalKind as DaemonKind,
 };
 use swarm_term::{ExitStatus, TerminalChannels, TerminalInput};
 use swarm_term_view::{TerminalEvent, TerminalView, palette_for};
@@ -47,6 +47,10 @@ const RECONNECT_STEPS: [Duration; 3] = [
 const RECONNECT_LONG: Duration = Duration::from_secs(5);
 /// How often the Swarm view asks for the changes of the open task's agents.
 const CHANGES_INTERVAL: Duration = Duration::from_secs(5);
+/// How often the visible Review source is asked for while Review shows.
+pub(crate) const REVIEW_INTERVAL: Duration = Duration::from_secs(2);
+/// How often the open task's Live diff is asked for while the window is active.
+pub(crate) const LIVE_INTERVAL: Duration = Duration::from_secs(5);
 /// How long an exited process terminal stays, so its exit code can be read.
 pub(crate) const PROCESS_LINGER: Duration = Duration::from_secs(3);
 
@@ -75,6 +79,12 @@ impl DaemonLaunch {
 
         Ok(Self { paths, binary })
     }
+}
+
+/// A running poll for one diff. Dropping it stops the poll.
+pub(crate) struct DiffPoll {
+    key: (swarm_protocol::TaskId, ReviewSource),
+    _task: gpui::Task<()>,
 }
 
 /// A user or process terminal tile backed by a terminal in the daemon.
@@ -546,6 +556,11 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if info.closed {
+            self.task_closed(info, window, cx);
+            return;
+        }
+
         let Some(project) = self.data.project_with_daemon_id(info.project) else {
             log::warn!("task {} belongs to an unknown project", info.id.0);
             return;
@@ -559,6 +574,65 @@ impl Workspace {
 
         if !known {
             self.attach_listed_terminals(window, cx);
+        }
+
+        cx.notify();
+    }
+
+    /// The daemon closed a task: drops its tab, its terminals and what Review kept.
+    fn task_closed(&mut self, info: &TaskInfo, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(task) = self
+            .data
+            .tasks
+            .iter()
+            .find(|task| {
+                task.daemon
+                    .as_ref()
+                    .is_some_and(|daemon| daemon.id == info.id)
+            })
+            .map(|task| task.id)
+        else {
+            return;
+        };
+
+        if self.close_dialog_is_for(task, cx) {
+            self.close_overlay(window, cx);
+        }
+
+        self.remove_closed_task(task, cx);
+    }
+
+    /// Removes a tab with its agents, terminals and Review state. When it was open, the
+    /// tab beside it opens, else the project's Start tab.
+    pub(crate) fn remove_closed_task(&mut self, task: TaskId, cx: &mut Context<Self>) {
+        let Some(entry) = self.data.task(task) else {
+            return;
+        };
+        let project = entry.project;
+        let tabs: Vec<TaskId> = self.data.tasks_of(project).map(|other| other.id).collect();
+        let position = tabs.iter().position(|other| *other == task).unwrap_or(0);
+        let was_open = self.active_task == task;
+
+        for terminal in self.data.remove_task(task) {
+            self.forget_terminal(terminal);
+        }
+
+        self.review_sources.remove(&task);
+        self.swarm_selection.remove(&task);
+        self.previous_tabs.retain(|_, other| *other != task);
+        if self.review_approving == Some(task) {
+            self.review_approving = None;
+        }
+
+        if was_open {
+            let next = tabs
+                .get(position + 1)
+                .or_else(|| position.checked_sub(1).and_then(|before| tabs.get(before)))
+                .copied()
+                .filter(|other| self.data.task(*other).is_some())
+                .unwrap_or_else(|| self.data.first_or_start_task(project));
+
+            self.select_task(next, cx);
         }
 
         cx.notify();
@@ -673,6 +747,8 @@ impl Workspace {
     /// active window: the poll for changes and the clock for running times. The poll
     /// restarts, and so asks at once, when the open task changes.
     pub(crate) fn sync_swarm_tasks(&mut self, window_active: bool, cx: &mut Context<Self>) {
+        self.sync_diff_polls(window_active, cx);
+
         if self.view != View::Swarm || self.has_no_projects() || !window_active {
             self.changes_poll = None;
             self.polled_task = None;
@@ -699,6 +775,110 @@ impl Workspace {
                     }
                 }
             }));
+        }
+    }
+
+    /// Keeps the diff polls running only while they are needed: the visible Review source
+    /// while Review shows, and the open task's Live diff for the header and the Changes
+    /// panel. Both need an active window and a connected daemon. A poll restarts, and so
+    /// asks at once, when its task or source changes.
+    pub(crate) fn sync_diff_polls(&mut self, window_active: bool, cx: &mut Context<Self>) {
+        let connected = window_active && !self.has_no_projects() && self.daemon.is_some();
+        let open = self
+            .data
+            .task(self.active_task)
+            .and_then(|task| task.daemon.as_ref())
+            .map(|daemon| daemon.id)
+            .filter(|_| connected);
+
+        let review = open
+            .filter(|_| self.view == View::Review)
+            .map(|id| (id, self.review_source(self.active_task)));
+        let live = open
+            .map(|id| (id, ReviewSource::Live))
+            .filter(|key| Some(*key) != review);
+        let (review_every, live_every) = self.diff_intervals;
+
+        Self::sync_poll(&mut self.review_poll, review, review_every, cx);
+        Self::sync_poll(&mut self.live_poll, live, live_every, cx);
+    }
+
+    fn sync_poll(
+        slot: &mut Option<DiffPoll>,
+        wanted: Option<(swarm_protocol::TaskId, ReviewSource)>,
+        interval: Duration,
+        cx: &mut Context<Self>,
+    ) {
+        match wanted {
+            None => *slot = None,
+            Some(key) if slot.as_ref().is_some_and(|poll| poll.key == key) => {}
+            Some(key) => {
+                *slot = Some(DiffPoll {
+                    key,
+                    _task: Self::poll_diff(key, interval, cx),
+                });
+            }
+        }
+    }
+
+    fn poll_diff(
+        (task, source): (swarm_protocol::TaskId, ReviewSource),
+        interval: Duration,
+        cx: &mut Context<Self>,
+    ) -> gpui::Task<()> {
+        cx.spawn(async move |this, cx| {
+            loop {
+                let Ok(request) =
+                    this.update(cx, |workspace, _| workspace.diff_request(task, source))
+                else {
+                    return;
+                };
+
+                if let Some((client, known)) = request {
+                    let asking = cx
+                        .background_executor()
+                        .spawn(async move { client.task_diff(task, source, known) });
+
+                    match asking.await {
+                        Ok(Some(diff)) => {
+                            let applied = this.update(cx, |workspace, cx| {
+                                workspace.apply_diff(diff, cx);
+                            });
+
+                            if applied.is_err() {
+                                return;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => log::debug!("cannot read the task diff: {error}"),
+                    }
+                }
+
+                cx.background_executor().timer(interval).await;
+            }
+        })
+    }
+
+    /// The client and the fingerprint already known, while the daemon answers.
+    fn diff_request(
+        &self,
+        task: swarm_protocol::TaskId,
+        source: ReviewSource,
+    ) -> Option<(Client, Option<u64>)> {
+        let client = self.daemon.clone().filter(Client::is_connected)?;
+        let known = self
+            .data
+            .diffs
+            .get(&(task, source))
+            .map(|diff| diff.fingerprint);
+
+        Some((client, known))
+    }
+
+    /// Keeps a diff the daemon sent, and redraws when it differs from the one known.
+    pub(crate) fn apply_diff(&mut self, diff: TaskDiff, cx: &mut Context<Self>) {
+        if self.data.store_diff(diff) {
+            cx.notify();
         }
     }
 
@@ -1679,6 +1859,8 @@ mod tests {
             agents: Vec::new(),
             created_by: None,
             briefed: false,
+            approved: None,
+            closed: false,
         }
     }
 
@@ -3796,5 +3978,325 @@ mod tests {
                 Duration::from_secs(5),
             ]
         );
+    }
+
+    fn diff_of(task: u64, source: ReviewSource, fingerprint: u64) -> TaskDiff {
+        TaskDiff {
+            task: DaemonTaskId(task),
+            source,
+            fingerprint,
+            stat: DiffStat {
+                files: 0,
+                additions: 3,
+                deletions: 1,
+            },
+            files: Vec::new(),
+        }
+    }
+
+    type DiffRequests = flume::Receiver<(ReviewSource, Option<u64>)>;
+
+    /// A daemon that answers a diff once and then says nothing changed.
+    fn diff_daemon() -> (PathBuf, DiffRequests) {
+        let (asked, requests) = flume::unbounded();
+        let socket = fake_daemon_replying(move |request| match request {
+            Request::TaskDiff {
+                call,
+                task,
+                source,
+                known,
+            } => {
+                asked.send((source, known)).ok();
+                let diff = known.is_none().then(|| diff_of(task.0, source, 9));
+
+                Some(Event::TaskDiff { call, diff })
+            }
+            _ => None,
+        });
+
+        (socket, requests)
+    }
+
+    fn fast_polls(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) {
+        workspace.update(cx, |workspace, _| {
+            workspace.diff_intervals = (Duration::from_millis(20), Duration::from_millis(20));
+        });
+    }
+
+    #[gpui::test]
+    fn the_live_diff_is_polled_with_the_known_fingerprint(cx: &mut TestAppContext) {
+        let (socket, requests) = diff_daemon();
+        let (workspace, cx, _client) = real_task_workspace(&socket, cx);
+        fast_polls(&workspace, cx);
+        cx.update(|window, _| window.activate_window());
+
+        redraw(cx);
+        let stored = wait_until(cx, |cx| {
+            redraw(cx);
+            workspace.read_with(cx, |workspace, _| {
+                workspace.data.live_stat(TaskId(0)).additions == 3
+                    || workspace
+                        .data
+                        .diffs
+                        .contains_key(&(DaemonTaskId(7), ReviewSource::Live))
+            })
+        });
+        let reused = wait_until(cx, |cx| {
+            cx.executor().advance_clock(Duration::from_millis(30));
+            redraw(cx);
+            requests.len() >= 3
+        });
+
+        let asked: Vec<_> = requests.try_iter().collect();
+        assert!(stored, "stored");
+        assert!(reused, "reused {asked:?}");
+        assert_eq!(asked.first(), Some(&(ReviewSource::Live, None)));
+        assert!(
+            asked
+                .iter()
+                .skip(1)
+                .all(|request| *request == (ReviewSource::Live, Some(9)))
+        );
+    }
+
+    #[gpui::test]
+    fn the_review_source_is_polled_only_while_review_shows_and_the_window_is_active(
+        cx: &mut TestAppContext,
+    ) {
+        let (socket, requests) = diff_daemon();
+        let (workspace, cx, _client) = real_task_workspace(&socket, cx);
+        fast_polls(&workspace, cx);
+        cx.update(|window, _| window.activate_window());
+        redraw(cx);
+
+        let polls = |cx: &VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                (
+                    workspace.review_poll.is_some(),
+                    workspace.live_poll.is_some(),
+                )
+            })
+        };
+        let terminals = polls(cx);
+
+        workspace.update(cx, |workspace, cx| workspace.set_view(View::Review, cx));
+        redraw(cx);
+        let review = polls(cx);
+        let sources = wait_until(cx, |cx| {
+            redraw(cx);
+            requests
+                .try_iter()
+                .any(|(source, _)| source == ReviewSource::Merged)
+        });
+
+        cx.deactivate_window();
+        redraw(cx);
+        let inactive = polls(cx);
+
+        workspace.update(cx, |workspace, cx| workspace.set_view(View::Terminals, cx));
+        cx.update(|window, _| window.activate_window());
+        redraw(cx);
+        let back = polls(cx);
+
+        assert_eq!(terminals, (false, true));
+        assert_eq!(review, (true, true));
+        assert!(sources);
+        assert_eq!(inactive, (false, false));
+        assert_eq!(back, (false, true));
+    }
+
+    fn close_daemon(check: swarm_protocol::CloseCheck) -> (PathBuf, flume::Receiver<DaemonTaskId>) {
+        let (sent, closes) = flume::unbounded();
+        let socket = fake_daemon_replying(move |request| match request {
+            Request::CheckClose { call, .. } => Some(Event::CloseCheck {
+                call,
+                check: check.clone(),
+            }),
+            Request::CloseTask { call, task } => {
+                sent.send(task).ok();
+
+                Some(Event::Done { call })
+            }
+            _ => None,
+        });
+
+        (socket, closes)
+    }
+
+    fn dialog(
+        workspace: &Entity<Workspace>,
+        cx: &VisualTestContext,
+    ) -> Option<Entity<crate::close_task::CloseTaskDialog>> {
+        workspace.read_with(cx, |workspace, _| match &workspace.overlay {
+            Some(Overlay::CloseTask { view, .. }) => Some(view.clone()),
+            _ => None,
+        })
+    }
+
+    #[gpui::test]
+    fn the_close_dialog_checks_then_closes_and_the_tab_goes_when_the_daemon_says_closed(
+        cx: &mut TestAppContext,
+    ) {
+        let (socket, closes) = close_daemon(swarm_protocol::CloseCheck {
+            running_agents: 3,
+            uncommitted_files: 4,
+            unmerged_workers: vec!["a".into(), "b".into()],
+        });
+        let (workspace, cx, _client) = real_task_workspace(&socket, cx);
+        let task = workspace.read_with(cx, |workspace, _| workspace.active_task);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_close_task(task, window, cx);
+        });
+        let loading = dialog(&workspace, cx).is_some_and(|dialog| {
+            dialog.read_with(cx, |dialog, _| {
+                *dialog.check_state() == crate::close_task::CheckState::Checking
+            })
+        });
+        let ready = wait_until(cx, |cx| {
+            redraw(cx);
+            dialog(&workspace, cx)
+                .is_some_and(|dialog| dialog.read_with(cx, |dialog, _| !dialog.lines().is_empty()))
+        });
+        let lines = dialog(&workspace, cx)
+            .map(|dialog| dialog.read_with(cx, |dialog, _| dialog.lines()))
+            .unwrap_or_default();
+
+        let texts: Vec<_> = lines.iter().map(|(text, _)| text.as_str()).collect();
+        assert!(loading && ready);
+        assert_eq!(
+            texts,
+            [
+                "Stops 3 agents",
+                "Deletes 4 uncommitted files",
+                "Keeps branch swarm/login",
+                "Not merged: a, b"
+            ]
+        );
+        assert_eq!(lines[1].1, swarm_ui::prelude::Color::Warn);
+
+        let bounds = cx.debug_bounds("close-task-confirm");
+        assert!(bounds.is_some());
+        cx.simulate_click(
+            bounds.map_or_else(Default::default, |bounds| bounds.center()),
+            gpui::Modifiers::none(),
+        );
+        let sent = wait_until(cx, |_| !closes.is_empty());
+        assert!(sent);
+        assert_eq!(closes.try_recv().ok(), Some(DaemonTaskId(7)));
+
+        let mut gone = task_info(7, 5, "login");
+        gone.closed = true;
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.task_changed(&gone, window, cx);
+        });
+        cx.run_until_parked();
+
+        let (has_task, overlay, active_is_start) = workspace.read_with(cx, |workspace, _| {
+            (
+                workspace.data.has_daemon_task(DaemonTaskId(7)),
+                workspace.overlay.is_some(),
+                workspace.active_task().is_start,
+            )
+        });
+        assert!(!has_task);
+        assert!(!overlay);
+        assert!(active_is_start);
+    }
+
+    #[gpui::test]
+    fn a_closed_task_leaves_the_neighbor_tab_open(cx: &mut TestAppContext) {
+        let (workspace, cx, _client) = real_task_workspace(&fake_daemon(), cx);
+        let second = task_info(8, 5, "signup");
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.task_changed(&second, window, cx);
+        });
+        let (first, other) = workspace.read_with(cx, |workspace, _| {
+            let ids: Vec<_> = workspace.data.tasks.iter().map(|task| task.id).collect();
+            (ids[0], ids[1])
+        });
+        workspace.update(cx, |workspace, cx| workspace.select_task(first, cx));
+
+        let mut gone = task_info(7, 5, "login");
+        gone.closed = true;
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.task_changed(&gone, window, cx);
+        });
+
+        let active = workspace.read_with(cx, |workspace, _| workspace.active_task);
+        assert_eq!(active, other);
+    }
+
+    #[gpui::test]
+    fn cancel_closes_the_dialog_and_a_failed_close_shows_its_error(cx: &mut TestAppContext) {
+        let socket = fake_daemon_replying(|request| match request {
+            Request::CheckClose { call, .. } => Some(Event::CloseCheck {
+                call,
+                check: swarm_protocol::CloseCheck::default(),
+            }),
+            Request::CloseTask { call, .. } => Some(Event::Error {
+                call: Some(call),
+                id: None,
+                message: "teardown failed".into(),
+            }),
+            _ => None,
+        });
+        let (workspace, cx, _client) = real_task_workspace(&socket, cx);
+        let task = workspace.read_with(cx, |workspace, _| workspace.active_task);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_close_task(task, window, cx);
+        });
+        wait_until(cx, |cx| {
+            redraw(cx);
+            dialog(&workspace, cx)
+                .is_some_and(|dialog| dialog.read_with(cx, |dialog, _| !dialog.lines().is_empty()))
+        });
+
+        let bounds = cx.debug_bounds("close-task-confirm");
+        assert!(bounds.is_some());
+        cx.simulate_click(
+            bounds.map_or_else(Default::default, |bounds| bounds.center()),
+            gpui::Modifiers::none(),
+        );
+        let failed = wait_until(cx, |cx| {
+            redraw(cx);
+            dialog(&workspace, cx).is_some_and(|dialog| {
+                dialog.read_with(cx, |dialog, _| dialog.error_text().is_some())
+            })
+        });
+        cx.simulate_keystrokes("escape");
+
+        assert!(failed);
+        assert!(dialog(&workspace, cx).is_none());
+        assert!(workspace.read_with(cx, |workspace, _| {
+            workspace.data.has_daemon_task(DaemonTaskId(7))
+        }));
+    }
+
+    #[gpui::test]
+    fn the_palette_closes_the_open_task_but_not_a_start_tab(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+
+        cx.simulate_keystrokes("cmd-k");
+        cx.simulate_input("close task");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        let opened = dialog(&workspace, cx).is_some();
+        let lines = dialog(&workspace, cx)
+            .map(|dialog| dialog.read_with(cx, |dialog, _| dialog.lines()))
+            .unwrap_or_default();
+        cx.simulate_keystrokes("escape");
+
+        workspace.update(cx, Workspace::open_start_task);
+        let rows = crate::palette::rows(
+            &workspace.read_with(cx, |workspace, _| workspace.data.clone()),
+            ProjectId(0),
+            workspace.read_with(cx, |workspace, _| workspace.active_task),
+            View::Terminals,
+        );
+        assert!(opened);
+        assert!(!lines.is_empty());
+        assert!(rows.iter().all(|row| row.label() != "Close task"));
     }
 }

@@ -7,7 +7,7 @@ use gpui::{
     AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable, Pixels, SharedString, Size,
     Subscription, Window, div, px,
 };
-use swarm_protocol::Client;
+use swarm_protocol::{Client, ReviewSource};
 use swarm_ui::fonts::UI_FONT;
 use swarm_ui::prelude::*;
 
@@ -15,11 +15,14 @@ use crate::actions::{
     FocusAgent, NewTask, NewTerminal, OpenSettings, PlanWithOrchestrator, ShowReview, ShowSwarm,
     ShowTerminals, ToggleChanges, ToggleCommandPalette, ToggleFiles,
 };
+use crate::daemon::DiffPoll;
 use crate::daemon::{DaemonLaunch, LiveTerminal};
 use crate::model::{
     AgentId, FakeData, ProjectId, SAMPLE_NOW, Task, TaskId, TaskStatus, TerminalId, TerminalKind,
 };
 use crate::palette::Overlay;
+use crate::panels::ChangesList;
+use crate::review_view::ReviewView;
 use crate::swarm_view::{DotGrid, INSPECTOR_WIDTH, InspectorTab, MessageThread, TerminalPreview};
 use crate::views::Resizing;
 use crate::{panels, sidebar, status_bar, tab_bar, views};
@@ -52,6 +55,10 @@ pub(crate) enum DataSource {
     },
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent flags, not one state"
+)]
 pub(crate) struct Workspace {
     pub data: FakeData,
     pub active_project: ProjectId,
@@ -122,6 +129,23 @@ pub(crate) struct Workspace {
     pub(crate) polled_task: Option<TaskId>,
     _activation_subscription: Subscription,
     pub(crate) swarm_clock: Option<gpui::Task<()>>,
+    pub(crate) review: Entity<ReviewView>,
+    pub(crate) changes_list: Entity<ChangesList>,
+    /// The source the user picked, or the default decided when Review first opened.
+    pub(crate) review_sources: HashMap<TaskId, ReviewSource>,
+    /// Goes up with every request to scroll Review to a file.
+    pub(crate) review_jump_serial: u64,
+    /// The worktree of the file Review opens at, when the request knows it.
+    pub(crate) review_worktree: Option<PathBuf>,
+    /// The task whose approval is on its way to the daemon.
+    pub(crate) review_approving: Option<TaskId>,
+    pub(crate) review_error: Option<(TaskId, SharedString)>,
+    /// Moves keyboard focus into Review at the next frame.
+    pub(crate) pending_review_focus: bool,
+    pub(crate) review_poll: Option<DiffPoll>,
+    pub(crate) live_poll: Option<DiffPoll>,
+    /// How often the visible Review source and the open task's Live diff are asked for.
+    pub(crate) diff_intervals: (std::time::Duration, std::time::Duration),
 }
 
 impl Workspace {
@@ -170,7 +194,15 @@ impl Workspace {
 
         let inspector_subscription = cx.observe(&cx.entity(), |this, _, cx| {
             this.sync_inspector(cx);
+            this.sync_review(cx);
+            this.sync_changes_list(cx);
         });
+        let workspace = cx.weak_entity();
+        let review = cx.new({
+            let workspace = workspace.clone();
+            |cx| ReviewView::new(workspace, cx)
+        });
+        let changes_list = cx.new(|_| ChangesList::new(workspace));
 
         let mut workspace = Self {
             data,
@@ -224,8 +256,20 @@ impl Workspace {
             polled_task: None,
             _activation_subscription: activation_subscription,
             swarm_clock: None,
+            review,
+            changes_list,
+            review_sources: HashMap::new(),
+            review_jump_serial: 0,
+            review_worktree: None,
+            review_approving: None,
+            review_error: None,
+            pending_review_focus: false,
+            review_poll: None,
+            live_poll: None,
+            diff_intervals: (crate::daemon::REVIEW_INTERVAL, crate::daemon::LIVE_INTERVAL),
         };
         workspace.sync_inspector(cx);
+        workspace.sync_changes_list(cx);
 
         workspace
     }
@@ -308,6 +352,7 @@ impl Workspace {
         self.view = view;
         self.review_agent = None;
         self.review_file = None;
+        self.pending_review_focus = view == View::Review;
         cx.notify();
     }
 
@@ -389,6 +434,20 @@ impl Workspace {
         window.focus(&handle, cx);
     }
 
+    /// Moves keyboard focus into Review after it opened, so its keys work at once.
+    fn apply_pending_review_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overlay.is_some() || self.view != View::Review {
+            return;
+        }
+        if !std::mem::take(&mut self.pending_review_focus) {
+            return;
+        }
+
+        let handle = self.review.read(cx).focus_handle().clone();
+
+        window.focus(&handle, cx);
+    }
+
     /// Focuses the agent at `index` in the open task; the orchestrator is 0.
     pub(crate) fn focus_agent(&mut self, index: usize, cx: &mut Context<Self>) {
         let terminal = self
@@ -444,8 +503,7 @@ static NO_TASK: Task = Task {
     workers: Vec::new(),
     processes: Vec::new(),
     user_terminals: Vec::new(),
-    additions: 0,
-    deletions: 0,
+    approved: None,
     is_start: false,
     daemon: None,
 };
@@ -464,6 +522,7 @@ impl Render for Workspace {
         self.start_orchestrator_if_needed(window, cx);
         self.sync_swarm_tasks(window.is_window_active(), cx);
         self.apply_pending_focus(window, cx);
+        self.apply_pending_review_focus(window, cx);
         self.ensure_focus_handles(cx);
 
         if self.view == View::Swarm {

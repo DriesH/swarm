@@ -14,9 +14,11 @@ use swarm_ui::{
 use crate::actions::{
     FocusAgent, NewTask, NewTerminal, OpenSettings, PlanWithOrchestrator, ShowReview,
 };
+use crate::close_task::CloseTaskDialog;
 use crate::model::{AgentKind, FakeData, ProjectId, TaskId, TaskStatus, TerminalId};
 use crate::new_task::NewTaskDialog;
-use crate::workspace::Workspace;
+use crate::review_view::ReviewView;
+use crate::workspace::{View, Workspace};
 
 const KEY_COMMAND: &str = "\u{2318}";
 const KEY_SHIFT: &str = "\u{21e7}";
@@ -31,6 +33,10 @@ pub(crate) enum Command {
     PlanWithOrchestrator,
     NewTerminal,
     Settings,
+    NextFile,
+    PreviousFile,
+    ToggleViewed,
+    CloseTask,
     Task(TaskId),
     Agent(TerminalId),
 }
@@ -92,6 +98,11 @@ impl Row {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn label(&self) -> &str {
+        &self.label
+    }
+
     fn detail(mut self, detail: Detail) -> Self {
         self.detail = detail;
         self
@@ -120,10 +131,9 @@ fn task_status(status: TaskStatus) -> (AgentStatus, Option<&'static str>) {
 }
 
 /// The rows for the open project and task, in group order.
-pub(crate) fn rows(data: &FakeData, project: ProjectId, task: TaskId) -> Vec<Row> {
-    let (additions, deletions) = data
-        .task(task)
-        .map_or((0, 0), |task| (task.additions, task.deletions));
+pub(crate) fn rows(data: &FakeData, project: ProjectId, task: TaskId, view: View) -> Vec<Row> {
+    let stat = data.live_stat(task);
+    let (additions, deletions) = (stat.additions, stat.deletions);
 
     let mut rows = vec![
         Row::new(
@@ -199,6 +209,35 @@ pub(crate) fn rows(data: &FakeData, project: ProjectId, task: TaskId) -> Vec<Row
                 row
             }),
     );
+
+    if view == View::Review {
+        rows.extend([
+            Row::new(Group::Swarm, IconName::File, "Next file", Command::NextFile).keys(&["J"]),
+            Row::new(
+                Group::Swarm,
+                IconName::File,
+                "Previous file",
+                Command::PreviousFile,
+            )
+            .keys(&["K"]),
+            Row::new(
+                Group::Swarm,
+                IconName::Check,
+                "Toggle viewed",
+                Command::ToggleViewed,
+            )
+            .keys(&["V"]),
+        ]);
+    }
+
+    if data.task(task).is_some_and(|task| !task.is_start) {
+        rows.push(Row::new(
+            Group::Swarm,
+            IconName::Close,
+            "Close task",
+            Command::CloseTask,
+        ));
+    }
 
     rows.extend([
         Row::new(
@@ -570,6 +609,10 @@ pub(crate) enum Overlay {
         view: Entity<NewTaskDialog>,
         _subscription: Subscription,
     },
+    CloseTask {
+        view: Entity<CloseTaskDialog>,
+        _subscription: Subscription,
+    },
 }
 
 impl Overlay {
@@ -577,6 +620,7 @@ impl Overlay {
         match self {
             Self::Palette { view, .. } => view.clone().into_any_element(),
             Self::NewTask { view, .. } => view.clone().into_any_element(),
+            Self::CloseTask { view, .. } => view.clone().into_any_element(),
         }
     }
 }
@@ -588,7 +632,7 @@ impl Workspace {
             return;
         }
 
-        let rows = rows(&self.data, self.active_project, self.active_task);
+        let rows = rows(&self.data, self.active_project, self.active_task, self.view);
         let view = cx.new(|cx| Palette::new(rows, window, cx));
         let subscription =
             cx.subscribe_in(&view, window, |this, _, event, window, cx| match event {
@@ -626,6 +670,10 @@ impl Workspace {
             }
             Command::NewTerminal => window.dispatch_action(Box::new(NewTerminal), cx),
             Command::Settings => window.dispatch_action(Box::new(OpenSettings), cx),
+            Command::NextFile => self.review.update(cx, ReviewView::next_file),
+            Command::PreviousFile => self.review.update(cx, ReviewView::previous_file),
+            Command::ToggleViewed => self.review.update(cx, ReviewView::toggle_selected_viewed),
+            Command::CloseTask => self.open_close_task(self.active_task, window, cx),
         }
     }
 }
@@ -635,7 +683,12 @@ mod tests {
     use super::*;
 
     fn sample_rows() -> Vec<Row> {
-        rows(&FakeData::sample(), ProjectId(0), TaskId(0))
+        rows(
+            &FakeData::sample(),
+            ProjectId(0),
+            TaskId(0),
+            View::Terminals,
+        )
     }
 
     fn labels(rows: &[Row], indexes: &[usize]) -> Vec<String> {

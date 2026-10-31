@@ -51,6 +51,7 @@ pub(crate) fn render(
     }
 
     let task = workspace.active_task();
+    let stat = workspace.data.live_stat(task.id);
     let panel = workspace.visible_panel();
     let panels_disabled = workspace.view == View::Swarm;
 
@@ -89,7 +90,7 @@ pub(crate) fn render(
                         workspace.toggle_panel(RightPanel::Changes, cx);
                     }),
                 )
-                .end_slot(changes_count(task.additions, task.deletions)),
+                .end_slot(changes_count(stat.additions, stat.deletions)),
             )
         })
         .into_any_element()
@@ -118,6 +119,11 @@ fn task_tab(
     .debug_selector(move || format!("tab-{}", id.0))
     .toggle_state(workspace.active_task == id)
     .on_click(cx.listener(move |workspace, _, _, cx| workspace.select_task(id, cx)))
+    .when(!task.is_start, |tab| {
+        tab.on_close(cx.listener(move |workspace, _, window, cx| {
+            workspace.open_close_task(id, window, cx);
+        }))
+    })
 }
 
 fn new_tab_menu() -> impl IntoElement {
