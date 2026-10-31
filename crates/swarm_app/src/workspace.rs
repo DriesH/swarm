@@ -77,6 +77,8 @@ pub(crate) struct Workspace {
     /// True when the right panel was shown as `terminal_area` was measured.
     pub(crate) terminal_area_had_panel: bool,
     pub(crate) layout: swarm_layout::Layout,
+    /// The width of the tray in the status bar at the last paint, once known.
+    pub(crate) tray_width: Option<Pixels>,
     pub(crate) user_sizes: HashMap<TerminalId, Size<Pixels>>,
     pub(crate) resizing: Option<Resizing>,
     pub(crate) daemon: Option<Client>,
@@ -231,6 +233,7 @@ impl Workspace {
             terminal_area: None,
             terminal_area_had_panel: false,
             layout: swarm_layout::Layout::default(),
+            tray_width: None,
             user_sizes: HashMap::new(),
             resizing: None,
             daemon: None,

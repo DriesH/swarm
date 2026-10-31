@@ -979,6 +979,34 @@ mod tests {
         assert!((larger - 346.).abs() < 0.01);
     }
 
+    #[gpui::test]
+    fn a_fixed_size_tile_holds_all_its_columns(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let cell = workspace.read_with(cx, |workspace, _| workspace.cell_size);
+        let (cell_width, cell_height) = cell.expect("the cell size was measured");
+
+        cx.update(|window, cx| {
+            let exact = swarm_term_view::TerminalView::cell_size(window, cx);
+            assert!((cell_width - f32::from(exact.width)).abs() < 0.001);
+
+            for columns in 1..=300 {
+                let tile = fixed_size(cell, columns, 12);
+                let body = Size {
+                    width: px(tile.width - CHROME_WIDTH),
+                    height: px(tile.height - CHROME_HEIGHT),
+                };
+                let grid = swarm_term_view::TerminalView::size_for(body, window, cx);
+
+                assert_eq!(
+                    grid.cols,
+                    columns.max(2),
+                    "{columns} columns at {cell_width}"
+                );
+                assert_eq!(grid.rows, 12, "{cell_height} high");
+            }
+        });
+    }
+
     fn rect_of(workspace: &Workspace, terminal: TerminalId) -> Rect {
         workspace
             .layout
@@ -1058,6 +1086,41 @@ mod tests {
 
         assert!(grown > small + 50.);
         assert!((height(cx) - small).abs() < 0.5);
+    }
+
+    #[gpui::test]
+    fn a_tall_window_shows_the_tall_box_with_process_terminals_below_it(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        cx.simulate_resize(gpui::size(px(1600.), px(1300.)));
+        redraw(cx);
+        redraw(cx);
+
+        workspace.read_with(cx, |workspace, _| {
+            let blocked = workspace
+                .data
+                .agents
+                .iter()
+                .find(|agent| agent.status == AgentStatus::Blocked)
+                .map(|agent| rect_of(workspace, agent.terminal))
+                .expect("the sample has a blocked worker");
+            let style = layout_style(workspace);
+            let tall = 2. * style.small_tile_height + style.gap;
+            assert!((blocked.size.height - tall).abs() < 0.5);
+
+            let below: Vec<Rect> = workspace
+                .active_task()
+                .processes
+                .iter()
+                .map(|id| rect_of(workspace, *id))
+                .filter(|rect| rect.size.width > 0. && rect.origin.y >= blocked.bottom())
+                .collect();
+            assert!(!below.is_empty(), "no process terminal below {blocked:?}");
+            assert!(
+                below
+                    .iter()
+                    .all(|rect| (rect.origin.x - blocked.origin.x).abs() < 0.5)
+            );
+        });
     }
 
     #[gpui::test]

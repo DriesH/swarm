@@ -31,11 +31,6 @@ const DAEMON_BINARY: &str = "swarm-daemon";
 /// The tile's header, border and body padding.
 pub(crate) const CHROME_WIDTH: f32 = 26.;
 pub(crate) const CHROME_HEIGHT: f32 = 66.;
-/// A bounds that is only used to read the cell size of the terminal font.
-const CELL_PROBE: Size<gpui::Pixels> = Size {
-    width: px(200.),
-    height: px(200.),
-};
 const FALLBACK_GRID: (u16, u16) = (100, 30);
 /// How often the app checks that the daemon connection is alive.
 const WATCH_INTERVAL: Duration = Duration::from_secs(1);
@@ -1192,8 +1187,8 @@ impl Workspace {
             return;
         }
 
-        let size = TerminalView::size_for(CELL_PROBE, window, cx);
-        self.cell_size = Some((f32::from(size.cell_width), f32::from(size.cell_height)));
+        let size = TerminalView::cell_size(window, cx);
+        self.cell_size = Some((f32::from(size.width), f32::from(size.height)));
     }
 
     /// What a screen reader announces for a live view.

@@ -32,7 +32,7 @@ Cargo workspace:
 | `swarm_core` | Projects, tasks, agents, worktrees, messages, state in SQLite |
 | `swarm_protocol` | Socket protocol between daemon and app (postcard frames) and the app's client. No libghostty |
 | `swarm_daemon` | Background process that owns PTYs and runs `swarm_core` |
-| `swarm_settings` | User settings in `~/.config/swarm/settings.toml` (agents, default models), shared by app and daemon |
+| `swarm_settings` | User settings in `~/.config/swarm/settings.toml` (agents, default models, terminal typing), shared by app and daemon |
 | `swarm_cli` | The `swarm` CLI agents use (hooks now; spawn, send, ask and MCP next) over the daemon's agent socket (ADR 0008) |
 | `swarm_app` | Window, sidebar, tabs, Terminals / Swarm / Review views, panels, settings |
 | `swarm_usage` | Menu bar icon, popover and usage polling |
@@ -142,7 +142,7 @@ Four kinds:
 
 - **User terminals are off-limits to agents** (ADR 0006): agents cannot read, type into, resize or kill them. The layout treats them as fixed islands.
 - **Process terminals**: started with `swarm terminal spawn`. When the process exits or is killed, the terminal closes after a short delay (to show the exit code); a failed exit stays until the user closes it and the owner agent and the orchestrator get a `terminal.exited` event with who stopped it (`agent`, `user`, `process`) and the exit code or signal.
-- **Layout engine**: tiles fill the space. Priority: user terminals (fixed size), orchestrator, terminals that need attention (`blocked`, `error`), working agents, process terminals, done or idle agents. Each tile has a minimum size; tiles that don't fit move to the **tray**: chips on the left of the status bar, each with a restore icon. A tile that needs attention is promoted out of the tray. The user can pin or minimize any tile.
+- **Layout engine**: tiles fill the space. Priority: user terminals (fixed size), orchestrator, terminals that need attention (`blocked`, `error`), working agents, process terminals, done or idle agents. Each tile has a minimum size; tiles that don't fit move to the **tray**: chips on the left of the status bar, each with a restore icon; chips that don't fit the bar sit behind a "+N" chip that opens a menu of them. A tile that needs attention is promoted out of the tray. The user can pin or minimize any tile.
 - When the user resizes a user terminal, the other tiles reflow around it.
 - **Tile sizes**: the orchestrator always gets the main slot on the left, about two thirds of the width (65 %), the full height, and never goes to the tray. Workers are small boxes stacked from the top of the column on the right: tall enough to see what they are doing (about 12 rows), never the full height. A blocked worker grows by itself and shrinks when it works again. The orchestrator can grow or shrink any of its workers with `tile.grow` / `tile.shrink`; a worker only itself (phase 8). A tile the user pinned, minimized or resized ignores these calls until the user resets it.
 - **Font size**: one global setting (Settings › Terminals, 10–20 px, default 13) for every terminal. Process terminals keep their columns and rows, so their tiles change size with the font.

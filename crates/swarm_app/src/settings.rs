@@ -96,8 +96,8 @@ fn cli_mut(agents: &mut swarm_settings::AgentSettings, index: usize) -> &mut Cli
     }
 }
 
-/// Settings shared by every page. The agent settings live in `settings.toml`; the rest
-/// is in memory only for now.
+/// Settings shared by every page. The agent and terminal settings live in `settings.toml`;
+/// the rest is in memory only for now.
 pub(crate) struct SettingsState {
     pub settings: Settings,
     path: Option<PathBuf>,
@@ -105,10 +105,9 @@ pub(crate) struct SettingsState {
     pub save_error: Option<SharedString>,
     /// The last load failed. Nothing is saved until a load works, so the file stays as it is.
     load_failed: bool,
-    /// The agent settings last loaded or queued for saving.
-    queued: swarm_settings::AgentSettings,
+    /// The settings last loaded or queued for saving.
+    queued: Settings,
     pending_save: Option<gpui::Task<()>>,
-    pub allow_worker_typing: bool,
     pub idle_stop: usize,
     pub max_agents_per_task: String,
     pub max_agents_total: String,
@@ -155,9 +154,8 @@ impl SettingsState {
             path,
             save_error: None,
             load_failed: false,
-            queued: swarm_settings::AgentSettings::default(),
+            queued: Settings::default(),
             pending_save: None,
-            allow_worker_typing: true,
             idle_stop: 1,
             max_agents_per_task: "6".to_owned(),
             max_agents_total: "16".to_owned(),
@@ -186,18 +184,18 @@ impl SettingsState {
             }
         }
 
-        self.queued = self.settings.agents.clone();
+        self.queued = self.settings.clone();
         self.pending_save = None;
         cx.notify();
     }
 
-    /// Saves the agent settings after a pause in editing.
+    /// Saves the settings after a pause in editing.
     fn queue_save(&mut self, cx: &mut Context<Self>) {
-        if self.path.is_none() || self.load_failed || self.settings.agents == self.queued {
+        if self.path.is_none() || self.load_failed || self.settings == self.queued {
             return;
         }
 
-        self.queued = self.settings.agents.clone();
+        self.queued = self.settings.clone();
         self.pending_save = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SAVE_DELAY).await;
 
@@ -888,17 +886,32 @@ fn bind_keys(cx: &mut App) {
     ]);
 }
 
+/// Loads the settings file at startup, so the settings apply before the window opens.
+pub(crate) fn load(path: Option<PathBuf>, cx: &mut App) {
+    let state = shared_state(path, cx);
+
+    state.update(cx, SettingsState::reload);
+}
+
 /// Whether the user may type into worker terminals. It stays on until the settings turn it off.
 pub(crate) fn allow_worker_typing(cx: &App) -> bool {
-    cx.try_global::<Registry>()
-        .is_none_or(|registry| registry.state.read(cx).allow_worker_typing)
+    cx.try_global::<Registry>().is_none_or(|registry| {
+        registry
+            .state
+            .read(cx)
+            .settings
+            .terminals
+            .allow_worker_typing
+    })
 }
 
 #[cfg(test)]
 pub(crate) fn set_allow_worker_typing(allowed: bool, cx: &mut App) {
     let state = shared_state(None, cx);
 
-    state.update(cx, |state, _| state.allow_worker_typing = allowed);
+    state.update(cx, |state, _| {
+        state.settings.terminals.allow_worker_typing = allowed;
+    });
 }
 
 fn shared_state(path: Option<PathBuf>, cx: &mut App) -> Entity<SettingsState> {
@@ -1176,6 +1189,44 @@ mod tests {
         assert_eq!(restarted, Settings::default());
         assert!(saved.agents.skip_permissions);
         assert_eq!(saved.agents.claude_code.worker_model, "haiku");
+    }
+
+    #[gpui::test]
+    fn turning_off_worker_typing_is_saved(cx: &mut TestAppContext) {
+        let path = temp_path("worker-typing");
+        let state = open_with(&path, cx);
+        let before = cx.update(|cx| allow_worker_typing(cx));
+
+        state.update(cx, |state, cx| {
+            state.settings.terminals.allow_worker_typing = false;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(SAVE_DELAY);
+        cx.run_until_parked();
+        let saved = swarm_settings::load(&path).expect("read the settings");
+        let after = cx.update(|cx| allow_worker_typing(cx));
+        std::fs::remove_file(&path).ok();
+
+        assert!(before);
+        assert!(!after);
+        assert!(!saved.terminals.allow_worker_typing);
+    }
+
+    #[gpui::test]
+    fn a_saved_worker_typing_choice_applies_without_opening_the_window(cx: &mut TestAppContext) {
+        let path = temp_path("worker-typing-start");
+        let mut saved = Settings::default();
+        saved.terminals.allow_worker_typing = false;
+        swarm_settings::save(&path, &saved).expect("write the settings");
+        let before = cx.update(|cx| allow_worker_typing(cx));
+
+        cx.update(|cx| load(Some(path.clone()), cx));
+
+        let after = cx.update(|cx| allow_worker_typing(cx));
+        std::fs::remove_file(&path).ok();
+        assert!(before);
+        assert!(!after);
     }
 
     #[gpui::test]

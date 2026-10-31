@@ -3329,30 +3329,36 @@ mod tests {
         show_agent(&workspace, "pty-io", cx);
         let live = attach(&workspace, "pty-io", cx);
         let tile = format!("tile-slot-{}", live.terminal.0).leak();
+        let view = view_of(&workspace, live.terminal, cx);
+
+        // The wrappers that hold the view, and how often a frame paints the view.
+        let frame = |cx: &mut VisualTestContext| {
+            redraw(cx);
+            let before = view.read_with(cx, |view, _| view.paint_count());
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            });
+
+            (
+                cx.debug_bounds("inspector-terminal").is_some(),
+                cx.debug_bounds(tile).is_some(),
+                view.read_with(cx, |view, _| view.paint_count()) - before,
+            )
+        };
 
         open_terminal_tab(cx);
-        let in_swarm = (
-            cx.debug_bounds("inspector-terminal").is_some(),
-            cx.debug_bounds(tile).is_some(),
-        );
+        let in_swarm = frame(cx);
 
         workspace.update(cx, |workspace, cx| workspace.set_view(View::Terminals, cx));
-        redraw(cx);
-        let in_terminals = (
-            cx.debug_bounds("inspector-terminal").is_some(),
-            cx.debug_bounds(tile).is_some(),
-        );
+        let in_terminals = frame(cx);
 
         workspace.update(cx, |workspace, cx| workspace.set_view(View::Swarm, cx));
-        redraw(cx);
-        let back_in_swarm = (
-            cx.debug_bounds("inspector-terminal").is_some(),
-            cx.debug_bounds(tile).is_some(),
-        );
+        let back_in_swarm = frame(cx);
 
-        assert_eq!(in_swarm, (true, false));
-        assert_eq!(in_terminals, (false, true));
-        assert_eq!(back_in_swarm, (true, false));
+        assert_eq!(in_swarm, (true, false, 1));
+        assert_eq!(in_terminals, (false, true, 1));
+        assert_eq!(back_in_swarm, (true, false, 1));
     }
 
     #[gpui::test]
