@@ -20,9 +20,7 @@ use crate::model::{
     AgentId, FakeData, ProjectId, SAMPLE_NOW, Task, TaskId, TaskStatus, TerminalId, TerminalKind,
 };
 use crate::palette::Overlay;
-use crate::swarm_view::{
-    DotGrid, INSPECTOR_WIDTH, InspectorDrag, InspectorTab, MessageThread, TerminalPreview,
-};
+use crate::swarm_view::{DotGrid, INSPECTOR_WIDTH, InspectorTab, MessageThread, TerminalPreview};
 use crate::views::Resizing;
 use crate::{panels, sidebar, status_bar, tab_bar, views};
 
@@ -111,7 +109,9 @@ pub(crate) struct Workspace {
     pub(crate) inspector_tab: InspectorTab,
     /// In memory only: `settings.toml` holds config, not window state.
     pub(crate) inspector_width: f32,
-    pub(crate) inspector_drag: Option<InspectorDrag>,
+    /// The width of the Swarm view at the last paint, once known.
+    pub(crate) swarm_view_width: Option<f32>,
+    pub(crate) inspector_dragging: bool,
     pub(crate) inspector_handle: FocusHandle,
     pub(crate) thread: Entity<MessageThread>,
     pub(crate) preview: Entity<TerminalPreview>,
@@ -213,7 +213,8 @@ impl Workspace {
             review_file: None,
             inspector_tab: InspectorTab::default(),
             inspector_width: INSPECTOR_WIDTH,
-            inspector_drag: None,
+            swarm_view_width: None,
+            inspector_dragging: false,
             inspector_handle: cx.focus_handle().tab_stop(true),
             thread: cx.new(|_| MessageThread::new()),
             preview: cx.new(|_| TerminalPreview::new()),

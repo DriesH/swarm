@@ -1,5 +1,6 @@
 //! The Swarm view: the task's agents as a graph and the inspector.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -7,10 +8,10 @@ use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    AnyElement, Bounds, ClickEvent, Context, Entity, FollowMode, FontWeight, Hsla, KeyDownEvent,
-    ListAlignment, ListState, MouseButton, MouseMoveEvent, Pixels, Role, SharedString,
-    StyleRefinement, Subscription, Window, canvas, div, linear_color_stop, linear_gradient, list,
-    point, px, uniform_list,
+    AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, DragMoveEvent, Entity, FollowMode,
+    FontWeight, Hsla, KeyDownEvent, ListAlignment, ListState, MouseButton, Pixels, Role,
+    SharedString, StyleRefinement, Subscription, Window, canvas, div, linear_color_stop,
+    linear_gradient, list, point, px, uniform_list,
 };
 use swarm_protocol::{AgentId as DaemonAgentId, FileStat, MessageId, MessageKind};
 use swarm_term_view::TerminalView;
@@ -41,6 +42,8 @@ pub(crate) const INSPECTOR_WIDTH: f32 = 400.;
 pub(crate) const INSPECTOR_MIN_WIDTH: f32 = 320.;
 pub(crate) const INSPECTOR_MAX_WIDTH: f32 = 640.;
 const INSPECTOR_KEY_STEP: f32 = 20.;
+/// The graph keeps at least this much room.
+const GRAPH_MIN_WIDTH: f32 = 400.;
 /// The rows of a terminal the preview keeps; the box shows as many as fit.
 const PREVIEW_ROWS: usize = 60;
 /// A folded message is this high.
@@ -79,12 +82,9 @@ impl InspectorTab {
     }
 }
 
-/// A drag on the inspector's left border.
+/// The payload of a drag on the inspector's left border.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct InspectorDrag {
-    start_x: Pixels,
-    start_width: f32,
-}
+pub(crate) struct InspectorDrag;
 
 /// A cubic curve from the orchestrator's bottom center to a worker's top center.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -243,6 +243,11 @@ fn plural(count: u32, one: &str, many: &str) -> String {
     format!("{count} {}", if count == 1 { one } else { many })
 }
 
+/// The preview reads a terminal only while someone can see it.
+fn reads_terminal(view: View, tab: InspectorTab) -> bool {
+    view == View::Swarm && tab == InspectorTab::Terminal
+}
+
 impl Workspace {
     /// Now in milliseconds since the Unix epoch, or the fixed clock of fake data.
     pub(crate) fn now_ms(&self) -> u64 {
@@ -300,13 +305,15 @@ impl Workspace {
     /// notifies one entity does not redo the work here.
     pub(crate) fn sync_inspector(&mut self, cx: &mut Context<Self>) {
         let Some(agent) = self.selected_agent().and_then(|id| self.data.agent(id)) else {
+            self.thread.update(cx, MessageThread::clear);
+            self.preview.update(cx, TerminalPreview::clear);
             return;
         };
         let (id, name) = (agent.id, agent.name.clone());
         let fallback = self.fake_preview(agent);
-        let live = self
-            .live_terminals
-            .get(&agent.terminal)
+        let live = reads_terminal(self.view, self.inspector_tab)
+            .then(|| self.live_terminals.get(&agent.terminal))
+            .flatten()
             .map(|live| live.view.clone());
 
         let revision = self.data.messages_revision;
@@ -378,8 +385,24 @@ impl Workspace {
         }
     }
 
+    /// The widest the inspector may be: the graph keeps its room, but the inspector never
+    /// gets narrower than its minimum.
+    pub(crate) fn inspector_max_width(&self) -> f32 {
+        let room = self
+            .swarm_view_width
+            .map_or(INSPECTOR_MAX_WIDTH, |width| width - GRAPH_MIN_WIDTH);
+
+        room.clamp(INSPECTOR_MIN_WIDTH, INSPECTOR_MAX_WIDTH)
+    }
+
+    /// The width the inspector has now: the chosen width, held to the current limits.
+    pub(crate) fn shown_inspector_width(&self) -> f32 {
+        self.inspector_width
+            .clamp(INSPECTOR_MIN_WIDTH, self.inspector_max_width())
+    }
+
     pub(crate) fn set_inspector_width(&mut self, width: f32, cx: &mut Context<Self>) {
-        let width = width.clamp(INSPECTOR_MIN_WIDTH, INSPECTOR_MAX_WIDTH);
+        let width = width.clamp(INSPECTOR_MIN_WIDTH, self.inspector_max_width());
 
         if (width - self.inspector_width).abs() > f32::EPSILON {
             self.inspector_width = width;
@@ -387,43 +410,56 @@ impl Workspace {
         }
     }
 
-    fn start_inspector_drag(&mut self, start_x: Pixels, cx: &mut Context<Self>) {
-        self.inspector_drag = Some(InspectorDrag {
-            start_x,
-            start_width: self.inspector_width,
-        });
-        cx.notify();
-    }
-
-    /// Dragging the border to the left widens the inspector.
-    fn drag_inspector(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
-        let Some(drag) = self.inspector_drag else {
-            return;
-        };
-
-        if event.pressed_button != Some(MouseButton::Left) {
-            self.end_inspector_drag(cx);
-            return;
-        }
-
-        let moved = f32::from(drag.start_x - event.position.x);
-        self.set_inspector_width(drag.start_width + moved, cx);
-    }
-
-    fn end_inspector_drag(&mut self, cx: &mut Context<Self>) {
-        if self.inspector_drag.take().is_some() {
+    /// Notes the width of the Swarm view, so the inspector can leave the graph its room.
+    fn measured_swarm_view(&mut self, width: f32, cx: &mut Context<Self>) {
+        if self
+            .swarm_view_width
+            .is_none_or(|known| (known - width).abs() > 0.5)
+        {
+            self.swarm_view_width = Some(width);
             cx.notify();
         }
     }
 
-    /// Left moves the border left, which widens the inspector.
+    /// The inspector reaches from the pointer to the right edge of the view, wherever the
+    /// pointer is in the window.
+    fn drag_inspector(&mut self, event: &DragMoveEvent<InspectorDrag>, cx: &mut Context<Self>) {
+        if event.event.pressed_button != Some(MouseButton::Left) {
+            self.end_inspector_drag(cx);
+            return;
+        }
+
+        if !self.inspector_dragging {
+            self.inspector_dragging = true;
+            cx.notify();
+        }
+
+        let width = f32::from(event.bounds.right() - event.event.position.x);
+        self.set_inspector_width(width, cx);
+    }
+
+    fn end_inspector_drag(&mut self, cx: &mut Context<Self>) {
+        if self.inspector_dragging {
+            self.inspector_dragging = false;
+            cx.notify();
+        }
+    }
+
+    /// A double click on the border goes back to the default width.
+    fn reset_inspector_width(&mut self, cx: &mut Context<Self>) {
+        self.set_inspector_width(INSPECTOR_WIDTH, cx);
+    }
+
+    /// Left moves the border left, which widens the inspector. Home and End go to the limits.
     pub(crate) fn nudge_inspector(&mut self, nudge: Nudge, cx: &mut Context<Self>) {
-        let step = match nudge {
-            Nudge::Left => INSPECTOR_KEY_STEP,
-            Nudge::Right => -INSPECTOR_KEY_STEP,
+        let width = match nudge {
+            Nudge::Left => self.shown_inspector_width() + INSPECTOR_KEY_STEP,
+            Nudge::Right => self.shown_inspector_width() - INSPECTOR_KEY_STEP,
+            Nudge::Smallest => INSPECTOR_MIN_WIDTH,
+            Nudge::Largest => self.inspector_max_width(),
         };
 
-        self.set_inspector_width(self.inspector_width + step, cx);
+        self.set_inspector_width(width, cx);
     }
 
     /// Moves the selection and the keyboard focus with an arrow key. Enter focuses the tile.
@@ -578,6 +614,19 @@ impl TerminalPreview {
         self.refresh(cx);
     }
 
+    /// Shows nothing and stops reading any terminal.
+    fn clear(&mut self, cx: &mut Context<Self>) {
+        if self.live.is_none() && self.agent_name.is_empty() && self.shown == Preview::default() {
+            return;
+        }
+
+        self.live = None;
+        self.agent_name = SharedString::default();
+        self.fallback = Preview::default();
+        self.shown = Preview::default();
+        cx.notify();
+    }
+
     fn refresh(&mut self, cx: &mut Context<Self>) {
         let Some((view, _)) = &self.live else {
             self.shown = self.fallback.clone();
@@ -691,6 +740,9 @@ pub(crate) struct MessageThread {
     parse_cache: HashMap<MessageId, Rc<Markdown>>,
     /// Messages the user unfolded.
     expanded: Rc<HashSet<MessageId>>,
+    /// Whether the last paint found a message taller than [`FOLDED_HEIGHT`]. A message
+    /// that was never measured counts as short.
+    tall: Rc<RefCell<HashMap<MessageId, bool>>>,
     names: Rc<HashMap<DaemonAgentId, SharedString>>,
     now: u64,
     scroll_key: Option<(AgentId, Option<MessageId>)>,
@@ -706,6 +758,7 @@ impl MessageThread {
             parsed: Rc::from([]),
             parse_cache: HashMap::new(),
             expanded: Rc::default(),
+            tall: Rc::default(),
             names: Rc::default(),
             now: 0,
             scroll_key: None,
@@ -756,9 +809,24 @@ impl MessageThread {
         }
     }
 
+    /// Forgets the agent and its messages.
+    fn clear(&mut self, cx: &mut Context<Self>) {
+        if self.agent.is_none() && self.messages.is_empty() {
+            return;
+        }
+
+        self.agent = None;
+        self.messages = Rc::from([]);
+        self.parsed = Rc::from([]);
+        self.scroll_key = None;
+        self.list.reset(0);
+        cx.notify();
+    }
+
     fn parse(&mut self, messages: &[Message]) {
         if self.parse_cache.len() > PARSED_LIMIT {
             self.parse_cache.clear();
+            self.tall.borrow_mut().clear();
         }
 
         let parsed: Vec<Rc<Markdown>> = messages
@@ -774,6 +842,22 @@ impl MessageThread {
             .collect();
 
         self.parsed = parsed.into();
+    }
+
+    /// Takes what the last paint found: whether the text of a message is taller than the
+    /// folded height at the current width. The list measures that one row again when the
+    /// answer changes, because the fold and the Show more button come or go with it.
+    fn set_tall(&mut self, message: MessageId, tall: bool, cx: &mut Context<Self>) {
+        let known = self.tall.borrow_mut().insert(message, tall);
+        if known.unwrap_or(false) == tall {
+            return;
+        }
+
+        if let Some(index) = self.messages.iter().position(|entry| entry.id == message) {
+            self.list.splice(index..index + 1, 1);
+        }
+
+        cx.notify();
     }
 
     /// Folds or unfolds a message. The list measures that one row again.
@@ -827,26 +911,36 @@ impl Render for MessageThread {
         let colors = cx.theme().colors().clone();
         let thread = cx.entity();
         let (messages, parsed) = (Rc::clone(&self.messages), Rc::clone(&self.parsed));
-        let (expanded, names) = (Rc::clone(&self.expanded), Rc::clone(&self.names));
+        let (expanded, tall, names) = (
+            Rc::clone(&self.expanded),
+            Rc::clone(&self.tall),
+            Rc::clone(&self.names),
+        );
         let now = self.now;
 
         list(self.list.clone(), move |index, _, _| {
             let (Some(message), Some(markdown)) = (messages.get(index), parsed.get(index)) else {
                 return div().into_any_element();
             };
-            let unfolded = expanded.contains(&message.id);
-            let thread = thread.clone();
             let id = message.id;
+            let measured = tall.borrow().get(&id).copied();
+            let is_tall = markdown.overflows() || measured == Some(true);
+            let (toggled, measuring) = (thread.clone(), thread.clone());
 
             let row = MessageRow {
                 index,
                 message,
                 markdown,
-                folded: markdown.tall && !unfolded,
+                tall: is_tall,
+                folded: is_tall && !expanded.contains(&id),
+                measured,
                 names: &names,
                 now,
                 on_toggle: Rc::new(move |cx: &mut App| {
-                    thread.update(cx, |thread, cx| thread.toggle(id, cx));
+                    toggled.update(cx, |thread, cx| thread.toggle(id, cx));
+                }),
+                on_measure: Rc::new(move |tall: bool, cx: &mut App| {
+                    measuring.update(cx, |thread, cx| thread.set_tall(id, tall, cx));
                 }),
             };
 
@@ -918,11 +1012,14 @@ pub(crate) fn render(
 
     h_flex()
         .id("swarm-view")
+        .relative()
         .size_full()
         .items_stretch()
-        .on_mouse_move(cx.listener(|workspace, event: &MouseMoveEvent, _, cx| {
-            workspace.drag_inspector(event, cx);
-        }))
+        .on_drag_move(
+            cx.listener(|workspace, event: &DragMoveEvent<InspectorDrag>, _, cx| {
+                workspace.drag_inspector(event, cx);
+            }),
+        )
         .on_mouse_up(
             MouseButton::Left,
             cx.listener(|workspace, _, _, cx| workspace.end_inspector_drag(cx)),
@@ -939,6 +1036,33 @@ pub(crate) fn render(
                 .child(graph(workspace, &data, cx)),
         )
         .child(inspector(workspace, &data, cx))
+        .child({
+            let this = cx.entity();
+
+            canvas(
+                move |bounds, _, cx| {
+                    let width = f32::from(bounds.size.width);
+                    let this = this.clone();
+
+                    cx.defer(move |cx| {
+                        this.update(cx, |workspace, cx| workspace.measured_swarm_view(width, cx));
+                    });
+                },
+                |_, (), _, _| {},
+            )
+            .absolute()
+            .size_full()
+        })
+        .when(workspace.inspector_dragging, |view| {
+            view.child(
+                canvas(
+                    |_, _, _| (),
+                    |_, (), window, _| window.set_window_cursor_style(CursorStyle::ResizeLeftRight),
+                )
+                .absolute()
+                .size_full(),
+            )
+        })
         .into_any_element()
 }
 
@@ -1379,8 +1503,7 @@ fn card(
 
 fn inspector(workspace: &Workspace, data: &SwarmData, cx: &mut Context<Workspace>) -> AnyElement {
     let colors = cx.theme().colors().clone();
-    let this = cx.entity();
-    let (start, nudge) = (this.clone(), this);
+    let (nudge, reset) = (cx.entity(), cx.entity());
 
     let selected = data
         .selected
@@ -1403,15 +1526,14 @@ fn inspector(workspace: &Workspace, data: &SwarmData, cx: &mut Context<Workspace
         &workspace.inspector_handle,
     )
     .value(
-        workspace.inspector_width,
+        workspace.shown_inspector_width(),
         INSPECTOR_MIN_WIDTH,
-        INSPECTOR_MAX_WIDTH,
+        workspace.inspector_max_width(),
     )
-    .dragging(workspace.inspector_drag.is_some())
-    .on_drag_start(move |event, _, cx| {
-        start.update(cx, |workspace, cx| {
-            workspace.start_inspector_drag(event.position.x, cx);
-        });
+    .dragging(workspace.inspector_dragging)
+    .on_drag(InspectorDrag)
+    .on_reset(move |_, cx| {
+        reset.update(cx, Workspace::reset_inspector_width);
     })
     .on_nudge(move |direction, _, cx| {
         nudge.update(cx, |workspace, cx| workspace.nudge_inspector(direction, cx));
@@ -1423,7 +1545,7 @@ fn inspector(workspace: &Workspace, data: &SwarmData, cx: &mut Context<Workspace
         .role(Role::Complementary)
         .aria_label("Selected agent")
         .relative()
-        .w(px(workspace.inspector_width))
+        .w(px(workspace.shown_inspector_width()))
         .flex_none()
         .h_full()
         .min_h_0()
@@ -1522,20 +1644,24 @@ fn inspector_body(
             });
         });
 
-    let content = match tab {
-        InspectorTab::Messages => div()
-            .id("message-thread")
-            .role(Role::List)
-            .aria_label("Messages")
-            .flex_1()
-            .min_h_0()
-            .px(px(16.))
-            .pt(px(2.))
-            .child(workspace.thread.clone().cached(full_size()))
-            .into_any_element(),
-        InspectorTab::Changes => changes_tab(workspace, agent, cx),
-        InspectorTab::Terminal => terminal_tab(workspace, agent, cx),
+    let (tab_name, content) = match tab {
+        InspectorTab::Messages => (
+            "Messages",
+            div()
+                .id("message-thread")
+                .role(Role::List)
+                .aria_label("Messages")
+                .flex_1()
+                .min_h_0()
+                .px(px(16.))
+                .pt(px(2.))
+                .child(workspace.thread.clone().cached(full_size()))
+                .into_any_element(),
+        ),
+        InspectorTab::Changes => ("Changes", changes_tab(workspace, agent, cx)),
+        InspectorTab::Terminal => ("Terminal", terminal_tab(workspace, agent, cx)),
     };
+    let panel = tab_panel(tab_name, content);
 
     v_flex()
         .size_full()
@@ -1550,8 +1676,19 @@ fn inspector_body(
                 .child(details)
                 .child(tabs),
         )
-        .child(content)
+        .child(panel)
         .into_any_element()
+}
+
+/// The content under the tab strip, named after the selected tab.
+fn tab_panel(tab_name: &'static str, content: AnyElement) -> gpui::Stateful<gpui::Div> {
+    v_flex()
+        .id("inspector-panel")
+        .role(Role::TabPanel)
+        .aria_label(tab_name)
+        .flex_1()
+        .min_h_0()
+        .child(content)
 }
 
 fn signed(additions: u32, deletions: u32, colors: &ThemeColors) -> gpui::Div {
@@ -1581,6 +1718,9 @@ fn changes_tab(workspace: &Workspace, agent: &Agent, cx: &mut Context<Workspace>
             .into_any_element();
     };
     let stat = changes.stat;
+    let hidden = usize::try_from(stat.files)
+        .unwrap_or(usize::MAX)
+        .saturating_sub(changes.files.len());
 
     let files = uniform_list(
         "changed-files",
@@ -1627,6 +1767,23 @@ fn changes_tab(workspace: &Workspace, agent: &Agent, cx: &mut Context<Workspace>
                 .px(px(8.))
                 .child(files),
         )
+        .when(hidden > 0, |tab| {
+            tab.child(
+                div()
+                    .flex_none()
+                    .px(px(16.))
+                    .pb(px(12.))
+                    .debug_selector(|| "changed-files-more".to_owned())
+                    .child(
+                        Label::new(format!(
+                            "and {hidden} more {}",
+                            if hidden == 1 { "file" } else { "files" }
+                        ))
+                        .size(LabelSize::Small)
+                        .color(Color::Faint),
+                    ),
+            )
+        })
         .into_any_element()
 }
 
@@ -1635,17 +1792,22 @@ fn file_label(path: &Path, additions: u32, deletions: u32) -> String {
         || path.display().to_string(),
         |name| name.to_string_lossy().into_owned(),
     );
-    let mut parts = vec![name];
+    let folder = path
+        .parent()
+        .filter(|folder| !folder.as_os_str().is_empty())
+        .map(|folder| folder.display().to_string());
+    let located = match folder {
+        Some(folder) => format!("{name} in {folder}"),
+        None => name,
+    };
 
-    if additions > 0 {
-        parts.push(plural(additions, "addition", "additions"));
-    }
-    if deletions > 0 {
-        parts.push(plural(deletions, "deletion", "deletions"));
-    }
-    parts.push("open in Review".to_owned());
-
-    parts.join(", ")
+    [
+        located,
+        plural(additions, "addition", "additions"),
+        plural(deletions, "deletion", "deletions"),
+        "open in Review".to_owned(),
+    ]
+    .join(", ")
 }
 
 fn file_row(
@@ -1837,15 +1999,23 @@ fn agent_name(
         .unwrap_or_else(|| SharedString::new_static("agent"))
 }
 
+/// Called with whether a message is taller than [`FOLDED_HEIGHT`].
+type MeasureHandler = Rc<dyn Fn(bool, &mut App)>;
+
 /// What one row of the thread needs to draw itself.
 struct MessageRow<'a> {
     index: usize,
     message: &'a Message,
     markdown: &'a Markdown,
+    /// The text is taller than [`FOLDED_HEIGHT`], so the row has a fold.
+    tall: bool,
     folded: bool,
+    /// What the last paint found, if it measured the text.
+    measured: Option<bool>,
     names: &'a HashMap<DaemonAgentId, SharedString>,
     now: u64,
     on_toggle: Rc<dyn Fn(&mut App)>,
+    on_measure: MeasureHandler,
 }
 
 fn capitalised(word: &str) -> String {
@@ -1908,12 +2078,35 @@ fn message_row(row: &MessageRow<'_>, colors: &ThemeColors) -> AnyElement {
             if in_flight { colors.ok } else { colors.faint },
         ));
 
+    let measure = (!row.markdown.overflows()).then(|| {
+        let (known, on_measure) = (row.measured.unwrap_or(false), Rc::clone(&row.on_measure));
+
+        canvas(
+            move |bounds, _, cx| {
+                let tall = bounds.size.height > px(FOLDED_HEIGHT);
+
+                if tall != known {
+                    let on_measure = Rc::clone(&on_measure);
+                    cx.defer(move |cx| on_measure(tall, cx));
+                }
+            },
+            |_, (), _, _| {},
+        )
+        .absolute()
+        .size_full()
+    });
+
     let body = div()
         .relative()
         .when(row.folded, |body| {
             body.max_h(px(FOLDED_HEIGHT)).overflow_hidden()
         })
-        .child(markdown::render(row.markdown, colors))
+        .child(
+            div()
+                .relative()
+                .child(markdown::render(row.markdown, row.folded, colors))
+                .children(measure),
+        )
         .when(row.folded, |body| {
             body.child(
                 div()
@@ -1930,35 +2123,19 @@ fn message_row(row: &MessageRow<'_>, colors: &ThemeColors) -> AnyElement {
             )
         });
 
-    let toggle = row.markdown.tall.then(|| {
-        let label = if row.folded { "Show more" } else { "Show less" };
-        let on_toggle = Rc::clone(&row.on_toggle);
-        let accent = colors.accent;
-
-        h_flex().child(
-            div()
-                .id(("message-fold", row.index))
-                .debug_selector(|| format!("message-fold-{}", row.index))
-                .role(Role::Button)
-                .aria_label(label)
-                .focusable()
-                .tab_stop(true)
-                .cursor_pointer()
-                .rounded(px(4.))
-                .focus_visible(move |style| focus_ring(style, accent))
-                .on_click(move |_, _, cx| on_toggle(cx))
-                .child(
-                    Label::new(label)
-                        .size(LabelSize::Small)
-                        .weight(FontWeight::MEDIUM)
-                        .color(Color::Accent),
-                ),
-        )
+    let toggle = row.tall.then(|| {
+        h_flex().child(fold_toggle(
+            row.index,
+            row.folded,
+            colors.accent,
+            Rc::clone(&row.on_toggle),
+        ))
     });
 
     v_flex()
         .id(("message", row.index))
         .role(Role::ListItem)
+        .w_full()
         .py(px(12.))
         .gap(px(8.))
         .border_b_1()
@@ -1967,6 +2144,35 @@ fn message_row(row: &MessageRow<'_>, colors: &ThemeColors) -> AnyElement {
         .child(body)
         .children(toggle)
         .into_any_element()
+}
+
+/// The Show more or Show less button of a long message.
+fn fold_toggle(
+    index: usize,
+    folded: bool,
+    accent: Hsla,
+    on_toggle: Rc<dyn Fn(&mut App)>,
+) -> gpui::Stateful<gpui::Div> {
+    let label = if folded { "Show more" } else { "Show less" };
+
+    div()
+        .id(("message-fold", index))
+        .debug_selector(|| format!("message-fold-{index}"))
+        .role(Role::Button)
+        .aria_label(label)
+        .aria_expanded(!folded)
+        .focusable()
+        .tab_stop(true)
+        .cursor_pointer()
+        .rounded(px(4.))
+        .focus_visible(move |style| focus_ring(style, accent))
+        .on_click(move |_, _, cx| on_toggle(cx))
+        .child(
+            Label::new(label)
+                .size(LabelSize::Small)
+                .weight(FontWeight::MEDIUM)
+                .color(Color::Accent),
+        )
 }
 
 /// What the thread was last scrolled for: the agent and its newest message.
@@ -2213,7 +2419,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn view_diff_opens_review_for_the_agent(cx: &mut TestAppContext) {
+    fn view_diff_stores_the_review_filter_for_the_agent(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
         let worker = workspace.read_with(cx, |workspace, _| workspace.active_task().workers[0]);
 
@@ -2441,7 +2647,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn only_view_diff_filters_review_to_an_agent(cx: &mut TestAppContext) {
+    fn only_view_diff_stores_a_review_filter(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
         let worker = workspace.read_with(cx, |workspace, _| workspace.active_task().workers[0]);
         let filter = |cx: &mut VisualTestContext| {
@@ -2569,6 +2775,19 @@ mod tests {
     }
 
     #[gpui::test]
+    fn home_and_end_jump_to_the_first_and_last_tab(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        click("inspector-tab-1", cx);
+
+        cx.simulate_keystrokes("end");
+        assert_eq!(tab(&workspace, cx), InspectorTab::Terminal);
+
+        redraw(cx);
+        cx.simulate_keystrokes("home");
+        assert_eq!(tab(&workspace, cx), InspectorTab::Messages);
+    }
+
+    #[gpui::test]
     fn tab_reaches_the_strip_and_the_arrows_work_from_there(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
         let orchestrator = worker_named(&workspace, "orchestrator", cx);
@@ -2612,14 +2831,13 @@ mod tests {
                 markdown::Block::Paragraph(_) => "paragraph",
                 markdown::Block::Heading(_) => "heading",
                 markdown::Block::Item { .. } => "item",
-                markdown::Block::Code(_) => "code",
+                markdown::Block::Code { .. } => "code",
             })
             .collect();
         assert_eq!(
             kinds,
             ["paragraph", "heading", "item", "item", "item", "item"]
         );
-        assert!(brief.tall);
 
         add_thread_messages(&workspace, 100..101, cx);
         workspace.update(cx, |workspace, cx| {
@@ -2634,49 +2852,285 @@ mod tests {
         assert!(again.is_some_and(|again| Rc::ptr_eq(&again, &brief)));
     }
 
-    fn brief_height(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Pixels {
+    /// Sends a message to bench, shows bench and returns the row of the message.
+    fn post_to_bench(
+        workspace: &Entity<Workspace>,
+        id: u64,
+        text: &str,
+        cx: &mut VisualTestContext,
+    ) -> usize {
+        workspace.update(cx, |workspace, cx| {
+            let orchestrator = id_of(workspace, "orchestrator");
+            let Some((project, task)) = workspace.data.message_key(workspace.active_task) else {
+                return;
+            };
+
+            workspace.data.record_message(&swarm_protocol::MessageInfo {
+                id: MessageId(id),
+                project,
+                task,
+                from: Some(orchestrator),
+                to: id_of(workspace, "bench"),
+                kind: MessageKind::Task,
+                text: text.to_owned(),
+                sent_at: SAMPLE_NOW,
+                delivered_at: Some(SAMPLE_NOW),
+            });
+            cx.notify();
+        });
+        show_agent(workspace, "bench", cx);
+        settle(cx);
+
+        workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .thread
+                .read(cx)
+                .messages
+                .iter()
+                .position(|message| message.id == MessageId(id))
+                .expect("the message is in the thread")
+        })
+    }
+
+    /// Draws until the rows have measured their text and folded.
+    fn settle(cx: &mut VisualTestContext) {
+        for _ in 0..4 {
+            redraw(cx);
+        }
+    }
+
+    fn row_height(
+        workspace: &Entity<Workspace>,
+        index: usize,
+        cx: &mut VisualTestContext,
+    ) -> Pixels {
         workspace.read_with(cx, |workspace, cx| {
             workspace
                 .thread
                 .read(cx)
                 .list
-                .bounds_for_item(0)
+                .bounds_for_item(index)
                 .map_or(px(0.), |bounds| bounds.size.height)
         })
     }
 
-    #[gpui::test]
-    fn a_long_message_folds_and_show_more_and_less_change_its_height(cx: &mut TestAppContext) {
-        let (workspace, cx) = setup(cx);
-        show_agent(&workspace, "pty-io", cx);
-        redraw(cx);
+    fn fold_selector(index: usize) -> &'static str {
+        Box::leak(format!("message-fold-{index}").into_boxed_str())
+    }
 
-        let folded = brief_height(&workspace, cx);
-        assert!(folded > px(0.));
-        assert!(folded < px(FOLDED_HEIGHT + 100.));
+    fn fold_button(index: usize, cx: &mut VisualTestContext) -> bool {
+        cx.debug_bounds(fold_selector(index)).is_some()
+    }
 
-        click("message-fold-0", cx);
-        redraw(cx);
-        let expanded = brief_height(&workspace, cx);
-        assert!(
-            expanded > folded,
-            "{expanded:?} is not taller than {folded:?}"
-        );
-
-        click("message-fold-0", cx);
-        redraw(cx);
-        assert_eq!(brief_height(&workspace, cx), folded);
+    fn paragraphs(count: usize) -> String {
+        vec!["a block of text"; count].join("\n\n")
     }
 
     #[gpui::test]
-    fn a_short_message_has_no_fold_button(cx: &mut TestAppContext) {
+    fn a_tall_message_folds_and_show_more_and_less_change_its_row_height(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let index = post_to_bench(&workspace, 700, &paragraphs(9), cx);
+
+        let folded = row_height(&workspace, index, cx);
+        assert!(fold_button(index, cx), "a tall message has Show more");
+
+        click(fold_selector(index), cx);
+        settle(cx);
+        let unfolded = row_height(&workspace, index, cx);
+        assert!(
+            folded < unfolded,
+            "{folded:?} is not shorter than {unfolded:?}"
+        );
+        assert!(fold_button(index, cx), "an unfolded message has Show less");
+
+        click(fold_selector(index), cx);
+        settle(cx);
+        assert_eq!(row_height(&workspace, index, cx), folded);
+    }
+
+    #[gpui::test]
+    fn show_more_appears_only_for_messages_taller_than_the_fold(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let short = post_to_bench(&workspace, 701, "ok", cx);
+        let few_lines = post_to_bench(&workspace, 702, &paragraphs(5), cx);
+        let tall = post_to_bench(&workspace, 703, &paragraphs(9), cx);
+        let many_blocks = post_to_bench(&workspace, 704, &paragraphs(40), cx);
+
+        assert!(!fold_button(short, cx));
+        assert!(!fold_button(few_lines, cx));
+        assert!(fold_button(tall, cx));
+        assert!(fold_button(many_blocks, cx));
+    }
+
+    #[gpui::test]
+    fn a_message_folds_by_its_wrapped_height_and_follows_the_width(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let words = "word ".repeat(80);
+        let index = post_to_bench(&workspace, 705, &words, cx);
+        assert!(!fold_button(index, cx), "it fits the folded height");
+
+        workspace.update(cx, |workspace, cx| workspace.set_inspector_width(320., cx));
+        settle(cx);
+        assert!(fold_button(index, cx), "it wraps to more lines when narrow");
+
+        workspace.update(cx, |workspace, cx| workspace.set_inspector_width(640., cx));
+        settle(cx);
+        assert!(!fold_button(index, cx), "it fits again when wide");
+    }
+
+    #[gpui::test]
+    fn a_folded_message_draws_only_the_first_blocks(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let index = post_to_bench(&workspace, 706, &paragraphs(40), cx);
+
+        let folded = row_height(&workspace, index, cx);
+        click(fold_selector(index), cx);
+        settle(cx);
+
+        assert!(row_height(&workspace, index, cx) > folded + px(400.));
+        assert!(folded < px(FOLDED_HEIGHT + 100.));
+    }
+
+    #[gpui::test]
+    fn short_and_long_rows_both_span_the_thread(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let short = post_to_bench(&workspace, 710, "ok", cx);
+        let long = post_to_bench(&workspace, 711, &"long words that wrap ".repeat(20), cx);
+
+        let width = |index: usize, cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, cx| {
+                workspace
+                    .thread
+                    .read(cx)
+                    .list
+                    .bounds_for_item(index)
+                    .map(|bounds| bounds.size.width)
+            })
+        };
+
+        assert!(width(short, cx).is_some());
+        assert_eq!(width(short, cx), width(long, cx));
+    }
+
+    #[test]
+    fn the_fold_button_says_whether_the_message_is_open() {
+        let name = |folded: bool| {
+            let button = fold_toggle(0, folded, Hsla::default(), Rc::new(|_: &mut App| {}));
+            let mut node = gpui::accesskit::Node::new(button.a11y_role().unwrap_or(Role::Unknown));
+            button.write_a11y_info(&mut node);
+
+            (node.label().map(str::to_owned), node.is_expanded())
+        };
+
+        assert_eq!(name(true), (Some("Show more".to_owned()), Some(false)));
+        assert_eq!(name(false), (Some("Show less".to_owned()), Some(true)));
+    }
+
+    #[test]
+    fn the_tab_content_is_a_panel_named_after_its_tab() {
+        let panel = tab_panel("Changes", div().into_any_element());
+        let mut node = gpui::accesskit::Node::new(panel.a11y_role().unwrap_or(Role::Unknown));
+        panel.write_a11y_info(&mut node);
+
+        assert_eq!(panel.a11y_role(), Some(Role::TabPanel));
+        assert_eq!(node.label(), Some("Changes"));
+    }
+
+    #[test]
+    fn the_preview_reads_a_terminal_only_in_the_swarm_view_on_the_terminal_tab() {
+        assert!(reads_terminal(View::Swarm, InspectorTab::Terminal));
+        assert!(!reads_terminal(View::Swarm, InspectorTab::Messages));
+        assert!(!reads_terminal(View::Swarm, InspectorTab::Changes));
+        assert!(!reads_terminal(View::Terminals, InspectorTab::Terminal));
+    }
+
+    fn watching(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> bool {
+        workspace.read_with(cx, |workspace, cx| {
+            workspace.preview.read(cx).live.is_some()
+        })
+    }
+
+    #[gpui::test]
+    fn the_preview_subscribes_to_a_live_terminal_only_while_it_is_shown(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let pty_io = show_agent(&workspace, "pty-io", cx);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let Some(terminal) = workspace.data.agent(pty_io).map(|agent| agent.terminal) else {
+                return;
+            };
+            let (input, _) = flume::unbounded();
+            let (_, output) = flume::unbounded();
+            let live = workspace.live_terminal(
+                terminal,
+                swarm_protocol::TerminalId(900),
+                "pty-io".into(),
+                swarm_term::TerminalChannels { input, output },
+                window,
+                cx,
+            );
+
+            workspace.live_terminals.insert(terminal, live);
+            cx.notify();
+        });
+        redraw(cx);
+        assert!(!watching(&workspace, cx), "the Messages tab is shown");
+
+        click("inspector-tab-1", cx);
+        assert!(!watching(&workspace, cx), "the Changes tab is shown");
+
+        click("inspector-tab-2", cx);
+        assert!(watching(&workspace, cx), "the Terminal tab is shown");
+
+        workspace.update(cx, |workspace, cx| workspace.set_view(View::Terminals, cx));
+        redraw(cx);
+        assert!(!watching(&workspace, cx), "the Swarm view is hidden");
+
+        workspace.update(cx, |workspace, cx| workspace.set_view(View::Swarm, cx));
+        redraw(cx);
+        assert!(watching(&workspace, cx));
+    }
+
+    #[gpui::test]
+    fn with_no_agent_selected_the_thread_and_the_preview_are_cleared(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
         show_agent(&workspace, "pty-io", cx);
+        let shown = workspace.read_with(cx, |workspace, cx| {
+            (
+                workspace.thread.read(cx).messages.len(),
+                workspace.preview.read(cx).agent_name.clone(),
+            )
+        });
+        assert!(shown.0 > 0 && !shown.1.is_empty());
 
-        assert!(cx.debug_bounds("message-fold-0").is_some());
-        assert!(cx.debug_bounds("message-fold-1").is_none());
-        assert!(cx.debug_bounds("message-fold-2").is_none());
-        drop(workspace);
+        workspace.update(cx, |workspace, cx| {
+            let task = workspace.active_task;
+            if let Some(task) = workspace
+                .data
+                .tasks
+                .iter_mut()
+                .find(|entry| entry.id == task)
+            {
+                task.orchestrator = None;
+                task.workers.clear();
+            }
+            cx.notify();
+        });
+        redraw(cx);
+
+        let (agent, messages, name, live) = workspace.read_with(cx, |workspace, cx| {
+            let thread = workspace.thread.read(cx);
+            let preview = workspace.preview.read(cx);
+
+            (
+                thread.agent,
+                thread.messages.len(),
+                preview.agent_name.clone(),
+                preview.live.is_some(),
+            )
+        });
+        assert_eq!((agent, messages, live), (None, 0, false));
+        assert!(name.is_empty());
     }
 
     #[gpui::test]
@@ -2716,10 +3170,39 @@ mod tests {
     #[test]
     fn a_file_row_names_its_counts_and_where_it_goes() {
         let label = file_label(Path::new("crates/swarm-term/src/pty.rs"), 39, 8);
-        let added_only = file_label(Path::new("Cargo.toml"), 1, 0);
+        let in_folder = file_label(Path::new("crates/swarm-term/Cargo.toml"), 2, 0);
+        let in_root = file_label(Path::new("Cargo.toml"), 1, 0);
 
-        assert_eq!(label, "pty.rs, 39 additions, 8 deletions, open in Review");
-        assert_eq!(added_only, "Cargo.toml, 1 addition, open in Review");
+        assert_eq!(
+            label,
+            "pty.rs in crates/swarm-term/src, 39 additions, 8 deletions, open in Review"
+        );
+        assert_eq!(
+            in_folder,
+            "Cargo.toml in crates/swarm-term, 2 additions, 0 deletions, open in Review"
+        );
+        assert_eq!(
+            in_root,
+            "Cargo.toml, 1 addition, 0 deletions, open in Review"
+        );
+    }
+
+    #[gpui::test]
+    fn a_capped_file_list_says_how_many_files_it_leaves_out(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let pty_io = show_agent(&workspace, "pty-io", cx);
+        click("inspector-tab-1", cx);
+        assert!(cx.debug_bounds("changed-files-more").is_none());
+
+        workspace.update(cx, |workspace, cx| {
+            if let Some(changes) = workspace.data.agent_changes.get_mut(&pty_io) {
+                changes.stat.files += 7;
+            }
+            cx.notify();
+        });
+        redraw(cx);
+
+        assert!(cx.debug_bounds("changed-files-more").is_some());
     }
 
     #[gpui::test]
@@ -2842,6 +3325,40 @@ mod tests {
         assert!((width(&workspace, cx) - 640.).abs() < 1e-6);
     }
 
+    fn dragging(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> bool {
+        workspace.read_with(cx, |workspace, _| workspace.inspector_dragging)
+    }
+
+    #[gpui::test]
+    fn home_and_end_set_the_smallest_and_largest_inspector(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            let handle = workspace.inspector_handle.clone();
+            window.focus(&handle, cx);
+        });
+        redraw(cx);
+
+        cx.simulate_keystrokes("home");
+        assert!((width(&workspace, cx) - 320.).abs() < 1e-6);
+
+        cx.simulate_keystrokes("end");
+        assert!((width(&workspace, cx) - 640.).abs() < 1e-6);
+    }
+
+    #[gpui::test]
+    fn the_arrow_keys_with_a_modifier_do_not_resize_the_inspector(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            let handle = workspace.inspector_handle.clone();
+            window.focus(&handle, cx);
+        });
+        redraw(cx);
+
+        cx.simulate_keystrokes("shift-left alt-right ctrl-left");
+
+        assert!((width(&workspace, cx) - INSPECTOR_WIDTH).abs() < 1e-6);
+    }
+
     #[gpui::test]
     fn dragging_the_left_border_resizes_the_inspector_within_the_limits(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
@@ -2850,9 +3367,10 @@ mod tests {
         let none = gpui::Modifiers::none();
 
         cx.simulate_mouse_down(border, MouseButton::Left, none);
+        cx.simulate_mouse_move(border - point(px(10.), px(0.)), MouseButton::Left, none);
         cx.simulate_mouse_move(border - point(px(60.), px(0.)), MouseButton::Left, none);
         assert!((width(&workspace, cx) - 460.).abs() < 1.0);
-        assert!(workspace.read_with(cx, |workspace, _| workspace.inspector_drag.is_some()));
+        assert!(dragging(&workspace, cx));
 
         cx.simulate_mouse_move(border - point(px(900.), px(0.)), MouseButton::Left, none);
         assert!((width(&workspace, cx) - 640.).abs() < 1e-6);
@@ -2861,7 +3379,109 @@ mod tests {
         assert!((width(&workspace, cx) - 320.).abs() < 1e-6);
 
         cx.simulate_mouse_up(border, MouseButton::Left, none);
-        assert!(workspace.read_with(cx, |workspace, _| workspace.inspector_drag.is_none()));
+        assert!(!dragging(&workspace, cx));
+    }
+
+    #[gpui::test]
+    fn a_drag_that_leaves_the_swarm_view_keeps_resizing_the_inspector(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let bounds = cx.debug_bounds("inspector").expect("the inspector");
+        let border = point(bounds.origin.x, bounds.center().y);
+        let none = gpui::Modifiers::none();
+
+        cx.simulate_mouse_down(border, MouseButton::Left, none);
+        cx.simulate_mouse_move(border - point(px(10.), px(0.)), MouseButton::Left, none);
+        cx.simulate_mouse_move(point(px(20.), border.y), MouseButton::Left, none);
+
+        assert!((width(&workspace, cx) - 640.).abs() < 1e-6);
+        assert!(dragging(&workspace, cx));
+
+        cx.simulate_mouse_up(point(px(20.), border.y), MouseButton::Left, none);
+        assert!(!dragging(&workspace, cx));
+    }
+
+    fn view_width(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> f32 {
+        workspace.read_with(cx, |workspace, _| workspace.swarm_view_width.unwrap_or(0.))
+    }
+
+    fn shown(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> f32 {
+        workspace.read_with(cx, |workspace, _| workspace.shown_inspector_width())
+    }
+
+    #[gpui::test]
+    fn the_graph_keeps_400_pixels_and_the_chosen_width_comes_back(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let wide = view_width(&workspace, cx);
+        assert!(wide >= 1040., "the test window is {wide} wide");
+
+        workspace.update(cx, |workspace, cx| workspace.set_inspector_width(600., cx));
+        assert!((shown(&workspace, cx) - 600.).abs() < 1e-6);
+
+        let window = cx.update(|window, _| window.viewport_size());
+        let narrower = window.width - px(wide - 900.);
+        cx.simulate_resize(gpui::size(narrower, window.height));
+        settle(cx);
+
+        let view = view_width(&workspace, cx);
+        assert!((view - 900.).abs() < 1.0, "the view is {view} wide");
+        assert!((shown(&workspace, cx) - 500.).abs() < 1.0);
+        assert!(
+            (width(&workspace, cx) - 600.).abs() < 1e-6,
+            "the choice is kept"
+        );
+        let max = workspace.read_with(cx, |workspace, _| workspace.inspector_max_width());
+        assert!((max - 500.).abs() < 1.0);
+
+        cx.simulate_resize(window);
+        settle(cx);
+        assert!((shown(&workspace, cx) - 600.).abs() < 1e-6, "it comes back");
+
+        cx.simulate_resize(gpui::size(narrower, window.height));
+        settle(cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            let handle = workspace.inspector_handle.clone();
+            window.focus(&handle, cx);
+        });
+        redraw(cx);
+        cx.simulate_keystrokes("end");
+        assert!((width(&workspace, cx) - 500.).abs() < 1.0);
+    }
+
+    #[gpui::test]
+    fn a_view_too_narrow_for_the_graph_keeps_the_inspector_at_its_minimum(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let wide = view_width(&workspace, cx);
+        let window = cx.update(|window, _| window.viewport_size());
+
+        cx.simulate_resize(gpui::size(window.width - px(wide - 600.), window.height));
+        settle(cx);
+
+        assert!((shown(&workspace, cx) - 320.).abs() < 1e-6);
+    }
+
+    #[gpui::test]
+    fn a_double_click_on_the_border_resets_the_width(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        workspace.update(cx, |workspace, cx| workspace.set_inspector_width(600., cx));
+        redraw(cx);
+        let bounds = cx.debug_bounds("inspector").expect("the inspector");
+        let border = point(bounds.origin.x, bounds.center().y);
+
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: border,
+            modifiers: gpui::Modifiers::none(),
+            button: MouseButton::Left,
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: border,
+            modifiers: gpui::Modifiers::none(),
+            button: MouseButton::Left,
+            click_count: 2,
+        });
+
+        assert!((width(&workspace, cx) - INSPECTOR_WIDTH).abs() < 1e-6);
     }
 
     #[gpui::test]

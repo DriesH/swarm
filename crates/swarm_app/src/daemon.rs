@@ -1270,7 +1270,7 @@ impl Workspace {
         terminal
     }
 
-    fn live_terminal(
+    pub(crate) fn live_terminal(
         &mut self,
         terminal: TerminalId,
         daemon_id: DaemonTerminalId,
