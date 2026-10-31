@@ -88,6 +88,10 @@ _Avoid_: Accept, sign off, LGTM
 A note the user leaves on one line in Review. It goes through the orchestrator to the worker that owns the file. It becomes outdated when its line is gone.
 _Avoid_: Review note, annotation, feedback
 
+**Local checks**:
+The project's own commands (tests, linters) that must pass on a task's branch before Swarm opens its pull request.
+_Avoid_: CI, pre-flight, tests
+
 **Close task**:
 Ending a task: its agents stop and its worktrees are removed. Its branch stays unless it is already merged into the base branch.
 _Avoid_: Delete task, archive, kill

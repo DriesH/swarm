@@ -218,6 +218,14 @@ A PR can only be created after the task is approved in Review. This makes the us
 
 Other ways in: ⌘K "Create pull request"; `swarm pr draft` from the orchestrator opens the panel with its draft (still only after approval).
 
+- **Draft:** opening the panel sends the orchestrator a `pr draft` message. It writes the title and description from the `pr.md` prompt (built in: What, Why, Notes for reviewers, Open tasks; a project can replace it in `.swarm/prompts/pr.md`) and sends them back with `swarm pr draft`. Without a running orchestrator the fields stay empty and the user writes them.
+- **Local checks:** run one after the other, each in its own process terminal in the task worktree, so a failure can be read. A result belongs to the commit it ran on; a new commit makes it stale.
+- **Create PR** pushes the task branch (the repository's pre-push hook runs as usual) and runs `gh pr create`. The daemon refuses it when the approval no longer matches the Merged diff, a comment is pending, or required checks did not pass on the current commit. A push or `gh` failure shows its output.
+- **After merge:** one option, **Close the task after merge**, which closes the task as Close task does (it stays open when closing would lose uncommitted work). Merge uses squash by default, with merge and rebase as other choices, and deletes the remote branch.
+- **Status** is read with `gh pr view` while the panel shows: every 10 s while GitHub checks run, every 30 s otherwise.
+- **Set up GitHub:** without `gh`, **Create PR** becomes **Set up GitHub**. It installs `gh` in a visible user terminal (Homebrew when it exists, else the official release, checked against its published checksums, into Swarm's own bin folder), then runs `gh auth login --web` the same way. Agents get the same `gh` on their `PATH`.
+- **New task from any branch:** the New task sheet's "branch from" lists every local branch, so a closed task's kept branch can be picked up again.
+
 ### Notifications
 
 Native macOS notifications through GPUI's `show_system_notification`. Only the orchestrator notifies the user.
