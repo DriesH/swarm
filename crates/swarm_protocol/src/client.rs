@@ -16,10 +16,20 @@ use std::time::{Duration, Instant};
 use swarm_term::{TerminalChannels, TerminalInput, TerminalOutput};
 
 use crate::{
-    AgentInfo, AgentKind, CallId, CreateTask, CreateTerminal, Event, FrameError, MessageInfo,
-    Paths, ProjectId, ProjectInfo, Request, TaskInfo, TerminalId, TerminalInfo, VERSION,
-    check_private_dir, read, write,
+    AgentId, AgentInfo, AgentKind, CallId, CreateTask, CreateTerminal, DiffStat, Event, FrameError,
+    MessageId, MessageInfo, Paths, ProjectId, ProjectInfo, Request, TaskId, TaskInfo, TerminalId,
+    TerminalInfo, VERSION, check_private_dir, read, write,
 };
+
+/// A message was sent or delivered, in the order the daemon sent the events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MessageEvent {
+    Sent(MessageInfo),
+    Delivered {
+        ids: Vec<MessageId>,
+        delivered_at: u64,
+    },
+}
 
 const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Creating a task runs git and copies files.
@@ -81,7 +91,7 @@ struct Shared {
     agents: flume::Sender<AgentInfo>,
     tasks: flume::Sender<TaskInfo>,
     terminals: flume::Sender<TerminalInfo>,
-    messages: flume::Sender<MessageInfo>,
+    messages: flume::Sender<MessageEvent>,
     /// Terminals whose size an agent owns: their `Resize` input is dropped.
     size_locked: Mutex<HashSet<TerminalId>>,
 }
@@ -128,7 +138,7 @@ struct Inner {
     agent_events: flume::Receiver<AgentInfo>,
     task_events: flume::Receiver<TaskInfo>,
     terminal_events: flume::Receiver<TerminalInfo>,
-    message_events: flume::Receiver<MessageInfo>,
+    message_events: flume::Receiver<MessageEvent>,
 }
 
 impl Drop for Inner {
@@ -305,8 +315,8 @@ impl Client {
         self.inner.terminal_events.clone()
     }
 
-    /// Every `MessageSent` the daemon sends. Use one consumer.
-    pub fn message_events(&self) -> flume::Receiver<MessageInfo> {
+    /// Every `MessageSent` and `MessagesDelivered` the daemon sends. Use one consumer.
+    pub fn message_events(&self) -> flume::Receiver<MessageEvent> {
         self.inner.message_events.clone()
     }
 
@@ -374,6 +384,40 @@ impl Client {
         match reply {
             Event::AgentStarted { agent, .. } => Ok(agent),
             other => Err(unexpected("StartOrchestrator", &other)),
+        }
+    }
+
+    /// The newest messages of a task, or of the project's Start orchestrator when `task`
+    /// is `None`, oldest first.
+    pub fn list_messages(
+        &self,
+        project: ProjectId,
+        task: Option<TaskId>,
+    ) -> Result<Vec<MessageInfo>, ClientError> {
+        let reply = self.call(
+            |call| Request::ListMessages {
+                call,
+                project,
+                task,
+            },
+            None,
+        )?;
+
+        match reply {
+            Event::Messages { messages, .. } => Ok(messages),
+            other => Err(unexpected("ListMessages", &other)),
+        }
+    }
+
+    /// What each agent changed in its worktree. Agents whose worktree cannot be read
+    /// are left out.
+    pub fn agent_changes(
+        &self,
+        agents: Vec<AgentId>,
+    ) -> Result<Vec<(AgentId, DiffStat)>, ClientError> {
+        match self.call(|call| Request::AgentChanges { call, agents }, None)? {
+            Event::AgentChanges { changes, .. } => Ok(changes),
+            other => Err(unexpected("AgentChanges", &other)),
         }
     }
 
@@ -655,9 +699,21 @@ fn read_events(
                 }
             }
             Event::MessageSent { message } => {
-                if shared.messages.send(message).is_err() {
+                if shared.messages.send(MessageEvent::Sent(message)).is_err() {
                     log::debug!("message event has no listener");
                 }
+            }
+            Event::MessagesDelivered { ids, delivered_at } => {
+                let event = MessageEvent::Delivered { ids, delivered_at };
+                if shared.messages.send(event).is_err() {
+                    log::debug!("message event has no listener");
+                }
+            }
+            Event::Messages { call, messages } => {
+                deliver(shared, call, Event::Messages { call, messages });
+            }
+            Event::AgentChanges { call, changes } => {
+                deliver(shared, call, Event::AgentChanges { call, changes });
             }
         }
     }
