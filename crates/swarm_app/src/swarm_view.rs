@@ -1,22 +1,26 @@
 //! The Swarm view: the task's agents as a graph and the inspector.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{
     AnyElement, Bounds, ClickEvent, Context, Entity, FollowMode, FontWeight, Hsla, KeyDownEvent,
-    ListAlignment, ListState, Pixels, Role, SharedString, StyleRefinement, Subscription, Window,
-    canvas, div, list, point, px,
+    ListAlignment, ListState, MouseButton, MouseMoveEvent, Pixels, Role, SharedString,
+    StyleRefinement, Subscription, Window, canvas, div, linear_color_stop, linear_gradient, list,
+    point, px, uniform_list,
 };
-use swarm_protocol::{AgentId as DaemonAgentId, MessageId, MessageKind};
+use swarm_protocol::{AgentId as DaemonAgentId, FileStat, MessageId, MessageKind};
 use swarm_term_view::TerminalView;
 use swarm_ui::fonts::MONO_FONT;
 use swarm_ui::prelude::*;
 use swarm_ui::styles::focus_ring;
-use swarm_ui::{ButtonVariant, ThemeColors};
+use swarm_ui::{ButtonVariant, Nudge, ThemeColors};
 
-use crate::model::{Agent, AgentId, AgentKind, Message};
+use crate::markdown::{self, Markdown, Parsed};
+use crate::model::{Agent, AgentId, AgentKind, Message, TerminalId};
 use crate::workspace::{View, Workspace};
 
 const ORCHESTRATOR_SIZE: (f32, f32) = (210., 80.);
@@ -33,12 +37,54 @@ const FLIGHT_DOT: f32 = 7.;
 const MAX_FLIGHT_DOTS: usize = 4;
 const DOT_SPACING: f32 = 18.;
 const DOT_SIZE: f32 = 1.5;
-const INSPECTOR_WIDTH: f32 = 320.;
-const PREVIEW_ROWS: usize = 5;
+pub(crate) const INSPECTOR_WIDTH: f32 = 400.;
+pub(crate) const INSPECTOR_MIN_WIDTH: f32 = 320.;
+pub(crate) const INSPECTOR_MAX_WIDTH: f32 = 640.;
+const INSPECTOR_KEY_STEP: f32 = 20.;
+/// The rows of a terminal the preview keeps; the box shows as many as fit.
+const PREVIEW_ROWS: usize = 60;
+/// A folded message is this high.
+const FOLDED_HEIGHT: f32 = 214.;
+/// Parsed messages kept after the thread changed; more than this are parsed again.
+const PARSED_LIMIT: usize = 2_000;
 const MIN_ZOOM: f32 = 0.6;
 const MAX_ZOOM: f32 = 1.4;
 const ZOOM_STEP: f32 = 0.1;
 const MINUTE: u64 = 60_000;
+
+/// What the inspector shows under its tabs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum InspectorTab {
+    #[default]
+    Messages,
+    Changes,
+    Terminal,
+}
+
+impl InspectorTab {
+    fn index(self) -> usize {
+        match self {
+            Self::Messages => 0,
+            Self::Changes => 1,
+            Self::Terminal => 2,
+        }
+    }
+
+    fn from_index(index: usize) -> Self {
+        match index {
+            1 => Self::Changes,
+            2 => Self::Terminal,
+            _ => Self::Messages,
+        }
+    }
+}
+
+/// A drag on the inspector's left border.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InspectorDrag {
+    start_x: Pixels,
+    start_width: f32,
+}
 
 /// A cubic curve from the orchestrator's bottom center to a worker's top center.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -312,6 +358,74 @@ impl Workspace {
         self.review_agent = Some(agent);
     }
 
+    /// Switches to Review, filtered to the agent and opened at one of its files.
+    pub(crate) fn view_file_diff(&mut self, agent: AgentId, path: PathBuf, cx: &mut Context<Self>) {
+        self.view_agent_diff(agent, cx);
+        self.review_file = Some(path);
+    }
+
+    /// Switches to Terminals with a process terminal's tile focused.
+    pub(crate) fn focus_process(&mut self, terminal: TerminalId, cx: &mut Context<Self>) {
+        self.view = View::Terminals;
+        self.focus_terminal(terminal, cx);
+    }
+
+    /// The tab is kept for the whole window, not for each agent.
+    pub(crate) fn select_inspector_tab(&mut self, tab: InspectorTab, cx: &mut Context<Self>) {
+        if self.inspector_tab != tab {
+            self.inspector_tab = tab;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn set_inspector_width(&mut self, width: f32, cx: &mut Context<Self>) {
+        let width = width.clamp(INSPECTOR_MIN_WIDTH, INSPECTOR_MAX_WIDTH);
+
+        if (width - self.inspector_width).abs() > f32::EPSILON {
+            self.inspector_width = width;
+            cx.notify();
+        }
+    }
+
+    fn start_inspector_drag(&mut self, start_x: Pixels, cx: &mut Context<Self>) {
+        self.inspector_drag = Some(InspectorDrag {
+            start_x,
+            start_width: self.inspector_width,
+        });
+        cx.notify();
+    }
+
+    /// Dragging the border to the left widens the inspector.
+    fn drag_inspector(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let Some(drag) = self.inspector_drag else {
+            return;
+        };
+
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.end_inspector_drag(cx);
+            return;
+        }
+
+        let moved = f32::from(drag.start_x - event.position.x);
+        self.set_inspector_width(drag.start_width + moved, cx);
+    }
+
+    fn end_inspector_drag(&mut self, cx: &mut Context<Self>) {
+        if self.inspector_drag.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Left moves the border left, which widens the inspector.
+    pub(crate) fn nudge_inspector(&mut self, nudge: Nudge, cx: &mut Context<Self>) {
+        let step = match nudge {
+            Nudge::Left => INSPECTOR_KEY_STEP,
+            Nudge::Right => -INSPECTOR_KEY_STEP,
+        };
+
+        self.set_inspector_width(self.inspector_width + step, cx);
+    }
+
     /// Moves the selection and the keyboard focus with an arrow key. Enter focuses the tile.
     fn swarm_key(&mut self, from: AgentId, key: &str, window: &mut Window, cx: &mut Context<Self>) {
         let task = self.active_task();
@@ -354,30 +468,26 @@ impl Workspace {
             .collect()
     }
 
-    /// The agent's worktree relative to the project root.
-    fn worktree_label(&self, agent: &Agent) -> String {
+    /// True when the agent works in the worktree of its task.
+    fn in_task_worktree(&self, agent: &Agent) -> bool {
         let task = self.active_task();
 
-        let Some(daemon) = &agent.daemon else {
-            let name = if task.orchestrator == Some(agent.id) {
-                task.name.to_string()
-            } else {
-                agent.name.to_string()
-            };
+        match (&agent.daemon, &task.daemon) {
+            (Some(daemon), Some(task_daemon)) => daemon.worktree == task_daemon.worktree,
+            _ => task.orchestrator == Some(agent.id),
+        }
+    }
 
-            return format!(".worktrees/{name}");
+    /// How many messages the agent sent or got.
+    fn thread_len(&self, agent: AgentId) -> usize {
+        let Some(id) = self.data.agent(agent).map(Agent::protocol_id) else {
+            return 0;
         };
 
-        let root = self
-            .data
-            .project(task.project)
-            .and_then(|project| project.root.as_deref());
-
-        match root.and_then(|root| daemon.worktree.strip_prefix(root).ok()) {
-            Some(relative) if relative.as_os_str().is_empty() => ".".to_owned(),
-            Some(relative) => relative.display().to_string(),
-            None => daemon.worktree.display().to_string(),
-        }
+        self.data
+            .task_messages(self.active_task)
+            .filter(|message| message.from == Some(id) || message.to == id)
+            .count()
     }
 
     fn branch_label(&self, agent: &Agent) -> SharedString {
@@ -512,6 +622,7 @@ impl Render for TerminalPreview {
                 };
 
                 div()
+                    .flex_none()
                     .whitespace_nowrap()
                     .text_color(color.hsla(cx))
                     .child(text)
@@ -520,12 +631,11 @@ impl Render for TerminalPreview {
             .collect();
 
         v_flex()
-            .flex_none()
+            .size_full()
             .gap(px(6.))
-            .px(px(14.))
-            .pt(px(12.))
             .child(
                 h_flex()
+                    .flex_none()
                     .gap(px(6.))
                     .child(div().size(px(6.)).rounded(px(6.)).bg(if preview.running {
                         colors.ok
@@ -533,7 +643,7 @@ impl Render for TerminalPreview {
                         colors.faint
                     }))
                     .child(
-                        Label::new("Live terminal")
+                        Label::new(self.agent_name.clone())
                             .size(LabelSize::Small)
                             .color(Color::Faint),
                     )
@@ -546,11 +656,13 @@ impl Render for TerminalPreview {
                     })),
             )
             .child(
-                div()
+                v_flex()
                     .id("terminal-preview")
                     .role(Role::Group)
                     .aria_label(format!("{} terminal preview", self.agent_name))
-                    .h(px(118.))
+                    .flex_1()
+                    .min_h_0()
+                    .justify_end()
                     .px(px(10.))
                     .py(px(8.))
                     .rounded(px(8.))
@@ -573,6 +685,12 @@ pub(crate) struct MessageThread {
     agent: Option<AgentId>,
     revision: u64,
     messages: Rc<[Message]>,
+    /// The parsed text of each message, in the order of `messages`.
+    parsed: Parsed,
+    /// Parsed text by message, so a message is parsed once however often the thread changes.
+    parse_cache: HashMap<MessageId, Rc<Markdown>>,
+    /// Messages the user unfolded.
+    expanded: Rc<HashSet<MessageId>>,
     names: Rc<HashMap<DaemonAgentId, SharedString>>,
     now: u64,
     scroll_key: Option<(AgentId, Option<MessageId>)>,
@@ -585,6 +703,9 @@ impl MessageThread {
             agent: None,
             revision: 0,
             messages: Rc::from([]),
+            parsed: Rc::from([]),
+            parse_cache: HashMap::new(),
+            expanded: Rc::default(),
             names: Rc::default(),
             now: 0,
             scroll_key: None,
@@ -612,6 +733,7 @@ impl MessageThread {
 
         if let Some(messages) = messages {
             self.fit_list(agent, &messages);
+            self.parse(&messages);
             self.messages = messages;
             changed = true;
         }
@@ -632,6 +754,40 @@ impl MessageThread {
         if changed {
             cx.notify();
         }
+    }
+
+    fn parse(&mut self, messages: &[Message]) {
+        if self.parse_cache.len() > PARSED_LIMIT {
+            self.parse_cache.clear();
+        }
+
+        let parsed: Vec<Rc<Markdown>> = messages
+            .iter()
+            .map(|message| {
+                let markdown = self
+                    .parse_cache
+                    .entry(message.id)
+                    .or_insert_with(|| Rc::new(markdown::parse(&message.text)));
+
+                Rc::clone(markdown)
+            })
+            .collect();
+
+        self.parsed = parsed.into();
+    }
+
+    /// Folds or unfolds a message. The list measures that one row again.
+    fn toggle(&mut self, message: MessageId, cx: &mut Context<Self>) {
+        let expanded = Rc::make_mut(&mut self.expanded);
+        if !expanded.remove(&message) {
+            expanded.insert(message);
+        }
+
+        if let Some(index) = self.messages.iter().position(|entry| entry.id == message) {
+            self.list.splice(index..index + 1, 1);
+        }
+
+        cx.notify();
     }
 
     fn fit_list(&mut self, agent: AgentId, thread: &[Message]) {
@@ -669,13 +825,32 @@ impl MessageThread {
 impl Render for MessageThread {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
-        let (messages, names, now) = (Rc::clone(&self.messages), Rc::clone(&self.names), self.now);
+        let thread = cx.entity();
+        let (messages, parsed) = (Rc::clone(&self.messages), Rc::clone(&self.parsed));
+        let (expanded, names) = (Rc::clone(&self.expanded), Rc::clone(&self.names));
+        let now = self.now;
 
         list(self.list.clone(), move |index, _, _| {
-            messages.get(index).map_or_else(
-                || div().into_any_element(),
-                |message| message_row(index, message, now, &names, &colors),
-            )
+            let (Some(message), Some(markdown)) = (messages.get(index), parsed.get(index)) else {
+                return div().into_any_element();
+            };
+            let unfolded = expanded.contains(&message.id);
+            let thread = thread.clone();
+            let id = message.id;
+
+            let row = MessageRow {
+                index,
+                message,
+                markdown,
+                folded: markdown.tall && !unfolded,
+                names: &names,
+                now,
+                on_toggle: Rc::new(move |cx: &mut App| {
+                    thread.update(cx, |thread, cx| thread.toggle(id, cx));
+                }),
+            };
+
+            message_row(&row, &colors)
         })
         .size_full()
     }
@@ -745,6 +920,17 @@ pub(crate) fn render(
         .id("swarm-view")
         .size_full()
         .items_stretch()
+        .on_mouse_move(cx.listener(|workspace, event: &MouseMoveEvent, _, cx| {
+            workspace.drag_inspector(event, cx);
+        }))
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(|workspace, _, _, cx| workspace.end_inspector_drag(cx)),
+        )
+        .on_mouse_up_out(
+            MouseButton::Left,
+            cx.listener(|workspace, _, _, cx| workspace.end_inspector_drag(cx)),
+        )
         .child(
             v_flex()
                 .flex_1()
@@ -1082,7 +1268,12 @@ fn stats_line(workspace: &Workspace, agent: &Agent, zoom: f32, cx: &App) -> gpui
     let colors = cx.theme().colors();
     let (add, del) = (colors.add, colors.del);
 
-    match workspace.data.diff_stats.get(&agent.id) {
+    match workspace
+        .data
+        .agent_changes
+        .get(&agent.id)
+        .map(|changes| changes.stat)
+    {
         Some(stat) => h_flex()
             .gap(px(4. * zoom))
             .child(mono(format!("+{}", stat.additions), 11. * zoom, add))
@@ -1188,6 +1379,8 @@ fn card(
 
 fn inspector(workspace: &Workspace, data: &SwarmData, cx: &mut Context<Workspace>) -> AnyElement {
     let colors = cx.theme().colors().clone();
+    let this = cx.entity();
+    let (start, nudge) = (this.clone(), this);
 
     let selected = data
         .selected
@@ -1204,32 +1397,40 @@ fn inspector(workspace: &Workspace, data: &SwarmData, cx: &mut Context<Workspace
             .into_any_element(),
     };
 
+    let handle = ResizeHandle::new(
+        "inspector-resize",
+        "Resize inspector",
+        &workspace.inspector_handle,
+    )
+    .value(
+        workspace.inspector_width,
+        INSPECTOR_MIN_WIDTH,
+        INSPECTOR_MAX_WIDTH,
+    )
+    .dragging(workspace.inspector_drag.is_some())
+    .on_drag_start(move |event, _, cx| {
+        start.update(cx, |workspace, cx| {
+            workspace.start_inspector_drag(event.position.x, cx);
+        });
+    })
+    .on_nudge(move |direction, _, cx| {
+        nudge.update(cx, |workspace, cx| workspace.nudge_inspector(direction, cx));
+    });
+
     v_flex()
         .id("inspector")
+        .debug_selector(|| "inspector".to_owned())
         .role(Role::Complementary)
         .aria_label("Selected agent")
-        .w(px(INSPECTOR_WIDTH))
+        .relative()
+        .w(px(workspace.inspector_width))
         .flex_none()
         .h_full()
         .min_h_0()
         .border_l_1()
         .border_color(colors.line)
         .child(body)
-        .into_any_element()
-}
-
-fn definition(label: &'static str, value: impl IntoElement, colors: &ThemeColors) -> AnyElement {
-    h_flex()
-        .items_start()
-        .child(
-            div()
-                .w(px(84.))
-                .flex_none()
-                .text_size(px(12.))
-                .text_color(colors.faint)
-                .child(label),
-        )
-        .child(div().flex_1().min_w_0().text_size(px(12.)).child(value))
+        .child(handle)
         .into_any_element()
 }
 
@@ -1241,125 +1442,384 @@ fn inspector_body(
 ) -> AnyElement {
     let colors = cx.theme().colors().clone();
     let id = agent.id;
+    let tab = workspace.inspector_tab;
+    let this = cx.entity();
 
-    let changes = match workspace.data.diff_stats.get(&id) {
-        Some(stat) => h_flex()
-            .gap(px(4.))
-            .child(
-                div()
-                    .text_color(colors.add)
-                    .child(format!("+{}", stat.additions)),
-            )
-            .child(
-                div()
-                    .text_color(colors.del)
-                    .child(format!("\u{2212}{}", stat.deletions)),
-            )
-            .child(
-                div()
-                    .text_color(colors.muted)
-                    .child(format!("\u{b7} {}", plural(stat.files, "file", "files"))),
-            )
-            .into_any_element(),
-        None => div().child("\u{2014}").into_any_element(),
-    };
-    let running = running_time(agent.running_since(), agent.ended_at, data.now)
-        .unwrap_or_else(|| "\u{2014}".to_owned());
-
-    let header = h_flex()
-        .p(px(14.))
+    let title = h_flex()
         .gap(px(10.))
-        .flex_none()
-        .border_b_1()
-        .border_color(colors.line)
         .child(Icon::new(kind_icon(agent.kind)).size(IconSize::Custom(px(20.))))
         .child(
-            Label::new(agent.name.clone())
-                .size(LabelSize::Large)
-                .weight(FontWeight::SEMIBOLD),
+            div().min_w_0().child(
+                Label::new(agent.name.clone())
+                    .size(LabelSize::Large)
+                    .weight(FontWeight::SEMIBOLD)
+                    .truncate(),
+            ),
         )
+        .child(StatusPill::new(agent.status))
         .child(div().flex_1())
-        .child(StatusPill::new(agent.status));
-
-    let definitions = v_flex()
-        .flex_none()
-        .gap(px(8.))
-        .px(px(14.))
-        .py(px(12.))
-        .border_b_1()
-        .border_color(colors.line)
-        .child(definition(
-            "Agent",
-            format!("{} \u{b7} {}", agent.kind.label(), agent.model),
-            &colors,
-        ))
-        .child(definition(
-            "Worktree",
-            mono(workspace.worktree_label(agent), 11., colors.fg),
-            &colors,
-        ))
-        .child(definition(
-            "Branch",
-            mono(workspace.branch_label(agent), 11., colors.fg),
-            &colors,
-        ))
-        .child(definition("Running", running, &colors))
-        .child(definition("Changes", changes, &colors));
-
-    let messages = v_flex()
-        .flex_1()
-        .min_h_0()
-        .px(px(14.))
-        .pt(px(12.))
-        .gap(px(12.))
         .child(
-            Label::new("Messages")
-                .size(LabelSize::Small)
-                .color(Color::Faint),
+            Button::new("inspector-diff", "View diff").on_click(cx.listener(
+                move |workspace, _: &ClickEvent, _, cx| {
+                    workspace.view_agent_diff(id, cx);
+                },
+            )),
         )
         .child(
-            div()
-                .id("message-thread")
-                .role(Role::List)
-                .aria_label("Messages")
-                .flex_1()
-                .min_h_0()
-                .child(workspace.thread.clone().cached(full_size())),
+            Button::new("inspector-focus", "Focus")
+                .variant(ButtonVariant::Primary)
+                .on_click(cx.listener(move |workspace, _: &ClickEvent, _, cx| {
+                    workspace.focus_swarm_agent(id, cx);
+                })),
         );
 
-    let buttons = h_flex()
-        .flex_none()
-        .gap(px(8.))
-        .px(px(14.))
-        .py(px(12.))
+    let mut facts = vec![format!("{} \u{b7} {}", agent.kind.label(), agent.model)];
+    facts.extend(running_time(
+        agent.running_since(),
+        agent.ended_at,
+        data.now,
+    ));
+    facts.push(
+        if workspace.in_task_worktree(agent) {
+            "Task worktree"
+        } else {
+            "Own worktree"
+        }
+        .to_owned(),
+    );
+
+    let details = v_flex()
+        .gap(px(4.))
+        .mt(px(-4.))
         .child(
-            div().flex_1().child(
-                Button::new("inspector-focus", "Focus")
-                    .variant(ButtonVariant::Primary)
-                    .full_width()
-                    .on_click(cx.listener(move |workspace, _: &ClickEvent, _, cx| {
-                        workspace.focus_swarm_agent(id, cx);
-                    })),
-            ),
+            h_flex()
+                .flex_wrap()
+                .gap_x(px(12.))
+                .gap_y(px(4.))
+                .text_size(px(12.))
+                .text_color(colors.muted)
+                .children(facts.into_iter().map(|fact| div().child(fact))),
         )
         .child(
-            div().flex_1().child(
-                Button::new("inspector-diff", "View diff")
-                    .full_width()
-                    .on_click(cx.listener(move |workspace, _: &ClickEvent, _, cx| {
-                        workspace.view_agent_diff(id, cx);
-                    })),
-            ),
+            mono(workspace.branch_label(agent), 11., colors.faint)
+                .whitespace_nowrap()
+                .truncate(),
         );
+
+    let mut tabs = TabStrip::new("inspector-tabs", "Inspector")
+        .tab_with_count("Messages", workspace.thread_len(id).to_string());
+    tabs = match workspace.data.agent_changes.get(&id) {
+        Some(changes) => tabs.tab_with_count("Changes", changes.stat.files.to_string()),
+        None => tabs.tab("Changes"),
+    };
+    let tabs = tabs
+        .tab("Terminal")
+        .selected(tab.index())
+        .debug_selector(|| "inspector-tab".to_owned())
+        .on_select(move |index, _, cx| {
+            this.update(cx, |workspace, cx| {
+                workspace.select_inspector_tab(InspectorTab::from_index(index), cx);
+            });
+        });
+
+    let content = match tab {
+        InspectorTab::Messages => div()
+            .id("message-thread")
+            .role(Role::List)
+            .aria_label("Messages")
+            .flex_1()
+            .min_h_0()
+            .px(px(16.))
+            .pt(px(2.))
+            .child(workspace.thread.clone().cached(full_size()))
+            .into_any_element(),
+        InspectorTab::Changes => changes_tab(workspace, agent, cx),
+        InspectorTab::Terminal => terminal_tab(workspace, agent, cx),
+    };
 
     v_flex()
         .size_full()
         .min_h_0()
-        .child(header)
-        .child(definitions)
-        .child(messages)
-        .child(workspace.preview.clone())
-        .child(buttons)
+        .child(
+            v_flex()
+                .flex_none()
+                .gap(px(12.))
+                .px(px(16.))
+                .pt(px(14.))
+                .child(title)
+                .child(details)
+                .child(tabs),
+        )
+        .child(content)
+        .into_any_element()
+}
+
+fn signed(additions: u32, deletions: u32, colors: &ThemeColors) -> gpui::Div {
+    h_flex()
+        .flex_none()
+        .gap(px(4.))
+        .child(mono(format!("+{additions}"), 11., colors.add))
+        .child(mono(format!("\u{2212}{deletions}"), 11., colors.del))
+}
+
+fn changes_tab(workspace: &Workspace, agent: &Agent, cx: &mut Context<Workspace>) -> AnyElement {
+    let colors = cx.theme().colors().clone();
+    let id = agent.id;
+
+    let Some(changes) = workspace
+        .data
+        .agent_changes
+        .get(&id)
+        .filter(|changes| changes.stat.files > 0)
+    else {
+        return div()
+            .flex_1()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(Label::new("No changes").color(Color::Faint))
+            .into_any_element();
+    };
+    let stat = changes.stat;
+
+    let files = uniform_list(
+        "changed-files",
+        changes.files.len(),
+        cx.processor(move |workspace, range: Range<usize>, _, cx| {
+            let colors = cx.theme().colors().clone();
+            let Some(changes) = workspace.data.agent_changes.get(&id) else {
+                return Vec::new();
+            };
+            let listed = Rc::clone(&changes.files);
+
+            range
+                .filter_map(|index| listed.get(index).map(|file| (index, file)))
+                .map(|(index, file)| file_row(index, file, id, &colors, cx))
+                .collect()
+        }),
+    )
+    .size_full();
+
+    v_flex()
+        .flex_1()
+        .min_h_0()
+        .pt(px(12.))
+        .gap(px(10.))
+        .child(
+            h_flex()
+                .flex_none()
+                .gap(px(8.))
+                .px(px(16.))
+                .child(signed(stat.additions, stat.deletions, &colors))
+                .child(
+                    Label::new(plural(stat.files, "file", "files"))
+                        .size(LabelSize::Small)
+                        .color(Color::Faint),
+                ),
+        )
+        .child(
+            div()
+                .id("changed-files-list")
+                .role(Role::List)
+                .aria_label("Changed files")
+                .flex_1()
+                .min_h_0()
+                .px(px(8.))
+                .child(files),
+        )
+        .into_any_element()
+}
+
+fn file_label(path: &Path, additions: u32, deletions: u32) -> String {
+    let name = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let mut parts = vec![name];
+
+    if additions > 0 {
+        parts.push(plural(additions, "addition", "additions"));
+    }
+    if deletions > 0 {
+        parts.push(plural(deletions, "deletion", "deletions"));
+    }
+    parts.push("open in Review".to_owned());
+
+    parts.join(", ")
+}
+
+fn file_row(
+    index: usize,
+    file: &FileStat,
+    agent: AgentId,
+    colors: &ThemeColors,
+    cx: &mut Context<Workspace>,
+) -> AnyElement {
+    let name = file.path.file_name().map_or_else(
+        || file.path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let folder = file
+        .path
+        .parent()
+        .map(|folder| folder.display().to_string())
+        .unwrap_or_default();
+    let (path, accent, active) = (file.path.clone(), colors.accent, colors.active);
+
+    div()
+        .h(px(36.))
+        .child(
+            h_flex()
+                .id(("changed-file", index))
+                .debug_selector(|| format!("changed-file-{index}"))
+                .role(Role::Button)
+                .aria_label(file_label(&file.path, file.additions, file.deletions))
+                .focusable()
+                .tab_stop(true)
+                .cursor_pointer()
+                .h(px(34.))
+                .gap(px(10.))
+                .px(px(8.))
+                .rounded(px(7.))
+                .hover(move |style| style.bg(active))
+                .focus_visible(move |style| focus_ring(style, accent))
+                .on_click(cx.listener(move |workspace, _: &ClickEvent, _, cx| {
+                    workspace.view_file_diff(agent, path.clone(), cx);
+                }))
+                .child(
+                    Icon::new(IconName::File)
+                        .size(IconSize::Custom(px(14.)))
+                        .color(Color::Faint),
+                )
+                .child(Label::new(name).weight(FontWeight::MEDIUM))
+                .child(
+                    div().flex_1().min_w_0().child(
+                        mono(folder, 11., colors.faint)
+                            .whitespace_nowrap()
+                            .truncate(),
+                    ),
+                )
+                .child(signed(file.additions, file.deletions, colors)),
+        )
+        .into_any_element()
+}
+
+fn terminal_tab(workspace: &Workspace, agent: &Agent, cx: &mut Context<Workspace>) -> AnyElement {
+    let rows: Vec<AnyElement> = workspace
+        .active_task()
+        .processes
+        .iter()
+        .filter_map(|id| workspace.data.terminal(*id))
+        .filter(|terminal| terminal.owner == Some(agent.id))
+        .map(|terminal| process_row(workspace, terminal, cx))
+        .collect();
+
+    v_flex()
+        .flex_1()
+        .min_h_0()
+        .px(px(16.))
+        .pt(px(12.))
+        .pb(px(16.))
+        .gap(px(6.))
+        .child(
+            div()
+                .flex_1()
+                .min_h_0()
+                .child(workspace.preview.clone().cached(full_size())),
+        )
+        .when(!rows.is_empty(), |tab| {
+            tab.child(
+                div().flex_none().mt(px(8.)).child(
+                    Label::new("Process terminals")
+                        .size(LabelSize::Small)
+                        .color(Color::Faint),
+                ),
+            )
+            .child(
+                v_flex()
+                    .id("process-terminals")
+                    .role(Role::List)
+                    .aria_label("Process terminals")
+                    .flex_none()
+                    .gap(px(2.))
+                    .children(rows),
+            )
+        })
+        .into_any_element()
+}
+
+fn exit_label(exit: Option<&swarm_term::ExitStatus>) -> String {
+    match exit {
+        None => "Running".to_owned(),
+        Some(swarm_term::ExitStatus::Code(code)) => format!("Exited {code}"),
+        Some(swarm_term::ExitStatus::Signal(signal)) => format!("Exited {signal}"),
+    }
+}
+
+fn process_row(
+    workspace: &Workspace,
+    terminal: &crate::model::Terminal,
+    cx: &mut Context<Workspace>,
+) -> AnyElement {
+    let colors = cx.theme().colors().clone();
+    let id = terminal.id;
+
+    let live = workspace
+        .live_terminals
+        .get(&id)
+        .map(|live| live.view.read(cx));
+    let exit = live.map_or(terminal.exit.as_ref(), TerminalView::exit_status);
+    let size = live
+        .and_then(TerminalView::grid_size)
+        .or(terminal.requested_size)
+        .or(terminal.fixed_size);
+    let state = exit_label(exit);
+    let running = exit.is_none();
+
+    let label = format!(
+        "{}, {}, focus in Terminals",
+        terminal.title,
+        state.to_lowercase()
+    );
+    let (accent, active) = (colors.accent, colors.active);
+
+    let dot = div().flex_none().size(px(6.)).rounded(px(6.));
+    let dot = if running {
+        dot.bg(colors.ok)
+    } else {
+        dot.border_1().border_color(colors.faint)
+    };
+
+    h_flex()
+        .id(("process", id.0 as usize))
+        .debug_selector(|| format!("process-{}", id.0))
+        .role(Role::Button)
+        .aria_label(label)
+        .focusable()
+        .tab_stop(true)
+        .cursor_pointer()
+        .h(px(32.))
+        .gap(px(10.))
+        .mx(px(-8.))
+        .px(px(8.))
+        .rounded(px(7.))
+        .hover(move |style| style.bg(active))
+        .focus_visible(move |style| focus_ring(style, accent))
+        .on_click(cx.listener(move |workspace, _: &ClickEvent, _, cx| {
+            workspace.focus_process(id, cx);
+        }))
+        .child(dot)
+        .child(
+            div().flex_1().min_w_0().child(
+                mono(terminal.title.clone(), 11.5, colors.fg)
+                    .whitespace_nowrap()
+                    .truncate(),
+            ),
+        )
+        .children(size.map(|(columns, rows)| {
+            mono(format!("{columns}\u{d7}{rows}"), 11., colors.faint).flex_none()
+        }))
+        .child(Label::new(state).size(LabelSize::Small).color(Color::Muted))
         .into_any_element()
 }
 
@@ -1377,46 +1837,135 @@ fn agent_name(
         .unwrap_or_else(|| SharedString::new_static("agent"))
 }
 
-fn message_row(
+/// What one row of the thread needs to draw itself.
+struct MessageRow<'a> {
     index: usize,
-    message: &Message,
+    message: &'a Message,
+    markdown: &'a Markdown,
+    folded: bool,
+    names: &'a HashMap<DaemonAgentId, SharedString>,
     now: u64,
-    names: &HashMap<DaemonAgentId, SharedString>,
-    colors: &ThemeColors,
-) -> AnyElement {
-    let when = if message.delivered_at.is_none() {
-        "in flight".to_owned()
-    } else {
-        relative_time(message.sent_at, now)
-    };
+    on_toggle: Rc<dyn Fn(&mut App)>,
+}
 
-    v_flex()
-        .id(("message", index))
-        .role(Role::ListItem)
-        .pb(px(12.))
+fn capitalised(word: &str) -> String {
+    let mut letters = word.chars();
+
+    letters.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(letters).collect()
+    })
+}
+
+/// The text and fill of a message kind's tag.
+fn kind_tag_colors(kind: MessageKind, colors: &ThemeColors) -> (Hsla, Hsla) {
+    match kind {
+        MessageKind::Brief | MessageKind::Task => (colors.accent, colors.accent_bg),
+        MessageKind::Question => (colors.warn, colors.warn_bg),
+        MessageKind::Report => (colors.ok, colors.ok_bg),
+        MessageKind::TerminalExited | MessageKind::UserInput | MessageKind::WorkerStopped => {
+            (colors.muted, colors.soft)
+        }
+    }
+}
+
+fn message_row(row: &MessageRow<'_>, colors: &ThemeColors) -> AnyElement {
+    let message = row.message;
+    let in_flight = message.delivered_at.is_none();
+    let when = if in_flight {
+        "In flight".to_owned()
+    } else {
+        relative_time(message.sent_at, row.now)
+    };
+    let (tag_color, tag_fill) = kind_tag_colors(message.kind, colors);
+
+    let header = h_flex()
+        .gap(px(6.))
+        .text_size(px(12.))
         .child(
-            v_flex()
-                .gap(px(4.))
+            div()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(agent_name(row.names, message.from)),
+        )
+        .child(div().text_color(colors.faint).child(format!(
+            "\u{2192} {}",
+            agent_name(row.names, Some(message.to))
+        )))
+        .child(
+            div()
+                .px(px(6.))
+                .rounded(px(4.))
+                .bg(tag_fill)
+                .text_color(tag_color)
+                .text_size(px(11.))
+                .line_height(px(18.))
+                .font_weight(FontWeight::MEDIUM)
+                .child(capitalised(message.kind.label())),
+        )
+        .child(div().flex_1())
+        .child(mono(
+            when,
+            11.,
+            if in_flight { colors.ok } else { colors.faint },
+        ));
+
+    let body = div()
+        .relative()
+        .when(row.folded, |body| {
+            body.max_h(px(FOLDED_HEIGHT)).overflow_hidden()
+        })
+        .child(markdown::render(row.markdown, colors))
+        .when(row.folded, |body| {
+            body.child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .h(px(56.))
+                    .bg(linear_gradient(
+                        180.,
+                        linear_color_stop(colors.panel.opacity(0.), 0.),
+                        linear_color_stop(colors.panel, 1.),
+                    )),
+            )
+        });
+
+    let toggle = row.markdown.tall.then(|| {
+        let label = if row.folded { "Show more" } else { "Show less" };
+        let on_toggle = Rc::clone(&row.on_toggle);
+        let accent = colors.accent;
+
+        h_flex().child(
+            div()
+                .id(("message-fold", row.index))
+                .debug_selector(|| format!("message-fold-{}", row.index))
+                .role(Role::Button)
+                .aria_label(label)
+                .focusable()
+                .tab_stop(true)
+                .cursor_pointer()
+                .rounded(px(4.))
+                .focus_visible(move |style| focus_ring(style, accent))
+                .on_click(move |_, _, cx| on_toggle(cx))
                 .child(
-                    h_flex()
-                        .gap(px(6.))
-                        .child(
-                            mono(agent_name(names, message.from), 11., colors.fg)
-                                .font_weight(FontWeight::MEDIUM),
-                        )
-                        .child(mono("\u{2192}", 11., colors.faint))
-                        .child(mono(agent_name(names, Some(message.to)), 11., colors.faint))
-                        .child(div().flex_1())
-                        .child(mono(when, 11., colors.faint)),
-                )
-                .child(
-                    div()
-                        .text_size(px(12.5))
-                        .line_height(px(18.75))
-                        .text_color(colors.muted)
-                        .child(message.text.clone()),
+                    Label::new(label)
+                        .size(LabelSize::Small)
+                        .weight(FontWeight::MEDIUM)
+                        .color(Color::Accent),
                 ),
         )
+    });
+
+    v_flex()
+        .id(("message", row.index))
+        .role(Role::ListItem)
+        .py(px(12.))
+        .gap(px(8.))
+        .border_b_1()
+        .border_color(colors.line)
+        .child(header)
+        .child(body)
+        .children(toggle)
         .into_any_element()
 }
 
@@ -1489,7 +2038,7 @@ mod tests {
             kinds,
             [
                 Some(MessageKind::Task),
-                Some(MessageKind::Question),
+                Some(MessageKind::Task),
                 Some(MessageKind::Report),
                 None
             ]
@@ -1500,7 +2049,7 @@ mod tests {
     fn messages_in_flight_become_dots_by_sender(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
 
-        let (down, up, none) = workspace.read_with(cx, |workspace, _| {
+        let (term_render, pty_io, none) = workspace.read_with(cx, |workspace, _| {
             let messages: Vec<&Message> = workspace
                 .data
                 .task_messages(workspace.active_task)
@@ -1511,9 +2060,27 @@ mod tests {
             (dots("term-render"), dots("pty-io"), dots("ui-tokens"))
         });
 
-        assert_eq!(down, [(0.35, MessageKind::Task)]);
-        assert_eq!(up, [(0.65, MessageKind::Question)]);
+        assert_eq!(term_render, [(0.35, MessageKind::Task)]);
+        assert_eq!(pty_io, [(0.35, MessageKind::Task)]);
         assert!(none.is_empty());
+    }
+
+    #[test]
+    fn a_message_from_the_worker_starts_on_its_side_of_the_curve() {
+        let (orchestrator, worker) = (DaemonAgentId(1), DaemonAgentId(2));
+        let question = Message {
+            id: MessageId(1),
+            from: Some(worker),
+            to: orchestrator,
+            kind: MessageKind::Question,
+            text: SharedString::default(),
+            sent_at: 1,
+            delivered_at: None,
+        };
+
+        let dots = flight_dots(&[&question], orchestrator, worker);
+
+        assert_eq!(dots, [(0.65, MessageKind::Question)]);
     }
 
     #[test]
@@ -1678,7 +2245,7 @@ mod tests {
         workspace.update(cx, |workspace, cx| {
             workspace.message_event(
                 swarm_protocol::MessageEvent::Delivered {
-                    ids: vec![MessageId(6), MessageId(7)],
+                    ids: vec![MessageId(7), MessageId(8)],
                     delivered_at: SAMPLE_NOW,
                 },
                 cx,
@@ -1745,7 +2312,7 @@ mod tests {
 
     fn add_thread_messages(
         workspace: &Entity<Workspace>,
-        range: std::ops::Range<u64>,
+        range: Range<u64>,
         cx: &mut VisualTestContext,
     ) {
         workspace.update(cx, |workspace, cx| {
@@ -1920,5 +2487,401 @@ mod tests {
 
         let count = workspace.read_with(cx, |workspace, _| agents(workspace).len());
         assert_eq!(count, 1);
+    }
+
+    fn worker_named(
+        workspace: &Entity<Workspace>,
+        name: &str,
+        cx: &mut VisualTestContext,
+    ) -> AgentId {
+        workspace.read_with(cx, |workspace, _| {
+            agents(workspace)
+                .into_iter()
+                .find(|(_, agent, _)| agent == name)
+                .map_or(AgentId(u32::MAX), |(id, _, _)| id)
+        })
+    }
+
+    fn show_agent(
+        workspace: &Entity<Workspace>,
+        name: &str,
+        cx: &mut VisualTestContext,
+    ) -> AgentId {
+        let agent = worker_named(workspace, name, cx);
+
+        workspace.update(cx, |workspace, cx| workspace.select_swarm_agent(agent, cx));
+        redraw(cx);
+
+        agent
+    }
+
+    fn click(selector: &'static str, cx: &mut VisualTestContext) {
+        let bounds = cx.debug_bounds(selector);
+        assert!(bounds.is_some(), "{selector} is not on screen");
+
+        cx.simulate_click(
+            bounds.map_or_else(Default::default, |bounds| bounds.center()),
+            gpui::Modifiers::none(),
+        );
+        redraw(cx);
+    }
+
+    fn tab(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> InspectorTab {
+        workspace.read_with(cx, |workspace, _| workspace.inspector_tab)
+    }
+
+    #[gpui::test]
+    fn the_tabs_switch_and_keep_their_choice_for_every_agent(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        assert_eq!(tab(&workspace, cx), InspectorTab::Messages);
+
+        click("inspector-tab-1", cx);
+        assert_eq!(tab(&workspace, cx), InspectorTab::Changes);
+
+        show_agent(&workspace, "pty-io", cx);
+        assert_eq!(tab(&workspace, cx), InspectorTab::Changes);
+
+        click("inspector-tab-2", cx);
+        show_agent(&workspace, "bench", cx);
+        assert_eq!(tab(&workspace, cx), InspectorTab::Terminal);
+
+        click("inspector-tab-0", cx);
+        assert_eq!(tab(&workspace, cx), InspectorTab::Messages);
+    }
+
+    #[gpui::test]
+    fn the_arrow_keys_move_between_the_tabs_of_the_strip(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        click("inspector-tab-0", cx);
+
+        cx.simulate_keystrokes("right");
+        assert_eq!(tab(&workspace, cx), InspectorTab::Changes);
+
+        cx.simulate_keystrokes("right");
+        assert_eq!(tab(&workspace, cx), InspectorTab::Terminal);
+
+        cx.simulate_keystrokes("left");
+        assert_eq!(tab(&workspace, cx), InspectorTab::Changes);
+
+        redraw(cx);
+        cx.simulate_keystrokes("left left");
+        assert_eq!(tab(&workspace, cx), InspectorTab::Terminal);
+    }
+
+    #[gpui::test]
+    fn tab_reaches_the_strip_and_the_arrows_work_from_there(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let orchestrator = worker_named(&workspace, "orchestrator", cx);
+
+        let mut reached = None;
+        for presses in 1..=12 {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.select_inspector_tab(InspectorTab::Messages, cx);
+                let handle = workspace.swarm_handle(orchestrator, cx);
+                window.focus(&handle, cx);
+            });
+            redraw(cx);
+
+            for _ in 0..presses {
+                cx.simulate_keystrokes("tab");
+            }
+            cx.simulate_keystrokes("right");
+
+            if tab(&workspace, cx) == InspectorTab::Changes {
+                reached = Some(presses);
+                break;
+            }
+        }
+
+        assert!(reached.is_some(), "Tab never reached the tab strip");
+    }
+
+    #[gpui::test]
+    fn the_thread_parses_each_message_once_into_blocks(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        show_agent(&workspace, "pty-io", cx);
+
+        let brief = workspace.read_with(cx, |workspace, cx| {
+            workspace.thread.read(cx).parsed.first().cloned()
+        });
+        let brief = brief.expect("the brief");
+        let kinds: Vec<&str> = brief
+            .blocks
+            .iter()
+            .map(|block| match block {
+                markdown::Block::Paragraph(_) => "paragraph",
+                markdown::Block::Heading(_) => "heading",
+                markdown::Block::Item { .. } => "item",
+                markdown::Block::Code(_) => "code",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            ["paragraph", "heading", "item", "item", "item", "item"]
+        );
+        assert!(brief.tall);
+
+        add_thread_messages(&workspace, 100..101, cx);
+        workspace.update(cx, |workspace, cx| {
+            let bench = workspace.active_task().workers[0];
+            workspace.select_swarm_agent(bench, cx);
+        });
+        show_agent(&workspace, "pty-io", cx);
+
+        let again = workspace.read_with(cx, |workspace, cx| {
+            workspace.thread.read(cx).parsed.first().cloned()
+        });
+        assert!(again.is_some_and(|again| Rc::ptr_eq(&again, &brief)));
+    }
+
+    fn brief_height(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Pixels {
+        workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .thread
+                .read(cx)
+                .list
+                .bounds_for_item(0)
+                .map_or(px(0.), |bounds| bounds.size.height)
+        })
+    }
+
+    #[gpui::test]
+    fn a_long_message_folds_and_show_more_and_less_change_its_height(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        show_agent(&workspace, "pty-io", cx);
+        redraw(cx);
+
+        let folded = brief_height(&workspace, cx);
+        assert!(folded > px(0.));
+        assert!(folded < px(FOLDED_HEIGHT + 100.));
+
+        click("message-fold-0", cx);
+        redraw(cx);
+        let expanded = brief_height(&workspace, cx);
+        assert!(
+            expanded > folded,
+            "{expanded:?} is not taller than {folded:?}"
+        );
+
+        click("message-fold-0", cx);
+        redraw(cx);
+        assert_eq!(brief_height(&workspace, cx), folded);
+    }
+
+    #[gpui::test]
+    fn a_short_message_has_no_fold_button(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        show_agent(&workspace, "pty-io", cx);
+
+        assert!(cx.debug_bounds("message-fold-0").is_some());
+        assert!(cx.debug_bounds("message-fold-1").is_none());
+        assert!(cx.debug_bounds("message-fold-2").is_none());
+        drop(workspace);
+    }
+
+    #[gpui::test]
+    fn a_changed_file_opens_review_at_that_file(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let pty_io = show_agent(&workspace, "pty-io", cx);
+        click("inspector-tab-1", cx);
+
+        click("changed-file-0", cx);
+
+        let (view, agent, file) = workspace.read_with(cx, |workspace, _| {
+            (
+                workspace.view,
+                workspace.review_agent,
+                workspace.review_file.clone(),
+            )
+        });
+        assert_eq!(view, View::Review);
+        assert_eq!(agent, Some(pty_io));
+        assert_eq!(file, Some(PathBuf::from("crates/swarm-term/src/pty.rs")));
+    }
+
+    #[gpui::test]
+    fn view_diff_clears_the_file_a_row_set(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let pty_io = show_agent(&workspace, "pty-io", cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.view_file_diff(pty_io, PathBuf::from("a.rs"), cx);
+            workspace.set_view(View::Swarm, cx);
+        });
+
+        let file = workspace.read_with(cx, |workspace, _| workspace.review_file.clone());
+
+        assert_eq!(file, None);
+    }
+
+    #[test]
+    fn a_file_row_names_its_counts_and_where_it_goes() {
+        let label = file_label(Path::new("crates/swarm-term/src/pty.rs"), 39, 8);
+        let added_only = file_label(Path::new("Cargo.toml"), 1, 0);
+
+        assert_eq!(label, "pty.rs, 39 additions, 8 deletions, open in Review");
+        assert_eq!(added_only, "Cargo.toml, 1 addition, open in Review");
+    }
+
+    #[gpui::test]
+    fn an_agent_without_changes_shows_none(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        show_agent(&workspace, "bench", cx);
+        click("inspector-tab-2", cx);
+        click("inspector-tab-1", cx);
+
+        assert!(cx.debug_bounds("changed-file-0").is_none());
+        let known = workspace.read_with(cx, |workspace, _| {
+            let bench = workspace.active_task().workers[3];
+            workspace.data.agent_changes.contains_key(&bench)
+        });
+        assert!(!known);
+    }
+
+    #[gpui::test]
+    fn a_process_row_focuses_its_tile_in_the_terminals_view(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let pty_io = show_agent(&workspace, "pty-io", cx);
+        click("inspector-tab-2", cx);
+
+        let processes: Vec<TerminalId> = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .active_task()
+                .processes
+                .iter()
+                .copied()
+                .filter(|id| {
+                    workspace
+                        .data
+                        .terminal(*id)
+                        .is_some_and(|terminal| terminal.owner == Some(pty_io))
+                })
+                .collect()
+        });
+        assert_eq!(processes.len(), 2);
+
+        workspace.update(cx, |workspace, cx| workspace.minimize(processes[1], cx));
+        click("process-8", cx);
+
+        let (view, focused, minimized) = workspace.read_with(cx, |workspace, _| {
+            (
+                workspace.view,
+                workspace.focused_terminal,
+                workspace.minimized.contains(&processes[1]),
+            )
+        });
+        assert_eq!(processes[1], TerminalId(8));
+        assert_eq!(view, View::Terminals);
+        assert_eq!(focused, Some(processes[1]));
+        assert!(!minimized);
+    }
+
+    #[test]
+    fn a_process_that_ended_says_how() {
+        assert_eq!(exit_label(None), "Running");
+        assert_eq!(
+            exit_label(Some(&swarm_term::ExitStatus::Code(0))),
+            "Exited 0"
+        );
+        assert_eq!(
+            exit_label(Some(&swarm_term::ExitStatus::Code(2))),
+            "Exited 2"
+        );
+    }
+
+    #[gpui::test]
+    fn the_orchestrator_is_in_the_task_worktree_and_a_worker_in_its_own(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+
+        let (orchestrator, worker) = workspace.read_with(cx, |workspace, _| {
+            let task = workspace.active_task();
+            let agent = |id: Option<AgentId>| id.and_then(|id| workspace.data.agent(id));
+
+            (
+                agent(task.orchestrator).map(|agent| workspace.in_task_worktree(agent)),
+                agent(task.workers.first().copied()).map(|agent| workspace.in_task_worktree(agent)),
+            )
+        });
+
+        assert_eq!(orchestrator, Some(true));
+        assert_eq!(worker, Some(false));
+    }
+
+    fn width(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> f32 {
+        workspace.read_with(cx, |workspace, _| workspace.inspector_width)
+    }
+
+    #[gpui::test]
+    fn the_inspector_width_stays_between_the_limits(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        assert!((width(&workspace, cx) - INSPECTOR_WIDTH).abs() < 1e-6);
+
+        workspace.update(cx, |workspace, cx| workspace.set_inspector_width(100., cx));
+        assert!((width(&workspace, cx) - 320.).abs() < 1e-6);
+
+        workspace.update(cx, |workspace, cx| workspace.set_inspector_width(900., cx));
+        assert!((width(&workspace, cx) - 640.).abs() < 1e-6);
+    }
+
+    #[gpui::test]
+    fn the_arrow_keys_resize_the_inspector_by_twenty_pixels(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            let handle = workspace.inspector_handle.clone();
+            window.focus(&handle, cx);
+        });
+        redraw(cx);
+
+        cx.simulate_keystrokes("left");
+        assert!((width(&workspace, cx) - 420.).abs() < 1e-6);
+
+        cx.simulate_keystrokes("right right");
+        assert!((width(&workspace, cx) - 380.).abs() < 1e-6);
+
+        workspace.update(cx, |workspace, cx| workspace.set_inspector_width(630., cx));
+        cx.simulate_keystrokes("left left");
+        assert!((width(&workspace, cx) - 640.).abs() < 1e-6);
+    }
+
+    #[gpui::test]
+    fn dragging_the_left_border_resizes_the_inspector_within_the_limits(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let bounds = cx.debug_bounds("inspector").expect("the inspector");
+        let border = point(bounds.origin.x, bounds.center().y);
+        let none = gpui::Modifiers::none();
+
+        cx.simulate_mouse_down(border, MouseButton::Left, none);
+        cx.simulate_mouse_move(border - point(px(60.), px(0.)), MouseButton::Left, none);
+        assert!((width(&workspace, cx) - 460.).abs() < 1.0);
+        assert!(workspace.read_with(cx, |workspace, _| workspace.inspector_drag.is_some()));
+
+        cx.simulate_mouse_move(border - point(px(900.), px(0.)), MouseButton::Left, none);
+        assert!((width(&workspace, cx) - 640.).abs() < 1e-6);
+
+        cx.simulate_mouse_move(border + point(px(300.), px(0.)), MouseButton::Left, none);
+        assert!((width(&workspace, cx) - 320.).abs() < 1e-6);
+
+        cx.simulate_mouse_up(border, MouseButton::Left, none);
+        assert!(workspace.read_with(cx, |workspace, _| workspace.inspector_drag.is_none()));
+    }
+
+    #[gpui::test]
+    fn the_inspector_width_does_not_change_the_terminal_area(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        workspace.update(cx, |workspace, cx| workspace.set_view(View::Terminals, cx));
+        redraw(cx);
+        redraw(cx);
+        let before = workspace.read_with(cx, |workspace, _| workspace.terminal_area);
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_view(View::Swarm, cx);
+            workspace.set_inspector_width(600., cx);
+            workspace.set_view(View::Terminals, cx);
+        });
+        redraw(cx);
+        redraw(cx);
+
+        let after = workspace.read_with(cx, |workspace, _| workspace.terminal_area);
+        assert!(before.is_some());
+        assert_eq!(before, after);
     }
 }

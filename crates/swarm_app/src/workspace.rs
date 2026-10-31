@@ -20,7 +20,9 @@ use crate::model::{
     AgentId, FakeData, ProjectId, SAMPLE_NOW, Task, TaskId, TaskStatus, TerminalId, TerminalKind,
 };
 use crate::palette::Overlay;
-use crate::swarm_view::{DotGrid, MessageThread, TerminalPreview};
+use crate::swarm_view::{
+    DotGrid, INSPECTOR_WIDTH, InspectorDrag, InspectorTab, MessageThread, TerminalPreview,
+};
 use crate::views::Resizing;
 use crate::{panels, sidebar, status_bar, tab_bar, views};
 
@@ -103,6 +105,14 @@ pub(crate) struct Workspace {
     pub(crate) swarm_zoom: f32,
     /// The agent Review shows, set by View diff.
     pub(crate) review_agent: Option<AgentId>,
+    /// The file Review opens at, set by a row of the Changes tab.
+    pub(crate) review_file: Option<PathBuf>,
+    /// The inspector tab, kept for the window and not for each agent.
+    pub(crate) inspector_tab: InspectorTab,
+    /// In memory only: `settings.toml` holds config, not window state.
+    pub(crate) inspector_width: f32,
+    pub(crate) inspector_drag: Option<InspectorDrag>,
+    pub(crate) inspector_handle: FocusHandle,
     pub(crate) thread: Entity<MessageThread>,
     pub(crate) preview: Entity<TerminalPreview>,
     pub(crate) dot_grid: Entity<DotGrid>,
@@ -200,6 +210,11 @@ impl Workspace {
             swarm_focus: HashMap::new(),
             swarm_zoom: 1.,
             review_agent: None,
+            review_file: None,
+            inspector_tab: InspectorTab::default(),
+            inspector_width: INSPECTOR_WIDTH,
+            inspector_drag: None,
+            inspector_handle: cx.focus_handle().tab_stop(true),
             thread: cx.new(|_| MessageThread::new()),
             preview: cx.new(|_| TerminalPreview::new()),
             dot_grid: cx.new(|_| DotGrid),
@@ -291,6 +306,7 @@ impl Workspace {
     pub(crate) fn set_view(&mut self, view: View, cx: &mut Context<Self>) {
         self.view = view;
         self.review_agent = None;
+        self.review_file = None;
         cx.notify();
     }
 

@@ -2,6 +2,7 @@
 
 mod actions;
 mod daemon;
+mod markdown;
 mod model;
 mod new_task;
 mod palette;

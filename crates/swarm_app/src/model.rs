@@ -2,12 +2,13 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use gpui::{Hsla, SharedString, rgb};
 use swarm_protocol::{
     AgentId as DaemonAgentId, AgentInfo, AgentLifecycle, AgentRole,
-    AgentStatus as DaemonAgentStatus, DiffStat, MessageId, MessageInfo, MessageKind, ProjectInfo,
-    TaskInfo, TerminalId as DaemonTerminalId, TerminalInfo,
+    AgentStatus as DaemonAgentStatus, DiffStat, FileStat, MessageId, MessageInfo, MessageKind,
+    ProjectInfo, TaskInfo, TerminalId as DaemonTerminalId, TerminalInfo,
 };
 use swarm_term::{BlockedKind, ExitStatus};
 use swarm_ui::AgentStatus;
@@ -328,6 +329,8 @@ pub(crate) struct Terminal {
     pub requested_size: Option<(u16, u16)>,
     /// Columns and rows an agent fixed. The app never resizes such a terminal.
     pub fixed_size: Option<(u16, u16)>,
+    /// How a process ended. `None` while it runs. A live terminal's view knows it too.
+    pub exit: Option<ExitStatus>,
     pub lines: Vec<FakeLine>,
 }
 
@@ -388,6 +391,15 @@ pub(crate) const PULL_REQUEST_DESCRIPTION: &str = "## What
 ## Notes for reviewers
 
 - check the frame bench in crates/swarm-term/benches";
+
+const PTY_BRIEF: &str = "Wire PTY read and write on a background thread in `crates/swarm-term`. Report the API back to me.
+
+## Scope
+
+- Spawn the shell with `portable-pty` or raw `openpty`. Ask me before you add a dependency.
+- Read output on its own thread and send it over a `flume` channel.
+- Resize with `TIOCSWINSZ` when the grid changes.
+- Add tests for spawn, resize and exit.";
 
 /// The `PRStatus` mockup's pull request.
 pub(crate) fn sample_pull_request() -> FakePullRequest {
@@ -468,7 +480,14 @@ pub(crate) struct FakeData {
     /// Delivery times that came before their message, newest last.
     pub early_deliveries: VecDeque<(MessageId, u64)>,
     /// The latest changes of each agent's worktree. Missing while unknown.
-    pub diff_stats: HashMap<AgentId, DiffStat>,
+    pub agent_changes: HashMap<AgentId, AgentChanges>,
+}
+
+/// What an agent changed: the totals and the files, most changed lines first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AgentChanges {
+    pub stat: DiffStat,
+    pub files: Rc<[FileStat]>,
 }
 
 fn sample_usage() -> Vec<(SharedString, f32)> {
@@ -585,6 +604,7 @@ impl Builder {
             requested_size: None,
             daemon_owner: None,
             fixed_size: None,
+            exit: None,
             lines: spec.lines,
         });
         data.agents.push(Agent {
@@ -647,11 +667,19 @@ impl Builder {
             requested_size: Some(size),
             daemon_owner: None,
             fixed_size: None,
+            exit: None,
             lines: output,
         });
 
         if let Some(entry) = data.tasks.iter_mut().find(|entry| entry.id == task) {
             entry.processes.push(id);
+        }
+    }
+
+    /// Marks the process terminal added last as ended with `code`.
+    fn exited(&mut self, code: u32) {
+        if let Some(terminal) = self.data.terminals.last_mut() {
+            terminal.exit = Some(ExitStatus::Code(code));
         }
     }
 
@@ -782,7 +810,7 @@ impl FakeData {
             AgentSpec {
                 name: "pty-io",
                 kind: AgentKind::Codex,
-                model: "codex",
+                model: "gpt-6-luna",
                 status: AgentStatus::Blocked,
                 lines: lines(&[
                     ("• Ran cargo test -p swarm-term", Color::Default),
@@ -846,6 +874,31 @@ impl FakeData {
                 ("10:41:07 [vite] hmr update /tokens.css", Color::Faint),
             ]),
         );
+
+        builder.process(
+            renderer,
+            pty_io,
+            "cargo test -p swarm-term --watch",
+            (90, 12),
+            None,
+            lines(&[
+                ("running 14 tests", Color::Default),
+                ("test pty::spawn ... ok", Color::Muted),
+                ("test pty::resize ... ok", Color::Muted),
+            ]),
+        );
+        builder.process(
+            renderer,
+            pty_io,
+            "cargo build -p swarm-term",
+            (80, 12),
+            None,
+            lines(&[
+                ("   Compiling swarm-term v0.1.0", Color::Muted),
+                ("    Finished `dev` profile in 3.42s", Color::Muted),
+            ]),
+        );
+        builder.exited(0);
 
         let src = "crates/swarm-term/src";
         builder.change(
@@ -953,6 +1006,56 @@ impl FakeData {
         data
     }
 
+    /// What each worker of the sample task changed.
+    fn add_sample_changes(&mut self, team: &SampleSwarm) {
+        let changes = |files: &[(&str, u32, u32)]| {
+            let (additions, deletions) = files.iter().fold((0, 0), |sum, (_, added, removed)| {
+                (sum.0 + added, sum.1 + removed)
+            });
+            let listed: Vec<FileStat> = files
+                .iter()
+                .map(|(path, additions, deletions)| FileStat {
+                    path: PathBuf::from(path),
+                    additions: *additions,
+                    deletions: *deletions,
+                })
+                .collect();
+
+            AgentChanges {
+                stat: DiffStat {
+                    files: u32::try_from(listed.len()).unwrap_or(u32::MAX),
+                    additions,
+                    deletions,
+                },
+                files: listed.into(),
+            }
+        };
+        self.agent_changes.insert(
+            team.ui_tokens,
+            changes(&[
+                ("crates/swarm-ui/src/tokens.rs", 142, 0),
+                ("crates/swarm-ui/src/theme.rs", 38, 12),
+                ("crates/swarm-ui/src/lib.rs", 6, 0),
+            ]),
+        );
+        self.agent_changes.insert(
+            team.term_render,
+            changes(&[
+                ("crates/swarm-term/src/element.rs", 48, 12),
+                ("crates/swarm-term/src/grid.rs", 22, 9),
+                ("crates/swarm-term/src/font.rs", 18, 0),
+                ("benches/grid.rs", 6, 0),
+            ]),
+        );
+        self.agent_changes.insert(
+            team.pty_io,
+            changes(&[
+                ("crates/swarm-term/src/pty.rs", 39, 8),
+                ("crates/swarm-term/Cargo.toml", 2, 0),
+            ]),
+        );
+    }
+
     /// Times, status notes, changes and messages for the Swarm view of the sample task.
     fn add_sample_swarm(&mut self, team: &SampleSwarm) {
         const SECOND: u64 = 1_000;
@@ -974,14 +1077,7 @@ impl FakeData {
             }
         }
 
-        let stat = |files, additions, deletions| DiffStat {
-            files,
-            additions,
-            deletions,
-        };
-        self.diff_stats.insert(team.ui_tokens, stat(3, 186, 12));
-        self.diff_stats.insert(team.term_render, stat(4, 94, 21));
-        self.diff_stats.insert(team.pty_io, stat(2, 41, 8));
+        self.add_sample_changes(team);
 
         let Some(key) = self.message_key(team.task) else {
             return;
@@ -1025,8 +1121,8 @@ impl FakeData {
                 team.pty_io,
                 team.orchestrator,
                 MessageKind::Question,
-                20,
-                false,
+                62,
+                true,
             ),
             (
                 7,
@@ -1036,14 +1132,23 @@ impl FakeData {
                 8,
                 false,
             ),
+            (
+                8,
+                team.orchestrator,
+                team.pty_io,
+                MessageKind::Task,
+                6,
+                false,
+            ),
         ];
         let texts = [
             "Build the color tokens for the terminal. Report when the theme compiles.",
             "Render the terminal grid with shaped lines. Report the frame time.",
-            "Wire PTY read/write on a background thread. Report the API back to me.",
+            PTY_BRIEF,
             "Tokens done: 38 tokens, light and dark. Ready to merge.",
-            "portable-pty or raw openpty? portable-pty adds 4 dependencies.",
+            "`portable-pty` or raw `openpty`? `portable-pty` adds 4 dependencies.",
             "Run cargo bench on the grid and report the numbers.",
+            "`portable-pty`. It handles resize and gives us Windows later.",
         ];
 
         let log = self.messages.entry(key).or_default();
@@ -1275,6 +1380,7 @@ impl FakeData {
             requested_size: None,
             daemon_owner: None,
             fixed_size: None,
+            exit: None,
             lines: Vec::new(),
         });
         self.agents.push(Agent {
@@ -1596,6 +1702,7 @@ impl FakeData {
             entry.daemon_owner = info.owner;
             entry.owner = owner;
             entry.fixed_size = info.fixed_size.map(|size| (size.cols, size.rows));
+            entry.exit.clone_from(&info.exit);
         }
     }
 
@@ -1694,6 +1801,7 @@ impl FakeData {
             requested_size: None,
             daemon_owner: None,
             fixed_size: None,
+            exit: None,
             lines: Vec::new(),
         });
 
@@ -1733,6 +1841,7 @@ impl FakeData {
             requested_size: None,
             daemon_owner: None,
             fixed_size: None,
+            exit: None,
             lines,
         });
 
@@ -1908,6 +2017,7 @@ impl FakeData {
             requested_size: None,
             daemon_owner: None,
             fixed_size: None,
+            exit: None,
             lines: terminal_lines,
         });
         self.agents.push(Agent {
@@ -1988,12 +2098,12 @@ mod tests {
     }
 
     #[test]
-    fn terminal_renderer_has_four_workers_and_two_processes() {
+    fn terminal_renderer_has_four_workers_and_four_processes() {
         let data = FakeData::sample();
         let task = data.tasks.first();
 
         assert_eq!(task.map(|task| task.workers.len()), Some(4));
-        assert_eq!(task.map(|task| task.processes.len()), Some(2));
+        assert_eq!(task.map(|task| task.processes.len()), Some(4));
     }
 
     #[test]

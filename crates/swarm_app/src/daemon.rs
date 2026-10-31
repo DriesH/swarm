@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
@@ -12,15 +13,15 @@ use gpui::{
     Subscription, Window, px,
 };
 use swarm_protocol::{
-    AgentId as DaemonAgentId, AgentInfo, AgentLifecycle, Client, ClientError, CreateTerminal,
-    DiffStat, MessageEvent, Paths, ProjectInfo, TaskInfo, TerminalId as DaemonTerminalId,
+    AgentChange, AgentId as DaemonAgentId, AgentInfo, AgentLifecycle, Client, ClientError,
+    CreateTerminal, MessageEvent, Paths, ProjectInfo, TaskInfo, TerminalId as DaemonTerminalId,
     TerminalInfo, TerminalKind as DaemonKind,
 };
 use swarm_term::{ExitStatus, TerminalChannels, TerminalInput};
 use swarm_term_view::{TerminalEvent, TerminalView, palette_for};
 use swarm_ui::ActiveTheme as _;
 
-use crate::model::{FakeData, ProjectId, TaskId, TerminalId};
+use crate::model::{AgentChanges, FakeData, ProjectId, TaskId, TerminalId};
 use crate::workspace::{DataSource, View, Workspace};
 
 /// Scrollback lines requested when attaching.
@@ -747,32 +748,43 @@ impl Workspace {
     }
 
     /// Keeps the changes of the asked agents. An asked agent missing from the reply loses
-    /// its stats, so a worktree that can no longer be read does not show old numbers.
+    /// its changes, so a worktree that can no longer be read does not show old numbers.
     pub(crate) fn apply_changes(
         &mut self,
         asked: &[DaemonAgentId],
-        changes: &[(DaemonAgentId, DiffStat)],
+        changes: &[AgentChange],
         cx: &mut Context<Self>,
     ) {
         let mut updated = false;
 
         for id in asked {
-            if changes.iter().any(|(answered, _)| answered == id) {
+            if changes.iter().any(|change| change.agent == *id) {
                 continue;
             }
             let Some(agent) = self.data.agent_with_daemon_id(*id).map(|agent| agent.id) else {
                 continue;
             };
 
-            updated |= self.data.diff_stats.remove(&agent).is_some();
+            updated |= self.data.agent_changes.remove(&agent).is_some();
         }
 
-        for (id, stat) in changes {
-            let Some(agent) = self.data.agent_with_daemon_id(*id).map(|agent| agent.id) else {
+        for change in changes {
+            let Some(agent) = self
+                .data
+                .agent_with_daemon_id(change.agent)
+                .map(|agent| agent.id)
+            else {
                 continue;
             };
+            let known = AgentChanges {
+                stat: change.stat,
+                files: Rc::from(change.files.as_slice()),
+            };
 
-            updated |= self.data.diff_stats.insert(agent, *stat) != Some(*stat);
+            if self.data.agent_changes.get(&agent) != Some(&known) {
+                self.data.agent_changes.insert(agent, known);
+                updated = true;
+            }
         }
 
         if updated {
@@ -1475,8 +1487,8 @@ mod tests {
     use gpui::{TestAppContext, VisualTestContext};
     use swarm_protocol::AgentStatus as DaemonAgentStatus;
     use swarm_protocol::{
-        Event, MessageInfo, ProjectId as DaemonProjectId, Request, TaskId as DaemonTaskId, VERSION,
-        read, write,
+        DiffStat, Event, MessageInfo, ProjectId as DaemonProjectId, Request,
+        TaskId as DaemonTaskId, VERSION, read, write,
     };
     use swarm_term_view::TerminalEvent;
     use swarm_ui::AgentStatus;
@@ -3296,15 +3308,14 @@ mod tests {
                     call,
                     changes: agents
                         .into_iter()
-                        .map(|agent| {
-                            (
-                                agent,
-                                DiffStat {
-                                    files: 2,
-                                    additions: 5,
-                                    deletions: 1,
-                                },
-                            )
+                        .map(|agent| AgentChange {
+                            agent,
+                            stat: DiffStat {
+                                files: 2,
+                                additions: 5,
+                                deletions: 1,
+                            },
+                            files: Vec::new(),
                         })
                         .collect(),
                 })
@@ -3332,7 +3343,7 @@ mod tests {
         redraw(cx);
 
         let polled = wait_until(cx, |cx| {
-            workspace.read_with(cx, |workspace, _| !workspace.data.diff_stats.is_empty())
+            workspace.read_with(cx, |workspace, _| !workspace.data.agent_changes.is_empty())
         });
 
         assert_eq!(before, 0);
@@ -3446,13 +3457,59 @@ mod tests {
         };
 
         workspace.update(cx, |workspace, cx| {
-            workspace.apply_changes(&ask, &[(ask[0], stat)], cx);
+            workspace.apply_changes(
+                &ask,
+                &[AgentChange {
+                    agent: ask[0],
+                    stat,
+                    files: Vec::new(),
+                }],
+                cx,
+            );
         });
-        let known = workspace.read_with(cx, |workspace, _| workspace.data.diff_stats.len());
+        let known = workspace.read_with(cx, |workspace, _| workspace.data.agent_changes.len());
         workspace.update(cx, |workspace, cx| workspace.apply_changes(&ask, &[], cx));
-        let left = workspace.read_with(cx, |workspace, _| workspace.data.diff_stats.len());
+        let left = workspace.read_with(cx, |workspace, _| workspace.data.agent_changes.len());
 
         assert_eq!((known, left), (1, 0));
+    }
+
+    #[gpui::test]
+    fn applied_changes_keep_the_files_next_to_the_stat(cx: &mut TestAppContext) {
+        let (workspace, cx, _client) = real_task_workspace(&fake_daemon(), cx);
+        change_agent(
+            &workspace,
+            &agent_info(1, 7, DaemonAgentStatus::Working),
+            cx,
+        );
+        let ask = [swarm_protocol::AgentId(1)];
+        let change = AgentChange {
+            agent: ask[0],
+            stat: DiffStat {
+                files: 1,
+                additions: 2,
+                deletions: 3,
+            },
+            files: vec![swarm_protocol::FileStat {
+                path: "src/lib.rs".into(),
+                additions: 2,
+                deletions: 3,
+            }],
+        };
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.apply_changes(&ask, std::slice::from_ref(&change), cx);
+        });
+
+        let kept = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .data
+                .agent_changes
+                .values()
+                .next()
+                .map(|changes| (changes.stat, changes.files.to_vec()))
+        });
+        assert_eq!(kept, Some((change.stat, change.files)));
     }
 
     type StartRequests = flume::Receiver<(DaemonProjectId, Option<swarm_protocol::AgentKind>)>;

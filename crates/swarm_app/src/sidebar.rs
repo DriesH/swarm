@@ -491,6 +491,8 @@ mod tests {
             ("term-render", 1),
             ("cargo test", 2),
             ("pty-io", 1),
+            ("cargo test -p swarm-term --watch", 2),
+            ("cargo build -p swarm-term", 2),
             ("ui-tokens", 1),
             ("pnpm dev", 2),
             ("bench", 1),

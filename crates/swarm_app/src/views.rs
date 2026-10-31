@@ -957,6 +957,8 @@ mod tests {
                 TileKind::Worker,
                 TileKind::Process,
                 TileKind::Process,
+                TileKind::Process,
+                TileKind::Process,
             ]
         );
     }
