@@ -68,6 +68,8 @@ pub struct TerminalView {
 #[derive(Default)]
 struct PaintInfo {
     cursor_bounds: Option<Bounds<Pixels>>,
+    /// Top left corner of the grid, in window coordinates.
+    grid_origin: Point<Pixels>,
     paints: u64,
 }
 
@@ -513,7 +515,7 @@ impl TerminalView {
     }
 
     fn on_scroll(&mut self, event: &ScrollEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(model) = self.model.as_mut() else {
+        let Some(alternate) = self.model.as_ref().map(|model| model.screen().alternate) else {
             return;
         };
 
@@ -529,7 +531,28 @@ impl TerminalView {
 
         self.scroll_remainder -= lines;
         // A positive wheel delta moves the content down, back into history.
-        model.scroll_by(whole_lines(lines));
+        let lines = whole_lines(lines);
+
+        if alternate {
+            // Mouse wheel events are not typing, so the gate does not apply to them. The
+            // arrow-key fallback is typing, so it needs the gate open.
+            let (column, row) = self
+                .metrics
+                .cell_at(event.position - self.paint_info.grid_origin);
+            let keys = self.typing_allowed(cx);
+
+            self.send(TerminalInput::Scroll {
+                lines,
+                column,
+                row,
+                keys,
+            });
+            return;
+        }
+
+        if let Some(model) = self.model.as_mut() {
+            model.scroll_by(i64::from(lines));
+        }
 
         self.requested_history = None;
         self.request_history();
@@ -541,8 +564,8 @@ impl TerminalView {
     clippy::cast_possible_truncation,
     reason = "a wheel event is a few lines at most"
 )]
-fn whole_lines(lines: f32) -> i64 {
-    lines as i64
+fn whole_lines(lines: f32) -> i32 {
+    lines as i32
 }
 
 /// The key press as the emulator wants it. GPUI reports Enter and Tab as `\n` and `\t`,

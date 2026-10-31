@@ -18,15 +18,19 @@ use libghostty_vt::{
     },
 };
 use swarm_term::{
-    BgSpan, Colors, Cursor, CursorStyle, History, Key, Palette, ProgramStatus, Rgb, Row, Screen,
-    Size, Snapshot, TerminalOutput, TextFlags, TextSpan, Update,
+    BgSpan, Colors, Cursor, CursorStyle, History, Key, Modifiers, Palette, ProgramStatus, Rgb, Row,
+    Screen, Size, Snapshot, TerminalOutput, TextFlags, TextSpan, Update,
 };
 
 use crate::keys::KeyEncoder;
+use crate::mouse::WheelEncoder;
 use crate::osc7501::{Parsed, Parser, QUERY_REPLY};
 
 /// Longest a synchronized update (mode 2026) holds back the screen, as in Ghostty.
 const SYNC_OUTPUT_CAP: Duration = Duration::from_secs(1);
+
+/// Most wheel events or arrow keys one scroll input sends.
+const MAX_WHEEL_EVENTS: usize = 10;
 
 /// Where the terminal sends what it produces on its own.
 pub(crate) struct Sinks {
@@ -42,6 +46,7 @@ pub(crate) struct Emulator {
     row_iterator: RowIterator<'static>,
     cell_iterator: CellIterator<'static>,
     key_encoder: KeyEncoder,
+    wheel_encoder: WheelEncoder,
     status_parser: Parser,
     parsed: Vec<Parsed>,
     replies: flume::Sender<Vec<u8>>,
@@ -121,6 +126,7 @@ impl Emulator {
             row_iterator: RowIterator::new()?,
             cell_iterator: CellIterator::new()?,
             key_encoder: KeyEncoder::new()?,
+            wheel_encoder: WheelEncoder::new()?,
             status_parser: Parser::default(),
             parsed: Vec::new(),
             replies: query_replies,
@@ -171,6 +177,46 @@ impl Emulator {
 
     pub(crate) fn encode_key(&mut self, key: &Key) -> Vec<u8> {
         self.key_encoder.encode(&self.terminal, key)
+    }
+
+    /// What a wheel turn sends to a full-screen program: wheel events when it asked for
+    /// mouse reporting, else arrow keys when `keys` is set and it did not turn alternate
+    /// scroll (mode 1007) off. Empty on the main screen, which the view scrolls itself.
+    pub(crate) fn encode_scroll(
+        &mut self,
+        lines: i32,
+        column: u16,
+        row: u16,
+        keys: bool,
+    ) -> Result<Vec<u8>> {
+        if lines == 0 || self.terminal.active_screen()? != GhosttyScreen::Alternate {
+            return Ok(Vec::new());
+        }
+
+        let count = usize::try_from(lines.unsigned_abs())
+            .unwrap_or(MAX_WHEEL_EVENTS)
+            .min(MAX_WHEEL_EVENTS);
+        let up = lines > 0;
+
+        let one = if self.terminal.is_mouse_tracking()? {
+            // A cell outside the grid is dropped by the encoder; keep the wheel inside.
+            let column = column.min(self.size.cols.saturating_sub(1));
+            let row = row.min(self.size.rows.saturating_sub(1));
+
+            self.wheel_encoder
+                .encode(&self.terminal, self.size, up, column, row)?
+        } else if keys && self.terminal.mode(Mode::ALT_SCROLL)? {
+            self.encode_key(&Key {
+                name: (if up { "up" } else { "down" }).to_owned(),
+                modifiers: Modifiers::default(),
+                text: None,
+                repeat: false,
+            })
+        } else {
+            Vec::new()
+        };
+
+        Ok(one.repeat(count))
     }
 
     /// Wrapped in bracketed paste when the program asked for it; unsafe control
@@ -987,6 +1033,233 @@ mod tests {
         assert_eq!(silent, None);
         assert_eq!(gained.as_deref(), Some(&b"\x1b[I"[..]));
         assert_eq!(lost.as_deref(), Some(&b"\x1b[O"[..]));
+    }
+
+    const ALTERNATE_SCREEN: &[u8] = b"\x1b[?1049h";
+
+    #[test]
+    fn wheel_goes_to_a_program_that_asked_for_mouse_reporting() {
+        let mut harness = harness();
+        harness
+            .emulator
+            .write(&[ALTERNATE_SCREEN, b"\x1b[?1000h\x1b[?1006h"].concat());
+
+        let up = harness
+            .emulator
+            .encode_scroll(3, 5, 2, true)
+            .expect("scroll");
+        let down = harness
+            .emulator
+            .encode_scroll(-2, 0, 9, true)
+            .expect("scroll");
+
+        assert_eq!(up, b"\x1b[<64;6;3M".repeat(3));
+        assert_eq!(down, b"\x1b[<65;1;10M".repeat(2));
+    }
+
+    #[test]
+    fn wheel_uses_the_format_the_program_asked_for() {
+        let mut harness = harness();
+        harness
+            .emulator
+            .write(&[ALTERNATE_SCREEN, b"\x1b[?1003h"].concat());
+
+        let legacy = harness
+            .emulator
+            .encode_scroll(1, 5, 2, true)
+            .expect("scroll");
+        harness.emulator.write(b"\x1b[?1015h");
+        let urxvt = harness
+            .emulator
+            .encode_scroll(1, 5, 2, true)
+            .expect("scroll");
+
+        assert_eq!(legacy, [0x1b, b'[', b'M', 32 + 64, 32 + 6, 32 + 3]);
+        assert_eq!(urxvt, b"\x1b[96;6;3M");
+    }
+
+    #[test]
+    fn wheel_works_in_every_tracking_mode_with_a_wheel() {
+        for mode in ["1000", "1002", "1003"] {
+            let mut harness = harness();
+            harness
+                .emulator
+                .write(format!("\x1b[?1049h\x1b[?{mode}h\x1b[?1006h").as_bytes());
+
+            let bytes = harness
+                .emulator
+                .encode_scroll(1, 0, 0, true)
+                .expect("scroll");
+
+            assert_eq!(bytes, b"\x1b[<64;1;1M", "mode {mode}");
+        }
+    }
+
+    #[test]
+    fn x10_mouse_reporting_has_no_wheel() {
+        let mut harness = harness();
+        harness
+            .emulator
+            .write(&[ALTERNATE_SCREEN, b"\x1b[?9h\x1b[?1006h"].concat());
+
+        let bytes = harness
+            .emulator
+            .encode_scroll(2, 5, 2, true)
+            .expect("scroll");
+
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn wheel_over_a_cell_outside_the_grid_stays_inside() {
+        let mut harness = harness();
+        harness
+            .emulator
+            .write(&[ALTERNATE_SCREEN, b"\x1b[?1000h\x1b[?1006h"].concat());
+
+        let bytes = harness
+            .emulator
+            .encode_scroll(1, 500, 500, true)
+            .expect("scroll");
+
+        assert_eq!(bytes, b"\x1b[<64;20;10M");
+    }
+
+    #[test]
+    fn wheel_sends_at_most_ten_events_per_input() {
+        let mut tracking = harness();
+        tracking
+            .emulator
+            .write(&[ALTERNATE_SCREEN, b"\x1b[?1000h\x1b[?1006h"].concat());
+        let mut plain = harness();
+        plain.emulator.write(ALTERNATE_SCREEN);
+
+        let mouse = tracking
+            .emulator
+            .encode_scroll(i32::MAX, 0, 0, true)
+            .expect("scroll");
+        let arrows = plain
+            .emulator
+            .encode_scroll(i32::MIN, 0, 0, true)
+            .expect("scroll");
+
+        assert_eq!(mouse, b"\x1b[<64;1;1M".repeat(10));
+        assert_eq!(arrows, b"\x1b[B".repeat(10));
+    }
+
+    #[test]
+    fn alternate_screen_without_mouse_reporting_gets_arrow_keys() {
+        let mut harness = harness();
+        harness.emulator.write(ALTERNATE_SCREEN);
+
+        let up = harness
+            .emulator
+            .encode_scroll(3, 5, 2, true)
+            .expect("scroll");
+        let down = harness
+            .emulator
+            .encode_scroll(-2, 5, 2, true)
+            .expect("scroll");
+
+        assert_eq!(up, b"\x1b[A".repeat(3));
+        assert_eq!(down, b"\x1b[B".repeat(2));
+    }
+
+    #[test]
+    fn arrow_keys_follow_application_cursor_mode() {
+        let mut harness = harness();
+        harness
+            .emulator
+            .write(&[ALTERNATE_SCREEN, b"\x1b[?1h"].concat());
+
+        let up = harness
+            .emulator
+            .encode_scroll(2, 0, 0, true)
+            .expect("scroll");
+        let down = harness
+            .emulator
+            .encode_scroll(-1, 0, 0, true)
+            .expect("scroll");
+
+        assert_eq!(up, b"\x1bOA\x1bOA");
+        assert_eq!(down, b"\x1bOB");
+    }
+
+    #[test]
+    fn arrow_keys_need_the_keys_flag() {
+        let mut harness = harness();
+        harness.emulator.write(ALTERNATE_SCREEN);
+
+        let without = harness
+            .emulator
+            .encode_scroll(3, 5, 2, false)
+            .expect("scroll");
+        let with = harness
+            .emulator
+            .encode_scroll(3, 5, 2, true)
+            .expect("scroll");
+
+        assert!(without.is_empty());
+        assert_eq!(with, b"\x1b[A".repeat(3));
+    }
+
+    #[test]
+    fn mouse_wheel_events_do_not_need_the_keys_flag() {
+        let mut harness = harness();
+        harness
+            .emulator
+            .write(&[ALTERNATE_SCREEN, b"\x1b[?1000h\x1b[?1006h"].concat());
+
+        let bytes = harness
+            .emulator
+            .encode_scroll(3, 5, 2, false)
+            .expect("scroll");
+
+        assert_eq!(bytes, b"\x1b[<64;6;3M".repeat(3));
+    }
+
+    #[test]
+    fn turning_alternate_scroll_off_stops_the_arrow_keys() {
+        let mut harness = harness();
+        harness
+            .emulator
+            .write(&[ALTERNATE_SCREEN, b"\x1b[?1007l"].concat());
+
+        let bytes = harness
+            .emulator
+            .encode_scroll(3, 0, 0, true)
+            .expect("scroll");
+
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn wheel_on_the_main_screen_sends_nothing() {
+        let mut plain = harness();
+        let mut tracking = harness();
+        tracking.emulator.write(b"\x1b[?1000h\x1b[?1006h");
+
+        let first = plain.emulator.encode_scroll(3, 5, 2, true).expect("scroll");
+        let second = tracking
+            .emulator
+            .encode_scroll(3, 5, 2, true)
+            .expect("scroll");
+
+        assert!(first.is_empty());
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn no_lines_send_nothing() {
+        let mut harness = harness();
+        harness.emulator.write(ALTERNATE_SCREEN);
+
+        let bytes = harness
+            .emulator
+            .encode_scroll(0, 0, 0, true)
+            .expect("scroll");
+
+        assert!(bytes.is_empty());
     }
 
     #[test]

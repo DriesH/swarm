@@ -275,3 +275,68 @@ fn snapshot_request_answers_with_the_current_screen() {
         .send(swarm_term::TerminalInput::Kill)
         .expect("send");
 }
+
+/// Reads output until a row holds `needle`.
+fn wait_for_text(terminal: &TerminalChannels, needle: &str) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let output = terminal
+            .output
+            .recv_deadline(deadline)
+            .map_err(|error| format!("no {needle:?} on the screen: {error}"))?;
+        let rows: Vec<&Row> = match &output {
+            TerminalOutput::Update(update) => update.rows.iter().map(|(_, row)| row).collect(),
+            TerminalOutput::Snapshot(snapshot) => snapshot.rows.iter().collect(),
+            _ => continue,
+        };
+        if rows.iter().any(|row| row_text(row).contains(needle)) {
+            return Ok(());
+        }
+    }
+}
+
+#[test]
+fn wheel_reaches_the_program_as_mouse_events_and_as_arrow_keys() {
+    let script = "printf '\\033[?1049h\\033[?1000h\\033[?1006h'; stty raw -echo; printf ready; \
+                  dd bs=1 count=10 2>/dev/null | cat -v; printf '\\033[?1000l\\033[?1006l'; \
+                  printf ' keys'; dd bs=1 count=6 2>/dev/null | cat -v; sleep 30";
+    let (terminal, emulator) = channels();
+    let _local =
+        LocalTerminal::spawn(options(&["/bin/sh", "-c", script]), emulator).expect("spawn");
+    wait_for_text(&terminal, "ready").expect("ready");
+
+    terminal
+        .input
+        .send(swarm_term::TerminalInput::Scroll {
+            lines: 1,
+            column: 5,
+            row: 2,
+            keys: false,
+        })
+        .expect("send");
+    wait_for_text(&terminal, "^[[<64;6;3M keys").expect("mouse events");
+
+    terminal
+        .input
+        .send(swarm_term::TerminalInput::Scroll {
+            lines: 1,
+            column: 5,
+            row: 2,
+            keys: false,
+        })
+        .expect("send");
+    terminal
+        .input
+        .send(swarm_term::TerminalInput::Scroll {
+            lines: -2,
+            column: 5,
+            row: 2,
+            keys: true,
+        })
+        .expect("send");
+    wait_for_text(&terminal, "^[[B^[[B").expect("arrow keys");
+    terminal
+        .input
+        .send(swarm_term::TerminalInput::Kill)
+        .expect("send");
+}

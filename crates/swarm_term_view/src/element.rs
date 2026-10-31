@@ -91,6 +91,14 @@ impl Metrics {
             cell_height: to_u16(f32::from(self.line_height)),
         }
     }
+
+    /// The column and row under `offset`, counted from the grid's top left corner.
+    pub(crate) fn cell_at(&self, offset: gpui::Point<Pixels>) -> (u16, u16) {
+        (
+            to_u16((offset.x / self.cell_width).floor()),
+            to_u16((offset.y / self.line_height).floor()),
+        )
+    }
 }
 
 /// Rounds down, but forgives the float error of a bounds that is exactly n cells wide.
@@ -484,7 +492,10 @@ impl Element for TerminalElement {
             )
         };
 
-        self.view.update(cx, |view, _| view.paint_info.paints += 1);
+        self.view.update(cx, |view, _| {
+            view.paint_info.paints += 1;
+            view.paint_info.grid_origin = origin;
+        });
 
         let focus_handle = self.view.read(cx).focus_handle.clone();
         window.handle_input(
