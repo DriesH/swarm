@@ -1,0 +1,3 @@
+# Workers share the task worktree unless they need their own
+
+Replaces the worker part of ADR 0003. A task still gets one task branch and one task worktree. Workers now work in the task worktree by default, on parts that touch different files, and commit their own files with `swarm commit`, which takes a lock per worktree and records the worker as the commit author and in a `Swarm-Agent` trailer. The orchestrator gives a worker its own worktree only with a stated reason: parts that must change the same files at the same time, or an experiment it may throw away. Such a worker is merged back as before. A worktree per worker was the default before, but most parts do not collide, and each extra worktree costs a setup script, disk space and a merge.

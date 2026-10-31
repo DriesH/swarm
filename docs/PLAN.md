@@ -1,6 +1,6 @@
 # Swarm plan
 
-Swarm is a native macOS app to run a swarm of coding agents (Claude Code and Codex) in real terminals. One orchestrator agent splits a task, spawns workers in their own worktrees, and talks to them. You watch, review the combined diff, and open the PR.
+Swarm is a native macOS app to run a swarm of coding agents (Claude Code and Codex) in real terminals. One orchestrator agent splits a task, spawns workers that share the task worktree (or get their own when it has a reason), and talks to them. You watch, review the combined diff, and open the PR.
 
 Design canvas: https://claude.ai/artifact/6r2WfEmYoTDCWCTJckxVkt (direction **A · Graphite**).
 
@@ -43,8 +43,8 @@ Crate names use snake_case, like Zed. Key decisions live in [`docs/adr/`](adr/).
 
 Every agent terminal gets `SWARM_SOCKET`, `SWARM_AGENT_ID`, `SWARM_TASK` and its own `SWARM_TOKEN`, and finds `swarm` on its `PATH`.
 
-- Orchestrator: `swarm spawn`, `swarm send`, `swarm agents`, `swarm merge`, `swarm notify` (asks the user for attention), `swarm confirm` (the brief is understood), `swarm pr draft` (phase 6, only after the user approved the review).
-- Workers: `swarm ask`, `swarm report`.
+- Orchestrator: `swarm spawn` (the worker shares the task worktree; `--own-worktree "<reason>"` gives it its own worktree and branch), `swarm send`, `swarm agents`, `swarm merge` (only for a worker with its own worktree), `swarm commit`, `swarm notify` (asks the user for attention), `swarm confirm` (the brief is understood), `swarm pr draft` (phase 6, only after the user approved the review).
+- Workers: `swarm ask`, `swarm report`, `swarm commit -m <message> <path>...`. `commit` commits only the named files in the caller's worktree, with a lock per worktree, the agent as author (`<name> (Swarm)`) and a `Swarm-Agent` trailer, so Review groups changes by worker (ADR 0009). Absolute paths, `..`, `.git` and an empty path list are refused.
 - Every agent: `swarm read` and `swarm wait` take the caller's unread messages. A message the agent has not read is pasted into its terminal the next time it is idle.
 - The daemon checks the caller's role on every call; a worker cannot message another worker.
 - The same calls are exposed as MCP tools. Task calls (`task.*`) and terminal calls (`terminal.*`) are listed below.
@@ -62,9 +62,10 @@ Every agent terminal gets `SWARM_SOCKET`, `SWARM_AGENT_ID`, `SWARM_TASK` and its
 **Opening a project.** The project opens on a **Start** tab with an **orchestrator**: a Claude Code (or Codex) session in the project root on the base branch.
 
 1. The user says what they want.
-2. The Start orchestrator splits it into tasks. One request can become one task or several.
-3. For each task it calls `task.create`: Swarm makes the task worktree and branch, runs the setup script, opens a tab and starts that task's orchestrator with the Start orchestrator's brief as its first message.
-4. When every orchestrator confirms its brief, the Start orchestrator exits and the Start tab closes. Focus moves to the first task tab.
+2. The Start orchestrator counts the features in the request. A feature is one change a user can see or use that can be built and reviewed on its own. With more than one feature, or when it is unsure, it lists them in its terminal and talks with the user until they agree on the list.
+3. It makes exactly one task per agreed feature. A task is focused on one feature.
+4. For each task it calls `task.create`: Swarm makes the task worktree and branch, runs the setup script, opens a tab and starts that task's orchestrator with the Start orchestrator's brief as its first message.
+5. When every orchestrator confirms its brief, the Start orchestrator exits and the Start tab closes. Focus moves to the first task tab.
 
 **When the Start tab shows.**
 
@@ -89,7 +90,7 @@ Harness calls for the Start orchestrator:
 ### Workspace layout
 
 - **Sidebar**: projects (with "Needs you" and busy markers and a tab count), then the agents, processes and user terminals of the open tab.
-- **Tabs**: one tab per task, at the top of the window, plus the Start or Plan tab while its orchestrator runs. That tab has no worktree, so it shows no branch, Files or Changes. A tab shows the task name and its status ring. Each task runs in its own task worktree; worker worktrees are not tabs. **+** opens the New tab menu.
+- **Tabs**: one tab per task, at the top of the window, plus the Start or Plan tab while its orchestrator runs. That tab has no worktree, so it shows no branch, Files or Changes. A tab shows the task name and its status ring. Each task runs in its own task worktree; workers share it unless they have their own worktree, and worker worktrees are not tabs. **+** opens the New tab menu.
 - **Header, right side**: view switch **Terminals | Swarm | Review**, then panel toggles **Files**, **Changes +N −N** and, after approval, **Pull request** (later the live PR state, e.g. **#42 · checks running**).
 - **Right panel**: Files (file tree of the task worktree, changed files marked), Changes (changed files grouped by worker, with a **Review** button), or Pull request.
 - **Terminal tiles**: separate cards with 10 px gaps and rounded corners. Focus is a 2 px accent border, "needs attention" a 2 px amber border; both are drawn above the tile and never move the layout. Only the orchestrator tile has an input box.
@@ -134,8 +135,8 @@ Four kinds:
 
 | Kind | Who types | Who resizes | Who kills |
 |---|---|---|---|
-| **Orchestrator** | user | layout: always large | user |
-| **Worker** | output view; user can type in v1 (setting, may be off by default later) | layout: small; grows when blocked or on `tile.grow` | orchestrator, user |
+| **Orchestrator** | user | layout | user |
+| **Worker** | output view; user can type in v1 (setting, may be off by default later) | its agent | orchestrator, user |
 | **Process** (dev server, tests, any command an agent starts) | nobody by default | the agent that started it | that agent, orchestrator, user |
 | **User** | user only | user only | user only |
 
@@ -143,8 +144,6 @@ Four kinds:
 - **Process terminals**: started with `swarm terminal spawn`. When the process exits or is killed, the terminal closes after a short delay (to show the exit code); a failed exit stays until the user closes it and the owner agent and the orchestrator get a `terminal.exited` event with who stopped it (`agent`, `user`, `process`) and the exit code or signal.
 - **Layout engine**: tiles fill the space. Priority: user terminals (fixed size), orchestrator, terminals that need attention (`blocked`, `error`), working agents, process terminals, done or idle agents. Each tile has a minimum size; tiles that don't fit move to the **tray**: chips on the left of the status bar, each with a restore icon. A tile that needs attention is promoted out of the tray. The user can pin or minimize any tile.
 - When the user resizes a user terminal, the other tiles reflow around it.
-- **Tile sizes**: the orchestrator always gets the main slot, at least half the width, and never goes to the tray. Workers are small by default (about 80×12). A blocked worker grows by itself and shrinks when it works again. The orchestrator can grow or shrink any of its workers with `tile.grow` / `tile.shrink`; a worker only itself. A tile the user pinned, minimized or resized ignores these calls until the user resets it.
-- **Font size**: one global setting (Settings › Terminals, 10–20 px, default 13) for every terminal. Process terminals keep their columns and rows, so their tiles change size with the font.
 
 ### Terminal harness (CLI + MCP)
 
@@ -156,7 +155,6 @@ Four kinds:
 | `terminal.wait {id, until: exit\|output-match, pattern?}` | owner agent, orchestrator | Waits for exit or for a line such as `ready in`. |
 | `terminal.kill {id, signal?}` | owner agent, orchestrator | Stops the process; the terminal closes. |
 | `terminal.list` | any agent | Lists terminals the caller may see (never user terminals). |
-| `tile.grow {agent?}` / `tile.shrink {agent?}` | orchestrator for its workers, worker for itself | Makes a worker's tile large or small again. Changes the layout only, never sends a message. |
 | event `terminal.exited {id, by, code\|signal}` | to owner + orchestrator | Sent when a process terminal ends for any reason. |
 
 ### Prompts
@@ -169,7 +167,7 @@ The harness block is always added first and is not editable.
 
 Every agent belongs to a task. The daemon tracks every agent in SQLite (ADR 0005), so none are lost; the goal is that none are forgotten.
 
-- **Task done or archived**: its agents stop and their worktrees are removed. Unmerged changes ask for confirmation first.
+- **Task done or archived**: its agents stop and their worktrees are removed (workers in the task worktree have none of their own). Unmerged changes ask for confirmation first.
 - **Quit**: with running agents, ask once: keep running or stop all. Option to remember the choice.
 - **Idle stop**: a done or idle agent stops after 30 minutes (setting). Its session ID is kept, so it resumes with `claude --resume <id>` or `codex resume <id>`.
 - **Menu bar**: shows the running agent count and **Stop all**, also when the app is closed.
@@ -190,7 +188,7 @@ A third view next to Terminals and Swarm in the header switch (**Terminals | Swa
 
 Two sources:
 
-- **Live** (default while workers run): each worker's worktree diff, committed and uncommitted, refreshed as agents edit. Files being edited get an "Editing" pill. A comment is sent right away through the orchestrator to the worker that owns the file. Approve is disabled.
+- **Live** (default while workers run): each worker's worktree diff, committed and uncommitted, refreshed as agents edit. For workers that share the task worktree, only their `swarm commit` commits are attributed to them; uncommitted work is not. Files being edited get an "Editing" pill. A comment is sent right away through the orchestrator to the worker that owns the file. Approve is disabled.
 - **Merged** (default when all workers are done): task branch against the base branch. Comments are batched and sent with **Request changes**.
 
 Live comments are anchored to the code text, not line numbers. If the agent rewrites those lines, the comment is marked outdated.
