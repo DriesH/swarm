@@ -3397,6 +3397,14 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the fake daemon answers on its own thread"
+    )]
+    fn answer_late() {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
     fn wait_until(
         cx: &mut VisualTestContext,
         done: impl Fn(&mut VisualTestContext) -> bool,
@@ -4035,7 +4043,7 @@ mod tests {
             redraw(cx);
             workspace.read_with(cx, |workspace, _| {
                 workspace.data.live_stat(TaskId(0)).additions == 3
-                    || workspace
+                    && workspace
                         .data
                         .diffs
                         .contains_key(&(DaemonTaskId(7), ReviewSource::Live))
@@ -4112,7 +4120,7 @@ mod tests {
                 call,
                 check: check.clone(),
             }),
-            Request::CloseTask { call, task } => {
+            Request::CloseTask { call, task, .. } => {
                 sent.send(task).ok();
 
                 Some(Event::Done { call })
@@ -4139,6 +4147,7 @@ mod tests {
     ) {
         let (socket, closes) = close_daemon(swarm_protocol::CloseCheck {
             running_agents: 3,
+            user_terminals: 2,
             uncommitted_files: 4,
             unmerged_workers: vec!["a".into(), "b".into()],
         });
@@ -4168,12 +4177,13 @@ mod tests {
             texts,
             [
                 "Stops 3 agents",
+                "Stops 2 terminals",
                 "Deletes 4 uncommitted files",
                 "Keeps branch swarm/login",
                 "Not merged: a, b"
             ]
         );
-        assert_eq!(lines[1].1, swarm_ui::prelude::Color::Warn);
+        assert_eq!(lines[2].1, swarm_ui::prelude::Color::Warn);
 
         let bounds = cx.debug_bounds("close-task-confirm");
         assert!(bounds.is_some());
@@ -4271,6 +4281,193 @@ mod tests {
         assert!(workspace.read_with(cx, |workspace, _| {
             workspace.data.has_daemon_task(DaemonTaskId(7))
         }));
+    }
+
+    fn open_dialog_and_wait(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> DaemonTaskId {
+        let task = workspace.read_with(cx, |workspace, _| workspace.active_task);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_close_task(task, window, cx);
+        });
+        let ready = wait_until(cx, |cx| {
+            redraw(cx);
+            dialog(workspace, cx).is_some_and(|dialog| {
+                dialog.read_with(cx, |dialog, _| dialog.confirmed().is_some())
+            })
+        });
+        assert!(ready);
+
+        DaemonTaskId(7)
+    }
+
+    fn click_selector(selector: &'static str, cx: &mut VisualTestContext) {
+        let bounds = cx.debug_bounds(selector);
+        assert!(bounds.is_some(), "{selector} is not on screen");
+        cx.simulate_click(
+            bounds.map_or_else(Default::default, |bounds| bounds.center()),
+            gpui::Modifiers::none(),
+        );
+    }
+
+    #[gpui::test]
+    fn a_slow_close_keeps_the_tab_until_the_daemon_says_closed(cx: &mut TestAppContext) {
+        let check = swarm_protocol::CloseCheck {
+            running_agents: 1,
+            user_terminals: 1,
+            ..swarm_protocol::CloseCheck::default()
+        };
+        let (sent, closes) = flume::unbounded();
+        let socket = fake_daemon_replying({
+            let check = check.clone();
+
+            move |request| match request {
+                Request::CheckClose { call, .. } => Some(Event::CloseCheck {
+                    call,
+                    check: check.clone(),
+                }),
+                Request::CloseTask {
+                    call, confirmed, ..
+                } => {
+                    sent.send(confirmed).ok();
+                    answer_late();
+
+                    Some(Event::Done { call })
+                }
+                _ => None,
+            }
+        });
+        let (workspace, cx, _client) = real_task_workspace(&socket, cx);
+        open_dialog_and_wait(&workspace, cx);
+
+        click_selector("close-task-confirm", cx);
+        let answered = wait_until(cx, |cx| {
+            redraw(cx);
+            dialog(&workspace, cx).is_none()
+        });
+        let still_there = workspace.read_with(cx, |workspace, _| {
+            workspace.data.has_daemon_task(DaemonTaskId(7))
+        });
+
+        let mut gone = task_info(7, 5, "login");
+        gone.closed = true;
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.task_changed(&gone, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(answered);
+        assert_eq!(closes.try_recv().ok(), Some(check));
+        assert!(still_there, "the tab went before the daemon said closed");
+        assert!(workspace.read_with(cx, |workspace, _| {
+            !workspace.data.has_daemon_task(DaemonTaskId(7))
+        }));
+    }
+
+    #[gpui::test]
+    fn cancel_and_escape_do_nothing_while_the_close_runs(cx: &mut TestAppContext) {
+        let (socket, _closes) = close_daemon(swarm_protocol::CloseCheck::default());
+        let (workspace, cx, _client) = real_task_workspace(&socket, cx);
+        open_dialog_and_wait(&workspace, cx);
+        let Some(view) = dialog(&workspace, cx) else {
+            panic!("the dialog is not open");
+        };
+        let events = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = Rc::clone(&events);
+        cx.update(|_, app| {
+            app.subscribe(
+                &view,
+                move |_, event: &crate::close_task::CloseTaskEvent, _| {
+                    seen.borrow_mut().push(event.clone());
+                },
+            )
+            .detach();
+        });
+
+        view.update(cx, crate::close_task::CloseTaskDialog::set_busy);
+        redraw(cx);
+        click_selector("close-task-cancel", cx);
+        cx.simulate_keystrokes("escape");
+        let while_busy = events.borrow().len();
+        let open = dialog(&workspace, cx).is_some();
+
+        view.update(cx, |dialog, cx| dialog.fail("refused".into(), cx));
+        redraw(cx);
+        click_selector("close-task-cancel", cx);
+
+        assert_eq!(while_busy, 0, "Cancel or Escape dismissed a running close");
+        assert!(open);
+        assert!(dialog(&workspace, cx).is_none());
+    }
+
+    #[gpui::test]
+    fn a_refused_close_checks_again_and_confirms_the_new_check(cx: &mut TestAppContext) {
+        let (sent, closes) = flume::unbounded();
+        let checks = std::sync::Arc::new(AtomicU64::new(0));
+        let socket = fake_daemon_replying({
+            let checks = std::sync::Arc::clone(&checks);
+
+            move |request| match request {
+                Request::CheckClose { call, .. } => {
+                    let round = checks.fetch_add(1, Ordering::Relaxed);
+
+                    Some(Event::CloseCheck {
+                        call,
+                        check: swarm_protocol::CloseCheck {
+                            uncommitted_files: u32::try_from(round + 1).unwrap_or(u32::MAX),
+                            ..swarm_protocol::CloseCheck::default()
+                        },
+                    })
+                }
+                Request::CloseTask {
+                    call, confirmed, ..
+                } => {
+                    sent.send(confirmed.clone()).ok();
+
+                    if confirmed.uncommitted_files < 2 {
+                        Some(Event::Error {
+                            call: Some(call),
+                            id: None,
+                            message: "more files changed".into(),
+                        })
+                    } else {
+                        Some(Event::Done { call })
+                    }
+                }
+                _ => None,
+            }
+        });
+        let (workspace, cx, _client) = real_task_workspace(&socket, cx);
+        open_dialog_and_wait(&workspace, cx);
+
+        click_selector("close-task-confirm", cx);
+        let refreshed = wait_until(cx, |cx| {
+            redraw(cx);
+            dialog(&workspace, cx).is_some_and(|dialog| {
+                dialog.read_with(cx, |dialog, _| {
+                    dialog.error_text().is_some()
+                        && dialog
+                            .confirmed()
+                            .is_some_and(|check| check.uncommitted_files == 2)
+                })
+            })
+        });
+        let lines = dialog(&workspace, cx)
+            .map(|dialog| dialog.read_with(cx, |dialog, _| dialog.lines()))
+            .unwrap_or_default();
+
+        click_selector("close-task-confirm", cx);
+        let second = wait_until(cx, |_| closes.len() >= 2);
+
+        let asked: Vec<_> = closes
+            .try_iter()
+            .map(|check| check.uncommitted_files)
+            .collect();
+        assert!(refreshed, "the dialog did not show the new check");
+        assert_eq!(lines[0].0, "Deletes 2 uncommitted files");
+        assert!(second);
+        assert_eq!(asked, [1, 2]);
     }
 
     #[gpui::test]

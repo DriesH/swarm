@@ -219,6 +219,7 @@ pub(crate) fn file_hash(file: &FileDiff) -> u64 {
     (file.change as u8).hash(&mut hasher);
     file.binary.hash(&mut hasher);
     file.truncated.hash(&mut hasher);
+    file.mode_change.hash(&mut hasher);
     file.additions.hash(&mut hasher);
     file.deletions.hash(&mut hasher);
 
@@ -265,6 +266,8 @@ pub(crate) enum Note {
     Empty,
     /// Changed lines left out of the file.
     Truncated(u32),
+    /// The whole file was left out.
+    TooLarge,
 }
 
 /// One row of the flattened body.
@@ -383,7 +386,15 @@ pub(crate) fn build_rows(
             continue;
         }
 
-        if file.hunks.is_empty() && !file.truncated {
+        if file.hunks.is_empty() && file.truncated {
+            body.rows.push(Row::Note {
+                file: at,
+                note: Note::TooLarge,
+            });
+            continue;
+        }
+
+        if file.hunks.is_empty() {
             body.rows.push(Row::Note {
                 file: at,
                 note: Note::Empty,
@@ -431,12 +442,13 @@ fn unified_rows(rows: &mut Vec<Row>, file: u32, hunk: u32, data: &DiffHunk) {
             DiffLineKind::Context => (old, new),
             DiffLineKind::Deleted => (old, 0),
             DiffLineKind::Added => (0, new),
+            DiffLineKind::NoNewline => (0, 0),
         };
 
-        if line.kind != DiffLineKind::Added {
+        if matches!(line.kind, DiffLineKind::Context | DiffLineKind::Deleted) {
             old += 1;
         }
-        if line.kind != DiffLineKind::Deleted {
+        if matches!(line.kind, DiffLineKind::Context | DiffLineKind::Added) {
             new += 1;
         }
 
@@ -460,6 +472,22 @@ fn split_rows(rows: &mut Vec<Row>, file: u32, hunk: u32, data: &DiffHunk) {
             break;
         };
 
+        if line.kind == DiffLineKind::NoNewline {
+            let side = Side {
+                line: row_index(index),
+                number: 0,
+            };
+
+            rows.push(Row::Pair {
+                file,
+                hunk,
+                left: Some(side),
+                right: Some(side),
+            });
+            index += 1;
+            continue;
+        }
+
         if line.kind == DiffLineKind::Context {
             rows.push(Row::Pair {
                 file,
@@ -481,12 +509,19 @@ fn split_rows(rows: &mut Vec<Row>, file: u32, hunk: u32, data: &DiffHunk) {
 
         let mut deleted = Vec::new();
         let mut added = Vec::new();
+        let mut marks: (Option<usize>, Option<usize>) = (None, None);
+        let mut last = DiffLineKind::Context;
 
         while let Some(line) = data.lines.get(index) {
             match line.kind {
                 DiffLineKind::Context => break,
                 DiffLineKind::Deleted => deleted.push(index),
                 DiffLineKind::Added => added.push(index),
+                DiffLineKind::NoNewline if last == DiffLineKind::Deleted => marks.0 = Some(index),
+                DiffLineKind::NoNewline => marks.1 = Some(index),
+            }
+            if line.kind != DiffLineKind::NoNewline {
+                last = line.kind;
             }
             index += 1;
         }
@@ -504,6 +539,22 @@ fn split_rows(rows: &mut Vec<Row>, file: u32, hunk: u32, data: &DiffHunk) {
                 hunk,
                 left: side(&deleted, old),
                 right: side(&added, new),
+            });
+        }
+
+        if marks.0.is_some() || marks.1.is_some() {
+            let mark = |line: Option<usize>| {
+                line.map(|line| Side {
+                    line: row_index(line),
+                    number: 0,
+                })
+            };
+
+            rows.push(Row::Pair {
+                file,
+                hunk,
+                left: mark(marks.0),
+                right: mark(marks.1),
             });
         }
 
@@ -547,7 +598,7 @@ const SAMPLE_FILES: [(usize, &str, FileChange, u32, u32); 9] = [
         9,
     ),
     (0, "crates/swarm-term/src/font.rs", FileChange::Added, 18, 0),
-    (0, "benches/grid.rs", FileChange::Added, 6, 0),
+    (0, "benches/grid.rs", FileChange::Modified, 6, 0),
     (
         1,
         "crates/swarm-term/src/pty.rs",
@@ -610,6 +661,21 @@ pub(crate) fn sample_diff(
             )
         })
         .collect();
+    for file in &mut files {
+        let shows_edge_cases =
+            file.path.ends_with("benches/grid.rs") || file.path.ends_with("swarm-ui/src/lib.rs");
+
+        if shows_edge_cases {
+            file.mode_change = Some((0o100_644, 0o100_755));
+        }
+
+        if shows_edge_cases && let Some(hunk) = file.hunks.last_mut() {
+            hunk.lines.push(DiffLine {
+                kind: DiffLineKind::NoNewline,
+                text: String::new(),
+            });
+        }
+    }
     files.sort_by(|a, b| (&a.worktree, &a.path).cmp(&(&b.worktree, &b.path)));
 
     let stat = DiffStat {
@@ -672,6 +738,7 @@ pub(crate) fn generated_file(
         path: PathBuf::from(path),
         agent,
         change,
+        mode_change: None,
         additions,
         deletions,
         binary: false,
@@ -773,6 +840,7 @@ mod tests {
             path: PathBuf::from(path),
             agent: agent.map(DaemonAgentId),
             change: FileChange::Modified,
+            mode_change: None,
             additions,
             deletions,
             binary: false,
@@ -987,6 +1055,96 @@ mod tests {
             file: 1,
             note: Note::Truncated(1_204)
         }));
+    }
+
+    #[test]
+    fn a_no_newline_line_has_no_number_and_does_not_shift_the_next_one() {
+        let diff = diff(vec![file(
+            "a.rs",
+            None,
+            vec![
+                line(DiffLineKind::Deleted, "old"),
+                line(DiffLineKind::NoNewline, ""),
+                line(DiffLineKind::Added, "new"),
+                line(DiffLineKind::NoNewline, ""),
+            ],
+        )]);
+
+        let unified: Vec<_> = rows_of(&diff, DiffStyle::Unified)
+            .into_iter()
+            .filter_map(|row| match row {
+                Row::Line { old, new, .. } => Some((old, new)),
+                _ => None,
+            })
+            .collect();
+        let split: Vec<_> = rows_of(&diff, DiffStyle::Split)
+            .into_iter()
+            .filter_map(|row| match row {
+                Row::Pair { left, right, .. } => Some((
+                    left.map(|side| (side.line, side.number)),
+                    right.map(|side| (side.line, side.number)),
+                )),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(unified, [(10, 0), (0, 0), (0, 20), (0, 0)]);
+        assert_eq!(
+            split,
+            [(Some((0, 10)), Some((2, 20))), (Some((1, 0)), Some((3, 0))),]
+        );
+    }
+
+    #[test]
+    fn a_no_newline_line_after_context_marks_both_sides() {
+        let diff = diff(vec![file(
+            "a.rs",
+            None,
+            vec![
+                line(DiffLineKind::Context, "same"),
+                line(DiffLineKind::NoNewline, ""),
+            ],
+        )]);
+
+        let pairs: Vec<_> = rows_of(&diff, DiffStyle::Split)
+            .into_iter()
+            .filter_map(|row| match row {
+                Row::Pair { left, right, .. } => Some((left?.number, right?.number)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(pairs, [(10, 20), (0, 0)]);
+    }
+
+    #[test]
+    fn a_file_left_out_whole_shows_one_note() {
+        let mut big = file("big.bin", None, Vec::new());
+        big.hunks.clear();
+        big.truncated = true;
+
+        let rows = rows_of(&diff(vec![big]), DiffStyle::Unified);
+
+        assert!(rows.contains(&Row::Note {
+            file: 0,
+            note: Note::TooLarge
+        }));
+        assert!(!rows.iter().any(|row| matches!(
+            row,
+            Row::Note {
+                note: Note::Truncated(_),
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn a_mode_change_changes_the_hash() {
+        let plain = file("a.rs", None, vec![line(DiffLineKind::Added, "x")]);
+        let mut moded = plain.clone();
+        moded.mode_change = Some((0o100_644, 0o100_755));
+
+        assert_ne!(file_hash(&plain), file_hash(&moded));
     }
 
     #[test]

@@ -7,8 +7,8 @@ use std::rc::Rc;
 
 use gpui::{
     AnyElement, App, ClickEvent, Context, Div, FocusHandle, FontWeight, ListAlignment, ListOffset,
-    ListState, Role, ScrollStrategy, SharedString, UniformListScrollHandle, WeakEntity, Window,
-    div, list, px, uniform_list,
+    ListState, Role, ScrollStrategy, SharedString, Stateful, UniformListScrollHandle, WeakEntity,
+    Window, div, list, px, uniform_list,
 };
 use swarm_protocol::{DiffLine, DiffLineKind, FileChange, FileDiff, ReviewSource, TaskDiff};
 use swarm_ui::fonts::MONO_FONT;
@@ -32,6 +32,7 @@ const CARD_GAP: f32 = 14.;
 const LINE_HEIGHT: f32 = 21.;
 const NUMBER_WIDTH: f32 = 40.;
 const SIGN_WIDTH: f32 = 14.;
+const NO_NEWLINE: &str = "No newline at end of file";
 const SOURCES: [ReviewSource; 2] = [ReviewSource::Live, ReviewSource::Merged];
 const STYLES: [DiffStyle; 2] = [DiffStyle::Unified, DiffStyle::Split];
 const GROUPINGS: [Grouping; 2] = [Grouping::ByAgent, Grouping::ByFolder];
@@ -178,7 +179,8 @@ impl ReviewView {
         cx.notify();
     }
 
-    /// Forgets the viewed mark of every file whose hunks changed, and opens its card.
+    /// Forgets the viewed mark of every file present with other hunks, and opens its card.
+    /// A file the diff does not hold keeps its mark.
     fn forget_changed_files(&mut self, input: &ReviewInput) {
         let Some(diff) = &input.diff else {
             return;
@@ -193,9 +195,9 @@ impl ReviewView {
 
         viewed.retain(|key, hash| {
             let current = infos.iter().find(|info| info.key == *key).map(|i| i.hash);
-            let keep = current == Some(*hash);
+            let keep = current.is_none_or(|current| current == *hash);
 
-            if !keep && current.is_some() {
+            if !keep {
                 collapsed.remove(key);
             }
 
@@ -962,7 +964,6 @@ impl ReviewView {
             .border_color(colors.line)
             .child(pill)
             .child(summary)
-            .child(div().flex_1())
             .child(source)
             .child(style)
             .children(error)
@@ -970,8 +971,14 @@ impl ReviewView {
             .into_any_element()
     }
 
-    fn summary(input: &ReviewInput) -> Div {
-        let mut line = h_flex().min_w_0().overflow_hidden().gap(px(4.));
+    fn summary(input: &ReviewInput) -> Stateful<Div> {
+        let mut line = h_flex()
+            .id("review-summary")
+            .debug_selector(|| "review-summary".to_owned())
+            .flex_1()
+            .min_w_0()
+            .overflow_hidden()
+            .gap(px(4.));
         let faint = |text: String| {
             Label::new(text)
                 .mono()
@@ -991,20 +998,33 @@ impl ReviewView {
         };
 
         if !place.is_empty() {
-            line = line.child(faint(place));
+            line = line.child(
+                div()
+                    .id("review-place")
+                    .debug_selector(|| "review-place".to_owned())
+                    .min_w_0()
+                    .overflow_hidden()
+                    .child(faint(place).truncate()),
+            );
         }
 
         if let Some(diff) = &input.diff {
             line = line
-                .child(faint(format!(
-                    "\u{b7} {} \u{b7}",
-                    plural(diff.stat.files, "file", "files")
-                )))
-                .child(counts(
-                    diff.stat.additions,
-                    diff.stat.deletions,
-                    LabelSize::XSmall,
-                ));
+                .child(
+                    div()
+                        .id("review-file-count")
+                        .debug_selector(|| "review-file-count".to_owned())
+                        .flex_none()
+                        .child(faint(format!(
+                            "\u{b7} {} \u{b7}",
+                            plural(diff.stat.files, "file", "files")
+                        ))),
+                )
+                .child(
+                    counts(diff.stat.additions, diff.stat.deletions, LabelSize::XSmall)
+                        .id("review-counts")
+                        .debug_selector(|| "review-counts".to_owned()),
+                );
         }
 
         line
@@ -1119,6 +1139,10 @@ impl ReviewView {
             FileChange::Modified => None,
         };
 
+        let mode = data
+            .mode_change
+            .map(|(old, new)| format!("{old:o} \u{2192} {new:o}"));
+
         h_flex()
             .id(("review-file", file))
             .role(Role::Group)
@@ -1175,6 +1199,24 @@ impl ReviewView {
                             .size(LabelSize::XSmall)
                             .weight(FontWeight::MEDIUM)
                             .color(color),
+                    )
+            }))
+            .children(mode.map(|mode| {
+                div()
+                    .id(("review-mode", file))
+                    .debug_selector(|| format!("review-mode-{file}"))
+                    .role(Role::Label)
+                    .aria_label(format!("File mode {mode}"))
+                    .flex_none()
+                    .px(px(6.))
+                    .py(px(1.))
+                    .rounded(px(5.))
+                    .bg(colors.soft)
+                    .child(
+                        Label::new(mode)
+                            .mono()
+                            .size(LabelSize::XSmall)
+                            .color(Color::Faint),
                     )
             }))
             .child(div().flex_1())
@@ -1319,6 +1361,7 @@ fn note_row(index: usize, note: Note, colors: &ThemeColors) -> AnyElement {
     let text = match note {
         Note::Binary => "Binary file".to_owned(),
         Note::Empty => "Empty file".to_owned(),
+        Note::TooLarge => "Too large to show".to_owned(),
         Note::Truncated(0) => "More lines not shown".to_owned(),
         Note::Truncated(count) => format!("{} lines not shown", thousands(count)),
     };
@@ -1341,6 +1384,14 @@ fn display_text(text: &str) -> SharedString {
     }
 }
 
+fn line_text(line: &DiffLine) -> SharedString {
+    if line.kind == DiffLineKind::NoNewline {
+        NO_NEWLINE.into()
+    } else {
+        display_text(&line.text)
+    }
+}
+
 /// The text color, the tint and the sign of a line kind.
 fn line_style(
     kind: DiffLineKind,
@@ -1350,6 +1401,7 @@ fn line_style(
         DiffLineKind::Context => (colors.fg, None, " "),
         DiffLineKind::Added => (colors.add, Some(colors.add_bg), "+"),
         DiffLineKind::Deleted => (colors.del, Some(colors.del_bg), "\u{2212}"),
+        DiffLineKind::NoNewline => (colors.faint, None, ""),
     }
 }
 
@@ -1368,10 +1420,15 @@ fn number_cell(number: u32, right_padding: f32, colors: &ThemeColors) -> Div {
 }
 
 fn line_label(kind: DiffLineKind, number: u32, text: &str) -> String {
+    if kind == DiffLineKind::NoNewline {
+        return NO_NEWLINE.to_owned();
+    }
+
     let word = match kind {
         DiffLineKind::Context => "Line",
         DiffLineKind::Added => "Added line",
         DiffLineKind::Deleted => "Deleted line",
+        DiffLineKind::NoNewline => NO_NEWLINE,
     };
 
     format!("{word} {number}: {text}")
@@ -1418,7 +1475,7 @@ fn unified_line(
                 .min_w_0()
                 .whitespace_normal()
                 .text_color(text_color)
-                .child(display_text(&line.text)),
+                .child(line_text(line)),
         )
         .into_any_element()
 }
@@ -1462,7 +1519,7 @@ fn split_line(
                             .min_w_0()
                             .whitespace_normal()
                             .text_color(text_color)
-                            .child(display_text(&line.text)),
+                            .child(line_text(line)),
                     )
             }
             None => div()
@@ -1478,8 +1535,13 @@ fn split_line(
 
     let describe = |side: Option<Side>, word: &str| {
         side.and_then(|side| {
-            hunk_line(diff, file, hunk, side.line)
-                .map(|line| format!("{word} {}: {}", side.number, line.text))
+            hunk_line(diff, file, hunk, side.line).map(|line| {
+                if line.kind == DiffLineKind::NoNewline {
+                    format!("{word}: {NO_NEWLINE}")
+                } else {
+                    format!("{word} {}: {}", side.number, line.text)
+                }
+            })
         })
     };
     let label = [describe(left, "Old line"), describe(right, "New line")]
@@ -2106,6 +2168,138 @@ mod tests {
         ] {
             assert!(cx.debug_bounds(selector).is_some(), "{selector}");
         }
+    }
+
+    #[gpui::test]
+    fn a_narrow_header_cuts_the_branch_but_never_the_counts(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_review_source(ReviewSource::Merged, cx);
+        });
+        open_review(&workspace, cx);
+
+        let width = |selector: &'static str, cx: &mut VisualTestContext| {
+            cx.debug_bounds(selector).map(|bounds| bounds.size.width)
+        };
+        cx.simulate_resize(gpui::size(px(2800.), px(800.)));
+        redraw(cx);
+        let wide = (
+            width("review-place", cx),
+            width("review-file-count", cx),
+            width("review-counts", cx),
+        );
+
+        cx.simulate_resize(gpui::size(px(1650.), px(800.)));
+        redraw(cx);
+        let narrow = (
+            width("review-place", cx),
+            width("review-file-count", cx),
+            width("review-counts", cx),
+        );
+        let counts_right = cx
+            .debug_bounds("review-counts")
+            .map(|bounds| bounds.right());
+        let source_left = cx.debug_bounds("review-source").map(|bounds| bounds.left());
+
+        assert!(wide.0.is_some() && narrow.0.is_some());
+        assert!(narrow.0 < wide.0, "the branch was not cut: {narrow:?}");
+        assert_eq!(narrow.1, wide.1);
+        assert_eq!(narrow.2, wide.2);
+        assert!(
+            counts_right <= source_left,
+            "{counts_right:?} {source_left:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn the_viewed_mark_survives_a_source_switch_unless_the_file_changed(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = open_review(&workspace, cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_review_source(ReviewSource::Live, cx);
+        });
+        redraw(cx);
+
+        review.update(cx, |review, cx| review.toggle_viewed(0, cx));
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_review_source(ReviewSource::Merged, cx);
+        });
+        redraw(cx);
+        let merged = review.read_with(cx, |review, _| review.is_file_viewed(0));
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_review_source(ReviewSource::Live, cx);
+        });
+        redraw(cx);
+        let back = review.read_with(cx, |review, _| review.is_file_viewed(0));
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_review_source(ReviewSource::Merged, cx);
+        });
+        redraw(cx);
+        change_first_file(&workspace, cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_review_source(ReviewSource::Live, cx);
+        });
+        redraw(cx);
+        let changed = review.read_with(cx, |review, _| review.is_file_viewed(0));
+
+        assert!(!merged);
+        assert!(back, "the mark was lost while the file was not shown");
+        assert!(!changed, "a changed file kept its mark");
+    }
+
+    #[gpui::test]
+    fn no_newline_rows_a_mode_tag_and_a_too_large_note_show(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        workspace.update(cx, |workspace, _| {
+            let key = (swarm_protocol::TaskId(0), ReviewSource::Live);
+            let mut diff = sample_diff(
+                swarm_protocol::TaskId(0),
+                ReviewSource::Live,
+                [swarm_protocol::AgentId(1); 3],
+            );
+            let last = diff.files.len() - 1;
+            diff.files[last].hunks.clear();
+            diff.files[last].truncated = true;
+            workspace.data.diffs.insert(key, Rc::new(diff));
+        });
+        let review = open_review(&workspace, cx);
+
+        let unified = review.read_with(cx, |review, _| review.rows().to_vec());
+        let diff = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .data
+                .diffs
+                .get(&(swarm_protocol::TaskId(0), ReviewSource::Live))
+                .cloned()
+        });
+        let no_newline = |rows: &[Row]| {
+            rows.iter()
+                .filter(|row| match (row, &diff) {
+                    (
+                        Row::Line {
+                            file, hunk, line, ..
+                        },
+                        Some(diff),
+                    ) => hunk_line(diff, *file, *hunk, *line)
+                        .is_some_and(|line| line.kind == DiffLineKind::NoNewline),
+                    _ => false,
+                })
+                .count()
+        };
+        let tag = cx.debug_bounds("review-mode-0").is_some();
+        review.update(cx, |review, cx| review.set_style(DiffStyle::Split, cx));
+        redraw(cx);
+
+        assert!(no_newline(&unified) >= 1);
+        assert!(tag, "the mode tag is missing");
+        assert!(unified.iter().any(|row| matches!(
+            row,
+            Row::Note {
+                note: Note::TooLarge,
+                ..
+            }
+        )));
     }
 
     #[test]

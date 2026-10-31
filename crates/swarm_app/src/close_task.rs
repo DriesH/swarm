@@ -77,6 +77,20 @@ impl CloseTaskDialog {
         cx.notify();
     }
 
+    /// The check the user is looking at, once there is one.
+    pub(crate) fn confirmed(&self) -> Option<CloseCheck> {
+        match &self.check {
+            CheckState::Ready(check) => Some(check.clone()),
+            _ => None,
+        }
+    }
+
+    fn dismiss(&mut self, cx: &mut Context<Self>) {
+        if !self.busy {
+            cx.emit(CloseTaskEvent::Dismissed);
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn check_state(&self) -> &CheckState {
         &self.check
@@ -101,6 +115,15 @@ impl CloseTaskDialog {
         if check.running_agents > 0 {
             lines.push((
                 format!("Stops {}", plural(check.running_agents, "agent", "agents")),
+                Color::Default,
+            ));
+        }
+        if check.user_terminals > 0 {
+            lines.push((
+                format!(
+                    "Stops {}",
+                    plural(check.user_terminals, "terminal", "terminals")
+                ),
                 Color::Default,
             ));
         }
@@ -135,6 +158,7 @@ impl CloseTaskDialog {
 impl Render for CloseTaskDialog {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let on_dismiss = cx.entity();
+        let busy = self.busy;
 
         let body = match &self.check {
             CheckState::Checking => div()
@@ -184,7 +208,9 @@ impl Render for CloseTaskDialog {
             .child(
                 Button::new("close-task-cancel", "Cancel")
                     .variant(ButtonVariant::Secondary)
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(CloseTaskEvent::Dismissed))),
+                    .debug_selector(|| "close-task-cancel".to_owned())
+                    .disabled(busy)
+                    .on_click(cx.listener(|this, _, _, cx| this.dismiss(cx))),
             )
             .child(
                 Button::new("close-task-confirm", "Close task")
@@ -204,8 +230,9 @@ impl Render for CloseTaskDialog {
             &self.focus_handle,
         )
         .width(px(420.))
+        .close_disabled(busy)
         .on_dismiss(move |_, cx| {
-            on_dismiss.update(cx, |_, cx| cx.emit(CloseTaskEvent::Dismissed));
+            on_dismiss.update(cx, Self::dismiss);
         })
         .child(body)
         .children(error)
@@ -292,6 +319,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let task = dialog.read(cx).task;
+        let Some(confirmed) = dialog.read(cx).confirmed() else {
+            return;
+        };
         let daemon_id = self
             .data
             .task(task)
@@ -305,10 +335,13 @@ impl Workspace {
         };
 
         dialog.update(cx, CloseTaskDialog::set_busy);
-        let closing = cx.background_spawn(async move { client.close_task(daemon_id) });
+        let again = client.clone();
+        let closing = cx.background_spawn(async move { client.close_task(daemon_id, confirmed) });
 
         cx.spawn_in(window, async move |this, cx| {
             let result = closing.await;
+
+            let refused = result.is_err();
 
             let updated = this.update_in(cx, |workspace, window, cx| match result {
                 Ok(()) => {
@@ -318,12 +351,29 @@ impl Workspace {
                 }
                 Err(error) => {
                     log::warn!("cannot close the task: {error}");
-                    dialog.update(cx, |dialog, cx| dialog.fail(describe(&error), cx));
+                    dialog.update(cx, |dialog, cx| {
+                        dialog.fail(describe(&error), cx);
+                        dialog.set_check(CheckState::Checking, cx);
+                    });
                 }
             });
 
             if let Err(error) = updated {
                 log::debug!("the window closed before the task closed: {error}");
+                return;
+            }
+
+            if refused {
+                let state = match cx
+                    .background_executor()
+                    .spawn(async move { again.check_close(daemon_id) })
+                    .await
+                {
+                    Ok(check) => CheckState::Ready(check),
+                    Err(error) => CheckState::Failed(describe(&error)),
+                };
+
+                dialog.update(cx, |dialog, cx| dialog.set_check(state, cx));
             }
         })
         .detach();
