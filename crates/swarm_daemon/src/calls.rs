@@ -37,6 +37,9 @@ const MAX_WAIT_SECS: u32 = 600;
 /// How often `task_wait` looks at the tasks again.
 const TASK_POLL: Duration = Duration::from_millis(100);
 
+/// How long `swarm exit` may take to print its answer before its agent ends.
+const EXIT_GRACE: Duration = Duration::from_secs(2);
+
 /// Why a call did not return a value, in the words the agent sees.
 struct Failure(String);
 
@@ -77,7 +80,7 @@ fn reply_with(result: impl Serialize) -> Outcome {
 }
 
 /// Work that runs after the reply was written. The flag says whether the write worked.
-pub(crate) type After = Box<dyn FnOnce(bool) + Send>;
+pub(crate) type After = Box<dyn FnOnce(bool, Gone<'_>) + Send>;
 
 /// Tells whether the caller hung up.
 pub(crate) type Gone<'a> = &'a dyn Fn() -> bool;
@@ -132,10 +135,18 @@ impl Calls {
         if request.call == Call::AgentExit {
             let agents = Arc::clone(&self.services.agents);
             let id = caller.id;
-            let after: After = Box::new(move |written| {
-                if written {
-                    agents.exit(id);
+            let after: After = Box::new(move |written, gone| {
+                if !written {
+                    return;
                 }
+
+                // The CLI is in the agent's process group, so it waits for the hang-up.
+                let deadline = Instant::now() + EXIT_GRACE;
+                while !gone() && Instant::now() < deadline {
+                    std::thread::park_timeout(Duration::from_millis(10));
+                }
+
+                agents.exit(id);
             });
 
             return Ok((Reply::success(Value::Null), Some(after)));
@@ -148,7 +159,7 @@ impl Calls {
         };
 
         let after = claim.filter(|_| reply.ok).map(|claim| -> After {
-            Box::new(move |written| {
+            Box::new(move |written, _| {
                 if written {
                     claim.commit();
                 }
