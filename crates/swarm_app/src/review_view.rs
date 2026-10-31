@@ -25,6 +25,7 @@ use crate::actions::{
 };
 use crate::markdown::Markdown;
 use crate::model::{AgentKind, TaskId};
+use crate::review_comments::refusal;
 use crate::review_model::{
     AgentLabel, BodyRows, DiffStyle, FileGroup, FileInfo, FileKey, GroupKind, Grouping, LinePos,
     Marks, Note, Row, Side, Thread, build_rows, count_comments, file_infos, group_files, plural,
@@ -44,6 +45,8 @@ const CARD_GAP: f32 = 14.;
 const LINE_HEIGHT: f32 = 21.;
 const NUMBER_WIDTH: f32 = 40.;
 const SIGN_WIDTH: f32 = 14.;
+/// The place gives way long before the status pill does when the header is short.
+const PLACE_SHRINK: f32 = 1_000.;
 const NO_NEWLINE: &str = "No newline at end of file";
 const SOURCES: [ReviewSource; 2] = [ReviewSource::Live, ReviewSource::Merged];
 const STYLES: [DiffStyle; 2] = [DiffStyle::Unified, DiffStyle::Split];
@@ -223,6 +226,7 @@ impl ReviewView {
             .is_none_or(|old| old.changes_files(&input))
         {
             self.forget_changed_files(&input);
+            self.follow_composer();
             self.rebuild(same_scope);
         } else if previous
             .as_ref()
@@ -336,7 +340,7 @@ impl ReviewView {
         let collapsed = self.collapsed.get(&input.task);
         let marks = Marks {
             threads: Rc::clone(&self.threads),
-            composer: self.composer_pos(),
+            composer: self.composer_at(),
         };
 
         self.body = Rc::new(build_rows(
@@ -979,9 +983,10 @@ impl ReviewView {
         } else {
             StatusPill::new(AgentStatus::Blocked)
         }
-        .label(pill_label(input.working));
+        .label(pill_label(input.working))
+        .truncate();
 
-        let summary = Self::summary(input);
+        let (place, counts) = Self::summary(input);
 
         let workspace = self.workspace.clone();
         let source = SegmentedControl::new("review-source", "Source", ["Live", "Merged"])
@@ -1079,7 +1084,9 @@ impl ReviewView {
             .border_b_1()
             .border_color(colors.line)
             .child(pill)
-            .child(summary)
+            .child(place)
+            .children(counts)
+            .child(div().flex_1())
             .child(source)
             .child(style)
             .children(error)
@@ -1088,21 +1095,9 @@ impl ReviewView {
             .into_any_element()
     }
 
-    fn summary(input: &ReviewInput) -> Stateful<Div> {
-        let mut line = h_flex()
-            .id("review-summary")
-            .debug_selector(|| "review-summary".to_owned())
-            .flex_1()
-            .min_w_0()
-            .overflow_hidden()
-            .gap(px(4.));
-        let faint = |text: String| {
-            Label::new(text)
-                .mono()
-                .size(LabelSize::XSmall)
-                .color(Color::Faint)
-        };
-
+    /// The place the diff is from, which shrinks with an ellipsis, and the totals,
+    /// which never do. The place pulls the totals 8 px closer than the header gap.
+    fn summary(input: &ReviewInput) -> (Stateful<Div>, Option<Stateful<Div>>) {
         let place = match input.source {
             ReviewSource::Merged => format!("{} \u{2190} {}", input.base, input.branch),
             ReviewSource::Live => input.diff.as_ref().map_or_else(String::new, |diff| {
@@ -1113,38 +1108,33 @@ impl ReviewView {
                 )
             }),
         };
+        let place = if input.diff.is_some() && !place.is_empty() {
+            format!("{place} \u{b7}")
+        } else {
+            place
+        };
 
-        if !place.is_empty() {
-            line = line.child(
-                div()
-                    .id("review-place")
-                    .debug_selector(|| "review-place".to_owned())
-                    .min_w_0()
-                    .overflow_hidden()
-                    .child(faint(place).truncate()),
+        let place = div()
+            .id("review-place")
+            .debug_selector(|| "review-place".to_owned())
+            .flex_shrink(PLACE_SHRINK)
+            .min_w_0()
+            .mr(px(-8.))
+            .overflow_hidden()
+            .child(
+                Label::new(place)
+                    .mono()
+                    .size(LabelSize::XSmall)
+                    .color(Color::Faint)
+                    .truncate(),
             );
-        }
+        let counts = input.diff.as_ref().map(|diff| {
+            counts(diff.stat.additions, diff.stat.deletions, LabelSize::XSmall)
+                .id("review-counts")
+                .debug_selector(|| "review-counts".to_owned())
+        });
 
-        if let Some(diff) = &input.diff {
-            line = line
-                .child(
-                    div()
-                        .id("review-file-count")
-                        .debug_selector(|| "review-file-count".to_owned())
-                        .flex_none()
-                        .child(faint(format!(
-                            "\u{b7} {} \u{b7}",
-                            plural(diff.stat.files, "file", "files")
-                        ))),
-                )
-                .child(
-                    counts(diff.stat.additions, diff.stat.deletions, LabelSize::XSmall)
-                        .id("review-counts")
-                        .debug_selector(|| "review-counts".to_owned()),
-                );
-        }
-
-        line
+        (place, counts)
     }
 
     fn body_area(
@@ -1250,6 +1240,7 @@ impl ReviewView {
                     ((left, &ctx), (right, &right_ctx)),
                     &colors,
                 )
+                .into_any_element()
             }
             Row::Note { note, .. } => note_row(index, note, &colors),
             Row::Thread { thread, .. } => self.thread_row(thread as usize, index, &colors, cx),
@@ -1571,19 +1562,16 @@ fn number_cell(number: u32, right_padding: f32, colors: &ThemeColors) -> Div {
         })
 }
 
+/// What a screen reader says for a line: "Line 85, added, let cell = …".
 fn line_label(kind: DiffLineKind, number: u32, text: &str) -> String {
-    if kind == DiffLineKind::NoNewline {
-        return NO_NEWLINE.to_owned();
-    }
-
     let word = match kind {
-        DiffLineKind::Context => "Line",
-        DiffLineKind::Added => "Added line",
-        DiffLineKind::Deleted => "Deleted line",
-        DiffLineKind::NoNewline => NO_NEWLINE,
+        DiffLineKind::Context => "unchanged",
+        DiffLineKind::Added => "added",
+        DiffLineKind::Deleted => "deleted",
+        DiffLineKind::NoNewline => return NO_NEWLINE.to_owned(),
     };
 
-    format!("{word} {number}: {text}")
+    format!("Line {number}, {word}, {text}")
 }
 
 /// What a line row needs to take part in comments.
@@ -1672,13 +1660,27 @@ fn add_button(
 fn unified_line(
     index: usize,
     line: Option<&DiffLine>,
-    (old, new): (u32, u32),
+    numbers: (u32, u32),
     colors: &ThemeColors,
     ctx: &LineCtx,
 ) -> AnyElement {
-    let Some(line) = line else {
-        return div().into_any_element();
-    };
+    match unified_row(index, line, numbers, colors, ctx) {
+        Some(row) if ctx.cursor.is_some() => cursor_ring(row, colors).into_any_element(),
+        Some(row) => row.into_any_element(),
+        None => div().into_any_element(),
+    }
+}
+
+/// A unified line without the cursor ring. The cursor line is the selected one, and the
+/// body's active descendant, so a screen reader follows the cursor.
+fn unified_row(
+    index: usize,
+    line: Option<&DiffLine>,
+    (old, new): (u32, u32),
+    colors: &ThemeColors,
+    ctx: &LineCtx,
+) -> Option<Stateful<Div>> {
+    let line = line?;
     let (text_color, tint, sign) = line_style(line.kind, colors);
     let number = if line.kind == DiffLineKind::Deleted {
         old
@@ -1708,6 +1710,11 @@ fn unified_line(
         .id(("review-line", index))
         .role(Role::ListItem)
         .aria_label(line_label(line.kind, number, &line.text))
+        .aria_selected(ctx.cursor.is_some())
+        .when(
+            ctx.cursor.is_some(),
+            StatefulInteractiveElement::aria_active_descendant,
+        )
         .group(group.clone())
         .relative()
         .flex()
@@ -1736,14 +1743,54 @@ fn unified_line(
             row.child(add_button(("review-add", index), ctx, side, number, &group))
         });
 
-    if ctx.cursor.is_some() {
-        cursor_ring(row, colors).into_any_element()
-    } else {
-        row.into_any_element()
-    }
+    Some(row)
 }
 
 type Half<'a> = (Option<Side>, &'a LineCtx);
+
+/// What a screen reader says for a split row, and whether the cursor sits in it. The
+/// cursor half is named like a unified line, else both halves are read.
+fn pair_label(
+    diff: &TaskDiff,
+    (file, hunk): (u32, u32),
+    (left, right): (Half<'_>, Half<'_>),
+) -> (String, bool) {
+    let describe = |side: Option<Side>, word: &str| {
+        side.and_then(|side| {
+            hunk_line(diff, file, hunk, side.line).map(|line| {
+                if line.kind == DiffLineKind::NoNewline {
+                    format!("{word}: {NO_NEWLINE}")
+                } else {
+                    format!("{word} {}: {}", side.number, line.text)
+                }
+            })
+        })
+    };
+
+    let cursor_half = if left.0.is_some() && left.1.cursor == Some(DiffSide::Old) {
+        left.0
+    } else if right.0.is_some() && right.1.cursor == Some(DiffSide::New) {
+        right.0
+    } else {
+        None
+    };
+    let cursor_label = cursor_half.and_then(|side| {
+        hunk_line(diff, file, hunk, side.line)
+            .map(|line| line_label(line.kind, side.number, &line.text))
+    });
+
+    match cursor_label {
+        Some(label) => (label, true),
+        None => (
+            [describe(left.0, "Old line"), describe(right.0, "New line")]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("; "),
+            false,
+        ),
+    }
+}
 
 fn split_line(
     index: usize,
@@ -1751,7 +1798,7 @@ fn split_line(
     (file, hunk): (u32, u32),
     (left, right): (Half<'_>, Half<'_>),
     colors: &ThemeColors,
-) -> AnyElement {
+) -> Stateful<Div> {
     let half = |(side, ctx): Half<'_>, position: usize| {
         let line = side.and_then(|side| hunk_line(diff, file, hunk, side.line));
         let number = side.map_or(0, |side| side.number);
@@ -1843,32 +1890,18 @@ fn split_line(
         }
     };
 
-    let describe = |side: Option<Side>, word: &str| {
-        side.and_then(|side| {
-            hunk_line(diff, file, hunk, side.line).map(|line| {
-                if line.kind == DiffLineKind::NoNewline {
-                    format!("{word}: {NO_NEWLINE}")
-                } else {
-                    format!("{word} {}: {}", side.number, line.text)
-                }
-            })
-        })
-    };
-    let label = [describe(left.0, "Old line"), describe(right.0, "New line")]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join("; ");
+    let (label, selected) = pair_label(diff, (file, hunk), (left, right));
 
     code_text()
         .id(("review-pair", index))
         .role(Role::ListItem)
         .aria_label(label)
+        .aria_selected(selected)
+        .when(selected, StatefulInteractiveElement::aria_active_descendant)
         .flex()
         .w_full()
         .child(half(left, 0))
         .child(half(right, 1))
-        .into_any_element()
 }
 
 impl Workspace {
@@ -1960,7 +1993,7 @@ impl Workspace {
             base,
             branch: entry.branch.clone(),
             approved: entry.approved,
-            approving: self.review_approving == Some(task),
+            approving: self.review_approving.contains(&task),
             approve_error: self
                 .review_error
                 .as_ref()
@@ -1972,7 +2005,7 @@ impl Workspace {
                 worktree: self.review_worktree.clone(),
             }),
             comments: self.data.task_comments(task),
-            requesting: self.review_requesting == Some(task),
+            requesting: self.review_requesting.contains(&task),
             fixed_now: self.fixed_now,
         };
 
@@ -1994,7 +2027,7 @@ impl Workspace {
 
         if self.review_source(task) != ReviewSource::Merged
             || approved == Some(diff.fingerprint)
-            || self.review_approving.is_some()
+            || self.review_approving.contains(&task)
             || pending > 0
         {
             return;
@@ -2016,18 +2049,18 @@ impl Workspace {
             return;
         };
 
-        self.review_approving = Some(task);
+        self.review_approving.insert(task);
         let approving = cx.background_spawn(async move { client.approve_task(id, fingerprint) });
 
         cx.spawn(async move |this, cx| {
             let result = approving.await;
 
             let updated = this.update(cx, |workspace, cx| {
-                workspace.review_approving = None;
+                workspace.review_approving.remove(&task);
 
                 if let Err(error) = result {
                     log::warn!("cannot approve the task: {error}");
-                    workspace.review_error = Some((task, short(&error.to_string())));
+                    workspace.review_error = Some((task, refusal(&error)));
                 }
 
                 cx.notify();
@@ -2085,7 +2118,9 @@ mod tests {
     use super::*;
     use crate::actions;
     use crate::model::AgentId;
-    use crate::review_model::{LinePos, Note, Place, Row, count_comments, sample_diff};
+    use crate::review_model::{
+        ComposerAt, LinePos, Note, Place, Row, count_comments, first_changed_line, sample_diff,
+    };
     use swarm_protocol::{CommentEvent, CommentId, ReviewComment};
 
     fn setup(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
@@ -2503,38 +2538,50 @@ mod tests {
             workspace.set_review_source(ReviewSource::Merged, cx);
         });
         open_review(&workspace, cx);
+        let pending = count_comments(&comments_of(&workspace, cx)).pending;
 
-        let width = |selector: &'static str, cx: &mut VisualTestContext| {
-            cx.debug_bounds(selector).map(|bounds| bounds.size.width)
-        };
         cx.simulate_resize(gpui::size(px(2800.), px(800.)));
         redraw(cx);
         let wide = (
-            width("review-place", cx),
-            width("review-file-count", cx),
-            width("review-counts", cx),
+            cx.debug_bounds("review-place")
+                .map(|bounds| bounds.size.width),
+            cx.debug_bounds("review-counts")
+                .map(|bounds| bounds.size.width),
         );
-
-        cx.simulate_resize(gpui::size(px(1800.), px(800.)));
-        redraw(cx);
-        let narrow = (
-            width("review-place", cx),
-            width("review-file-count", cx),
-            width("review-counts", cx),
-        );
-        let counts_right = cx
-            .debug_bounds("review-counts")
-            .map(|bounds| bounds.right());
-        let source_left = cx.debug_bounds("review-source").map(|bounds| bounds.left());
-
-        assert!(wide.0.is_some() && narrow.0.is_some());
-        assert!(narrow.0 < wide.0, "the branch was not cut: {narrow:?}");
-        assert_eq!(narrow.1, wide.1);
-        assert_eq!(narrow.2, wide.2);
+        let follows = cx
+            .debug_bounds("review-place")
+            .zip(cx.debug_bounds("review-counts"))
+            .map(|(place, counts)| counts.left() - place.right());
         assert!(
-            counts_right <= source_left,
-            "{counts_right:?} {source_left:?}"
+            follows.is_some_and(|gap| gap < px(16.)),
+            "the counts sit away from the place: {follows:?}"
         );
+
+        for width in [1650., 1600.] {
+            cx.simulate_resize(gpui::size(px(width), px(800.)));
+            redraw(cx);
+            let place = cx.debug_bounds("review-place");
+            let counts = cx.debug_bounds("review-counts");
+            let source = cx.debug_bounds("review-source");
+            let request = cx.debug_bounds("review-request-changes");
+            let approve = cx.debug_bounds("review-approve");
+
+            let (Some(place), Some(counts), Some(source), Some(_), Some(approve)) =
+                (place, counts, source, request, approve)
+            else {
+                panic!("the header is missing a part at {width} px");
+            };
+
+            assert!(pending > 0, "Request changes shows its count");
+            assert!(
+                Some(place.size.width) < wide.0,
+                "the branch was not cut at {width} px"
+            );
+            assert_eq!(Some(counts.size.width), wide.1, "the counts shrank");
+            assert!(place.right() <= counts.left(), "{place:?} {counts:?}");
+            assert!(counts.right() <= source.left(), "{counts:?} {source:?}");
+            assert!(approve.right() <= px(width), "{approve:?}");
+        }
     }
 
     #[gpui::test]
@@ -2990,6 +3037,550 @@ mod tests {
                 .iter()
                 .all(|comment| comment.id != CommentId(1) && comment.parent != Some(CommentId(1)))
         );
+    }
+
+    fn live_pos(workspace: &Entity<Workspace>, cx: &VisualTestContext) -> LinePos {
+        workspace.read_with(cx, |workspace, _| {
+            workspace
+                .data
+                .task_diff(TaskId(0), ReviewSource::Live)
+                .and_then(|diff| {
+                    diff.files
+                        .first()
+                        .and_then(|file| first_changed_line(file, 0))
+                })
+                .expect("the first Live file has a changed line")
+        })
+    }
+
+    /// Stores a new Live diff after `edit` changed the first file.
+    fn edit_first_live_file(
+        workspace: &Entity<Workspace>,
+        edit: impl FnOnce(&mut FileDiff),
+        cx: &mut VisualTestContext,
+    ) {
+        workspace.update(cx, |workspace, cx| {
+            let key = (swarm_protocol::TaskId(0), ReviewSource::Live);
+            if let Some(diff) = workspace.data.diffs.get_mut(&key) {
+                let mut changed = (**diff).clone();
+
+                changed.fingerprint += 1;
+                edit(&mut changed.files[0]);
+                *diff = Rc::new(changed);
+            }
+            cx.notify();
+        });
+        redraw(cx);
+    }
+
+    fn context_lines(count: usize) -> Vec<DiffLine> {
+        (0..count)
+            .map(|n| DiffLine {
+                kind: DiffLineKind::Context,
+                text: format!("inserted {n}"),
+            })
+            .collect()
+    }
+
+    fn composer_focused(review: &Entity<ReviewView>, cx: &mut VisualTestContext) -> bool {
+        let handle = review.read_with(cx, |review, cx| review.composer_input().focus_handle(cx));
+
+        cx.update(|window, _| handle.is_focused(window))
+    }
+
+    /// The row index of the box, and the line row it sits under.
+    fn composer_under(review: &Entity<ReviewView>, cx: &VisualTestContext) -> Option<(usize, Row)> {
+        review.read_with(cx, |review, _| {
+            let rows = review.rows();
+            let at = rows
+                .iter()
+                .position(|row| matches!(row, Row::Composer { .. }))?;
+            let above = rows[..at]
+                .iter()
+                .rposition(|row| !matches!(row, Row::Thread { .. }))?;
+
+            Some((at, rows[above]))
+        })
+    }
+
+    #[gpui::test]
+    fn the_comment_box_follows_its_line_when_a_live_diff_moves_it(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = open_review(&workspace, cx);
+        use_source(&workspace, ReviewSource::Live, cx);
+        let pos = live_pos(&workspace, cx);
+
+        review.update(cx, |review, cx| review.open_composer(pos, cx));
+        redraw(cx);
+        cx.simulate_input("keep me");
+        let before = review.read_with(cx, |review, _| review.composer_line());
+
+        edit_first_live_file(
+            &workspace,
+            |file| {
+                let top = &mut file.hunks[0].lines;
+                top.splice(0..0, context_lines(3));
+            },
+            cx,
+        );
+        let after = review.read_with(cx, |review, _| review.composer_line());
+        let at = review.read_with(cx, |review, _| review.composer_at());
+        let under = composer_under(&review, cx);
+
+        assert_eq!(after, before.map(|line| line + 3));
+        assert_eq!(
+            at,
+            Some(ComposerAt::Line(LinePos {
+                line: pos.line + 3,
+                ..pos
+            }))
+        );
+        assert!(matches!(
+            under,
+            Some((_, Row::Line { line, .. })) if line == pos.line + 3
+        ));
+        assert_eq!(review.read_with(cx, ReviewView::composer_text), "keep me");
+        assert!(composer_focused(&review, cx), "the box lost focus");
+        cx.simulate_input("!");
+        assert_eq!(review.read_with(cx, ReviewView::composer_text), "keep me!");
+    }
+
+    #[gpui::test]
+    fn a_comment_box_whose_line_is_gone_waits_at_the_top_with_its_text(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = open_review(&workspace, cx);
+        use_source(&workspace, ReviewSource::Live, cx);
+        let pos = live_pos(&workspace, cx);
+        let original = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .data
+                .task_diff(TaskId(0), ReviewSource::Live)
+                .map(|diff| diff.files[0].hunks.clone())
+                .unwrap_or_default()
+        });
+
+        review.update(cx, |review, cx| review.open_composer(pos, cx));
+        redraw(cx);
+        cx.simulate_input("do not lose me");
+
+        let removed = pos.line as usize;
+        edit_first_live_file(
+            &workspace,
+            |file| {
+                file.hunks[0].lines[removed].text = "something else entirely".into();
+            },
+            cx,
+        );
+        let at = review.read_with(cx, |review, _| review.composer_at());
+        let under = composer_under(&review, cx);
+
+        assert_eq!(at, Some(ComposerAt::Top { file: 0 }));
+        assert!(
+            matches!(under, Some((_, Row::Header { file: 0 }))),
+            "the box sits right under the card header: {under:?}"
+        );
+        assert!(review.read_with(cx, |review, _| review.composer_is_open()));
+        assert_eq!(
+            review.read_with(cx, ReviewView::composer_text),
+            "do not lose me"
+        );
+        assert!(composer_focused(&review, cx), "the box lost focus");
+        review.update(cx, |review, cx| review.select_file(0, cx));
+        redraw(cx);
+        let tagged = cx.debug_bounds("comment-composer-outdated").is_some();
+
+        edit_first_live_file(&workspace, |file| file.hunks = original.clone(), cx);
+        let back = review.read_with(cx, |review, _| review.composer_at());
+        let still_tagged = cx.debug_bounds("comment-composer-outdated").is_some();
+
+        assert!(tagged, "the box shows no Outdated tag");
+        assert_eq!(back, Some(ComposerAt::Line(pos)));
+        assert!(!still_tagged, "the tag stayed after the line came back");
+    }
+
+    #[gpui::test]
+    fn a_comment_sent_from_one_line_does_not_close_the_box_of_another(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = open_review(&workspace, cx);
+        use_source(&workspace, ReviewSource::Merged, cx);
+        let first = review.read_with(cx, |review, _| review.selected_file());
+        let pos = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .data
+                .task_diff(TaskId(0), ReviewSource::Merged)
+                .and_then(|diff| {
+                    first
+                        .and_then(|file| diff.files.get(file).map(|data| (file, data)))
+                        .and_then(|(file, data)| first_changed_line(data, file))
+                })
+                .expect("the selected file has a changed line")
+        });
+        let other = LinePos {
+            line: pos.line + 1,
+            ..pos
+        };
+
+        review.update(cx, |review, cx| review.open_composer(pos, cx));
+        redraw(cx);
+        let first_line = review.read_with(cx, |review, _| review.composer_line());
+        let area = review.read_with(cx, |review, _| review.composer_input().clone());
+        area.update(cx, |area, cx| area.set_text("first", cx));
+        review.update(cx, |review, cx| {
+            review.submit_composer_for_test(cx);
+            review.open_composer(other, cx);
+        });
+        area.update(cx, |area, cx| area.set_text("second", cx));
+        let sending_while_away = review.read_with(cx, |review, _| review.composer_sending());
+        cx.run_until_parked();
+
+        let (line, text, error) = review.read_with(cx, |review, cx| {
+            (
+                review.composer_line(),
+                review.composer_text(cx),
+                review.composer_error(),
+            )
+        });
+        let parked = review.read_with(cx, |review, _| review.draft_text(pos));
+        review.update(cx, |review, cx| review.open_composer(pos, cx));
+        let reopened = review.read_with(cx, ReviewView::composer_text);
+
+        assert!(!sending_while_away, "the other line is not sending");
+        assert!(line.is_some() && line != first_line, "the other box closed");
+        assert!(review.read_with(cx, |review, _| review.composer_is_open()));
+        assert_eq!(text, "second", "the answer touched the other box");
+        assert_eq!(error, None);
+        assert_eq!(parked, None, "sent text was parked as a draft");
+        assert_eq!(reopened, "", "sent text came back");
+    }
+
+    #[gpui::test]
+    fn a_failed_comment_comes_back_with_its_text_and_leaves_the_other_box_alone(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = setup(cx);
+        let review = open_review(&workspace, cx);
+        use_source(&workspace, ReviewSource::Live, cx);
+        workspace.update(cx, |workspace, _| {
+            workspace.source = crate::workspace::DataSource::Connecting;
+        });
+        let pos = live_pos(&workspace, cx);
+        let other = LinePos {
+            line: pos.line + 1,
+            ..pos
+        };
+
+        review.update(cx, |review, cx| review.open_composer(pos, cx));
+        redraw(cx);
+        let area = review.read_with(cx, |review, _| review.composer_input().clone());
+        area.update(cx, |area, cx| area.set_text("first", cx));
+        review.update(cx, |review, cx| {
+            review.submit_composer_for_test(cx);
+            review.open_composer(other, cx);
+        });
+        cx.run_until_parked();
+
+        let (text, error, sending) = review.read_with(cx, |review, cx| {
+            (
+                review.composer_text(cx),
+                review.composer_error(),
+                review.composer_sending(),
+            )
+        });
+        review.update(cx, |review, cx| review.open_composer(pos, cx));
+        let (back, back_error, back_sending) = review.read_with(cx, |review, cx| {
+            (
+                review.composer_text(cx),
+                review.composer_error(),
+                review.composer_sending(),
+            )
+        });
+
+        assert_eq!((text.as_ref(), error, sending), ("", None, false));
+        assert_eq!(back, "first");
+        assert_eq!(back_error.as_deref(), Some("Not connected"));
+        assert!(!back_sending);
+    }
+
+    #[gpui::test]
+    fn a_reply_is_sent_once_and_its_field_waits_for_the_answer(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        use_source(&workspace, ReviewSource::Merged, cx);
+        let review = open_review(&workspace, cx);
+        let before = comments_of(&workspace, cx).len();
+        let root = CommentId(1);
+
+        let input = review.update(cx, |review, cx| review.reply_input_for_test(root, cx));
+        input.update(cx, |input, cx| input.set_text("Thanks", cx));
+        review.update(cx, |review, cx| {
+            review.submit_reply(root, cx);
+            review.submit_reply(root, cx);
+        });
+        let sending = review.read_with(cx, |review, _| review.reply_sending(root));
+        cx.run_until_parked();
+
+        let (waiting, text) = (
+            review.read_with(cx, |review, _| review.reply_sending(root)),
+            input.read_with(cx, |input, _| input.text()),
+        );
+
+        assert!(sending);
+        assert_eq!(comments_of(&workspace, cx).len(), before + 1, "sent twice");
+        assert!(!waiting);
+        assert_eq!(text, "", "the sent text stayed in the field");
+    }
+
+    #[gpui::test]
+    fn a_failed_reply_keeps_its_text_and_can_be_sent_again(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        use_source(&workspace, ReviewSource::Merged, cx);
+        let review = open_review(&workspace, cx);
+        let before = comments_of(&workspace, cx).len();
+        let root = CommentId(1);
+        workspace.update(cx, |workspace, _| {
+            workspace.source = crate::workspace::DataSource::Connecting;
+        });
+
+        let input = review.update(cx, |review, cx| review.reply_input_for_test(root, cx));
+        input.update(cx, |input, cx| input.set_text("Thanks", cx));
+        review.update(cx, |review, cx| review.submit_reply(root, cx));
+        cx.run_until_parked();
+
+        let (waiting, text, error) = (
+            review.read_with(cx, |review, _| review.reply_sending(root)),
+            input.read_with(cx, |input, _| input.text()),
+            review.read_with(cx, |review, _| review.card_error(root)),
+        );
+
+        assert!(!waiting);
+        assert_eq!(text, "Thanks");
+        assert_eq!(error.as_deref(), Some("Not connected"));
+        assert_eq!(comments_of(&workspace, cx).len(), before);
+    }
+
+    #[gpui::test]
+    fn deleting_or_resolving_a_thread_leaves_its_reply_text_alone(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        use_source(&workspace, ReviewSource::Live, cx);
+        let review = open_review(&workspace, cx);
+        let root = CommentId(3);
+
+        let input = review.update(cx, |review, cx| review.reply_input_for_test(root, cx));
+        input.update(cx, |input, cx| input.set_text("half a reply", cx));
+        workspace.update(cx, |workspace, cx| {
+            workspace.resolve_review_comment(swarm_protocol::TaskId(0), root, true, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(input.read_with(cx, |input, _| input.text()), "half a reply");
+    }
+
+    #[gpui::test]
+    fn one_tasks_request_changes_does_not_block_another_task(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        use_source(&workspace, ReviewSource::Merged, cx);
+        open_review(&workspace, cx);
+        let active = workspace.read_with(cx, |workspace, _| workspace.active_task);
+        let pending = |cx: &VisualTestContext| count_comments(&comments_of(&workspace, cx)).pending;
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.review_requesting.insert(active);
+            workspace.request_review_changes(cx);
+        });
+        let own_in_flight = pending(cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.review_requesting.clear();
+            workspace.review_requesting.insert(TaskId(99));
+            workspace.request_review_changes(cx);
+        });
+
+        assert!(own_in_flight > 0, "a second request went out for the task");
+        assert_eq!(pending(cx), 0, "another task's request blocked this one");
+    }
+
+    #[gpui::test]
+    fn one_tasks_approval_does_not_block_another_task(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        use_source(&workspace, ReviewSource::Merged, cx);
+        open_review(&workspace, cx);
+        click("review-request-changes", cx);
+        workspace.update(cx, |workspace, _| {
+            workspace.review_approving.insert(TaskId(99));
+        });
+
+        click("review-approve", cx);
+
+        assert_eq!(approve_state(&workspace, cx), Some(0x22));
+    }
+
+    #[gpui::test]
+    fn a_comment_of_the_limit_goes_through_and_one_byte_more_does_not(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = open_review(&workspace, cx);
+        let before = comments_of(&workspace, cx).len();
+        let limit = swarm_protocol::COMMENT_BYTES;
+
+        cx.simulate_keystrokes("c");
+        redraw(cx);
+        let area = review.read_with(cx, |review, _| review.composer_input().clone());
+        area.update(cx, |area, cx| area.set_text("x".repeat(limit + 1), cx));
+        cx.simulate_keystrokes("cmd-enter");
+        cx.run_until_parked();
+        let refused = review.read_with(cx, |review, _| review.composer_error());
+        let unchanged = comments_of(&workspace, cx).len();
+
+        area.update(cx, |area, cx| area.set_text("x".repeat(limit), cx));
+        cx.simulate_keystrokes("cmd-enter");
+        cx.run_until_parked();
+
+        assert_eq!(limit, 16 << 10);
+        assert_eq!(refused.as_deref(), Some("Comment is too long"));
+        assert_eq!(unchanged, before);
+        assert_eq!(comments_of(&workspace, cx).len(), before + 1);
+    }
+
+    #[gpui::test]
+    fn a_reply_over_the_limit_is_refused_in_the_app(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        use_source(&workspace, ReviewSource::Merged, cx);
+        let review = open_review(&workspace, cx);
+        let before = comments_of(&workspace, cx).len();
+        let root = CommentId(1);
+
+        review.update(cx, |review, cx| {
+            review.reply_for_test(&"x".repeat(swarm_protocol::COMMENT_BYTES + 1), root, cx);
+        });
+        cx.run_until_parked();
+
+        let error = review.read_with(cx, |review, _| review.card_error(root));
+        assert_eq!(error.as_deref(), Some("Comment is too long"));
+        assert_eq!(comments_of(&workspace, cx).len(), before);
+    }
+
+    /// The accessibility name and state of an element.
+    fn a11y_of(element: impl IntoElement) -> (Option<String>, Option<bool>) {
+        use gpui::Element as _;
+
+        let element = element.into_element();
+        let mut node = gpui::accesskit::Node::new(Role::Unknown);
+
+        element.write_a11y_info(&mut node);
+
+        (node.label().map(str::to_owned), node.is_selected())
+    }
+
+    #[gpui::test]
+    fn the_cursor_line_is_selected_and_named_for_a_screen_reader(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = open_review(&workspace, cx);
+        let colors = cx.update(|_, cx| cx.theme().colors().clone());
+        let line = DiffLine {
+            kind: DiffLineKind::Added,
+            text: "let cell = grid.cell(row, column);".into(),
+        };
+        let row = |cursor: Option<DiffSide>| {
+            let ctx = LineCtx {
+                view: review.clone(),
+                file: 0,
+                hunk: 0,
+                line: 0,
+                cursor,
+            };
+
+            unified_row(0, Some(&line), (0, 85), &colors, &ctx).map(a11y_of)
+        };
+
+        let on = row(Some(DiffSide::New));
+        let off = row(None);
+
+        assert_eq!(
+            on,
+            Some((
+                Some("Line 85, added, let cell = grid.cell(row, column);".to_owned()),
+                Some(true)
+            ))
+        );
+        assert_eq!(
+            off,
+            Some((
+                Some("Line 85, added, let cell = grid.cell(row, column);".to_owned()),
+                Some(false)
+            ))
+        );
+    }
+
+    #[gpui::test]
+    fn the_cursor_half_of_a_split_row_is_the_selected_one(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = open_review(&workspace, cx);
+        review.update(cx, |review, cx| review.set_style(DiffStyle::Split, cx));
+        redraw(cx);
+        let colors = cx.update(|_, cx| cx.theme().colors().clone());
+        let diff = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .data
+                .task_diff(TaskId(0), ReviewSource::Live)
+                .cloned()
+        });
+        let diff = diff.expect("the sample has a Live diff");
+        let (hunk_index, hunk) = diff.files[0]
+            .hunks
+            .iter()
+            .enumerate()
+            .find(|(_, hunk)| {
+                hunk.lines
+                    .iter()
+                    .any(|line| line.kind == DiffLineKind::Context)
+            })
+            .expect("a hunk with a context line");
+        let at = hunk
+            .lines
+            .iter()
+            .position(|line| line.kind == DiffLineKind::Context)
+            .unwrap_or(0);
+        let numbers = crate::review_model::hunk_numbers(hunk)[at];
+        let side = |number: u32| Side {
+            line: u32::try_from(at).unwrap_or(0),
+            number,
+        };
+        let hunk_at = u32::try_from(hunk_index).unwrap_or(0);
+        let ctx = |cursor: Option<DiffSide>| LineCtx {
+            view: review.clone(),
+            file: 0,
+            hunk: hunk_at,
+            line: u32::try_from(at).unwrap_or(0),
+            cursor,
+        };
+        let read = |cursor: Option<DiffSide>| {
+            let (left, right) = (ctx(cursor), ctx(cursor));
+
+            a11y_of(split_line(
+                0,
+                &diff,
+                (0, hunk_at),
+                (
+                    (Some(side(numbers.0)), &left),
+                    (Some(side(numbers.1)), &right),
+                ),
+                &colors,
+            ))
+        };
+
+        let (new_label, new_selected) = read(Some(DiffSide::New));
+        let (old_label, old_selected) = read(Some(DiffSide::Old));
+        let (none_label, none_selected) = read(None);
+
+        assert_eq!(new_selected, Some(true));
+        assert_eq!(old_selected, Some(true));
+        assert_eq!(none_selected, Some(false));
+        assert!(
+            new_label
+                .is_some_and(|label| label.starts_with(&format!("Line {}, unchanged", numbers.1)))
+        );
+        assert!(
+            old_label
+                .is_some_and(|label| label.starts_with(&format!("Line {}, unchanged", numbers.0)))
+        );
+        assert!(none_label.is_some_and(|label| label.starts_with("Old line")));
     }
 
     #[test]

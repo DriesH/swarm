@@ -1,5 +1,6 @@
 //! Review: the data behind the diff view. Plain data, no gpui entities.
 
+use std::cmp::Reverse;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
@@ -400,6 +401,10 @@ pub(crate) fn build_rows(
             });
         }
 
+        if marks.composer == Some(ComposerAt::Top { file: *index }) {
+            body.rows.push(Row::Composer { file: at });
+        }
+
         if file.binary {
             body.rows.push(Row::Note {
                 file: at,
@@ -710,6 +715,56 @@ pub(crate) fn find_line(file: &FileDiff, side: DiffSide, number: u32) -> Option<
     None
 }
 
+/// The number of the line an anchor sits on now, among the lines of its side that the
+/// diff shows. Same rule as the daemon: equal text, one point for an equal line before
+/// and one after, and the nearest to the old number on a tie.
+pub(crate) fn refind_line(file: &FileDiff, anchor: &CommentAnchor) -> Option<u32> {
+    // Equal neighbors, then nearest to the old number, then the earlier line.
+    type Rank = (u8, Reverse<u32>, Reverse<u32>);
+
+    let mut best: Option<(Rank, u32)> = None;
+
+    for hunk in &file.hunks {
+        let numbers = hunk_numbers(hunk);
+        let same_side: Vec<(u32, &str)> = hunk
+            .lines
+            .iter()
+            .zip(numbers)
+            .filter(|(line, _)| on_side(line.kind, anchor.side))
+            .map(|(line, (old, new))| {
+                let number = match anchor.side {
+                    DiffSide::Old => old,
+                    DiffSide::New => new,
+                };
+
+                (number, line.text.as_str())
+            })
+            .collect();
+
+        for (position, (number, text)) in same_side.iter().enumerate() {
+            if *text != anchor.text {
+                continue;
+            }
+
+            let before = position > 0
+                && anchor.before.as_deref() == same_side.get(position - 1).map(|other| other.1);
+            let after = anchor.after.is_some()
+                && anchor.after.as_deref() == same_side.get(position + 1).map(|other| other.1);
+            let rank = (
+                u8::from(before) + u8::from(after),
+                Reverse(number.abs_diff(anchor.line)),
+                Reverse(*number),
+            );
+
+            if best.is_none_or(|(other, _)| rank > other) {
+                best = Some((rank, *number));
+            }
+        }
+    }
+
+    best.map(|(_, number)| number)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Place {
     /// Under a line, as hunk and line index.
@@ -777,11 +832,20 @@ pub(crate) fn place_threads(diff: &TaskDiff, comments: &[ReviewComment]) -> Vec<
     threads
 }
 
+/// Where the comment box sits in a diff.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ComposerAt {
+    /// Under a line.
+    Line(LinePos),
+    /// At the top of the file card: its line is gone.
+    Top { file: usize },
+}
+
 /// What the rows need besides the diff: the placed threads and the open composer.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Marks {
     pub threads: Rc<[Thread]>,
-    pub composer: Option<LinePos>,
+    pub composer: Option<ComposerAt>,
 }
 
 /// Finds the threads of a line quickly while rows are built.
@@ -871,12 +935,14 @@ impl<'a> Lookup<'a> {
             }
         }
 
-        let composer = self
-            .marks
-            .composer
-            .filter(|at| at.file == file && at.hunk == hunk && at.line == line && fits(at.side));
+        let composer = match self.marks.composer {
+            Some(ComposerAt::Line(at)) => {
+                at.file == file && at.hunk == hunk && at.line == line && fits(at.side)
+            }
+            _ => false,
+        };
 
-        if composer.is_some() {
+        if composer {
             rows.push(Row::Composer { file });
         }
     }
@@ -2030,18 +2096,121 @@ mod tests {
         let comments = [comment(1, DiffSide::New, 21, CommentState::Pending)];
         let marks = Marks {
             threads: place_threads(&diff, &comments).into(),
-            composer: Some(LinePos {
+            composer: Some(ComposerAt::Line(LinePos {
                 file: 0,
                 hunk: 0,
                 line: 2,
                 side: DiffSide::New,
-            }),
+            })),
         };
 
         let rows = build_rows(&diff, &infos, &[0], |_| false, DiffStyle::Unified, &marks).rows;
 
         assert!(matches!(rows[5], Row::Thread { .. }));
         assert!(matches!(rows[6], Row::Composer { .. }));
+    }
+
+    #[test]
+    fn a_comment_box_without_a_line_sits_at_the_top_of_its_card() {
+        let diff = commented_diff();
+        let infos = file_infos(&diff);
+        let mut outdated = comment(1, DiffSide::New, 21, CommentState::Pending);
+        outdated.outdated = true;
+        let marks = Marks {
+            threads: place_threads(&diff, &[outdated]).into(),
+            composer: Some(ComposerAt::Top { file: 0 }),
+        };
+
+        let rows = build_rows(&diff, &infos, &[0], |_| false, DiffStyle::Unified, &marks).rows;
+
+        assert!(matches!(rows[1], Row::Thread { .. }));
+        assert!(matches!(rows[2], Row::Composer { .. }));
+        assert_eq!(
+            rows.iter()
+                .filter(|row| matches!(row, Row::Composer { .. }))
+                .count(),
+            1
+        );
+    }
+
+    fn anchored(side: DiffSide, line: u32, text: &str, around: (&str, &str)) -> CommentAnchor {
+        CommentAnchor {
+            worktree: PathBuf::from("/wt"),
+            path: PathBuf::from("a.rs"),
+            side,
+            line,
+            text: text.to_owned(),
+            before: Some(around.0)
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned),
+            after: Some(around.1)
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned),
+        }
+    }
+
+    /// A file with one hunk whose lines start at number 1 on both sides.
+    fn numbered(lines: Vec<DiffLine>) -> FileDiff {
+        let mut data = file("a.rs", None, lines);
+
+        data.hunks[0].old_start = 1;
+        data.hunks[0].new_start = 1;
+
+        data
+    }
+
+    fn context(texts: &[&str]) -> FileDiff {
+        numbered(
+            texts
+                .iter()
+                .map(|text| line(DiffLineKind::Context, text))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn a_line_moved_by_new_lines_above_is_found_again() {
+        let data = context(&["new", "new", "a", "b", "c"]);
+        let anchor = anchored(DiffSide::New, 2, "b", ("a", "c"));
+
+        assert_eq!(refind_line(&data, &anchor), Some(4));
+    }
+
+    #[test]
+    fn equal_neighbors_beat_distance_and_ties_go_to_the_earlier_line() {
+        let data = context(&["p", "x", "q", "a", "x", "c", "x"]);
+        let with_neighbors = anchored(DiffSide::New, 2, "x", ("a", "c"));
+        let nearest = anchored(DiffSide::New, 7, "x", ("", ""));
+
+        let tie = context(&["x", "a", "b", "c", "x"]);
+        let halfway = anchored(DiffSide::New, 3, "x", ("", ""));
+
+        assert_eq!(refind_line(&data, &with_neighbors), Some(5));
+        assert_eq!(refind_line(&data, &nearest), Some(7));
+        assert_eq!(refind_line(&tie, &halfway), Some(1));
+    }
+
+    #[test]
+    fn a_line_that_is_gone_or_on_the_other_side_is_not_found() {
+        let data = numbered(vec![
+            line(DiffLineKind::Context, "a"),
+            line(DiffLineKind::Deleted, "old"),
+            line(DiffLineKind::Added, "new"),
+        ]);
+
+        assert_eq!(
+            refind_line(&data, &anchored(DiffSide::New, 1, "gone", ("", ""))),
+            None
+        );
+        assert_eq!(
+            refind_line(&data, &anchored(DiffSide::New, 2, "old", ("", ""))),
+            None,
+            "a deleted line is not on the new side"
+        );
+        assert_eq!(
+            refind_line(&data, &anchored(DiffSide::Old, 2, "old", ("a", ""))),
+            Some(2)
+        );
     }
 
     #[test]

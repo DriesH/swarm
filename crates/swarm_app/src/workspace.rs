@@ -137,13 +137,14 @@ pub(crate) struct Workspace {
     pub(crate) review_jump_serial: u64,
     /// The worktree of the file Review opens at, when the request knows it.
     pub(crate) review_worktree: Option<PathBuf>,
-    /// The task whose approval is on its way to the daemon.
-    pub(crate) review_approving: Option<TaskId>,
+    /// The tasks whose approval is on its way to the daemon.
+    pub(crate) review_approving: HashSet<TaskId>,
     pub(crate) review_error: Option<(TaskId, SharedString)>,
-    /// The task whose Request changes is on its way to the daemon.
-    pub(crate) review_requesting: Option<TaskId>,
+    /// The tasks whose Request changes is on its way to the daemon.
+    pub(crate) review_requesting: HashSet<TaskId>,
     /// The comments listing the daemon last answered, so a list is asked once per diff.
     pub(crate) comments_listed: Option<crate::review_comments::Listed>,
+    pub(crate) comment_sync: crate::review_comments::CommentSync,
     /// Moves keyboard focus into Review at the next frame.
     pub(crate) pending_review_focus: bool,
     pub(crate) review_poll: Option<DiffPoll>,
@@ -265,10 +266,11 @@ impl Workspace {
             review_sources: HashMap::new(),
             review_jump_serial: 0,
             review_worktree: None,
-            review_approving: None,
+            review_approving: HashSet::new(),
             review_error: None,
-            review_requesting: None,
+            review_requesting: HashSet::new(),
             comments_listed: None,
+            comment_sync: crate::review_comments::CommentSync::default(),
             pending_review_focus: false,
             review_poll: None,
             live_poll: None,
@@ -357,7 +359,7 @@ impl Workspace {
     pub(crate) fn set_view(&mut self, view: View, cx: &mut Context<Self>) {
         self.view = view;
         if view != View::Review {
-            self.comments_listed = None;
+            self.forget_comment_listing();
         }
         self.review_agent = None;
         self.review_file = None;

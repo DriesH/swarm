@@ -1,6 +1,6 @@
 //! Comments in the Review view: the line cursor, the comment box and the threads.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -21,7 +21,8 @@ use crate::markdown;
 use crate::model::TaskId;
 use crate::review_comments::CommentSlot;
 use crate::review_model::{
-    LinePos, Place, Row, ago, anchor_for, find_line, first_changed_line, place_threads, side_of,
+    ComposerAt, LinePos, Place, Row, ago, anchor_for, find_line, first_changed_line, place_threads,
+    refind_line, side_of,
 };
 
 const TOO_LONG: &str = "Comment is too long";
@@ -37,15 +38,18 @@ pub(super) struct Cursor {
 
 type DraftKey = (TaskId, ReviewSource, FileKey, DiffSide, u32);
 
+/// Tells one comment box from another, even when its line moves.
+type BoxId = u64;
+
 /// The line a comment box is open on.
 struct Open {
+    id: BoxId,
     task: TaskId,
     source: ReviewSource,
     key: FileKey,
     anchor: CommentAnchor,
     daemon_task: swarm_protocol::TaskId,
     error: Option<SharedString>,
-    sending: bool,
 }
 
 impl Open {
@@ -60,11 +64,21 @@ impl Open {
     }
 }
 
+/// What a box left behind on its line.
+struct Draft {
+    id: BoxId,
+    text: String,
+    error: Option<SharedString>,
+}
+
 /// The one comment box, and the unsent text of lines it left.
 pub(super) struct Composer {
     pub input: Entity<TextArea>,
     open: Option<Open>,
-    drafts: HashMap<DraftKey, String>,
+    drafts: HashMap<DraftKey, Draft>,
+    /// Boxes whose comment is on its way to the daemon.
+    sending: HashSet<BoxId>,
+    next_id: BoxId,
     _subscription: Subscription,
 }
 
@@ -85,8 +99,24 @@ impl Composer {
             input,
             open: None,
             drafts: HashMap::new(),
+            sending: HashSet::new(),
+            next_id: 1,
             _subscription: subscription,
         }
+    }
+
+    fn new_id(&mut self) -> BoxId {
+        let id = self.next_id;
+
+        self.next_id += 1;
+
+        id
+    }
+
+    fn is_sending(&self) -> bool {
+        self.open
+            .as_ref()
+            .is_some_and(|open| self.sending.contains(&open.id))
     }
 
     #[cfg(test)]
@@ -98,6 +128,8 @@ impl Composer {
 /// The reply field of a thread.
 pub(super) struct ReplyBox {
     input: Entity<TextInput>,
+    /// The reply is on its way to the daemon.
+    sending: bool,
     _subscription: Subscription,
 }
 
@@ -280,6 +312,61 @@ impl ReviewView {
     }
 
     #[cfg(test)]
+    pub(crate) fn reply_sending(&self, root: CommentId) -> bool {
+        self.reply_boxes
+            .get(&root)
+            .is_some_and(|reply| reply.sending)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reply_input_for_test(
+        &mut self,
+        root: CommentId,
+        cx: &mut Context<Self>,
+    ) -> Entity<TextInput> {
+        self.reply_input(root, cx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn card_error(&self, id: CommentId) -> Option<SharedString> {
+        self.card_errors.get(&id).cloned()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn composer_sending(&self) -> bool {
+        self.composer.is_sending()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn composer_line(&self) -> Option<u32> {
+        self.composer.open.as_ref().map(|open| open.anchor.line)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn draft_text(&self, pos: LinePos) -> Option<String> {
+        let input = self.input.as_ref()?;
+        let file = input.diff.as_ref()?.files.get(pos.file as usize)?;
+        let anchor = anchor_for(file, pos.hunk as usize, pos.line as usize, pos.side)?;
+        let key = (
+            input.task,
+            input.source,
+            (file.worktree.clone(), file.path.clone()),
+            anchor.side,
+            anchor.line,
+        );
+
+        self.composer
+            .drafts
+            .get(&key)
+            .map(|draft| draft.text.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn submit_composer_for_test(&mut self, cx: &mut Context<Self>) {
+        self.submit_composer(cx);
+    }
+
+    #[cfg(test)]
     pub(crate) fn is_folded(&self, id: CommentId) -> bool {
         self.input.as_ref().is_some_and(|input| {
             input
@@ -294,8 +381,9 @@ impl ReviewView {
         self.open_counts.get(file).copied().unwrap_or(0)
     }
 
-    /// Where the open comment box sits in the current diff, if its line is still there.
-    pub(super) fn composer_pos(&self) -> Option<LinePos> {
+    /// Where the open comment box sits in the current diff: under its line, else at the
+    /// top of its file card. `None` when its file is not in the diff.
+    pub(super) fn composer_at(&self) -> Option<ComposerAt> {
         let open = self.composer.open.as_ref()?;
         let input = self.input.as_ref()?;
 
@@ -309,19 +397,51 @@ impl ReviewView {
             .iter()
             .position(|file| (file.worktree.clone(), file.path.clone()) == open.key)?;
         let data = diff.files.get(file)?;
-        let (hunk, line) = find_line(data, open.anchor.side, open.anchor.line)?;
-        let text_matches = data
-            .hunks
-            .get(hunk as usize)
-            .and_then(|hunk| hunk.lines.get(line as usize))
-            .is_some_and(|found| found.text == open.anchor.text);
 
-        text_matches.then_some(LinePos {
-            file: u32::try_from(file).unwrap_or(u32::MAX),
-            hunk,
-            line,
-            side: open.anchor.side,
+        let under = find_line(data, open.anchor.side, open.anchor.line).filter(|(hunk, line)| {
+            data.hunks
+                .get(*hunk as usize)
+                .and_then(|hunk| hunk.lines.get(*line as usize))
+                .is_some_and(|found| found.text == open.anchor.text)
+        });
+
+        Some(match under {
+            Some((hunk, line)) => ComposerAt::Line(LinePos {
+                file: u32::try_from(file).unwrap_or(u32::MAX),
+                hunk,
+                line,
+                side: open.anchor.side,
+            }),
+            None => ComposerAt::Top { file },
         })
+    }
+
+    /// Moves the open comment box to where its line is in a new diff, so it stays put
+    /// under the same code. A line that is gone keeps its number: the box then shows at
+    /// the top of the card.
+    pub(super) fn follow_composer(&mut self) {
+        let Some(input) = self.input.as_ref() else {
+            return;
+        };
+        let Some(open) = self.composer.open.as_mut() else {
+            return;
+        };
+        let Some(diff) = input.diff.as_ref() else {
+            return;
+        };
+
+        if open.task != input.task || open.source != input.source {
+            return;
+        }
+
+        let file = diff
+            .files
+            .iter()
+            .find(|file| (file.worktree.clone(), file.path.clone()) == open.key);
+
+        if let Some(line) = file.and_then(|file| refind_line(file, &open.anchor)) {
+            open.anchor.line = line;
+        }
     }
 
     /// The commentable lines on screen, in order, as `(row, position)`.
@@ -481,20 +601,28 @@ impl ReviewView {
 
         self.park_draft(cx);
 
+        let key: FileKey = (file.worktree.clone(), file.path.clone());
+        let draft_key = (
+            input.task,
+            input.source,
+            key.clone(),
+            anchor.side,
+            anchor.line,
+        );
+        let draft = self.composer.drafts.remove(&draft_key);
+
         let open = Open {
+            id: draft
+                .as_ref()
+                .map_or_else(|| self.composer.new_id(), |draft| draft.id),
             task: input.task,
             source: input.source,
-            key: (file.worktree.clone(), file.path.clone()),
+            key,
             anchor,
             daemon_task: diff.task,
-            error: None,
-            sending: false,
+            error: draft.as_ref().and_then(|draft| draft.error.clone()),
         };
-        let text = self
-            .composer
-            .drafts
-            .remove(&open.draft_key())
-            .unwrap_or_default();
+        let text = draft.map(|draft| draft.text).unwrap_or_default();
 
         self.composer
             .input
@@ -516,17 +644,26 @@ impl ReviewView {
         cx.notify();
     }
 
-    /// Keeps the text of the open box as the draft of its line.
+    /// Keeps the open box as the draft of its line. A box whose comment is on its way
+    /// is kept too, so its answer finds it.
     fn park_draft(&mut self, cx: &Context<Self>) {
         let Some(open) = &self.composer.open else {
             return;
         };
         let text = self.composer.input.read(cx).text().to_string();
+        let sending = self.composer.sending.contains(&open.id);
 
-        if text.trim().is_empty() {
+        if text.trim().is_empty() && !sending {
             self.composer.drafts.remove(&open.draft_key());
         } else {
-            self.composer.drafts.insert(open.draft_key(), text);
+            self.composer.drafts.insert(
+                open.draft_key(),
+                Draft {
+                    id: open.id,
+                    text,
+                    error: open.error.clone(),
+                },
+            );
         }
     }
 
@@ -549,11 +686,12 @@ impl ReviewView {
     fn submit_composer(&mut self, cx: &mut Context<Self>) {
         let text = self.composer.input.read(cx).text();
         let body = text.trim().to_owned();
-        let Some(open) = self.composer.open.as_mut() else {
+        let composer = &mut self.composer;
+        let Some(open) = composer.open.as_mut() else {
             return;
         };
 
-        if open.sending || body.is_empty() {
+        if composer.sending.contains(&open.id) || body.is_empty() {
             return;
         }
         if body.len() > COMMENT_BYTES {
@@ -563,7 +701,7 @@ impl ReviewView {
         }
 
         open.error = None;
-        open.sending = true;
+        let slot = CommentSlot::Composer(open.id);
         let comment = NewComment {
             task: open.daemon_task,
             parent: None,
@@ -571,9 +709,10 @@ impl ReviewView {
             anchor: open.anchor.clone(),
             body,
         };
+        composer.sending.insert(open.id);
 
         update_workspace(&self.workspace, cx, |workspace, cx| {
-            workspace.add_review_comment(comment, CommentSlot::Composer, cx);
+            workspace.add_review_comment(comment, slot, cx);
         });
         cx.notify();
     }
@@ -585,36 +724,91 @@ impl ReviewView {
         result: Result<(), SharedString>,
         cx: &mut Context<Self>,
     ) {
-        match (slot, result) {
-            (CommentSlot::Composer, Ok(())) => {
-                if let Some(open) = self.composer.open.take() {
-                    self.composer.drafts.remove(&open.draft_key());
+        match slot {
+            CommentSlot::Composer(id) => self.composer_answer(id, result, cx),
+            CommentSlot::Reply(id) => self.reply_answer(id, result, cx),
+            CommentSlot::Card(id) => match result {
+                Ok(()) => {
+                    self.card_errors.remove(&id);
                 }
+                Err(message) => {
+                    self.card_errors.insert(id, message);
+                }
+            },
+        }
+
+        cx.notify();
+    }
+
+    /// Applies an answer to the box it was sent from, which may have left the screen.
+    fn composer_answer(
+        &mut self,
+        id: BoxId,
+        result: Result<(), SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.composer.sending.remove(&id);
+        let shown = self
+            .composer
+            .open
+            .as_ref()
+            .is_some_and(|open| open.id == id);
+
+        match result {
+            Ok(()) if shown => {
+                self.composer.open = None;
                 self.composer
                     .input
                     .update(cx, |area, cx| area.set_text("", cx));
                 self.focus_body = true;
                 self.after_card_change();
             }
-            (CommentSlot::Composer, Err(message)) => {
+            Ok(()) => self.composer.drafts.retain(|_, draft| draft.id != id),
+            Err(message) if shown => {
                 if let Some(open) = self.composer.open.as_mut() {
-                    open.sending = false;
                     open.error = Some(message);
                 }
             }
-            (CommentSlot::Card(id), Ok(())) => {
-                self.card_errors.remove(&id);
-
-                if let Some(reply) = self.reply_boxes.get(&id) {
-                    reply.input.update(cx, |input, cx| input.set_text("", cx));
+            Err(message) => {
+                if let Some(draft) = self
+                    .composer
+                    .drafts
+                    .values_mut()
+                    .find(|draft| draft.id == id)
+                {
+                    draft.error = Some(message);
                 }
             }
-            (CommentSlot::Card(id), Err(message)) => {
-                self.card_errors.insert(id, message);
-            }
+        }
+    }
+
+    /// Applies an answer to a reply: the field clears on success and opens again on
+    /// failure.
+    fn reply_answer(
+        &mut self,
+        root: CommentId,
+        result: Result<(), SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(reply) = self.reply_boxes.get_mut(&root) {
+            reply.sending = false;
+            reply.input.update(cx, |input, cx| {
+                input.set_disabled(false, cx);
+
+                if result.is_ok() {
+                    input.set_text("", cx);
+                }
+            });
         }
 
-        cx.notify();
+        match result {
+            Ok(()) => {
+                self.card_errors.remove(&root);
+            }
+            Err(message) => {
+                self.card_errors.insert(root, message);
+            }
+        }
     }
 
     /// Forgets the draft and the box of a task that closed.
@@ -652,6 +846,7 @@ impl ReviewView {
 
             ReplyBox {
                 input,
+                sending: false,
                 _subscription: subscription,
             }
         });
@@ -661,7 +856,7 @@ impl ReviewView {
 
     /// Sends the text of a thread's reply field as a reply.
     pub(crate) fn submit_reply(&mut self, root: CommentId, cx: &mut Context<Self>) {
-        let Some(reply) = self.reply_boxes.get(&root) else {
+        let Some(reply) = self.reply_boxes.get_mut(&root) else {
             return;
         };
         let body = reply.input.read(cx).text().trim().to_owned();
@@ -674,7 +869,7 @@ impl ReviewView {
             return;
         };
 
-        if body.is_empty() {
+        if reply.sending || body.is_empty() {
             return;
         }
         if body.len() > COMMENT_BYTES {
@@ -684,6 +879,11 @@ impl ReviewView {
         }
 
         self.card_errors.remove(&root);
+        reply.sending = true;
+        reply
+            .input
+            .update(cx, |input, cx| input.set_disabled(true, cx));
+
         let comment = NewComment {
             task: parent.task,
             parent: Some(parent.id),
@@ -693,7 +893,7 @@ impl ReviewView {
         };
 
         update_workspace(&self.workspace, cx, |workspace, cx| {
-            workspace.add_review_comment(comment, CommentSlot::Card(root), cx);
+            workspace.add_review_comment(comment, CommentSlot::Reply(root), cx);
         });
         cx.notify();
     }
@@ -1026,14 +1226,16 @@ impl ReviewView {
         colors: &ThemeColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let outdated = matches!(self.composer_at(), Some(ComposerAt::Top { .. }));
+        let sending = self.composer.is_sending();
         let Some(open) = self.composer.open.as_ref() else {
             return div().into_any_element();
         };
         let open_source = open.source;
         let side = open.anchor.side;
-        let sending = open.sending;
         let error = open.error.clone();
         let line_number = open.anchor.line;
+        let quoted = outdated.then(|| super::display_text(&open.anchor.text));
         let file_name = open
             .key
             .1
@@ -1049,7 +1251,10 @@ impl ReviewView {
             .debug_selector(|| "comment-composer".to_owned())
             .key_context(COMPOSER_CONTEXT)
             .role(Role::Group)
-            .aria_label(format!("New comment on {file_name} line {line_number}"))
+            .aria_label(format!(
+                "New comment on {file_name} line {line_number}{}",
+                if outdated { ", outdated" } else { "" }
+            ))
             .w_full()
             .min_w_0()
             .gap(px(8.))
@@ -1058,6 +1263,37 @@ impl ReviewView {
             .border_1()
             .border_color(line)
             .bg(raised)
+            .children(quoted.map(|text| {
+                v_flex()
+                    .gap(px(4.))
+                    .child(
+                        h_flex()
+                            .id("comment-composer-outdated")
+                            .debug_selector(|| "comment-composer-outdated".to_owned())
+                            .gap(px(8.))
+                            .child(
+                                Label::new(format!("line {line_number}"))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Faint),
+                            )
+                            .child(Tag::new("Outdated").tone(TagTone::Warn)),
+                    )
+                    .child(
+                        div()
+                            .border_l_2()
+                            .border_color(line)
+                            .pl(px(8.))
+                            .min_w_0()
+                            .flex()
+                            .child(
+                                Label::new(text)
+                                    .mono()
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Faint)
+                                    .truncate(),
+                            ),
+                    )
+            }))
             .child(self.composer.input.clone())
             .children(error.map(|message| {
                 div()
