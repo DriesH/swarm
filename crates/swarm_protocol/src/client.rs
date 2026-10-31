@@ -18,8 +18,8 @@ use swarm_term::{TerminalChannels, TerminalInput, TerminalOutput};
 use crate::{
     AgentChange, AgentId, AgentInfo, AgentKind, CallId, CloseCheck, CreateTask, CreateTerminal,
     Event, FrameError, MessageId, MessageInfo, Paths, ProjectId, ProjectInfo, Request,
-    ReviewSource, TaskDiff, TaskId, TaskInfo, TerminalId, TerminalInfo, VERSION,
-    check_private_dir, read, write,
+    ReviewSource, TaskDiff, TaskId, TaskInfo, TerminalId, TerminalInfo, VERSION, check_private_dir,
+    read, write,
 };
 
 /// A message was sent or delivered, in the order the daemon sent the events.
