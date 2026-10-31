@@ -5,8 +5,11 @@ use std::io::Read as _;
 
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use swarm_protocol::agent::{AgentSummary, Call, InboxMessage, Merged, Sent, render_inbox};
-use swarm_protocol::{AgentId, AgentKind};
+use swarm_protocol::agent::{
+    AgentSummary, Call, InboxMessage, Merged, Sent, TaskSummary, TaskUntil, TerminalSize,
+    TerminalSummary, TerminalText, TerminalUntil, TerminalWaited, render_inbox,
+};
+use swarm_protocol::{AgentId, AgentKind, AgentLifecycle, GridSize, TaskId, TerminalId};
 
 use crate::session::Session;
 
@@ -45,6 +48,43 @@ pub(crate) enum Command {
     },
     Agents,
     Confirm,
+    TaskCreate {
+        name: String,
+        from: Option<String>,
+        brief: String,
+        kind: Option<AgentKind>,
+    },
+    TaskList,
+    TaskWait {
+        ids: Vec<TaskId>,
+        until: TaskUntil,
+        timeout_secs: Option<u32>,
+    },
+    Exit,
+    TerminalSpawn {
+        command: Vec<String>,
+        cwd: Option<std::path::PathBuf>,
+        size: Option<TerminalSize>,
+        name: Option<String>,
+    },
+    TerminalResize {
+        id: TerminalId,
+        size: TerminalSize,
+    },
+    TerminalRead {
+        id: TerminalId,
+        lines: Option<u32>,
+    },
+    TerminalWait {
+        id: TerminalId,
+        until: TerminalUntil,
+        timeout_secs: Option<u32>,
+    },
+    TerminalKill {
+        id: TerminalId,
+        signal: Option<String>,
+    },
+    TerminalList,
 }
 
 /// What a command printed: the raw result for `--json`, the words for people and agents.
@@ -112,7 +152,288 @@ impl Command {
 
                 Ok(output(result, "ok".to_owned()))
             }
+            Self::TaskCreate { .. } | Self::TaskList | Self::TaskWait { .. } | Self::Exit => {
+                self.run_task(session)
+            }
+            Self::TerminalSpawn { .. }
+            | Self::TerminalResize { .. }
+            | Self::TerminalRead { .. }
+            | Self::TerminalWait { .. }
+            | Self::TerminalKill { .. }
+            | Self::TerminalList => self.run_terminal(session),
         }
+    }
+}
+
+impl Command {
+    fn run_task(self, session: &Session) -> Result<Output, String> {
+        match self {
+            Self::TaskCreate {
+                name,
+                from,
+                brief,
+                kind,
+            } => {
+                let result = session.call(Call::TaskCreate {
+                    name,
+                    from,
+                    brief,
+                    kind,
+                })?;
+                let task: TaskSummary = decode(&result)?;
+                let orchestrator = task.orchestrator.as_ref().map_or_else(
+                    || "none".to_owned(),
+                    |agent| format!("agent {}", agent.id.0),
+                );
+                let text = format!(
+                    "created task {} ({})\nbranch: {}\norchestrator: {orchestrator}",
+                    task.id.0, task.name, task.branch
+                );
+
+                Ok(output(result, text))
+            }
+            Self::TaskList => {
+                let result = session.call(Call::TaskList)?;
+                let tasks: Vec<TaskSummary> = decode(&result)?;
+
+                Ok(output(result, tasks_text(&tasks)))
+            }
+            Self::TaskWait {
+                ids,
+                until,
+                timeout_secs,
+            } => {
+                let result = session.call(Call::TaskWait {
+                    ids,
+                    until,
+                    timeout_secs,
+                })?;
+                let tasks: Vec<TaskSummary> = decode(&result)?;
+
+                let reached = tasks.iter().all(|task| task_reached(until, task));
+                let mut text = tasks_text(&tasks);
+                if !reached {
+                    text.push_str("\ntimed out");
+                }
+
+                Ok(Output {
+                    json: result,
+                    text,
+                    clean: reached,
+                })
+            }
+            Self::Exit => {
+                let result = session.call(Call::AgentExit)?;
+
+                Ok(output(result, "ok".to_owned()))
+            }
+            other => Err(format!("{other:?} is not a task command")),
+        }
+    }
+
+    fn run_terminal(self, session: &Session) -> Result<Output, String> {
+        match self {
+            Self::TerminalSpawn {
+                command,
+                cwd,
+                size,
+                name,
+            } => {
+                let result = session.call(Call::TerminalSpawn {
+                    command,
+                    cwd,
+                    size,
+                    name,
+                })?;
+                let terminal: TerminalSummary = decode(&result)?;
+                let text = format!(
+                    "started terminal {} ({})\nsize: {}",
+                    terminal.id.0,
+                    terminal_label(&terminal),
+                    grid_text(terminal.size)
+                );
+
+                Ok(output(result, text))
+            }
+            Self::TerminalResize { id, size } => {
+                let result = session.call(Call::TerminalResize { id, size })?;
+                let terminal: TerminalSummary = decode(&result)?;
+                let text = format!(
+                    "terminal {} is now {}",
+                    terminal.id.0,
+                    grid_text(terminal.size)
+                );
+
+                Ok(output(result, text))
+            }
+            Self::TerminalRead { id, lines } => {
+                let result = session.call(Call::TerminalRead { id, lines })?;
+                let read: TerminalText = decode(&result)?;
+
+                Ok(output(result, read.text))
+            }
+            Self::TerminalWait {
+                id,
+                until,
+                timeout_secs,
+            } => {
+                let result = session.call(Call::TerminalWait {
+                    id,
+                    until,
+                    timeout_secs,
+                })?;
+
+                waited(result)
+            }
+            Self::TerminalKill { id, signal } => {
+                let result = session.call(Call::TerminalKill { id, signal })?;
+                let terminal: TerminalSummary = decode(&result)?;
+
+                Ok(output(result, terminal_state(&terminal)))
+            }
+            Self::TerminalList => {
+                let result = session.call(Call::TerminalList)?;
+                let terminals: Vec<TerminalSummary> = decode(&result)?;
+
+                Ok(output(result, terminals_text(&terminals)))
+            }
+            other => Err(format!("{other:?} is not a terminal command")),
+        }
+    }
+}
+
+/// The task orchestrator confirmed its brief, or finished.
+fn task_reached(until: TaskUntil, task: &TaskSummary) -> bool {
+    match until {
+        TaskUntil::Briefed => task.briefed,
+        TaskUntil::Done => task.orchestrator.as_ref().is_some_and(|orchestrator| {
+            orchestrator.status == "done"
+                || matches!(
+                    orchestrator.lifecycle,
+                    AgentLifecycle::Stopped | AgentLifecycle::Resumable
+                )
+        }),
+    }
+}
+
+fn tasks_text(tasks: &[TaskSummary]) -> String {
+    if tasks.is_empty() {
+        return "no tasks".to_owned();
+    }
+
+    tasks
+        .iter()
+        .map(|task| {
+            let orchestrator = task.orchestrator.as_ref().map_or_else(
+                || "no orchestrator".to_owned(),
+                |agent| format!("{} (agent {})", agent.status, agent.id.0),
+            );
+
+            format!(
+                "{}  {}  {}  {}  {orchestrator}",
+                task.id.0,
+                task.name,
+                task.branch,
+                if task.briefed {
+                    "briefed"
+                } else {
+                    "not briefed"
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn grid_text(size: GridSize) -> String {
+    format!("{}x{}", size.cols, size.rows)
+}
+
+fn terminal_label(terminal: &TerminalSummary) -> String {
+    terminal
+        .name
+        .clone()
+        .unwrap_or_else(|| terminal.command.join(" "))
+}
+
+fn terminal_state(terminal: &TerminalSummary) -> String {
+    match (&terminal.exit, terminal.running) {
+        (Some(exit), _) => format!("terminal {} ended, {exit}", terminal.id.0),
+        (None, true) => format!("terminal {} runs", terminal.id.0),
+        (None, false) => format!("terminal {} ended", terminal.id.0),
+    }
+}
+
+fn terminals_text(terminals: &[TerminalSummary]) -> String {
+    if terminals.is_empty() {
+        return "no process terminals".to_owned();
+    }
+
+    terminals
+        .iter()
+        .map(|terminal| {
+            let state = match (&terminal.exit, terminal.running) {
+                (Some(exit), _) => format!("ended, {exit}"),
+                (None, true) => "running".to_owned(),
+                (None, false) => "ended".to_owned(),
+            };
+
+            format!(
+                "{}  {}  {}  {}  agent {}",
+                terminal.id.0,
+                terminal_label(terminal),
+                grid_text(terminal.size),
+                state,
+                terminal.owner.map_or(0, |owner| owner.0)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn waited(result: Value) -> Result<Output, String> {
+    let waited: TerminalWaited = decode(&result)?;
+
+    let text = match (&waited.line, waited.reached) {
+        (Some(line), true) => format!("found: {line}"),
+        (None, true) => terminal_state(&waited.terminal),
+        (_, false) if !waited.terminal.running => format!(
+            "{}; the text did not appear",
+            terminal_state(&waited.terminal)
+        ),
+        (_, false) => "timed out".to_owned(),
+    };
+
+    Ok(Output {
+        json: result,
+        text,
+        clean: waited.reached,
+    })
+}
+
+/// `small`, `medium`, `large` or `COLSxROWS`.
+pub(crate) fn parse_size(text: &str) -> Result<TerminalSize, String> {
+    match text {
+        "small" => return Ok(TerminalSize::Small),
+        "medium" => return Ok(TerminalSize::Medium),
+        "large" => return Ok(TerminalSize::Large),
+        _ => {}
+    }
+
+    let wrong = || format!("{text:?} is not a size: use small, medium, large or COLSxROWS");
+    let (cols, rows) = text.split_once(['x', 'X']).ok_or_else(wrong)?;
+
+    Ok(TerminalSize::Grid(GridSize {
+        cols: cols.parse().map_err(|_| wrong())?,
+        rows: rows.parse().map_err(|_| wrong())?,
+    }))
+}
+
+pub(crate) fn parse_until(name: &str) -> Result<TaskUntil, String> {
+    match name {
+        "briefed" => Ok(TaskUntil::Briefed),
+        "done" => Ok(TaskUntil::Done),
+        other => Err(format!("unknown state {other:?}: use briefed or done")),
     }
 }
 

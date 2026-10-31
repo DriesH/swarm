@@ -6,19 +6,28 @@
 //! stateless requests of 2026-07-28 with `server/discover`. The daemon checks every
 //! call again; the tools listed only follow `SWARM_ROLE`.
 
+use std::collections::HashMap;
 use std::process::ExitCode;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
 
-use crate::commands::{Command, parse_kind};
-use crate::session::Session;
+use swarm_protocol::agent::TerminalUntil;
+use swarm_protocol::{TaskId, TerminalId};
+
+use crate::commands::{Command, parse_kind, parse_size, parse_until};
+use crate::session::{Cancel, Session};
 
 /// The stateless protocol version this server speaks.
 const MODERN_VERSION: &str = "2026-07-28";
 
-/// The versions served after an `initialize` handshake, newest first.
-const LEGACY_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+/// The versions served after an `initialize` handshake, newest first. 2025-03-26 is
+/// left out: it requires JSON-RPC batches, which this server does not read.
+const LEGACY_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2024-11-05"];
+
+/// After stdin closed, calls in flight get this long to answer before they are cancelled.
+const CLOSE_GRACE: Duration = Duration::from_millis(500);
 
 const VERSION_KEY: &str = "io.modelcontextprotocol/protocolVersion";
 const CAPABILITIES_KEY: &str = "io.modelcontextprotocol/clientCapabilities";
@@ -164,7 +173,7 @@ const TOOLS: &[Tool] = &[
                 &[(
                     "timeout_secs",
                     "integer",
-                    "Seconds to wait. Defaults to 120, at most 600.",
+                    "Seconds to wait. Defaults to 100, at most 600.",
                 )],
                 &[],
             )
@@ -216,6 +225,231 @@ const TOOLS: &[Tool] = &[
         schema: || schema(&[], &[]),
         build: |_| Ok(Command::Confirm),
     },
+    Tool {
+        name: "task_create",
+        description: "Make a task: a branch, a task worktree and a tab, with an orchestrator that starts on your brief. The brief states the goal, the scope and what done means.",
+        audience: Audience::Only(&[Role::StartOrchestrator]),
+        schema: || {
+            schema(
+                &[
+                    (
+                        "name",
+                        "string",
+                        "The task's name; it becomes part of its branch.",
+                    ),
+                    (
+                        "brief",
+                        "string",
+                        "The goal, the scope and what done means.",
+                    ),
+                    (
+                        "from",
+                        "string",
+                        "The branch to start from. Defaults to the base branch.",
+                    ),
+                    (
+                        "kind",
+                        "string",
+                        "claude or codex. Defaults to the orchestrator agent from the settings.",
+                    ),
+                ],
+                &["name", "brief"],
+            )
+        },
+        build: |arguments| {
+            Ok(Command::TaskCreate {
+                name: required(arguments, "name")?,
+                from: optional(arguments, "from")?,
+                brief: required(arguments, "brief")?,
+                kind: optional(arguments, "kind")?
+                    .map(|kind| parse_kind(&kind))
+                    .transpose()?,
+            })
+        },
+    },
+    Tool {
+        name: "task_list",
+        description: "List the tasks of the project with their branch, brief state and orchestrator status.",
+        audience: Audience::Only(&[Role::StartOrchestrator]),
+        schema: || schema(&[], &[]),
+        build: |_| Ok(Command::TaskList),
+    },
+    Tool {
+        name: "task_wait",
+        description: "Wait until every task is briefed (its orchestrator confirmed the brief) or done (its orchestrator finished or stopped). Returns the tasks as they are when the wait ends.",
+        audience: Audience::Only(&[Role::StartOrchestrator]),
+        schema: || {
+            schema(
+                &[
+                    ("ids", "integers", "The task IDs."),
+                    ("until", "string", "briefed or done."),
+                    (
+                        "timeout_secs",
+                        "integer",
+                        "Seconds to wait. Defaults to 100, at most 600.",
+                    ),
+                ],
+                &["ids", "until"],
+            )
+        },
+        build: |arguments| {
+            Ok(Command::TaskWait {
+                ids: number_list(arguments, "ids")?
+                    .into_iter()
+                    .map(TaskId)
+                    .collect(),
+                until: parse_until(&required(arguments, "until")?)?,
+                timeout_secs: optional_number(arguments, "timeout_secs")?,
+            })
+        },
+    },
+    Tool {
+        name: "agent_exit",
+        description: "End your own session. Call it when your work is done.",
+        audience: Audience::Only(&[Role::StartOrchestrator]),
+        schema: || schema(&[], &[]),
+        build: |_| Ok(Command::Exit),
+    },
+    Tool {
+        name: "terminal_spawn",
+        description: "Run a command in a process terminal inside your worktree, such as a dev server or a test run. No shell is added: pass sh, -c and the script when you need one. Returns the terminal ID.",
+        audience: Audience::Everyone,
+        schema: || {
+            schema(
+                &[
+                    (
+                        "command",
+                        "strings",
+                        "The program and its arguments, for example [\"pnpm\", \"dev\"].",
+                    ),
+                    ("name", "string", "A label, such as \"dev server\"."),
+                    (
+                        "size",
+                        "string",
+                        "small, medium (the default), large or COLSxROWS.",
+                    ),
+                    (
+                        "cwd",
+                        "string",
+                        "A folder inside your worktree. Defaults to the worktree.",
+                    ),
+                ],
+                &["command"],
+            )
+        },
+        build: |arguments| {
+            Ok(Command::TerminalSpawn {
+                command: string_list(arguments, "command")?,
+                cwd: optional(arguments, "cwd")?.map(std::path::PathBuf::from),
+                size: optional(arguments, "size")?
+                    .map(|size| parse_size(&size))
+                    .transpose()?,
+                name: optional(arguments, "name")?,
+            })
+        },
+    },
+    Tool {
+        name: "terminal_resize",
+        description: "Resize a process terminal you started.",
+        audience: Audience::Everyone,
+        schema: || {
+            schema(
+                &[
+                    ("id", "integer", "The terminal ID."),
+                    ("size", "string", "small, medium, large or COLSxROWS."),
+                ],
+                &["id", "size"],
+            )
+        },
+        build: |arguments| {
+            Ok(Command::TerminalResize {
+                id: terminal_id(arguments)?,
+                size: parse_size(&required(arguments, "size")?)?,
+            })
+        },
+    },
+    Tool {
+        name: "terminal_read",
+        description: "Read the screen of a process terminal, or its last lines of output.",
+        audience: Audience::Everyone,
+        schema: || {
+            schema(
+                &[
+                    ("id", "integer", "The terminal ID."),
+                    (
+                        "lines",
+                        "integer",
+                        "How many lines. Defaults to the screen, at most 2000.",
+                    ),
+                ],
+                &["id"],
+            )
+        },
+        build: |arguments| {
+            Ok(Command::TerminalRead {
+                id: terminal_id(arguments)?,
+                lines: optional_number(arguments, "lines")?,
+            })
+        },
+    },
+    Tool {
+        name: "terminal_wait",
+        description: "Wait for a process terminal to exit, or, with output, for a line that contains that text (also one already on screen).",
+        audience: Audience::Everyone,
+        schema: || {
+            schema(
+                &[
+                    ("id", "integer", "The terminal ID."),
+                    (
+                        "output",
+                        "string",
+                        "Text to wait for in a line. Without it, waits for the exit.",
+                    ),
+                    (
+                        "timeout_secs",
+                        "integer",
+                        "Seconds to wait. Defaults to 100, at most 600.",
+                    ),
+                ],
+                &["id"],
+            )
+        },
+        build: |arguments| {
+            Ok(Command::TerminalWait {
+                id: terminal_id(arguments)?,
+                until: optional(arguments, "output")?
+                    .map_or(TerminalUntil::Exit, TerminalUntil::Output),
+                timeout_secs: optional_number(arguments, "timeout_secs")?,
+            })
+        },
+    },
+    Tool {
+        name: "terminal_kill",
+        description: "Stop the process of a terminal you started, or one in your task if you are its orchestrator.",
+        audience: Audience::Everyone,
+        schema: || {
+            schema(
+                &[
+                    ("id", "integer", "The terminal ID."),
+                    ("signal", "string", "TERM (the default), INT, KILL or HUP."),
+                ],
+                &["id"],
+            )
+        },
+        build: |arguments| {
+            Ok(Command::TerminalKill {
+                id: terminal_id(arguments)?,
+                signal: optional(arguments, "signal")?,
+            })
+        },
+    },
+    Tool {
+        name: "terminal_list",
+        description: "List the process terminals of your task with their size and state.",
+        audience: Audience::Everyone,
+        schema: || schema(&[], &[]),
+        build: |_| Ok(Command::TerminalList),
+    },
 ];
 
 impl Tool {
@@ -239,10 +473,21 @@ fn schema(properties: &[(&str, &str, &str)], required: &[&str]) -> Value {
     let properties: Map<String, Value> = properties
         .iter()
         .map(|(name, kind, description)| {
-            (
-                (*name).to_owned(),
-                json!({ "type": kind, "description": description }),
-            )
+            let definition = match *kind {
+                "strings" => json!({
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": description,
+                }),
+                "integers" => json!({
+                    "type": "array",
+                    "items": { "type": "integer" },
+                    "description": description,
+                }),
+                kind => json!({ "type": kind, "description": description }),
+            };
+
+            ((*name).to_owned(), definition)
         })
         .collect();
 
@@ -274,6 +519,44 @@ fn identifier(arguments: &Map<String, Value>, name: &str) -> Result<String, Stri
     }
 }
 
+fn terminal_id(arguments: &Map<String, Value>) -> Result<TerminalId, String> {
+    identifier(arguments, "id")?
+        .parse()
+        .map(TerminalId)
+        .map_err(|_| "id must be a terminal ID".to_owned())
+}
+
+fn string_list(arguments: &Map<String, Value>, name: &str) -> Result<Vec<String>, String> {
+    let list = match arguments.get(name) {
+        Some(Value::Array(list)) => list,
+        None | Some(Value::Null) => return Err(format!("{name} is required")),
+        Some(_) => return Err(format!("{name} must be a list of strings")),
+    };
+
+    list.iter()
+        .map(|item| {
+            item.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| format!("{name} must be a list of strings"))
+        })
+        .collect()
+}
+
+fn number_list(arguments: &Map<String, Value>, name: &str) -> Result<Vec<u64>, String> {
+    let list = match arguments.get(name) {
+        Some(Value::Array(list)) => list,
+        None | Some(Value::Null) => return Err(format!("{name} is required")),
+        Some(_) => return Err(format!("{name} must be a list of IDs")),
+    };
+
+    list.iter()
+        .map(|item| {
+            item.as_u64()
+                .ok_or_else(|| format!("{name} must be a list of IDs"))
+        })
+        .collect()
+}
+
 fn optional_number(arguments: &Map<String, Value>, name: &str) -> Result<Option<u32>, String> {
     match arguments.get(name) {
         None | Some(Value::Null) => Ok(None),
@@ -288,20 +571,60 @@ fn optional_number(arguments: &Map<String, Value>, name: &str) -> Result<Option<
 pub(crate) struct Server {
     role: Role,
     session: Result<Session, String>,
+    /// Tool calls in flight by request ID, so a cancel can reach their connection.
+    pending: Mutex<HashMap<String, Arc<Cancel>>>,
 }
 
 impl Server {
     pub(crate) fn new(role: Role, session: Result<Session, String>) -> Self {
-        Self { role, session }
+        Self {
+            role,
+            session,
+            pending: Mutex::default(),
+        }
+    }
+
+    fn pending(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<Cancel>>> {
+        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The cancel handle of the call with this request ID. The reader registers a call
+    /// before its thread starts, so a close never misses it.
+    fn register(&self, id: &Value) -> Arc<Cancel> {
+        Arc::clone(
+            self.pending()
+                .entry(id.to_string())
+                .or_insert_with(|| Arc::new(Cancel::default())),
+        )
+    }
+
+    /// Ends the call with this request ID, if it still runs.
+    fn cancel(&self, request: &Value) {
+        if let Some(cancel) = self.pending().get(&request.to_string()) {
+            cancel.cancel();
+        }
+    }
+
+    /// After stdin closed: gives the calls in flight a moment, then cancels the rest.
+    fn close(&self) {
+        let deadline = Instant::now() + CLOSE_GRACE;
+        while !self.pending().is_empty() && Instant::now() < deadline {
+            std::thread::park_timeout(Duration::from_millis(10));
+        }
+
+        for cancel in self.pending().values() {
+            cancel.cancel();
+        }
     }
 
     fn from_env() -> Self {
-        let role = Role::parse(std::env::var("SWARM_ROLE").ok().as_deref());
+        let role = Role::parse(crate::session::harness_var("SWARM_ROLE").as_deref());
 
         Self::new(role, Session::from_env())
     }
 
-    /// The reply to one message, or `None` for a notification.
+    /// The reply to one message, or `None` for a notification, a response from the
+    /// client or a call that was cancelled.
     pub(crate) fn handle(&self, message: &Value) -> Option<Value> {
         let Some(object) = message.as_object() else {
             return Some(error_reply(
@@ -311,17 +634,49 @@ impl Server {
             ));
         };
         let method = object.get("method").and_then(Value::as_str);
-        let id = object.get("id")?;
+
+        if method == Some("notifications/cancelled") {
+            if let Some(request) = object
+                .get("params")
+                .and_then(|params| params.get("requestId"))
+            {
+                self.cancel(request);
+            }
+
+            return None;
+        }
+
+        let id = object.get("id");
         let Some(method) = method else {
+            let is_response = object.contains_key("result") || object.contains_key("error");
+            if id.is_some() && is_response {
+                return None;
+            }
+
             return Some(error_reply(
-                id,
+                id.unwrap_or(&Value::Null),
                 INVALID_REQUEST,
                 "the request has no method",
             ));
         };
+        let id = id?;
+        if !(id.is_string() || id.is_number()) {
+            return Some(error_reply(
+                &Value::Null,
+                INVALID_REQUEST,
+                "the ID must be a string or a number",
+            ));
+        }
         let params = object.get("params").cloned().unwrap_or(Value::Null);
 
-        let outcome = self.dispatch(method, &params);
+        let cancel = (method == "tools/call").then(|| self.register(id));
+        let outcome = self.dispatch(method, &params, cancel.as_ref());
+        if let Some(cancel) = cancel {
+            self.pending().remove(&id.to_string());
+            if cancel.is_cancelled() {
+                return None;
+            }
+        }
 
         Some(match outcome {
             Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
@@ -329,19 +684,25 @@ impl Server {
         })
     }
 
-    fn dispatch(&self, method: &str, params: &Value) -> Result<Value, RpcError> {
+    fn dispatch(
+        &self,
+        method: &str,
+        params: &Value,
+        cancel: Option<&Arc<Cancel>>,
+    ) -> Result<Value, RpcError> {
         if method == "initialize" {
             return Ok(Self::initialize(params));
         }
-        if method == "ping" {
+
+        let modern = check_modern(params)?;
+        if method == "ping" && !modern {
             return Ok(json!({}));
         }
 
-        let modern = check_modern(params)?;
         let mut result = match method {
             "server/discover" => Self::discover(),
             "tools/list" => self.list_tools(),
-            "tools/call" => self.call_tool(params)?,
+            "tools/call" => self.call_tool(params, cancel)?,
             other => {
                 return Err(RpcError::new(
                     METHOD_NOT_FOUND,
@@ -352,6 +713,10 @@ impl Server {
 
         if modern && let Some(object) = result.as_object_mut() {
             object.insert("resultType".to_owned(), json!("complete"));
+            if matches!(method, "server/discover" | "tools/list") {
+                object.insert("ttlMs".to_owned(), json!(0));
+                object.insert("cacheScope".to_owned(), json!("private"));
+            }
         }
 
         Ok(result)
@@ -391,7 +756,7 @@ impl Server {
         json!({ "tools": tools })
     }
 
-    fn call_tool(&self, params: &Value) -> Result<Value, RpcError> {
+    fn call_tool(&self, params: &Value, cancel: Option<&Arc<Cancel>>) -> Result<Value, RpcError> {
         let name = params
             .get("name")
             .and_then(Value::as_str)
@@ -413,7 +778,10 @@ impl Server {
         let outcome = (tool.build)(arguments).and_then(|command| {
             let session = self.session.as_ref().map_err(Clone::clone)?;
 
-            command.run(session)
+            match cancel {
+                Some(cancel) => command.run(&session.cancellable(Arc::clone(cancel))),
+                None => command.run(session),
+            }
         });
 
         Ok(match outcome {
@@ -508,7 +876,8 @@ fn error_reply(id: &Value, code: i64, message: &str) -> Value {
 }
 
 /// Reads messages until `input` ends. A tool call runs on its own thread, because a
-/// `wait` can take minutes and the client may send other requests meanwhile.
+/// `wait` can take minutes and the client may send other requests meanwhile. When
+/// `input` ends, calls that still run are cancelled after a moment.
 pub(crate) fn serve(
     server: &Server,
     input: impl std::io::BufRead,
@@ -516,9 +885,7 @@ pub(crate) fn serve(
 ) {
     let output = Mutex::new(output);
     let send = |reply: &Value| {
-        let mut output = output
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut output = output.lock().unwrap_or_else(PoisonError::into_inner);
 
         writeln!(output, "{reply}")
             .and_then(|()| output.flush())
@@ -545,6 +912,12 @@ pub(crate) fn serve(
             };
 
             if message.get("method").and_then(Value::as_str) == Some("tools/call") {
+                if let Some(id) = message
+                    .get("id")
+                    .filter(|id| id.is_string() || id.is_number())
+                {
+                    server.register(id);
+                }
                 scope.spawn(move || {
                     if let Some(reply) = server.handle(&message) {
                         send(&reply);
@@ -554,6 +927,8 @@ pub(crate) fn serve(
                 send(&reply);
             }
         }
+
+        server.close();
     });
 }
 
@@ -590,6 +965,15 @@ mod tests {
             .map(|tool| tool["name"].as_str().expect("name").to_owned())
             .collect()
     }
+
+    const TERMINAL_TOOLS: [&str; 6] = [
+        "terminal_spawn",
+        "terminal_resize",
+        "terminal_read",
+        "terminal_wait",
+        "terminal_kill",
+        "terminal_list",
+    ];
 
     fn modern_meta() -> Value {
         json!({ VERSION_KEY: MODERN_VERSION, CAPABILITIES_KEY: {} })
@@ -645,18 +1029,46 @@ mod tests {
             [
                 "spawn", "send", "read", "wait", "merge", "notify", "agents", "confirm"
             ]
+            .into_iter()
+            .chain(TERMINAL_TOOLS)
+            .collect::<Vec<_>>()
         );
     }
 
     #[test]
     fn a_worker_lists_only_its_tools() {
-        assert_eq!(tool_names(Role::Worker), ["ask", "report", "read", "wait"]);
+        assert_eq!(
+            tool_names(Role::Worker),
+            ["ask", "report", "read", "wait"]
+                .into_iter()
+                .chain(TERMINAL_TOOLS)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
     fn the_start_orchestrator_and_an_unknown_role_get_the_shared_tools() {
-        assert_eq!(tool_names(Role::StartOrchestrator), ["read", "wait"]);
-        assert_eq!(tool_names(Role::Unknown), ["read", "wait"]);
+        assert_eq!(
+            tool_names(Role::StartOrchestrator),
+            [
+                "read",
+                "wait",
+                "task_create",
+                "task_list",
+                "task_wait",
+                "agent_exit"
+            ]
+            .into_iter()
+            .chain(TERMINAL_TOOLS)
+            .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            tool_names(Role::Unknown),
+            ["read", "wait"]
+                .into_iter()
+                .chain(TERMINAL_TOOLS)
+                .collect::<Vec<_>>()
+        );
         assert_eq!(
             Role::parse(Some("start_orchestrator")),
             Role::StartOrchestrator
@@ -741,7 +1153,10 @@ mod tests {
             .expect("reply");
 
         assert_eq!(reply["result"]["resultType"], "complete");
-        assert_eq!(reply["result"]["tools"].as_array().expect("tools").len(), 4);
+        assert_eq!(
+            reply["result"]["tools"].as_array().expect("tools").len(),
+            10
+        );
     }
 
     #[test]
@@ -765,6 +1180,148 @@ mod tests {
         assert_eq!(reply["result"]["supportedVersions"][0], MODERN_VERSION);
         assert_eq!(reply["result"]["_meta"][SERVER_INFO_KEY]["name"], "swarm");
         assert_eq!(reply["result"]["resultType"], "complete");
+    }
+
+    #[test]
+    fn the_tools_are_the_harness_calls_the_adapters_know() {
+        let mut tools: Vec<String> = [Role::Orchestrator, Role::Worker, Role::StartOrchestrator]
+            .into_iter()
+            .flat_map(tool_names)
+            .collect();
+        tools.sort();
+        tools.dedup();
+        let mut calls: Vec<String> = swarm_protocol::agent::HARNESS_CALLS
+            .iter()
+            .map(|(tool, _)| (*tool).to_owned())
+            .collect();
+        calls.sort();
+
+        assert_eq!(tools, calls);
+    }
+
+    #[test]
+    fn modern_lists_say_how_long_they_may_be_cached() {
+        for method in ["tools/list", "server/discover"] {
+            let reply = server(Role::Worker)
+                .handle(&request(method, json!({ "_meta": modern_meta() })))
+                .expect("reply");
+
+            assert_eq!(reply["result"]["ttlMs"], 0, "{method}");
+            assert_eq!(reply["result"]["cacheScope"], "private", "{method}");
+        }
+    }
+
+    #[test]
+    fn a_legacy_list_has_no_cache_fields() {
+        let reply = server(Role::Worker)
+            .handle(&request("tools/list", json!({})))
+            .expect("reply");
+
+        assert!(reply["result"].get("ttlMs").is_none());
+    }
+
+    #[test]
+    fn ping_is_unknown_in_the_stateless_protocol() {
+        let reply = server(Role::Worker)
+            .handle(&request("ping", json!({ "_meta": modern_meta() })))
+            .expect("reply");
+
+        assert_eq!(reply["error"]["code"], METHOD_NOT_FOUND);
+    }
+
+    #[test]
+    fn the_protocol_with_batches_is_not_offered() {
+        assert!(!LEGACY_VERSIONS.contains(&"2025-03-26"));
+        let reply = server(Role::Worker)
+            .handle(&request(
+                "initialize",
+                json!({ "protocolVersion": "2025-03-26" }),
+            ))
+            .expect("reply");
+
+        assert_eq!(reply["result"]["protocolVersion"], LEGACY_VERSIONS[0]);
+    }
+
+    #[test]
+    fn a_response_from_the_client_gets_no_reply() {
+        let server = server(Role::Worker);
+
+        assert!(
+            server
+                .handle(&json!({ "jsonrpc": "2.0", "id": 5, "result": {} }))
+                .is_none()
+        );
+        assert!(
+            server
+                .handle(
+                    &json!({ "jsonrpc": "2.0", "id": "a", "error": { "code": 1, "message": "x" } })
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_null_id_is_an_invalid_request() {
+        let reply = server(Role::Worker)
+            .handle(&json!({ "jsonrpc": "2.0", "id": null, "method": "tools/list" }))
+            .expect("reply");
+
+        assert_eq!(reply["error"]["code"], INVALID_REQUEST);
+        assert!(reply["id"].is_null());
+    }
+
+    #[test]
+    fn a_cancel_closes_the_connection_of_the_call_and_sends_no_reply() {
+        use std::io::Read as _;
+        use std::os::unix::net::UnixListener;
+
+        let socket = std::path::PathBuf::from(format!("/tmp/swm-cancel-{}", std::process::id()));
+        std::fs::remove_file(&socket).ok();
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let session = Session::from_vars(|name| match name {
+            "SWARM_SOCKET" => Some(socket.display().to_string()),
+            "SWARM_AGENT_ID" => Some("3".to_owned()),
+            "SWARM_TOKEN" => Some("t".to_owned()),
+            _ => None,
+        })
+        .expect("session");
+        let server = Server::new(Role::Worker, Ok(session));
+
+        let (reply, hung_up) = std::thread::scope(|scope| {
+            let daemon = scope.spawn(|| {
+                let (mut stream, _) = listener.accept().expect("accept");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .expect("timeout");
+                let mut seen = Vec::new();
+                let mut buffer = [0_u8; 256];
+                loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) => return true,
+                        Ok(count) => seen.extend_from_slice(&buffer[..count]),
+                        Err(_) => return false,
+                    }
+                }
+            });
+            let call = scope.spawn(|| {
+                server.handle(&json!({ "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                    "params": { "name": "wait", "arguments": { "timeout": 60 } } }))
+            });
+
+            while server.pending().is_empty() {
+                std::thread::park_timeout(Duration::from_millis(10));
+            }
+            std::thread::park_timeout(Duration::from_millis(200));
+            let cancelled = server.handle(&json!({ "jsonrpc": "2.0",
+                "method": "notifications/cancelled", "params": { "requestId": 9 } }));
+            assert!(cancelled.is_none());
+
+            (call.join().expect("call"), daemon.join().expect("daemon"))
+        });
+        std::fs::remove_file(&socket).ok();
+
+        assert!(reply.is_none(), "a cancelled call gets no reply");
+        assert!(hung_up, "the daemon saw the connection close");
     }
 
     #[test]

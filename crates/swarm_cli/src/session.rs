@@ -3,6 +3,7 @@
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -18,7 +19,65 @@ const WAIT_MARGIN: Duration = Duration::from_secs(30);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The daemon replies to a `wait` after at most this many seconds.
-pub(crate) const DEFAULT_WAIT_SECS: u32 = 120;
+pub(crate) const DEFAULT_WAIT_SECS: u32 = 100;
+
+/// Lets another thread end a call in flight by closing its connection. The daemon sees
+/// the hang-up and keeps the messages the call would have taken.
+#[derive(Debug, Default)]
+pub(crate) struct Cancel {
+    state: Mutex<CancelState>,
+}
+
+#[derive(Debug, Default)]
+struct CancelState {
+    cancelled: bool,
+    stream: Option<UnixStream>,
+}
+
+impl Cancel {
+    pub(crate) fn cancel(&self) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.cancelled = true;
+
+        if let Some(stream) = &state.stream {
+            // Fails when the call ended already.
+            stream.shutdown(std::net::Shutdown::Both).ok();
+        }
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .cancelled
+    }
+
+    /// Remembers the connection of the call. Fails when the call was cancelled already.
+    fn attach(&self, stream: &UnixStream) -> Result<(), String> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.cancelled {
+            return Err("the call was cancelled".to_owned());
+        }
+
+        state.stream = Some(stream.try_clone().map_err(|error| error.to_string())?);
+
+        Ok(())
+    }
+}
+
+/// A `SWARM_*` value. The MCP server may get it as `<NAME>_MCP` instead, and a value
+/// that Claude Code did not expand (`${NAME}`) counts as missing.
+pub(crate) fn harness_var(name: &str) -> Option<String> {
+    harness_var_from(name, |key| std::env::var(key).ok())
+}
+
+fn harness_var_from(name: &str, var: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let usable = |value: &String| !value.is_empty() && !value.starts_with("${");
+
+    var(name)
+        .filter(usable)
+        .or_else(|| var(&format!("{name}_MCP")).filter(usable))
+}
 
 /// Who the caller is, as the agent terminal's environment says.
 #[derive(Debug, Clone)]
@@ -26,11 +85,12 @@ pub(crate) struct Session {
     pub(crate) socket: PathBuf,
     pub(crate) agent: AgentId,
     pub(crate) token: String,
+    cancel: Option<Arc<Cancel>>,
 }
 
 impl Session {
     pub(crate) fn from_env() -> Result<Self, String> {
-        Self::from_vars(|name| std::env::var(name).ok())
+        Self::from_vars(harness_var)
     }
 
     pub(crate) fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
@@ -47,13 +107,24 @@ impl Session {
             socket: PathBuf::from(socket),
             agent: AgentId(agent),
             token,
+            cancel: None,
         })
+    }
+
+    /// The same caller, with calls that `cancel` can end.
+    pub(crate) fn cancellable(&self, cancel: Arc<Cancel>) -> Self {
+        Self {
+            cancel: Some(cancel),
+            ..self.clone()
+        }
     }
 
     /// Sends the call and returns the result, or the daemon's error text.
     pub(crate) fn call(&self, call: Call) -> Result<Value, String> {
         let timeout = match &call {
-            Call::Wait { timeout_secs } => {
+            Call::Wait { timeout_secs }
+            | Call::TaskWait { timeout_secs, .. }
+            | Call::TerminalWait { timeout_secs, .. } => {
                 Duration::from_secs(u64::from(timeout_secs.unwrap_or(DEFAULT_WAIT_SECS)))
                     + WAIT_MARGIN
             }
@@ -74,6 +145,9 @@ impl Session {
 
         let mut stream = UnixStream::connect(&self.socket)
             .map_err(|error| format!("cannot reach Swarm at {}: {error}", self.socket.display()))?;
+        if let Some(cancel) = &self.cancel {
+            cancel.attach(&stream)?;
+        }
         stream
             .set_read_timeout(Some(read_timeout))
             .and_then(|()| stream.set_write_timeout(Some(WRITE_TIMEOUT)))
@@ -152,5 +226,26 @@ mod tests {
         .expect_err("bad id");
 
         assert!(error.contains("not a number"), "{error}");
+    }
+
+    #[test]
+    fn a_harness_value_comes_from_its_name_or_the_mcp_copy() {
+        let inherited = |key: &str| (key == "SWARM_TOKEN").then(|| "a".to_owned());
+        let expanded = |key: &str| match key {
+            "SWARM_TOKEN" => Some("${SWARM_TOKEN}".to_owned()),
+            "SWARM_TOKEN_MCP" => Some("b".to_owned()),
+            _ => None,
+        };
+        let neither = |key: &str| (key == "SWARM_TOKEN_MCP").then(|| "${SWARM_TOKEN}".to_owned());
+
+        assert_eq!(
+            harness_var_from("SWARM_TOKEN", inherited).as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            harness_var_from("SWARM_TOKEN", expanded).as_deref(),
+            Some("b")
+        );
+        assert_eq!(harness_var_from("SWARM_TOKEN", neither), None);
     }
 }

@@ -442,7 +442,21 @@ fn the_mcp_server_lists_the_tools_of_the_role_over_stdio() {
         .iter()
         .filter_map(|tool| tool["name"].as_str())
         .collect();
-    assert_eq!(names, ["ask", "report", "read", "wait"]);
+    assert_eq!(
+        names,
+        [
+            "ask",
+            "report",
+            "read",
+            "wait",
+            "terminal_spawn",
+            "terminal_resize",
+            "terminal_read",
+            "terminal_wait",
+            "terminal_kill",
+            "terminal_list",
+        ]
+    );
 }
 
 #[test]
@@ -490,4 +504,144 @@ fn an_mcp_tool_call_that_the_daemon_refuses_is_an_error_result() {
         replies[0]["result"]["content"][0]["text"],
         "only a task's orchestrator can merge a worker"
     );
+}
+
+fn terminal_json(id: u64, running: bool) -> serde_json::Value {
+    serde_json::json!({
+        "id": id, "name": "dev server", "command": ["pnpm", "dev"], "owner": 3,
+        "size": { "cols": 100, "rows": 24 }, "running": running,
+        "exit": if running { serde_json::Value::Null } else { "code 0".into() },
+    })
+}
+
+#[test]
+fn terminal_spawn_sends_the_command_and_prints_the_id() {
+    let (socket, daemon) = fake_daemon(
+        "terminal-spawn",
+        vec![serde_json::json!({ "ok": true, "result": terminal_json(7, true) })],
+    );
+    let mut command = agent_command(&socket);
+    command.args([
+        "terminal",
+        "spawn",
+        "--name",
+        "dev server",
+        "--size",
+        "medium",
+        "--",
+        "pnpm",
+        "dev",
+    ]);
+
+    let output = run(command, "");
+    let requests = daemon.join().expect("daemon");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "started terminal 7 (dev server)\nsize: 100x24"
+    );
+    assert_eq!(requests[0]["method"], "terminal_spawn");
+    assert_eq!(
+        requests[0]["params"]["command"],
+        serde_json::json!(["pnpm", "dev"])
+    );
+    assert_eq!(requests[0]["params"]["size"], "medium");
+    assert_eq!(requests[0]["params"]["name"], "dev server");
+}
+
+#[test]
+fn terminal_wait_that_times_out_exits_with_one() {
+    let (socket, daemon) = fake_daemon(
+        "terminal-wait",
+        vec![serde_json::json!({ "ok": true, "result": {
+            "reached": false, "terminal": terminal_json(7, true), "line": null,
+        } })],
+    );
+    let mut command = agent_command(&socket);
+    command.args([
+        "terminal",
+        "wait",
+        "7",
+        "--output",
+        "ready in",
+        "--timeout",
+        "1",
+    ]);
+
+    let output = run(command, "");
+    let requests = daemon.join().expect("daemon");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "timed out");
+    assert_eq!(
+        requests[0]["params"]["until"],
+        serde_json::json!({ "output": "ready in" })
+    );
+    assert_eq!(requests[0]["params"]["timeout_secs"], 1);
+}
+
+#[test]
+fn task_wait_lists_the_tasks_and_task_create_reads_the_brief_from_stdin() {
+    let task = serde_json::json!({
+        "id": 5, "name": "Login", "branch": "swarm/login", "briefed": true,
+        "orchestrator": worker_json(9, "orchestrator"),
+    });
+    let (socket, daemon) = fake_daemon(
+        "tasks",
+        vec![
+            serde_json::json!({ "ok": true, "result": task }),
+            serde_json::json!({ "ok": true, "result": [task] }),
+        ],
+    );
+    let mut create = agent_command(&socket);
+    create.args(["task", "create", "Login"]);
+    let created = run(create, "build login\n");
+    let mut wait = agent_command(&socket);
+    wait.args(["task", "wait", "5", "--until", "briefed"]);
+    let waited = run(wait, "");
+    let requests = daemon.join().expect("daemon");
+
+    assert!(created.status.success());
+    assert!(
+        String::from_utf8_lossy(&created.stdout)
+            .starts_with("created task 5 (Login)\nbranch: swarm/login")
+    );
+    assert_eq!(requests[0]["params"]["brief"], "build login\n");
+    assert!(waited.status.success());
+    assert!(String::from_utf8_lossy(&waited.stdout).contains("5  Login  swarm/login  briefed"));
+    assert_eq!(requests[1]["params"]["until"], "briefed");
+    assert_eq!(requests[1]["params"]["ids"], serde_json::json!([5]));
+}
+
+#[test]
+fn the_mcp_server_exits_when_stdin_closes_during_a_wait() {
+    let dir = temp_dir("mcp-eof");
+    let socket = dir.join("agent.sock");
+    let listener = UnixListener::bind(&socket).expect("bind");
+    let daemon = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().expect("clone"))
+            .read_line(&mut line)
+            .expect("request");
+        // Never answers. The client must hang up.
+        let mut rest = Vec::new();
+        std::io::Read::read_to_end(&mut stream, &mut rest).expect("until the hang-up");
+    });
+    let lines = [
+        serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "wait", "arguments": { "timeout": 600 } } }),
+    ];
+
+    let start = std::time::Instant::now();
+    mcp_session(&socket, "worker", &lines);
+
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(10),
+        "{:?}",
+        start.elapsed()
+    );
+    daemon.join().expect("the daemon saw the connection close");
+    std::fs::remove_dir_all(dir).ok();
 }
