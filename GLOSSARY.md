@@ -61,7 +61,7 @@ The view that shows a task's swarm as a graph of agents and the messages between
 _Avoid_: Graph view, map
 
 **Inspector**:
-The panel in the Swarm view that shows the selected agent: its details, messages and a live terminal preview.
+The panel in the Swarm view that shows the selected agent: its details, messages, changes and terminals.
 _Avoid_: Details pane, sidebar
 
 **In flight**:
@@ -71,6 +71,22 @@ _Avoid_: Pending, queued, unread
 **Review**:
 The step where a person reads the combined diff of a task and approves it or requests changes.
 _Avoid_: Code review session, check
+
+**Live**:
+The Review source that shows the work in progress: the task worktree and each worker's own worktree that is not merged yet.
+_Avoid_: Current, working copy
+
+**Merged**:
+The Review source that shows only the task worktree against the base branch: what the pull request would hold.
+_Avoid_: Final, combined
+
+**Approve**:
+The user's sign-off on the Merged changes of a task. It holds only while those changes stay the same, and a pull request needs it.
+_Avoid_: Accept, sign off, LGTM
+
+**Close task**:
+Ending a task: its agents stop and its worktrees are removed. Its branch stays.
+_Avoid_: Delete task, archive, kill
 
 **Task worktree**:
 The worktree that holds a task branch; each tab in the window shows one.
