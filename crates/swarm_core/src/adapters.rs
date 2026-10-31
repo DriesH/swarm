@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use swarm_protocol::AgentKind;
+use swarm_protocol::agent::{HARNESS_CALLS, PROMPTED_TOOL};
 
 use crate::agents::to_hex;
 
@@ -49,8 +50,21 @@ const CLAUDE_HOOK_TIMEOUT: u32 = 5;
 /// 600 s.
 const CODEX_TOOL_TIMEOUT_SECS: u32 = 660;
 
-/// Permission rules that let the harness run without asking (Claude Code).
-const CLAUDE_ALLOWED: &[&str] = &["Bash(swarm *)", "mcp__swarm__*"];
+/// Permission rules that let the harness run without asking (Claude Code): every call
+/// but the one that starts a program outside the sandbox.
+fn claude_allowed() -> Vec<String> {
+    let mut rules = Vec::new();
+    for (tool, words) in HARNESS_CALLS {
+        if *tool == PROMPTED_TOOL {
+            continue;
+        }
+
+        rules.push(format!("Bash(swarm {words} *)"));
+        rules.push(format!("mcp__swarm__{tool}"));
+    }
+
+    rules
+}
 
 /// Whether the agent starts a new session or continues one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,8 +89,8 @@ pub struct LaunchSpec<'a> {
     /// Where this agent's files go: `<data>/agents/<id>/`.
     pub agent_dir: &'a Path,
     pub session: Session<'a>,
-    /// The `SWARM_*` values of this agent. Claude Code gets them in its MCP file, Codex
-    /// by name.
+    /// The `SWARM_*` values of this agent. Both CLIs get only the names; the values reach
+    /// the MCP server through the agent's environment.
     pub harness_env: &'a [(String, String)],
     /// Git folders outside the worktree that a Codex sandbox must be able to write for
     /// `git commit` to work in a linked worktree.
@@ -143,19 +157,20 @@ fn claude(spec: &LaunchSpec<'_>) -> Launch {
         .collect();
     let mut settings = json!({
         "hooks": hooks,
-        "permissions": { "allow": CLAUDE_ALLOWED },
+        "permissions": { "allow": claude_allowed() },
     });
     if spec.skip_permissions {
         // Else Claude Code asks once before it enters bypass mode.
         settings["skipDangerousModePermissionPrompt"] = json!(true);
     }
 
-    // Claude Code does not document which variables a stdio server inherits, so the
-    // values go in the file. It is private (0600) like the folder it is in.
+    // No secret goes in a file: agents run as the same user and could read it. The
+    // server gets the values from Claude Code's environment, either inherited or through
+    // `${NAME}` expansion into `<NAME>_MCP`; the docs promise neither for `--mcp-config`.
     let env: serde_json::Map<String, serde_json::Value> = spec
         .harness_env
         .iter()
-        .map(|(name, value)| (name.clone(), json!(value)))
+        .map(|(name, _)| (format!("{name}_MCP"), json!(format!("${{{name}}}"))))
         .collect();
     let mcp = json!({
         "mcpServers": {
@@ -221,16 +236,21 @@ fn codex(spec: &LaunchSpec<'_>) -> Launch {
 
     if spec.skip_permissions {
         argv.push("--dangerously-bypass-approvals-and-sandbox".to_owned());
-    } else if !spec.writable_roots.is_empty() {
-        let roots: Vec<String> = spec
-            .writable_roots
-            .iter()
-            .map(|root| toml_string(&text(root)))
-            .collect();
-        argv.extend(config(format!(
-            "sandbox_workspace_write.writable_roots=[{}]",
-            roots.join(",")
-        )));
+    } else {
+        // Without a mode, Codex stays read-only until the folder is trusted.
+        argv.extend(config("sandbox_mode=\"workspace-write\"".to_owned()));
+
+        if !spec.writable_roots.is_empty() {
+            let roots: Vec<String> = spec
+                .writable_roots
+                .iter()
+                .map(|root| toml_string(&text(root)))
+                .collect();
+            argv.extend(config(format!(
+                "sandbox_workspace_write.writable_roots=[{}]",
+                roots.join(",")
+            )));
+        }
     }
 
     Launch {
@@ -240,7 +260,8 @@ fn codex(spec: &LaunchSpec<'_>) -> Launch {
 }
 
 /// Registers the `swarm` MCP server. Codex starts it with a small allow-list of
-/// variables, so the `SWARM_*` names are added with `env_vars`.
+/// variables, so the `SWARM_*` names are added with `env_vars`. Every tool is approved
+/// one by one; the tool that leaves the sandbox always asks.
 fn codex_mcp_config(spec: &LaunchSpec<'_>) -> Vec<String> {
     let names: Vec<String> = spec
         .harness_env
@@ -248,19 +269,30 @@ fn codex_mcp_config(spec: &LaunchSpec<'_>) -> Vec<String> {
         .map(|(name, _)| toml_string(name))
         .collect();
 
-    [
+    let mut values = vec![
         format!(
             "mcp_servers.swarm.command={}",
             toml_string(&text(spec.swarm))
         ),
         "mcp_servers.swarm.args=[\"mcp\"]".to_owned(),
         format!("mcp_servers.swarm.env_vars=[{}]", names.join(",")),
-        "mcp_servers.swarm.default_tools_approval_mode=\"approve\"".to_owned(),
         format!("mcp_servers.swarm.tool_timeout_sec={CODEX_TOOL_TIMEOUT_SECS}"),
-    ]
-    .into_iter()
-    .flat_map(|value| ["-c".to_owned(), value])
-    .collect()
+    ];
+    for (tool, _) in HARNESS_CALLS {
+        let mode = if *tool == PROMPTED_TOOL {
+            "prompt"
+        } else {
+            "approve"
+        };
+        values.push(format!(
+            "mcp_servers.swarm.tools.{tool}.approval_mode=\"{mode}\""
+        ));
+    }
+
+    values
+        .into_iter()
+        .flat_map(|value| ["-c".to_owned(), value])
+        .collect()
 }
 
 /// The hash Codex expects for a hook it may run without asking: `sha256:` and the
@@ -665,8 +697,27 @@ mod tests {
         let server = &mcp["mcpServers"]["swarm"];
         assert_eq!(server["command"], "/bin/swarm");
         assert_eq!(server["args"], json!(["mcp"]));
-        assert_eq!(server["env"]["SWARM_TOKEN"], "s3cret-token");
-        assert_eq!(server["env"]["SWARM_ROLE"], "worker");
+        assert_eq!(server["env"]["SWARM_TOKEN_MCP"], "${SWARM_TOKEN}");
+        assert_eq!(server["env"]["SWARM_ROLE_MCP"], "${SWARM_ROLE}");
+    }
+
+    #[test]
+    fn no_file_holds_a_secret() {
+        let env = harness_env();
+        let launch = build(&LaunchSpec {
+            harness_env: &env,
+            ..spec(AgentKind::ClaudeCode)
+        });
+
+        for file in &launch.files {
+            for (_, value) in &env {
+                assert!(
+                    !file.contents.contains(value.as_str()),
+                    "{} holds {value}",
+                    file.path.display()
+                );
+            }
+        }
     }
 
     #[test]
@@ -676,10 +727,31 @@ mod tests {
         let settings: serde_json::Value =
             serde_json::from_str(&launch.files[0].contents).expect("json");
 
-        assert_eq!(
-            settings["permissions"]["allow"],
-            json!(["Bash(swarm *)", "mcp__swarm__*"])
-        );
+        let allowed: Vec<&str> = settings["permissions"]["allow"]
+            .as_array()
+            .expect("rules")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert!(allowed.contains(&"Bash(swarm task create *)"));
+        assert!(allowed.contains(&"Bash(swarm terminal read *)"));
+        assert!(allowed.contains(&"mcp__swarm__terminal_read"));
+        assert!(allowed.contains(&"mcp__swarm__agent_exit"));
+    }
+
+    #[test]
+    fn claude_is_never_pre_approved_to_spawn_a_terminal() {
+        let launch = build(&spec(AgentKind::ClaudeCode));
+
+        let settings: serde_json::Value =
+            serde_json::from_str(&launch.files[0].contents).expect("json");
+
+        for rule in settings["permissions"]["allow"].as_array().expect("rules") {
+            let rule = rule.as_str().expect("rule");
+            assert!(rule != "Bash(swarm *)" && !rule.ends_with("__*"), "{rule}");
+            assert!(!rule.contains("terminal spawn"), "{rule}");
+            assert!(!rule.contains("terminal_spawn"), "{rule}");
+        }
     }
 
     fn codex_config(launch: &Launch) -> toml::Table {
@@ -704,10 +776,20 @@ mod tests {
 
         assert_eq!(server["command"].as_str(), Some("/bin/swarm"));
         assert_eq!(server["args"][0].as_str(), Some("mcp"));
-        assert_eq!(
-            server["default_tools_approval_mode"].as_str(),
-            Some("approve")
-        );
+        assert!(server.get("default_tools_approval_mode").is_none());
+        let tools = server["tools"].as_table().expect("tools");
+        for (tool, _) in HARNESS_CALLS {
+            let expected = if *tool == PROMPTED_TOOL {
+                "prompt"
+            } else {
+                "approve"
+            };
+            assert_eq!(
+                tools[*tool]["approval_mode"].as_str(),
+                Some(expected),
+                "{tool}"
+            );
+        }
         assert_eq!(server["tool_timeout_sec"].as_integer(), Some(660));
         let names: Vec<&str> = server["env_vars"]
             .as_array()
@@ -730,7 +812,7 @@ mod tests {
     #[test]
     fn codex_may_write_the_git_folders_of_a_worktree() {
         let roots = [
-            PathBuf::from("/repo/.git"),
+            PathBuf::from("/repo/.git/objects"),
             PathBuf::from("/repo/.git/worktrees/fix it"),
         ];
         let launch = build(&LaunchSpec {
@@ -746,7 +828,15 @@ mod tests {
             .iter()
             .filter_map(toml::Value::as_str)
             .collect();
-        assert_eq!(written, ["/repo/.git", "/repo/.git/worktrees/fix it"]);
+        assert_eq!(
+            written,
+            ["/repo/.git/objects", "/repo/.git/worktrees/fix it"]
+        );
+        assert_eq!(
+            config["sandbox_mode"].as_str(),
+            Some("workspace-write"),
+            "the roots apply only in this mode"
+        );
     }
 
     #[test]

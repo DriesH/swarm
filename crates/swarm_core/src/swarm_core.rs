@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use swarm_protocol::{
-    AgentInfo, AgentRole, CreateTask, ProjectId, ProjectInfo, TaskId, TaskInfo, TerminalId,
+    AgentId, AgentInfo, AgentRole, CreateTask, ProjectId, ProjectInfo, TaskId, TaskInfo, TerminalId,
 };
 use swarm_term::ExitStatus;
 
@@ -136,9 +136,96 @@ impl Projects {
         lock(&self.store).finish_setup(task, exit)
     }
 
+    /// Undoes [`Projects::create_task`] for a task that never started: removes its
+    /// worktree, branch and row, which frees its ports.
+    pub fn discard_task(&self, task: &TaskInfo) {
+        let _creating = lock(&self.creating);
+
+        if let Some(root) = self.project_root(task.project) {
+            remove_task_leftovers(&root, &task.branch, &task.worktree);
+        }
+        if let Err(error) = lock(&self.store).delete_task(task.id) {
+            log::error!("cannot delete task {}: {error}", task.id.0);
+        }
+    }
+
+    /// Undoes [`Projects::create_worker`] for a worker that never started: removes its
+    /// worktree, branch and row, which frees its ports.
+    pub fn discard_worker(&self, worker: &AgentInfo) {
+        let _creating = lock(&self.creating);
+
+        if let Some(root) = self.project_root(worker.project) {
+            remove_task_leftovers(&root, &worker.branch, &worker.worktree);
+        }
+        if let Err(error) = lock(&self.store).delete_agent(worker.id) {
+            log::error!("cannot delete agent {}: {error}", worker.id.0);
+        }
+    }
+
+    fn project_root(&self, project: ProjectId) -> Option<PathBuf> {
+        match lock(&self.store).project(project) {
+            Ok(project) => project.map(|project| project.path),
+            Err(error) => {
+                log::error!("cannot find project {}: {error}", project.0);
+
+                None
+            }
+        }
+    }
+
+    /// The ports a worker or orchestrator reserved, as `SWARM_PORT`.
+    pub fn agent_env(&self, agent: &AgentInfo) -> Result<Vec<(String, String)>, Error> {
+        let store = lock(&self.store);
+
+        let ports = match agent.task {
+            Some(task) if agent.role == AgentRole::Orchestrator => {
+                store.task(task)?.map(|task| task.ports).unwrap_or_default()
+            }
+            _ => store.agent_ports(agent.id)?,
+        };
+
+        Ok(match agent.task {
+            Some(task) => ports_env(task, &ports),
+            None => Vec::new(),
+        })
+    }
+
+    /// The project's running Start orchestrator, or the one `register` makes in the
+    /// project root on the base branch. The flag is true for a new one. Only one runs
+    /// per project, even when two callers ask at once.
+    pub fn start_agent_or(
+        &self,
+        project: ProjectId,
+        register: impl FnOnce(&Path, &str) -> Result<AgentInfo, Error>,
+    ) -> Result<(AgentInfo, bool), Error> {
+        let _creating = lock(&self.creating);
+
+        let stored = lock(&self.store)
+            .project(project)?
+            .ok_or(Error::UnknownProject(project.0))?;
+        if let Some(agent) = lock(&self.store).start_agent(project)? {
+            return Ok((agent, false));
+        }
+
+        let LoadedConfig { config, .. } = config::load(&stored.path);
+        let base = git::default_base_branch(&stored.path, config.worktrees.base_branch.as_deref());
+
+        Ok((register(&stored.path, &base)?, true))
+    }
+
     /// Makes the task branch and task worktree, copies files, reserves ports and
     /// records the task. Nothing is left behind when a step fails.
     pub fn create_task(&self, request: &CreateTask) -> Result<PreparedTask, Error> {
+        self.create_task_by(request, None)
+    }
+
+    /// Like [`Projects::create_task`]; the row records `created_by`, the Start
+    /// orchestrator that asked for the task.
+    pub fn create_task_by(
+        &self,
+        request: &CreateTask,
+        created_by: Option<AgentId>,
+    ) -> Result<PreparedTask, Error> {
         let _creating = lock(&self.creating);
 
         let project = lock(&self.store)
@@ -180,7 +267,7 @@ impl Projects {
         git::worktree_add(&root, &branch, &worktree, &base)?;
 
         let recorded = self.record(
-            &root, &config, request, name, &branch, &base, &worktree, &ports,
+            &root, &config, request, name, &branch, &base, &worktree, &ports, created_by,
         );
         let task = match recorded {
             Ok(task) => task,
@@ -307,17 +394,21 @@ impl Projects {
         base: &str,
         worktree: &Path,
         ports: &[u16],
+        created_by: Option<AgentId>,
     ) -> Result<TaskInfo, Error> {
         task::copy_files(root, worktree, &config.worktrees.copy)?;
 
-        lock(&self.store).add_task(&NewTask {
-            project: request.project,
-            name,
-            branch,
-            base,
-            worktree,
-            ports,
-        })
+        lock(&self.store).add_task_by(
+            &NewTask {
+                project: request.project,
+                name,
+                branch,
+                base,
+                worktree,
+                ports,
+            },
+            created_by,
+        )
     }
 
     fn info(&self, project: StoredProject) -> Result<ProjectInfo, Error> {
@@ -333,7 +424,7 @@ impl Projects {
             base_branch,
             config_error: error,
             tasks,
-            start: None,
+            start: lock(&self.store).start_agent(project.id)?,
         })
     }
 }

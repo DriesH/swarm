@@ -9,7 +9,8 @@ use serde::de::DeserializeOwned;
 use swarm_protocol::agent::InboxMessage;
 use swarm_protocol::{
     AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, CreateTerminal,
-    MessageId, MessageInfo, MessageKind, ProjectId, TaskId, TaskInfo, TerminalId, TerminalKind,
+    GridSize, MessageId, MessageInfo, MessageKind, ProjectId, TaskId, TaskInfo, TerminalId,
+    TerminalKind,
 };
 use swarm_term::ExitStatus;
 
@@ -111,6 +112,10 @@ const MIGRATIONS: &[&str] = &[
         delivered_at INTEGER
     );
     CREATE INDEX messages_unread ON messages (to_agent) WHERE delivered_at IS NULL",
+    "ALTER TABLE terminals ADD COLUMN owner INTEGER;
+    ALTER TABLE terminals ADD COLUMN name TEXT;
+    ALTER TABLE terminals ADD COLUMN fixed_cols INTEGER;
+    ALTER TABLE terminals ADD COLUMN fixed_rows INTEGER",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +146,14 @@ pub struct Leftover {
     pub pid: Option<i32>,
     /// Process start time in microseconds since the epoch; guards against PID reuse.
     pub started_us: Option<u64>,
+}
+
+/// What an agent gave a process terminal it started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessMeta {
+    pub owner: AgentId,
+    pub name: Option<String>,
+    pub size: GridSize,
 }
 
 /// A project row.
@@ -260,6 +273,60 @@ impl Store {
         )?;
 
         Ok(TerminalId(from_row(self.connection.last_insert_rowid())?))
+    }
+
+    /// Records who started a process terminal, what they called it and its fixed size.
+    pub fn set_process(&self, id: TerminalId, meta: &ProcessMeta) -> Result<(), Error> {
+        self.connection.execute(
+            "UPDATE terminals SET owner = ?1, name = ?2, fixed_cols = ?3, fixed_rows = ?4
+             WHERE id = ?5",
+            params![
+                to_row(meta.owner.0)?,
+                meta.name,
+                meta.size.cols,
+                meta.size.rows,
+                to_row(id.0)?
+            ],
+        )?;
+
+        Ok(())
+    }
+
+    pub fn set_process_size(&self, id: TerminalId, size: GridSize) -> Result<(), Error> {
+        self.connection.execute(
+            "UPDATE terminals SET fixed_cols = ?1, fixed_rows = ?2 WHERE id = ?3",
+            params![size.cols, size.rows, to_row(id.0)?],
+        )?;
+
+        Ok(())
+    }
+
+    /// `None` for a terminal no agent started.
+    pub fn process(&self, id: TerminalId) -> Result<Option<ProcessMeta>, Error> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT owner, name, fixed_cols, fixed_rows FROM terminals WHERE id = ?1",
+                params![to_row(id.0)?],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<u16>>(2)?,
+                        row.get::<_, Option<u16>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        Ok(match row {
+            Some((Some(owner), name, Some(cols), Some(rows))) => Some(ProcessMeta {
+                owner: AgentId(owner.unsigned_abs()),
+                name,
+                size: GridSize { cols, rows },
+            }),
+            _ => None,
+        })
     }
 
     pub fn mark_running(
@@ -383,11 +450,22 @@ impl Store {
     }
 
     pub fn add_task(&self, task: &NewTask<'_>) -> Result<TaskInfo, Error> {
+        self.add_task_by(task, None)
+    }
+
+    /// Records a task made by `created_by`, the Start orchestrator that asked for it.
+    pub fn add_task_by(
+        &self,
+        task: &NewTask<'_>,
+        created_by: Option<AgentId>,
+    ) -> Result<TaskInfo, Error> {
         let ports = join_ports(task.ports);
+        let creator = created_by.map(|agent| to_row(agent.0)).transpose()?;
 
         self.connection.execute(
-            "INSERT INTO tasks (project, name, branch, base, worktree, ports, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO tasks (project, name, branch, base, worktree, ports, created_at,
+                 created_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 to_row(task.project.0)?,
                 task.name,
@@ -395,7 +473,8 @@ impl Store {
                 task.base,
                 task.worktree.to_string_lossy(),
                 ports,
-                now_seconds()
+                now_seconds(),
+                creator
             ],
         )?;
 
@@ -410,7 +489,7 @@ impl Store {
             setup_terminal: None,
             setup_exit: None,
             agents: Vec::new(),
-            created_by: None,
+            created_by,
             briefed: false,
         })
     }
@@ -453,6 +532,38 @@ impl Store {
             "UPDATE tasks SET briefed = 1 WHERE id = ?1",
             params![to_row(id.0)?],
         )?;
+
+        Ok(())
+    }
+
+    /// Records the Start orchestrator that made the task.
+    pub fn set_task_created_by(&self, task: TaskId, agent: AgentId) -> Result<(), Error> {
+        self.connection.execute(
+            "UPDATE tasks SET created_by = ?1 WHERE id = ?2",
+            params![to_row(agent.0)?, to_row(task.0)?],
+        )?;
+
+        Ok(())
+    }
+
+    /// Removes a task that never started.
+    pub fn delete_task(&self, id: TaskId) -> Result<(), Error> {
+        self.connection
+            .execute("DELETE FROM tasks WHERE id = ?1", params![to_row(id.0)?])?;
+
+        Ok(())
+    }
+
+    /// Removes an agent that never started, with its messages.
+    pub fn delete_agent(&self, id: AgentId) -> Result<(), Error> {
+        let id = to_row(id.0)?;
+
+        self.connection.execute(
+            "DELETE FROM messages WHERE to_agent = ?1 OR from_agent = ?1",
+            params![id],
+        )?;
+        self.connection
+            .execute("DELETE FROM agents WHERE id = ?1", params![id])?;
 
         Ok(())
     }
@@ -512,6 +623,50 @@ impl Store {
                 agent_from_row,
             )
             .optional()?)
+    }
+
+    /// The project's Start orchestrator while its process starts or runs.
+    pub fn start_agent(&self, project: ProjectId) -> Result<Option<AgentInfo>, Error> {
+        let alive = [
+            to_json(&AgentLifecycle::Starting)?,
+            to_json(&AgentLifecycle::Running)?,
+        ];
+
+        Ok(self
+            .connection
+            .query_row(
+                &format!(
+                    "{AGENT_COLUMNS} WHERE project = ?1 AND role = ?2 AND lifecycle IN (?3, ?4)
+                     ORDER BY id DESC LIMIT 1"
+                ),
+                params![
+                    to_row(project.0)?,
+                    to_json(&AgentRole::StartOrchestrator)?,
+                    alive[0],
+                    alive[1]
+                ],
+                agent_from_row,
+            )
+            .optional()?
+            .map(|stored| stored.info))
+    }
+
+    /// The ports the agent reserved; empty for an agent that reserved none.
+    pub fn agent_ports(&self, id: AgentId) -> Result<Vec<u16>, Error> {
+        let ports: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT ports FROM agents WHERE id = ?1",
+                params![to_row(id.0)?],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        Ok(ports
+            .iter()
+            .flat_map(|ports| ports.split(','))
+            .filter_map(|port| port.parse().ok())
+            .collect())
     }
 
     pub fn list_agents(&self, task: TaskId) -> Result<Vec<AgentInfo>, Error> {
@@ -646,10 +801,8 @@ impl Store {
         )?)
     }
 
-    /// Takes the agent's unread messages, oldest first, and marks them delivered.
-    pub fn take_unread(&self, agent: AgentId) -> Result<Vec<InboxMessage>, Error> {
-        let to = to_row(agent.0)?;
-
+    /// The agent's unread messages, oldest first. Nothing is marked.
+    pub fn unread(&self, agent: AgentId) -> Result<Vec<InboxMessage>, Error> {
         let mut statement = self.connection.prepare(
             "SELECT messages.id, messages.from_agent, sender.name, messages.kind, messages.text,
                  messages.sent_at
@@ -657,7 +810,7 @@ impl Store {
              WHERE messages.to_agent = ?1 AND messages.delivered_at IS NULL
              ORDER BY messages.id",
         )?;
-        let rows = statement.query_map(params![to], |row| {
+        let rows = statement.query_map(params![to_row(agent.0)?], |row| {
             let id: i64 = row.get(0)?;
             let from: Option<i64> = row.get(1)?;
             let from_name: Option<String> = row.get(2)?;
@@ -672,18 +825,29 @@ impl Store {
                 sent_at: sent_at.unsigned_abs(),
             })
         })?;
-        let messages: Vec<InboxMessage> = rows.collect::<rusqlite::Result<_>>()?;
 
-        let newest = messages
-            .last()
-            .map(|message| to_row(message.id.0))
-            .transpose()?
-            .unwrap_or(0);
-        self.connection.execute(
-            "UPDATE messages SET delivered_at = ?1 WHERE to_agent = ?2 AND delivered_at IS NULL
-                 AND id <= ?3",
-            params![now_millis(), to, newest],
-        )?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Marks messages as delivered.
+    pub fn mark_delivered(&self, messages: &[MessageId]) -> Result<(), Error> {
+        let now = now_millis();
+
+        for message in messages {
+            self.connection.execute(
+                "UPDATE messages SET delivered_at = ?1 WHERE id = ?2 AND delivered_at IS NULL",
+                params![now, to_row(message.0)?],
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Takes the agent's unread messages, oldest first, and marks them delivered.
+    pub fn take_unread(&self, agent: AgentId) -> Result<Vec<InboxMessage>, Error> {
+        let messages = self.unread(agent)?;
+        let ids: Vec<MessageId> = messages.iter().map(|message| message.id).collect();
+        self.mark_delivered(&ids)?;
 
         Ok(messages)
     }
@@ -715,12 +879,13 @@ impl Store {
         Ok(())
     }
 
-    /// The ports of every task and worker in every project.
+    /// The ports of every task and every worker that has not stopped, in every project.
     pub fn all_task_ports(&self) -> Result<Vec<u16>, Error> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT ports FROM tasks UNION ALL SELECT ports FROM agents")?;
-        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut statement = self.connection.prepare(
+            "SELECT ports FROM tasks UNION ALL SELECT ports FROM agents WHERE lifecycle != ?1",
+        )?;
+        let stopped = to_json(&AgentLifecycle::Stopped)?;
+        let rows = statement.query_map(params![stopped], |row| row.get::<_, String>(0))?;
 
         let mut ports = Vec::new();
         for row in rows {
@@ -1409,6 +1574,176 @@ mod tests {
     }
 
     #[test]
+    fn the_ports_of_a_stopped_worker_are_free_again() {
+        let (store, task) = store_with_task();
+        let mut new = new_agent(task);
+        new.ports = &[5180, 5181];
+        let mut worker = store.add_agent(&new).expect("agent");
+
+        worker.lifecycle = AgentLifecycle::Stopped;
+        store.save_agent(&worker).expect("save");
+
+        assert!(store.all_task_ports().expect("ports").is_empty());
+
+        worker.lifecycle = AgentLifecycle::Resumable;
+        store.save_agent(&worker).expect("save");
+
+        assert_eq!(store.all_task_ports().expect("ports"), [5180, 5181]);
+    }
+
+    #[test]
+    fn a_database_from_the_sixth_schema_keeps_its_terminals() {
+        let connection = Connection::open_in_memory().expect("connection");
+        for migration in &MIGRATIONS[..6] {
+            connection.execute_batch(migration).expect("old schema");
+        }
+        connection
+            .pragma_update(None, "user_version", 6)
+            .expect("version");
+        connection
+            .execute(
+                "INSERT INTO terminals (kind, task, command, status, created_at)
+                 VALUES ('process', 'task:1', '[\"sleep\",\"1\"]', 'exited', 5)",
+                [],
+            )
+            .expect("old row");
+
+        let store = Store::migrated(connection).expect("migrated");
+
+        assert_eq!(store.status(TerminalId(1)).expect("status"), Status::Exited);
+        assert_eq!(store.process(TerminalId(1)).expect("process"), None);
+    }
+
+    #[test]
+    fn a_process_terminal_keeps_its_owner_name_and_size() {
+        let store = Store::open_in_memory().expect("store");
+        let id = store.insert_starting(&request(None)).expect("terminal");
+        let meta = ProcessMeta {
+            owner: AgentId(4),
+            name: Some("dev server".to_owned()),
+            size: GridSize {
+                cols: 100,
+                rows: 30,
+            },
+        };
+
+        store.set_process(id, &meta).expect("set");
+        assert_eq!(store.process(id).expect("get"), Some(meta));
+
+        store
+            .set_process_size(
+                id,
+                GridSize {
+                    cols: 120,
+                    rows: 40,
+                },
+            )
+            .expect("resize");
+        let resized = store.process(id).expect("get").expect("row");
+        assert_eq!((resized.size.cols, resized.size.rows), (120, 40));
+        assert_eq!(resized.owner, AgentId(4));
+    }
+
+    #[test]
+    fn the_start_agent_is_the_one_that_starts_or_runs() {
+        let (store, task) = store_with_task();
+        let project = ProjectId(1);
+        assert_eq!(store.start_agent(project).expect("none"), None);
+
+        let mut new = new_agent(task);
+        new.task = None;
+        new.role = AgentRole::StartOrchestrator;
+        new.name = "start";
+        let mut first = store.add_agent(&new).expect("agent");
+        assert_eq!(
+            store
+                .start_agent(project)
+                .expect("starting")
+                .map(|agent| agent.id),
+            Some(first.id)
+        );
+
+        first.lifecycle = AgentLifecycle::Stopped;
+        store.save_agent(&first).expect("save");
+        assert_eq!(store.start_agent(project).expect("stopped"), None);
+
+        let second = store.add_agent(&new).expect("second");
+        assert_eq!(
+            store
+                .start_agent(project)
+                .expect("running")
+                .map(|agent| agent.id),
+            Some(second.id)
+        );
+        assert_eq!(
+            store.start_agent(ProjectId(2)).expect("other project"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_deleted_agent_takes_its_messages_along() {
+        let (store, task) = store_with_task();
+        let worker = store.add_agent(&new_agent(task)).expect("agent");
+        store
+            .add_message(&message(None, worker.id, "brief"))
+            .expect("message");
+
+        store.delete_agent(worker.id).expect("delete");
+
+        assert!(store.agent(worker.id).expect("read").is_none());
+        assert!(!store.has_unread(worker.id).expect("unread"));
+    }
+
+    #[test]
+    fn a_deleted_task_is_gone() {
+        let (store, task) = store_with_task();
+
+        store.delete_task(task).expect("delete");
+
+        assert!(store.task(task).expect("read").is_none());
+    }
+
+    #[test]
+    fn a_task_can_be_recorded_with_its_creator() {
+        let (store, _) = store_with_task();
+
+        let task = store
+            .add_task_by(&new_task(ProjectId(1), &[]), Some(AgentId(9)))
+            .expect("task");
+
+        assert_eq!(task.created_by, Some(AgentId(9)));
+        assert_eq!(
+            store.task(task.id).expect("read").expect("task").created_by,
+            Some(AgentId(9))
+        );
+    }
+
+    #[test]
+    fn a_task_remembers_who_created_it() {
+        let (store, task) = store_with_task();
+
+        store.set_task_created_by(task, AgentId(9)).expect("set");
+
+        let stored = store.task(task).expect("task").expect("row");
+        assert_eq!(stored.created_by, Some(AgentId(9)));
+    }
+
+    #[test]
+    fn an_agent_has_its_own_ports() {
+        let (store, task) = store_with_task();
+        let mut new = new_agent(task);
+        new.ports = &[5180, 5181];
+        let agent = store.add_agent(&new).expect("agent");
+
+        assert_eq!(store.agent_ports(agent.id).expect("ports"), [5180, 5181]);
+        assert_eq!(
+            store.agent_ports(AgentId(99)).expect("none"),
+            Vec::<u16>::new()
+        );
+    }
+
+    #[test]
     fn confirming_a_task_marks_it_briefed() {
         let (store, task) = store_with_task();
         assert!(!store.task(task).expect("task").expect("row").briefed);
@@ -1460,6 +1795,22 @@ mod tests {
         assert!(store.take_unread(sender.id).expect("again").is_empty());
         assert!(!store.has_unread(sender.id).expect("unread"));
         assert_eq!(store.take_unread(worker.id).expect("other").len(), 1);
+    }
+
+    #[test]
+    fn reading_does_not_mark_until_told() {
+        let (store, task) = store_with_task();
+        let agent = store.add_agent(&new_agent(task)).expect("agent");
+        store
+            .add_message(&message(None, agent.id, "one"))
+            .expect("message");
+
+        let first = store.unread(agent.id).expect("unread");
+        let again = store.unread(agent.id).expect("unread");
+        store.mark_delivered(&[first[0].id]).expect("mark");
+
+        assert_eq!(first, again);
+        assert!(store.unread(agent.id).expect("unread").is_empty());
     }
 
     #[test]

@@ -774,7 +774,7 @@ fn a_branch_that_looks_like_an_option_is_not_read_as_one() {
 }
 
 #[test]
-fn a_linked_worktree_lists_its_shared_and_own_git_folders() {
+fn a_linked_worktree_lists_only_the_git_folders_a_commit_writes() {
     let repo = Repo::new("");
     let (projects, store) = shared_projects();
     let task = task_with_a_commit(&projects, &repo);
@@ -788,12 +788,88 @@ fn a_linked_worktree_lists_its_shared_and_own_git_folders() {
     assert_eq!(
         folders,
         [
-            repo.root.join(".git"),
+            repo.root.join(".git/objects"),
+            repo.root.join(".git/refs"),
+            repo.root.join(".git/logs"),
             repo.root.join(".git/worktrees/login--api")
         ]
     );
-    assert_eq!(
-        git::writable_git_dirs(&repo.root).expect("root"),
-        [repo.root.join(".git")]
+    assert!(git::writable_git_dirs(&repo.root).expect("root").is_empty());
+}
+
+#[test]
+fn a_discarded_worker_leaves_no_branch_folder_or_ports() {
+    let repo = Repo::new(CONFIG);
+    let (projects, store) = shared_projects();
+    let task = task_with_a_commit(&projects, &repo);
+    let worker = projects
+        .create_worker(&task, "api", |checkout| register_worker(&store, checkout))
+        .expect("worker")
+        .agent;
+
+    projects.discard_worker(&worker);
+
+    assert!(!repo.branches().contains(&"swarm/login--api".to_owned()));
+    assert!(!worker.worktree.exists());
+    assert!(
+        store
+            .lock()
+            .expect("store")
+            .agent(worker.id)
+            .expect("read")
+            .is_none()
     );
+    let again = projects
+        .create_worker(&task, "api", |checkout| register_worker(&store, checkout))
+        .expect("the name and ports are free again")
+        .agent;
+    assert_eq!(again.worktree, worker.worktree);
+}
+
+#[test]
+fn a_discarded_task_leaves_no_branch_folder_or_row() {
+    let repo = Repo::new(CONFIG);
+    let (projects, store) = shared_projects();
+    let project = projects.add(&repo.root).expect("add");
+    let task = projects
+        .create_task(&request(project.id, "login"))
+        .expect("task")
+        .task;
+
+    projects.discard_task(&task);
+
+    assert!(!repo.branches().contains(&task.branch));
+    assert!(!task.worktree.exists());
+    assert!(
+        store
+            .lock()
+            .expect("store")
+            .task(task.id)
+            .expect("read")
+            .is_none()
+    );
+}
+
+#[test]
+fn a_task_made_by_an_agent_records_it() {
+    let repo = Repo::new("");
+    let (projects, store) = shared_projects();
+    let project = projects.add(&repo.root).expect("add");
+
+    let task = projects
+        .create_task_by(
+            &request(project.id, "login"),
+            Some(swarm_protocol::AgentId(9)),
+        )
+        .expect("task")
+        .task;
+
+    assert_eq!(task.created_by, Some(swarm_protocol::AgentId(9)));
+    let stored = store
+        .lock()
+        .expect("store")
+        .task(task.id)
+        .expect("read")
+        .expect("task");
+    assert_eq!(stored.created_by, Some(swarm_protocol::AgentId(9)));
 }

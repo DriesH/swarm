@@ -204,8 +204,9 @@ pub fn worktree_remove(root: &Path, path: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-/// The git folders a commit in `worktree` writes: the shared one, and for a linked
-/// worktree its own folder inside it.
+/// The git folders a commit in a linked `worktree` writes: the shared objects, refs and
+/// reflogs, and the worktree's own folder. Not the shared folder itself: hooks and the
+/// config in it would run outside the sandbox. Empty for a main worktree.
 pub fn writable_git_dirs(worktree: &Path) -> Result<Vec<PathBuf>, Error> {
     let shared = run(
         worktree,
@@ -215,11 +216,17 @@ pub fn writable_git_dirs(worktree: &Path) -> Result<Vec<PathBuf>, Error> {
         worktree,
         ["rev-parse", "--path-format=absolute", "--git-dir"],
     )?;
-
-    let mut folders = vec![PathBuf::from(&shared)];
-    if own != shared {
-        folders.push(PathBuf::from(own));
+    if own == shared {
+        return Ok(Vec::new());
     }
+
+    let shared = PathBuf::from(shared);
+    let mut folders: Vec<PathBuf> = ["objects", "refs", "logs"]
+        .iter()
+        .map(|folder| shared.join(folder))
+        .filter(|folder| folder.is_dir())
+        .collect();
+    folders.push(PathBuf::from(own));
 
     Ok(folders)
 }
