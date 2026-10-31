@@ -14,7 +14,7 @@ use swarm_core::store::{MAX_MESSAGE_BYTES, NewMessage};
 use swarm_core::{WorkerCheckout, git, github};
 use swarm_protocol::agent::{
     AgentRequest, AgentSummary, Call, Committed, Merged, Reply, Sent, TaskSummary, TaskUntil,
-    TerminalSize, TerminalUntil,
+    TerminalUntil,
 };
 use swarm_protocol::{
     AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, CreateTask, Event,
@@ -230,14 +230,15 @@ impl Calls {
             // `handle` answers it before it gets here.
             Call::AgentExit => Ok(Value::Null),
 
+            // The size is accepted and ignored: a process terminal follows its tile.
             Call::TerminalSpawn {
                 command,
                 cwd,
-                size,
+                size: _,
                 name,
-            } => self.terminal_spawn(caller, command, cwd, size, name),
-            Call::TerminalResize { id, size } => {
-                reply_with(self.services.processes.resize(caller, id, size)?)
+            } => self.terminal_spawn(caller, command, cwd, name),
+            Call::TerminalResize { id, size: _ } => {
+                reply_with(self.services.processes.resize(caller, id)?)
             }
             Call::TerminalRead { id, lines } => {
                 reply_with(self.services.processes.read(caller, id, lines)?)
@@ -649,7 +650,6 @@ impl Calls {
         caller: &AgentInfo,
         command: Vec<String>,
         cwd: Option<PathBuf>,
-        size: Option<TerminalSize>,
         name: Option<String>,
     ) -> Outcome {
         let env = self.services.projects.agent_env(caller)?;
@@ -659,7 +659,6 @@ impl Calls {
             Spawn {
                 command,
                 cwd,
-                size,
                 name,
                 env,
             },

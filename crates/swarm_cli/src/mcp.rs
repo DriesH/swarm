@@ -384,11 +384,7 @@ const TOOLS: &[Tool] = &[
                         "The program and its arguments, for example [\"pnpm\", \"dev\"].",
                     ),
                     ("name", "string", "A label, such as \"dev server\"."),
-                    (
-                        "size",
-                        "string",
-                        "small, medium (the default), large or COLSxROWS.",
-                    ),
+                    ("size", "string", "Ignored: the terminal follows its tile."),
                     (
                         "cwd",
                         "string",
@@ -411,13 +407,17 @@ const TOOLS: &[Tool] = &[
     },
     Tool {
         name: "terminal_resize",
-        description: "Resize a process terminal you started.",
+        description: "Return the size of a process terminal you started. The tile sets the size, so the request changes nothing.",
         audience: Audience::Everyone,
         schema: || {
             schema(
                 &[
                     ("id", "integer", "The terminal ID."),
-                    ("size", "string", "small, medium, large or COLSxROWS."),
+                    (
+                        "size",
+                        "string",
+                        "Ignored: small, medium, large or COLSxROWS.",
+                    ),
                 ],
                 &["id", "size"],
             )

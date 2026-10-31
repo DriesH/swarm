@@ -186,11 +186,12 @@ enum TaskAction {
 enum TerminalAction {
     /// Start a command in a process terminal.
     Spawn(SpawnArguments),
-    /// Resize a terminal you started.
+    /// Show the size of a terminal you started. The tile sets the size, so the request
+    /// changes nothing.
     Resize {
         /// The terminal ID.
         id: u64,
-        /// small, medium, large or a grid such as 100x30.
+        /// Ignored: small, medium, large or a grid such as 100x30.
         #[arg(value_parser = parse_size)]
         size: TerminalSize,
     },
@@ -221,7 +222,7 @@ struct SpawnArguments {
     /// A label, such as "dev server".
     #[arg(long)]
     name: Option<String>,
-    /// small, medium (the default), large or a grid such as 100x30.
+    /// Ignored: the terminal follows its tile. small, medium, large or a grid such as 100x30.
     #[arg(long, value_parser = parse_size)]
     size: Option<TerminalSize>,
     /// A folder inside your worktree; the default is the worktree.

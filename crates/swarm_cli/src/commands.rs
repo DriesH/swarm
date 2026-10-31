@@ -282,7 +282,7 @@ impl Command {
                 let result = session.call(Call::TerminalResize { id, size })?;
                 let terminal: TerminalSummary = decode(&result)?;
                 let text = format!(
-                    "terminal {} is now {}",
+                    "terminal {} is {}; its tile sets the size",
                     terminal.id.0,
                     grid_text(terminal.size)
                 );

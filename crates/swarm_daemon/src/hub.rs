@@ -366,7 +366,8 @@ impl Hub {
                 .process
                 .as_ref()
                 .and_then(|process| process.name.clone()),
-            fixed_size: state.process.as_ref().map(|process| process.size),
+            // Frozen protocol field: a process terminal follows its tile.
+            fixed_size: None,
             title: state.title.clone(),
             cwd: state.cwd.clone(),
             exit: state.exit.clone(),
@@ -389,24 +390,6 @@ impl Hub {
 
     pub(crate) fn send_input(&self, input: TerminalInput) -> bool {
         self.input.send(input).is_ok()
-    }
-
-    /// The size an agent chose for its process terminal; the app must not change it.
-    pub(crate) fn fixed_size(&self) -> Option<GridSize> {
-        lock(&self.state)
-            .process
-            .as_ref()
-            .map(|process| process.size)
-    }
-
-    /// Resizes the PTY and remembers the size as the fixed one. Returns false when the
-    /// terminal is gone.
-    pub(crate) fn resize_fixed(&self, size: GridSize) -> bool {
-        if let Some(process) = &mut lock(&self.state).process {
-            process.size = size;
-        }
-
-        self.send_input(TerminalInput::Resize(cell_size(size)))
     }
 
     /// Sends the signal to the process group. Returns false when the terminal is gone

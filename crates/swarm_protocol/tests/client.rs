@@ -852,7 +852,7 @@ fn change(stat: DiffStat) -> AgentChange {
 }
 
 #[test]
-fn a_locked_terminal_drops_resize_input() {
+fn a_resize_input_reaches_the_daemon() {
     let (seen_sender, seen) = flume::unbounded();
     let socket = serve(move |fake| {
         fake.handshake(VERSION);
@@ -869,7 +869,6 @@ fn a_locked_terminal_drops_resize_input() {
         cell_height: 17,
     };
 
-    client.set_size_locked(TerminalId(4), true);
     channels
         .input
         .send(TerminalInput::Resize(size))
@@ -889,23 +888,16 @@ fn a_locked_terminal_drops_resize_input() {
         requests.push(seen.recv_timeout(WAIT).expect("a request"));
     }
 
-    client.set_size_locked(TerminalId(4), false);
-    channels
-        .input
-        .send(TerminalInput::Resize(size))
-        .expect("send resize");
-    requests.push(seen.recv_timeout(WAIT).expect("the resize"));
-
     assert_eq!(
         requests[1..],
         [
             Request::Input {
                 id: TerminalId(4),
-                input: TerminalInput::Focus(true)
+                input: TerminalInput::Resize(size)
             },
             Request::Input {
                 id: TerminalId(4),
-                input: TerminalInput::Resize(size)
+                input: TerminalInput::Focus(true)
             },
         ]
     );

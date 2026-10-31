@@ -102,11 +102,8 @@ pub struct TileSpec {
     pub id: TileId,
     pub kind: TileKind,
     pub activity: Activity,
-    /// A process terminal's requested height. Only the height is used.
-    pub requested: Option<Size>,
-    /// The size a user terminal has after the user resized it, or a process
-    /// terminal has after its agent fixed it. A user terminal keeps it. A
-    /// process terminal gets the closest size that fits.
+    /// The size a user terminal has after the user resized it. The layout keeps it.
+    /// Other kinds ignore it.
     pub fixed: Option<Size>,
     /// The user pinned the tile: keep it on screen if at all possible.
     pub pinned: bool,
@@ -115,13 +112,12 @@ pub struct TileSpec {
 }
 
 impl TileSpec {
-    /// A tile with no requested or fixed size that is neither pinned nor minimized.
+    /// A tile with no fixed size that is neither pinned nor minimized.
     pub const fn new(id: TileId, kind: TileKind, activity: Activity) -> Self {
         Self {
             id,
             kind,
             activity,
-            requested: None,
             fixed: None,
             pinned: false,
             minimized: false,
@@ -141,6 +137,9 @@ pub struct LayoutStyle {
     /// The height of a small box: a tile without a size of its own that does not
     /// need attention. The app measures it from the terminal font.
     pub small_tile_height: f32,
+    /// The height of a process terminal's box, the smallest tile. The app measures it
+    /// from the terminal font.
+    pub process_tile_height: f32,
 }
 
 impl Default for LayoutStyle {
@@ -152,6 +151,7 @@ impl Default for LayoutStyle {
             min_tile: Size::new(260.0, 160.0),
             min_orchestrator: Size::new(320.0, 300.0),
             small_tile_height: 286.0,
+            process_tile_height: 218.0,
         }
     }
 }
@@ -281,12 +281,14 @@ struct Metrics {
     min_tile: Size,
     min_orchestrator: Size,
     small_height: f32,
+    process_height: f32,
 }
 
 impl Metrics {
     fn new(style: &LayoutStyle) -> Self {
         let at_least_one = |size: Size| Size::new(size.width.max(1.0), size.height.max(1.0));
         let min_tile = at_least_one(style.min_tile);
+        let small_height = style.small_tile_height.max(min_tile.height);
 
         Self {
             gap: style.gap.max(0.0),
@@ -294,7 +296,12 @@ impl Metrics {
             orchestrator_share: style.orchestrator_share.clamp(0.0, 1.0),
             min_tile,
             min_orchestrator: at_least_one(style.min_orchestrator),
-            small_height: style.small_tile_height.max(min_tile.height),
+            small_height,
+            // The smallest tile: never taller than a small box.
+            process_height: style
+                .process_tile_height
+                .max(min_tile.height)
+                .min(small_height),
         }
     }
 
@@ -305,15 +312,7 @@ impl Metrics {
 }
 
 fn is_island(tile: &TileSpec) -> bool {
-    matches!(tile.kind, TileKind::User | TileKind::Process) && tile.fixed.is_some()
-}
-
-/// `wanted`, raised to `min` and then cut down to `space`.
-fn clamp_size(wanted: Size, min: Size, space: Size) -> Size {
-    Size::new(
-        wanted.width.max(min.width).min(space.width),
-        wanted.height.max(min.height).min(space.height),
-    )
+    tile.kind == TileKind::User && tile.fixed.is_some()
 }
 
 fn fits(size: Size, space: Size) -> bool {
@@ -328,9 +327,8 @@ fn flow_band(tiles: &[TileSpec], flow: &[usize]) -> Vec<usize> {
     band
 }
 
-/// Fixed-size terminals, packed in rows from the top right. User terminals keep
-/// their size; process terminals shrink or grow to the closest size that fits, but never
-/// below `min_tile`.
+/// User terminals with a fixed size, packed in rows from the top right. They keep
+/// their size.
 struct Islands {
     rects: Vec<(usize, Rect)>,
     content: Rect,
@@ -338,7 +336,7 @@ struct Islands {
 
 impl Islands {
     /// Leaves room for the orchestrator column on the left when that loses no user
-    /// terminal. A process terminal that does not fit beside the column goes to the tray.
+    /// terminal.
     fn place(
         content: Rect,
         tiles: &[TileSpec],
@@ -358,14 +356,7 @@ impl Islands {
             content.size.width - reserve,
             metrics,
         );
-        let users = |islands: &Self| {
-            islands
-                .rects
-                .iter()
-                .filter(|(index, _)| tiles[*index].kind == TileKind::User)
-                .count()
-        };
-        if users(&narrow) >= users(&full) {
+        if narrow.rects.len() >= full.rects.len() {
             narrow
         } else {
             full
@@ -380,7 +371,6 @@ impl Islands {
         metrics: &Metrics,
     ) -> Self {
         let gap = metrics.gap;
-        let space = Size::new(width.max(0.0), content.size.height);
         let left_limit = content.right() - width;
         let fits_at = |size: Size, top: f32, right: f32| {
             right - size.width >= left_limit - EPSILON
@@ -401,18 +391,9 @@ impl Islands {
                 continue;
             }
 
-            let size = if tiles[index].kind == TileKind::Process {
-                clamp_size(wanted, metrics.min_tile, space)
-            } else {
-                wanted
-            };
-            if tiles[index].kind == TileKind::Process && !fits(metrics.min_tile, size) {
-                continue;
-            }
-
-            if !fits_at(size, row_top, cursor) {
+            if !fits_at(wanted, row_top, cursor) {
                 let next_top = row_top + row_height + gap;
-                if !row_used || !fits_at(size, next_top, content.right()) {
+                if !row_used || !fits_at(wanted, next_top, content.right()) {
                     continue;
                 }
 
@@ -423,10 +404,10 @@ impl Islands {
 
             rects.push((
                 index,
-                Rect::new(cursor - size.width, row_top, size.width, size.height),
+                Rect::new(cursor - wanted.width, row_top, wanted.width, wanted.height),
             ));
-            cursor -= size.width + gap;
-            row_height = row_height.max(size.height);
+            cursor -= wanted.width + gap;
+            row_height = row_height.max(wanted.height);
             row_used = true;
         }
 
@@ -524,7 +505,6 @@ enum Growth {
 /// Boxes that are tall when there is room for it.
 fn grows(tile: &TileSpec) -> bool {
     tile.activity == Activity::Attention
-        && !(tile.kind == TileKind::Process && tile.requested.is_some())
 }
 
 /// Tiles that rank above running processes and done or idle tiles.
@@ -719,14 +699,12 @@ impl Flow {
         Some(stacks)
     }
 
-    /// The height a tile asks for. A process terminal with a requested size gets that
-    /// height; a tile that needs attention may ask for two small boxes.
+    /// The height a tile asks for. A process terminal is the smallest box; a tile that
+    /// needs attention may ask for two small boxes.
     fn wanted_height(&self, tile: &TileSpec, growth: Growth) -> f32 {
-        match (tile.kind, tile.requested) {
-            (TileKind::Process, Some(requested)) => {
-                requested.height.max(self.metrics.min_tile.height)
-            }
+        match tile.kind {
             _ if growth == Growth::Tall && grows(tile) => self.metrics.tall_height(),
+            TileKind::Process => self.metrics.process_height,
             _ => self.metrics.small_height,
         }
     }

@@ -80,11 +80,10 @@ const ORCHESTRATOR_COMMANDS: &[&str] = &[
 
 /// Every role can run process terminals (dev servers, tests) in its worktree.
 const TERMINAL_COMMANDS: &[&str] = &[
-    "`swarm terminal spawn [--name N] [--size small|medium|large|COLSxROWS] [--cwd DIR] -- <command>...`: run a command in a process terminal; no shell is added, so pass `sh -c` yourself when you need one",
+    "`swarm terminal spawn [--name N] [--cwd DIR] -- <command>...`: run a command in a process terminal; no shell is added, so pass `sh -c` yourself when you need one",
     "`swarm terminal list`: list the process terminals of your task",
     "`swarm terminal read <id> [--lines N]`: read the screen or the last lines of output (at most 2000)",
     "`swarm terminal wait <id> (--exit | --output TEXT) [--timeout SECS]`: wait for the process to exit or for a line that contains TEXT",
-    "`swarm terminal resize <id> <size>`: resize a terminal you started",
     "`swarm terminal kill <id> [--signal TERM|INT|KILL|HUP]`: stop a process (the terminal's owner or your orchestrator)",
 ];
 

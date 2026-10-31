@@ -1973,10 +1973,7 @@ fn process_row(
         .get(&id)
         .map(|live| live.view.read(cx));
     let exit = live.map_or(terminal.exit.as_ref(), TerminalView::exit_status);
-    let size = live
-        .and_then(TerminalView::grid_size)
-        .or(terminal.requested_size)
-        .or(terminal.fixed_size);
+    let size = live.and_then(TerminalView::grid_size);
     let state = exit_label(exit);
     let running = exit.is_none();
 

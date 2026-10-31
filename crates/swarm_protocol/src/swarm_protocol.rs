@@ -246,7 +246,7 @@ pub struct TerminalInfo {
     pub owner: Option<AgentId>,
     /// A label the owner gave, such as "dev server".
     pub name: Option<String>,
-    /// Set by the owner agent; the app never resizes such a terminal.
+    /// Unused: a process terminal follows its tile. The daemon sends `None`.
     pub fixed_size: Option<GridSize>,
     pub title: Option<String>,
     pub cwd: Option<PathBuf>,

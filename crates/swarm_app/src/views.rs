@@ -11,7 +11,7 @@ use swarm_ui::prelude::*;
 use swarm_ui::styles::focus_ring;
 use swarm_ui::{FocusStyle, TextFieldSize, TileRing};
 
-use crate::daemon::{CHROME_HEIGHT, CHROME_WIDTH};
+use crate::daemon::{CHROME_HEIGHT, exit_failed};
 use crate::model::{Agent, AgentKind, FakeLine, Terminal, TerminalId, TerminalKind};
 use crate::workspace::{DataSource, View, Workspace};
 
@@ -23,6 +23,8 @@ const HEADER_HEIGHT: f32 = 34.;
 const HANDLE_HEIGHT: f32 = 6.;
 /// The rows of the terminal a small tile shows.
 const SMALL_TILE_ROWS: u16 = 12;
+/// The rows of the terminal a process tile shows.
+const PROCESS_TILE_ROWS: u16 = 8;
 const KEY_STEP: f32 = 20.;
 const MIN_TILE: Size<Pixels> = Size {
     width: px(260.),
@@ -115,14 +117,6 @@ fn to_rect(size: Size<Pixels>) -> Rect {
     Rect::new(0., 0., f32::from(size.width), f32::from(size.height))
 }
 
-/// Size of a process terminal with `columns` × `rows` cells, header included.
-fn process_size(columns: u16, rows: u16) -> swarm_layout::Size {
-    swarm_layout::Size::new(
-        f32::from(columns) * CHAR_WIDTH,
-        f32::from(rows) * ROW_HEIGHT + HEADER_HEIGHT,
-    )
-}
-
 /// Height of a tile that shows `rows` rows of the terminal font: the rows, the padding of
 /// the terminal view and the tile's header and border.
 fn rows_height(cell: Option<(f32, f32)>, rows: u16) -> f32 {
@@ -131,21 +125,12 @@ fn rows_height(cell: Option<(f32, f32)>, rows: u16) -> f32 {
     f32::from(rows) * cell_height + 2. * VIEW_PADDING + CHROME_HEIGHT
 }
 
-/// Size of a tile for a process terminal that an agent fixed at `columns` × `rows`,
-/// from the terminal view's cell size when it is known.
-fn fixed_size(cell: Option<(f32, f32)>, columns: u16, rows: u16) -> swarm_layout::Size {
-    let (cell_width, _) = cell.unwrap_or((CHAR_WIDTH, ROW_HEIGHT));
-
-    swarm_layout::Size::new(
-        f32::from(columns) * cell_width + 2. * VIEW_PADDING + CHROME_WIDTH,
-        rows_height(cell, rows),
-    )
-}
-
-/// The layout style with a small tile that shows [`SMALL_TILE_ROWS`] rows.
-fn layout_style(workspace: &Workspace) -> LayoutStyle {
+/// The layout style with a small tile that shows [`SMALL_TILE_ROWS`] rows and a process
+/// tile that shows [`PROCESS_TILE_ROWS`].
+pub(crate) fn layout_style(workspace: &Workspace) -> LayoutStyle {
     LayoutStyle {
         small_tile_height: rows_height(workspace.cell_size, SMALL_TILE_ROWS),
+        process_tile_height: rows_height(workspace.cell_size, PROCESS_TILE_ROWS),
         ..LayoutStyle::default()
     }
 }
@@ -174,6 +159,15 @@ fn activity_of(status: AgentStatus) -> Activity {
     }
 }
 
+/// A process that ended with a failure needs attention, so its tile grows.
+fn process_activity(terminal: &Terminal) -> Activity {
+    if terminal.exit.as_ref().is_some_and(exit_failed) {
+        Activity::Attention
+    } else {
+        Activity::Running
+    }
+}
+
 fn tile_kind(kind: TerminalKind) -> TileKind {
     match kind {
         TerminalKind::Orchestrator => TileKind::Orchestrator,
@@ -186,13 +180,6 @@ fn tile_kind(kind: TerminalKind) -> TileKind {
 fn tile_spec(workspace: &Workspace, terminal: &Terminal, activity: Activity) -> TileSpec {
     let mut spec = TileSpec::new(TileId(terminal.id.0), tile_kind(terminal.kind), activity);
     spec.minimized = workspace.minimized.contains(&terminal.id);
-    spec.requested = terminal
-        .requested_size
-        .map(|(columns, rows)| process_size(columns, rows));
-
-    if let Some((columns, rows)) = terminal.fixed_size {
-        spec.fixed = Some(fixed_size(workspace.cell_size, columns, rows));
-    }
 
     if terminal.kind == TerminalKind::User {
         spec.fixed = workspace
@@ -235,7 +222,7 @@ pub(crate) fn tile_specs(workspace: &Workspace) -> Vec<TileSpec> {
         .iter()
         .chain(&task.user_terminals)
         .filter_map(|id| data.terminal(*id))
-        .map(|terminal| (terminal, Activity::Running));
+        .map(|terminal| (terminal, process_activity(terminal)));
 
     agents
         .chain(others)
@@ -882,6 +869,7 @@ fn size_badge(size: Size<Pixels>, cx: &Context<Workspace>) -> AnyElement {
 #[cfg(test)]
 mod tests {
     use gpui::{TestAppContext, VisualTestContext};
+    use swarm_term::ExitStatus;
 
     use super::*;
     use crate::actions::{self, NewTerminal, PlanWithOrchestrator};
@@ -936,15 +924,7 @@ mod tests {
     }
 
     #[test]
-    fn process_size_is_cells_plus_header() {
-        let size = process_size(90, 14);
-
-        assert!((size.width - 648.).abs() < 0.01);
-        assert!((size.height - 272.).abs() < 0.01);
-    }
-
-    #[test]
-    fn cells_invert_the_process_size() {
+    fn cells_are_the_columns_and_rows_that_fit_a_tile() {
         let size = Size {
             width: px(648.),
             height: px(272.),
@@ -981,30 +961,20 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_fixed_size_tile_holds_all_its_columns(cx: &mut TestAppContext) {
+    fn a_process_tile_shows_eight_rows_of_the_terminal_font(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
-        let cell = workspace.read_with(cx, |workspace, _| workspace.cell_size);
-        let (cell_width, cell_height) = cell.expect("the cell size was measured");
+        let height = workspace.read_with(cx, |workspace, _| {
+            layout_style(workspace).process_tile_height
+        });
 
         cx.update(|window, cx| {
-            let exact = swarm_term_view::TerminalView::cell_size(window, cx);
-            assert!((cell_width - f32::from(exact.width)).abs() < 0.001);
+            let body = Size {
+                width: px(300.),
+                height: px(height - CHROME_HEIGHT),
+            };
+            let grid = swarm_term_view::TerminalView::size_for(body, window, cx);
 
-            for columns in 1..=300 {
-                let tile = fixed_size(cell, columns, 12);
-                let body = Size {
-                    width: px(tile.width - CHROME_WIDTH),
-                    height: px(tile.height - CHROME_HEIGHT),
-                };
-                let grid = swarm_term_view::TerminalView::size_for(body, window, cx);
-
-                assert_eq!(
-                    grid.cols,
-                    columns.max(2),
-                    "{columns} columns at {cell_width}"
-                );
-                assert_eq!(grid.rows, 12, "{cell_height} high");
-            }
+            assert_eq!(grid.rows, PROCESS_TILE_ROWS);
         });
     }
 
@@ -1146,6 +1116,44 @@ mod tests {
                 TileKind::Process,
             ]
         );
+    }
+
+    fn process_activity_after_exit(exit: Option<ExitStatus>, cx: &mut TestAppContext) -> Activity {
+        let (workspace, cx) = setup(cx);
+        let process = workspace.update(cx, |workspace, _| {
+            let process = workspace.active_task().processes.first().copied();
+            let process = process.unwrap_or(TerminalId(u32::MAX));
+
+            if let Some(exit) = exit {
+                workspace.data.set_terminal_exit(process, exit);
+            }
+
+            process
+        });
+
+        workspace.read_with(cx, |workspace, _| {
+            tile_specs(workspace)
+                .iter()
+                .find(|spec| spec.id == TileId(process.0))
+                .map_or(Activity::Idle, |spec| spec.activity)
+        })
+    }
+
+    #[gpui::test]
+    fn a_process_that_failed_needs_attention(cx: &mut TestAppContext) {
+        let failed = Some(ExitStatus::Code(2));
+        let killed = Some(ExitStatus::Signal("SIGKILL".to_owned()));
+
+        assert_eq!(process_activity_after_exit(failed, cx), Activity::Attention);
+        assert_eq!(process_activity_after_exit(killed, cx), Activity::Attention);
+    }
+
+    #[gpui::test]
+    fn a_process_that_runs_or_exited_well_stays_running(cx: &mut TestAppContext) {
+        let well = Some(ExitStatus::Code(0));
+
+        assert_eq!(process_activity_after_exit(None, cx), Activity::Running);
+        assert_eq!(process_activity_after_exit(well, cx), Activity::Running);
     }
 
     #[gpui::test]

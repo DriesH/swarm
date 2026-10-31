@@ -1,7 +1,7 @@
 //! The app's connection to the daemon: one reader thread, one writer thread, and one
 //! forwarder thread per attached terminal. There is no GPUI here.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{self, BufReader, BufWriter, Write};
 use std::os::unix::fs::DirBuilderExt as _;
 use std::os::unix::net::UnixStream;
@@ -126,8 +126,6 @@ struct Shared {
     messages: flume::Sender<MessageEvent>,
     comments: flume::Sender<CommentEvent>,
     pull_requests: flume::Sender<PrEvent>,
-    /// Terminals whose size an agent owns: their `Resize` input is dropped.
-    size_locked: Mutex<HashSet<TerminalId>>,
 }
 
 impl Shared {
@@ -281,7 +279,6 @@ impl Client {
             messages: message_sender,
             comments: comment_sender,
             pull_requests: pr_sender,
-            size_locked: Mutex::new(HashSet::new()),
         });
         let (request_sender, request_receiver) = flume::unbounded();
 
@@ -331,18 +328,6 @@ impl Client {
     /// so use one consumer.
     pub fn agent_events(&self) -> flume::Receiver<AgentInfo> {
         self.inner.agent_events.clone()
-    }
-
-    /// Locks or unlocks the size of a terminal. While locked, the client drops the
-    /// `Resize` input of its views, so the size an agent asked for stays.
-    pub fn set_size_locked(&self, id: TerminalId, locked: bool) {
-        let mut set = Shared::lock(&self.inner.shared.size_locked);
-
-        if locked {
-            set.insert(id);
-        } else {
-            set.remove(&id);
-        }
     }
 
     /// Every `TaskChanged` the daemon sends: a task was added, also by an agent, or
@@ -866,12 +851,6 @@ impl Client {
             .name(format!("daemon-input-{}", id.0))
             .spawn(move || {
                 while let Ok(input) = input.recv() {
-                    let locked = matches!(input, TerminalInput::Resize(_))
-                        && Shared::lock(&shared.size_locked).contains(&id);
-                    if locked {
-                        continue;
-                    }
-
                     if writer.send(Request::Input { id, input }).is_err() {
                         return;
                     }
