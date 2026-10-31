@@ -487,6 +487,8 @@ fn task_info() -> TaskInfo {
         agents: Vec::new(),
         created_by: None,
         briefed: false,
+        approved: None,
+        closed: false,
     }
 }
 

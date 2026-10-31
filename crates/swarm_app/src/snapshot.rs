@@ -9,9 +9,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gpui::{AnyWindowHandle, App, AsyncApp, Context, Window};
+use swarm_protocol::ReviewSource;
 use swarm_ui::theme::{self, Appearance};
 
 use crate::model::ProjectId;
+use crate::review_model::DiffStyle;
 use crate::swarm_view::InspectorTab;
 use crate::workspace::{View, Workspace};
 
@@ -58,6 +60,24 @@ fn open_swarm_changes(workspace: &mut Workspace, _: &mut Window, cx: &mut Contex
 
 fn open_swarm_terminal(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
     show_pty_io(workspace, InspectorTab::Terminal, cx);
+}
+
+fn open_review(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
+    workspace.set_view(View::Review, cx);
+}
+
+fn open_review_split(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
+    workspace.set_view(View::Review, cx);
+    workspace.set_review_source(ReviewSource::Merged, cx);
+    workspace
+        .review
+        .update(cx, |review, cx| review.set_style(DiffStyle::Split, cx));
+}
+
+fn open_close_task(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    let task = workspace.active_task;
+
+    workspace.open_close_task(task, window, cx);
 }
 
 fn show_empty(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
@@ -178,6 +198,36 @@ pub(crate) fn run(directory: PathBuf, cx: &mut App) {
                 Appearance::Dark,
                 "workspace-new-task-dark.png",
                 Some(Workspace::open_new_task),
+            ),
+            (
+                Appearance::Light,
+                "workspace-review-light.png",
+                Some(open_review),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-review-dark.png",
+                Some(open_review),
+            ),
+            (
+                Appearance::Light,
+                "workspace-review-split-light.png",
+                Some(open_review_split),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-review-split-dark.png",
+                Some(open_review_split),
+            ),
+            (
+                Appearance::Light,
+                "workspace-close-task-light.png",
+                Some(open_close_task),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-close-task-dark.png",
+                Some(open_close_task),
             ),
             (
                 Appearance::Light,

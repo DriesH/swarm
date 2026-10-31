@@ -276,6 +276,10 @@ impl Calls {
             return refuse(format!("only a task's orchestrator can {action}"));
         };
 
+        if self.services.agents.is_closing(Some(task)) {
+            return refuse("the task is closing");
+        }
+
         lock(&self.services.store)
             .task(task)?
             .ok_or_else(|| Failure("the task is gone".to_owned()))
@@ -792,6 +796,8 @@ mod tests {
             agents: vec![orchestrator],
             created_by: None,
             briefed: true,
+            approved: None,
+            closed: false,
         }
     }
 

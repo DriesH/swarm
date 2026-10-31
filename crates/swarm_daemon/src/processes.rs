@@ -317,6 +317,10 @@ impl Processes {
             bail!("the name is longer than {MAX_NAME_CHARS} characters");
         }
 
+        if self.agents.is_closing(caller.task) {
+            bail!("the task is closing");
+        }
+
         let cwd = inside_worktree(caller, request.cwd)?;
         let size = clamp(request.size.unwrap_or(TerminalSize::Medium).grid());
 
@@ -643,6 +647,10 @@ impl Processes {
             (state.id, state.stopper.clone())
         };
         entry.changed.notify_all();
+
+        if self.agents.is_closing(entry.task) {
+            return;
+        }
 
         let how = match &stopper {
             Stopper::Process => "exited".to_owned(),

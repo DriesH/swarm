@@ -1,5 +1,6 @@
 use gpui::{
-    AnyElement, App, ClickEvent, ElementId, FontWeight, Role, SharedString, Window, div, px,
+    AnyElement, App, ClickEvent, ElementId, FontWeight, MouseButton, Role, SharedString, Window,
+    div, px,
 };
 
 use crate::component::{Component, example, example_group};
@@ -17,6 +18,7 @@ pub struct Tab {
     selected: bool,
     debug_selector: Option<String>,
     on_click: Option<ClickHandler>,
+    on_close: Option<ClickHandler>,
 }
 
 impl Tab {
@@ -32,7 +34,18 @@ impl Tab {
             selected: false,
             debug_selector: None,
             on_click: None,
+            on_close: None,
         }
+    }
+
+    /// Adds a close button after the label. It shows on hover, on keyboard focus and
+    /// while the tab is selected.
+    pub fn on_close(
+        mut self,
+        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_close = Some(Box::new(handler));
+        self
     }
 
     /// Name for `VisualTestContext::debug_bounds`. Only recorded in test builds.
@@ -63,15 +76,21 @@ impl RenderOnce for Tab {
             (colors.raised, colors.line, colors.active, colors.accent);
         let accessible_label =
             SharedString::from(format!("{}, {}", self.label, self.status.label()));
+        let close_label = SharedString::from(format!("Close task {}", self.label));
+        let group = SharedString::from(format!("tab-{:?}", self.id));
+        let close_id = (self.id.clone(), "tab-close");
+        let selected = self.selected;
+        let closable = self.on_close.is_some();
 
         div()
             .id(self.id)
+            .group(group.clone())
             .when_some(self.debug_selector, |element, selector| {
                 element.debug_selector(move || selector)
             })
             .role(Role::Tab)
             .aria_label(accessible_label)
-            .aria_selected(self.selected)
+            .aria_selected(selected)
             .focusable()
             .tab_stop(true)
             .cursor_pointer()
@@ -80,11 +99,12 @@ impl RenderOnce for Tab {
             .items_center()
             .gap(px(8.))
             .h(px(32.))
-            .px(px(12.))
+            .pl(px(12.))
+            .pr(if closable { px(4.) } else { px(12.) })
             .rounded(px(8.))
             .border_1()
             .map(|tab| {
-                if self.selected {
+                if selected {
                     tab.bg(raised).border_color(line)
                 } else {
                     tab.border_color(gpui::transparent_black())
@@ -96,12 +116,28 @@ impl RenderOnce for Tab {
             .child(
                 Label::new(self.label)
                     .weight(FontWeight::MEDIUM)
-                    .color(if self.selected {
+                    .color(if selected {
                         Color::Default
                     } else {
                         Color::Muted
                     }),
             )
+            .when_some(self.on_close, |tab, on_close| {
+                let button =
+                    IconButton::new(close_id, IconName::Close, close_label).on_click(on_close);
+                let button = if selected {
+                    button
+                } else {
+                    button.reveal_with_group(group)
+                };
+
+                // Keeps the click from selecting the tab.
+                tab.child(
+                    div()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(button),
+                )
+            })
             .when_some(self.on_click, |tab, handler| tab.on_click(handler))
     }
 }
@@ -149,6 +185,22 @@ impl Component for Tab {
                                 }),
                         ),
                 )],
+            ))
+            .child(example_group(
+                "Closable",
+                [
+                    example(
+                        "Selected",
+                        Tab::new("close-selected", "terminal-renderer", AgentStatus::Working)
+                            .toggle_state(true)
+                            .on_close(|_, _, _| {}),
+                    ),
+                    example(
+                        "Shown on hover",
+                        Tab::new("close-idle", "menu-bar-usage", AgentStatus::Blocked)
+                            .on_close(|_, _, _| {}),
+                    ),
+                ],
             ))
             .child(example_group(
                 "States",

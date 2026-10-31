@@ -1,9 +1,9 @@
 //! The main area: terminals, swarm and review views.
 
 use gpui::{
-    AnyElement, AppContext as _, Bounds, Context, Div, Entity, FontWeight, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Role, SharedString, Size, Subscription,
-    Window, div, px,
+    AnyElement, AppContext as _, Bounds, Context, Entity, FontWeight, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, Pixels, Role, SharedString, Size, Subscription, Window, div,
+    px,
 };
 use swarm_layout::{Activity, Layout, LayoutStyle, Rect, TileId, TileKind, TileSpec};
 use swarm_ui::fonts::MONO_FONT;
@@ -57,7 +57,11 @@ pub(crate) fn render(
     match workspace.view {
         View::Terminals => terminals(workspace, cx).into_any_element(),
         View::Swarm => crate::swarm_view::render(workspace, window, cx),
-        View::Review => centered("Review").into_any_element(),
+        View::Review => workspace
+            .review
+            .clone()
+            .cached(crate::swarm_view::full_size())
+            .into_any_element(),
     }
 }
 
@@ -79,15 +83,6 @@ fn empty_state(workspace: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
                 .disabled(!live)
                 .on_click(cx.listener(|_, _, window, cx| Workspace::pick_project(window, cx))),
         )
-}
-
-fn centered(text: &'static str) -> Div {
-    div()
-        .size_full()
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(Label::new(text).color(Color::Faint))
 }
 
 pub(crate) fn orchestrator_input(cx: &mut Context<Workspace>) -> (Entity<TextInput>, Subscription) {

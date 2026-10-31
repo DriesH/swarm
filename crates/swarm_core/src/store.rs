@@ -120,6 +120,9 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE agents ADD COLUMN base_commit TEXT;
     UPDATE agents SET created_at = created_at * 1000",
     "ALTER TABLE agents ADD COLUMN started_at INTEGER",
+    "ALTER TABLE tasks ADD COLUMN approved INTEGER;
+    ALTER TABLE tasks ADD COLUMN closed_at INTEGER",
+    "ALTER TABLE tasks ADD COLUMN closing_at INTEGER",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -503,13 +506,16 @@ impl Store {
             agents: Vec::new(),
             created_by,
             briefed: false,
+            approved: None,
+            closed: false,
         })
     }
 
+    /// The open tasks of the project; closed ones are never listed.
     pub fn list_tasks(&self, project: ProjectId) -> Result<Vec<TaskInfo>, Error> {
-        let mut statement = self
-            .connection
-            .prepare(&format!("{TASK_COLUMNS} WHERE project = ?1 ORDER BY id"))?;
+        let mut statement = self.connection.prepare(&format!(
+            "{TASK_COLUMNS} WHERE project = ?1 AND closed_at IS NULL ORDER BY id"
+        ))?;
         let rows = statement.query_map(params![to_row(project.0)?], task_from_row)?;
 
         let mut tasks: Vec<TaskInfo> = rows.collect::<rusqlite::Result<_>>()?;
@@ -520,7 +526,12 @@ impl Store {
         Ok(tasks)
     }
 
+    /// An open task. A closed task looks like one that never existed.
     pub fn task(&self, id: TaskId) -> Result<Option<TaskInfo>, Error> {
+        Ok(self.task_including_closed(id)?.filter(|task| !task.closed))
+    }
+
+    pub fn task_including_closed(&self, id: TaskId) -> Result<Option<TaskInfo>, Error> {
         let task = self
             .connection
             .query_row(
@@ -546,6 +557,69 @@ impl Store {
         )?;
 
         Ok(())
+    }
+
+    /// Records the fingerprint of the Merged diff the user approved.
+    pub fn set_approved(&self, task: TaskId, fingerprint: u64) -> Result<(), Error> {
+        let stored = i64::from_ne_bytes(fingerprint.to_ne_bytes());
+
+        self.connection.execute(
+            "UPDATE tasks SET approved = ?1 WHERE id = ?2",
+            params![stored, to_row(task.0)?],
+        )?;
+
+        Ok(())
+    }
+
+    /// Records that closing the task began, so a crash or a failure half way is found
+    /// again. Keeps the first time when called twice.
+    pub fn begin_closing(&self, task: TaskId) -> Result<(), Error> {
+        self.connection.execute(
+            "UPDATE tasks SET closing_at = ?1 WHERE id = ?2 AND closing_at IS NULL",
+            params![now_millis(), to_row(task.0)?],
+        )?;
+
+        Ok(())
+    }
+
+    /// Tasks whose close began and did not finish.
+    pub fn closing_tasks(&self) -> Result<Vec<TaskId>, Error> {
+        let mut statement = self.connection.prepare(
+            "SELECT id FROM tasks WHERE closing_at IS NOT NULL AND closed_at IS NULL ORDER BY id",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, i64>(0))?;
+
+        Ok(rows
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .map(|id| TaskId(id.unsigned_abs()))
+            .collect())
+    }
+
+    /// Closes the task and ends every agent of it that is not `Stopped` yet. Returns
+    /// the agents it changed.
+    pub fn close_task(&self, task: TaskId) -> Result<Vec<AgentInfo>, Error> {
+        self.connection.execute(
+            "UPDATE tasks SET closed_at = ?1 WHERE id = ?2 AND closed_at IS NULL",
+            params![now_millis(), to_row(task.0)?],
+        )?;
+
+        let mut changed = Vec::new();
+        for mut agent in self.list_agents(task)? {
+            if agent.lifecycle == AgentLifecycle::Stopped {
+                continue;
+            }
+
+            agent.terminal = None;
+            agent.lifecycle = AgentLifecycle::Stopped;
+            agent.revision += 1;
+            agent.ended_at.get_or_insert(from_row(now_millis())?);
+
+            self.save_agent(&agent)?;
+            changed.push(agent);
+        }
+
+        Ok(changed)
     }
 
     /// Records the Start orchestrator that made the task.
@@ -777,13 +851,21 @@ impl Store {
         let rows = statement.query_map(params![alive[0], alive[1]], agent_from_row)?;
         let stored: Vec<StoredAgent> = rows.collect::<rusqlite::Result<_>>()?;
 
+        let closing = self.closing_tasks()?;
+
         for mut agent in stored {
-            agent.info.terminal = None;
-            agent.info.lifecycle = if agent.session_id.is_some() && agent.session_confirmed {
-                AgentLifecycle::Resumable
-            } else {
-                AgentLifecycle::Stopped
+            let task_closed = match agent.info.task {
+                Some(task) => self.task(task)?.is_none() || closing.contains(&task),
+                None => false,
             };
+
+            agent.info.terminal = None;
+            agent.info.lifecycle =
+                if !task_closed && agent.session_id.is_some() && agent.session_confirmed {
+                    AgentLifecycle::Resumable
+                } else {
+                    AgentLifecycle::Stopped
+                };
             if matches!(
                 agent.info.status,
                 AgentStatus::Working | AgentStatus::Blocked(_)
@@ -976,7 +1058,10 @@ impl Store {
     /// The ports of every task and every worker that has not stopped, in every project.
     pub fn all_task_ports(&self) -> Result<Vec<u16>, Error> {
         let mut statement = self.connection.prepare(
-            "SELECT ports FROM tasks UNION ALL SELECT ports FROM agents WHERE lifecycle != ?1",
+            "SELECT ports FROM tasks WHERE closed_at IS NULL
+             UNION ALL
+             SELECT ports FROM agents WHERE lifecycle != ?1
+                 AND (task IS NULL OR task NOT IN (SELECT id FROM tasks WHERE closed_at IS NOT NULL))",
         )?;
         let stopped = to_json(&AgentLifecycle::Stopped)?;
         let rows = statement.query_map(params![stopped], |row| row.get::<_, String>(0))?;
@@ -1040,7 +1125,7 @@ fn agent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAgent> {
 }
 
 const TASK_COLUMNS: &str = "SELECT id, project, name, branch, base, worktree, ports,
-    setup_terminal, setup_exit, created_by, briefed FROM tasks";
+    setup_terminal, setup_exit, created_by, briefed, approved, closed_at FROM tasks";
 
 fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskInfo> {
     let id: i64 = row.get(0)?;
@@ -1050,6 +1135,8 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskInfo> {
     let setup_terminal: Option<i64> = row.get(7)?;
     let setup_exit: Option<String> = row.get(8)?;
     let created_by: Option<i64> = row.get(9)?;
+    let approved: Option<i64> = row.get(11)?;
+    let closed_at: Option<i64> = row.get(12)?;
 
     Ok(TaskInfo {
         id: TaskId(id.unsigned_abs()),
@@ -1067,6 +1154,8 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskInfo> {
         agents: Vec::new(),
         created_by: created_by.map(|id| AgentId(id.unsigned_abs())),
         briefed: row.get(10)?,
+        approved: approved.map(|stored| u64::from_ne_bytes(stored.to_ne_bytes())),
+        closed: closed_at.is_some(),
     })
 }
 
@@ -1932,10 +2021,13 @@ mod tests {
         assert!(store.take_unread(agent.id).expect("take").0.is_empty());
     }
 
+    /// The migration that adds `ended_at` is the ninth.
+    const END_MIGRATION: usize = 8;
+
     #[test]
     fn the_end_migration_turns_agent_seconds_into_milliseconds() {
         let connection = Connection::open_in_memory().expect("memory");
-        for migration in &MIGRATIONS[..MIGRATIONS.len() - 2] {
+        for migration in &MIGRATIONS[..END_MIGRATION] {
             connection.execute_batch(migration).expect("schema");
         }
         connection
@@ -1964,7 +2056,7 @@ mod tests {
             .pragma_update(
                 None,
                 "user_version",
-                i64::try_from(MIGRATIONS.len() - 2).expect("count"),
+                i64::try_from(END_MIGRATION).expect("count"),
             )
             .expect("version");
 
