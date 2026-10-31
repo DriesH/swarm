@@ -27,9 +27,22 @@ mod frame_stats;
 #[cfg(feature = "snapshot")]
 mod snapshot;
 
-use gpui::{App, AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
+use gpui::{
+    App, AppContext as _, Bounds, Pixels, Point, TitlebarOptions, WindowBounds, WindowOptions,
+    point, px, size,
+};
 
-use crate::workspace::Workspace;
+use crate::workspace::{HEADER_CENTER, Workspace};
+
+/// The standard window buttons are 14pt tall on macOS.
+const TRAFFIC_LIGHT_SIZE: Pixels = px(14.);
+
+/// Where GPUI puts the close button's origin. GPUI makes the titlebar `size + 2 * y` tall
+/// and places the button `y` above its bottom, so the buttons' middle sits at
+/// `y + size / 2` below the window top. That middle is the header's center line.
+fn traffic_light_position() -> Point<Pixels> {
+    point(px(14.), HEADER_CENTER - TRAFFIC_LIGHT_SIZE / 2.)
+}
 
 fn window_options(cx: &App) -> WindowOptions {
     let bounds = Bounds::centered(None, size(px(1600.), px(1000.)), cx);
@@ -40,7 +53,7 @@ fn window_options(cx: &App) -> WindowOptions {
         titlebar: Some(TitlebarOptions {
             title: Some("Swarm".into()),
             appears_transparent: true,
-            ..Default::default()
+            traffic_light_position: Some(traffic_light_position()),
         }),
         app_owns_titlebar_drag: true,
         ..Default::default()

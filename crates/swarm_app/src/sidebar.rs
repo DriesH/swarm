@@ -1,12 +1,15 @@
 //! Sidebar: projects, the open task's agents and the usage card.
 
-use gpui::{App, Context, FontWeight, Role, SharedString, Window, div, px, relative};
+use gpui::{App, Context, FontWeight, Pixels, Role, SharedString, Window, div, px, relative};
 use swarm_ui::prelude::*;
 
 use crate::actions::ToggleCommandPalette;
 use crate::model::{Agent, AgentKind, Project, Task, TaskStatus, Terminal};
 use crate::window_drag::drag_region;
 use crate::workspace::{DataSource, Workspace};
+
+/// Height of the row with the traffic lights and the sidebar toggle.
+pub(crate) const WINDOW_ROW_HEIGHT: Pixels = px(30.);
 
 pub(crate) fn render(
     workspace: &Workspace,
@@ -29,8 +32,9 @@ pub(crate) fn render(
         .child(window_row(window, cx))
         .child(logo_row(window, cx))
         .child(
-            heading("Projects", 14.).child(
+            heading("Projects", 14.).h(px(30.)).child(
                 IconButton::new("add-project", IconName::Plus, "Add project")
+                    .size(IconButtonSize::Medium)
                     .on_click(cx.listener(|_, _, window, cx| Workspace::pick_project(window, cx))),
             ),
         )
@@ -115,7 +119,7 @@ fn error_message(workspace: &Workspace, cx: &mut Context<Workspace>) -> Option<i
 
 fn window_row(window: &mut Window, cx: &mut App) -> impl IntoElement {
     h_flex()
-        .h(px(24.))
+        .h(WINDOW_ROW_HEIGHT)
         .px(px(6.))
         .child(
             drag_region("sidebar-top-drag", window, cx)
@@ -124,6 +128,8 @@ fn window_row(window: &mut Window, cx: &mut App) -> impl IntoElement {
         )
         .child(
             IconButton::new("toggle-sidebar", IconName::Sidebar, "Toggle sidebar")
+                .size(IconButtonSize::Medium)
+                .debug_selector(|| "toggle-sidebar".to_owned())
                 .on_click(|_, _, _| log::info!("Toggle sidebar is not built yet")),
         )
 }
@@ -161,11 +167,12 @@ fn logo_row(window: &mut Window, cx: &mut App) -> impl IntoElement {
     h_flex()
         .h(px(32.))
         .px(px(6.))
-        .mt(px(12.))
+        .mt(px(4.))
         .gap(px(8.))
         .child(brand)
         .child(
             IconButton::new("search", IconName::Search, "Search")
+                .size(IconButtonSize::Medium)
                 .color(Color::Muted)
                 .on_click(|_, window, cx| {
                     window.dispatch_action(Box::new(ToggleCommandPalette), cx);

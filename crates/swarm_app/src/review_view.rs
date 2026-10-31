@@ -1644,7 +1644,7 @@ fn add_button(
     div()
         .absolute()
         .left(px(2.))
-        .top(px(-0.5))
+        .top(px(-1.5))
         .child(
             IconButton::new(id, IconName::Plus, format!("Comment on line {number}"))
                 .debug_selector(move || format!("{}-{}", id.0, id.1))

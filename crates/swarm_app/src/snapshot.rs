@@ -1,6 +1,7 @@
 //! Saves the main window as `workspace-light.png`, `workspace-dark.png` and the other
 //! `workspace-*.png` shots, then quits.
 //! Run with `SWARM_APP_SNAPSHOT_DIR=<dir> cargo run -p swarm_app --features snapshot`.
+//! `SWARM_APP_SNAPSHOT_FILTER=<text>` saves only files whose name contains it.
 //!
 //! GPUI's `render_to_image` throws on macOS 14+ while the window's display link
 //! runs, so the window is minimized first; the last frame stays available.
@@ -13,7 +14,7 @@ use gpui::{AnyWindowHandle, App, AsyncApp, Context, Window};
 use swarm_protocol::ReviewSource;
 use swarm_ui::theme::{self, Appearance};
 
-use crate::model::ProjectId;
+use crate::model::{AgentKind, ProjectId, TaskId, TaskStatus};
 use crate::review_model::{DiffStyle, LinePos};
 use crate::swarm_view::InspectorTab;
 use crate::workspace::{View, Workspace};
@@ -30,6 +31,49 @@ fn open_start(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Worksp
 
 fn open_start_empty(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
     workspace.select_project(ProjectId(3), cx);
+}
+
+/// Nine more tasks in the open project, so the tabs overflow. Returns their ids.
+fn add_many_tasks(workspace: &mut Workspace) -> Vec<TaskId> {
+    let tasks = [
+        ("menu-bar-usage", TaskStatus::NeedsYou),
+        ("worktree-scripts", TaskStatus::Idle),
+        ("ui-tokens", TaskStatus::Working),
+        ("daemon-restart-after-crash", TaskStatus::Working),
+        ("review-comments", TaskStatus::NeedsYou),
+        ("palette-search", TaskStatus::Idle),
+        ("settings-pages", TaskStatus::Working),
+        ("pull-request-flow", TaskStatus::Idle),
+        ("release-notes", TaskStatus::Working),
+    ];
+    let project = workspace.active_project;
+
+    tasks
+        .into_iter()
+        .map(|(name, status)| {
+            let id = workspace
+                .data
+                .add_task(project, name, AgentKind::ClaudeCode, Vec::new());
+            if let Some(task) = workspace.data.tasks.iter_mut().find(|task| task.id == id) {
+                task.status = status;
+            }
+
+            id
+        })
+        .collect()
+}
+
+fn open_many_tabs(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
+    add_many_tasks(workspace);
+    cx.notify();
+}
+
+fn open_many_tabs_scrolled(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
+    let ids = add_many_tasks(workspace);
+
+    if let Some(id) = ids.get(6) {
+        workspace.select_task(*id, cx);
+    }
 }
 
 fn open_swarm(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
@@ -187,13 +231,35 @@ pub(crate) fn run(directory: PathBuf, cx: &mut App) {
             return;
         }
 
+        let filter = std::env::var("SWARM_APP_SNAPSHOT_FILTER").ok();
+
         for (appearance, name, open) in [
             (Appearance::Light, "workspace-light.png", None),
             (Appearance::Dark, "workspace-dark.png", None),
             (
                 Appearance::Light,
+                "workspace-many-tabs-light.png",
+                Some(open_many_tabs as OpenOverlay),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-many-tabs-dark.png",
+                Some(open_many_tabs),
+            ),
+            (
+                Appearance::Light,
+                "workspace-many-tabs-scrolled-light.png",
+                Some(open_many_tabs_scrolled),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-many-tabs-scrolled-dark.png",
+                Some(open_many_tabs_scrolled),
+            ),
+            (
+                Appearance::Light,
                 "workspace-island-light.png",
-                Some(open_island as OpenOverlay),
+                Some(open_island),
             ),
             (
                 Appearance::Dark,
@@ -361,6 +427,13 @@ pub(crate) fn run(directory: PathBuf, cx: &mut App) {
                 Some(show_unavailable),
             ),
         ] {
+            if filter
+                .as_ref()
+                .is_some_and(|filter| !name.contains(filter.as_str()))
+            {
+                continue;
+            }
+
             cx.update(|cx| theme::set_appearance(appearance, cx));
             snap(&directory.join(name), open, cx).await;
         }

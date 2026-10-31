@@ -31,6 +31,16 @@ use crate::{panels, sidebar, status_bar, tab_bar, views};
 
 pub(crate) const RIGHT_PANEL_WIDTH: Pixels = px(320.);
 
+/// Space between the window edge and the main panel.
+const PANEL_MARGIN: f32 = 8.;
+/// The header's height, with its bottom border.
+const HEADER_HEIGHT: f32 = 47.;
+
+/// Distance from the window top to the middle of the header's content (the panel border
+/// and the header's bottom border do not count). The traffic lights, the sidebar's window
+/// row and the task tabs are all centered on this line.
+pub(crate) const HEADER_CENTER: Pixels = px(PANEL_MARGIN + 1. + (HEADER_HEIGHT - 1.) / 2.);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum View {
     Terminals,
@@ -633,7 +643,7 @@ impl Render for Workspace {
                 .w(px(248.))
                 .flex_none()
                 .h_full()
-                .pt(px(12.))
+                .pt(HEADER_CENTER - sidebar::WINDOW_ROW_HEIGHT / 2.)
                 .px(px(8.))
                 .pb(px(10.))
                 .child(sidebar),
@@ -642,7 +652,7 @@ impl Render for Workspace {
             v_flex()
                 .flex_1()
                 .min_w_0()
-                .m(px(8.))
+                .m(px(PANEL_MARGIN))
                 .ml_0()
                 .bg(panel)
                 .border_1()
@@ -651,7 +661,7 @@ impl Render for Workspace {
                 .overflow_hidden()
                 .child(
                     div()
-                        .h(px(46.))
+                        .h(px(HEADER_HEIGHT))
                         .flex_none()
                         .border_b_1()
                         .border_color(line)
