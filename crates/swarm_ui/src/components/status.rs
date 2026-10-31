@@ -79,6 +79,7 @@ impl AgentStatus {
 pub struct StatusPill {
     status: AgentStatus,
     label: Option<SharedString>,
+    truncate: bool,
 }
 
 impl StatusPill {
@@ -86,6 +87,7 @@ impl StatusPill {
         Self {
             status,
             label: None,
+            truncate: false,
         }
     }
 
@@ -94,27 +96,35 @@ impl StatusPill {
         self.label = Some(label.into());
         self
     }
+
+    /// Lets the pill shrink in a row: the label is cut with an ellipsis.
+    pub fn truncate(mut self) -> Self {
+        self.truncate = true;
+        self
+    }
 }
 
 impl RenderOnce for StatusPill {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let (text, background) = self.status.pill_colors(cx);
 
+        let truncate = self.truncate;
+        let label = Label::new(
+            self.label
+                .unwrap_or_else(|| SharedString::from(self.status.label())),
+        )
+        .size(LabelSize::XSmall)
+        .weight(FontWeight::MEDIUM)
+        .color(Color::Custom(text));
+
         div()
-            .flex_none()
+            .when(!truncate, Styled::flex_none)
+            .when(truncate, |pill| pill.flex().min_w_0().overflow_hidden())
             .px(px(6.))
             .py(px(1.))
             .rounded(px(5.))
             .bg(background)
-            .child(
-                Label::new(
-                    self.label
-                        .unwrap_or_else(|| SharedString::from(self.status.label())),
-                )
-                .size(LabelSize::XSmall)
-                .weight(FontWeight::MEDIUM)
-                .color(Color::Custom(text)),
-            )
+            .child(if truncate { label.truncate() } else { label })
     }
 }
 
@@ -270,11 +280,68 @@ impl Component for StatusPill {
             ))
             .child(example_group(
                 "Custom label",
-                [example(
-                    "Needs you",
-                    StatusPill::new(AgentStatus::Blocked).label("Needs you"),
-                )],
+                [
+                    example(
+                        "Needs you",
+                        StatusPill::new(AgentStatus::Blocked).label("Needs you"),
+                    ),
+                    example(
+                        "Truncated",
+                        div().w(px(80.)).flex().child(
+                            StatusPill::new(AgentStatus::Blocked)
+                                .label("2 agents working")
+                                .truncate(),
+                        ),
+                    ),
+                ],
             ))
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::{Render, TestAppContext, VisualTestContext};
+
+    use super::*;
+
+    struct Row;
+
+    impl Render for Row {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let pill = |id: &'static str, truncate: bool| {
+                let pill = StatusPill::new(AgentStatus::Blocked).label("2 agents working");
+                let pill = if truncate { pill.truncate() } else { pill };
+
+                div()
+                    .flex()
+                    .w(px(80.))
+                    .child(pill)
+                    .child(div().size(px(1.)).debug_selector(move || id.to_owned()))
+            };
+
+            div()
+                .flex()
+                .flex_col()
+                .child(pill("cut", true))
+                .child(pill("whole", false))
+        }
+    }
+
+    fn after(selector: &'static str, cx: &mut VisualTestContext) -> f32 {
+        cx.debug_bounds(selector)
+            .map_or(0., |bounds| f32::from(bounds.left()))
+    }
+
+    #[gpui::test]
+    fn a_truncating_pill_shrinks_to_its_row_and_a_plain_one_does_not(cx: &mut TestAppContext) {
+        cx.update(crate::theme::init);
+        let (_, cx) = cx.add_window_view(|_, _| Row);
+        cx.run_until_parked();
+
+        let (cut, whole) = (after("cut", cx), after("whole", cx));
+
+        assert!(cut <= 80., "the pill did not shrink: {cut}");
+        assert!(whole > 80., "the plain pill shrank: {whole}");
     }
 }
