@@ -56,6 +56,18 @@ _Avoid_: Sandbox, copy, clone
 The branch that collects the work of all workers in a task; the PR is opened from it.
 _Avoid_: Integration branch, feature branch
 
+**Swarm view**:
+The view that shows a task's swarm as a graph of agents and the messages between them, with a timeline below.
+_Avoid_: Graph view, map
+
+**Inspector**:
+The panel in the Swarm view that shows the selected agent: its details, messages and a live terminal preview.
+_Avoid_: Details pane, sidebar
+
+**In flight**:
+A message that was sent but not yet delivered to its recipient.
+_Avoid_: Pending, queued, unread
+
 **Review**:
 The step where a person reads the combined diff of a task and approves it or requests changes.
 _Avoid_: Code review session, check
