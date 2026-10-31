@@ -1713,6 +1713,11 @@ mod tests {
                 call: *call,
                 changes: Vec::new(),
             }),
+            // Unanswered, the client waits out the 60 s git timeout on the test thread.
+            Request::TaskDiff { call, .. } => Some(Event::TaskDiff {
+                call: *call,
+                diff: None,
+            }),
             _ => None,
         }
     }
