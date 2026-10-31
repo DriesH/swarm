@@ -24,8 +24,8 @@ use std::time::{Duration, Instant};
 
 use swarm_protocol::{
     AgentChange, AgentId, AgentInfo, AgentLifecycle, AgentRole, CloseCheck, CreateTask, DIFF_FILES,
-    DiffStat, FileChange, GithubStatus, PrLink, ProjectId, ProjectInfo, ReviewSource, TaskDiff,
-    TaskId, TaskInfo, TerminalId,
+    DiffStat, FileChange, FileDiff, GithubStatus, PrLink, ProjectId, ProjectInfo, ReviewSource,
+    TaskDiff, TaskId, TaskInfo, TerminalId,
 };
 use swarm_term::ExitStatus;
 
@@ -596,9 +596,48 @@ impl Projects {
 
     /// The changes of a task. `Merged` is the commits of the task branch since it left
     /// its base. `Live` is the task worktree as it is now, and adds each worker with its
-    /// own worktree that is not merged yet.
+    /// own worktree that is not merged yet. A folded file comes without its lines, see
+    /// [`Projects::file_hunks`].
     pub fn task_diff(&self, id: TaskId, source: ReviewSource) -> Result<TaskDiff, Error> {
         self.diff_at(id, source, None)
+    }
+
+    /// One file of the task diff with its lines, also when it is folded. It has the
+    /// agent, digest and counts it has in [`Projects::task_diff`], and the caps of a
+    /// diff apply to it alone. `None` when the diff of `worktree` does not hold `path`.
+    pub fn file_hunks(
+        &self,
+        id: TaskId,
+        source: ReviewSource,
+        worktree: &Path,
+        path: &Path,
+    ) -> Result<Option<FileDiff>, Error> {
+        let plan = self.plan_diff(id, source, None)?;
+        let Some(section) = plan
+            .sections
+            .iter()
+            .find(|section| section.worktree == worktree)
+        else {
+            return Ok(None);
+        };
+
+        let Some(mut file) = git::worktree_file(
+            &section.worktree,
+            &section.base,
+            section.tip(&plan.head),
+            scope_of(source),
+            path,
+            &mut git::DiffBudget::default(),
+        )?
+        else {
+            return Ok(None);
+        };
+
+        let names = unique_names(&plan.agents);
+        let authors = authors(section, &plan.head, source, &names)?;
+        file.diff.agent = authors.of(&file.raw_path);
+
+        Ok(Some(file.diff))
     }
 
     /// Like [`Projects::task_diff`]. With `commit`, `Merged` reads that commit instead of
@@ -609,6 +648,73 @@ impl Projects {
         source: ReviewSource,
         commit: Option<&str>,
     ) -> Result<TaskDiff, Error> {
+        let plan = self.plan_diff(id, source, commit)?;
+        let scope = scope_of(source);
+        let names = unique_names(&plan.agents);
+        let mut budget = git::DiffBudget::default();
+        let mut fingerprint = git::Fingerprint::default();
+        fingerprint.write(&[match source {
+            ReviewSource::Live => 1,
+            ReviewSource::Merged => 2,
+        }]);
+
+        let (mut stat, mut files) = (DiffStat::default(), Vec::new());
+        for section in &plan.sections {
+            let changed = match git::worktree_diff(
+                &section.worktree,
+                &section.base,
+                section.tip(&plan.head),
+                scope,
+                &mut budget,
+            ) {
+                Ok(changed) => changed,
+                Err(error) if section.owner.is_some() => {
+                    log::warn!("cannot read {}: {error}", section.worktree.display());
+
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let authors = authors(section, &plan.head, source, &names)?;
+
+            for mut file in changed {
+                fingerprint.write_text(section.worktree.as_os_str().as_bytes());
+                fingerprint.write_text(&file.raw_path);
+                fingerprint.write(&[match file.diff.change {
+                    FileChange::Added => 1,
+                    FileChange::Modified => 2,
+                    FileChange::Deleted => 3,
+                }]);
+                fingerprint.write_u64(file.diff.digest);
+
+                stat.files = stat.files.saturating_add(1);
+                stat.additions = stat.additions.saturating_add(file.diff.additions);
+                stat.deletions = stat.deletions.saturating_add(file.diff.deletions);
+
+                file.diff.agent = authors.of(&file.raw_path);
+                if files.len() < DIFF_FILES {
+                    files.push(file.diff);
+                }
+            }
+        }
+
+        Ok(TaskDiff {
+            task: id,
+            source,
+            fingerprint: fingerprint.finish(),
+            head: plan.head,
+            stat,
+            files,
+        })
+    }
+
+    /// The sections a diff of the task reads, in the order it lists them.
+    fn plan_diff(
+        &self,
+        id: TaskId,
+        source: ReviewSource,
+        commit: Option<&str>,
+    ) -> Result<DiffPlan, Error> {
         // The store lock is gone before git runs.
         let (task, agents) = {
             let store = lock(&self.store);
@@ -659,84 +765,10 @@ impl Projects {
                 .cmp(other.worktree.as_os_str().as_bytes())
         });
 
-        let scope = match source {
-            ReviewSource::Live => git::DiffScope::WorkingTree,
-            ReviewSource::Merged => git::DiffScope::Committed,
-        };
-        let names = unique_names(&agents);
-        let mut budget = git::DiffBudget::default();
-        let mut fingerprint = git::Fingerprint::default();
-        fingerprint.write(&[match source {
-            ReviewSource::Live => 1,
-            ReviewSource::Merged => 2,
-        }]);
-
-        let (mut stat, mut files) = (DiffStat::default(), Vec::new());
-        for section in &sections {
-            let tip = if section.owner.is_some() {
-                "HEAD"
-            } else {
-                head.as_str()
-            };
-            let changed =
-                match git::worktree_diff(&section.worktree, &section.base, tip, scope, &mut budget)
-                {
-                    Ok(changed) => changed,
-                    Err(error) if section.owner.is_some() => {
-                        log::warn!("cannot read {}: {error}", section.worktree.display());
-
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                };
-            let (trailers, uncommitted) = match section.owner {
-                Some(_) => (HashMap::new(), HashSet::new()),
-                None => (
-                    git::attribution_at(&section.worktree, &section.base, &head)?,
-                    match source {
-                        ReviewSource::Live => git::uncommitted_paths(&section.worktree)?,
-                        ReviewSource::Merged => HashSet::new(),
-                    },
-                ),
-            };
-
-            for mut file in changed {
-                fingerprint.write_text(section.worktree.as_os_str().as_bytes());
-                fingerprint.write_text(&file.raw_path);
-                fingerprint.write(&[match file.diff.change {
-                    FileChange::Added => 1,
-                    FileChange::Modified => 2,
-                    FileChange::Deleted => 3,
-                }]);
-                fingerprint.write_u64(file.digest);
-
-                stat.files = stat.files.saturating_add(1);
-                stat.additions = stat.additions.saturating_add(file.diff.additions);
-                stat.deletions = stat.deletions.saturating_add(file.diff.deletions);
-
-                // Uncommitted work has no trailer, so it belongs to nobody.
-                file.diff.agent = section.owner.or_else(|| {
-                    if uncommitted.contains(&file.raw_path) {
-                        return None;
-                    }
-
-                    trailers
-                        .get(&file.raw_path)
-                        .and_then(|name| names.get(name.as_str()).copied().flatten())
-                });
-                if files.len() < DIFF_FILES {
-                    files.push(file.diff);
-                }
-            }
-        }
-
-        Ok(TaskDiff {
-            task: id,
-            source,
-            fingerprint: fingerprint.finish(),
+        Ok(DiffPlan {
+            agents,
             head,
-            stat,
-            files,
+            sections,
         })
     }
 
@@ -1105,6 +1137,77 @@ struct Section {
     base: String,
     /// The worker that owns the worktree; `None` for the task worktree.
     owner: Option<AgentId>,
+}
+
+impl Section {
+    /// The worktree of a worker is read at its `HEAD`, the task worktree at `head`.
+    fn tip<'a>(&self, head: &'a str) -> &'a str {
+        if self.owner.is_some() { "HEAD" } else { head }
+    }
+}
+
+/// What a diff of a task reads.
+struct DiffPlan {
+    agents: Vec<AgentInfo>,
+    /// The commit `Merged` reads, and the tip of the task worktree.
+    head: String,
+    sections: Vec<Section>,
+}
+
+fn scope_of(source: ReviewSource) -> git::DiffScope {
+    match source {
+        ReviewSource::Live => git::DiffScope::WorkingTree,
+        ReviewSource::Merged => git::DiffScope::Committed,
+    }
+}
+
+/// Who changed the files of one section.
+struct Authors<'a> {
+    owner: Option<AgentId>,
+    /// The agent of the newest commit of each path.
+    trailers: HashMap<Vec<u8>, String>,
+    uncommitted: HashSet<Vec<u8>>,
+    names: &'a HashMap<&'a str, Option<AgentId>>,
+}
+
+impl Authors<'_> {
+    fn of(&self, raw_path: &[u8]) -> Option<AgentId> {
+        // Uncommitted work has no trailer, so it belongs to nobody.
+        self.owner.or_else(|| {
+            if self.uncommitted.contains(raw_path) {
+                return None;
+            }
+
+            self.trailers
+                .get(raw_path)
+                .and_then(|name| self.names.get(name.as_str()).copied().flatten())
+        })
+    }
+}
+
+fn authors<'a>(
+    section: &Section,
+    head: &str,
+    source: ReviewSource,
+    names: &'a HashMap<&'a str, Option<AgentId>>,
+) -> Result<Authors<'a>, Error> {
+    let (trailers, uncommitted) = match section.owner {
+        Some(_) => (HashMap::new(), HashSet::new()),
+        None => (
+            git::attribution_at(&section.worktree, &section.base, head)?,
+            match source {
+                ReviewSource::Live => git::uncommitted_paths(&section.worktree)?,
+                ReviewSource::Merged => HashSet::new(),
+            },
+        ),
+    };
+
+    Ok(Authors {
+        owner: section.owner,
+        trailers,
+        uncommitted,
+        names,
+    })
 }
 
 /// The section of a worker with its own worktree, unless the task branch has all of its

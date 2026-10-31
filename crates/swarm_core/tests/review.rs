@@ -12,8 +12,8 @@ use swarm_core::store::{NewAgent, Store};
 use swarm_core::{Error, Projects, WorkerCheckout, git};
 use swarm_protocol::{
     AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, CreateTask, DIFF_FILES,
-    DIFF_LINE_BYTES, DIFF_LINES, DIFF_LINES_PER_FILE, DiffLineKind, FileChange, FileDiff,
-    ReviewSource, TaskDiff, TaskInfo,
+    DIFF_LINE_BYTES, DIFF_LINES, DIFF_LINES_PER_FILE, DiffLineKind, FOLD_LINES, FileChange,
+    FileDiff, Fold, ReviewSource, TaskDiff, TaskInfo,
 };
 
 static NEXT_FOLDER: AtomicU32 = AtomicU32::new(0);
@@ -135,7 +135,7 @@ fn setup_with(config: &str, files: &[(&str, &[u8])]) -> Setup {
 
 impl Setup {
     fn write(&self, path: &str, content: &str) {
-        std::fs::write(self.task.worktree.join(path), content).expect("write");
+        write_in(&self.task.worktree, path, content);
     }
 
     fn merged(&self) -> TaskDiff {
@@ -170,6 +170,24 @@ impl Setup {
 
         prepared.expect("worker").agent
     }
+}
+
+fn write_in(folder: &Path, path: &str, content: &str) {
+    let full = folder.join(path);
+    std::fs::create_dir_all(full.parent().expect("parent")).expect("folder");
+    std::fs::write(full, content).expect("write");
+}
+
+/// `count` different lines.
+fn numbered(count: usize) -> String {
+    use std::fmt::Write as _;
+
+    let mut text = String::new();
+    for number in 0..count {
+        writeln!(text, "line {number}").expect("a string grows");
+    }
+
+    text
 }
 
 fn commit(agent: &str, folder: &Path, paths: &[&str]) {
@@ -389,21 +407,32 @@ fn the_per_file_cap_marks_the_file_but_the_totals_stay_full() {
     setup.write("big.txt", &"x\n".repeat(count));
 
     let diff = setup.live();
+    let loaded = setup
+        .projects
+        .file_hunks(
+            setup.task.id,
+            ReviewSource::Live,
+            &setup.task.worktree,
+            Path::new("big.txt"),
+        )
+        .expect("file")
+        .expect("the diff holds it");
 
-    let big = file(&diff, "big.txt");
-    assert!(big.truncated);
-    assert_eq!(lines(big).len(), DIFF_LINES_PER_FILE);
-    assert_eq!(big.additions, u32::try_from(count).expect("small"));
-    assert_eq!(diff.stat.additions, big.additions);
+    assert!(loaded.truncated);
+    assert_eq!(lines(&loaded).len(), DIFF_LINES_PER_FILE);
+    assert_eq!(loaded.additions, u32::try_from(count).expect("small"));
+    assert_eq!(diff.stat.additions, loaded.additions);
 }
 
 #[test]
 fn the_total_line_cap_and_the_file_cap_keep_the_totals() {
     let setup = setup("");
-    let full = "x\n".repeat(DIFF_LINES_PER_FILE);
-    let files = DIFF_LINES / DIFF_LINES_PER_FILE;
+    // The most a file may have and still come with its lines.
+    let per_file = usize::try_from(FOLD_LINES).expect("small");
+    let full = "x\n".repeat(per_file);
+    let files = DIFF_LINES / per_file;
     for index in 0..=files {
-        setup.write(&format!("big-{index:02}.txt"), &full);
+        setup.write(&format!("big-{index:03}.txt"), &full);
     }
     for index in 0..DIFF_FILES {
         setup.write(&format!("small-{index:04}.txt"), "y\n");
@@ -413,14 +442,14 @@ fn the_total_line_cap_and_the_file_cap_keep_the_totals() {
 
     let kept: usize = diff.files.iter().map(|file| lines(file).len()).sum();
     assert_eq!(kept, DIFF_LINES);
-    assert!(file(&diff, &format!("big-{files:02}.txt")).truncated);
-    assert!(!file(&diff, "big-00.txt").truncated);
+    assert!(file(&diff, &format!("big-{files:03}.txt")).truncated);
+    assert!(!file(&diff, "big-000.txt").truncated);
     assert_eq!(diff.files.len(), DIFF_FILES);
     assert_eq!(
         diff.stat.files,
         u32::try_from(files + 1 + DIFF_FILES).expect("small")
     );
-    let expected = (files + 1) * DIFF_LINES_PER_FILE + DIFF_FILES;
+    let expected = (files + 1) * per_file + DIFF_FILES;
     assert_eq!(diff.stat.additions, u32::try_from(expected).expect("small"));
 }
 
@@ -1078,4 +1107,603 @@ fn a_closing_task_is_finished_by_recovery() {
             .expect("closing")
             .is_empty()
     );
+}
+
+/// Files that come folded and files next to them that do not.
+fn write_folding_files(setup: &Setup) {
+    setup.write(".gitattributes", "generated/** linguist-generated\n");
+    setup.write("Cargo.lock", &numbered(600));
+    setup.write("web/package-lock.json", &numbered(50));
+    setup.write("generated/schema.txt", &numbered(20));
+    setup.write("dist/app.min.js", &numbered(5));
+    setup.write("big.txt", &numbered(501));
+    setup.write("edge.txt", &numbered(500));
+    setup.write("normal.txt", &numbered(3));
+}
+
+fn assert_folding(diff: &TaskDiff) {
+    let folded = |path: &str, fold: Fold, count: u32| {
+        let folded = file(diff, path);
+
+        assert_eq!(folded.fold, Some(fold), "{path}");
+        assert!(folded.hunks.is_empty(), "{path} has no lines");
+        assert!(!folded.truncated, "{path} is not cut");
+        assert_eq!(folded.additions, count, "{path}");
+        assert_eq!(folded.deletions, 0, "{path}");
+        assert_ne!(folded.digest, 0, "{path}");
+    };
+    folded("Cargo.lock", Fold::Lock, 600);
+    folded("web/package-lock.json", Fold::Lock, 50);
+    folded("generated/schema.txt", Fold::Generated, 20);
+    folded("dist/app.min.js", Fold::Generated, 5);
+    folded("big.txt", Fold::Large, 501);
+
+    for (path, count) in [("edge.txt", 500), ("normal.txt", 3), (".gitattributes", 1)] {
+        let shown = file(diff, path);
+
+        assert_eq!(shown.fold, None, "{path}");
+        assert_eq!(lines(shown).len(), count, "{path}");
+        assert!(!shown.truncated, "{path}");
+    }
+}
+
+#[test]
+fn lock_generated_minified_and_large_files_come_without_lines() {
+    let setup = setup("");
+    write_folding_files(&setup);
+
+    let live = setup.live();
+    assert_folding(&live);
+    assert_eq!(live.stat.files, 8);
+    assert_eq!(live.stat.additions, 600 + 50 + 20 + 5 + 501 + 500 + 3 + 1);
+
+    // Merged reads the attributes of the commit.
+    setup.commit_all();
+    assert_folding(&setup.merged());
+}
+
+#[test]
+fn a_changed_tracked_file_comes_folded_by_its_counts() {
+    let big = numbered(600);
+    let setup = setup_with(
+        "",
+        &[
+            ("Cargo.lock", numbered(600).as_bytes()),
+            ("big.txt", big.as_bytes()),
+        ],
+    );
+    setup.write("Cargo.lock", &numbered(599));
+    setup.write("big.txt", &big.replace("line 3\n", "changed\n"));
+    setup.write("grown.txt", &numbered(10));
+
+    let live = setup.live();
+
+    assert_eq!(file(&live, "Cargo.lock").fold, Some(Fold::Lock));
+    assert_eq!(file(&live, "Cargo.lock").deletions, 1);
+    assert_eq!(file(&live, "big.txt").fold, None, "2 changed lines");
+    assert!(!lines(file(&live, "big.txt")).is_empty());
+
+    setup.write("big.txt", &numbered(601).replace("line", "other"));
+    let live = setup.live();
+
+    let big = file(&live, "big.txt");
+    assert_eq!(big.fold, Some(Fold::Large));
+    assert!(big.hunks.is_empty());
+    assert_eq!((big.additions, big.deletions), (601, 600));
+}
+
+#[test]
+fn a_false_attribute_turns_the_folds_off() {
+    let setup = setup("");
+    setup.write(
+        ".gitattributes",
+        "*.min.js linguist-generated=false\nCargo.lock -linguist-generated\nweb/** linguist-generated=true\nweb/yarn.lock linguist-generated=false\n",
+    );
+    setup.write("app.min.js", "x\n");
+    setup.write("other.min.js", "x\n");
+    setup.write("Cargo.lock", "x\n");
+    setup.write("web/yarn.lock", "x\n");
+    setup.write("web/notes.txt", "x\n");
+    setup.write("web/package-lock.json", "x\n");
+
+    let assert_folds = |diff: &TaskDiff| {
+        assert_eq!(file(diff, "app.min.js").fold, None);
+        assert_eq!(file(diff, "other.min.js").fold, None);
+        assert_eq!(file(diff, "Cargo.lock").fold, None);
+        assert_eq!(file(diff, "web/yarn.lock").fold, None);
+        assert_eq!(file(diff, "web/notes.txt").fold, Some(Fold::Generated));
+        assert_eq!(
+            file(diff, "web/package-lock.json").fold,
+            Some(Fold::Lock),
+            "a lock file stays a lock file"
+        );
+    };
+
+    assert_folds(&setup.live());
+
+    setup.commit_all();
+    assert_folds(&setup.merged());
+}
+
+#[test]
+fn merged_reads_the_attributes_of_the_commit_and_live_those_of_the_worktree() {
+    let setup = setup("");
+    setup.write(".gitattributes", "generated.txt linguist-generated\n");
+    setup.write("generated.txt", "x\n");
+    setup.commit_all();
+    setup.write(".gitattributes", "");
+
+    assert_eq!(
+        file(&setup.merged(), "generated.txt").fold,
+        Some(Fold::Generated)
+    );
+    assert_eq!(
+        file(&setup.live(), "generated.txt").fold,
+        None,
+        "the worktree no longer marks it"
+    );
+
+    setup.write(".gitattributes", "generated.txt linguist-generated\n");
+    assert_eq!(
+        file(&setup.live(), "generated.txt").fold,
+        Some(Fold::Generated)
+    );
+}
+
+#[test]
+fn binary_files_and_files_left_out_are_never_folded() {
+    let setup = setup("");
+    std::fs::write(setup.task.worktree.join("yarn.lock"), [0_u8, 1, 2]).expect("binary");
+    std::fs::write(
+        setup.task.worktree.join("Cargo.lock"),
+        "x".repeat((1 << 20) + 10),
+    )
+    .expect("big");
+
+    let live = setup.live();
+
+    let binary = file(&live, "yarn.lock");
+    assert!(binary.binary);
+    assert_eq!(binary.fold, None);
+    let left_out = file(&live, "Cargo.lock");
+    assert!(left_out.truncated);
+    assert_eq!(left_out.fold, None);
+}
+
+#[test]
+fn a_change_deep_inside_a_folded_file_changes_its_digest_and_the_fingerprint() {
+    let base = numbered(1000);
+    let setup = setup_with("", &[("Cargo.lock", base.as_bytes())]);
+    setup.write("Cargo.lock", &base.replace("line 700\n", "line 700b\n"));
+    setup.write("big.txt", &numbered(700));
+    let before = setup.live();
+
+    setup.write("Cargo.lock", &base.replace("line 701\n", "line 701b\n"));
+    let lock_changed = setup.live();
+    setup.write(
+        "big.txt",
+        &numbered(700).replace("line 650\n", "line 650b\n"),
+    );
+    let big_changed = setup.live();
+
+    assert_eq!(file(&before, "Cargo.lock").fold, Some(Fold::Lock));
+    assert_ne!(
+        file(&lock_changed, "Cargo.lock").digest,
+        file(&before, "Cargo.lock").digest
+    );
+    assert_eq!(
+        file(&lock_changed, "big.txt").digest,
+        file(&before, "big.txt").digest
+    );
+    assert_ne!(lock_changed.fingerprint, before.fingerprint);
+    assert_ne!(
+        file(&big_changed, "big.txt").digest,
+        file(&lock_changed, "big.txt").digest
+    );
+    assert_ne!(big_changed.fingerprint, lock_changed.fingerprint);
+}
+
+#[test]
+fn an_approval_ends_when_a_folded_file_changes() {
+    let base = numbered(1000);
+    let setup = setup_with("", &[("Cargo.lock", base.as_bytes())]);
+    setup.write("Cargo.lock", &base.replace("line 700\n", "line 700b\n"));
+    setup.commit_all();
+    let reviewed = setup.merged();
+    assert_eq!(file(&reviewed, "Cargo.lock").fold, Some(Fold::Lock));
+    setup
+        .projects
+        .approve(setup.task.id, reviewed.fingerprint)
+        .expect("approve");
+    setup
+        .projects
+        .check_approved(setup.task.id)
+        .expect("approved");
+
+    setup.write("Cargo.lock", &base.replace("line 700\n", "line 700c\n"));
+    setup.commit_all();
+
+    assert!(setup.projects.check_approved(setup.task.id).is_err());
+}
+
+/// Every fingerprint and digest must be what they were before files could fold.
+fn assert_same_without_folds(read: impl Fn() -> TaskDiff) {
+    let folded = read();
+    let plain = git::unfolded(&read);
+
+    assert_eq!(folded.fingerprint, plain.fingerprint);
+    assert_eq!(folded.stat, plain.stat);
+    assert_eq!(folded.files.len(), plain.files.len());
+
+    for (folded, plain) in folded.files.iter().zip(&plain.files) {
+        assert_eq!(folded.path, plain.path);
+        assert_eq!(folded.digest, plain.digest, "{}", folded.path.display());
+        assert_eq!(
+            folded.additions,
+            plain.additions,
+            "{}",
+            folded.path.display()
+        );
+        assert_eq!(
+            folded.deletions,
+            plain.deletions,
+            "{}",
+            folded.path.display()
+        );
+        assert_eq!(plain.fold, None, "folding is off");
+    }
+    assert!(folded.files.iter().any(|file| file.fold.is_some()));
+    assert!(
+        !lines(file(&plain, "Cargo.lock")).is_empty(),
+        "the switch brings the lines back"
+    );
+}
+
+#[test]
+fn folding_changes_no_digest_and_no_fingerprint() {
+    let base = numbered(600);
+    let setup = setup_with(
+        "",
+        &[
+            ("Cargo.lock", base.as_bytes()),
+            ("old-big.txt", base.as_bytes()),
+        ],
+    );
+    write_folding_files(&setup);
+    setup.write("Cargo.lock", &base.replace("line 300\n", "line 300b\n"));
+    setup.write("old-big.txt", &numbered(700));
+    std::fs::write(setup.task.worktree.join("blob.bin"), [0_u8, 1, 2]).expect("binary");
+
+    assert_same_without_folds(|| setup.live());
+
+    setup.commit_all();
+    assert_same_without_folds(|| setup.merged());
+}
+
+#[test]
+fn folding_changes_nothing_for_a_worker_with_its_own_worktree() {
+    let setup = setup("");
+    let ui = setup.worker("ui", true);
+    write_in(&ui.worktree, "Cargo.lock", &numbered(600));
+    write_in(&ui.worktree, "ui.rs", &numbered(3));
+    setup.write("Cargo.lock", &numbered(700));
+
+    assert_same_without_folds(|| setup.live());
+    let live = setup.live();
+    assert!(
+        live.files
+            .iter()
+            .filter(|file| file.path == Path::new("Cargo.lock"))
+            .all(|file| file.fold == Some(Fold::Lock)),
+        "both locks are folded"
+    );
+    assert_eq!(
+        live.files
+            .iter()
+            .filter(|file| file.path == Path::new("Cargo.lock"))
+            .count(),
+        2
+    );
+}
+
+fn file_hunks(
+    setup: &Setup,
+    source: ReviewSource,
+    worktree: &Path,
+    path: &str,
+) -> Option<FileDiff> {
+    setup
+        .projects
+        .file_hunks(setup.task.id, source, worktree, Path::new(path))
+        .expect("file hunks")
+}
+
+#[test]
+fn file_hunks_loads_the_lines_of_a_folded_file_in_live_and_merged() {
+    let setup = setup("");
+    write_folding_files(&setup);
+    setup.write("huge.txt", &numbered(DIFF_LINES_PER_FILE + 10));
+
+    for source in [ReviewSource::Live, ReviewSource::Merged] {
+        if source == ReviewSource::Merged {
+            setup.commit_all();
+        }
+        let diff = setup
+            .projects
+            .task_diff(setup.task.id, source)
+            .expect("diff");
+
+        for (path, count, fold) in [
+            ("Cargo.lock", 600, Fold::Lock),
+            ("generated/schema.txt", 20, Fold::Generated),
+            ("dist/app.min.js", 5, Fold::Generated),
+            ("big.txt", 501, Fold::Large),
+        ] {
+            let folded = file(&diff, path);
+            let loaded = file_hunks(&setup, source, &setup.task.worktree, path)
+                .unwrap_or_else(|| panic!("{path} in {source:?}"));
+
+            assert_eq!(loaded.fold, Some(fold), "{path} keeps its tag");
+            assert_eq!(lines(&loaded).len(), count, "{path}");
+            assert!(!loaded.truncated, "{path}");
+            assert_eq!(
+                loaded,
+                FileDiff {
+                    hunks: loaded.hunks.clone(),
+                    ..folded.clone()
+                },
+                "{path} differs from the diff only in its lines"
+            );
+        }
+
+        let huge = file_hunks(&setup, source, &setup.task.worktree, "huge.txt").expect("huge");
+        assert_eq!(huge.fold, Some(Fold::Large));
+        assert!(huge.truncated, "the caps still apply");
+        assert_eq!(lines(&huge).len(), DIFF_LINES_PER_FILE);
+        assert_eq!(huge.digest, file(&diff, "huge.txt").digest);
+
+        let plain = file_hunks(&setup, source, &setup.task.worktree, "normal.txt").expect("file");
+        assert_eq!(plain.fold, None);
+        assert_eq!(plain, *file(&diff, "normal.txt"));
+    }
+}
+
+#[test]
+fn file_hunks_of_a_tracked_file_has_the_hunks_of_the_diff() {
+    let base = numbered(100);
+    let setup = setup_with("", &[("Cargo.lock", base.as_bytes())]);
+    setup.write("Cargo.lock", &base.replace("line 50\n", "line 50b\n"));
+
+    let diff = setup.live();
+    let loaded = file_hunks(
+        &setup,
+        ReviewSource::Live,
+        &setup.task.worktree,
+        "Cargo.lock",
+    )
+    .expect("file");
+
+    assert_eq!(file(&diff, "Cargo.lock").hunks, []);
+    assert_eq!(loaded.fold, Some(Fold::Lock));
+    assert_eq!(loaded.change, FileChange::Modified);
+    assert_eq!((loaded.additions, loaded.deletions), (1, 1));
+    assert_eq!(loaded.hunks.len(), 1);
+    assert_eq!(loaded.digest, file(&diff, "Cargo.lock").digest);
+    assert!(
+        lines(&loaded).contains(&(DiffLineKind::Added, "line 50b")),
+        "{:?}",
+        lines(&loaded)
+    );
+}
+
+#[test]
+fn file_hunks_reads_a_file_of_a_workers_own_worktree() {
+    let setup = setup("");
+    let ui = setup.worker("ui", true);
+    write_in(&ui.worktree, "Cargo.lock", &numbered(600));
+    write_in(&ui.worktree, "ui.rs", &numbered(3));
+    setup.write("task.rs", &numbered(2));
+
+    let live = setup.live();
+    let own = file(&live, "Cargo.lock");
+    assert_eq!(own.worktree, ui.worktree);
+    let loaded = file_hunks(&setup, ReviewSource::Live, &ui.worktree, "Cargo.lock")
+        .expect("the worker's file");
+
+    assert_eq!(loaded.agent, Some(ui.id));
+    assert_eq!(loaded.fold, Some(Fold::Lock));
+    assert_eq!(lines(&loaded).len(), 600);
+    assert_eq!(loaded.digest, own.digest);
+    assert_eq!(loaded.worktree, ui.worktree);
+    assert!(
+        file_hunks(
+            &setup,
+            ReviewSource::Live,
+            &setup.task.worktree,
+            "Cargo.lock"
+        )
+        .is_none(),
+        "the task worktree has no such file"
+    );
+    assert!(
+        file_hunks(&setup, ReviewSource::Live, &setup.task.worktree, "ui.rs").is_none(),
+        "the worker's other file neither"
+    );
+    assert!(
+        file_hunks(&setup, ReviewSource::Merged, &ui.worktree, "Cargo.lock").is_none(),
+        "Merged holds the task worktree only"
+    );
+
+    commit("ui", &ui.worktree, &["Cargo.lock", "ui.rs"]);
+    let committed =
+        file_hunks(&setup, ReviewSource::Live, &ui.worktree, "Cargo.lock").expect("committed");
+    assert_eq!(committed.agent, Some(ui.id));
+    assert_eq!(lines(&committed).len(), 600);
+}
+
+#[test]
+fn file_hunks_names_the_same_agent_as_the_diff() {
+    let setup = setup("");
+    let api = setup.worker("api", false);
+    setup.write("Cargo.lock", &numbered(600));
+    setup.write("loose.lock", &numbered(2));
+    commit("api", &setup.task.worktree, &["Cargo.lock"]);
+    setup.write("dirty.txt", &numbered(2));
+
+    let live = setup.live();
+    let task_worktree = &setup.task.worktree;
+
+    assert_eq!(file(&live, "Cargo.lock").agent, Some(api.id));
+    for path in ["Cargo.lock", "loose.lock", "dirty.txt"] {
+        let loaded = file_hunks(&setup, ReviewSource::Live, task_worktree, path).expect(path);
+
+        assert_eq!(loaded.agent, file(&live, path).agent, "{path}");
+    }
+    assert_eq!(
+        file_hunks(&setup, ReviewSource::Live, task_worktree, "dirty.txt")
+            .expect("dirty")
+            .agent,
+        None
+    );
+}
+
+#[test]
+fn file_hunks_answers_none_for_paths_the_diff_does_not_hold() {
+    let setup = setup("");
+    setup.write("a.txt", "one\n");
+    setup.write("ab.txt", "two\n");
+    setup.write("a*.txt", "star\n");
+    setup.write("folder/inner.txt", "inner\n");
+    setup.write("Cargo.lock", &numbered(600));
+    setup.commit_all();
+    setup.write("untracked.txt", "three\n");
+    let worktree = &setup.task.worktree;
+
+    let unchanged = file_hunks(&setup, ReviewSource::Live, worktree, "README.md");
+    assert!(unchanged.is_none(), "README.md did not change");
+    for path in [
+        "missing.txt",
+        "../a.txt",
+        "folder/../a.txt",
+        "./a.txt",
+        "/etc/passwd",
+        "",
+        "folder",
+        "folder/",
+        "*.txt",
+        "a?.txt",
+        ":(top)a.txt",
+        ".git/config",
+        "a.txt\0",
+    ] {
+        for source in [ReviewSource::Live, ReviewSource::Merged] {
+            assert!(
+                file_hunks(&setup, source, worktree, path).is_none(),
+                "{path:?} in {source:?}"
+            );
+        }
+    }
+
+    let star = file_hunks(&setup, ReviewSource::Merged, worktree, "a*.txt").expect("star");
+    assert_eq!(star.path, Path::new("a*.txt"));
+    assert_eq!(lines(&star), [(DiffLineKind::Added, "star")]);
+    let inner = file_hunks(&setup, ReviewSource::Merged, worktree, "folder/inner.txt");
+    assert_eq!(
+        lines(&inner.expect("inner")),
+        [(DiffLineKind::Added, "inner")]
+    );
+
+    assert!(
+        file_hunks(&setup, ReviewSource::Merged, worktree, "untracked.txt").is_none(),
+        "Merged holds commits only"
+    );
+    let untracked =
+        file_hunks(&setup, ReviewSource::Live, worktree, "untracked.txt").expect("untracked");
+    assert_eq!(untracked.change, FileChange::Added);
+    assert_eq!(lines(&untracked), [(DiffLineKind::Added, "three")]);
+    assert!(
+        file_hunks(
+            &setup,
+            ReviewSource::Live,
+            &worktree.join("folder"),
+            "inner.txt"
+        )
+        .is_none(),
+        "a folder is no section"
+    );
+    assert!(
+        file_hunks(&setup, ReviewSource::Live, Path::new("/"), "a.txt").is_none(),
+        "an outside folder is no section"
+    );
+}
+
+#[test]
+fn file_hunks_reads_a_path_literally() {
+    let setup = setup("");
+    let names = [
+        "a*.txt",
+        "ab.txt",
+        "[x].txt",
+        "x.txt",
+        ":colon.txt",
+        "-dash.txt",
+    ];
+    for name in names {
+        setup.write(name, &format!("{name}\n"));
+    }
+    setup.commit_all();
+
+    for name in names {
+        let loaded = file_hunks(&setup, ReviewSource::Merged, &setup.task.worktree, name)
+            .unwrap_or_else(|| panic!("{name}"));
+
+        assert_eq!(loaded.path, Path::new(name));
+        assert_eq!(lines(&loaded), [(DiffLineKind::Added, name)]);
+    }
+}
+
+#[test]
+fn file_hunks_loads_an_untracked_lock_file_and_a_deleted_one() {
+    let base = numbered(600);
+    let setup = setup_with("", &[("yarn.lock", base.as_bytes())]);
+    std::fs::remove_file(setup.task.worktree.join("yarn.lock")).expect("remove");
+    setup.write("Cargo.lock", &numbered(700));
+
+    let live = setup.live();
+
+    let deleted = file_hunks(
+        &setup,
+        ReviewSource::Live,
+        &setup.task.worktree,
+        "yarn.lock",
+    )
+    .expect("deleted");
+    assert_eq!(deleted.change, FileChange::Deleted);
+    assert_eq!(deleted.fold, Some(Fold::Lock));
+    assert_eq!((deleted.additions, deleted.deletions), (0, 600));
+    assert_eq!(lines(&deleted).len(), 600);
+    assert_eq!(deleted.digest, file(&live, "yarn.lock").digest);
+    let added = file_hunks(
+        &setup,
+        ReviewSource::Live,
+        &setup.task.worktree,
+        "Cargo.lock",
+    )
+    .expect("untracked");
+    assert_eq!(added.change, FileChange::Added);
+    assert_eq!(lines(&added).len(), 700);
+}
+
+#[test]
+fn file_hunks_for_an_unknown_task_is_an_error() {
+    let setup = setup("");
+
+    let unknown = setup.projects.file_hunks(
+        swarm_protocol::TaskId(9999),
+        ReviewSource::Live,
+        &setup.task.worktree,
+        Path::new("a.txt"),
+    );
+
+    assert!(matches!(unknown, Err(Error::Invalid(_))), "{unknown:?}");
 }

@@ -1,5 +1,6 @@
 //! Runs the `git` binary. User text only ever travels as an argument, never through a shell.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::io::{Read as _, Write as _};
@@ -12,11 +13,13 @@ use std::time::Duration;
 
 use swarm_protocol::{
     DIFF_FILES, DIFF_LINE_BYTES, DIFF_LINES, DIFF_LINES_PER_FILE, DiffHunk, DiffLine, DiffLineKind,
-    DiffStat, FILES_LISTED, FileChange, FileDiff, FileStat,
+    DiffStat, FILES_LISTED, FOLD_LINES, FileChange, FileDiff, FileStat, Fold,
 };
 
 use crate::Error;
 use crate::process;
+
+mod folds;
 
 /// Apps started from Finder get a minimal `PATH`, so known install folders come second.
 const FALLBACK_BINARIES: [&str; 3] = [
@@ -78,13 +81,7 @@ where
         .map(|argument| argument.as_ref().to_owned())
         .collect();
 
-    let output = Command::new(binary()?)
-        .arg("-C")
-        .arg(directory)
-        .args(&arguments)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .envs(environment.iter().copied())
+    let output = git_command(directory, &arguments, environment)?
         .stdin(std::process::Stdio::null())
         .output()
         .map_err(|source| Error::Io {
@@ -92,15 +89,79 @@ where
             source,
         })?;
 
-    let output = Output {
+    Ok((arguments, captured(output)))
+}
+
+/// Like [`execute`], with `input` on stdin. A thread feeds git, so a long input and a long
+/// output cannot block each other.
+fn execute_fed<I, S>(
+    directory: &Path,
+    arguments: I,
+    input: Vec<u8>,
+) -> Result<(Vec<OsString>, Output), Error>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let arguments: Vec<OsString> = arguments
+        .into_iter()
+        .map(|argument| argument.as_ref().to_owned())
+        .collect();
+    let io_error = |source| Error::Io {
+        action: "run git".to_owned(),
+        source,
+    };
+
+    let mut child = git_command(directory, &arguments, &[])?
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(io_error)?;
+
+    let feeder = child.stdin.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            // Git may stop reading early, on a bad option for example.
+            if let Err(error) = pipe.write_all(&input) {
+                log::debug!("git stopped reading its input: {error}");
+            }
+        })
+    });
+    let output = child.wait_with_output().map_err(io_error)?;
+    if let Some(feeder) = feeder
+        && feeder.join().is_err()
+    {
+        log::warn!("the thread feeding git panicked");
+    }
+
+    Ok((arguments, captured(output)))
+}
+
+fn git_command(
+    directory: &Path,
+    arguments: &[OsString],
+    environment: &[(&str, &str)],
+) -> Result<Command, Error> {
+    let mut command = Command::new(binary()?);
+    command
+        .arg("-C")
+        .arg(directory)
+        .args(arguments)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .envs(environment.iter().copied());
+
+    Ok(command)
+}
+
+fn captured(output: std::process::Output) -> Output {
+    Output {
         success: output.status.success(),
         code: output.status.code(),
         stdout: String::from_utf8_lossy(&output.stdout).trim().to_owned(),
         raw: output.stdout,
         stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-    };
-
-    Ok((arguments, output))
+    }
 }
 
 fn failure(arguments: &[OsString], output: &Output) -> Error {
@@ -832,10 +893,40 @@ impl Default for DiffBudget {
 pub struct ChangedFile {
     /// The path as git printed it; `diff.path` is the lossy form.
     pub raw_path: Vec<u8>,
-    /// Hash of the whole change, also of lines the caps left out.
-    pub digest: u64,
-    /// `agent` is `None`. A file past the file budget has no hunks.
+    /// `agent` is `None`. A file past the file budget or a folded file has no hunks.
     pub diff: FileDiff,
+}
+
+/// What a read of a diff does with the files that qualify for a [`Fold`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Folding {
+    /// Leaves out their lines.
+    Fold,
+    /// Marks them and keeps their lines.
+    Tag,
+    /// Folds no file.
+    Off,
+}
+
+thread_local! {
+    static UNFOLDED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Runs `work` with the diffs of this thread read without folds, as before folds
+/// existed. Lets a test show that folding changes no digest and no fingerprint.
+#[doc(hidden)]
+pub fn unfolded<T>(work: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            UNFOLDED.set(self.0);
+        }
+    }
+
+    let _restore = Restore(UNFOLDED.replace(true));
+
+    work()
 }
 
 /// Git needs a NUL byte in the first 8 KiB to call a file binary.
@@ -856,8 +947,9 @@ pub enum DiffScope {
 /// What `worktree` changed since `base`, as reviewable files: tracked changes from
 /// git's patch, and for [`DiffScope::WorkingTree`] untracked files as added files.
 /// Sorted by path. [`DiffScope::Committed`] reads the commit `tip`. Spends `budget` on
-/// the hunk lines; files and lines past it are still counted and hashed. Retries once
-/// when the worktree changes while git runs.
+/// the hunk lines; files and lines past it are still counted and hashed. A file that
+/// qualifies for a [`Fold`] comes without lines and spends only a file of the budget.
+/// Retries once when the worktree changes while git runs.
 pub fn worktree_diff(
     worktree: &Path,
     base: &str,
@@ -865,10 +957,65 @@ pub fn worktree_diff(
     scope: DiffScope,
     budget: &mut DiffBudget,
 ) -> Result<Vec<ChangedFile>, Error> {
+    let folding = if UNFOLDED.get() {
+        Folding::Off
+    } else {
+        Folding::Fold
+    };
+
+    read_with_retry(worktree, (base, tip), scope, (None, folding), budget)
+}
+
+/// One file of what [`worktree_diff`] reads, with its lines also when it is folded; its
+/// `fold` stays set. `None` when the diff does not hold the path. Reads only that path.
+pub fn worktree_file(
+    worktree: &Path,
+    base: &str,
+    tip: &str,
+    scope: DiffScope,
+    path: &Path,
+    budget: &mut DiffBudget,
+) -> Result<Option<ChangedFile>, Error> {
+    let Some(only) = diff_path(path) else {
+        return Ok(None);
+    };
+
+    let files = read_with_retry(
+        worktree,
+        (base, tip),
+        scope,
+        (Some(&only), Folding::Tag),
+        budget,
+    )?;
+
+    Ok(files.into_iter().next())
+}
+
+/// The bytes of a path that is relative, plain and could be in a diff. Anything else
+/// (`..`, an absolute path, `./a`) names no file of the worktree.
+fn diff_path(path: &Path) -> Option<Vec<u8>> {
+    let plain = path
+        .components()
+        .all(|component| matches!(component, Component::Normal(_)));
+    let bytes = path.as_os_str().as_bytes();
+
+    (plain && !bytes.is_empty() && !bytes.contains(&0)).then(|| bytes.to_vec())
+}
+
+/// Reads again once when the worktree changed while git ran.
+fn read_with_retry(
+    worktree: &Path,
+    revisions: (&str, &str),
+    scope: DiffScope,
+    (only, folding): (Option<&[u8]>, Folding),
+    budget: &mut DiffBudget,
+) -> Result<Vec<ChangedFile>, Error> {
     for _ in 0..2 {
         let mut attempt = *budget;
 
-        if let Some(files) = read_worktree_diff(worktree, (base, tip), scope, &mut attempt)? {
+        if let Some(files) =
+            read_worktree_diff(worktree, revisions, scope, (only, folding), &mut attempt)?
+        {
             *budget = attempt;
 
             return Ok(files);
@@ -904,18 +1051,20 @@ impl Item {
     }
 }
 
-/// `None` when the patch and the numstat disagree.
+/// With `only`, reads that path alone. `None` when the patch and the numstat disagree.
 fn read_worktree_diff(
     worktree: &Path,
     (base, tip): (&str, &str),
     scope: DiffScope,
+    (only, folding): (Option<&[u8]>, Folding),
     budget: &mut DiffBudget,
 ) -> Result<Option<Vec<ChangedFile>>, Error> {
-    let numstat = diff_command(worktree, (base, tip), scope, &["--numstat", "-z"])?;
+    let numstat = diff_command(worktree, (base, tip), scope, only, &["--numstat", "-z"])?;
     let patch = diff_command(
         worktree,
         (base, tip),
         scope,
+        only,
         &["-p", "-U3", "--full-index", "--inter-hunk-context=0"],
     )?;
 
@@ -924,21 +1073,37 @@ fn read_worktree_diff(
     };
 
     if scope == DiffScope::WorkingTree {
-        let untracked = untracked_paths(worktree)?;
+        let untracked = untracked_paths(worktree, only)?;
         items.retain(|item| match item {
             Item::Tracked { path, .. } => !untracked.contains(path),
             Item::Untracked { .. } => true,
         });
         items.extend(untracked.into_iter().map(|path| Item::Untracked { path }));
     }
+    // A path pattern can match a whole folder.
+    if let Some(only) = only {
+        items.retain(|item| item.path() == only);
+    }
     items.sort_by(|one, other| one.path().cmp(other.path()));
+
+    let folds = if folding == Folding::Off {
+        HashMap::new()
+    } else {
+        let paths: Vec<&[u8]> = items.iter().map(Item::path).collect();
+
+        folds::marked(
+            worktree,
+            (scope == DiffScope::Committed).then_some(tip),
+            &paths,
+        )?
+    };
 
     let mut untracked_budget = MAX_TOTAL_BYTES;
     let mut untracked_seen = 0;
     let mut files = Vec::with_capacity(items.len());
 
     for item in &items {
-        let mut collector = Collector::new(budget);
+        let mut collector = Collector::new(budget, folds.get(item.path()).copied(), folding);
 
         let file = match item {
             Item::Tracked {
@@ -987,6 +1152,7 @@ fn diff_command(
     worktree: &Path,
     (base, tip): (&str, &str),
     scope: DiffScope,
+    only: Option<&[u8]>,
     options: &[&str],
 ) -> Result<Vec<u8>, Error> {
     // `diff-index` never writes the index, so it cannot block the agent's own git.
@@ -1010,7 +1176,14 @@ fn diff_command(
     }
     arguments.push("--");
 
-    let (arguments, output) = execute(worktree, arguments)?;
+    let pathspec = only.map(literal_pathspec);
+    let (arguments, output) = execute(
+        worktree,
+        arguments
+            .into_iter()
+            .map(OsStr::new)
+            .chain(pathspec.as_deref()),
+    )?;
     if !output.success {
         return Err(failure(&arguments, &output));
     }
@@ -1018,10 +1191,22 @@ fn diff_command(
     Ok(output.raw)
 }
 
-fn untracked_paths(worktree: &Path) -> Result<HashSet<Vec<u8>>, Error> {
+/// Matches the path as it is: no globs, no magic.
+fn literal_pathspec(path: &[u8]) -> OsString {
+    let mut pathspec = OsString::from(":(literal)");
+    pathspec.push(OsStr::from_bytes(path));
+
+    pathspec
+}
+
+fn untracked_paths(worktree: &Path, only: Option<&[u8]>) -> Result<HashSet<Vec<u8>>, Error> {
+    let pathspec = only.map(literal_pathspec);
     let (arguments, output) = execute(
         worktree,
-        ["ls-files", "--others", "--exclude-standard", "-z"],
+        ["ls-files", "--others", "--exclude-standard", "-z", "--"]
+            .map(OsStr::new)
+            .into_iter()
+            .chain(pathspec.as_deref()),
     )?;
     if !output.success {
         return Err(failure(&arguments, &output));
@@ -1127,10 +1312,13 @@ struct Collector {
     last_kept: bool,
     /// The file was not read; its size and mtime stand in for its content.
     left_out: bool,
+    /// Set by name or attribute, which are known before the lines are read.
+    marked: Option<Fold>,
+    folding: Folding,
 }
 
 impl Collector {
-    fn new(budget: &DiffBudget) -> Self {
+    fn new(budget: &DiffBudget, marked: Option<Fold>, folding: Folding) -> Self {
         let limit = if budget.files == 0 {
             0
         } else {
@@ -1148,7 +1336,14 @@ impl Collector {
             deletions: 0,
             last_kept: false,
             left_out: false,
+            marked,
+            folding,
         }
+    }
+
+    /// The lines are only counted and hashed.
+    fn hidden(&self) -> bool {
+        self.folding == Folding::Fold && self.marked.is_some()
     }
 
     /// A header line of the file block (modes, blob hashes), hashed but never shown.
@@ -1205,6 +1400,10 @@ impl Collector {
             DiffLineKind::Context | DiffLineKind::NoNewline => {}
         }
 
+        if self.hidden() {
+            return;
+        }
+
         if self.kept >= self.limit {
             self.truncated = true;
             self.last_kept = false;
@@ -1237,6 +1436,18 @@ impl Collector {
         let mut digest = self.digest;
         digest.write_u64(u64::from(file.binary));
 
+        let large = self.additions.saturating_add(self.deletions) > FOLD_LINES;
+        let fold = if file.binary || self.left_out || self.folding == Folding::Off {
+            None
+        } else {
+            self.marked.or(large.then_some(Fold::Large))
+        };
+        let (hunks, kept, truncated) = if fold.is_some() && self.folding == Folding::Fold {
+            (Vec::new(), 0, false)
+        } else {
+            (self.hunks, self.kept, self.truncated)
+        };
+
         // A committed binary change shows in its blob hashes; the working tree has none.
         let by_stat = scope == DiffScope::WorkingTree && file.binary;
         if (by_stat || self.left_out)
@@ -1248,18 +1459,19 @@ impl Collector {
         }
 
         budget.files = budget.files.saturating_sub(1);
-        budget.lines = budget.lines.saturating_sub(self.kept);
+        budget.lines = budget.lines.saturating_sub(kept);
 
-        file.hunks = self.hunks;
-        file.truncated |= self.truncated;
+        file.hunks = hunks;
+        file.truncated |= truncated;
         if !file.binary {
             file.additions = self.additions;
             file.deletions = self.deletions;
         }
+        file.digest = digest.finish();
+        file.fold = fold;
 
         ChangedFile {
             raw_path: file.path.as_os_str().as_bytes().to_vec(),
-            digest: digest.finish(),
             diff: file,
         }
     }
@@ -1985,6 +2197,156 @@ mod tests {
         assert!(open_regular(&folder.0.join("link")).is_none());
         assert!(open_regular(&folder.0.join("real")).is_some());
         assert!(open_regular(&folder.0).is_none(), "a folder is no file");
+    }
+
+    fn numbered(count: usize) -> String {
+        use std::fmt::Write as _;
+
+        let mut text = String::new();
+        for number in 0..count {
+            writeln!(text, "line {number}").expect("a string grows");
+        }
+
+        text
+    }
+
+    #[test]
+    fn a_folded_file_spends_a_file_of_the_budget_and_no_lines() {
+        let folder = Folder::new("budget");
+        let root = folder.0.as_path();
+        let identity = ["-c", "user.name=Test", "-c", "user.email=test@example.com"];
+        run(root, ["init", "-q"]).expect("init");
+        std::fs::write(root.join("big.txt"), "one\n").expect("file");
+        run(root, ["add", "big.txt"]).expect("add");
+        run(
+            root,
+            identity.into_iter().chain(["commit", "-q", "-m", "first"]),
+        )
+        .expect("commit");
+
+        std::fs::write(root.join("Cargo.lock"), numbered(600)).expect("lock");
+        std::fs::write(root.join("big.txt"), numbered(700)).expect("tracked large");
+        std::fs::write(root.join("huge.txt"), numbered(800)).expect("untracked large");
+        std::fs::write(root.join("z.txt"), numbered(5)).expect("small");
+        let read = || {
+            let mut budget = DiffBudget {
+                files: 10,
+                lines: 10,
+            };
+            let files = worktree_diff(root, "HEAD", "HEAD", DiffScope::WorkingTree, &mut budget)
+                .expect("diff");
+
+            (files, budget)
+        };
+
+        let (files, budget) = read();
+
+        let names: Vec<_> = files.iter().map(|file| file.diff.path.clone()).collect();
+        assert_eq!(
+            names,
+            ["Cargo.lock", "big.txt", "huge.txt", "z.txt"].map(PathBuf::from)
+        );
+        let folds: Vec<_> = files.iter().map(|file| file.diff.fold).collect();
+        assert_eq!(
+            folds,
+            [Some(Fold::Lock), Some(Fold::Large), Some(Fold::Large), None]
+        );
+        for folded in &files[..3] {
+            assert!(folded.diff.hunks.is_empty() && !folded.diff.truncated);
+        }
+        let small = &files[3].diff;
+        assert!(!small.truncated);
+        assert_eq!(
+            small
+                .hunks
+                .iter()
+                .map(|hunk| hunk.lines.len())
+                .sum::<usize>(),
+            5
+        );
+        assert_eq!((budget.files, budget.lines), (6, 5));
+
+        let (plain, budget) = unfolded(read);
+
+        assert!(
+            plain[3].diff.truncated,
+            "the unfolded files used the lines up"
+        );
+        assert_eq!((budget.files, budget.lines), (6, 0));
+    }
+
+    #[test]
+    fn attributes_come_from_the_commit_or_else_from_the_worktree() {
+        let folder = Folder::new("attributes");
+        let root = folder.0.as_path();
+        run(root, ["init", "-q"]).expect("init");
+        std::fs::write(root.join(".gitattributes"), "made.txt linguist-generated\n").expect("file");
+        run(root, ["add", ".gitattributes"]).expect("add");
+        run(
+            root,
+            [
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "first",
+            ],
+        )
+        .expect("commit");
+        std::fs::write(
+            root.join(".gitattributes"),
+            "other.txt linguist-generated\n",
+        )
+        .expect("file");
+        let paths: [&[u8]; 2] = [b"made.txt", b"other.txt"];
+
+        let from_commit = folds::marked(root, Some("HEAD"), &paths).expect("commit");
+        let from_worktree = folds::marked(root, None, &paths).expect("worktree");
+        let unusable = folds::marked(root, Some("no-such-commit"), &paths).expect("fallback");
+
+        assert_eq!(
+            from_commit,
+            HashMap::from([(b"made.txt".to_vec(), Fold::Generated)])
+        );
+        assert_eq!(
+            from_worktree,
+            HashMap::from([(b"other.txt".to_vec(), Fold::Generated)])
+        );
+        assert_eq!(
+            unusable, from_worktree,
+            "a git without --source reads the worktree"
+        );
+    }
+
+    #[test]
+    fn the_attributes_of_many_paths_are_read_in_one_call_without_blocking() {
+        let folder = Folder::new("many-attributes");
+        run(&folder.0, ["init", "-q"]).expect("init");
+        std::fs::write(
+            folder.0.join(".gitattributes"),
+            "*.gen linguist-generated\n",
+        )
+        .expect("file");
+        let root = folder.0.clone();
+
+        let found = within_seconds(move || {
+            let paths: Vec<String> = (0..20_000)
+                .map(|number| {
+                    let ending = if number % 2 == 0 { "gen" } else { "txt" };
+
+                    format!("folder/{number:05}-{}.{ending}", "x".repeat(80))
+                })
+                .collect();
+            let paths: Vec<&[u8]> = paths.iter().map(String::as_bytes).collect();
+
+            folds::marked(&root, None, &paths).expect("attributes")
+        });
+
+        assert_eq!(found.len(), 10_000);
+        assert!(found.values().all(|fold| *fold == Fold::Generated));
     }
 
     #[test]

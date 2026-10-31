@@ -15,9 +15,9 @@ use std::time::{Duration, Instant};
 use swarm_core::store::Store;
 use swarm_protocol::{
     AgentChange, AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, CallId,
-    CloseCheck, CommentId, CommentState, CreateTask, CreateTerminal, DiffStat, Event, FileStat,
-    MessageInfo, MessageKind, ProjectId, ProjectInfo, Request, ReviewSource, TaskDiff, TaskId,
-    TaskInfo, TerminalId, TerminalInfo, TerminalKind, VERSION, read, write,
+    CloseCheck, CommentId, CommentState, CreateTask, CreateTerminal, DiffStat, Event, FileDiff,
+    FileStat, Fold, MessageInfo, MessageKind, ProjectId, ProjectInfo, Request, ReviewSource,
+    TaskDiff, TaskId, TaskInfo, TerminalId, TerminalInfo, TerminalKind, VERSION, read, write,
 };
 use swarm_term::{
     BlockedKind, ExitStatus, Palette, ProgramState, Rgb, Row, Size, TerminalInput, TerminalOutput,
@@ -3802,6 +3802,33 @@ impl Client {
         })
     }
 
+    /// One file of a task diff with its lines, or the daemon's error text.
+    fn file_hunks(
+        &mut self,
+        task: TaskId,
+        source: ReviewSource,
+        worktree: &Path,
+        path: &str,
+    ) -> Result<Option<FileDiff>, String> {
+        self.send(&Request::FileHunks {
+            call: CALL,
+            task,
+            source,
+            worktree: worktree.to_owned(),
+            path: PathBuf::from(path),
+        });
+
+        self.wait_for(|event| match event {
+            Event::FileHunks { call: CALL, file } => Some(Ok(file.clone())),
+            Event::Error {
+                call: Some(CALL),
+                message,
+                ..
+            } => Some(Err(message.clone())),
+            _ => None,
+        })
+    }
+
     fn check_close(&mut self, task: TaskId) -> CloseCheck {
         self.send(&Request::CheckClose { call: CALL, task });
 
@@ -3997,6 +4024,111 @@ fn a_new_commit_with_the_same_changes_is_still_sent() {
             .expect("known"),
         None
     );
+}
+
+fn numbered(count: usize) -> String {
+    use std::fmt::Write as _;
+
+    let mut text = String::new();
+    for number in 0..count {
+        writeln!(text, "line {number}").expect("a string grows");
+    }
+
+    text
+}
+
+#[test]
+fn file_hunks_loads_the_lines_of_a_folded_file() {
+    let repo = Repo::new("");
+    let daemon = Daemon::start();
+    let (mut client, task) = reviewed_task(&daemon, &repo);
+    std::fs::write(task.worktree.join("Cargo.lock"), numbered(600)).expect("lock");
+    commit_all(&task.worktree);
+
+    let diff = client
+        .task_diff(task.id, ReviewSource::Merged, None)
+        .expect("diff")
+        .expect("a diff");
+    let folded = diff
+        .files
+        .iter()
+        .find(|file| file.path == Path::new("Cargo.lock"))
+        .expect("the lock file");
+    assert_eq!(folded.fold, Some(Fold::Lock));
+    assert!(folded.hunks.is_empty());
+    assert_eq!(folded.additions, 600);
+
+    let loaded = client
+        .file_hunks(task.id, ReviewSource::Merged, &task.worktree, "Cargo.lock")
+        .expect("answer")
+        .expect("the diff holds the file");
+
+    assert_eq!(loaded.fold, Some(Fold::Lock));
+    assert_eq!(loaded.digest, folded.digest);
+    assert_eq!(loaded.additions, 600);
+    assert_eq!(loaded.hunks.len(), 1);
+    assert_eq!(loaded.hunks[0].lines.len(), 600);
+    assert_eq!(loaded.hunks[0].lines[599].text, "line 599");
+
+    assert_eq!(
+        client
+            .file_hunks(
+                task.id,
+                ReviewSource::Merged,
+                &task.worktree,
+                "../outside.txt"
+            )
+            .expect("answer"),
+        None
+    );
+    assert_eq!(
+        client
+            .file_hunks(task.id, ReviewSource::Merged, &task.worktree, "gone.txt")
+            .expect("answer"),
+        None
+    );
+    assert!(
+        client
+            .file_hunks(
+                TaskId(999),
+                ReviewSource::Merged,
+                &task.worktree,
+                "Cargo.lock"
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn loading_a_file_never_waits_for_a_diff_refresh() {
+    let repo = Repo::new("");
+    let daemon = Daemon::start();
+    let (mut client, task) = reviewed_task(&daemon, &repo);
+    std::fs::write(task.worktree.join("big.txt"), numbered(3000)).expect("file");
+
+    for call in [CallId(1), CallId(2), CallId(3)] {
+        client.send(&Request::FileHunks {
+            call,
+            task: task.id,
+            source: ReviewSource::Live,
+            worktree: task.worktree.clone(),
+            path: PathBuf::from("big.txt"),
+        });
+    }
+
+    let mut answered = Vec::new();
+    while answered.len() < 3 {
+        match client.next() {
+            Event::FileHunks { call, file } => {
+                assert_eq!(file.expect("the file").hunks[0].lines.len(), 3000);
+                answered.push(call);
+            }
+            Event::Error { message, .. } => panic!("refused: {message}"),
+            _ => {}
+        }
+    }
+    answered.sort_by_key(|call| call.0);
+    assert_eq!(answered, [CallId(1), CallId(2), CallId(3)]);
 }
 
 #[test]
