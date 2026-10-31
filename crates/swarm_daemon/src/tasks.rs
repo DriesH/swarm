@@ -209,6 +209,8 @@ fn stop_and_close(services: &Services, id: TaskId, confirmed: &CloseCheck) -> Re
     services
         .clients
         .broadcast(&Event::TaskChanged { task: closed.task });
+    services.checks.forget(id);
+    services.pull_requests.forget(id);
 
     Ok(())
 }

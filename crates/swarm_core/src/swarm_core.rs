@@ -8,6 +8,8 @@ pub mod agents;
 pub mod comments;
 pub mod config;
 pub mod git;
+pub mod github;
+mod process;
 pub mod prompts;
 pub mod store;
 pub mod task;
@@ -22,12 +24,13 @@ use std::time::{Duration, Instant};
 
 use swarm_protocol::{
     AgentChange, AgentId, AgentInfo, AgentLifecycle, AgentRole, CloseCheck, CreateTask, DIFF_FILES,
-    DiffStat, FileChange, ProjectId, ProjectInfo, ReviewSource, TaskDiff, TaskId, TaskInfo,
-    TerminalId,
+    DiffStat, FileChange, GithubStatus, PrLink, ProjectId, ProjectInfo, ReviewSource, TaskDiff,
+    TaskId, TaskInfo, TerminalId,
 };
 use swarm_term::ExitStatus;
 
-use crate::config::{LoadedConfig, ProjectConfig};
+use crate::config::{ChecksConfig, LoadedConfig, ProjectConfig};
+use crate::github::Github;
 use crate::store::{NewTask, Store, StoredProject};
 use crate::task::BRANCH_PREFIX;
 
@@ -37,6 +40,8 @@ pub enum Error {
     GitMissing,
     #[error("{}", git_message(.command, .stderr))]
     Git { command: String, stderr: String },
+    #[error("{}", gh_message(.command, .output))]
+    Gh { command: String, output: String },
     #[error("cannot {action}: {source}")]
     Io {
         action: String,
@@ -59,6 +64,14 @@ fn git_message(command: &str, stderr: &str) -> String {
         format!("git {command} failed")
     } else {
         format!("git {command} failed: {stderr}")
+    }
+}
+
+fn gh_message(command: &str, output: &str) -> String {
+    if output.is_empty() {
+        format!("gh {command} failed")
+    } else {
+        format!("gh {command} failed: {output}")
     }
 }
 
@@ -695,6 +708,100 @@ impl Projects {
         self.task(id)
     }
 
+    /// The task, when the user approved the Merged changes as they are now.
+    pub fn check_approved(&self, id: TaskId) -> Result<TaskInfo, Error> {
+        let task = self.task(id)?;
+        let Some(approved) = task.approved else {
+            return Err(Error::Invalid(
+                "the task is not approved: approve its changes in Review first".to_owned(),
+            ));
+        };
+
+        let current = self.task_diff(id, ReviewSource::Merged)?;
+        if current.fingerprint != approved {
+            return Err(Error::Invalid(
+                "the changes changed since you approved them: approve them again".to_owned(),
+            ));
+        }
+
+        Ok(task)
+    }
+
+    /// The folder of the project's repository.
+    pub fn project_path(&self, project: ProjectId) -> Result<PathBuf, Error> {
+        lock(&self.store)
+            .project(project)?
+            .map(|stored| stored.path)
+            .ok_or(Error::UnknownProject(project.0))
+    }
+
+    /// `gh`, its sign-in and the `origin` remote of the project.
+    pub fn github_status(
+        &self,
+        github: &Github,
+        project: ProjectId,
+    ) -> Result<GithubStatus, Error> {
+        let root = self.project_path(project)?;
+
+        Ok(github.status(&root))
+    }
+
+    /// The project's local branches, newest commit first.
+    pub fn local_branches(&self, project: ProjectId) -> Result<Vec<String>, Error> {
+        git::local_branches(&self.project_path(project)?)
+    }
+
+    /// `owner/name` of the project's `origin`, when it is on github.com.
+    pub fn repository(&self, project: ProjectId) -> Result<Option<String>, Error> {
+        let root = self.project_path(project)?;
+
+        Ok(git::origin_url(&root).and_then(|url| github::parse_repository(&url)))
+    }
+
+    /// `[checks]` of the project's config. A config with a problem is an error, so a
+    /// broken file never counts as "no checks".
+    pub fn checks_config(&self, project: ProjectId) -> Result<ChecksConfig, Error> {
+        let LoadedConfig { config, error } = config::load(&self.project_path(project)?);
+        if let Some(error) = error {
+            return Err(Error::Invalid(format!(
+                "the project config has a problem: {error}"
+            )));
+        }
+
+        Ok(config.checks)
+    }
+
+    /// Records the pull request of the task.
+    pub fn set_pull_request(
+        &self,
+        id: TaskId,
+        link: &PrLink,
+        close_after_merge: bool,
+    ) -> Result<TaskInfo, Error> {
+        lock(&self.store).set_pull_request(id, link, close_after_merge)?;
+
+        self.task(id)
+    }
+
+    pub fn set_close_after_merge(&self, id: TaskId, close: bool) -> Result<TaskInfo, Error> {
+        self.task(id)?;
+        lock(&self.store).set_close_after_merge(id, close)?;
+
+        self.task(id)
+    }
+
+    /// Deletes a local branch whose work is merged on GitHub. A squash merge leaves the
+    /// branch looking unmerged, so closing a task keeps it. Missing branches are fine.
+    pub fn delete_merged_branch(&self, project: ProjectId, branch: &str) -> Result<(), Error> {
+        let root = self.project_path(project)?;
+
+        if git::branch_exists(&root, branch)? {
+            git::branch_delete(&root, branch)?;
+        }
+
+        Ok(())
+    }
+
     /// What closing the task would throw away.
     pub fn close_check(&self, id: TaskId) -> Result<CloseCheck, Error> {
         let task = self.task(id)?;
@@ -1032,7 +1139,9 @@ fn remove_task_leftovers(root: &Path, branch: &str, worktree: &Path) {
     }
 }
 
-fn task_env(task: &TaskInfo) -> Vec<(String, String)> {
+/// `SWARM_TASK`, `SWARM_PORT` and `SWARM_PORTS` of a task: the environment of its setup
+/// script and of its local checks.
+pub fn task_env(task: &TaskInfo) -> Vec<(String, String)> {
     ports_env(task.id, &task.ports)
 }
 

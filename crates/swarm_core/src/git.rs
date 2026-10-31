@@ -8,6 +8,7 @@ use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::time::Duration;
 
 use swarm_protocol::{
     DIFF_FILES, DIFF_LINE_BYTES, DIFF_LINES, DIFF_LINES_PER_FILE, DiffHunk, DiffLine, DiffLineKind,
@@ -15,6 +16,7 @@ use swarm_protocol::{
 };
 
 use crate::Error;
+use crate::process;
 
 /// Apps started from Finder get a minimal `PATH`, so known install folders come second.
 const FALLBACK_BINARIES: [&str; 3] = [
@@ -1635,6 +1637,138 @@ pub fn uncommitted_paths(worktree: &Path) -> Result<HashSet<Vec<u8>>, Error> {
         .collect())
 }
 
+/// The project's local branches, newest commit first.
+pub fn local_branches(root: &Path) -> Result<Vec<String>, Error> {
+    let listed = run(
+        root,
+        [
+            "for-each-ref",
+            "--sort=-committerdate",
+            "refs/heads",
+            "--format=%(refname:short)",
+        ],
+    )?;
+
+    Ok(listed
+        .lines()
+        .map(str::trim)
+        .filter(|branch| !branch.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+/// The URL of the `origin` remote, as git would use it. `None` without that remote.
+pub fn origin_url(root: &Path) -> Option<String> {
+    run(root, ["remote", "get-url", "origin"])
+        .ok()
+        .filter(|url| !url.is_empty())
+}
+
+/// The tool behind the `pre-push` hook git runs in `worktree`: "husky", "lefthook", or
+/// "pre-push" for any other executable hook. `None` without one.
+pub fn pre_push_hook(worktree: &Path) -> Option<String> {
+    let configured = run(
+        worktree,
+        ["config", "--type=path", "--get", "core.hooksPath"],
+    )
+    .ok()
+    .filter(|path| !path.is_empty())
+    .map(PathBuf::from);
+
+    let folder = match configured {
+        Some(path) if path.is_absolute() => path,
+        // Hooks run from the top of the worktree.
+        Some(path) => {
+            PathBuf::from(run(worktree, ["rev-parse", "--show-toplevel"]).ok()?).join(path)
+        }
+        None => PathBuf::from(
+            run(
+                worktree,
+                ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            )
+            .ok()?,
+        )
+        .join("hooks"),
+    };
+
+    let hook = folder.join("pre-push");
+    // Git skips a hook that is not executable.
+    if !crate::adapters::is_executable(&hook) {
+        return None;
+    }
+
+    if folder
+        .components()
+        .any(|part| part.as_os_str() == OsStr::new(".husky"))
+    {
+        return Some("husky".to_owned());
+    }
+
+    let mut head = Vec::new();
+    if let Ok(file) = std::fs::File::open(&hook)
+        && let Err(error) = file.take(8192).read_to_end(&mut head)
+    {
+        log::debug!("cannot read {}: {error}", hook.display());
+    }
+    let head = String::from_utf8_lossy(&head).to_lowercase();
+
+    let name = if head.contains("lefthook") {
+        "lefthook"
+    } else if head.contains("husky") {
+        "husky"
+    } else {
+        "pre-push"
+    };
+
+    Some(name.to_owned())
+}
+
+/// How many lines of a failed push the error carries.
+const PUSH_ERROR_LINES: usize = 40;
+
+/// Pushes `branch` to `origin` and sets it as the upstream. The repository's `pre-push`
+/// hook runs as usual. A failure carries the last lines of what git and the hook
+/// printed; the push is killed after `timeout`.
+pub fn push_branch(worktree: &Path, branch: &str, timeout: Duration) -> Result<(), Error> {
+    if branch.starts_with('-') {
+        return Err(Error::Invalid(format!(
+            "the branch {branch:?} must not start with \"-\""
+        )));
+    }
+
+    let mut command = Command::new(binary()?);
+    command
+        .arg("-C")
+        .arg(worktree)
+        .args(["push", "-u", "origin", branch])
+        .env("GIT_TERMINAL_PROMPT", "0");
+
+    let captured = process::capture(command, None, timeout, true).map_err(|source| Error::Io {
+        action: "run git push".to_owned(),
+        source,
+    })?;
+    if captured.success() {
+        return Ok(());
+    }
+
+    let output = String::from_utf8_lossy(&captured.stdout);
+    let tail = process::last_lines(output.trim(), PUSH_ERROR_LINES);
+    let what = if captured.status.is_none() {
+        format!(
+            "git push took longer than {} minutes",
+            timeout.as_secs().div_ceil(60)
+        )
+    } else {
+        "git push failed".to_owned()
+    };
+
+    Err(Error::Invalid(if tail.is_empty() {
+        what
+    } else {
+        format!("{what}:\n{tail}")
+    }))
+}
+
 /// Forgets worktrees whose folder is gone.
 pub fn worktree_prune(root: &Path) -> Result<(), Error> {
     run(root, ["worktree", "prune"])?;
@@ -1692,7 +1826,7 @@ mod tests {
         std::thread::spawn(move || sender.send(work()).ok());
 
         receiver
-            .recv_timeout(std::time::Duration::from_secs(10))
+            .recv_timeout(Duration::from_secs(10))
             .expect("the call blocked")
     }
 

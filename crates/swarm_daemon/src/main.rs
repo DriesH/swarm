@@ -3,11 +3,13 @@
 mod agent_socket;
 mod agents;
 mod calls;
+mod checks;
 mod comments;
 mod connection;
 mod hub;
 mod messages;
 mod processes;
+mod pull_requests;
 mod recovery;
 mod tasks;
 
@@ -25,14 +27,17 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use swarm_core::Projects;
+use swarm_core::github::Github;
 use swarm_core::store::Store;
 use swarm_protocol::{Paths, check_private_dir};
 
 use crate::agents::{AgentConfig, Agents};
 use crate::calls::Calls;
+use crate::checks::Checks;
 use crate::hub::{Clients, Terminals};
 use crate::messages::Messages;
 use crate::processes::Processes;
+use crate::pull_requests::PullRequests;
 use crate::recovery::System;
 
 /// What every client connection works with.
@@ -43,6 +48,8 @@ pub(crate) struct Services {
     pub(crate) clients: Arc<Clients>,
     pub(crate) messages: Arc<Messages>,
     pub(crate) processes: Arc<Processes>,
+    pub(crate) checks: Arc<Checks>,
+    pub(crate) pull_requests: PullRequests,
     pub(crate) store: Arc<Mutex<Store>>,
 }
 
@@ -50,6 +57,8 @@ pub(crate) struct Services {
 struct Arguments {
     data_dir: Option<PathBuf>,
     settings: Option<PathBuf>,
+    /// A `gh` to use as it is, without looking for one (tests).
+    gh: Option<PathBuf>,
 }
 
 /// How long terminals get to exit on SIGTERM before the daemon leaves anyway.
@@ -149,12 +158,19 @@ fn run() -> Result<()> {
     let terminals = Terminals::new(Arc::clone(&store));
     let clients = Arc::new(Clients::default());
     let messages = Messages::new(Arc::clone(&store), Arc::clone(&clients));
+    let settings = arguments.settings.or_else(swarm_settings::default_path);
+    let config_dir = settings
+        .as_deref()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf);
+    let github = Github::new(paths.data.join("bin"), arguments.gh);
     let agents = Agents::new(
         AgentConfig {
             data_dir: paths.data.clone(),
             socket: agent_socket_path.clone(),
-            settings: arguments.settings.or_else(swarm_settings::default_path),
+            settings,
             swarm,
+            github: github.clone(),
         },
         Arc::clone(&store),
         Arc::clone(&terminals),
@@ -175,6 +191,13 @@ fn run() -> Result<()> {
         Arc::clone(&agents),
     );
 
+    let checks = Checks::new(
+        Arc::clone(&projects),
+        Arc::clone(&terminals),
+        Arc::clone(&clients),
+        Arc::clone(&agents),
+    );
+
     let services = Arc::new(Services {
         terminals,
         projects,
@@ -182,6 +205,8 @@ fn run() -> Result<()> {
         clients,
         messages,
         processes,
+        checks,
+        pull_requests: PullRequests::new(github, config_dir),
         store,
     });
 
@@ -195,12 +220,13 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-/// `--data-dir <folder>` and `--settings <file>`, both optional.
+/// `--data-dir <folder>`, `--settings <file>` and `--gh <file>`, all optional.
 fn arguments() -> Result<Arguments> {
     let mut input = std::env::args_os().skip(1);
     let mut parsed = Arguments {
         data_dir: None,
         settings: None,
+        gh: None,
     };
 
     while let Some(argument) = input.next() {
@@ -210,6 +236,9 @@ fn arguments() -> Result<Arguments> {
         } else if argument == "--settings" {
             let file = input.next().context("--settings needs a file")?;
             parsed.settings = Some(PathBuf::from(file));
+        } else if argument == "--gh" {
+            let file = input.next().context("--gh needs a file")?;
+            parsed.gh = Some(PathBuf::from(file));
         } else {
             anyhow::bail!("unknown argument {}", argument.to_string_lossy());
         }

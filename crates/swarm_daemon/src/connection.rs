@@ -16,6 +16,7 @@ use swarm_protocol::{
 use swarm_term::TerminalInput;
 
 use crate::hub::{CREATE_HISTORY_LINES, ClientSink, Frame, Hub, QUEUE_FRAMES};
+use crate::pull_requests::{self, NewRequest};
 use crate::tasks;
 use crate::{Services, comments};
 
@@ -198,6 +199,28 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
         | Request::DeleteComment { .. }
         | Request::ResolveComment { .. }
         | Request::SendComments { .. }) => handle_comments(services, sink, request),
+        request @ (Request::GithubStatus { .. }
+        | Request::ListBranches { .. }
+        | Request::RunChecks { .. }
+        | Request::ListChecks { .. }
+        | Request::DraftPr { .. }
+        | Request::CreatePr { .. }
+        | Request::PrStatus { .. }
+        | Request::MarkPrReady { .. }
+        | Request::AddReviewers { .. }
+        | Request::MergePr { .. }
+        | Request::SetCloseAfterMerge { .. }) => handle_pull_requests(services, sink, request),
+        request @ (Request::ListProjects { .. }
+        | Request::AddProject { .. }
+        | Request::CreateTask { .. }) => handle_projects(services, sink, request),
+    }
+}
+
+/// Projects and the tasks made in them.
+fn handle_projects(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
+    let projects = &services.projects;
+
+    match request {
         Request::ListProjects { call } => match projects.list() {
             Ok(projects) => {
                 sink.send_event(&Event::Projects { call, projects });
@@ -230,6 +253,7 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
                 }
             });
         }
+        _ => {}
     }
 }
 
@@ -337,6 +361,115 @@ fn handle_review(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Requ
     }
 }
 
+/// GitHub, local checks and pull requests.
+fn handle_pull_requests(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
+    let services = Arc::clone(services);
+
+    match request {
+        Request::GithubStatus { call, project } => {
+            run_slow(sink, "github-status", call, move |sink| {
+                let status = services
+                    .projects
+                    .github_status(services.pull_requests.github(), project);
+
+                match status {
+                    Ok(status) => {
+                        sink.send_event(&Event::GithubStatus { call, status });
+                    }
+                    Err(error) => send_error(sink, call, &error),
+                }
+            });
+        }
+        Request::ListBranches { call, project } => {
+            run_slow(sink, "list-branches", call, move |sink| {
+                match services.projects.local_branches(project) {
+                    Ok(branches) => {
+                        sink.send_event(&Event::Branches { call, branches });
+                    }
+                    Err(error) => send_error(sink, call, &error),
+                }
+            });
+        }
+        Request::RunChecks { call, task } => {
+            run_slow(sink, "run-checks", call, move |sink| {
+                done_or_error(sink, call, services.checks.start(task));
+            });
+        }
+        Request::ListChecks { call, task } => {
+            sink.send_event(&Event::Checks {
+                call,
+                run: services.checks.latest(task),
+            });
+        }
+        Request::DraftPr { call, task } => {
+            run_slow(sink, "draft-pr", call, move |sink| {
+                done_or_error(sink, call, pull_requests::request_draft(&services, task));
+            });
+        }
+        Request::CreatePr {
+            call,
+            task,
+            draft,
+            as_draft,
+            close_after_merge,
+            skip_checks,
+        } => {
+            run_slow(sink, "create-pr", call, move |sink| {
+                let request = NewRequest {
+                    draft,
+                    as_draft,
+                    close_after_merge,
+                    skip_checks,
+                };
+
+                done_or_error(sink, call, pull_requests::create(&services, task, &request));
+            });
+        }
+        Request::PrStatus { call, task } => {
+            run_slow(
+                sink,
+                "pr-status",
+                call,
+                move |sink| match pull_requests::status(&services, task) {
+                    Ok(pull_request) => {
+                        sink.send_event(&Event::PrStatus { call, pull_request });
+                    }
+                    Err(error) => send_error(sink, call, &error),
+                },
+            );
+        }
+        Request::MarkPrReady { call, task } => {
+            run_slow(sink, "mark-pr-ready", call, move |sink| {
+                done_or_error(sink, call, pull_requests::mark_ready(&services, task));
+            });
+        }
+        Request::AddReviewers { call, task, logins } => {
+            run_slow(sink, "add-reviewers", call, move |sink| {
+                done_or_error(
+                    sink,
+                    call,
+                    pull_requests::add_reviewers(&services, task, &logins),
+                );
+            });
+        }
+        Request::MergePr { call, task, method } => {
+            run_slow(sink, "merge-pr", call, move |sink| {
+                done_or_error(sink, call, pull_requests::merge(&services, task, method));
+            });
+        }
+        Request::SetCloseAfterMerge { call, task, close } => {
+            run_slow(sink, "set-close-after-merge", call, move |sink| {
+                done_or_error(
+                    sink,
+                    call,
+                    pull_requests::set_close_after_merge(&services, task, close),
+                );
+            });
+        }
+        _ => {}
+    }
+}
+
 /// Review comments: list, add, delete, resolve and send.
 fn handle_comments(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
     let services = Arc::clone(services);
@@ -402,6 +535,7 @@ fn forward_input(
     services.agents.app_input(id, &input);
     if killed {
         services.processes.stopped_by_user(id);
+        services.checks.user_closed(id);
     }
 
     if !hub.send_input(input) {

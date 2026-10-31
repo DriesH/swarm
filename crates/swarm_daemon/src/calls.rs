@@ -11,14 +11,14 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use serde_json::Value;
 use swarm_core::store::{MAX_MESSAGE_BYTES, NewMessage};
-use swarm_core::{WorkerCheckout, git};
+use swarm_core::{WorkerCheckout, git, github};
 use swarm_protocol::agent::{
     AgentRequest, AgentSummary, Call, Committed, Merged, Reply, Sent, TaskSummary, TaskUntil,
     TerminalSize, TerminalUntil,
 };
 use swarm_protocol::{
     AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, CreateTask, Event,
-    MessageKind, TaskId, TaskInfo, TerminalId,
+    MessageKind, PrDraft, TaskId, TaskInfo, TerminalId,
 };
 
 use crate::Services;
@@ -26,7 +26,7 @@ use crate::agent_socket::{MAX_WAITS, Slot, Throttle};
 use crate::agents::{Place, Refused, lock};
 use crate::messages::Claim;
 use crate::processes::Spawn;
-use crate::tasks;
+use crate::{pull_requests, tasks};
 
 /// `wait` without a timeout.
 const DEFAULT_WAIT_SECS: u32 = 100;
@@ -209,6 +209,7 @@ impl Calls {
             Call::Notify { text } => self.notify(caller, &text),
             Call::Agents => self.agents(caller),
             Call::Confirm => self.confirm(caller),
+            Call::PrDraft { title, body } => self.pr_draft(caller, &title, &body),
 
             Call::TaskCreate {
                 name,
@@ -686,6 +687,29 @@ impl Calls {
         )?)
     }
 
+    fn pr_draft(&self, caller: &AgentInfo, title: &str, body: &str) -> Outcome {
+        let task = self.orchestrated_task(caller, "send a pull request draft")?;
+
+        let title = github::check_title(title)?;
+        if body.trim().is_empty() {
+            return refuse("the description is empty");
+        }
+        github::check_body(body)?;
+        check_size(body)?;
+        self.services.projects.check_approved(task.id)?;
+
+        pull_requests::store_draft(
+            &self.services,
+            task.id,
+            PrDraft {
+                title,
+                body: body.to_owned(),
+            },
+        );
+
+        Ok(Value::Null)
+    }
+
     fn confirm(&self, caller: &AgentInfo) -> Outcome {
         let task = self.orchestrated_task(caller, "confirm a brief")?;
 
@@ -795,6 +819,8 @@ mod tests {
             briefed: true,
             approved: None,
             closed: false,
+            pull_request: None,
+            close_after_merge: false,
         }
     }
 

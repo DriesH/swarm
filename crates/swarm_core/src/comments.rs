@@ -1113,6 +1113,8 @@ mod tests {
             approved: None,
             closed: false,
             created_by: None,
+            pull_request: None,
+            close_after_merge: false,
         }
     }
 }
