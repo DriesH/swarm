@@ -12,14 +12,17 @@ use swarm_core::github::{self, Github, NewPullRequest, Target};
 use swarm_core::prompts::{self, PromptFile};
 use swarm_core::store::{MAX_MESSAGE_BYTES, NewMessage};
 use swarm_protocol::{
-    AgentLifecycle, AgentRole, CheckState, Event, MergeMethod, MessageKind, PrDraft, PullRequest,
-    TaskId, TaskInfo,
+    AgentLifecycle, AgentRole, CheckState, Event, GH_SECS, MergeMethod, MessageKind, PUSH_SECS,
+    PrDraft, PrLink, PrPanel, PrState, PullRequest, TaskId, TaskInfo,
 };
 
 use crate::{Services, tasks};
 
 /// A push may run a pre-push hook, which can run the whole test suite.
-const PUSH_TIMEOUT: Duration = Duration::from_secs(600);
+const PUSH_TIMEOUT: Duration = Duration::from_secs(PUSH_SECS);
+
+/// Deleting a branch runs no hook, so it gets the time of one `gh` call.
+const DELETE_TIMEOUT: Duration = Duration::from_secs(GH_SECS);
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -75,7 +78,6 @@ impl PullRequests {
         lock(&self.drafts).insert(task, draft);
     }
 
-    #[cfg(test)]
     fn draft(&self, task: TaskId) -> Option<PrDraft> {
         lock(&self.drafts).get(&task).cloned()
     }
@@ -85,9 +87,11 @@ impl PullRequests {
         lock(&self.drafts).remove(&task);
     }
 
-    fn begin(&self, task: TaskId) -> Result<Busy<'_>> {
+    /// Marks a push, merge or other change of the task as running. Fails while another
+    /// one runs, and a close of the task fails while this is held.
+    pub(crate) fn begin(&self, task: TaskId) -> Result<Busy<'_>> {
         if !lock(&self.busy).insert(task) {
-            bail!("another change to this pull request is running");
+            bail!("a pull request change of this task is running; try again");
         }
 
         Ok(Busy { owner: self, task })
@@ -156,19 +160,23 @@ pub(crate) fn request_draft(services: &Services, id: TaskId) -> Result<()> {
 fn draft_request(task: &TaskInfo, format: &str) -> String {
     format!(
         "The user approved the task \"{name}\". Write the pull request for branch `{branch}` \
-         into `{base}`.\n\n\
+         into `{pr_base}`.\n\n\
          1. Read the changes in the task worktree: `git log {base}..HEAD` and `git diff {base}...HEAD`.\n\
          2. Write a title and a description in the format below.\n\
-         3. Send them with `swarm pr draft --title \"<title>\" --body-file -` and the description \
-         on stdin, or with the `pr_draft` tool.\n\n\
+         3. Send them with the `pr_draft` tool when you have it. With the CLI, run \
+         `swarm pr draft --title '<title>' --body-file - <<'EOF'` with the description on the next \
+         lines and `EOF` on the last. Write a `'` in the title as `'\\''`. The single quotes \
+         and `<<'EOF'` stop the shell from running backticks or `$` in your text.\n\n\
          {format}",
         name = task.name,
         branch = task.branch,
+        pr_base = task.pr_base,
         base = task.base,
     )
 }
 
-/// Pushes the task branch and opens the pull request, then records it on the task.
+/// Pushes the checked commit and opens the pull request, then records it on the task. A
+/// closed pull request is replaced; an open one that Swarm did not record is taken over.
 pub(crate) fn create(services: &Services, id: TaskId, request: &NewRequest) -> Result<()> {
     let _busy = services.pull_requests.begin(id)?;
 
@@ -176,47 +184,52 @@ pub(crate) fn create(services: &Services, id: TaskId, request: &NewRequest) -> R
     if services.agents.is_closing(Some(id)) {
         bail!("the task is closing");
     }
-    if let Some(link) = &task.pull_request {
-        bail!("the task has pull request #{} already", link.number);
-    }
 
     let title = github::check_title(&request.draft.title)?;
     github::check_body(&request.draft.body)?;
 
     let repository = repository_of(services, &task)?;
     let root = services.projects.project_path(task.project)?;
-    services.pull_requests.github.require_ready(&root)?;
+    let github = &services.pull_requests.github;
+    github.require_ready(&root)?;
+    let target = Target {
+        worktree: &task.worktree,
+        repository: &repository,
+    };
 
-    let task = services.projects.check_approved(id)?;
-    let pending = services.projects.pending_comments(id)?.len();
-    if pending > 0 {
-        bail!(
-            "{pending} {} pending: send or delete {} first",
-            if pending == 1 {
-                "comment is"
-            } else {
-                "comments are"
-            },
-            if pending == 1 { "it" } else { "them" },
-        );
+    if let Some(link) = &task.pull_request {
+        match github.pull_request(&target, link.number)?.state {
+            PrState::Closed => {}
+            PrState::Open => bail!(
+                "open pull request #{} exists; push changes instead",
+                link.number
+            ),
+            PrState::Merged => bail!("pull request #{} is merged already", link.number),
+        }
     }
-    check_local_checks(services, &task, request.skip_checks)?;
 
-    git::push_branch(&task.worktree, &task.branch, PUSH_TIMEOUT)?;
+    let (task, commit) = pushable(services, id, request.skip_checks)?;
 
-    let link = services.pull_requests.github.create_pull_request(
-        &Target {
-            worktree: &task.worktree,
-            repository: &repository,
-        },
+    git::push_commit(&task.worktree, &commit, &task.branch, PUSH_TIMEOUT)?;
+    if let Err(error) = git::track_origin(&task.worktree, &task.branch) {
+        log::debug!("cannot track origin/{}: {error}", task.branch);
+    }
+
+    let created = github.create_pull_request(
+        &target,
         &NewPullRequest {
-            base: &task.base,
+            base: &task.pr_base,
             head: &task.branch,
+            commit: &commit,
             title: &title,
             body: &request.draft.body,
             draft: request.as_draft,
         },
-    )?;
+    );
+    let link = match created {
+        Ok(link) => link,
+        Err(error) => take_over(github, &target, &task.branch, &commit).ok_or(error)?,
+    };
 
     let task = services
         .projects
@@ -232,16 +245,106 @@ pub(crate) fn create(services: &Services, id: TaskId, request: &NewRequest) -> R
     Ok(())
 }
 
-/// The local checks must have passed on the current commit, unless they are not required
+/// The open pull request from `branch` that exists already, as a link at `commit`. `None`
+/// when there is none or GitHub cannot say.
+fn take_over(github: &Github, target: &Target<'_>, branch: &str, commit: &str) -> Option<PrLink> {
+    match github.find_for_branch(target, branch) {
+        Ok(Some(found)) if found.state == PrState::Open => Some(PrLink {
+            number: found.number,
+            url: found.url,
+            head: commit.to_owned(),
+        }),
+        Ok(_) => None,
+        Err(error) => {
+            log::debug!("cannot look up the pull request of {branch}: {error}");
+
+            None
+        }
+    }
+}
+
+/// Pushes the checked commit to the task's open pull request, under the rules of
+/// [`create`], and records it as the commit to merge.
+pub(crate) fn update(services: &Services, id: TaskId, skip_checks: bool) -> Result<()> {
+    let _busy = services.pull_requests.begin(id)?;
+
+    let task = services.projects.task(id)?;
+    if services.agents.is_closing(Some(id)) {
+        bail!("the task is closing");
+    }
+    let number = task
+        .pull_request
+        .as_ref()
+        .context("the task has no pull request")?
+        .number;
+
+    let repository = repository_of(services, &task)?;
+    let root = services.projects.project_path(task.project)?;
+    let github = &services.pull_requests.github;
+    github.require_ready(&root)?;
+
+    let current = github.pull_request(
+        &Target {
+            worktree: &task.worktree,
+            repository: &repository,
+        },
+        number,
+    )?;
+    match current.state {
+        PrState::Open => {}
+        PrState::Merged => bail!("pull request #{number} is merged already"),
+        PrState::Closed => bail!("pull request #{number} is closed: create a new one"),
+    }
+
+    let (task, commit) = pushable(services, id, skip_checks)?;
+    git::push_commit(&task.worktree, &commit, &task.branch, PUSH_TIMEOUT)?;
+
+    let task = services
+        .projects
+        .set_pull_request_head(id, &commit)
+        .with_context(|| {
+            format!("pushed to pull request #{number}, but Swarm could not record it")
+        })?;
+    services.clients.broadcast(&Event::TaskChanged { task });
+
+    Ok(())
+}
+
+/// The commit at HEAD of the task worktree, read once, when it is the task branch, the
+/// user approved the Merged changes at that commit, no comment is pending and the local
+/// checks passed cleanly on it. Pushing exactly this commit sends what was reviewed.
+fn pushable(services: &Services, id: TaskId, skip_checks: bool) -> Result<(TaskInfo, String)> {
+    let task = services.projects.task(id)?;
+    let commit = git::branch_head(&task.worktree, &task.branch)?;
+
+    let task = services.projects.check_approved_at(id, &commit)?;
+    let pending = services.projects.pending_comments(id)?.len();
+    if pending > 0 {
+        bail!(
+            "{pending} {} pending: send or delete {} first",
+            if pending == 1 {
+                "comment is"
+            } else {
+                "comments are"
+            },
+            if pending == 1 { "it" } else { "them" },
+        );
+    }
+    check_local_checks(services, &task, &commit, skip_checks)?;
+
+    Ok((task, commit))
+}
+
+/// The local checks must have passed cleanly on `commit`, unless they are not required
 /// and the user chose to skip them.
-fn check_local_checks(services: &Services, task: &TaskInfo, skip: bool) -> Result<()> {
+fn check_local_checks(
+    services: &Services,
+    task: &TaskInfo,
+    commit: &str,
+    skip: bool,
+) -> Result<()> {
     let config = services.projects.checks_config(task.project)?;
-    let commands: Vec<String> = config
-        .before_pr
-        .iter()
-        .map(|command| command.trim().to_owned())
-        .filter(|command| !command.is_empty())
-        .collect();
+    let commands = config.commands();
 
     if commands.is_empty() || (skip && !config.required) {
         return Ok(());
@@ -250,7 +353,7 @@ fn check_local_checks(services: &Services, task: &TaskInfo, skip: bool) -> Resul
     let Some(run) = services.checks.latest(task.id) else {
         bail!("run the local checks first");
     };
-    if run.commit != git::commit_of(&task.worktree, "HEAD")? {
+    if run.commit != commit {
         bail!("the local checks ran on an older commit: run them again");
     }
     if run
@@ -275,8 +378,25 @@ fn check_local_checks(services: &Services, task: &TaskInfo, skip: bool) -> Resul
     {
         bail!("the local checks have not all passed");
     }
+    if !run.clean {
+        bail!("the local checks ran with uncommitted changes: commit them and run them again");
+    }
 
     Ok(())
+}
+
+/// The configured checks, the latest run and the latest draft of a task.
+pub(crate) fn panel(services: &Services, id: TaskId) -> Result<PrPanel> {
+    let task = services.projects.task(id)?;
+    let config = services.projects.checks_config(task.project)?;
+
+    Ok(PrPanel {
+        commands: config.commands(),
+        required: config.required,
+        pre_push_hook: git::pre_push_hook(&task.worktree),
+        run: services.checks.latest(id),
+        draft: services.pull_requests.draft(id),
+    })
 }
 
 /// `owner/name` of the project's `origin`, which must be on GitHub.
@@ -344,40 +464,81 @@ pub(crate) fn add_reviewers(services: &Services, id: TaskId, logins: &[String]) 
     Ok(())
 }
 
-/// Merges on GitHub. With "close after merge" the task then closes as Close task does,
-/// unless uncommitted work would be lost; its merged local branch goes too.
+/// Merges on GitHub, but only the commit Swarm pushed, and checks that it really merged.
+/// Then the remote branch goes. With "close after merge" the task closes as Close task
+/// does, unless that would lose uncommitted files or local commits that are not in the
+/// pull request; then its local branch goes too.
 pub(crate) fn merge(services: &Services, id: TaskId, method: MergeMethod) -> Result<()> {
     let _busy = services.pull_requests.begin(id)?;
     let (task, number, repository) = open_pull_request(services, id)?;
 
-    services.pull_requests.github.merge(
-        &Target {
-            worktree: &task.worktree,
-            repository: &repository,
-        },
-        number,
-        method,
-        &task.branch,
-    )?;
+    let head = task
+        .pull_request
+        .as_ref()
+        .map(|link| link.head.clone())
+        .filter(|head| !head.is_empty())
+        .context("Swarm did not record which commit it pushed: push the changes first")?;
+    let target = Target {
+        worktree: &task.worktree,
+        repository: &repository,
+    };
+    let github = &services.pull_requests.github;
 
-    if task.close_after_merge {
-        let check = tasks::close_check(services, id)?;
+    github.merge(&target, number, method, &head)?;
 
-        if check.uncommitted_files == 0 {
-            tasks::close(services, id, &check)
-                .context("the pull request is merged, but the task did not close")?;
+    let merged = github
+        .pull_request(&target, number)
+        .context("gh merged, but Swarm could not read the pull request")?
+        .state
+        == PrState::Merged;
+    if !merged {
+        broadcast_task(services, id)?;
 
-            if let Err(error) = services
-                .projects
-                .delete_merged_branch(task.project, &task.branch)
-            {
-                log::warn!("cannot delete the merged branch {}: {error}", task.branch);
-            }
-
-            return Ok(());
-        }
+        return Ok(());
     }
 
+    if let Err(error) = git::delete_remote_branch(&task.worktree, &task.branch, DELETE_TIMEOUT) {
+        log::warn!("cannot delete the remote branch {}: {error}", task.branch);
+    }
+
+    if !task.close_after_merge {
+        return broadcast_task(services, id);
+    }
+
+    let check = tasks::close_check(services, id)?;
+    let outside = services
+        .projects
+        .commits_outside(task.project, &task.branch, &head)
+        .context("the pull request is merged, but Swarm could not check the local commits")?;
+    if outside > 0 {
+        broadcast_task(services, id)?;
+
+        bail!(
+            "the pull request is merged, but the task stays open: {outside} local {} not in it",
+            if outside == 1 {
+                "commit is"
+            } else {
+                "commits are"
+            }
+        );
+    }
+    if check.uncommitted_files > 0 {
+        return broadcast_task(services, id);
+    }
+
+    tasks::close(services, id, &check)
+        .context("the pull request is merged, but the task did not close")?;
+    if let Err(error) = services
+        .projects
+        .delete_merged_branch(task.project, &task.branch)
+    {
+        log::warn!("cannot delete the merged branch {}: {error}", task.branch);
+    }
+
+    Ok(())
+}
+
+fn broadcast_task(services: &Services, id: TaskId) -> Result<()> {
     let task = services.projects.task(id)?;
     services.clients.broadcast(&Event::TaskChanged { task });
 
@@ -424,6 +585,12 @@ mod tests {
     }
 
     #[test]
+    fn the_push_and_gh_budgets_come_from_the_protocol() {
+        assert_eq!(PUSH_TIMEOUT, Duration::from_secs(PUSH_SECS));
+        assert_eq!(DELETE_TIMEOUT, Duration::from_secs(GH_SECS));
+    }
+
+    #[test]
     fn one_change_per_task_runs_at_a_time() {
         let pull_requests = pull_requests();
 
@@ -452,15 +619,19 @@ mod tests {
             briefed: true,
             approved: Some(1),
             closed: false,
+            pr_base: "develop".to_owned(),
             pull_request: None,
             close_after_merge: false,
         };
 
         let text = draft_request(&task, "## What\n\n- the format");
 
-        assert!(text.contains("branch `swarm/login` into `main`"));
+        assert!(text.contains("branch `swarm/login` into `develop`"));
         assert!(text.contains("git diff main...HEAD"));
-        assert!(text.contains("swarm pr draft --title"));
+        assert!(text.contains("the `pr_draft` tool when you have it"));
+        assert!(text.contains("swarm pr draft --title '<title>' --body-file - <<'EOF'"));
+        assert!(text.contains("backticks or `$`"));
+        assert!(!text.contains("--title \"<title>\""));
         assert!(text.ends_with("## What\n\n- the format"));
     }
 }

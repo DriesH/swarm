@@ -819,6 +819,7 @@ mod tests {
             briefed: true,
             approved: None,
             closed: false,
+            pr_base: "main".to_owned(),
             pull_request: None,
             close_after_merge: false,
         }

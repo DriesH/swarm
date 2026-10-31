@@ -202,9 +202,10 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
         request @ (Request::GithubStatus { .. }
         | Request::ListBranches { .. }
         | Request::RunChecks { .. }
-        | Request::ListChecks { .. }
-        | Request::DraftPr { .. }
-        | Request::CreatePr { .. }
+        | Request::PrPanel { .. }
+        | Request::DraftPr { .. }) => handle_github(services, sink, request),
+        request @ (Request::CreatePr { .. }
+        | Request::UpdatePr { .. }
         | Request::PrStatus { .. }
         | Request::MarkPrReady { .. }
         | Request::AddReviewers { .. }
@@ -349,20 +350,21 @@ fn handle_review(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Requ
         } => {
             let services = Arc::clone(services);
             run_slow(sink, "close-task", call, move |sink| {
-                match tasks::close(&services, task, &confirmed) {
-                    Ok(()) => {
-                        sink.send_event(&Event::Done { call });
-                    }
-                    Err(error) => send_error(sink, call, &error),
-                }
+                // A push or merge of the pull request keeps the worktree in use.
+                let closed = services
+                    .pull_requests
+                    .begin(task)
+                    .and_then(|_busy| tasks::close(&services, task, &confirmed));
+
+                done_or_error(sink, call, closed);
             });
         }
         _ => {}
     }
 }
 
-/// GitHub, local checks and pull requests.
-fn handle_pull_requests(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
+/// GitHub status, branches, local checks and the pull request panel.
+fn handle_github(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
     let services = Arc::clone(services);
 
     match request {
@@ -395,17 +397,33 @@ fn handle_pull_requests(services: &Arc<Services>, sink: &Arc<ClientSink>, reques
                 done_or_error(sink, call, services.checks.start(task));
             });
         }
-        Request::ListChecks { call, task } => {
-            sink.send_event(&Event::Checks {
+        Request::PrPanel { call, task } => {
+            run_slow(
+                sink,
+                "pr-panel",
                 call,
-                run: services.checks.latest(task),
-            });
+                move |sink| match pull_requests::panel(&services, task) {
+                    Ok(panel) => {
+                        sink.send_event(&Event::PrPanel { call, panel });
+                    }
+                    Err(error) => send_error(sink, call, &error),
+                },
+            );
         }
         Request::DraftPr { call, task } => {
             run_slow(sink, "draft-pr", call, move |sink| {
                 done_or_error(sink, call, pull_requests::request_draft(&services, task));
             });
         }
+        _ => {}
+    }
+}
+
+/// Creating, updating, reading and merging the pull request.
+fn handle_pull_requests(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
+    let services = Arc::clone(services);
+
+    match request {
         Request::CreatePr {
             call,
             task,
@@ -423,6 +441,19 @@ fn handle_pull_requests(services: &Arc<Services>, sink: &Arc<ClientSink>, reques
                 };
 
                 done_or_error(sink, call, pull_requests::create(&services, task, &request));
+            });
+        }
+        Request::UpdatePr {
+            call,
+            task,
+            skip_checks,
+        } => {
+            run_slow(sink, "update-pr", call, move |sink| {
+                done_or_error(
+                    sink,
+                    call,
+                    pull_requests::update(&services, task, skip_checks),
+                );
             });
         }
         Request::PrStatus { call, task } => {

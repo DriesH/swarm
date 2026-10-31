@@ -333,6 +333,7 @@ mod tests {
                 name: "Task",
                 branch: "swarm/task",
                 base: "main",
+                pr_base: "main",
                 worktree: Path::new("/repo/.worktrees/task"),
                 ports: &[],
             })

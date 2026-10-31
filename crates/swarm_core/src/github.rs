@@ -8,15 +8,15 @@ use std::time::Duration;
 
 use serde::{Deserialize, Deserializer};
 use swarm_protocol::{
-    GithubCheck, GithubCheckState, GithubStatus, MergeMethod, PrLink, PrState, PullRequest,
-    ReviewState, Reviewer,
+    GH_SECS, GithubCheck, GithubCheckState, GithubStatus, MergeMethod, PrLink, PrState,
+    PullRequest, ReviewState, Reviewer,
 };
 
 use crate::store::unix_millis;
 use crate::{Error, adapters, git, process};
 
 /// How long one `gh` call may run.
-pub const GH_TIMEOUT: Duration = Duration::from_secs(60);
+const GH_TIMEOUT: Duration = Duration::from_secs(GH_SECS);
 
 /// Lines of `gh` output an error carries.
 const ERROR_LINES: usize = 40;
@@ -28,6 +28,9 @@ pub const TITLE_CHARS: usize = 256;
 pub const BODY_CHARS: usize = 65_536;
 
 const HOST: &str = "github.com";
+
+/// The JSON fields of a lookup by branch.
+const FIND_FIELDS: &str = "number,url,state,headRefOid";
 
 /// The JSON fields `PrStatus` reads.
 const VIEW_FIELDS: &str = "number,url,title,state,isDraft,mergeable,mergeStateStatus,statusCheckRollup,reviewRequests,latestReviews";
@@ -99,7 +102,10 @@ pub struct Github {
 #[derive(Debug, Clone, Copy)]
 pub struct NewPullRequest<'a> {
     pub base: &'a str,
+    /// The branch the pull request comes from.
     pub head: &'a str,
+    /// The commit pushed to that branch. The link records it.
+    pub commit: &'a str,
     pub title: &'a str,
     pub body: &'a str,
     pub draft: bool,
@@ -111,6 +117,16 @@ pub struct Target<'a> {
     pub worktree: &'a Path,
     /// `owner/name`. Set as `GH_REPO`, so a fork with more remotes is never ambiguous.
     pub repository: &'a str,
+}
+
+/// A pull request found by the branch it comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchPullRequest {
+    pub number: u64,
+    pub url: String,
+    pub state: PrState,
+    /// The commit GitHub shows as its head.
+    pub head: String,
 }
 
 /// What a successful `gh` call printed.
@@ -275,12 +291,35 @@ impl Github {
 
         let output = self.run(target, &arguments, Some(new.body))?;
 
-        parse_link(&output.stdout).ok_or_else(|| {
+        parse_link(&output.stdout, new.commit).ok_or_else(|| {
             Error::Invalid(format!(
                 "gh made the pull request but printed no link: {}",
                 process::last_lines(output.stdout.trim(), 3)
             ))
         })
+    }
+
+    /// The newest pull request from `branch`, open ones first. `None` when there is none.
+    pub fn find_for_branch(
+        &self,
+        target: &Target<'_>,
+        branch: &str,
+    ) -> Result<Option<BranchPullRequest>, Error> {
+        if branch.starts_with('-') {
+            return Err(Error::Invalid(format!(
+                "the branch {branch:?} must not start with \"-\""
+            )));
+        }
+
+        let output = match self.run(target, &["pr", "view", branch, "--json", FIND_FIELDS], None) {
+            Ok(output) => output,
+            Err(Error::Gh { output, .. }) if output.contains("no pull requests found") => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+
+        parse_branch_pull_request(&output.stdout).map(Some)
     }
 
     /// The pull request as GitHub reports it now.
@@ -320,10 +359,10 @@ impl Github {
         Ok(())
     }
 
-    /// Merges the pull request and deletes its branches. `gh` merges first and deletes
-    /// after, and it cannot remove the local branch while a worktree has it checked out.
-    /// So when `gh` fails but GitHub shows the pull request merged, the merge counts as
-    /// done and the remote branch is removed here.
+    /// Merges the pull request, but only when its head is still `head`. It deletes no
+    /// branch: `gh` would also touch the local branch, which a worktree has checked out.
+    /// A merge queue or auto-merge can leave the pull request open, so the caller reads
+    /// the state afterwards.
     pub fn merge(
         &self,
         target: &Target<'_>,
@@ -338,24 +377,18 @@ impl Github {
             MergeMethod::Rebase => "--rebase",
         };
 
-        let Err(error) = self.run(
+        self.run(
             target,
-            &["pr", "merge", &number_text, flag, "--delete-branch"],
+            &[
+                "pr",
+                "merge",
+                &number_text,
+                flag,
+                "--match-head-commit",
+                head,
+            ],
             None,
-        ) else {
-            return Ok(());
-        };
-
-        match self.pull_request(target, number) {
-            Ok(pull_request) if pull_request.state == PrState::Merged => {}
-            _ => return Err(error),
-        }
-
-        let endpoint = format!("repos/{}/git/refs/heads/{head}", target.repository);
-        if let Err(delete_error) = self.run(target, &["api", "--method", "DELETE", &endpoint], None)
-        {
-            log::debug!("the remote branch {head} is not deleted: {delete_error}");
-        }
+        )?;
 
         Ok(())
     }
@@ -498,8 +531,8 @@ pub fn parse_repository(url: &str) -> Option<String> {
     (valid(owner) && valid(name)).then(|| format!("{owner}/{name}"))
 }
 
-/// The pull request link `gh pr create` prints as its last line.
-fn parse_link(stdout: &str) -> Option<PrLink> {
+/// The pull request link `gh pr create` prints as its last line, pushed at `head`.
+fn parse_link(stdout: &str, head: &str) -> Option<PrLink> {
     let url = stdout
         .lines()
         .map(str::trim)
@@ -509,6 +542,7 @@ fn parse_link(stdout: &str) -> Option<PrLink> {
     Some(PrLink {
         number,
         url: url.to_owned(),
+        head: head.to_owned(),
     })
 }
 
@@ -662,11 +696,7 @@ pub fn parse_pull_request(json: &str, read_at: u64) -> Result<PullRequest, Error
     let view: ViewJson = serde_json::from_str(json)
         .map_err(|error| Error::Invalid(format!("gh printed JSON that cannot be read: {error}")))?;
 
-    let state = match view.state.as_str() {
-        "MERGED" => PrState::Merged,
-        "CLOSED" => PrState::Closed,
-        _ => PrState::Open,
-    };
+    let state = pr_state(&view.state);
     let mergeable = state == PrState::Open
         && !view.is_draft
         && view.mergeable == "MERGEABLE"
@@ -686,6 +716,38 @@ pub fn parse_pull_request(json: &str, read_at: u64) -> Result<PullRequest, Error
         mergeable,
         read_at,
     })
+}
+
+#[derive(Deserialize)]
+struct BranchJson {
+    number: u64,
+    #[serde(deserialize_with = "text_or_empty")]
+    url: String,
+    #[serde(deserialize_with = "text_or_empty")]
+    state: String,
+    #[serde(rename = "headRefOid", default, deserialize_with = "text_or_empty")]
+    head: String,
+}
+
+/// Reads the JSON of `gh pr view <branch> --json` ([`FIND_FIELDS`]).
+fn parse_branch_pull_request(json: &str) -> Result<BranchPullRequest, Error> {
+    let view: BranchJson = serde_json::from_str(json)
+        .map_err(|error| Error::Invalid(format!("gh printed JSON that cannot be read: {error}")))?;
+
+    Ok(BranchPullRequest {
+        number: view.number,
+        url: view.url,
+        state: pr_state(&view.state),
+        head: view.head,
+    })
+}
+
+fn pr_state(state: &str) -> PrState {
+    match state {
+        "MERGED" => PrState::Merged,
+        "CLOSED" => PrState::Closed,
+        _ => PrState::Open,
+    }
 }
 
 fn github_check(entry: RollupJson) -> GithubCheck {
@@ -819,6 +881,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_gh_call_gets_the_time_the_client_budgets() {
+        assert_eq!(GH_TIMEOUT, Duration::from_secs(GH_SECS));
+    }
+
+    #[test]
     fn https_remotes_give_the_repository() {
         for url in [
             "https://github.com/acme/widgets",
@@ -901,14 +968,18 @@ mod tests {
         let stdout = "Creating pull request for swarm/x into main\n\nhttps://github.com/acme/widgets/pull/42\n";
 
         assert_eq!(
-            parse_link(stdout),
+            parse_link(stdout, "abc"),
             Some(PrLink {
                 number: 42,
-                url: "https://github.com/acme/widgets/pull/42".to_owned()
+                url: "https://github.com/acme/widgets/pull/42".to_owned(),
+                head: "abc".to_owned(),
             })
         );
-        assert_eq!(parse_link("no link here"), None);
-        assert_eq!(parse_link("https://github.com/acme/widgets/pull/x"), None);
+        assert_eq!(parse_link("no link here", "abc"), None);
+        assert_eq!(
+            parse_link("https://github.com/acme/widgets/pull/x", "abc"),
+            None
+        );
     }
 
     #[test]
@@ -1163,6 +1234,25 @@ mod tests {
         assert_eq!(closed.state, PrState::Closed);
         assert!(merged.checks.is_empty());
         assert!(!merged.mergeable);
+    }
+
+    #[test]
+    fn a_pull_request_found_by_branch_has_its_state_and_head() {
+        let found = parse_branch_pull_request(
+            r#"{"number":7,"url":"https://github.com/acme/widgets/pull/7","state":"CLOSED","headRefOid":"abc123"}"#,
+        )
+        .expect("parse");
+
+        assert_eq!(
+            found,
+            BranchPullRequest {
+                number: 7,
+                url: "https://github.com/acme/widgets/pull/7".to_owned(),
+                state: PrState::Closed,
+                head: "abc123".to_owned(),
+            }
+        );
+        assert!(parse_branch_pull_request("{}").is_err());
     }
 
     #[test]

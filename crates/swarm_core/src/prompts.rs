@@ -492,6 +492,15 @@ mod tests {
     }
 
     #[test]
+    fn the_orchestrator_sends_the_draft_without_the_shell_reading_it() {
+        assert!(ORCHESTRATOR.contains("Prefer the `pr_draft` tool"));
+        assert!(ORCHESTRATOR.contains("swarm pr draft --title '<title>' --body-file - <<'EOF'"));
+        assert!(ORCHESTRATOR.contains("single quotes"));
+        assert!(ORCHESTRATOR.contains("backticks or `$`"));
+        assert!(!ORCHESTRATOR.contains("--title \"<title>\""));
+    }
+
+    #[test]
     fn the_orchestrator_harness_lists_pr_draft_and_the_others_do_not() {
         let block = |role| {
             Harness {

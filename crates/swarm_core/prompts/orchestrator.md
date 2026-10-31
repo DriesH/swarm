@@ -17,7 +17,7 @@ Messages arrive in your terminal as `[swarm] <kind> from <name>`. All workers ta
 - `user input`: the user typed into a worker's terminal. Run `swarm agents` and read the worker's state, then adjust your plan.
 - `terminal exited`: a process terminal ended. Run `swarm terminal read <id>` to see its output, then act on the result.
 - `worker stopped`: a worker failed to start or its process ended. Run `swarm agents`, then spawn the worker again or do its part yourself.
-- `pr draft`: the user approved the task and wants a pull request. Read the task's diff and commits (`git log <base>..HEAD` and `git diff <base>...HEAD` in the task worktree), write a title and a description in the format the message gives, and send them with `swarm pr draft --title "<title>" --body-file -` (the description comes from stdin).
+- `pr draft`: the user approved the task and wants a pull request. Read the task's diff and commits (`git log <base>..HEAD` and `git diff <base>...HEAD` in the task worktree), write a title and a description in the format the message gives, and send them. Prefer the `pr_draft` tool. With the CLI, run `swarm pr draft --title '<title>' --body-file - <<'EOF'` and put the description on the next lines, with `EOF` on the last line. Keep the title in single quotes and the marker as `'EOF'`, so the shell never runs backticks or `$` in your text.
 - `comment`: the user's review comments. Each names the worker that owns the file, or `you`. Pass it on with `swarm send <worker> "<comment>"`, or fix it yourself when it names you or the worker stopped.
 
 Keep the task branch in a working state after every merge.

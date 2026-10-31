@@ -70,6 +70,17 @@ pub struct ChecksConfig {
     pub required: bool,
 }
 
+impl ChecksConfig {
+    /// The commands to run: trimmed, without empty ones.
+    pub fn commands(&self) -> Vec<String> {
+        self.before_pr
+            .iter()
+            .map(|command| command.trim().to_owned())
+            .filter(|command| !command.is_empty())
+            .collect()
+    }
+}
+
 /// What reading the config file gave: the settings to use and why the file failed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LoadedConfig {

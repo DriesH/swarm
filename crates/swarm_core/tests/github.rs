@@ -459,19 +459,78 @@ fn repo_with_origin(name: &str) -> (Folder, Folder) {
     (repo, origin)
 }
 
+fn head_of(folder: &Path) -> String {
+    git_in(folder, &["rev-parse", "HEAD"])
+}
+
 #[test]
-fn pushing_sets_the_upstream_on_origin() {
+fn pushing_sends_exactly_the_commit_and_tracking_sets_the_upstream() {
     let (repo, origin) = repo_with_origin("push");
+    let pushed = head_of(repo.path());
+    std::fs::write(repo.path().join("later.txt"), "later\n").expect("file");
+    git_in(repo.path(), &["add", "later.txt"]);
+    git_in(repo.path(), &["commit", "-q", "-m", "later"]);
 
-    git::push_branch(repo.path(), "swarm/login", Duration::from_secs(60)).expect("push");
+    git::push_commit(repo.path(), &pushed, "swarm/login", Duration::from_secs(60)).expect("push");
+    git::track_origin(repo.path(), "swarm/login").expect("track");
 
-    let remote = git_in(origin.path(), &["branch", "--list", "swarm/login"]);
-    assert!(remote.contains("swarm/login"), "{remote}");
+    assert_eq!(
+        git_in(origin.path(), &["rev-parse", "swarm/login"]),
+        pushed,
+        "the commit made after is not on origin"
+    );
     let upstream = git_in(
         repo.path(),
         &["rev-parse", "--abbrev-ref", "swarm/login@{upstream}"],
     );
     assert_eq!(upstream, "origin/swarm/login");
+}
+
+#[test]
+fn a_push_that_is_not_a_fast_forward_is_rejected_with_gits_output() {
+    let (repo, origin) = repo_with_origin("push-diverged");
+    git::push_commit(
+        repo.path(),
+        &head_of(repo.path()),
+        "swarm/login",
+        Duration::from_secs(60),
+    )
+    .expect("first push");
+    git_in(repo.path(), &["commit", "-q", "--amend", "-m", "rewritten"]);
+    let rewritten = head_of(repo.path());
+
+    let error = git::push_commit(
+        repo.path(),
+        &rewritten,
+        "swarm/login",
+        Duration::from_secs(60),
+    )
+    .expect_err("rejected");
+
+    let message = error.to_string();
+    assert!(message.starts_with("git push failed:\n"), "{message}");
+    assert!(message.contains("rejected"), "{message}");
+    assert_ne!(
+        git_in(origin.path(), &["rev-parse", "swarm/login"]),
+        rewritten
+    );
+}
+
+#[test]
+fn only_a_full_commit_id_and_a_plain_branch_name_are_pushed() {
+    let (repo, _origin) = repo_with_origin("push-args");
+    let commit = head_of(repo.path());
+
+    for (id, branch) in [
+        ("swarm/login", "swarm/login"),
+        (&commit[..12], "swarm/login"),
+        (&commit, "-x"),
+    ] {
+        assert!(
+            git::push_commit(repo.path(), id, branch, Duration::from_secs(60)).is_err(),
+            "{id} {branch}"
+        );
+    }
 }
 
 #[test]
@@ -482,8 +541,13 @@ fn a_failing_pre_push_hook_puts_its_last_lines_in_the_error() {
         "#!/bin/sh\nfor n in $(seq 1 60); do echo \"hook line $n\"; done\necho 'tests failed' >&2\nexit 1\n",
     );
 
-    let error = git::push_branch(repo.path(), "swarm/login", Duration::from_secs(60))
-        .expect_err("the hook fails");
+    let error = git::push_commit(
+        repo.path(),
+        &head_of(repo.path()),
+        "swarm/login",
+        Duration::from_secs(60),
+    )
+    .expect_err("the hook fails");
 
     let message = error.to_string();
     assert!(message.starts_with("git push failed:\n"), "{message}");
@@ -503,8 +567,13 @@ fn a_push_to_a_missing_origin_carries_gits_message() {
     let repo = repo("push-missing");
     git_in(repo.path(), &["switch", "-q", "-c", "swarm/login"]);
 
-    let error = git::push_branch(repo.path(), "swarm/login", Duration::from_secs(60))
-        .expect_err("no origin");
+    let error = git::push_commit(
+        repo.path(),
+        &head_of(repo.path()),
+        "swarm/login",
+        Duration::from_secs(60),
+    )
+    .expect_err("no origin");
 
     assert!(error.to_string().starts_with("git push failed"), "{error}");
 }
@@ -518,12 +587,102 @@ fn a_push_that_takes_too_long_is_stopped() {
     );
 
     let started = std::time::Instant::now();
-    let error = git::push_branch(repo.path(), "swarm/login", Duration::from_millis(500))
-        .expect_err("the push hangs");
+    let error = git::push_commit(
+        repo.path(),
+        &head_of(repo.path()),
+        "swarm/login",
+        Duration::from_millis(500),
+    )
+    .expect_err("the push hangs");
 
     assert!(error.to_string().contains("took longer than"), "{error}");
     assert!(error.to_string().contains("slow"), "{error}");
     assert!(started.elapsed() < Duration::from_secs(15));
+}
+
+#[test]
+fn deleting_a_remote_branch_skips_the_hook_and_a_missing_branch_is_fine() {
+    let (repo, origin) = repo_with_origin("delete-remote");
+    let commit = head_of(repo.path());
+    git::push_commit(repo.path(), &commit, "swarm/login", Duration::from_secs(60)).expect("push");
+    make_executable(
+        &repo.path().join(".git/hooks/pre-push"),
+        "#!/bin/sh\necho hook ran > hook-ran\nexit 1\n",
+    );
+
+    git::delete_remote_branch(repo.path(), "swarm/login", Duration::from_secs(60))
+        .expect("deleted");
+    git::delete_remote_branch(repo.path(), "swarm/login", Duration::from_secs(60))
+        .expect("a missing branch is fine");
+
+    assert!(git_in(origin.path(), &["branch", "--list", "swarm/login"]).is_empty());
+    assert!(!repo.path().join("hook-ran").exists());
+    assert!(git::delete_remote_branch(repo.path(), "-x", Duration::from_secs(60)).is_err());
+}
+
+#[test]
+fn the_branch_head_is_read_together_with_the_branch_it_is_on() {
+    let (repo, _origin) = repo_with_origin("branch-head");
+    let commit = head_of(repo.path());
+
+    assert_eq!(
+        git::branch_head(repo.path(), "swarm/login").expect("on the branch"),
+        commit
+    );
+
+    let other = git::branch_head(repo.path(), "swarm/other").expect_err("another branch");
+    assert!(
+        other.to_string().contains("not on the task branch"),
+        "{other}"
+    );
+
+    git_in(repo.path(), &["checkout", "-q", "--detach"]);
+    let detached = git::branch_head(repo.path(), "swarm/login").expect_err("detached");
+    assert!(
+        detached.to_string().contains("not on the task branch"),
+        "{detached}"
+    );
+}
+
+#[test]
+fn commits_not_in_a_pushed_head_are_counted() {
+    let repo = repo("commits-outside");
+    let pushed = head_of(repo.path());
+    for name in ["one", "two"] {
+        std::fs::write(repo.path().join(name), name).expect("file");
+        git_in(repo.path(), &["add", name]);
+        git_in(repo.path(), &["commit", "-q", "-m", name]);
+    }
+
+    assert_eq!(
+        git::commits_not_in(repo.path(), "main", &pushed).expect("count"),
+        2
+    );
+    assert_eq!(
+        git::commits_not_in(repo.path(), "main", &head_of(repo.path())).expect("count"),
+        0
+    );
+    assert_eq!(
+        git::commits_not_in(repo.path(), &pushed, "main").expect("count"),
+        0
+    );
+}
+
+#[test]
+fn a_remote_tracking_branch_is_found_without_the_network() {
+    let (repo, _origin) = repo_with_origin("origin-branch");
+    assert!(!git::origin_has_branch(repo.path(), "swarm/login").expect("none yet"));
+
+    git::push_commit(
+        repo.path(),
+        &head_of(repo.path()),
+        "swarm/login",
+        Duration::from_secs(60),
+    )
+    .expect("push");
+
+    assert!(git::origin_has_branch(repo.path(), "swarm/login").expect("tracked"));
+    assert!(!git::origin_has_branch(repo.path(), "swarm/other").expect("other"));
 }
 
 fn target(worktree: &Path) -> Target<'_> {
@@ -551,6 +710,7 @@ fn creating_a_pull_request_passes_the_body_on_stdin_and_reads_the_link() {
             &NewPullRequest {
                 base: "main",
                 head: "swarm/login",
+                commit: "abc123",
                 title: "Add login; rm -rf /",
                 body,
                 draft: true,
@@ -562,7 +722,8 @@ fn creating_a_pull_request_passes_the_body_on_stdin_and_reads_the_link() {
         link,
         PrLink {
             number: 42,
-            url: "https://github.com/acme/widgets/pull/42".to_owned()
+            url: "https://github.com/acme/widgets/pull/42".to_owned(),
+            head: "abc123".to_owned(),
         }
     );
     assert_eq!(
@@ -602,6 +763,7 @@ fn a_pull_request_that_is_not_a_draft_leaves_out_the_flag() {
             &NewPullRequest {
                 base: "develop",
                 head: "swarm/login",
+                commit: "abc123",
                 title: "T",
                 body: "",
                 draft: false,
@@ -630,6 +792,7 @@ fn a_failed_create_carries_ghs_message() {
             &NewPullRequest {
                 base: "main",
                 head: "swarm/login",
+                commit: "abc123",
                 title: "T",
                 body: "B",
                 draft: false,
@@ -746,7 +909,7 @@ fn a_reviewer_that_is_not_a_login_never_reaches_gh() {
 }
 
 #[test]
-fn each_merge_method_has_its_flag_and_deletes_the_branch() {
+fn each_merge_method_has_its_flag_and_names_the_commit_but_never_deletes_a_branch() {
     let gh = FakeGh::new("merge");
     let bin = Folder::new("merge-bin");
     let worktree = Folder::new("merge-worktree");
@@ -754,84 +917,116 @@ fn each_merge_method_has_its_flag_and_deletes_the_branch() {
 
     for method in [MergeMethod::Squash, MergeMethod::Merge, MergeMethod::Rebase] {
         github
-            .merge(&target(worktree.path()), 42, method, "swarm/login")
+            .merge(&target(worktree.path()), 42, method, "abc123")
             .expect("merge");
     }
 
     assert_eq!(
         gh.calls(),
         [
-            vec!["pr", "merge", "42", "--squash", "--delete-branch"],
-            vec!["pr", "merge", "42", "--merge", "--delete-branch"],
-            vec!["pr", "merge", "42", "--rebase", "--delete-branch"],
+            vec![
+                "pr",
+                "merge",
+                "42",
+                "--squash",
+                "--match-head-commit",
+                "abc123"
+            ],
+            vec![
+                "pr",
+                "merge",
+                "42",
+                "--merge",
+                "--match-head-commit",
+                "abc123"
+            ],
+            vec![
+                "pr",
+                "merge",
+                "42",
+                "--rebase",
+                "--match-head-commit",
+                "abc123"
+            ],
         ]
     );
 }
 
 #[test]
-fn a_merge_whose_branch_cleanup_failed_still_counts_when_github_shows_it_merged() {
-    let gh = FakeGh::new("merge-cleanup");
-    gh.fail(
-        "pr-merge",
-        "failed to delete local branch swarm/login: cannot delete branch checked out at /repo/.worktrees/login",
-    );
-    gh.answer(
-        "pr-view",
-        r#"{"number":42,"url":"u","title":"t","state":"MERGED","isDraft":false,"mergeable":"UNKNOWN","mergeStateStatus":"UNKNOWN","statusCheckRollup":null,"reviewRequests":[],"latestReviews":[]}"#,
-        0,
-    );
-    let bin = Folder::new("merge-cleanup-bin");
-    let worktree = Folder::new("merge-cleanup-worktree");
-
-    github(&gh, bin.path())
-        .merge(
-            &target(worktree.path()),
-            42,
-            MergeMethod::Squash,
-            "swarm/login",
-        )
-        .expect("merged");
-
-    let calls = gh.calls();
-    assert_eq!(calls[0][..2], ["pr", "merge"]);
-    assert_eq!(calls[1][..2], ["pr", "view"]);
-    assert_eq!(
-        calls[2],
-        [
-            "api",
-            "--method",
-            "DELETE",
-            "repos/acme/widgets/git/refs/heads/swarm/login"
-        ]
-    );
-}
-
-#[test]
-fn a_merge_that_failed_and_is_not_merged_is_an_error() {
+fn a_failed_merge_is_an_error_and_nothing_else_runs() {
     let gh = FakeGh::new("merge-fail");
     gh.fail(
         "pr-merge",
-        "Pull request is not mergeable: the base branch policy prohibits the merge.",
-    );
-    gh.answer(
-        "pr-view",
-        r#"{"number":42,"url":"u","title":"t","state":"OPEN","isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"BLOCKED","statusCheckRollup":[],"reviewRequests":[],"latestReviews":[]}"#,
-        0,
+        "Head branch was modified. Review and try the merge again.",
     );
     let bin = Folder::new("merge-fail-bin");
     let worktree = Folder::new("merge-fail-worktree");
 
     let error = github(&gh, bin.path())
-        .merge(
-            &target(worktree.path()),
-            42,
-            MergeMethod::Squash,
-            "swarm/login",
-        )
+        .merge(&target(worktree.path()), 42, MergeMethod::Squash, "abc123")
         .expect_err("not merged");
 
-    assert!(error.to_string().contains("policy prohibits"), "{error}");
-    assert!(gh.calls().iter().all(|call| call[0] != "api"));
+    assert!(
+        error.to_string().contains("Head branch was modified"),
+        "{error}"
+    );
+    assert_eq!(gh.calls().len(), 1, "no view and no api call");
+}
+
+#[test]
+fn a_pull_request_is_found_by_its_branch_and_none_is_not_an_error() {
+    let gh = FakeGh::new("find");
+    gh.answer(
+        "pr-view",
+        r#"{"number":9,"url":"https://github.com/acme/widgets/pull/9","state":"OPEN","headRefOid":"abc"}"#,
+        0,
+    );
+    let bin = Folder::new("find-bin");
+    let worktree = Folder::new("find-worktree");
+    let github = github(&gh, bin.path());
+
+    let found = github
+        .find_for_branch(&target(worktree.path()), "swarm/login")
+        .expect("lookup")
+        .expect("found");
+    assert_eq!(found.number, 9);
+    assert_eq!(found.state, swarm_protocol::PrState::Open);
+    assert_eq!(found.head, "abc");
+    assert_eq!(
+        gh.calls(),
+        [[
+            "pr",
+            "view",
+            "swarm/login",
+            "--json",
+            "number,url,state,headRefOid"
+        ]
+        .map(str::to_owned)
+        .to_vec()]
+    );
+
+    gh.fail(
+        "pr-view",
+        "no pull requests found for branch \"swarm/login\"",
+    );
+    assert_eq!(
+        github
+            .find_for_branch(&target(worktree.path()), "swarm/login")
+            .expect("lookup"),
+        None
+    );
+
+    gh.fail("pr-view", "HTTP 502");
+    assert!(
+        github
+            .find_for_branch(&target(worktree.path()), "swarm/login")
+            .is_err()
+    );
+    assert!(
+        github
+            .find_for_branch(&target(worktree.path()), "--web")
+            .is_err()
+    );
 }
 
 #[test]
@@ -1079,6 +1274,7 @@ fn the_pull_request_and_the_after_merge_choice_are_recorded_on_the_task() {
     let link = PrLink {
         number: 7,
         url: "https://github.com/acme/widgets/pull/7".to_owned(),
+        head: "a".repeat(40),
     };
 
     let saved = projects
@@ -1146,4 +1342,157 @@ fn a_merged_branch_is_deleted_from_the_project_and_a_missing_one_is_fine() {
         .expect("again");
 
     assert!(!git::branch_exists(repo.path(), &task.branch).expect("gone"));
+}
+
+fn commit_file(folder: &Path, name: &str) -> String {
+    std::fs::write(folder.join(name), name).expect("file");
+    git_in(folder, &["add", name]);
+    git_in(folder, &["commit", "-q", "-m", name]);
+
+    head_of(folder)
+}
+
+#[test]
+fn approval_is_checked_at_the_commit_given_and_a_diff_names_its_head() {
+    use swarm_protocol::ReviewSource;
+
+    let (projects, task, _repo) = project_with_task();
+    let approved = commit_file(&task.worktree, "login.rs");
+    let merged = projects
+        .task_diff(task.id, ReviewSource::Merged)
+        .expect("diff");
+    assert_eq!(merged.head, approved);
+    projects
+        .approve(task.id, merged.fingerprint)
+        .expect("approve");
+
+    let later = commit_file(&task.worktree, "more.rs");
+
+    projects
+        .check_approved_at(task.id, &approved)
+        .expect("approved at the commit that was reviewed");
+    let error = projects
+        .check_approved_at(task.id, &later)
+        .expect_err("the later commit was not reviewed");
+    assert!(error.to_string().contains("changed since"), "{error}");
+    let error = projects.check_approved(task.id).expect_err("HEAD moved");
+    assert!(error.to_string().contains("changed since"), "{error}");
+    for source in [ReviewSource::Merged, ReviewSource::Live] {
+        let diff = projects.task_diff(task.id, source).expect("diff");
+        assert_eq!(diff.head, later, "{source:?}");
+    }
+}
+
+#[test]
+fn a_pull_request_goes_into_the_branch_the_task_started_from_when_origin_has_it() {
+    let (repo, _origin) = repo_with_origin("pr-base");
+    git::push_commit(
+        repo.path(),
+        &head_of(repo.path()),
+        "swarm/login",
+        Duration::from_secs(60),
+    )
+    .expect("push");
+    git_in(repo.path(), &["branch", "local-only", "swarm/login"]);
+    git_in(repo.path(), &["switch", "-q", "main"]);
+    let projects = Projects::new(Arc::new(Mutex::new(
+        Store::open_in_memory().expect("store"),
+    )));
+    let project = projects.add(repo.path()).expect("project");
+    let make = |name: &str, from: Option<&str>| {
+        projects
+            .create_task(&CreateTask {
+                project: project.id,
+                name: name.to_owned(),
+                from: from.map(str::to_owned),
+                run_setup: false,
+                orchestrator: None,
+                first_message: None,
+            })
+            .expect("task")
+            .task
+    };
+
+    let default = make("default", None);
+    let remote = make("remote", Some("swarm/login"));
+    let local = make("local", Some("local-only"));
+
+    assert_eq!(
+        (default.base.as_str(), default.pr_base.as_str()),
+        ("main", "main")
+    );
+    assert_eq!(
+        (remote.base.as_str(), remote.pr_base.as_str()),
+        ("swarm/login", "swarm/login")
+    );
+    assert_eq!(
+        (local.base.as_str(), local.pr_base.as_str()),
+        ("local-only", "main"),
+        "origin does not have it, so the pull request goes into the project base"
+    );
+    assert_eq!(
+        projects.task(remote.id).expect("task").pr_base,
+        "swarm/login"
+    );
+}
+
+#[test]
+fn a_task_from_before_the_pr_base_was_recorded_gets_the_project_base_branch() {
+    let repo = repo("pr-base-old");
+    let database = Folder::new("pr-base-old-db");
+    let path = database.path().join("swarm.db");
+    let projects = Projects::new(Arc::new(Mutex::new(Store::open(&path).expect("store"))));
+    let project = projects.add(repo.path()).expect("project");
+    let task = projects
+        .create_task(&CreateTask {
+            project: project.id,
+            name: "Old".to_owned(),
+            from: None,
+            run_setup: false,
+            orchestrator: None,
+            first_message: None,
+        })
+        .expect("task")
+        .task;
+    rusqlite::Connection::open(&path)
+        .expect("database")
+        .execute("UPDATE tasks SET pr_base = NULL", [])
+        .expect("old row");
+
+    assert_eq!(projects.task(task.id).expect("task").pr_base, "main");
+    assert_eq!(projects.list().expect("list")[0].tasks[0].pr_base, "main");
+}
+
+#[test]
+fn the_pushed_commit_is_recorded_and_local_commits_outside_it_are_counted() {
+    let (projects, task, _repo) = project_with_task();
+    let pushed = commit_file(&task.worktree, "login.rs");
+    let link = PrLink {
+        number: 7,
+        url: "https://github.com/acme/widgets/pull/7".to_owned(),
+        head: pushed.clone(),
+    };
+    projects
+        .set_pull_request(task.id, &link, false)
+        .expect("save");
+    assert_eq!(
+        projects
+            .commits_outside(task.project, &task.branch, &pushed)
+            .expect("count"),
+        0
+    );
+
+    let newer = commit_file(&task.worktree, "more.rs");
+    assert_eq!(
+        projects
+            .commits_outside(task.project, &task.branch, &pushed)
+            .expect("count"),
+        1
+    );
+
+    let updated = projects
+        .set_pull_request_head(task.id, &newer)
+        .expect("head");
+    let stored = updated.pull_request.expect("link");
+    assert_eq!((stored.number, stored.head), (7, newer));
 }

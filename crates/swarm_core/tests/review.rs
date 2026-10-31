@@ -673,6 +673,7 @@ fn a_fingerprint_with_the_top_bit_set_survives_the_database() {
             name: "t",
             branch: "swarm/t",
             base: "main",
+            pr_base: "main",
             worktree: Path::new("/repo/.worktrees/t"),
             ports: &[],
         })

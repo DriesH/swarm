@@ -105,16 +105,13 @@ impl Checks {
         }
 
         let config = self.projects.checks_config(task.project)?;
-        let commands: Vec<String> = config
-            .before_pr
-            .iter()
-            .map(|command| command.trim().to_owned())
-            .filter(|command| !command.is_empty())
-            .collect();
+        let commands = config.commands();
 
+        let commit = git::commit_of(&task.worktree, "HEAD")?;
         let run = ChecksRun {
             task: id,
-            commit: git::commit_of(&task.worktree, "HEAD")?,
+            clean: untouched(&task, &commit),
+            commit,
             required: config.required,
             checks: commands
                 .iter()
@@ -228,19 +225,36 @@ impl Checks {
     }
 
     fn run_all(&self, task: &TaskInfo, commands: &[String], generation: u64) {
+        let Some(commit) = lock(&self.slots)
+            .get(&task.id)
+            .filter(|slot| slot.generation == generation)
+            .map(|slot| slot.run.commit.clone())
+        else {
+            return;
+        };
+
         for (index, command) in commands.iter().enumerate() {
             if !self.owns(task.id, generation) {
                 return;
             }
 
-            if !self.run_one(task, index, command, generation) {
+            if !self.run_one(task, &commit, index, command, generation) {
                 return;
             }
         }
     }
 
-    /// True when the check passed and the next one may run.
-    fn run_one(&self, task: &TaskInfo, index: usize, command: &str, generation: u64) -> bool {
+    /// True when the check passed and the next one may run. A check that does not run
+    /// leaves the later ones skipped. After each check the worktree must still be at
+    /// `commit` with no uncommitted files, or the run stops counting as clean.
+    fn run_one(
+        &self,
+        task: &TaskInfo,
+        commit: &str,
+        index: usize,
+        command: &str,
+        generation: u64,
+    ) -> bool {
         let started = Instant::now();
         let (exited, exit_receiver) = flume::bounded(1);
 
@@ -251,6 +265,8 @@ impl Checks {
                 log::error!("cannot start the check {command:?}: {error:#}");
                 self.update(task.id, generation, |slot| {
                     slot.run.checks[index].state = CheckState::Failed;
+                    slot.run.clean &= untouched(task, commit);
+                    skip_rest(&mut slot.run, index);
                 });
 
                 return false;
@@ -273,6 +289,7 @@ impl Checks {
         let exit = exit_receiver.recv().ok().flatten();
         let duration = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let closing = self.agents.is_closing(Some(task.id));
+        let untouched = untouched(task, commit);
 
         let mut passed = false;
         self.update(task.id, generation, |slot| {
@@ -292,12 +309,16 @@ impl Checks {
             check.state = state;
             check.exit = exit;
             check.duration_ms = Some(duration);
+            slot.run.clean &= untouched;
 
-            // The user ended the run; a failure leaves the rest waiting.
-            if state == CheckState::Stopped {
-                for later in &mut slot.run.checks[index + 1..] {
-                    later.state = CheckState::Stopped;
+            match state {
+                CheckState::Stopped => {
+                    for later in &mut slot.run.checks[index + 1..] {
+                        later.state = CheckState::Stopped;
+                    }
                 }
+                CheckState::Failed => skip_rest(&mut slot.run, index),
+                _ => {}
             }
         });
 
@@ -367,4 +388,18 @@ impl Checks {
 
         true
     }
+}
+
+/// The checks after `index` will not run.
+fn skip_rest(run: &mut ChecksRun, index: usize) {
+    for later in &mut run.checks[index + 1..] {
+        later.state = CheckState::Skipped;
+    }
+}
+
+/// True when the worktree is at `commit` and has no uncommitted files. Ignored files do
+/// not count. A git failure counts as touched.
+fn untouched(task: &TaskInfo, commit: &str) -> bool {
+    git::commit_of(&task.worktree, "HEAD").is_ok_and(|head| head == commit)
+        && git::uncommitted_files(&task.worktree).is_ok_and(|count| count == 0)
 }

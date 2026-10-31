@@ -148,6 +148,8 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE tasks ADD COLUMN pr_number INTEGER;
     ALTER TABLE tasks ADD COLUMN pr_url TEXT;
     ALTER TABLE tasks ADD COLUMN close_after_merge INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE tasks ADD COLUMN pr_head TEXT;
+    ALTER TABLE tasks ADD COLUMN pr_base TEXT",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,6 +205,8 @@ pub struct NewTask<'a> {
     pub name: &'a str,
     pub branch: &'a str,
     pub base: &'a str,
+    /// The branch the pull request merges into.
+    pub pr_base: &'a str,
     pub worktree: &'a Path,
     pub ports: &'a [u16],
 }
@@ -516,8 +520,8 @@ impl Store {
 
         self.connection.execute(
             "INSERT INTO tasks (project, name, branch, base, worktree, ports, created_at,
-                 created_by)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 created_by, pr_base)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 to_row(task.project.0)?,
                 task.name,
@@ -526,7 +530,8 @@ impl Store {
                 task.worktree.to_string_lossy(),
                 ports,
                 now_seconds(),
-                creator
+                creator,
+                task.pr_base
             ],
         )?;
 
@@ -545,6 +550,7 @@ impl Store {
             briefed: false,
             approved: None,
             closed: false,
+            pr_base: task.pr_base.to_owned(),
             pull_request: None,
             close_after_merge: false,
         })
@@ -619,13 +625,25 @@ impl Store {
         close_after_merge: bool,
     ) -> Result<(), Error> {
         self.connection.execute(
-            "UPDATE tasks SET pr_number = ?1, pr_url = ?2, close_after_merge = ?3 WHERE id = ?4",
+            "UPDATE tasks SET pr_number = ?1, pr_url = ?2, pr_head = ?3, close_after_merge = ?4
+             WHERE id = ?5",
             params![
                 to_row(link.number)?,
                 link.url,
+                link.head,
                 close_after_merge,
                 to_row(task.0)?
             ],
+        )?;
+
+        Ok(())
+    }
+
+    /// Records the commit last pushed to the task's pull request.
+    pub fn set_pull_request_head(&self, task: TaskId, head: &str) -> Result<(), Error> {
+        self.connection.execute(
+            "UPDATE tasks SET pr_head = ?1 WHERE id = ?2 AND pr_number IS NOT NULL",
+            params![head, to_row(task.0)?],
         )?;
 
         Ok(())
@@ -1321,7 +1339,7 @@ fn agent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAgent> {
 
 const TASK_COLUMNS: &str = "SELECT id, project, name, branch, base, worktree, ports,
     setup_terminal, setup_exit, created_by, briefed, approved, closed_at, pr_number, pr_url,
-    close_after_merge FROM tasks";
+    close_after_merge, pr_head, pr_base FROM tasks";
 
 fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskInfo> {
     let id: i64 = row.get(0)?;
@@ -1335,6 +1353,8 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskInfo> {
     let closed_at: Option<i64> = row.get(12)?;
     let pr_number: Option<i64> = row.get(13)?;
     let pr_url: Option<String> = row.get(14)?;
+    let pr_head: Option<String> = row.get(16)?;
+    let pr_base: Option<String> = row.get(17)?;
 
     Ok(TaskInfo {
         id: TaskId(id.unsigned_abs()),
@@ -1354,9 +1374,12 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskInfo> {
         briefed: row.get(10)?,
         approved: approved.map(|stored| u64::from_ne_bytes(stored.to_ne_bytes())),
         closed: closed_at.is_some(),
+        // Empty for a row from before the column existed; `Projects` fills it in.
+        pr_base: pr_base.unwrap_or_default(),
         pull_request: pr_number.zip(pr_url).map(|(number, url)| PrLink {
             number: number.unsigned_abs(),
             url,
+            head: pr_head.unwrap_or_default(),
         }),
         close_after_merge: row.get(15)?,
     })
@@ -1510,6 +1533,7 @@ mod tests {
             name: "Fix it",
             branch: "swarm/fix-it",
             base: "main",
+            pr_base: "develop",
             worktree: Path::new("/repo/.worktrees/fix-it"),
             ports,
         }
@@ -1991,6 +2015,7 @@ mod tests {
 
         assert_eq!(info.pull_request, None);
         assert!(!info.close_after_merge);
+        assert_eq!(info.pr_base, "develop");
     }
 
     #[test]
@@ -1999,12 +2024,19 @@ mod tests {
         let link = PrLink {
             number: 42,
             url: "https://github.com/acme/widgets/pull/42".to_owned(),
+            head: "a".repeat(40),
         };
 
         store.set_pull_request(task, &link, true).expect("save");
         let info = store.task(task).expect("task").expect("open");
         assert_eq!(info.pull_request, Some(link));
         assert!(info.close_after_merge);
+
+        store
+            .set_pull_request_head(task, &"b".repeat(40))
+            .expect("head");
+        let info = store.task(task).expect("task").expect("open");
+        assert_eq!(info.pull_request.expect("link").head, "b".repeat(40));
 
         store.set_close_after_merge(task, false).expect("flag");
         let info = store.task(task).expect("task").expect("open");
@@ -2013,9 +2045,21 @@ mod tests {
     }
 
     #[test]
+    fn a_pull_request_head_needs_a_pull_request() {
+        let (store, task) = store_with_task();
+
+        store
+            .set_pull_request_head(task, &"b".repeat(40))
+            .expect("head");
+
+        let info = store.task(task).expect("task").expect("open");
+        assert_eq!(info.pull_request, None);
+    }
+
+    #[test]
     fn a_database_from_before_pull_requests_keeps_its_tasks() {
         let connection = Connection::open_in_memory().expect("connection");
-        let before = MIGRATIONS.len() - 1;
+        let before = MIGRATIONS.len() - 2;
         for migration in &MIGRATIONS[..before] {
             connection.execute_batch(migration).expect("old schema");
         }
@@ -2042,6 +2086,41 @@ mod tests {
         assert_eq!(tasks[0].name, "old");
         assert_eq!(tasks[0].pull_request, None);
         assert!(!tasks[0].close_after_merge);
+        assert_eq!(tasks[0].pr_base, "", "unset until the project fills it in");
+    }
+
+    #[test]
+    fn a_pull_request_from_before_the_pushed_commit_was_kept_has_an_empty_head() {
+        let connection = Connection::open_in_memory().expect("connection");
+        let before = MIGRATIONS.len() - 1;
+        for migration in &MIGRATIONS[..before] {
+            connection.execute_batch(migration).expect("old schema");
+        }
+        connection
+            .pragma_update(None, "user_version", i64::try_from(before).expect("count"))
+            .expect("version");
+        connection
+            .execute(
+                "INSERT INTO projects (path, name, added_at) VALUES ('/repo', 'repo', 1)",
+                [],
+            )
+            .expect("project");
+        connection
+            .execute(
+                "INSERT INTO tasks (project, name, branch, base, worktree, ports, created_at,
+                     pr_number, pr_url)
+                 VALUES (1, 'old', 'swarm/old', 'main', '/repo/.worktrees/old', '', 1,
+                     7, 'https://github.com/acme/widgets/pull/7')",
+                [],
+            )
+            .expect("task");
+
+        let store = Store::migrated(connection).expect("migrated");
+
+        let task = &store.list_tasks(ProjectId(1)).expect("tasks")[0];
+        let link = task.pull_request.as_ref().expect("link");
+        assert_eq!(link.number, 7);
+        assert_eq!(link.head, "");
     }
 
     #[test]
