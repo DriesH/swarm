@@ -11,12 +11,18 @@ pub mod prompts;
 pub mod store;
 pub mod task;
 
+use std::collections::HashMap;
+use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use swarm_protocol::{
-    AgentChange, AgentId, AgentInfo, AgentRole, CreateTask, ProjectId, ProjectInfo, TaskId,
-    TaskInfo, TerminalId,
+    AgentChange, AgentId, AgentInfo, AgentLifecycle, AgentRole, CloseCheck, CreateTask, DIFF_FILES,
+    DiffStat, FileChange, ProjectId, ProjectInfo, ReviewSource, TaskDiff, TaskId, TaskInfo,
+    TerminalId,
 };
 use swarm_term::ExitStatus;
 
@@ -85,6 +91,17 @@ pub struct PreparedWorker {
     pub setup: Option<String>,
     /// `SWARM_TASK`, `SWARM_PORT` and `SWARM_PORTS`.
     pub env: Vec<(String, String)>,
+}
+
+/// How long the teardown script may run before it is killed.
+const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// What closing a task changed, for the daemon to tell its clients.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClosedTask {
+    pub task: TaskInfo,
+    /// The agents the close ended that were not `Stopped` yet.
+    pub stopped: Vec<AgentInfo>,
 }
 
 /// Projects and their tasks. Share one value between all clients.
@@ -523,6 +540,230 @@ impl Projects {
         }))
     }
 
+    /// An open task. Unknown and closed tasks are errors.
+    pub fn task(&self, id: TaskId) -> Result<TaskInfo, Error> {
+        lock(&self.store)
+            .task(id)?
+            .ok_or_else(|| Error::Invalid(format!("no open task with id {}", id.0)))
+    }
+
+    /// The changes of a task. `Merged` is the task worktree against its base. `Live`
+    /// adds each worker with its own worktree that is not merged yet.
+    pub fn task_diff(&self, id: TaskId, source: ReviewSource) -> Result<TaskDiff, Error> {
+        // The store lock is gone before git runs.
+        let (task, agents, bases) = {
+            let store = lock(&self.store);
+            let task = store
+                .task(id)?
+                .ok_or_else(|| Error::Invalid(format!("no open task with id {}", id.0)))?;
+            let agents = store.list_agents(id)?;
+
+            let mut bases = HashMap::new();
+            for agent in &agents {
+                bases.insert(agent.id, store.base_commit(agent.id)?);
+            }
+
+            (task, agents, bases)
+        };
+
+        if !task.worktree.is_dir() {
+            return Err(Error::Invalid(format!(
+                "the task worktree {} is missing",
+                task.worktree.display()
+            )));
+        }
+
+        let base = git::merge_base(&task.worktree, &task.base)?;
+        let mut sections = vec![Section {
+            worktree: task.worktree.clone(),
+            base,
+            owner: None,
+        }];
+
+        if source == ReviewSource::Live {
+            for worker in agents
+                .iter()
+                .filter(|agent| agent.role == AgentRole::Worker)
+                .filter(|worker| worker.worktree != task.worktree && worker.worktree.is_dir())
+            {
+                match unmerged_section(&task, worker, bases.get(&worker.id).cloned().flatten()) {
+                    Ok(section) => sections.extend(section),
+                    Err(error) => {
+                        log::warn!("cannot review worker {}: {error}", worker.name);
+                    }
+                }
+            }
+        }
+        sections.sort_by(|one, other| {
+            one.worktree
+                .as_os_str()
+                .as_bytes()
+                .cmp(other.worktree.as_os_str().as_bytes())
+        });
+
+        let names = unique_names(&agents);
+        let mut budget = git::DiffBudget::default();
+        let mut fingerprint = git::Fingerprint::default();
+        fingerprint.write(&[match source {
+            ReviewSource::Live => 1,
+            ReviewSource::Merged => 2,
+        }]);
+
+        let (mut stat, mut files) = (DiffStat::default(), Vec::new());
+        for section in &sections {
+            let changed = match git::worktree_diff(&section.worktree, &section.base, &mut budget) {
+                Ok(changed) => changed,
+                Err(error) if section.owner.is_some() => {
+                    log::warn!("cannot read {}: {error}", section.worktree.display());
+
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let trailers = match section.owner {
+                Some(_) => HashMap::new(),
+                None => git::attribution(&section.worktree, &section.base)?,
+            };
+
+            for mut file in changed {
+                fingerprint.write_text(section.worktree.as_os_str().as_bytes());
+                fingerprint.write_text(&file.raw_path);
+                fingerprint.write(&[match file.diff.change {
+                    FileChange::Added => 1,
+                    FileChange::Modified => 2,
+                    FileChange::Deleted => 3,
+                }]);
+                fingerprint.write_u64(file.digest);
+
+                stat.files = stat.files.saturating_add(1);
+                stat.additions = stat.additions.saturating_add(file.diff.additions);
+                stat.deletions = stat.deletions.saturating_add(file.diff.deletions);
+
+                file.diff.agent = section.owner.or_else(|| {
+                    trailers
+                        .get(&file.raw_path)
+                        .and_then(|name| names.get(name.as_str()).copied().flatten())
+                });
+                if files.len() < DIFF_FILES {
+                    files.push(file.diff);
+                }
+            }
+        }
+
+        Ok(TaskDiff {
+            task: id,
+            source,
+            fingerprint: fingerprint.finish(),
+            stat,
+            files,
+        })
+    }
+
+    /// Stores the approval when the Merged diff still has this fingerprint.
+    pub fn approve(&self, id: TaskId, fingerprint: u64) -> Result<TaskInfo, Error> {
+        let current = self.task_diff(id, ReviewSource::Merged)?;
+        if current.fingerprint != fingerprint {
+            return Err(Error::Invalid(
+                "the changes changed since you reviewed them".to_owned(),
+            ));
+        }
+
+        lock(&self.store).set_approved(id, fingerprint)?;
+
+        self.task(id)
+    }
+
+    /// What closing the task would throw away.
+    pub fn close_check(&self, id: TaskId) -> Result<CloseCheck, Error> {
+        let task = self.task(id)?;
+
+        let mut check = CloseCheck::default();
+        let mut worktrees = Vec::new();
+        if task.worktree.is_dir() {
+            worktrees.push(task.worktree.clone());
+        }
+
+        for agent in &task.agents {
+            if matches!(
+                agent.lifecycle,
+                AgentLifecycle::Starting | AgentLifecycle::Running
+            ) {
+                check.running_agents += 1;
+            }
+
+            let own = agent.role == AgentRole::Worker && agent.worktree != task.worktree;
+            if !own {
+                continue;
+            }
+            if agent.worktree.is_dir() && !worktrees.contains(&agent.worktree) {
+                worktrees.push(agent.worktree.clone());
+            }
+            if task.worktree.is_dir() && !merged(&task, &agent.branch)? {
+                check.unmerged_workers.push(agent.name.clone());
+            }
+        }
+
+        for worktree in worktrees {
+            check.uncommitted_files = check
+                .uncommitted_files
+                .saturating_add(git::uncommitted_files(&worktree)?);
+        }
+
+        Ok(check)
+    }
+
+    /// Runs the teardown script, removes the task worktree and the workers' own
+    /// worktrees (uncommitted changes go with them), keeps every branch and marks the
+    /// task closed. The caller stopped the task's processes first.
+    pub fn close_task(&self, id: TaskId) -> Result<ClosedTask, Error> {
+        let (task, root) = {
+            let store = lock(&self.store);
+            let task = store
+                .task_including_closed(id)?
+                .ok_or_else(|| Error::Invalid(format!("no task with id {}", id.0)))?;
+            if task.closed {
+                return Err(Error::Invalid(format!("task {} is closed already", id.0)));
+            }
+            let root = store
+                .project(task.project)?
+                .ok_or(Error::UnknownProject(task.project.0))?
+                .path;
+
+            (task, root)
+        };
+
+        let LoadedConfig { config, .. } = config::load(&root);
+        if task.worktree.is_dir()
+            && !config.worktrees.teardown.trim().is_empty()
+            && let Err(error) = run_teardown(&config.worktrees.teardown, &task)
+        {
+            log::error!("the teardown of task {} failed: {error}", id.0);
+        }
+
+        let _creating = lock(&self.creating);
+
+        let own = task
+            .agents
+            .iter()
+            .filter(|agent| agent.role == AgentRole::Worker && agent.worktree != task.worktree)
+            .map(|agent| agent.worktree.as_path());
+        for worktree in own.chain([task.worktree.as_path()]) {
+            if worktree.symlink_metadata().is_ok() {
+                git::worktree_remove(&root, worktree)?;
+            }
+        }
+        if let Err(error) = git::worktree_prune(&root) {
+            log::warn!("cannot prune the worktrees of {}: {error}", root.display());
+        }
+
+        let stopped = lock(&self.store).close_task(id)?;
+        let task = lock(&self.store)
+            .task_including_closed(id)?
+            .ok_or_else(|| Error::Invalid(format!("no task with id {}", id.0)))?;
+
+        Ok(ClosedTask { task, stopped })
+    }
+
     /// Ports no task of any project uses, so two projects never share a port.
     fn reserve_ports(&self, config: &ProjectConfig) -> Result<Vec<u16>, Error> {
         let Some(range) = &config.worktrees.ports else {
@@ -581,6 +822,114 @@ impl Projects {
             tasks,
             start: lock(&self.store).start_agent(project.id)?,
         })
+    }
+}
+
+/// One worktree of a task diff and who owns its files.
+struct Section {
+    worktree: PathBuf,
+    base: String,
+    /// The worker that owns the worktree; `None` for the task worktree.
+    owner: Option<AgentId>,
+}
+
+/// The section of a worker with its own worktree, unless the task branch has all of its
+/// work already.
+fn unmerged_section(
+    task: &TaskInfo,
+    worker: &AgentInfo,
+    recorded_base: Option<String>,
+) -> Result<Option<Section>, Error> {
+    let worker_head = git::commit_of(&worker.worktree, "HEAD")?;
+    let task_head = git::commit_of(&task.worktree, "HEAD")?;
+    if git::is_ancestor(&task.worktree, &worker_head, &task_head)?
+        && git::uncommitted_files(&worker.worktree)? == 0
+    {
+        return Ok(None);
+    }
+
+    let base = match recorded_base {
+        Some(base) => base,
+        // Made before the base commit was recorded.
+        None => git::merge_base(&worker.worktree, &task.branch)?,
+    };
+
+    Ok(Some(Section {
+        worktree: worker.worktree.clone(),
+        base,
+        owner: Some(worker.id),
+    }))
+}
+
+/// The task branch has every commit of `branch`.
+fn merged(task: &TaskInfo, branch: &str) -> Result<bool, Error> {
+    git::is_ancestor(&task.worktree, branch, "HEAD")
+}
+
+/// Agent names that belong to one agent of the task. A name two agents share (a worker
+/// called "orchestrator") names nobody, because a trailer cannot tell them apart.
+fn unique_names(agents: &[AgentInfo]) -> HashMap<&str, Option<AgentId>> {
+    let mut names: HashMap<&str, Option<AgentId>> = HashMap::new();
+
+    for agent in agents {
+        names
+            .entry(agent.name.as_str())
+            .and_modify(|owner| *owner = None)
+            .or_insert(Some(agent.id));
+    }
+
+    names
+}
+
+/// Runs the script with `sh -c` in the task worktree, with the setup script's
+/// environment. Kills it after [`TEARDOWN_TIMEOUT`].
+fn run_teardown(script: &str, task: &TaskInfo) -> Result<(), Error> {
+    let io_error = |action: &str| {
+        let action = action.to_owned();
+        move |source| Error::Io { action, source }
+    };
+
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .current_dir(&task.worktree)
+        .envs(task_env(task))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .map_err(io_error("start the teardown script"))?;
+
+    let deadline = Instant::now() + TEARDOWN_TIMEOUT;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(io_error("wait for the teardown"))?
+        {
+            return if status.success() {
+                Ok(())
+            } else {
+                Err(Error::Invalid(format!("the script ended with {status}")))
+            };
+        }
+
+        if Instant::now() >= deadline {
+            if let Ok(group) = libc::pid_t::try_from(child.id()) {
+                // SAFETY: killpg takes plain integers and has no memory effects.
+                unsafe {
+                    libc::killpg(group, libc::SIGKILL);
+                }
+            }
+            child.wait().map_err(io_error("wait for the teardown"))?;
+
+            return Err(Error::Invalid(format!(
+                "the script ran longer than {} seconds",
+                TEARDOWN_TIMEOUT.as_secs()
+            )));
+        }
+
+        std::thread::park_timeout(Duration::from_millis(50));
     }
 }
 

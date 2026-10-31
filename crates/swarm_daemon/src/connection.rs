@@ -196,6 +196,10 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
                 sink.send_event(&Event::AgentChanges { call, changes });
             });
         }
+        request @ (Request::TaskDiff { .. }
+        | Request::ApproveTask { .. }
+        | Request::CheckClose { .. }
+        | Request::CloseTask { .. }) => handle_review(services, sink, request),
         Request::ListProjects { call } => match projects.list() {
             Ok(projects) => {
                 sink.send_event(&Event::Projects { call, projects });
@@ -228,6 +232,80 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
                 }
             });
         }
+    }
+}
+
+/// Review and close: the requests that read a diff, approve or close a task.
+fn handle_review(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
+    let projects = &services.projects;
+
+    match request {
+        Request::TaskDiff {
+            call,
+            task,
+            source,
+            known,
+        } => {
+            let Some(running) = sink.begin_diff() else {
+                send_error(sink, call, &"busy: the previous diff request still runs");
+
+                return;
+            };
+
+            let projects = Arc::clone(projects);
+            run_slow(sink, "task-diff", call, move |sink| {
+                let diff = projects.task_diff(task, source);
+                drop(running);
+
+                match diff {
+                    Ok(diff) => {
+                        let diff = (known != Some(diff.fingerprint)).then_some(diff);
+
+                        sink.send_event(&Event::TaskDiff { call, diff });
+                    }
+                    Err(error) => send_error(sink, call, &error),
+                }
+            });
+        }
+        Request::ApproveTask {
+            call,
+            task,
+            fingerprint,
+        } => {
+            let services = Arc::clone(services);
+            run_slow(sink, "approve-task", call, move |sink| {
+                match services.projects.approve(task, fingerprint) {
+                    Ok(task) => {
+                        services.clients.broadcast(&Event::TaskChanged { task });
+                        sink.send_event(&Event::Done { call });
+                    }
+                    Err(error) => send_error(sink, call, &error),
+                }
+            });
+        }
+        Request::CheckClose { call, task } => {
+            let projects = Arc::clone(projects);
+            run_slow(sink, "check-close", call, move |sink| {
+                match projects.close_check(task) {
+                    Ok(check) => {
+                        sink.send_event(&Event::CloseCheck { call, check });
+                    }
+                    Err(error) => send_error(sink, call, &error),
+                }
+            });
+        }
+        Request::CloseTask { call, task } => {
+            let services = Arc::clone(services);
+            run_slow(sink, "close-task", call, move |sink| {
+                match tasks::close(&services, task) {
+                    Ok(()) => {
+                        sink.send_event(&Event::Done { call });
+                    }
+                    Err(error) => send_error(sink, call, &error),
+                }
+            });
+        }
+        _ => {}
     }
 }
 

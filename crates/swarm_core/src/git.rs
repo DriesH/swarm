@@ -4,11 +4,15 @@ use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io::{Read as _, Write as _};
 use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
-use swarm_protocol::{DiffStat, FILES_LISTED, FileStat};
+use swarm_protocol::{
+    DIFF_FILES, DIFF_LINE_BYTES, DIFF_LINES, DIFF_LINES_PER_FILE, DiffHunk, DiffLine, DiffLineKind,
+    DiffStat, FILES_LISTED, FileChange, FileDiff, FileStat,
+};
 
 use crate::Error;
 
@@ -741,6 +745,696 @@ pub fn add_exclude_line(root: &Path, line: &str) -> Result<(), Error> {
         .open(&path)
         .map_err(io_error("open"))?;
     writeln!(file, "{separator}{line}").map_err(io_error("write"))?;
+
+    Ok(())
+}
+
+/// A stable 64-bit hash (FNV-1a). `DefaultHasher` may change between Rust releases, and
+/// fingerprints must survive a daemon restart.
+#[derive(Debug, Clone, Copy)]
+pub struct Fingerprint(u64);
+
+impl Default for Fingerprint {
+    fn default() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl Fingerprint {
+    pub fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+
+    pub fn write_u64(&mut self, value: u64) {
+        self.write(&value.to_le_bytes());
+    }
+
+    /// Writes the length first, so `("ab", "c")` and `("a", "bc")` differ.
+    pub fn write_text(&mut self, bytes: &[u8]) {
+        self.write_u64(bytes.len() as u64);
+        self.write(bytes);
+    }
+
+    pub fn finish(self) -> u64 {
+        self.0
+    }
+}
+
+/// How many files and lines a task diff may still carry. Share one value between the
+/// worktrees of a diff, in the order they are listed.
+#[derive(Debug, Clone, Copy)]
+pub struct DiffBudget {
+    files: usize,
+    lines: usize,
+}
+
+impl Default for DiffBudget {
+    fn default() -> Self {
+        Self {
+            files: DIFF_FILES,
+            lines: DIFF_LINES,
+        }
+    }
+}
+
+/// One changed file of a worktree, before it is attributed to an agent.
+#[derive(Debug, Clone)]
+pub struct ChangedFile {
+    /// The path as git printed it; `diff.path` is the lossy form.
+    pub raw_path: Vec<u8>,
+    /// Hash of the whole change, also of lines the caps left out.
+    pub digest: u64,
+    /// `agent` is `None`. A file past the file budget has no hunks.
+    pub diff: FileDiff,
+}
+
+/// Git needs a NUL byte in the first 8 KiB to call a file binary.
+const DIFF_BINARY_SNIFF: usize = 8192;
+
+/// Marks the start of a commit in the attribution log; unlikely inside a path.
+const COMMIT_MARK: &[u8] = b"\x01\x02swarm-commit\x02\x01";
+
+/// What the working tree of `worktree` changed since `base`, as reviewable files:
+/// tracked changes from git's patch, untracked files as added files. Sorted by path.
+/// Spends `budget` on the hunk lines; files and lines past it are still counted and
+/// hashed. Retries once when the worktree changes while git runs.
+pub fn worktree_diff(
+    worktree: &Path,
+    base: &str,
+    budget: &mut DiffBudget,
+) -> Result<Vec<ChangedFile>, Error> {
+    for _ in 0..2 {
+        let mut attempt = *budget;
+
+        if let Some(files) = read_worktree_diff(worktree, base, &mut attempt)? {
+            *budget = attempt;
+
+            return Ok(files);
+        }
+    }
+
+    Err(Error::Invalid(
+        "the files changed while the diff was read; try again".to_owned(),
+    ))
+}
+
+/// One path of the diff, before it is read.
+enum Item {
+    Tracked {
+        path: Vec<u8>,
+        /// The patch blocks of the path, as ranges of the patch. Two when a file
+        /// became a symlink or the other way round.
+        blocks: Vec<std::ops::Range<usize>>,
+        /// `None` for a binary file.
+        added: Option<u32>,
+        deleted: u32,
+    },
+    Untracked {
+        path: Vec<u8>,
+    },
+}
+
+impl Item {
+    fn path(&self) -> &[u8] {
+        match self {
+            Item::Tracked { path, .. } | Item::Untracked { path } => path,
+        }
+    }
+}
+
+/// `None` when the patch and the numstat disagree.
+fn read_worktree_diff(
+    worktree: &Path,
+    base: &str,
+    budget: &mut DiffBudget,
+) -> Result<Option<Vec<ChangedFile>>, Error> {
+    let numstat = diff_index(worktree, base, &["--numstat", "-z"])?;
+    let patch = diff_index(worktree, base, &["-p", "-U3", "--inter-hunk-context=0"])?;
+
+    let Some(mut items) = tracked_items(&numstat, &patch) else {
+        return Ok(None);
+    };
+
+    let untracked = untracked_paths(worktree)?;
+    items.retain(|item| match item {
+        Item::Tracked { path, .. } => !untracked.contains(path),
+        Item::Untracked { .. } => true,
+    });
+    items.extend(untracked.into_iter().map(|path| Item::Untracked { path }));
+    items.sort_by(|one, other| one.path().cmp(other.path()));
+
+    let mut untracked_budget = MAX_TOTAL_BYTES;
+    let mut files = Vec::with_capacity(items.len());
+
+    for (index, item) in items.iter().enumerate() {
+        let mut collector = Collector::new(budget);
+
+        let file = match item {
+            Item::Tracked {
+                path,
+                blocks,
+                added,
+                deleted,
+            } => {
+                let Some(file) = tracked_file(
+                    worktree,
+                    path,
+                    blocks.iter().map(|block| &patch[block.clone()]),
+                    (*added, *deleted),
+                    &mut collector,
+                ) else {
+                    return Ok(None);
+                };
+
+                file
+            }
+            Item::Untracked { path } => {
+                let readable = index < MAX_UNTRACKED_FILES;
+                let Some(file) = untracked_file(
+                    worktree,
+                    path,
+                    readable,
+                    &mut untracked_budget,
+                    &mut collector,
+                ) else {
+                    continue;
+                };
+
+                file
+            }
+        };
+
+        files.push(collector.finish(worktree, file, budget));
+    }
+
+    Ok(Some(files))
+}
+
+fn diff_index(worktree: &Path, base: &str, options: &[&str]) -> Result<Vec<u8>, Error> {
+    // `diff-index` never writes the index, so it cannot block the agent's own git.
+    let mut arguments: Vec<&str> = vec![
+        "diff-index",
+        "--no-renames",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+    ];
+    arguments.extend_from_slice(options);
+    arguments.extend(["--end-of-options", base, "--"]);
+
+    let (arguments, output) = execute(worktree, arguments)?;
+    if !output.success {
+        return Err(failure(&arguments, &output));
+    }
+
+    Ok(output.raw)
+}
+
+fn untracked_paths(worktree: &Path) -> Result<std::collections::HashSet<Vec<u8>>, Error> {
+    let (arguments, output) = execute(
+        worktree,
+        ["ls-files", "--others", "--exclude-standard", "-z"],
+    )?;
+    if !output.success {
+        return Err(failure(&arguments, &output));
+    }
+
+    Ok(output
+        .raw
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .take(MAX_UNTRACKED_FILES + 1)
+        .map(<[u8]>::to_vec)
+        .collect())
+}
+
+/// Pairs the NUL-separated numstat with the patch blocks, which come in the same order.
+/// Git quotes unusual paths in patch headers, so the numstat gives the exact path.
+fn tracked_items(counts: &[u8], diff: &[u8]) -> Option<Vec<Item>> {
+    let mut entries = Vec::new();
+    for entry in counts
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let mut parts = entry.splitn(3, |byte| *byte == b'\t');
+        let (Some(gained), Some(lost), Some(path)) = (parts.next(), parts.next(), parts.next())
+        else {
+            return None;
+        };
+
+        let added = (gained != b"-").then(|| parse_count(gained));
+        entries.push((path.to_vec(), added, parse_count(lost)));
+    }
+
+    // (header line, range) of each block; blocks of one path share their header.
+    let mut blocks: Vec<(&[u8], std::ops::Range<usize>)> = Vec::new();
+    let mut offset = 0;
+    for line in diff.split_inclusive(|byte| *byte == b'\n') {
+        if line.starts_with(b"diff --git ") {
+            let header = line.strip_suffix(b"\n").unwrap_or(line);
+
+            blocks.push((header, offset..offset + line.len()));
+        } else if let Some((_, range)) = blocks.last_mut() {
+            range.end = offset + line.len();
+        }
+        offset += line.len();
+    }
+
+    let mut groups: Vec<(&[u8], Vec<std::ops::Range<usize>>)> = Vec::new();
+    for (header, range) in blocks {
+        match groups.last_mut() {
+            Some((last, ranges)) if *last == header => ranges.push(range),
+            _ => groups.push((header, vec![range])),
+        }
+    }
+
+    if groups.len() != entries.len() {
+        return None;
+    }
+
+    let mut items = Vec::with_capacity(entries.len());
+    for ((path, added, deleted), (header, ranges)) in entries.into_iter().zip(groups) {
+        if !header_names(header, &path) {
+            return None;
+        }
+
+        items.push(Item::Tracked {
+            path,
+            blocks: ranges,
+            added,
+            deleted,
+        });
+    }
+
+    Some(items)
+}
+
+/// False when an unquoted header names another path. A quoted header cannot be checked
+/// without unescaping it, and its order and count already matched.
+fn header_names(header: &[u8], path: &[u8]) -> bool {
+    let Some(rest) = header.strip_prefix(b"diff --git ") else {
+        return false;
+    };
+    if rest.starts_with(b"\"") {
+        return true;
+    }
+
+    let mut expected = b"a/".to_vec();
+    expected.extend_from_slice(path);
+    expected.extend_from_slice(b" b/");
+    expected.extend_from_slice(path);
+
+    rest == expected.as_slice()
+}
+
+/// Collects the lines of one file under the caps while hashing all of them.
+struct Collector {
+    digest: Fingerprint,
+    hunks: Vec<DiffHunk>,
+    pending: Option<DiffHunk>,
+    kept: usize,
+    limit: usize,
+    truncated: bool,
+    additions: u32,
+    deletions: u32,
+}
+
+impl Collector {
+    fn new(budget: &DiffBudget) -> Self {
+        let limit = if budget.files == 0 {
+            0
+        } else {
+            DIFF_LINES_PER_FILE.min(budget.lines)
+        };
+
+        Self {
+            digest: Fingerprint::default(),
+            hunks: Vec::new(),
+            pending: None,
+            kept: 0,
+            limit,
+            truncated: false,
+            additions: 0,
+            deletions: 0,
+        }
+    }
+
+    fn start_hunk(&mut self, hunk: DiffHunk) {
+        for number in [
+            hunk.old_start,
+            hunk.old_lines,
+            hunk.new_start,
+            hunk.new_lines,
+        ] {
+            self.digest.write_u64(u64::from(number));
+        }
+        self.digest.write_text(hunk.section.as_bytes());
+
+        self.pending = Some(hunk);
+    }
+
+    fn push(&mut self, kind: DiffLineKind, text: &[u8]) {
+        self.digest.write(&[match kind {
+            DiffLineKind::Context => 0,
+            DiffLineKind::Added => 1,
+            DiffLineKind::Deleted => 2,
+        }]);
+        self.digest.write_text(text);
+
+        match kind {
+            DiffLineKind::Added => self.additions = self.additions.saturating_add(1),
+            DiffLineKind::Deleted => self.deletions = self.deletions.saturating_add(1),
+            DiffLineKind::Context => {}
+        }
+
+        if self.kept >= self.limit {
+            self.truncated = true;
+
+            return;
+        }
+        self.kept += 1;
+
+        if let Some(hunk) = self.pending.take() {
+            self.hunks.push(hunk);
+        }
+        let Some(hunk) = self.hunks.last_mut() else {
+            return;
+        };
+
+        hunk.lines.push(DiffLine {
+            kind,
+            text: cut_line(text),
+        });
+    }
+
+    fn finish(self, worktree: &Path, mut file: FileDiff, budget: &mut DiffBudget) -> ChangedFile {
+        let mut digest = self.digest;
+        digest.write_u64(u64::from(file.binary));
+
+        if file.binary
+            && let Ok(meta) = std::fs::symlink_metadata(worktree.join(&file.path))
+        {
+            digest.write_u64(meta.len());
+            digest.write_u64(meta.mtime().cast_unsigned());
+            digest.write_u64(meta.mtime_nsec().cast_unsigned());
+        }
+
+        budget.files = budget.files.saturating_sub(1);
+        budget.lines = budget.lines.saturating_sub(self.kept);
+
+        file.hunks = self.hunks;
+        file.truncated = self.truncated;
+        if !file.binary {
+            file.additions = self.additions;
+            file.deletions = self.deletions;
+        }
+
+        ChangedFile {
+            raw_path: file.path.as_os_str().as_bytes().to_vec(),
+            digest: digest.finish(),
+            diff: file,
+        }
+    }
+}
+
+/// Cuts at [`DIFF_LINE_BYTES`] on a character boundary. Invalid UTF-8 turns into
+/// replacement characters first.
+fn cut_line(text: &[u8]) -> String {
+    let text = String::from_utf8_lossy(text);
+    if text.len() <= DIFF_LINE_BYTES {
+        return text.into_owned();
+    }
+
+    let mut end = DIFF_LINE_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    text[..end].to_owned()
+}
+
+fn blank_file(worktree: &Path, raw_path: &[u8], change: FileChange, binary: bool) -> FileDiff {
+    FileDiff {
+        worktree: worktree.to_owned(),
+        path: PathBuf::from(String::from_utf8_lossy(raw_path).into_owned()),
+        agent: None,
+        change,
+        additions: 0,
+        deletions: 0,
+        binary,
+        hunks: Vec::new(),
+        truncated: false,
+    }
+}
+
+/// Reads the patch blocks of one tracked path. `None` when the line counts differ from
+/// the numstat, which means the worktree changed between the two git calls.
+fn tracked_file<'a>(
+    worktree: &Path,
+    path: &[u8],
+    blocks: impl Iterator<Item = &'a [u8]>,
+    (added, deleted): (Option<u32>, u32),
+    collector: &mut Collector,
+) -> Option<FileDiff> {
+    let (mut created, mut removed) = (false, false);
+
+    for block in blocks {
+        let mut in_hunks = false;
+
+        for line in block.split_inclusive(|byte| *byte == b'\n').skip(1) {
+            let line = line.strip_suffix(b"\n").unwrap_or(line);
+
+            if line.starts_with(b"@@ ") {
+                in_hunks = true;
+                if let Some(hunk) = parse_hunk_header(line) {
+                    collector.start_hunk(hunk);
+                }
+
+                continue;
+            }
+
+            if !in_hunks {
+                created |= line.starts_with(b"new file mode ");
+                removed |= line.starts_with(b"deleted file mode ");
+
+                continue;
+            }
+
+            match line.first() {
+                Some(b'+') => collector.push(DiffLineKind::Added, &line[1..]),
+                Some(b'-') => collector.push(DiffLineKind::Deleted, &line[1..]),
+                Some(b' ') => collector.push(DiffLineKind::Context, &line[1..]),
+                None => collector.push(DiffLineKind::Context, line),
+                Some(_) => {}
+            }
+        }
+    }
+
+    let change = match (created, removed) {
+        (true, false) => FileChange::Added,
+        (false, true) => FileChange::Deleted,
+        _ => FileChange::Modified,
+    };
+
+    let binary = added.is_none();
+    if !binary && (Some(collector.additions) != added || collector.deletions != deleted) {
+        return None;
+    }
+
+    Some(blank_file(worktree, path, change, binary))
+}
+
+/// `@@ -1,2 +3,4 @@ section`
+fn parse_hunk_header(line: &[u8]) -> Option<DiffHunk> {
+    let line = String::from_utf8_lossy(line);
+    let rest = line.strip_prefix("@@ ")?;
+    let (ranges, section) = rest.split_once(" @@")?;
+    let (old, new) = ranges.split_once(' ')?;
+
+    let range = |text: &str, sign: char| -> Option<(u32, u32)> {
+        let text = text.strip_prefix(sign)?;
+        match text.split_once(',') {
+            Some((start, count)) => Some((start.parse().ok()?, count.parse().ok()?)),
+            None => Some((text.parse().ok()?, 1)),
+        }
+    };
+    let ((old_start, old_lines), (new_start, new_lines)) = (range(old, '-')?, range(new, '+')?);
+
+    Some(DiffHunk {
+        old_start,
+        old_lines,
+        new_start,
+        new_lines,
+        section: cut_line(section.strip_prefix(' ').unwrap_or(section).as_bytes()),
+        lines: Vec::new(),
+    })
+}
+
+/// An untracked path as an added file. `None` when it vanished while reading.
+fn untracked_file(
+    worktree: &Path,
+    raw_path: &[u8],
+    readable: bool,
+    budget: &mut u64,
+    collector: &mut Collector,
+) -> Option<FileDiff> {
+    let path = worktree.join(OsStr::from_bytes(raw_path));
+    let meta = std::fs::symlink_metadata(&path).ok()?;
+
+    let text_file = |binary| blank_file(worktree, raw_path, FileChange::Added, binary);
+
+    if meta.file_type().is_symlink() {
+        let target = std::fs::read_link(&path).ok()?;
+
+        collector.start_hunk(added_hunk(1));
+        collector.push(DiffLineKind::Added, target.as_os_str().as_bytes());
+
+        return Some(text_file(false));
+    }
+
+    // A FIFO or a folder (a nested repository) is never opened.
+    if !meta.is_file() || !readable || meta.len() > MAX_COUNTED_BYTES || *budget == 0 {
+        return Some(text_file(true));
+    }
+
+    let mut bytes = Vec::new();
+    let read = std::fs::File::open(&path)
+        .and_then(|file| file.take(MAX_COUNTED_BYTES + 1).read_to_end(&mut bytes));
+    if read.is_err() {
+        return Some(text_file(true));
+    }
+
+    *budget = budget.saturating_sub(bytes.len() as u64);
+    if bytes.len() as u64 > MAX_COUNTED_BYTES
+        || bytes[..bytes.len().min(DIFF_BINARY_SNIFF)].contains(&0)
+    {
+        return Some(text_file(true));
+    }
+
+    let mut lines: Vec<&[u8]> = bytes.split(|byte| *byte == b'\n').collect();
+    if lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+
+    if !lines.is_empty() {
+        collector.start_hunk(added_hunk(u32::try_from(lines.len()).unwrap_or(u32::MAX)));
+    }
+    for line in lines {
+        collector.push(DiffLineKind::Added, line);
+    }
+
+    Some(text_file(false))
+}
+
+fn added_hunk(lines: u32) -> DiffHunk {
+    DiffHunk {
+        old_start: 0,
+        old_lines: 0,
+        new_start: 1,
+        new_lines: lines,
+        section: String::new(),
+        lines: Vec::new(),
+    }
+}
+
+/// The agent behind the newest commit in `base..HEAD` that carries a `Swarm-Agent`
+/// trailer and touched the path.
+pub fn attribution(worktree: &Path, base: &str) -> Result<HashMap<Vec<u8>, String>, Error> {
+    let format = "--format=%x01%x02swarm-commit%x02%x01%(trailers:key=Swarm-Agent,valueonly,unfold,separator=%x03)";
+    let range = format!("{base}..HEAD");
+
+    let (arguments, output) = execute(
+        worktree,
+        [
+            "log",
+            "-z",
+            "--name-only",
+            "--no-renames",
+            format,
+            "--end-of-options",
+            &range,
+        ],
+    )?;
+    if !output.success {
+        return Err(failure(&arguments, &output));
+    }
+
+    let mut agents = HashMap::new();
+    let mut current: Option<String> = None;
+
+    for token in output.raw.split(|byte| *byte == 0) {
+        if let Some(trailer) = token.strip_prefix(COMMIT_MARK) {
+            let trailer = String::from_utf8_lossy(trailer);
+            let name = trailer.split('\u{3}').next().unwrap_or("").trim();
+
+            current = (!name.is_empty()).then(|| name.to_owned());
+
+            continue;
+        }
+
+        let path = token.strip_prefix(b"\n").unwrap_or(token);
+        if let (Some(agent), false) = (&current, path.is_empty()) {
+            // The log lists the newest commit first.
+            agents.entry(path.to_vec()).or_insert_with(|| agent.clone());
+        }
+    }
+
+    Ok(agents)
+}
+
+/// True when `ancestor` is `descendant` or reachable from it.
+pub fn is_ancestor(worktree: &Path, ancestor: &str, descendant: &str) -> Result<bool, Error> {
+    let (arguments, output) = execute(
+        worktree,
+        [
+            "merge-base",
+            "--is-ancestor",
+            "--end-of-options",
+            ancestor,
+            descendant,
+        ],
+    )?;
+
+    match (output.success, output.code) {
+        (true, _) => Ok(true),
+        (false, Some(1)) => Ok(false),
+        (false, _) => Err(failure(&arguments, &output)),
+    }
+}
+
+/// Files with changes that are not committed, untracked ones included.
+pub fn uncommitted_files(worktree: &Path) -> Result<u32, Error> {
+    let (arguments, output) = execute(
+        worktree,
+        [
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--no-renames",
+            "--untracked-files=all",
+        ],
+    )?;
+    if !output.success {
+        return Err(failure(&arguments, &output));
+    }
+
+    let count = output
+        .raw
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .count();
+
+    Ok(u32::try_from(count).unwrap_or(u32::MAX))
+}
+
+/// Forgets worktrees whose folder is gone.
+pub fn worktree_prune(root: &Path) -> Result<(), Error> {
+    run(root, ["worktree", "prune"])?;
 
     Ok(())
 }

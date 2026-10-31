@@ -15,9 +15,9 @@ use std::time::{Duration, Instant};
 use swarm_core::store::Store;
 use swarm_protocol::{
     AgentChange, AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, CallId,
-    CreateTask, CreateTerminal, DiffStat, Event, FileStat, MessageInfo, MessageKind, ProjectId,
-    ProjectInfo, Request, TaskId, TaskInfo, TerminalId, TerminalInfo, TerminalKind, VERSION, read,
-    write,
+    CloseCheck, CreateTask, CreateTerminal, DiffStat, Event, FileStat, MessageInfo, MessageKind,
+    ProjectId, ProjectInfo, Request, ReviewSource, TaskDiff, TaskId, TaskInfo, TerminalId,
+    TerminalInfo, TerminalKind, VERSION, read, write,
 };
 use swarm_term::{
     BlockedKind, ExitStatus, Palette, ProgramState, Rgb, Row, Size, TerminalInput, TerminalOutput,
@@ -3363,4 +3363,420 @@ esac"#,
     );
     assert!(task.worktree.join("api.txt").is_file());
     assert!(task.worktree.join("ui.txt").is_file());
+}
+
+impl Client {
+    /// The diff of a task, or the daemon's error text.
+    fn task_diff(
+        &mut self,
+        task: TaskId,
+        source: ReviewSource,
+        known: Option<u64>,
+    ) -> Result<Option<TaskDiff>, String> {
+        self.send(&Request::TaskDiff {
+            call: CALL,
+            task,
+            source,
+            known,
+        });
+
+        self.wait_for(|event| match event {
+            Event::TaskDiff { call: CALL, diff } => Some(Ok(diff.clone())),
+            Event::Error {
+                call: Some(CALL),
+                message,
+                ..
+            } => Some(Err(message.clone())),
+            _ => None,
+        })
+    }
+
+    fn check_close(&mut self, task: TaskId) -> CloseCheck {
+        self.send(&Request::CheckClose { call: CALL, task });
+
+        self.wait_for(|event| match event {
+            Event::CloseCheck { call: CALL, check } => Some(check.clone()),
+            _ => None,
+        })
+    }
+
+    /// Sends a request that ends with `Done`. Returns every event up to it, or the
+    /// error text.
+    fn until_done(&mut self, request: &Request) -> Result<Vec<Event>, String> {
+        self.send(request);
+
+        let mut seen = Vec::new();
+        loop {
+            match self.next() {
+                Event::Done { call: CALL } => return Ok(seen),
+                Event::Error {
+                    call: Some(CALL),
+                    message,
+                    ..
+                } => return Err(message),
+                other => seen.push(other),
+            }
+        }
+    }
+
+    fn close_task(&mut self, task: TaskId) -> Result<Vec<Event>, String> {
+        self.until_done(&Request::CloseTask { call: CALL, task })
+    }
+}
+
+/// A task without agents, in a repository with a file to review.
+fn reviewed_task(daemon: &Daemon, repo: &Repo) -> (Client, TaskInfo) {
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let mut request = orchestrator_task(project.id, false);
+    request.orchestrator = None;
+    let task = client.create_task(request);
+    std::fs::write(task.worktree.join("review.txt"), "one\ntwo\n").expect("file");
+
+    (client, task)
+}
+
+#[test]
+fn a_task_diff_has_files_and_answers_none_for_a_known_fingerprint() {
+    let repo = Repo::new("");
+    let daemon = Daemon::start();
+    let (mut client, task) = reviewed_task(&daemon, &repo);
+
+    let diff = client
+        .task_diff(task.id, ReviewSource::Merged, None)
+        .expect("diff")
+        .expect("a diff");
+
+    assert_eq!(diff.task, task.id);
+    assert_eq!(diff.source, ReviewSource::Merged);
+    assert_eq!(diff.files.len(), 1);
+    assert_eq!(diff.files[0].path, Path::new("review.txt"));
+    assert_eq!(diff.files[0].additions, 2);
+    assert_eq!(
+        client
+            .task_diff(task.id, ReviewSource::Merged, Some(diff.fingerprint))
+            .expect("known"),
+        None
+    );
+    let live = client
+        .task_diff(task.id, ReviewSource::Live, Some(diff.fingerprint))
+        .expect("live")
+        .expect("another source has another fingerprint");
+    assert_eq!(live.source, ReviewSource::Live);
+    assert!(
+        client
+            .task_diff(TaskId(999), ReviewSource::Merged, None)
+            .is_err()
+    );
+
+    std::fs::write(task.worktree.join("review.txt"), "one\nthree\n").expect("file");
+    let changed = client
+        .task_diff(task.id, ReviewSource::Merged, Some(diff.fingerprint))
+        .expect("changed")
+        .expect("the diff changed");
+    assert_ne!(changed.fingerprint, diff.fingerprint);
+}
+
+#[test]
+fn a_second_diff_request_is_busy_while_the_first_runs() {
+    let repo = Repo::new("");
+    repo.commit_many_files(300);
+    let daemon = Daemon::start();
+    let (mut client, task) = reviewed_task(&daemon, &repo);
+    for number in 0..300 {
+        std::fs::write(task.worktree.join(format!("new-{number}.txt")), "x\n").expect("file");
+    }
+
+    for call in [CallId(1), CallId(2)] {
+        client.send(&Request::TaskDiff {
+            call,
+            task: task.id,
+            source: ReviewSource::Merged,
+            known: None,
+        });
+    }
+
+    let (mut diffs, mut busy) = (0, 0);
+    while diffs + busy < 2 {
+        match client.next() {
+            Event::TaskDiff { call, .. } => {
+                assert_eq!(call, CallId(1));
+                diffs += 1;
+            }
+            Event::Error {
+                call: Some(CallId(2)),
+                message,
+                ..
+            } => {
+                assert!(message.starts_with("busy"), "{message}");
+                busy += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!((diffs, busy), (1, 1));
+
+    let after = client.task_diff(task.id, ReviewSource::Merged, None);
+    assert!(after.is_ok(), "the guard was released");
+}
+
+#[test]
+fn approving_needs_the_current_fingerprint_and_reaches_every_client() {
+    let repo = Repo::new("");
+    let daemon = Daemon::start();
+    let (mut client, task) = reviewed_task(&daemon, &repo);
+    let mut watcher = daemon.connect();
+    watcher.hello();
+    let fingerprint = client
+        .task_diff(task.id, ReviewSource::Merged, None)
+        .expect("diff")
+        .expect("a diff")
+        .fingerprint;
+
+    let stale = client.until_done(&Request::ApproveTask {
+        call: CALL,
+        task: task.id,
+        fingerprint: fingerprint ^ 1,
+    });
+    assert_eq!(
+        stale.expect_err("refused"),
+        "the changes changed since you reviewed them"
+    );
+
+    let events = client
+        .until_done(&Request::ApproveTask {
+            call: CALL,
+            task: task.id,
+            fingerprint,
+        })
+        .expect("approved");
+    let own = events.iter().find_map(|event| match event {
+        Event::TaskChanged { task } => Some(task.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        own.expect("TaskChanged before Done").approved,
+        Some(fingerprint)
+    );
+    let seen = watcher.wait_for(|event| match event {
+        Event::TaskChanged { task } => Some(task.clone()),
+        _ => None,
+    });
+    assert_eq!(seen.approved, Some(fingerprint));
+    assert_eq!(
+        client.projects()[0].tasks[0].approved,
+        Some(fingerprint),
+        "the approval is stored"
+    );
+}
+
+const CLOSE_AGENT: &str = r#"case "$SWARM_ROLE" in
+orchestrator)
+  idle
+  IFS= read -r line
+  working
+  swarm spawn api --brief "wait" > "$OUT/spawn.out" 2>&1
+  swarm terminal spawn --name dev -- sh -c 'echo $$ > "$1"; exec sleep 300' sh "$OUT/pid" > "$OUT/terminal.out" 2>&1
+  until [ -s "$OUT/pid" ]; do sleep 0.1; done
+  echo ready > "$OUT/ready"
+  sleep 300
+  ;;
+worker)
+  idle
+  IFS= read -r line
+  working
+  sleep 300
+  ;;
+esac"#;
+
+fn process_alive(pid: i32) -> bool {
+    // SAFETY: kill with signal 0 only checks that the process exists.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+#[test]
+fn closing_a_task_stops_everything_removes_worktrees_and_survives_a_restart() {
+    let fixture = fixture_with_helpers(CLOSE_AGENT);
+    let repo = ported_repo("5170-5175", "");
+    repo.git(&["branch", "-q", "unrelated"]);
+    let mut daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, task) = start_task(&daemon, &repo);
+    fixture.read_when_written("ready");
+    let worker = client.wait_for_agent(|agent| {
+        agent.role == AgentRole::Worker && agent.status == AgentStatus::Working
+    });
+    let pid: i32 = fixture
+        .read_when_written("pid")
+        .trim()
+        .parse()
+        .expect("pid");
+    std::fs::write(task.worktree.join("loose.txt"), "uncommitted\n").expect("file");
+
+    let check = client.check_close(task.id);
+    assert_eq!(check.running_agents, 2);
+    assert_eq!(check.uncommitted_files, 1);
+    assert!(check.unmerged_workers.is_empty());
+    assert!(process_alive(pid));
+
+    let events = client.close_task(task.id).expect("closed");
+
+    assert!(!process_alive(pid), "the process terminal was stopped");
+    let stopped: Vec<AgentId> = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::AgentChanged { agent } if agent.lifecycle == AgentLifecycle::Stopped => {
+                Some(agent.id)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(stopped.contains(&task.agents[0].id), "{stopped:?}");
+    assert!(stopped.contains(&worker.id), "{stopped:?}");
+    let closed_at = events
+        .iter()
+        .position(|event| matches!(event, Event::TaskChanged { task } if task.closed))
+        .expect("TaskChanged with closed");
+    let last_stop = events
+        .iter()
+        .rposition(|event| matches!(event, Event::AgentChanged { .. }))
+        .expect("agent change");
+    assert!(
+        last_stop < closed_at,
+        "agents are announced before the task"
+    );
+
+    assert!(!task.worktree.exists());
+    let branches = git_output(&repo.root, &["branch", "--format=%(refname:short)"]);
+    assert!(
+        branches.lines().any(|branch| branch == task.branch),
+        "{branches}"
+    );
+    assert!(branches.lines().any(|branch| branch == "unrelated"));
+    assert!(client.projects()[0].tasks.is_empty());
+    let messages = client.list_messages(task.project, Some(task.id));
+    assert!(
+        messages.iter().all(|message| !matches!(
+            message.kind,
+            MessageKind::WorkerStopped | MessageKind::TerminalExited
+        )),
+        "a close tells nobody: {messages:?}"
+    );
+    assert!(client.close_task(task.id).is_err(), "closed already");
+    assert!(
+        client
+            .task_diff(task.id, ReviewSource::Merged, None)
+            .is_err(),
+        "a closed task is unknown"
+    );
+
+    let ports_free = client.create_task(CreateTask {
+        orchestrator: None,
+        ..orchestrator_task(task.project, false)
+    });
+    assert_eq!(ports_free.ports, task.ports, "the ports came back");
+    drop(client);
+
+    daemon.crash();
+    let restarted = Daemon::start_in(daemon.home.clone());
+    let mut client = restarted.connect();
+    client.hello();
+    let tasks = &client.projects()[0].tasks;
+    assert_eq!(tasks.len(), 1, "only the new task is listed");
+    assert_ne!(tasks[0].id, task.id);
+    for agent in [task.agents[0].id, worker.id] {
+        let stored = database(&restarted)
+            .agent(agent)
+            .expect("read")
+            .expect("row");
+        assert_eq!(stored.info.lifecycle, AgentLifecycle::Stopped);
+    }
+}
+
+#[test]
+fn a_stubborn_process_is_killed_and_nothing_new_starts_while_the_task_closes() {
+    let fixture = fixture_with_helpers(
+        r#"idle
+IFS= read -r line
+working
+trap 'swarm spawn late --brief "too late" > "$OUT/late-spawn.out" 2>&1; swarm terminal spawn -- sleep 1 > "$OUT/late-terminal.out" 2>&1; echo 1 > "$OUT/trapped"' TERM
+echo ready > "$OUT/ready"
+while :; do sleep 0.2; done"#,
+    );
+    let repo = ported_repo("5170-5175", "");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, task) = start_task(&daemon, &repo);
+    fixture.read_when_written("ready");
+    let started = Instant::now();
+
+    let events = client.close_task(task.id).expect("closed");
+
+    assert!(
+        started.elapsed() >= Duration::from_secs(4),
+        "SIGTERM was ignored"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::AgentChanged { agent }
+            if agent.id == task.agents[0].id && agent.lifecycle == AgentLifecycle::Stopped
+    )));
+    assert!(
+        fixture
+            .read_when_written("late-spawn.out")
+            .contains("the task is closing")
+    );
+    assert!(
+        fixture
+            .read_when_written("late-terminal.out")
+            .contains("the task is closing")
+    );
+    assert!(
+        client
+            .terminals()
+            .iter()
+            .all(|terminal| terminal.task.as_deref() != Some(task.id.terminal_key().as_str()))
+    );
+}
+
+#[test]
+fn a_restart_does_not_resume_agents_of_a_task_that_was_closed_mid_run() {
+    let fixture = Fixture::new(
+        r#"printf '\033]7501;state=working\007'
+printf '{"hook_event_name":"SessionStart","session_id":"hook-session-3"}' | "$SWARM" hook
+sleep 300"#,
+    );
+    let repo = Repo::new("");
+    let mut daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let task = client.create_task(orchestrator_task(project.id, false));
+    let agent = task.agents[0].id;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !database(&daemon)
+        .agent(agent)
+        .expect("read")
+        .expect("row")
+        .session_confirmed
+    {
+        assert!(Instant::now() < deadline, "the session was never confirmed");
+        thread::park_timeout(Duration::from_millis(30));
+    }
+    drop(client);
+
+    daemon.crash();
+    {
+        // A crash in the middle of a close: the row says closed, the agent still runs.
+        let connection = rusqlite::Connection::open(daemon.home.join("swarm.db")).expect("open");
+        connection
+            .execute("UPDATE tasks SET closed_at = 1", [])
+            .expect("close");
+    }
+    let restarted = Daemon::start_in(daemon.home.clone());
+
+    let stored = database(&restarted)
+        .agent(agent)
+        .expect("read")
+        .expect("row");
+    assert_eq!(stored.info.lifecycle, AgentLifecycle::Stopped);
 }

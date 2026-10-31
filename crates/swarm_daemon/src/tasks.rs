@@ -4,13 +4,15 @@
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use swarm_core::{PreparedTask, PreparedWorker, Projects};
 use swarm_protocol::{
-    AgentId, AgentInfo, AgentKind, AgentRole, CreateTask, CreateTerminal, ProjectId, TaskId,
+    AgentId, AgentInfo, AgentKind, AgentRole, CreateTask, CreateTerminal, Event, ProjectId, TaskId,
     TaskInfo, TerminalId, TerminalKind,
 };
+use swarm_term::TerminalInput;
 use swarm_term::{ExitStatus, Palette, Rgb, Size};
 
 use crate::Services;
@@ -49,6 +51,14 @@ pub(crate) const TERMINAL_PALETTE: Palette = Palette {
         Rgb(255, 255, 255),
     ],
 };
+
+/// How long the processes of a closing task get to end on SIGTERM before SIGKILL.
+const CLOSE_GRACE: Duration = Duration::from_secs(5);
+
+/// How long a close waits for processes after SIGKILL.
+const CLOSE_KILL_WAIT: Duration = Duration::from_secs(5);
+
+const CLOSE_POLL: Duration = Duration::from_millis(25);
 
 /// The name of a Start orchestrator.
 const START_NAME: &str = "start";
@@ -136,6 +146,112 @@ pub(crate) fn create(
     }
 
     Ok(())
+}
+
+/// Closes a task: stops its agents and process terminals, then removes its worktrees
+/// and tells every client. Nothing new starts in the task from the first step on.
+pub(crate) fn close(services: &Services, id: TaskId) -> Result<()> {
+    services.projects.task(id)?;
+    if !services.agents.begin_close(id) {
+        bail!("task {} is closing already", id.0);
+    }
+
+    let result = stop_and_close(services, id);
+    if result.is_err() {
+        services.agents.abort_close(id);
+    }
+
+    result
+}
+
+fn stop_and_close(services: &Services, id: TaskId) -> Result<()> {
+    stop_processes(services, id);
+
+    let closed = services.projects.close_task(id)?;
+
+    for agent in closed.stopped {
+        services.clients.broadcast(&Event::AgentChanged { agent });
+    }
+    services
+        .clients
+        .broadcast(&Event::TaskChanged { task: closed.task });
+
+    Ok(())
+}
+
+/// Ends every agent and process terminal of the task: SIGTERM, then SIGKILL after
+/// [`CLOSE_GRACE`]. Repeats while new ones show up from a request that was under way.
+fn stop_processes(services: &Services, task: TaskId) {
+    let key = task.terminal_key();
+
+    for _ in 0..3 {
+        let mut running = services.agents.stop_task_agents(task);
+        running.extend(
+            services
+                .terminals
+                .list()
+                .into_iter()
+                .filter(|info| info.task.as_deref() == Some(key.as_str()))
+                .filter(|info| info.kind != TerminalKind::User)
+                .map(|info| info.id),
+        );
+        running.sort_unstable();
+        running.dedup();
+
+        if running.is_empty() && !services.agents.has_live(task) {
+            return;
+        }
+
+        for terminal in &running {
+            let Some(hub) = services.terminals.get(*terminal) else {
+                continue;
+            };
+            if !hub.signal(libc::SIGTERM) {
+                hub.send_input(TerminalInput::Kill);
+            }
+        }
+        if wait_until_ended(services, task, &running, CLOSE_GRACE) {
+            continue;
+        }
+
+        for terminal in &running {
+            let Some(hub) = services.terminals.get(*terminal) else {
+                continue;
+            };
+            if !hub.signal(libc::SIGKILL) {
+                hub.send_input(TerminalInput::Kill);
+            }
+        }
+        if !wait_until_ended(services, task, &running, CLOSE_KILL_WAIT) {
+            log::warn!("task {} still has processes after SIGKILL", task.0);
+
+            return;
+        }
+    }
+}
+
+/// True when the terminals are gone and their agents have ended, within `timeout`.
+fn wait_until_ended(
+    services: &Services,
+    task: TaskId,
+    terminals: &[TerminalId],
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        let gone = terminals
+            .iter()
+            .all(|terminal| services.terminals.get(*terminal).is_none());
+        if gone && !services.agents.has_live(task) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+
+        thread::park_timeout(CLOSE_POLL);
+    }
 }
 
 /// Starts the project's Start orchestrator in the project root, or returns the one that

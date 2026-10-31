@@ -80,14 +80,15 @@ pub(crate) struct ClientSink {
     /// Closed when the queue is full, which ends the connection's reader too.
     stream: Option<UnixStream>,
     changes_running: AtomicBool,
+    diff_running: AtomicBool,
 }
 
-/// Held while an `AgentChanges` request of one client runs.
-pub(crate) struct ChangesGuard(Arc<ClientSink>);
+/// Held while an `AgentChanges` or `TaskDiff` request of one client runs.
+pub(crate) struct ChangesGuard(Arc<ClientSink>, fn(&ClientSink) -> &AtomicBool);
 
 impl Drop for ChangesGuard {
     fn drop(&mut self) {
-        self.0.changes_running.store(false, Ordering::Release);
+        (self.1)(&self.0).store(false, Ordering::Release);
     }
 }
 
@@ -98,15 +99,25 @@ impl ClientSink {
             frames,
             stream,
             changes_running: AtomicBool::new(false),
+            diff_running: AtomicBool::new(false),
         }
     }
 
     /// None while an earlier `AgentChanges` request of this client still runs.
     pub(crate) fn begin_changes(self: &Arc<Self>) -> Option<ChangesGuard> {
-        self.changes_running
+        self.begin(|sink| &sink.changes_running)
+    }
+
+    /// None while an earlier `TaskDiff` request of this client still runs.
+    pub(crate) fn begin_diff(self: &Arc<Self>) -> Option<ChangesGuard> {
+        self.begin(|sink| &sink.diff_running)
+    }
+
+    fn begin(self: &Arc<Self>, flag: fn(&ClientSink) -> &AtomicBool) -> Option<ChangesGuard> {
+        flag(self)
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
-            .then(|| ChangesGuard(Arc::clone(self)))
+            .then(|| ChangesGuard(Arc::clone(self), flag))
     }
 
     pub(crate) fn id(&self) -> u64 {
@@ -621,6 +632,19 @@ mod tests {
 
         drop(first);
         assert!(client.begin_changes().is_some());
+    }
+
+    #[test]
+    fn one_diff_request_runs_per_client_apart_from_changes() {
+        let (client, _frames) = sink(1, 8);
+
+        let first = client.begin_diff();
+        assert!(first.is_some());
+        assert!(client.begin_diff().is_none());
+        assert!(client.begin_changes().is_some(), "another kind of request");
+
+        drop(first);
+        assert!(client.begin_diff().is_some());
     }
 
     #[test]

@@ -11,6 +11,7 @@ path = "src/swarm_core.rs"
 workspace = true
 
 [dependencies]
+libc.workspace = true
 log.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
