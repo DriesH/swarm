@@ -161,6 +161,13 @@ impl TerminalView {
         self.exit_status.as_ref()
     }
 
+    /// Columns and rows of the screen, once the first snapshot arrived.
+    pub fn grid_size(&self) -> Option<(u16, u16)> {
+        let model = self.model.as_ref()?;
+
+        Some((model.screen().cols, model.screen().rows))
+    }
+
     /// The text on screen, one line per row, for assistive technology and tests.
     pub fn visible_text(&self) -> String {
         let Some(model) = &self.model else {
