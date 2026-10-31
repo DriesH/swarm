@@ -10,11 +10,11 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::Value;
-use swarm_core::git;
 use swarm_core::store::NewMessage;
+use swarm_core::{WorkerCheckout, git};
 use swarm_protocol::agent::{
-    AgentRequest, AgentSummary, Call, Merged, Reply, Sent, TaskSummary, TaskUntil, TerminalSize,
-    TerminalUntil,
+    AgentRequest, AgentSummary, Call, Committed, Merged, Reply, Sent, TaskSummary, TaskUntil,
+    TerminalSize, TerminalUntil,
 };
 use swarm_protocol::{
     AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, CreateTask, Event,
@@ -65,6 +65,14 @@ fn check_size(text: &str) -> Result<(), Failure> {
         text.len().div_ceil(1024),
         MAX_MESSAGE_BYTES >> 10,
     ))
+}
+
+/// What an orchestrator asked for in `spawn`, apart from the name.
+struct Worker {
+    kind: Option<AgentKind>,
+    model: Option<String>,
+    brief: String,
+    own_worktree: Option<String>,
 }
 
 fn reply_with(result: impl Serialize) -> Outcome {
@@ -173,7 +181,17 @@ impl Calls {
                 kind,
                 model,
                 brief,
-            } => self.spawn(caller, &name, kind, model, brief),
+                own_worktree,
+            } => self.spawn(
+                caller,
+                &name,
+                &Worker {
+                    kind,
+                    model,
+                    brief,
+                    own_worktree,
+                },
+            ),
             Call::Send { to, text } => self.send(caller, to, &text),
             Call::Ask { question } => {
                 self.to_orchestrator(caller, MessageKind::Question, &question)
@@ -189,6 +207,7 @@ impl Calls {
 
                 self.wait(caller, timeout_secs, gone, claim)
             }
+            Call::Commit { message, paths } => Self::commit(caller, &message, &paths),
             Call::Merge { worker } => self.merge(caller, worker),
             Call::Notify { text } => self.notify(caller, &text),
             Call::Agents => self.agents(caller),
@@ -303,21 +322,28 @@ impl Calls {
         })
     }
 
-    fn spawn(
-        &self,
-        caller: &AgentInfo,
-        name: &str,
-        kind: Option<AgentKind>,
-        model: Option<String>,
-        brief: String,
-    ) -> Outcome {
+    fn spawn(&self, caller: &AgentInfo, name: &str, worker: &Worker) -> Outcome {
+        let Worker {
+            kind,
+            model,
+            brief,
+            own_worktree,
+        } = worker;
         let task = self.orchestrated_task(caller, "spawn workers")?;
 
         if brief.trim().is_empty() {
             return refuse("a worker needs a brief");
         }
-        check_size(&brief)?;
-        let model = model.map(|model| model.trim().to_owned());
+        check_size(brief)?;
+        if own_worktree
+            .as_deref()
+            .is_some_and(|reason| reason.trim().is_empty())
+        {
+            return refuse(
+                "state a reason for --own-worktree, or leave it out to share the task worktree",
+            );
+        }
+        let model = model.as_deref().map(|model| model.trim().to_owned());
         if model
             .as_deref()
             .is_some_and(|model| model.is_empty() || model.starts_with('-'))
@@ -333,34 +359,40 @@ impl Calls {
             .with_model(model);
 
         let agents = &self.services.agents;
-        let prepared = self
-            .services
-            .projects
-            .create_worker(&task, name, |checkout| {
-                agents
-                    .register(
-                        &Place {
-                            project: checkout.project,
-                            task: Some(checkout.task),
-                            name: &checkout.name,
-                            worktree: &checkout.worktree,
-                            branch: &checkout.branch,
-                            ports: &checkout.ports,
-                        },
-                        plan,
-                    )
-                    .map_err(|error| swarm_core::Error::Invalid(format!("{error:#}")))
-            })?;
+        let register = |checkout: &WorkerCheckout| {
+            agents
+                .register(
+                    &Place {
+                        project: checkout.project,
+                        task: Some(checkout.task),
+                        name: &checkout.name,
+                        worktree: &checkout.worktree,
+                        branch: &checkout.branch,
+                        ports: &checkout.ports,
+                    },
+                    plan,
+                )
+                .map_err(|error| swarm_core::Error::Invalid(format!("{error:#}")))
+        };
+        let prepared = if own_worktree.is_some() {
+            self.services
+                .projects
+                .create_worker(&task, name, register)?
+        } else {
+            self.services
+                .projects
+                .create_shared_worker(&task, name, register)?
+        };
         let worker = prepared.agent.clone();
 
-        if let Err(failure) = self.post(caller, &worker, MessageKind::Brief, &brief, true) {
+        if let Err(failure) = self.post(caller, &worker, MessageKind::Brief, brief, true) {
             agents.forget(worker.id);
             self.services.projects.discard_worker(&worker);
 
             return Err(failure);
         }
         agents.announce(worker.id);
-        tasks::start_worker(&self.services, prepared, &task, brief);
+        tasks::start_worker(&self.services, prepared, &task, brief.clone());
 
         let worker = agents.info(worker.id).unwrap_or(worker);
 
@@ -422,9 +454,26 @@ impl Calls {
         inbox(taken, claim)
     }
 
+    fn commit(caller: &AgentInfo, message: &str, paths: &[PathBuf]) -> Outcome {
+        if caller.role == AgentRole::StartOrchestrator || caller.task.is_none() {
+            return refuse("only a worker or a task's orchestrator can commit");
+        }
+
+        let commit = git::commit_paths(&caller.worktree, &caller.name, message, paths)?;
+
+        reply_with(Committed { commit })
+    }
+
     fn merge(&self, caller: &AgentInfo, worker: AgentId) -> Outcome {
         let task = self.orchestrated_task(caller, "merge a worker")?;
         let worker = self.worker_of(caller, worker)?;
+
+        if worker.worktree == task.worktree {
+            return refuse(format!(
+                "{} works in the task worktree; nothing to merge",
+                worker.name
+            ));
+        }
 
         let outcome = git::merge_branch(&task.worktree, &worker.branch)?;
 
