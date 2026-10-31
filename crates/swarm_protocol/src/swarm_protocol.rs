@@ -17,10 +17,10 @@ use swarm_term::{Palette, Size, TerminalInput, TerminalOutput};
 pub mod agent;
 mod client;
 
-pub use client::{Client, ClientError, CommentEvent, MessageEvent};
+pub use client::{Client, ClientError, CommentEvent, MessageEvent, PrEvent};
 
 /// Bumped on every incompatible change; the daemon refuses other versions.
-pub const VERSION: u32 = 9;
+pub const VERSION: u32 = 10;
 
 /// The most messages [`Request::ListMessages`] returns.
 pub const MESSAGES_LISTED: usize = 500;
@@ -209,6 +209,10 @@ pub struct TaskInfo {
     /// The task was closed: its agents stopped and its worktrees are gone. Sent once in
     /// a `TaskChanged`; closed tasks are never listed.
     pub closed: bool,
+    /// The pull request made from the task branch, once it exists.
+    pub pull_request: Option<PrLink>,
+    /// Close the task (as [`Request::CloseTask`] does) once its pull request is merged.
+    pub close_after_merge: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -261,6 +265,9 @@ pub enum MessageKind {
     /// From Swarm: the user's review comments, to the task orchestrator, which passes
     /// each one on to the worker it names.
     Comment,
+    /// From Swarm: asks the task orchestrator for a pull request title and description,
+    /// which it sends back with `swarm pr draft`.
+    PrDraft,
 }
 
 impl MessageKind {
@@ -275,6 +282,7 @@ impl MessageKind {
             Self::UserInput => "user input",
             Self::WorkerStopped => "worker stopped",
             Self::Comment => "comment",
+            Self::PrDraft => "pr draft",
         }
     }
 }
@@ -475,6 +483,139 @@ pub struct NewComment {
     pub body: String,
 }
 
+/// GitHub setup of a project: the `gh` CLI, its sign-in and the `origin` remote.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct GithubStatus {
+    /// The `gh` the daemon uses, `None` when it is not installed.
+    pub gh: Option<PathBuf>,
+    pub gh_version: Option<String>,
+    /// `gh auth status` for github.com succeeded.
+    pub signed_in: bool,
+    /// `owner/name` when `origin` is on github.com. Pull request features only show
+    /// when this is set.
+    pub repository: Option<String>,
+    /// The command that installs `gh` (Homebrew when it exists, else the official
+    /// release into Swarm's own bin folder). The app runs it in a user terminal.
+    pub install: Vec<String>,
+    /// The command that signs `gh` in to github.com in the browser. The app runs it in a
+    /// user terminal.
+    pub sign_in: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckState {
+    Waiting,
+    Running,
+    Passed,
+    Failed,
+    /// Its terminal was closed or the run was replaced before it ended.
+    Stopped,
+}
+
+/// One command of the project's `[checks] before_pr`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct LocalCheck {
+    pub command: String,
+    pub state: CheckState,
+    /// The process terminal it runs in. It stays after a failure so its output can be
+    /// read.
+    pub terminal: Option<TerminalId>,
+    pub exit: Option<swarm_term::ExitStatus>,
+    pub duration_ms: Option<u64>,
+}
+
+/// One run of the local checks in the task worktree, one command after the other.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ChecksRun {
+    pub task: TaskId,
+    /// HEAD of the task worktree when the run started. A newer commit makes the result
+    /// stale.
+    pub commit: String,
+    /// `[checks] required`: a pull request needs every check passed on its commit.
+    pub required: bool,
+    pub checks: Vec<LocalCheck>,
+    /// The pre-push hook git runs on push, by its tool when known ("husky",
+    /// "lefthook", "pre-push"). Shown only; Swarm does not run it itself.
+    pub pre_push_hook: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PrDraft {
+    pub title: String,
+    pub body: String,
+}
+
+/// A pull request made from a task branch.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PrLink {
+    pub number: u64,
+    pub url: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeMethod {
+    Squash,
+    Merge,
+    Rebase,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrState {
+    Open,
+    Merged,
+    Closed,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GithubCheckState {
+    Queued,
+    Running,
+    Passed,
+    Failed,
+    Skipped,
+    Cancelled,
+}
+
+/// One check run or status on the pull request's head commit, as GitHub reports it.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct GithubCheck {
+    pub name: String,
+    pub state: GithubCheckState,
+    pub duration_secs: Option<u32>,
+    pub url: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewState {
+    Requested,
+    Approved,
+    ChangesRequested,
+    Commented,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Reviewer {
+    /// The GitHub login, without `@`.
+    pub login: String,
+    pub state: ReviewState,
+}
+
+/// The pull request as GitHub reports it now.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PullRequest {
+    pub number: u64,
+    pub url: String,
+    pub title: String,
+    pub state: PrState,
+    pub draft: bool,
+    pub checks: Vec<GithubCheck>,
+    pub reviewers: Vec<Reviewer>,
+    /// GitHub would merge it now: no conflicts, required checks and reviews passed.
+    pub mergeable: bool,
+    /// Milliseconds since the Unix epoch.
+    pub read_at: u64,
+}
+
 /// What closing a task would throw away, so the app can ask first.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct CloseCheck {
@@ -617,6 +758,79 @@ pub enum Request {
         call: CallId,
         task: TaskId,
     },
+    /// Answered with [`Event::GithubStatus`].
+    GithubStatus {
+        call: CallId,
+        project: ProjectId,
+    },
+    /// The project's local branches, newest commit first. Answered with
+    /// [`Event::Branches`].
+    ListBranches {
+        call: CallId,
+        project: ProjectId,
+    },
+    /// Starts the project's local checks in the task worktree, one process terminal per
+    /// command, replacing a run that is still going. Answered with [`Event::Done`];
+    /// progress arrives as [`Event::ChecksChanged`].
+    RunChecks {
+        call: CallId,
+        task: TaskId,
+    },
+    /// The task's latest run. Answered with [`Event::Checks`].
+    ListChecks {
+        call: CallId,
+        task: TaskId,
+    },
+    /// Asks the task orchestrator for a pull request draft. Refused unless the task is
+    /// approved and its orchestrator can take messages. Answered with [`Event::Done`];
+    /// the draft arrives as [`Event::PrDraftChanged`].
+    DraftPr {
+        call: CallId,
+        task: TaskId,
+    },
+    /// Pushes the task branch and opens the pull request with `gh`. Refused unless the
+    /// Merged diff is approved as it is now, no comment is pending, and the local checks
+    /// passed on the current commit (when `[checks] required` is false, `skip_checks`
+    /// allows failed or missing checks). An error carries the push or `gh` output.
+    /// Answered with a `TaskChanged` to every client, then [`Event::Done`].
+    CreatePr {
+        call: CallId,
+        task: TaskId,
+        draft: PrDraft,
+        as_draft: bool,
+        close_after_merge: bool,
+        skip_checks: bool,
+    },
+    /// Answered with [`Event::PrStatus`].
+    PrStatus {
+        call: CallId,
+        task: TaskId,
+    },
+    /// Marks a draft pull request ready for review. Answered with [`Event::Done`].
+    MarkPrReady {
+        call: CallId,
+        task: TaskId,
+    },
+    /// Asks these GitHub logins for a review. Answered with [`Event::Done`].
+    AddReviewers {
+        call: CallId,
+        task: TaskId,
+        logins: Vec<String>,
+    },
+    /// Merges the pull request on GitHub and deletes its remote branch. With
+    /// `close_after_merge`, the task then closes unless closing would lose uncommitted
+    /// work. Answered with a `TaskChanged` to every client, then [`Event::Done`].
+    MergePr {
+        call: CallId,
+        task: TaskId,
+        method: MergeMethod,
+    },
+    /// Answered with a `TaskChanged` to every client, then [`Event::Done`].
+    SetCloseAfterMerge {
+        call: CallId,
+        task: TaskId,
+        close: bool,
+    },
     /// Stops the task's agents and all its terminals, runs the teardown script, and
     /// removes the task worktree and workers' own worktrees, uncommitted changes
     /// included. Branches merged into the base branch are deleted; the others stay. Once the agents stopped, the daemon checks again and
@@ -731,6 +945,32 @@ pub enum Event {
     CommentDeleted {
         task: TaskId,
         id: CommentId,
+    },
+    GithubStatus {
+        call: CallId,
+        status: GithubStatus,
+    },
+    Branches {
+        call: CallId,
+        branches: Vec<String>,
+    },
+    /// `None` when the task never ran its checks.
+    Checks {
+        call: CallId,
+        run: Option<ChecksRun>,
+    },
+    /// Sent to every client whenever a check of a run starts or ends.
+    ChecksChanged {
+        run: ChecksRun,
+    },
+    /// Sent to every client when the task orchestrator sends a pull request draft.
+    PrDraftChanged {
+        task: TaskId,
+        draft: PrDraft,
+    },
+    PrStatus {
+        call: CallId,
+        pull_request: PullRequest,
     },
 }
 
