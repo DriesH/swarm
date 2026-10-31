@@ -233,8 +233,8 @@ impl SettingsWindow {
                 state,
                 "worker-typing",
                 "Allow typing in worker terminals",
-                settings.allow_worker_typing,
-                |state, on| state.allow_worker_typing = on,
+                settings.settings.terminals.allow_worker_typing,
+                |state, on| state.settings.terminals.allow_worker_typing = on,
             ))
             .row(dropdown_row(
                 state,

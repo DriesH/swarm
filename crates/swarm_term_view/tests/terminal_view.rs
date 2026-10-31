@@ -1,7 +1,7 @@
 //! Drives a `TerminalView` in a test window through the channel types, the way an
 //! emulator would.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gpui::{
@@ -305,6 +305,136 @@ fn typing_scrolls_back_to_the_bottom(cx: &mut TestAppContext) {
         .terminal
         .read_with(setup.cx, |view, _| view.visible_text());
     assert!(text.starts_with("a\nb\nc\n"), "{text:?}");
+}
+
+fn scroll_up(setup: &mut Setup<'_>, lines: f32) {
+    setup.cx.simulate_event(ScrollEvent {
+        position: point(px(100.), px(100.)),
+        delta: ScrollDelta::Lines(point(0., lines)),
+        modifiers: Modifiers::default(),
+        touch_phase: TouchPhase::Moved,
+        source: ScrollSource::Pointer,
+    });
+}
+
+#[gpui::test]
+fn scrolling_moves_the_scrollback_position(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    setup.send(snapshot(
+        &["a", "b", "c"],
+        History {
+            start: 0,
+            len: 1_000,
+        },
+    ));
+
+    scroll_up(&mut setup, 3.);
+    let scrolled = setup
+        .terminal
+        .read_with(setup.cx, |view, _| view.scrolled_back());
+    scroll_up(&mut setup, -3.);
+    let back = setup
+        .terminal
+        .read_with(setup.cx, |view, _| view.scrolled_back());
+
+    assert_eq!((scrolled, back), (3, 0));
+}
+
+fn gate(setup: &mut Setup<'_>, open: &Rc<Cell<bool>>) {
+    let open = Rc::clone(open);
+
+    setup.terminal.update(setup.cx, |view, _| {
+        view.set_typing_gate(move |_| open.get());
+    });
+}
+
+#[gpui::test]
+fn a_closed_typing_gate_keeps_typing_from_the_program(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    let open = Rc::new(Cell::new(false));
+    gate(&mut setup, &open);
+    setup.focus();
+    setup.inputs();
+    setup
+        .cx
+        .write_to_clipboard(ClipboardItem::new_string("pasted".to_owned()));
+
+    setup.cx.simulate_keystrokes("a enter cmd-v");
+    let terminal = setup.terminal.clone();
+    setup.cx.update(|window, cx| {
+        terminal.update(cx, |view, cx| {
+            view.replace_text_in_range(None, "x", window, cx);
+        });
+    });
+
+    assert!(setup.inputs().is_empty());
+    assert_eq!(*setup.seen.borrow(), ["a", "enter", "v"]);
+}
+
+#[gpui::test]
+fn a_closed_typing_gate_keeps_composing_text_off_the_screen(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    let open = Rc::new(Cell::new(false));
+    gate(&mut setup, &open);
+    let terminal = setup.terminal.clone();
+    let mark = |setup: &mut Setup<'_>| {
+        setup.cx.update(|window, cx| {
+            terminal.update(cx, |view, cx| {
+                view.replace_and_mark_text_in_range(None, "か", None, window, cx);
+            });
+        });
+
+        setup
+            .cx
+            .update(|window, cx| terminal.update(cx, |view, cx| view.marked_text_range(window, cx)))
+    };
+
+    let closed = mark(&mut setup);
+    open.set(true);
+    let opened = mark(&mut setup);
+
+    assert_eq!(closed, None);
+    assert_eq!(opened, Some(0..1));
+}
+
+#[gpui::test]
+fn an_open_typing_gate_lets_typing_through_again(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    let open = Rc::new(Cell::new(false));
+    gate(&mut setup, &open);
+    setup.focus();
+    setup.inputs();
+
+    setup.cx.simulate_keystrokes("a");
+    open.set(true);
+    setup.cx.simulate_keystrokes("b");
+
+    let keys = setup.keys();
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].name, "b");
+}
+
+#[gpui::test]
+fn a_closed_typing_gate_still_scrolls_and_takes_focus(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    setup.send(snapshot(
+        &["a", "b", "c"],
+        History {
+            start: 0,
+            len: 1_000,
+        },
+    ));
+    gate(&mut setup, &Rc::new(Cell::new(false)));
+    setup.inputs();
+
+    setup.focus();
+    scroll_up(&mut setup, 3.);
+
+    let scrolled = setup
+        .terminal
+        .read_with(setup.cx, |view, _| view.scrolled_back());
+    assert_eq!(scrolled, 3);
+    assert!(setup.inputs().contains(&TerminalInput::Focus(true)));
 }
 
 #[gpui::test]

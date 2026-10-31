@@ -61,7 +61,7 @@ The view that shows a task's swarm as a graph of agents and the messages between
 _Avoid_: Graph view, map
 
 **Inspector**:
-The panel in the Swarm view that shows the selected agent: its details, messages, changes and terminals.
+The panel in the Swarm view that shows the selected agent: its details, messages, changes and its live terminal.
 _Avoid_: Details pane, sidebar
 
 **In flight**:
@@ -113,7 +113,7 @@ A terminal the user opened that no agent can see or touch.
 _Avoid_: God mode terminal, private terminal
 
 **Tray**:
-The strip of chips in the status bar where tiles go when they don't fit on screen.
+The strip of chips in the status bar where tiles go when they don't fit on screen. Chips that don't fit the bar sit behind a "+N" chip that opens a menu.
 _Avoid_: Dock, minimized bar
 
 **Daemon**:

@@ -23,7 +23,9 @@ use crate::model::{
 use crate::palette::Overlay;
 use crate::panels::ChangesList;
 use crate::review_view::ReviewView;
-use crate::swarm_view::{DotGrid, INSPECTOR_WIDTH, InspectorTab, MessageThread, TerminalPreview};
+use crate::swarm_view::{
+    Clicked, DotGrid, INSPECTOR_WIDTH, InspectorTab, MessageThread, TerminalPreview,
+};
 use crate::views::Resizing;
 use crate::{panels, sidebar, status_bar, tab_bar, views};
 
@@ -75,6 +77,8 @@ pub(crate) struct Workspace {
     /// True when the right panel was shown as `terminal_area` was measured.
     pub(crate) terminal_area_had_panel: bool,
     pub(crate) layout: swarm_layout::Layout,
+    /// The width of the tray in the status bar at the last paint, once known.
+    pub(crate) tray_width: Option<Pixels>,
     pub(crate) user_sizes: HashMap<TerminalId, Size<Pixels>>,
     pub(crate) resizing: Option<Resizing>,
     pub(crate) daemon: Option<Client>,
@@ -124,6 +128,7 @@ pub(crate) struct Workspace {
     pub(crate) preview: Entity<TerminalPreview>,
     pub(crate) dot_grid: Entity<DotGrid>,
     _inspector_subscription: Subscription,
+    _preview_subscription: Subscription,
     pub(crate) changes_poll: Option<gpui::Task<()>>,
     /// The task the running poll asks about.
     pub(crate) polled_task: Option<TaskId>,
@@ -208,6 +213,10 @@ impl Workspace {
             |cx| ReviewView::new(workspace, cx)
         });
         let changes_list = cx.new(|_| ChangesList::new(workspace));
+        let preview = cx.new(|_| TerminalPreview::new());
+        let preview_subscription = cx.subscribe(&preview, |this, _, _: &Clicked, cx| {
+            this.focus_selected_terminal(cx);
+        });
 
         let mut workspace = Self {
             data,
@@ -224,6 +233,7 @@ impl Workspace {
             terminal_area: None,
             terminal_area_had_panel: false,
             layout: swarm_layout::Layout::default(),
+            tray_width: None,
             user_sizes: HashMap::new(),
             resizing: None,
             daemon: None,
@@ -254,9 +264,10 @@ impl Workspace {
             inspector_dragging: false,
             inspector_handle: cx.focus_handle().tab_stop(true),
             thread: cx.new(|_| MessageThread::new()),
-            preview: cx.new(|_| TerminalPreview::new()),
+            preview,
             dot_grid: cx.new(|_| DotGrid),
             _inspector_subscription: inspector_subscription,
+            _preview_subscription: preview_subscription,
             changes_poll: None,
             polled_task: None,
             _activation_subscription: activation_subscription,
@@ -389,6 +400,11 @@ impl Workspace {
 
     pub(crate) fn focus_terminal(&mut self, terminal: TerminalId, cx: &mut Context<Self>) {
         self.minimized.remove(&terminal);
+        self.claim_focus(terminal, cx);
+    }
+
+    /// Gives the terminal the focus where it is shown, and leaves the tray alone.
+    pub(crate) fn claim_focus(&mut self, terminal: TerminalId, cx: &mut Context<Self>) {
         self.focused_terminal = Some(terminal);
         self.pending_focus = Some(terminal);
         cx.notify();
@@ -540,6 +556,7 @@ impl Render for Workspace {
             self.ensure_swarm_handles(cx);
         }
 
+        self.measure_cells(window, cx);
         self.layout = views::compute_layout(self);
 
         let sidebar = sidebar::render(self, window, cx);

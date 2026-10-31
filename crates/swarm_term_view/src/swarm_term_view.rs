@@ -8,6 +8,7 @@ mod box_drawing;
 mod element;
 
 use std::ops::Range;
+use std::rc::Rc;
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
@@ -36,8 +37,12 @@ pub enum TerminalEvent {
     Disconnected,
 }
 
+/// Tells whether the user may type into a terminal right now.
+type TypingGate = Rc<dyn Fn(&App) -> bool>;
+
 pub struct TerminalView {
     input: flume::Sender<TerminalInput>,
+    typing_gate: Option<TypingGate>,
     focus_handle: FocusHandle,
     accessible_name: SharedString,
     metrics: Metrics,
@@ -63,6 +68,7 @@ pub struct TerminalView {
 #[derive(Default)]
 struct PaintInfo {
     cursor_bounds: Option<Bounds<Pixels>>,
+    paints: u64,
 }
 
 impl TerminalView {
@@ -118,6 +124,7 @@ impl TerminalView {
 
         let mut view = Self {
             input,
+            typing_gate: None,
             focus_handle,
             accessible_name,
             metrics: Metrics::measure(window),
@@ -144,6 +151,40 @@ impl TerminalView {
     /// terminal at the right size.
     pub fn size_for(bounds: Size<Pixels>, window: &mut Window, _cx: &App) -> swarm_term::Size {
         Metrics::measure(window).grid_for(bounds)
+    }
+
+    /// The exact size of one cell, as the view paints it. The cell sizes in
+    /// [`size_for`](Self::size_for) are whole pixels, which is too narrow for a tile that
+    /// must hold a number of columns.
+    pub fn cell_size(window: &Window, _cx: &App) -> Size<Pixels> {
+        let metrics = Metrics::measure(window);
+
+        Size {
+            width: metrics.cell_width,
+            height: metrics.line_height,
+        }
+    }
+
+    /// Lets `allowed` decide, for every key, paste, text input and composing text, whether it
+    /// reaches the program. Without it all typing is allowed. Scrolling and focus work either way, and
+    /// a key that is not allowed bubbles up like a key the view does not handle.
+    pub fn set_typing_gate(&mut self, allowed: impl Fn(&App) -> bool + 'static) {
+        self.typing_gate = Some(Rc::new(allowed));
+    }
+
+    fn typing_allowed(&self, cx: &App) -> bool {
+        self.typing_gate.as_ref().is_none_or(|allowed| allowed(cx))
+    }
+
+    /// How many times the view was painted. Tests use it to see that a view is drawn once
+    /// per frame, and only where it is shown.
+    pub fn paint_count(&self) -> u64 {
+        self.paint_info.paints
+    }
+
+    /// How many lines the view is scrolled back from the bottom.
+    pub fn scrolled_back(&self) -> u64 {
+        self.model.as_ref().map_or(0, ScreenModel::scroll_offset)
     }
 
     /// The last title the program set.
@@ -433,6 +474,9 @@ impl TerminalView {
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
+        if !self.typing_allowed(cx) {
+            return;
+        }
 
         if keystroke.modifiers.platform {
             let plain_paste = keystroke.key == "v"
@@ -454,6 +498,10 @@ impl TerminalView {
     }
 
     fn paste(&mut self, cx: &mut Context<Self>) {
+        if !self.typing_allowed(cx) {
+            return;
+        }
+
         let text = cx
             .read_from_clipboard()
             .and_then(|item: ClipboardItem| item.text());
@@ -632,7 +680,7 @@ impl EntityInputHandler for TerminalView {
     ) {
         self.marked_text = None;
 
-        if !text.is_empty() {
+        if !text.is_empty() && self.typing_allowed(cx) {
             self.send(TerminalInput::Text(text.to_owned()));
             self.scroll_to_bottom(cx);
         }
@@ -648,7 +696,8 @@ impl EntityInputHandler for TerminalView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.marked_text = (!new_text.is_empty()).then(|| new_text.to_owned());
+        let shown = !new_text.is_empty() && self.typing_allowed(cx);
+        self.marked_text = shown.then(|| new_text.to_owned());
         cx.notify();
     }
 

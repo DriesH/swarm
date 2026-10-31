@@ -20,6 +20,8 @@ mod views;
 mod window_drag;
 mod workspace;
 
+#[cfg(any(feature = "snapshot", feature = "frame-stats"))]
+mod demo;
 #[cfg(feature = "frame-stats")]
 mod frame_stats;
 #[cfg(feature = "snapshot")]
@@ -62,6 +64,8 @@ fn open_workspace(cx: &mut App) -> anyhow::Result<gpui::WindowHandle<Workspace>>
     })?;
 
     if !sample {
+        settings::load(swarm_settings::default_path(), cx);
+
         handle.update(cx, |workspace, window, cx| {
             workspace.settings_path = swarm_settings::default_path();
             workspace.connect_daemon(window, cx);

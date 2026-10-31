@@ -144,6 +144,23 @@ fn open_close_task(workspace: &mut Workspace, window: &mut Window, cx: &mut Cont
     workspace.open_close_task(task, window, cx);
 }
 
+fn open_swarm_terminal_live(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    show_pty_io(workspace, InspectorTab::Terminal, cx);
+    crate::demo::attach_terminal(workspace, window, cx);
+
+    let terminal = workspace
+        .selected_agent()
+        .and_then(|id| workspace.data.agent(id))
+        .map(|agent| agent.terminal);
+    if let Some(terminal) = terminal {
+        workspace.claim_focus(terminal, cx);
+    }
+}
+
 fn show_empty(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
     workspace.use_projects(&[], cx);
 }
@@ -222,6 +239,16 @@ pub(crate) fn run(directory: PathBuf, cx: &mut App) {
                 Appearance::Dark,
                 "workspace-swarm-terminal-dark.png",
                 Some(open_swarm_terminal),
+            ),
+            (
+                Appearance::Light,
+                "workspace-swarm-terminal-live-light.png",
+                Some(open_swarm_terminal_live),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-swarm-terminal-live-dark.png",
+                Some(open_swarm_terminal_live),
             ),
             (
                 Appearance::Light,
@@ -376,6 +403,11 @@ async fn snap(path: &Path, open: Option<OpenOverlay>, cx: &mut AsyncApp) {
         }
 
         cx.background_executor().timer(SETTLE).await;
+
+        // Content that arrives after the first frame, like a terminal's screen, needs another.
+        if let Err(error) = window.update(cx, |_, window, cx| window.draw(cx).clear(cx)) {
+            log::error!("cannot draw: {error:#}");
+        }
     }
 
     if let Err(error) = window.update(cx, |_, window, _| window.minimize_window()) {

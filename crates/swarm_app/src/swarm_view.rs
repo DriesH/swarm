@@ -8,10 +8,10 @@ use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, DragMoveEvent, Entity, FollowMode,
-    FontWeight, Hsla, KeyDownEvent, ListAlignment, ListState, MouseButton, Pixels, Role,
-    SharedString, StyleRefinement, Subscription, Window, canvas, div, linear_color_stop,
-    linear_gradient, list, point, px, uniform_list,
+    AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, DragMoveEvent, Entity, EventEmitter,
+    Focusable as _, FollowMode, FontWeight, Hsla, KeyDownEvent, ListAlignment, ListState,
+    MouseButton, Pixels, Role, SharedString, StyleRefinement, Window, canvas, div,
+    linear_color_stop, linear_gradient, list, point, px, uniform_list,
 };
 use swarm_protocol::{AgentId as DaemonAgentId, FileStat, MessageId, MessageKind};
 use swarm_term_view::TerminalView;
@@ -310,6 +310,7 @@ impl Workspace {
             return;
         };
         let (id, name) = (agent.id, agent.name.clone());
+        let label = SharedString::from(agent.accessible_label());
         let fallback = self.fake_preview(agent);
         let live = reads_terminal(self.view, self.inspector_tab)
             .then(|| self.live_terminals.get(&agent.terminal))
@@ -327,7 +328,7 @@ impl Workspace {
             thread.show(id, revision, messages, names, now, cx);
         });
         self.preview.update(cx, |preview, cx| {
-            preview.show(name, live, fallback, cx);
+            preview.show(name, label, live, fallback, cx);
         });
     }
 
@@ -540,129 +541,158 @@ impl Workspace {
 
     /// The preview of an agent without a live terminal: the last rows of its fake lines.
     fn fake_preview(&self, agent: &Agent) -> Preview {
-        let terminal = self.data.terminal(agent.terminal);
-        let lines = terminal.map_or_else(Vec::new, |terminal| {
-            let first = terminal.lines.len().saturating_sub(PREVIEW_ROWS);
+        let lines = self
+            .data
+            .terminal(agent.terminal)
+            .map_or_else(Vec::new, |terminal| {
+                let first = terminal.lines.len().saturating_sub(PREVIEW_ROWS);
 
-            terminal.lines[first..]
-                .iter()
-                .map(|line| (line.text.clone(), line.color))
-                .collect()
-        });
+                terminal.lines[first..]
+                    .iter()
+                    .map(|line| (line.text.clone(), line.color))
+                    .collect()
+            });
 
         Preview {
             lines,
-            grid: Some(
-                terminal
-                    .and_then(|terminal| terminal.requested_size)
-                    .unwrap_or((80, 24)),
-            ),
             running: agent.status != AgentStatus::Done,
+        }
+    }
+
+    /// A click in the Terminal tab focuses the selected agent's terminal, like a click on
+    /// its tile. The tray is left alone.
+    pub(crate) fn focus_selected_terminal(&mut self, cx: &mut Context<Self>) {
+        let terminal = self
+            .selected_agent()
+            .and_then(|id| self.data.agent(id))
+            .map(|agent| agent.terminal);
+
+        if let Some(terminal) = terminal {
+            self.claim_focus(terminal, cx);
         }
     }
 }
 
+/// The text copy of an agent without a live terminal.
 #[derive(Clone, Default, PartialEq)]
 struct Preview {
     lines: Vec<(SharedString, Color)>,
-    grid: Option<(u16, u16)>,
     running: bool,
 }
 
-/// The last rows of the selected agent's terminal. It reads a live terminal's text only
-/// when that terminal changes, not on every frame of the window.
+/// The user clicked the terminal in the tab.
+pub(crate) struct Clicked;
+
+/// The selected agent's terminal. A live terminal is the same view its tile shows, so it
+/// scrolls and takes typing under the same rules; an agent without one shows its text.
 pub(crate) struct TerminalPreview {
     agent_name: SharedString,
-    live: Option<(Entity<TerminalView>, Subscription)>,
+    label: SharedString,
+    live: Option<Entity<TerminalView>>,
     fallback: Preview,
-    shown: Preview,
 }
+
+impl EventEmitter<Clicked> for TerminalPreview {}
 
 impl TerminalPreview {
     pub(crate) fn new() -> Self {
         Self {
             agent_name: SharedString::default(),
+            label: SharedString::default(),
             live: None,
             fallback: Preview::default(),
-            shown: Preview::default(),
         }
     }
 
     fn show(
         &mut self,
         agent_name: SharedString,
+        label: SharedString,
         live: Option<Entity<TerminalView>>,
         fallback: Preview,
         cx: &mut Context<Self>,
     ) {
-        let same_live = self.live.as_ref().map(|(view, _)| view.entity_id())
-            == live.as_ref().map(Entity::entity_id);
-        let changed = !same_live || self.agent_name != agent_name || self.fallback != fallback;
-
-        if !changed {
+        let same_live =
+            self.live.as_ref().map(Entity::entity_id) == live.as_ref().map(Entity::entity_id);
+        if same_live
+            && self.agent_name == agent_name
+            && self.label == label
+            && self.fallback == fallback
+        {
             return;
         }
 
-        if !same_live {
-            self.live = live.map(|view| {
-                let subscription = cx.observe(&view, |this, _, cx| this.refresh(cx));
-
-                (view, subscription)
-            });
-        }
+        self.live = live;
         self.agent_name = agent_name;
+        self.label = label;
         self.fallback = fallback;
-
-        self.refresh(cx);
+        cx.notify();
     }
 
-    /// Shows nothing and stops reading any terminal.
+    /// The texts of the header: the agent's name, nothing else.
+    fn header_texts(&self) -> Vec<SharedString> {
+        vec![self.agent_name.clone()]
+    }
+
+    /// Shows nothing and lets go of any terminal.
     fn clear(&mut self, cx: &mut Context<Self>) {
-        if self.live.is_none() && self.agent_name.is_empty() && self.shown == Preview::default() {
+        if self.live.is_none() && self.agent_name.is_empty() && self.fallback == Preview::default()
+        {
             return;
         }
 
-        self.live = None;
-        self.agent_name = SharedString::default();
-        self.fallback = Preview::default();
-        self.shown = Preview::default();
+        *self = Self::new();
         cx.notify();
     }
 
-    fn refresh(&mut self, cx: &mut Context<Self>) {
-        let Some((view, _)) = &self.live else {
-            self.shown = self.fallback.clone();
-            cx.notify();
-            return;
-        };
-
-        let view = view.read(cx);
-        let text = view.visible_text();
-        let rows: Vec<&str> = text.lines().collect();
-        let used = rows
-            .iter()
-            .rposition(|row| !row.trim().is_empty())
-            .map_or(0, |last| last + 1);
-        let first = used.saturating_sub(PREVIEW_ROWS);
-
-        self.shown = Preview {
-            lines: rows[first..used]
-                .iter()
-                .map(|row| ((*row).to_owned().into(), Color::Default))
-                .collect(),
-            grid: view.grid_size(),
-            running: view.exit_status().is_none(),
-        };
-        cx.notify();
-    }
-}
-
-impl Render for TerminalPreview {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn live_body(
+        &self,
+        view: &Entity<TerminalView>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let colors = cx.theme().colors().clone();
-        let preview = &self.shown;
+        let focused = view.focus_handle(cx).is_focused(window);
 
-        let rows: Vec<AnyElement> = preview
+        div()
+            .id("terminal-live")
+            .debug_selector(|| "inspector-terminal".to_owned())
+            .role(Role::Group)
+            .aria_label(self.label.clone())
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .rounded(px(8.))
+            .border_1()
+            .border_color(colors.line)
+            .bg(colors.term)
+            .overflow_hidden()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| cx.emit(Clicked)),
+            )
+            .child(view.clone())
+            .when(focused, |body| {
+                body.child(
+                    div()
+                        .debug_selector(|| "inspector-terminal-ring".to_owned())
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .rounded(px(8.))
+                        .border_2()
+                        .border_color(colors.accent),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn text_body(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+
+        let rows: Vec<AnyElement> = self
+            .fallback
             .lines
             .iter()
             .map(|(text, color)| {
@@ -682,50 +712,58 @@ impl Render for TerminalPreview {
             .collect();
 
         v_flex()
+            .id("terminal-preview")
+            .debug_selector(|| "inspector-terminal-text".to_owned())
+            .role(Role::Group)
+            .aria_label(format!("{} terminal preview", self.agent_name))
+            .flex_1()
+            .min_h_0()
+            .justify_end()
+            .px(px(10.))
+            .py(px(8.))
+            .rounded(px(8.))
+            .border_1()
+            .border_color(colors.line)
+            .bg(colors.term)
+            .overflow_hidden()
+            .font_family(MONO_FONT)
+            .text_size(px(11.))
+            .line_height(px(17.6))
+            .children(rows)
+            .into_any_element()
+    }
+}
+
+impl Render for TerminalPreview {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors().clone();
+        let running = self.live.as_ref().map_or(self.fallback.running, |view| {
+            view.read(cx).exit_status().is_none()
+        });
+        let body = match &self.live {
+            Some(view) => self.live_body(view, window, cx),
+            None => self.text_body(cx),
+        };
+
+        v_flex()
             .size_full()
             .gap(px(6.))
             .child(
                 h_flex()
                     .flex_none()
                     .gap(px(6.))
-                    .child(div().size(px(6.)).rounded(px(6.)).bg(if preview.running {
+                    .child(div().size(px(6.)).rounded(px(6.)).bg(if running {
                         colors.ok
                     } else {
                         colors.faint
                     }))
-                    .child(
-                        Label::new(self.agent_name.clone())
-                            .size(LabelSize::Small)
-                            .color(Color::Faint),
-                    )
-                    .child(div().flex_1())
-                    .children(preview.grid.map(|(columns, rows)| {
-                        Label::new(format!("{columns}\u{d7}{rows}"))
-                            .mono()
-                            .size(LabelSize::XSmall)
-                            .color(Color::Faint)
-                    })),
+                    .children(
+                        self.header_texts().into_iter().map(|text| {
+                            Label::new(text).size(LabelSize::Small).color(Color::Faint)
+                        }),
+                    ),
             )
-            .child(
-                v_flex()
-                    .id("terminal-preview")
-                    .role(Role::Group)
-                    .aria_label(format!("{} terminal preview", self.agent_name))
-                    .flex_1()
-                    .min_h_0()
-                    .justify_end()
-                    .px(px(10.))
-                    .py(px(8.))
-                    .rounded(px(8.))
-                    .border_1()
-                    .border_color(colors.line)
-                    .bg(colors.term)
-                    .overflow_hidden()
-                    .font_family(MONO_FONT)
-                    .text_size(px(11.))
-                    .line_height(px(17.6))
-                    .children(rows),
-            )
+            .child(body)
     }
 }
 
@@ -3093,6 +3131,419 @@ mod tests {
         workspace.update(cx, |workspace, cx| workspace.set_view(View::Swarm, cx));
         redraw(cx);
         assert!(watching(&workspace, cx));
+    }
+
+    /// The emulator side of a live terminal that a test attaches to an agent.
+    struct Emulator {
+        terminal: TerminalId,
+        output: flume::Sender<swarm_term::TerminalOutput>,
+        input: flume::Receiver<swarm_term::TerminalInput>,
+    }
+
+    impl Emulator {
+        fn inputs(&self) -> Vec<swarm_term::TerminalInput> {
+            self.input.try_iter().collect()
+        }
+
+        /// The names of the keys the program got since the last call.
+        fn keys(&self) -> Vec<String> {
+            self.inputs()
+                .into_iter()
+                .filter_map(|input| match input {
+                    swarm_term::TerminalInput::Key(key) => Some(key.name),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn grids(inputs: &[swarm_term::TerminalInput]) -> Vec<(u16, u16)> {
+            inputs
+                .iter()
+                .filter_map(|input| match input {
+                    swarm_term::TerminalInput::Resize(size) => Some((size.cols, size.rows)),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    fn attach(workspace: &Entity<Workspace>, name: &str, cx: &mut VisualTestContext) -> Emulator {
+        let agent = worker_named(workspace, name, cx);
+        let (input_sender, input) = flume::unbounded();
+        let (output, output_receiver) = flume::unbounded();
+
+        let terminal = workspace.update_in(cx, |workspace, window, cx| {
+            let terminal = workspace
+                .data
+                .agent(agent)
+                .map_or(TerminalId(u32::MAX), |agent| agent.terminal);
+            let live = workspace.live_terminal(
+                terminal,
+                swarm_protocol::TerminalId(900),
+                name.to_owned().into(),
+                swarm_term::TerminalChannels {
+                    input: input_sender,
+                    output: output_receiver,
+                },
+                window,
+                cx,
+            );
+
+            workspace.live_terminals.insert(terminal, live);
+            cx.notify();
+
+            terminal
+        });
+        redraw(cx);
+
+        Emulator {
+            terminal,
+            output,
+            input,
+        }
+    }
+
+    /// Three rows on screen and a thousand lines of scrollback.
+    fn snapshot_with_history() -> swarm_term::TerminalOutput {
+        let row = |text: &str| swarm_term::Row {
+            bgs: Vec::new(),
+            texts: vec![swarm_term::TextSpan {
+                col: 0,
+                cells: 1,
+                text: text.to_owned(),
+                fg: swarm_term::Rgb(200, 200, 200),
+                flags: swarm_term::TextFlags::default(),
+            }],
+        };
+
+        swarm_term::TerminalOutput::Snapshot(swarm_term::Snapshot {
+            screen: swarm_term::Screen {
+                cols: 80,
+                rows: 3,
+                colors: swarm_term::Colors {
+                    fg: swarm_term::Rgb(255, 255, 255),
+                    bg: swarm_term::Rgb(0, 0, 0),
+                    cursor: None,
+                },
+                cursor: swarm_term::Cursor {
+                    col: 0,
+                    row: 0,
+                    style: swarm_term::CursorStyle::Block,
+                    visible: true,
+                },
+                alternate: false,
+                history: swarm_term::History {
+                    start: 0,
+                    len: 1_000,
+                },
+            },
+            rows: vec![row("a"), row("b"), row("c")],
+            history_rows: Vec::new(),
+            title: None,
+            working_directory: None,
+        })
+    }
+
+    fn open_terminal_tab(cx: &mut VisualTestContext) {
+        click("inspector-tab-2", cx);
+    }
+
+    fn scroll_over(selector: &'static str, lines: f32, cx: &mut VisualTestContext) {
+        let bounds = cx.debug_bounds(selector);
+        assert!(bounds.is_some(), "{selector} is not on screen");
+
+        cx.simulate_event(gpui::ScrollEvent {
+            position: bounds.map_or_else(Default::default, |bounds| bounds.center()),
+            delta: gpui::ScrollDelta::Lines(point(0., lines)),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+    }
+
+    fn view_of(
+        workspace: &Entity<Workspace>,
+        terminal: TerminalId,
+        cx: &VisualTestContext,
+    ) -> Entity<TerminalView> {
+        workspace.read_with(cx, |workspace, _| {
+            workspace
+                .live_terminals
+                .get(&terminal)
+                .map(|live| live.view.clone())
+                .expect("the terminal is live")
+        })
+    }
+
+    fn scrolled_back(view: &Entity<TerminalView>, cx: &VisualTestContext) -> u64 {
+        view.read_with(cx, |view, _| view.scrolled_back())
+    }
+
+    #[gpui::test]
+    fn the_preview_header_shows_the_name_and_no_size(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        show_agent(&workspace, "pty-io", cx);
+        let live = attach(&workspace, "pty-io", cx);
+
+        let texts = |workspace: &Entity<Workspace>, cx: &VisualTestContext| {
+            workspace.read_with(cx, |workspace, cx| {
+                workspace.preview.read(cx).header_texts()
+            })
+        };
+
+        assert_eq!(texts(&workspace, cx), ["pty-io"]);
+        open_terminal_tab(cx);
+        live.output
+            .send(snapshot_with_history())
+            .expect("the view listens");
+        cx.run_until_parked();
+        assert_eq!(texts(&workspace, cx), ["pty-io"]);
+    }
+
+    #[gpui::test]
+    fn the_terminal_tab_shows_the_view_of_the_tile(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        show_agent(&workspace, "pty-io", cx);
+        let live = attach(&workspace, "pty-io", cx);
+
+        open_terminal_tab(cx);
+
+        let shown = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .preview
+                .read(cx)
+                .live
+                .as_ref()
+                .map(Entity::entity_id)
+        });
+        assert_eq!(
+            shown,
+            Some(view_of(&workspace, live.terminal, cx).entity_id())
+        );
+        assert!(cx.debug_bounds("inspector-terminal").is_some());
+        assert!(cx.debug_bounds("inspector-terminal-text").is_none());
+    }
+
+    #[gpui::test]
+    fn the_view_is_painted_in_the_tab_or_in_its_tile_never_in_both(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        show_agent(&workspace, "pty-io", cx);
+        let live = attach(&workspace, "pty-io", cx);
+        let tile = format!("tile-slot-{}", live.terminal.0).leak();
+        let view = view_of(&workspace, live.terminal, cx);
+
+        // The wrappers that hold the view, and how often a frame paints the view.
+        let frame = |cx: &mut VisualTestContext| {
+            redraw(cx);
+            let before = view.read_with(cx, |view, _| view.paint_count());
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            });
+
+            (
+                cx.debug_bounds("inspector-terminal").is_some(),
+                cx.debug_bounds(tile).is_some(),
+                view.read_with(cx, |view, _| view.paint_count()) - before,
+            )
+        };
+
+        open_terminal_tab(cx);
+        let in_swarm = frame(cx);
+
+        workspace.update(cx, |workspace, cx| workspace.set_view(View::Terminals, cx));
+        let in_terminals = frame(cx);
+
+        workspace.update(cx, |workspace, cx| workspace.set_view(View::Swarm, cx));
+        let back_in_swarm = frame(cx);
+
+        assert_eq!(in_swarm, (true, false, 1));
+        assert_eq!(in_terminals, (false, true, 1));
+        assert_eq!(back_in_swarm, (true, false, 1));
+    }
+
+    #[gpui::test]
+    fn an_agent_without_a_live_terminal_keeps_the_text_copy(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        show_agent(&workspace, "pty-io", cx);
+
+        open_terminal_tab(cx);
+
+        let live = workspace.read_with(cx, |workspace, cx| {
+            workspace.preview.read(cx).live.is_some()
+        });
+        assert!(!live);
+        assert!(cx.debug_bounds("inspector-terminal-text").is_some());
+        assert!(cx.debug_bounds("inspector-terminal").is_none());
+    }
+
+    #[gpui::test]
+    fn the_wheel_scrolls_the_terminal_in_the_tab(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        show_agent(&workspace, "pty-io", cx);
+        let live = attach(&workspace, "pty-io", cx);
+        live.output
+            .send(snapshot_with_history())
+            .expect("the view listens");
+        cx.run_until_parked();
+        open_terminal_tab(cx);
+        let view = view_of(&workspace, live.terminal, cx);
+
+        scroll_over("inspector-terminal", 3., cx);
+        let scrolled = scrolled_back(&view, cx);
+        scroll_over("inspector-terminal", -3., cx);
+
+        assert_eq!(scrolled, 3);
+        assert_eq!(scrolled_back(&view, cx), 0);
+    }
+
+    #[gpui::test]
+    fn clicking_the_terminal_focuses_it_and_draws_the_ring(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        show_agent(&workspace, "pty-io", cx);
+        let live = attach(&workspace, "pty-io", cx);
+        open_terminal_tab(cx);
+        let view = view_of(&workspace, live.terminal, cx);
+        let focused = |cx: &mut VisualTestContext| {
+            let handle = view.read_with(cx, gpui::Focusable::focus_handle);
+            cx.update(|window, _| handle.is_focused(window))
+        };
+        assert!(!focused(cx));
+        assert!(cx.debug_bounds("inspector-terminal-ring").is_none());
+
+        click("inspector-terminal", cx);
+        redraw(cx);
+
+        assert!(focused(cx));
+        assert!(cx.debug_bounds("inspector-terminal-ring").is_some());
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.focused_terminal),
+            Some(live.terminal)
+        );
+    }
+
+    #[gpui::test]
+    fn clicking_the_terminal_leaves_a_minimized_tile_in_the_tray(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        show_agent(&workspace, "pty-io", cx);
+        let live = attach(&workspace, "pty-io", cx);
+        workspace.update(cx, |workspace, cx| workspace.minimize(live.terminal, cx));
+        open_terminal_tab(cx);
+
+        click("inspector-terminal", cx);
+
+        let minimized = workspace.read_with(cx, |workspace, _| {
+            workspace.minimized.contains(&live.terminal)
+        });
+        assert!(minimized);
+    }
+
+    /// Focuses the terminal in the tab and types a key.
+    fn type_in_the_tab(emulator: &Emulator, key: &str, cx: &mut VisualTestContext) -> Vec<String> {
+        click("inspector-terminal", cx);
+        emulator.inputs();
+        cx.simulate_keystrokes(key);
+
+        emulator.keys()
+    }
+
+    #[gpui::test]
+    fn typing_in_the_tab_reaches_the_orchestrator(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        show_agent(&workspace, "orchestrator", cx);
+        let live = attach(&workspace, "orchestrator", cx);
+        open_terminal_tab(cx);
+        cx.update(|_, cx| crate::settings::set_allow_worker_typing(false, cx));
+
+        let keys = type_in_the_tab(&live, "a", cx);
+
+        assert_eq!(keys, ["a"]);
+    }
+
+    #[gpui::test]
+    fn typing_in_the_tab_reaches_a_worker_only_when_the_setting_is_on(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        show_agent(&workspace, "pty-io", cx);
+        let live = attach(&workspace, "pty-io", cx);
+        open_terminal_tab(cx);
+
+        let on = type_in_the_tab(&live, "a", cx);
+        cx.update(|_, cx| crate::settings::set_allow_worker_typing(false, cx));
+        let off = type_in_the_tab(&live, "b", cx);
+        cx.update(|_, cx| crate::settings::set_allow_worker_typing(true, cx));
+        let on_again = type_in_the_tab(&live, "c", cx);
+
+        assert_eq!(
+            (on, off, on_again),
+            (vec!["a".to_owned()], Vec::new(), vec!["c".to_owned()])
+        );
+    }
+
+    #[gpui::test]
+    fn a_worker_tile_follows_the_same_typing_rule_as_the_tab(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        show_agent(&workspace, "pty-io", cx);
+        let live = attach(&workspace, "pty-io", cx);
+        workspace.update(cx, |workspace, cx| workspace.set_view(View::Terminals, cx));
+        redraw(cx);
+        let tile = format!("tile-slot-{}", live.terminal.0).leak();
+
+        click(tile, cx);
+        live.inputs();
+        cx.simulate_keystrokes("a");
+        let in_the_tile = live.keys();
+        cx.update(|_, cx| crate::settings::set_allow_worker_typing(false, cx));
+        cx.simulate_keystrokes("b");
+        let tile_off = live.keys();
+
+        assert_eq!((in_the_tile, tile_off), (vec!["a".to_owned()], Vec::new()));
+    }
+
+    #[gpui::test]
+    fn the_tab_and_the_tile_send_input_through_the_same_channel(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        show_agent(&workspace, "pty-io", cx);
+        let live = attach(&workspace, "pty-io", cx);
+        let tile = format!("tile-slot-{}", live.terminal.0).leak();
+
+        open_terminal_tab(cx);
+        let in_the_tab = type_in_the_tab(&live, "a", cx);
+        workspace.update(cx, |workspace, cx| workspace.set_view(View::Terminals, cx));
+        redraw(cx);
+        click(tile, cx);
+        live.inputs();
+        cx.simulate_keystrokes("b");
+        let in_the_tile = live.keys();
+
+        assert_eq!(
+            (in_the_tab, in_the_tile),
+            (vec!["a".to_owned()], vec!["b".to_owned()])
+        );
+    }
+
+    #[gpui::test]
+    fn the_terminal_takes_the_size_of_the_tab_and_goes_back_to_its_tile(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        show_agent(&workspace, "pty-io", cx);
+        let live = attach(&workspace, "pty-io", cx);
+        workspace.update(cx, |workspace, cx| workspace.set_view(View::Terminals, cx));
+        redraw(cx);
+        live.output
+            .send(snapshot_with_history())
+            .expect("the view listens");
+        cx.run_until_parked();
+        redraw(cx);
+        let tile_grid = Emulator::grids(&live.inputs()).last().copied();
+
+        workspace.update(cx, |workspace, cx| workspace.set_view(View::Swarm, cx));
+        open_terminal_tab(cx);
+        let tab_grid = Emulator::grids(&live.inputs()).last().copied();
+        workspace.update(cx, |workspace, cx| workspace.set_view(View::Terminals, cx));
+        redraw(cx);
+        let back_grid = Emulator::grids(&live.inputs()).last().copied();
+
+        assert!(tile_grid.is_some() && tab_grid.is_some());
+        assert_ne!(tile_grid, tab_grid);
+        assert_eq!(back_grid, tile_grid);
     }
 
     #[gpui::test]

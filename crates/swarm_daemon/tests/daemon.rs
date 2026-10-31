@@ -2059,6 +2059,68 @@ sleep 30"#,
 }
 
 #[test]
+fn a_resize_from_the_app_keeps_a_notice() {
+    let fixture = fixture_with_helpers(
+        r#"idle
+IFS= read -r line
+swarm notify "Review needed" > "$OUT/notify.out" 2>&1
+sleep 30"#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, task) = start_task(&daemon, &repo);
+
+    let blocked =
+        client.wait_for_agent(|agent| agent.status == AgentStatus::Blocked(BlockedKind::Other));
+    let terminal = blocked.terminal.expect("terminal");
+    for input in [
+        TerminalInput::Resize(Size {
+            cols: 100,
+            rows: 30,
+            cell_width: 8,
+            cell_height: 16,
+        }),
+        TerminalInput::Focus(true),
+        TerminalInput::FetchHistory { from: 0, count: 10 },
+    ] {
+        client.send(&Request::Input {
+            id: terminal,
+            input,
+        });
+    }
+
+    // The daemon answers in order, so the reply comes after the inputs were handled.
+    client.send(&Request::ListMessages {
+        call: CALL,
+        project: task.project,
+        task: None,
+    });
+    let mut changes = Vec::new();
+    client.wait_for(|event| match event {
+        Event::AgentChanged { agent } => {
+            changes.push(agent.clone());
+            None
+        }
+        Event::Messages { call: CALL, .. } => Some(()),
+        _ => None,
+    });
+
+    assert!(
+        changes
+            .iter()
+            .all(|agent| agent.status == AgentStatus::Blocked(BlockedKind::Other)),
+        "{changes:?}"
+    );
+
+    client.send(&Request::Input {
+        id: terminal,
+        input: TerminalInput::Text("x".to_owned()),
+    });
+    let cleared = client.wait_for_agent(|agent| agent.status == AgentStatus::Idle);
+    assert_eq!(cleared.message, None);
+}
+
+#[test]
 fn the_mcp_server_serves_an_agent_through_the_daemon() {
     let fixture = fixture_with_helpers(
         r#"idle

@@ -129,14 +129,18 @@ impl TileSpec {
     }
 }
 
-/// Spacing and minimum sizes, in pixels.
+/// Spacing, shares and sizes, in pixels.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LayoutStyle {
     pub gap: f32,
     pub padding: f32,
-    pub orchestrator_width: f32,
+    /// The part of the content width the orchestrator column takes, from 0 to 1.
+    pub orchestrator_share: f32,
     pub min_tile: Size,
     pub min_orchestrator: Size,
+    /// The height of a small box: a tile without a size of its own that does not
+    /// need attention. The app measures it from the terminal font.
+    pub small_tile_height: f32,
 }
 
 impl Default for LayoutStyle {
@@ -144,9 +148,10 @@ impl Default for LayoutStyle {
         Self {
             gap: 10.0,
             padding: 10.0,
-            orchestrator_width: 400.0,
+            orchestrator_share: 0.65,
             min_tile: Size::new(260.0, 160.0),
             min_orchestrator: Size::new(320.0, 300.0),
+            small_tile_height: 286.0,
         }
     }
 }
@@ -206,9 +211,15 @@ pub fn layout(area: Rect, tiles: &[TileSpec], style: &LayoutStyle) -> Layout {
         block: islands.block(),
         metrics,
     };
-    let column_width = orchestrator
-        .and_then(|_| ColumnRange::new(content, &islands, &metrics))
-        .map(|range| flow.column_width(range, band.len()));
+    let column = orchestrator.and_then(|_| ColumnRange::new(content, &islands, &metrics));
+
+    let (column_width, boxes) = match column {
+        Some(range) => {
+            let (width, boxes) = flow.beside_column(range, tiles, &band);
+            (Some(width), boxes)
+        }
+        None => (None, flow.place(None, tiles, &band)),
+    };
 
     if let (Some(index), Some(width)) = (orchestrator, column_width) {
         rects[index] = Some(Rect::new(
@@ -218,7 +229,9 @@ pub fn layout(area: Rect, tiles: &[TileSpec], style: &LayoutStyle) -> Layout {
             content.size.height,
         ));
     }
-    flow.place(column_width, tiles, &band, &mut rects);
+    for (index, rect) in boxes {
+        rects[index] = Some(rect);
+    }
 
     let mut result = Layout::default();
     for (tile, rect) in tiles.iter().zip(rects) {
@@ -257,10 +270,6 @@ impl Rank {
             (_, false, Activity::Idle) => Self::Idle,
         }
     }
-
-    fn is_active(self) -> bool {
-        self <= Self::Running
-    }
 }
 
 /// The style with values that can't break the math.
@@ -268,22 +277,30 @@ impl Rank {
 struct Metrics {
     gap: f32,
     padding: f32,
-    orchestrator_width: f32,
+    orchestrator_share: f32,
     min_tile: Size,
     min_orchestrator: Size,
+    small_height: f32,
 }
 
 impl Metrics {
     fn new(style: &LayoutStyle) -> Self {
         let at_least_one = |size: Size| Size::new(size.width.max(1.0), size.height.max(1.0));
+        let min_tile = at_least_one(style.min_tile);
 
         Self {
             gap: style.gap.max(0.0),
             padding: style.padding.max(0.0),
-            orchestrator_width: style.orchestrator_width.max(0.0),
-            min_tile: at_least_one(style.min_tile),
+            orchestrator_share: style.orchestrator_share.clamp(0.0, 1.0),
+            min_tile,
             min_orchestrator: at_least_one(style.min_orchestrator),
+            small_height: style.small_tile_height.max(min_tile.height),
         }
+    }
+
+    /// The height of a tall box: room for two small boxes and the gap between them.
+    fn tall_height(&self) -> f32 {
+        2.0 * self.small_height + self.gap
     }
 }
 
@@ -303,33 +320,25 @@ fn fits(size: Size, space: Size) -> bool {
     size.width <= space.width + EPSILON && size.height <= space.height + EPSILON
 }
 
-/// The flow tiles that compete for the grid, most important first.
-///
-/// Done and idle tiles only get the grid when no flow tile is active, so they
-/// never take space from a tile that is working.
+/// The flow tiles that compete for the lanes, most important first.
 fn flow_band(tiles: &[TileSpec], flow: &[usize]) -> Vec<usize> {
-    let mut band: Vec<usize> = flow
-        .iter()
-        .copied()
-        .filter(|&index| Rank::of(&tiles[index]).is_active())
-        .collect();
-    if band.is_empty() {
-        band = flow.to_vec();
-    }
-
+    let mut band = flow.to_vec();
     band.sort_by_key(|&index| (Rank::of(&tiles[index]), index));
+
     band
 }
 
 /// Fixed-size terminals, packed in rows from the top right. User terminals keep
-/// their size; process terminals shrink or grow to the closest size that fits.
+/// their size; process terminals shrink or grow to the closest size that fits, but never
+/// below `min_tile`.
 struct Islands {
     rects: Vec<(usize, Rect)>,
     content: Rect,
 }
 
 impl Islands {
-    /// Leaves room for the orchestrator column on the left when that loses no island.
+    /// Leaves room for the orchestrator column on the left when that loses no user
+    /// terminal. A process terminal that does not fit beside the column goes to the tray.
     fn place(
         content: Rect,
         tiles: &[TileSpec],
@@ -349,7 +358,14 @@ impl Islands {
             content.size.width - reserve,
             metrics,
         );
-        if narrow.rects.len() >= full.rects.len() {
+        let users = |islands: &Self| {
+            islands
+                .rects
+                .iter()
+                .filter(|(index, _)| tiles[*index].kind == TileKind::User)
+                .count()
+        };
+        if users(&narrow) >= users(&full) {
             narrow
         } else {
             full
@@ -390,6 +406,9 @@ impl Islands {
             } else {
                 wanted
             };
+            if tiles[index].kind == TileKind::Process && !fits(metrics.min_tile, size) {
+                continue;
+            }
 
             if !fits_at(size, row_top, cursor) {
                 let next_top = row_top + row_height + gap;
@@ -439,14 +458,16 @@ impl Islands {
 #[derive(Clone, Copy, Debug)]
 struct ColumnRange {
     min: f32,
-    max: f32,
     /// All the width left of the islands.
     available: f32,
+    /// The widest column that still leaves a lane of `min_tile` width for the other tiles.
+    room: f32,
 }
 
 impl ColumnRange {
     fn new(content: Rect, islands: &Islands, metrics: &Metrics) -> Option<Self> {
-        let available = match islands.block() {
+        let block = islands.block();
+        let available = match block {
             Some(block) => content.size.width - block.width - metrics.gap,
             None => content.size.width,
         };
@@ -457,18 +478,68 @@ impl ColumnRange {
             return None;
         }
 
-        let min = metrics.min_orchestrator.width.min(available);
-        let max = metrics.orchestrator_width.max(min).min(available);
-
         Some(Self {
-            min,
-            max,
+            min: metrics.min_orchestrator.width.min(available),
             available,
+            room: lane_room(content, block, metrics),
         })
+    }
+
+    /// The share of the content width, with room left for one `min_tile` lane on the
+    /// right. The minimum width of the orchestrator wins over both.
+    fn preferred(self, content_width: f32, metrics: &Metrics) -> f32 {
+        let share = content_width * metrics.orchestrator_share;
+
+        share.min(self.room).max(self.min).min(self.available)
     }
 }
 
+/// The widest orchestrator column that leaves a lane of `min_tile` width. The lane goes
+/// below the islands when there is height for it, else beside them.
+fn lane_room(content: Rect, block: Option<Size>, metrics: &Metrics) -> f32 {
+    let (gap, min) = (metrics.gap, metrics.min_tile);
+    let below = content.size.width - gap - min.width;
+    let Some(block) = block else {
+        return below;
+    };
+
+    let fits_below = content.size.height - block.height - gap >= min.height - EPSILON;
+    let fits_beside = block.height >= min.height - EPSILON;
+    if fits_below || !fits_beside {
+        return below;
+    }
+
+    below - block.width - gap
+}
+
+/// How tall the boxes of tiles that need attention are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Growth {
+    /// Room for two small boxes and the gap between them.
+    Tall,
+    /// One small box.
+    Small,
+}
+
+/// Boxes that are tall when there is room for it.
+fn grows(tile: &TileSpec) -> bool {
+    tile.activity == Activity::Attention
+        && !(tile.kind == TileKind::Process && tile.requested.is_some())
+}
+
+/// Tiles that rank above running processes and done or idle tiles.
+fn is_core(tile: &TileSpec) -> bool {
+    Rank::of(tile) <= Rank::Working
+}
+
+/// The box sizes of one lane, top to bottom.
+type LaneBoxes = Vec<(usize, f32)>;
+
 /// The space for every tile that is not an island or the orchestrator column.
+///
+/// It is cut into lanes: columns at least `min_tile` wide. Boxes are stacked from the
+/// top of a lane; the free space below stays empty, and a full lane hands over to the
+/// next one.
 struct Flow {
     content: Rect,
     block: Option<Size>,
@@ -508,175 +579,185 @@ impl Flow {
         [beside, below]
     }
 
-    fn capacity(&self, region: Rect) -> usize {
-        let min = self.metrics.min_tile;
-        let columns = fit_count(region.size.width, min.width, self.metrics.gap);
-        let rows = fit_count(region.size.height, min.height, self.metrics.gap);
-
-        columns.saturating_mul(rows)
-    }
-
-    fn capacities(&self, column: Option<f32>) -> [usize; 2] {
-        self.regions(column).map(|region| self.capacity(region))
-    }
-
-    fn fitting(&self, column: Option<f32>, count: usize) -> usize {
-        let [beside, below] = self.capacities(column);
-        count.min(beside.saturating_add(below))
-    }
-
-    /// The widest column that still shows as many tiles as the narrowest one.
-    fn column_width(&self, range: ColumnRange, count: usize) -> f32 {
-        let target = self.fitting(Some(range.min), count);
-        if target == 0 {
-            return range.available;
-        }
-        if self.fitting(Some(range.max), count) == target {
-            return range.max;
-        }
-
-        let (mut good, mut bad) = (range.min, range.max);
-        while bad - good > 1.0 {
-            let middle = f32::midpoint(good, bad).floor();
-            if middle <= good {
-                break;
-            }
-
-            if self.fitting(Some(middle), count) == target {
-                good = middle;
-            } else {
-                bad = middle;
-            }
-        }
-
-        good
-    }
-
-    fn place(
-        &self,
-        column: Option<f32>,
-        tiles: &[TileSpec],
-        band: &[usize],
-        rects: &mut [Option<Rect>],
-    ) {
-        let [beside, below] = self.regions(column);
-        let capacities = [self.capacity(beside), self.capacity(below)];
-        let shown = band.len().min(capacities[0].saturating_add(capacities[1]));
-
-        // Priority picks who is shown; input order picks where, so tiles don't
-        // jump around when their activity changes.
-        let mut slots = band[..shown].to_vec();
-        slots.sort_by_key(|&index| (tiles[index].kind == TileKind::Process, index));
-        let (beside_slots, below_slots) = slots.split_at(beside_share(shown, capacities));
-
-        let placed = self
-            .grid(beside, tiles, beside_slots)
-            .into_iter()
-            .chain(self.grid(below, tiles, below_slots));
-        for (index, rect) in placed {
-            rects[index] = Some(rect);
-        }
-    }
-
-    /// Rows of equal-width tiles. The caller makes sure the slots fit.
-    fn grid(&self, region: Rect, tiles: &[TileSpec], slots: &[usize]) -> Vec<(usize, Rect)> {
-        if slots.is_empty() {
+    /// The lanes of a region as wide as `min_tile` allows, sharing the width equally.
+    fn lanes_in(&self, region: Rect) -> Vec<Rect> {
+        let (gap, min) = (self.metrics.gap, self.metrics.min_tile);
+        let count = fit_count(region.size.width, min.width, gap);
+        if count == 0 || region.size.height < min.height - EPSILON {
             return Vec::new();
         }
 
-        let gap = self.metrics.gap;
-        let max_columns = fit_count(region.size.width, self.metrics.min_tile.width, gap).max(1);
-        let row_count = slots.len().div_ceil(max_columns);
-        let columns = slots.len().div_ceil(row_count);
-        let rows: Vec<&[usize]> = slots.chunks(columns).collect();
-        let heights = self.row_heights(region.size.height, tiles, &rows);
+        let width = (region.size.width - gap * float(count - 1)) / float(count);
 
-        let mut placed = Vec::with_capacity(slots.len());
-        let mut top = region.origin.y;
-        for (row, height) in rows.iter().zip(heights) {
-            let width = (region.size.width - gap * float(row.len() - 1)) / float(row.len());
-            for (column, &index) in row.iter().enumerate() {
-                let left = region.origin.x + float(column) * (width + gap);
-                placed.push((index, Rect::new(left, top, width, height)));
+        (0..count)
+            .map(|lane| {
+                Rect::new(
+                    region.origin.x + float(lane) * (width + gap),
+                    region.origin.y,
+                    width,
+                    region.size.height,
+                )
+            })
+            .collect()
+    }
+
+    fn lanes(&self, column: Option<f32>) -> Vec<Rect> {
+        self.regions(column)
+            .into_iter()
+            .flat_map(|region| self.lanes_in(region))
+            .collect()
+    }
+
+    /// Places the band beside the orchestrator column and returns the column's width.
+    /// With nothing to show beside it, the column takes all the width it may.
+    fn beside_column(
+        &self,
+        range: ColumnRange,
+        tiles: &[TileSpec],
+        band: &[usize],
+    ) -> (f32, Vec<(usize, Rect)>) {
+        if band.is_empty() {
+            return (range.available, Vec::new());
+        }
+
+        let width = range.preferred(self.content.size.width, &self.metrics);
+        let boxes = self.place(Some(width), tiles, band);
+        if boxes.is_empty() {
+            return (range.available, boxes);
+        }
+
+        (width, boxes)
+    }
+
+    /// Picks the tiles that fit, in priority order, and puts them in lanes in input order.
+    ///
+    /// Tiles that need attention are tall unless that sends a working tile or a tile
+    /// that needs attention to the tray, which small boxes would keep on screen.
+    fn place(&self, column: Option<f32>, tiles: &[TileSpec], band: &[usize]) -> Vec<(usize, Rect)> {
+        let lanes = self.lanes(column);
+
+        let small = self.select(&lanes, tiles, band, Growth::Small);
+        let tall = band
+            .iter()
+            .any(|&index| grows(&tiles[index]))
+            .then(|| self.select(&lanes, tiles, band, Growth::Tall));
+        let core = |shown: &[usize]| {
+            shown
+                .iter()
+                .filter(|&&index| is_core(&tiles[index]))
+                .count()
+        };
+        let (shown, growth) = match tall {
+            Some(tall) if core(&tall) >= core(&small) => (tall, Growth::Tall),
+            _ => (small, Growth::Small),
+        };
+
+        let boxes = self
+            .stack(&lanes, tiles, &shown, growth)
+            .unwrap_or_default();
+
+        self.rects(&lanes, &boxes)
+    }
+
+    /// The longest start of `band` that fits, in input order. Priority picks who is
+    /// shown; input order picks where, so tiles don't jump around when their activity
+    /// changes.
+    fn select(
+        &self,
+        lanes: &[Rect],
+        tiles: &[TileSpec],
+        band: &[usize],
+        growth: Growth,
+    ) -> Vec<usize> {
+        let mut shown: Vec<usize> = Vec::new();
+
+        for &index in band {
+            let mut next = shown.clone();
+            next.push(index);
+            next.sort_by_key(|&slot| (tiles[slot].kind == TileKind::Process, slot));
+
+            if self.stack(lanes, tiles, &next, growth).is_none() {
+                break;
             }
 
-            top += height + gap;
+            shown = next;
+        }
+
+        shown
+    }
+
+    /// Stacks the tiles in order, each in the first lane from the current one that has
+    /// room for it. `None` when a tile fits in no lane.
+    fn stack(
+        &self,
+        lanes: &[Rect],
+        tiles: &[TileSpec],
+        slots: &[usize],
+        growth: Growth,
+    ) -> Option<Vec<LaneBoxes>> {
+        let gap = self.metrics.gap;
+        let mut stacks: Vec<LaneBoxes> = vec![Vec::new(); lanes.len()];
+        let mut lane = 0;
+
+        for &index in slots {
+            let wanted = self.wanted_height(&tiles[index], growth);
+
+            loop {
+                let rect = lanes.get(lane)?;
+                let boxes = &mut stacks[lane];
+                let used: f32 = boxes.iter().map(|(_, height)| height + gap).sum();
+
+                if let Some(height) = self.fit(wanted, rect.size.height - used, boxes.is_empty()) {
+                    boxes.push((index, height));
+                    break;
+                }
+
+                lane += 1;
+            }
+        }
+
+        Some(stacks)
+    }
+
+    /// The height a tile asks for. A process terminal with a requested size gets that
+    /// height; a tile that needs attention may ask for two small boxes.
+    fn wanted_height(&self, tile: &TileSpec, growth: Growth) -> f32 {
+        match (tile.kind, tile.requested) {
+            (TileKind::Process, Some(requested)) => {
+                requested.height.max(self.metrics.min_tile.height)
+            }
+            _ if growth == Growth::Tall && grows(tile) => self.metrics.tall_height(),
+            _ => self.metrics.small_height,
+        }
+    }
+
+    /// The height a box gets in `room`, or `None` when it doesn't fit. The first box of a
+    /// lane may be cut down to the lane, but never below `min_tile`.
+    fn fit(&self, wanted: f32, room: f32, first: bool) -> Option<f32> {
+        let height = if first { wanted.min(room) } else { wanted };
+        let fits = height >= self.metrics.min_tile.height - EPSILON && height <= room + EPSILON;
+
+        fits.then_some(height)
+    }
+
+    /// The rect of every box, stacked from the top of its lane.
+    fn rects(&self, lanes: &[Rect], stacks: &[LaneBoxes]) -> Vec<(usize, Rect)> {
+        let mut placed = Vec::new();
+
+        for (lane, boxes) in lanes.iter().zip(stacks) {
+            let mut top = lane.origin.y;
+
+            for &(index, height) in boxes {
+                placed.push((
+                    index,
+                    Rect::new(lane.origin.x, top, lane.size.width, height),
+                ));
+                top += height + self.metrics.gap;
+            }
         }
 
         placed
     }
-
-    /// Process rows get their requested height when it fits; other rows share the rest.
-    fn row_heights(&self, region_height: f32, tiles: &[TileSpec], rows: &[&[usize]]) -> Vec<f32> {
-        let min = self.metrics.min_tile.height;
-        let space = region_height - self.metrics.gap * float(rows.len() - 1);
-        let wanted: Vec<Option<f32>> = rows
-            .iter()
-            .map(|row| requested_row_height(tiles, row).map(|height| height.max(min).min(space)))
-            .collect();
-
-        let flexible = wanted.iter().filter(|height| height.is_none()).count();
-        let requested_total: f32 = wanted.iter().flatten().sum();
-
-        if requested_total + float(flexible) * min <= space {
-            let leftover = space - requested_total;
-            if flexible > 0 {
-                let share = leftover / float(flexible);
-                return wanted
-                    .iter()
-                    .map(|height| height.unwrap_or(share))
-                    .collect();
-            }
-
-            let extra = leftover / float(rows.len());
-            return wanted
-                .iter()
-                .flatten()
-                .map(|height| height + extra)
-                .collect();
-        }
-
-        let budget = (space - float(rows.len()) * min).max(0.0);
-        let excess: f32 = wanted.iter().flatten().map(|height| height - min).sum();
-        let scale = if excess > 0.0 {
-            (budget / excess).min(1.0)
-        } else {
-            0.0
-        };
-
-        wanted
-            .iter()
-            .map(|height| height.map_or(min, |height| min + (height - min) * scale))
-            .collect()
-    }
-}
-
-/// The tallest requested height when every tile in the row is a process with one.
-fn requested_row_height(tiles: &[TileSpec], row: &[usize]) -> Option<f32> {
-    row.iter()
-        .map(|&index| {
-            let tile = &tiles[index];
-            match (tile.kind, tile.requested) {
-                (TileKind::Process, Some(size)) => Some(size.height),
-                _ => None,
-            }
-        })
-        .try_fold(0.0, |tallest: f32, height| Some(tallest.max(height?)))
-}
-
-/// How many of `count` tiles go beside the islands, in proportion to the space there.
-fn beside_share(count: usize, [beside, below]: [usize; 2]) -> usize {
-    if count == 0 || beside == 0 {
-        return 0;
-    }
-
-    let total = beside.saturating_add(below);
-    let share = whole((float(count) * float(beside) / float(total)).round());
-
-    share
-        .max(count.saturating_sub(below))
-        .min(beside)
-        .min(count)
 }
 
 /// How many items of `item` length fit in `length` with `gap` between them.
