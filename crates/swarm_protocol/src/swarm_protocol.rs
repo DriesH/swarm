@@ -411,6 +411,9 @@ pub struct CloseCheck {
     /// Names of workers with their own worktree whose commits are not merged into the
     /// task branch. Their branches stay.
     pub unmerged_workers: Vec<String>,
+    /// The task branch and workers' own branches that are merged into the base branch.
+    /// Closing deletes them; every other branch stays.
+    pub merged_branches: Vec<String>,
 }
 
 /// Matches a reply to its request, so a late reply never answers a newer call.
@@ -504,7 +507,7 @@ pub enum Request {
     },
     /// Stops the task's agents and all its terminals, runs the teardown script, and
     /// removes the task worktree and workers' own worktrees, uncommitted changes
-    /// included. Branches stay. Once the agents stopped, the daemon checks again and
+    /// included. Branches merged into the base branch are deleted; the others stay. Once the agents stopped, the daemon checks again and
     /// refuses when closing would lose more than `confirmed`, the check the user saw.
     /// Answered with a `TaskChanged` with `closed: true` to every client, then
     /// [`Event::Done`].
