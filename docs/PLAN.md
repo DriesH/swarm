@@ -90,7 +90,7 @@ Harness calls for the Start orchestrator:
 ### Workspace layout
 
 - **Sidebar**: projects (with "Needs you" and busy markers and a tab count), then the agents, processes and user terminals of the open tab.
-- **Tabs**: one tab per task, at the top of the window, plus the Start or Plan tab while its orchestrator runs. That tab has no worktree, so it shows no branch, Files or Changes. A tab shows the task name and its status ring. Each task runs in its own task worktree; workers share it unless they have their own worktree, and worker worktrees are not tabs. **+** opens the New tab menu.
+- **Tabs**: one tab per task, at the top of the window, plus the Start or Plan tab while its orchestrator runs. That tab has no worktree, so it shows no branch, Files or Changes. A tab shows the task name and its status ring. Tabs keep their width while there is room, then shrink to a minimum (the name is cut with an ellipsis) and then scroll sideways; a button with the task count then lists every task. The header controls on the right never move. Each task runs in its own task worktree; workers share it unless they have their own worktree, and worker worktrees are not tabs. **+** opens the New tab menu.
 - **Header, right side**: view switch **Terminals | Swarm | Review**, then panel toggles **Files**, **Changes +N −N** and, after approval, **Pull request** (later the live PR state, e.g. **#42 · checks running**).
 - **Right panel**: Files (file tree of the task worktree, changed files marked), Changes (changed files grouped by worker, with a **Review** button), or Pull request.
 - **Terminal tiles**: separate cards with 10 px gaps and rounded corners. Focus is a 2 px accent border, "needs attention" a 2 px amber border; both are drawn above the tile and never move the layout. Only the orchestrator tile has an input box.
@@ -126,6 +126,7 @@ Per project, under **Projects**: everything in `.swarm/config.toml` (worktrees, 
 ### Brand and icons
 
 - Logo: a line-drawn bee. The menu bar uses it as a template image so macOS tints it.
+- App icon: the pixel bee, a 24 × 24 black and yellow sprite on cream with a faint honeycomb (canvas boards "App icon" and "Pixel bee"). The same sprite is the mascot for the easter eggs and the website.
 - Agent icons: the real Claude Code and Codex icons (Lobe Icons, MIT). Claude Code keeps its orange in both themes; Codex uses the text color.
 - Fonts: Geist and Geist Mono.
 
@@ -324,6 +325,7 @@ Reports in `docs/spikes/`. Code in `spikes/` (throwaway).
 - `libghostty-vt` 0.2.2 needs Zig 0.15 (not 0.17). Set `LIBGHOSTTY_VT_SYS_OPTIMIZE=ReleaseFast` in `.cargo/config.toml`, or Ghostty builds in Debug mode and is far too slow.
 - `gpui_platform` needs the `font-kit` feature or no text is drawn. Use `runtime_shaders` when the Metal toolchain is missing.
 - Pin `gpui` and `gpui_platform` to one Zed git rev for the whole workspace.
+- Set `[profile.dev.package."*"] opt-level = 2` so `cargo run` draws and scrolls smoothly: dependencies (GPUI) are optimized, workspace crates are not. A clean `swarm_app` dev build went from 27 s to 70 s; rebuilds of workspace crates stay as fast.
 
 **Terminal and daemon**
 
