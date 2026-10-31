@@ -23,7 +23,7 @@ use crate::session::Session;
     name = "swarm",
     version,
     about = "Talk to Swarm from an agent terminal",
-    long_about = "Talk to Swarm from an agent terminal.\n\nWhich commands work depends on your role: orchestrators spawn, send, merge, notify, agents and confirm; workers ask and report; the Start orchestrator makes tasks; every agent can read, wait, exit and run terminals.\nA text of - is read from stdin."
+    long_about = "Talk to Swarm from an agent terminal.\n\nWhich commands work depends on your role: orchestrators spawn, send, merge, notify, agents and confirm; workers ask and report; workers and orchestrators commit; the Start orchestrator makes tasks; every agent can read, wait, exit and run terminals.\nA text of - is read from stdin."
 )]
 struct Cli {
     /// Print the raw result as JSON.
@@ -36,7 +36,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Action {
-    /// Start a worker in its own worktree (orchestrator).
+    /// Start a worker in the task worktree, or in its own worktree (orchestrator).
     Spawn {
         /// The worker's name; it becomes part of its branch.
         name: String,
@@ -49,6 +49,19 @@ enum Action {
         /// What to do and what done means; read from stdin when missing.
         #[arg(long)]
         brief: Option<String>,
+        /// Give the worker its own worktree, for this reason. Without it the worker
+        /// shares the task worktree.
+        #[arg(long, value_name = "REASON")]
+        own_worktree: Option<String>,
+    },
+    /// Commit the named files, and nothing else, in your worktree (worker, orchestrator).
+    Commit {
+        /// The commit message.
+        #[arg(short = 'm', long)]
+        message: String,
+        /// The files to commit, relative to your worktree.
+        #[arg(required = true, num_args = 1..)]
+        paths: Vec<std::path::PathBuf>,
     },
     /// Send a message to one of your workers (orchestrator).
     Send {
@@ -233,6 +246,7 @@ impl Action {
                 kind,
                 model,
                 brief,
+                own_worktree,
             } => {
                 let brief = match brief {
                     Some(brief) => brief,
@@ -249,8 +263,10 @@ impl Action {
                     kind: kind.map(KindArg::kind),
                     model,
                     brief,
+                    own_worktree,
                 }
             }
+            Self::Commit { message, paths } => Command::Commit { message, paths },
             Self::Send { agent, text } => Command::Send {
                 to: agent,
                 text: text_or_stdin(&text, stdin)?,
@@ -457,8 +473,65 @@ mod tests {
                 kind: Some(AgentKind::Codex),
                 model: Some("gpt-6".to_owned()),
                 brief: "do it".to_owned(),
+                own_worktree: None,
             }
         );
+    }
+
+    #[test]
+    fn spawn_takes_a_reason_for_its_own_worktree() {
+        let command = command(
+            &[
+                "spawn",
+                "api",
+                "--brief",
+                "do it",
+                "--own-worktree",
+                "same files as ui",
+            ],
+            "",
+        );
+
+        assert_eq!(
+            command,
+            Command::Spawn {
+                name: "api".to_owned(),
+                kind: None,
+                model: None,
+                brief: "do it".to_owned(),
+                own_worktree: Some("same files as ui".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn spawn_needs_a_reason_after_own_worktree() {
+        assert!(parse(&["spawn", "api", "--brief", "x", "--own-worktree"]).is_err());
+    }
+
+    #[test]
+    fn commit_takes_a_message_and_paths() {
+        let command = command(
+            &["commit", "-m", "feat: api", "src/api.rs", "src/lib.rs"],
+            "",
+        );
+
+        assert_eq!(
+            command,
+            Command::Commit {
+                message: "feat: api".to_owned(),
+                paths: vec![
+                    std::path::PathBuf::from("src/api.rs"),
+                    std::path::PathBuf::from("src/lib.rs"),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn commit_needs_a_message_and_at_least_one_path() {
+        assert!(parse(&["commit", "src/api.rs"]).is_err());
+        assert!(parse(&["commit", "-m", "feat: api"]).is_err());
     }
 
     #[test]
@@ -472,6 +545,7 @@ mod tests {
                 kind: None,
                 model: None,
                 brief: "line one\nline two\n".to_owned(),
+                own_worktree: None,
             }
         );
     }
