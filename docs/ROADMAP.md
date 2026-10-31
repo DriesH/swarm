@@ -13,6 +13,7 @@ Each phase ends with a pull request into `main`. A phase is done when every box 
 | 6 | Review and pull requests | Not started |
 | 7 | Menu bar, usage and notifications | Not started |
 | 8 | Polish and first release | Not started |
+| 9 | After first release | Not started |
 
 ## 0. Plan, design, spikes
 
@@ -135,7 +136,20 @@ Each phase ends with a pull request into `main`. A phase is done when every box 
 - [ ] Signed and notarized build installs on a clean Mac
 - [ ] Docs website and product website are live
 
+## 9. After first release
+
+**Goal:** Swarm is ready when the Mac starts.
+
+**Scope:** **Launch at login** in Settings: starts the daemon at login (with `SMAppService` and a launch agent in the app bundle), so agents and the menu bar work before the window opens. Off by default.
+
+**Done when:**
+
+- [ ] With the setting on, the daemon runs after a restart of the Mac without opening the app
+- [ ] Turning it off removes the login item
+- [ ] The setting shows the state macOS reports, also when the user changed it in System Settings › General › Login Items
+
 ## Designs still to make
 
 - Settings › Terminals and Prompts (phase 8)
 - Menu bar usage popover (phase 7)
+- Settings: Launch at login (phase 9)
