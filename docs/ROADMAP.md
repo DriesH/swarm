@@ -9,10 +9,11 @@ Each phase ends with a pull request into `main`. A phase is done when every box 
 | 2 | App shell with fake data | Done ([PR #3](https://github.com/DriesH/swarm/pull/3)) |
 | 3 | Daemon, terminals and worktrees | Done ([#4](https://github.com/DriesH/swarm/pull/4), [#5](https://github.com/DriesH/swarm/pull/5), [#6](https://github.com/DriesH/swarm/pull/6)) |
 | 4 | Agents and harness | In progress |
-| 5 | Swarm view | Not started |
+| 5 | Swarm view | In progress |
 | 6 | Review and pull requests | Not started |
 | 7 | Menu bar, usage and notifications | Not started |
 | 8 | Polish and first release | Not started |
+| 9 | After first release | Not started |
 
 ## 0. Plan, design, spikes
 
@@ -88,11 +89,11 @@ Each phase ends with a pull request into `main`. A phase is done when every box 
 
 **Goal:** see the swarm and its messages at a glance.
 
-**Scope:** graph of orchestrator and workers, message edges, timeline, agent inspector with live terminal preview.
+**Scope:** graph of orchestrator and workers, message edges, and a resizable agent inspector with Messages, Changes and Terminal tabs.
 
 **Done when:**
 
-- [ ] Graph and timeline update live from the daemon
+- [ ] Graph and inspector update live from the daemon
 - [ ] Inspector shows worktree, branch, changes and messages; **Focus** jumps to the agent's tile
 
 ## 6. Review and pull requests
@@ -124,18 +125,34 @@ Each phase ends with a pull request into `main`. A phase is done when every box 
 
 **Goal:** a signed app that someone else can install.
 
-**Scope:** welcome screen and system check, remaining settings pages (Terminals, Prompts), easter eggs, full VoiceOver and keyboard audit, performance pass, app bundle signing and notarization, updates, docs website and product website.
+**Scope:** welcome screen and system check, remaining settings pages (Terminals with the font size, Prompts), tile sizes (large orchestrator, small workers that grow when blocked, `tile.grow` / `tile.shrink`), file-type icons in the style of vscode-icons for files and folders (Changes tab, Changes and Files panels, Review), easter eggs, full VoiceOver and keyboard audit, performance pass, app bundle signing and notarization, updates, docs website and product website.
 
 **Done when:**
 
 - [ ] First launch guides through the system check
+- [ ] The orchestrator tile is always the largest; a blocked worker grows and shrinks back when it works again
+- [ ] Changing the terminal font size in Settings resizes every terminal at once
+- [ ] Files and folders show file-type icons; the icon set's license terms are met (vscode-icons: CC BY-SA 4.0 for the icons, attribution in About, branded icons excluded)
 - [ ] VoiceOver audit passes on every screen (checklist in `crates/swarm_ui/README.md`)
 - [ ] Reduce Motion reaches GPUI and stops spinners and easter-egg animations
 - [ ] Disabled controls and plain text are announced by VoiceOver (needs GPUI support or a contribution upstream)
 - [ ] Signed and notarized build installs on a clean Mac
 - [ ] Docs website and product website are live
 
+## 9. After first release
+
+**Goal:** Swarm is ready when the Mac starts.
+
+**Scope:** **Launch at login** in Settings: starts the daemon at login (with `SMAppService` and a launch agent in the app bundle), so agents and the menu bar work before the window opens. Off by default.
+
+**Done when:**
+
+- [ ] With the setting on, the daemon runs after a restart of the Mac without opening the app
+- [ ] Turning it off removes the login item
+- [ ] The setting shows the state macOS reports, also when the user changed it in System Settings › General › Login Items
+
 ## Designs still to make
 
 - Settings › Terminals and Prompts (phase 8)
 - Menu bar usage popover (phase 7)
+- Settings: Launch at login (phase 9)

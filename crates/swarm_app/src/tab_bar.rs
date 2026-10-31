@@ -52,6 +52,7 @@ pub(crate) fn render(
 
     let task = workspace.active_task();
     let panel = workspace.visible_panel();
+    let panels_disabled = workspace.view == View::Swarm;
 
     h_flex()
         .size_full()
@@ -74,6 +75,7 @@ pub(crate) fn render(
                 "Files",
                 IconName::File,
                 panel == Some(RightPanel::Files),
+                panels_disabled,
                 cx.listener(|workspace, _, _, cx| workspace.toggle_panel(RightPanel::Files, cx)),
             ))
             .child(
@@ -82,6 +84,7 @@ pub(crate) fn render(
                     "Changes",
                     IconName::Branch,
                     panel == Some(RightPanel::Changes),
+                    panels_disabled,
                     cx.listener(|workspace, _, _, cx| {
                         workspace.toggle_panel(RightPanel::Changes, cx);
                     }),
@@ -144,12 +147,14 @@ fn panel_toggle(
     label: &'static str,
     icon: IconName,
     open: bool,
+    disabled: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Button {
     Button::new(id, label)
         .variant(ButtonVariant::Ghost)
         .icon(icon)
         .toggle_state(open)
+        .disabled(disabled)
         .debug_selector(move || format!("{id}-button"))
         .on_click(on_click)
 }
@@ -228,7 +233,8 @@ mod tests {
 
         let toggled = |open: bool, cx: &mut VisualTestContext| {
             cx.update(|window, cx| {
-                let button = panel_toggle("files", "Files", IconName::File, open, |_, _, _| {});
+                let button =
+                    panel_toggle("files", "Files", IconName::File, open, false, |_, _, _| {});
                 let element = button.render(window, cx).into_element();
                 let mut node = Node::new(AccessRole::Unknown);
                 element.write_a11y_info(&mut node);
@@ -239,6 +245,19 @@ mod tests {
 
         assert_eq!(toggled(true, cx), Some(Toggled::True));
         assert_eq!(toggled(false, cx), Some(Toggled::False));
+    }
+
+    #[gpui::test]
+    fn the_panel_buttons_do_nothing_in_the_swarm_view(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        workspace.update(cx, |workspace, cx| workspace.set_view(View::Swarm, cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        click("files-button", cx);
+
+        let panel = workspace.read_with(cx, |workspace, _| workspace.right_panel);
+        assert_eq!(panel, Some(RightPanel::Changes));
     }
 
     #[gpui::test]

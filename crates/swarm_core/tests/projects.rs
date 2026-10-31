@@ -10,7 +10,10 @@ use std::sync::{Arc, Mutex};
 use swarm_core::git;
 use swarm_core::store::{NewAgent, Store};
 use swarm_core::{Error, Projects, WorkerCheckout};
-use swarm_protocol::{AgentInfo, AgentKind, AgentRole, CreateTask, ProjectId, TaskInfo};
+use swarm_protocol::{
+    AgentChange, AgentId, AgentInfo, AgentKind, AgentRole, CreateTask, DiffStat, FileStat,
+    ProjectId, TaskInfo,
+};
 
 static NEXT_FOLDER: AtomicU32 = AtomicU32::new(0);
 
@@ -857,19 +860,422 @@ fn a_task_made_by_an_agent_records_it() {
     let project = projects.add(&repo.root).expect("add");
 
     let task = projects
-        .create_task_by(
-            &request(project.id, "login"),
-            Some(swarm_protocol::AgentId(9)),
-        )
+        .create_task_by(&request(project.id, "login"), Some(AgentId(9)))
         .expect("task")
         .task;
 
-    assert_eq!(task.created_by, Some(swarm_protocol::AgentId(9)));
+    assert_eq!(task.created_by, Some(AgentId(9)));
     let stored = store
         .lock()
         .expect("store")
         .task(task.id)
         .expect("read")
         .expect("task");
-    assert_eq!(stored.created_by, Some(swarm_protocol::AgentId(9)));
+    assert_eq!(stored.created_by, Some(AgentId(9)));
+}
+
+/// The fixture's config and secret are untracked; keep them out of the counts.
+fn ignoring_setup_files() -> Repo {
+    let repo = Repo::new("");
+    std::fs::write(repo.root.join(".git/info/exclude"), ".swarm\n.env\n").expect("exclude");
+
+    repo
+}
+
+#[test]
+fn the_diff_stat_counts_commits_edits_untracked_and_binary_files() {
+    let repo = ignoring_setup_files();
+    let base = repo.git(&["rev-parse", "HEAD"]);
+    assert_eq!(
+        git::diff_stat(&repo.root, &base).expect("clean"),
+        DiffStat::default()
+    );
+
+    std::fs::write(repo.root.join("committed.txt"), "a\nb\nc\n").expect("file");
+    git_in(&repo.root, &["add", "committed.txt"]);
+    git_in(&repo.root, &["commit", "-q", "-m", "add a file"]);
+    std::fs::write(repo.root.join("README.md"), "hello\nworld\n").expect("edit");
+    std::fs::write(repo.root.join("new.txt"), "one\ntwo").expect("untracked");
+    std::fs::write(repo.root.join("blob.bin"), [0_u8, 1, 2, 3]).expect("binary");
+
+    let stat = git::diff_stat(&repo.root, &base).expect("stat");
+
+    assert_eq!(
+        stat,
+        DiffStat {
+            files: 4,
+            additions: 3 + 2 + 2,
+            deletions: 1,
+        }
+    );
+}
+
+fn file_stat(path: &str, additions: u32) -> FileStat {
+    FileStat {
+        path: path.into(),
+        additions,
+        deletions: 0,
+    }
+}
+
+#[test]
+fn the_file_list_puts_the_most_changed_files_first() {
+    let repo = ignoring_setup_files();
+    let base = repo.git(&["rev-parse", "HEAD"]);
+
+    std::fs::write(repo.root.join("README.md"), "hello\nworld\n").expect("edit");
+    std::fs::write(repo.root.join("big.txt"), "1\n2\n3\n4\n5\n").expect("untracked");
+    std::fs::write(repo.root.join("small.txt"), "1\n").expect("untracked");
+    std::fs::write(repo.root.join("blob.bin"), [0_u8, 1]).expect("binary");
+
+    let (stat, files) = git::diff_files(&repo.root, &base).expect("files");
+    let listed: Vec<(String, u32, u32)> = files
+        .iter()
+        .map(|file| {
+            (
+                file.path.display().to_string(),
+                file.additions,
+                file.deletions,
+            )
+        })
+        .collect();
+
+    assert_eq!(stat.files, 4);
+    assert_eq!(
+        listed,
+        [
+            ("big.txt".to_owned(), 5, 0),
+            ("README.md".to_owned(), 2, 1),
+            ("small.txt".to_owned(), 1, 0),
+            ("blob.bin".to_owned(), 0, 0),
+        ]
+    );
+}
+
+#[test]
+fn a_file_removed_from_the_index_but_kept_on_disk_is_one_entry_that_matches_the_totals() {
+    let repo = ignoring_setup_files();
+
+    std::fs::write(repo.root.join("README.md"), "a\nb\nc\n").expect("edit");
+    git_in(&repo.root, &["add", "README.md"]);
+    git_in(&repo.root, &["commit", "-q", "-m", "edit"]);
+    let base_after_edit = repo.git(&["rev-parse", "HEAD"]);
+    git_in(&repo.root, &["rm", "-q", "--cached", "README.md"]);
+
+    let (stat, files) = git::diff_files(&repo.root, &base_after_edit).expect("files");
+    let listed_additions: u32 = files.iter().map(|file| file.additions).sum();
+    let listed_deletions: u32 = files.iter().map(|file| file.deletions).sum();
+
+    assert_eq!(files.len(), 1, "{files:?}");
+    assert_eq!(stat.files, 1);
+    assert_eq!(listed_additions, stat.additions);
+    assert_eq!(listed_deletions, stat.deletions);
+    assert_eq!((stat.additions, stat.deletions), (3, 3));
+}
+
+#[test]
+fn the_file_list_stops_at_the_cap_but_the_totals_count_every_file() {
+    let repo = ignoring_setup_files();
+    let base = repo.git(&["rev-parse", "HEAD"]);
+
+    for index in 0..(swarm_protocol::FILES_LISTED + 20) {
+        std::fs::write(repo.root.join(format!("file-{index:04}.txt")), "x\n").expect("file");
+    }
+    std::fs::write(repo.root.join("large.txt"), "x\ny\nz\n").expect("file");
+
+    let (stat, files) = git::diff_files(&repo.root, &base).expect("files");
+
+    assert_eq!(files.len(), swarm_protocol::FILES_LISTED);
+    assert_eq!(stat.files as usize, swarm_protocol::FILES_LISTED + 21);
+    assert_eq!(files[0].path.display().to_string(), "large.txt");
+}
+
+#[test]
+fn a_tracked_binary_counts_as_a_file_without_lines() {
+    let repo = ignoring_setup_files();
+    let base = repo.git(&["rev-parse", "HEAD"]);
+
+    std::fs::write(repo.root.join("image.bin"), [0_u8, 255, 0, 255]).expect("binary");
+    git_in(&repo.root, &["add", "image.bin"]);
+    git_in(&repo.root, &["commit", "-q", "-m", "add a binary"]);
+
+    let stat = git::diff_stat(&repo.root, &base).expect("stat");
+
+    assert_eq!(
+        stat,
+        DiffStat {
+            files: 1,
+            additions: 0,
+            deletions: 0,
+        }
+    );
+}
+
+#[test]
+fn a_large_untracked_file_counts_without_lines() {
+    let repo = ignoring_setup_files();
+    let base = repo.git(&["rev-parse", "HEAD"]);
+
+    std::fs::write(repo.root.join("big.txt"), "x\n".repeat(600_000)).expect("big");
+
+    let stat = git::diff_stat(&repo.root, &base).expect("stat");
+
+    assert_eq!((stat.files, stat.additions), (1, 0));
+}
+
+#[test]
+fn a_worker_is_measured_from_where_it_branched() {
+    let repo = Repo::new("");
+    let (projects, store) = shared_projects();
+    let task = task_with_a_commit(&projects, &repo);
+    let worker = projects
+        .create_worker(&task, "api", |checkout| register_worker(&store, checkout))
+        .expect("worker")
+        .agent;
+    let branched = repo.git(&["rev-parse", &task.branch]);
+
+    std::fs::write(worker.worktree.join("work.txt"), "1\n2\n").expect("work");
+    git_in(&worker.worktree, &["add", "work.txt"]);
+    git_in(&worker.worktree, &["commit", "-q", "-m", "work"]);
+    std::fs::write(worker.worktree.join("loose.txt"), "x\n").expect("loose");
+
+    let recorded = store.lock().expect("lock").base_commit(worker.id);
+    let changes = projects.agent_changes(&[worker.id, AgentId(9999)]);
+
+    assert_eq!(recorded.expect("base").as_deref(), Some(branched.as_str()));
+    assert_eq!(
+        changes,
+        vec![AgentChange {
+            agent: worker.id,
+            stat: DiffStat {
+                files: 2,
+                additions: 3,
+                deletions: 0,
+            },
+            files: vec![file_stat("work.txt", 2), file_stat("loose.txt", 1)],
+        }]
+    );
+}
+
+#[test]
+fn a_worker_with_a_missing_worktree_is_left_out() {
+    let repo = Repo::new("");
+    let (projects, store) = shared_projects();
+    let task = task_with_a_commit(&projects, &repo);
+    let worker = projects
+        .create_worker(&task, "api", |checkout| register_worker(&store, checkout))
+        .expect("worker")
+        .agent;
+
+    std::fs::remove_dir_all(&worker.worktree).expect("remove");
+
+    assert!(projects.agent_changes(&[worker.id]).is_empty());
+}
+
+/// Runs `work` on a thread and fails instead of hanging when it never returns.
+fn within_seconds<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || sender.send(work()).ok());
+
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("the diff stat hung")
+}
+
+#[test]
+fn an_untracked_symlink_to_a_fifo_does_not_block() {
+    let repo = ignoring_setup_files();
+    let base = repo.git(&["rev-parse", "HEAD"]);
+    let fifo = repo.root.join("pipe");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo")
+            .success()
+    );
+    std::os::unix::fs::symlink(&fifo, repo.root.join("link-to-pipe")).expect("link");
+
+    let root = repo.root.clone();
+    let stat = within_seconds(move || git::diff_stat(&root, &base).expect("stat"));
+
+    assert_eq!((stat.files, stat.additions), (1, 1));
+}
+
+#[test]
+fn an_untracked_symlink_to_dev_zero_does_not_read_forever() {
+    let repo = ignoring_setup_files();
+    let base = repo.git(&["rev-parse", "HEAD"]);
+    std::os::unix::fs::symlink("/dev/zero", repo.root.join("zeros")).expect("link");
+
+    let root = repo.root.clone();
+    let stat = within_seconds(move || git::diff_stat(&root, &base).expect("stat"));
+
+    assert_eq!((stat.files, stat.additions), (1, 1));
+}
+
+#[test]
+fn a_symlink_counts_as_one_file_with_one_line() {
+    let repo = ignoring_setup_files();
+    let base = repo.git(&["rev-parse", "HEAD"]);
+    std::fs::write(repo.root.join("target.txt"), "a\nb\nc\n").expect("target");
+    std::os::unix::fs::symlink("target.txt", repo.root.join("alias")).expect("link");
+
+    let stat = git::diff_stat(&repo.root, &base).expect("stat");
+
+    assert_eq!((stat.files, stat.additions), (2, 3 + 1));
+}
+
+#[test]
+fn the_diff_stat_does_not_touch_the_index() {
+    let repo = ignoring_setup_files();
+    let base = repo.git(&["rev-parse", "HEAD"]);
+    let readme = repo.root.join("README.md");
+    let earlier = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    std::fs::File::options()
+        .write(true)
+        .open(&readme)
+        .and_then(|file| file.set_modified(earlier))
+        .expect("new mtime, same content");
+    let index = repo.root.join(".git/index");
+    let before = (
+        std::fs::read(&index).expect("index"),
+        std::fs::metadata(&index)
+            .and_then(|meta| meta.modified())
+            .expect("mtime"),
+    );
+
+    let stat = git::diff_stat(&repo.root, &base).expect("stat");
+
+    let after = (
+        std::fs::read(&index).expect("index"),
+        std::fs::metadata(&index)
+            .and_then(|meta| meta.modified())
+            .expect("mtime"),
+    );
+    assert_eq!(stat, DiffStat::default());
+    assert!(before == after, "the index was rewritten");
+}
+
+#[test]
+fn untracked_files_past_the_count_limit_have_no_line_count() {
+    let repo = ignoring_setup_files();
+    let base = repo.git(&["rev-parse", "HEAD"]);
+    std::fs::create_dir(repo.root.join("many")).expect("folder");
+    for number in 0..2100 {
+        std::fs::write(repo.root.join(format!("many/{number:05}")), "x\n").expect("file");
+    }
+
+    let stat = git::diff_stat(&repo.root, &base).expect("stat");
+
+    assert_eq!((stat.files, stat.additions), (2100, 2000));
+}
+
+#[test]
+fn untracked_files_past_the_file_limit_are_not_listed() {
+    let repo = ignoring_setup_files();
+    let base = repo.git(&["rev-parse", "HEAD"]);
+    std::fs::create_dir(repo.root.join("many")).expect("folder");
+    for number in 0..10_050 {
+        std::fs::write(repo.root.join(format!("many/{number:05}")), "").expect("file");
+    }
+
+    let stat = git::diff_stat(&repo.root, &base).expect("stat");
+
+    assert_eq!(stat.files, 10_000);
+}
+
+#[test]
+fn untracked_files_stop_counting_lines_after_the_byte_budget() {
+    let repo = ignoring_setup_files();
+    let base = repo.git(&["rev-parse", "HEAD"]);
+    let megabyte = "x\n".repeat(1 << 19);
+    for number in 0..34 {
+        std::fs::write(repo.root.join(format!("big-{number:02}.txt")), &megabyte).expect("file");
+    }
+
+    let stat = git::diff_stat(&repo.root, &base).expect("stat");
+
+    assert_eq!(stat.files, 34);
+    assert_eq!(stat.additions, 32 * (1 << 19));
+}
+
+#[test]
+fn paths_with_a_tab_and_a_newline_are_counted_once() {
+    let repo = ignoring_setup_files();
+    let base = repo.git(&["rev-parse", "HEAD"]);
+    std::fs::write(repo.root.join("tracked\tname\nhere.txt"), "a\nb\n").expect("tracked");
+    git_in(&repo.root, &["add", "--all"]);
+    git_in(&repo.root, &["commit", "-q", "-m", "odd name"]);
+    std::fs::write(repo.root.join("loose\tname\nhere.txt"), "c\n").expect("loose");
+
+    let stat = git::diff_stat(&repo.root, &base).expect("stat");
+
+    assert_eq!(
+        stat,
+        DiffStat {
+            files: 2,
+            additions: 3,
+            deletions: 0,
+        }
+    );
+}
+
+#[test]
+fn a_merge_base_ref_that_looks_like_an_option_is_not_an_option() {
+    let repo = ignoring_setup_files();
+
+    assert!(git::merge_base(&repo.root, "--all").is_err());
+}
+
+#[test]
+fn a_worker_without_a_base_commit_is_measured_from_the_task_branch() {
+    let repo = Repo::new("");
+    let (projects, store) = shared_projects();
+    let task = task_with_a_commit(&projects, &repo);
+    let worktree = task.worktree.with_file_name("old-worker");
+    git_in(
+        &repo.root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "old-worker-branch",
+            "--end-of-options",
+            worktree.to_str().expect("path"),
+            &task.branch,
+        ],
+    );
+    let worker = store
+        .lock()
+        .expect("lock")
+        .add_agent(&NewAgent {
+            project: task.project,
+            task: Some(task.id),
+            role: AgentRole::Worker,
+            kind: AgentKind::ClaudeCode,
+            model: "sonnet",
+            session_id: None,
+            name: "old",
+            worktree: &worktree,
+            branch: "old-worker-branch",
+            ports: &[],
+        })
+        .expect("agent");
+    std::fs::write(worktree.join("work.txt"), "1\n2\n").expect("work");
+
+    let changes = projects.agent_changes(&[worker.id]);
+
+    assert_eq!(
+        changes,
+        vec![AgentChange {
+            agent: worker.id,
+            stat: DiffStat {
+                files: 1,
+                additions: 2,
+                deletions: 0,
+            },
+            files: vec![file_stat("work.txt", 2)],
+        }]
+    );
 }

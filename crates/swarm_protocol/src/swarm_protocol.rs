@@ -17,10 +17,16 @@ use swarm_term::{Palette, Size, TerminalInput, TerminalOutput};
 pub mod agent;
 mod client;
 
-pub use client::{Client, ClientError};
+pub use client::{Client, ClientError, MessageEvent};
 
 /// Bumped on every incompatible change; the daemon refuses other versions.
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 7;
+
+/// The most messages [`Request::ListMessages`] returns.
+pub const MESSAGES_LISTED: usize = 500;
+
+/// The most files one [`AgentChange`] lists.
+pub const FILES_LISTED: usize = 500;
 
 /// Guards against a corrupt length prefix allocating gigabytes.
 const MAX_FRAME: usize = 256 << 20;
@@ -149,6 +155,14 @@ pub struct AgentInfo {
     pub lifecycle: AgentLifecycle,
     /// Goes up with every change, so a client can drop a copy older than the one it has.
     pub revision: u64,
+    /// Milliseconds since the Unix epoch.
+    pub created_at: u64,
+    /// When its process last started, in milliseconds since the Unix epoch. `None`
+    /// before the first start.
+    pub started_at: Option<u64>,
+    /// When its process last ended, in milliseconds since the Unix epoch. `None` while
+    /// it runs or before it starts.
+    pub ended_at: Option<u64>,
 }
 
 /// One task: its own branch and task worktree.
@@ -250,6 +264,34 @@ pub struct MessageInfo {
     pub text: String,
     /// Milliseconds since the Unix epoch.
     pub sent_at: u64,
+    /// When the recipient got it. `None` while it is in flight.
+    pub delivered_at: Option<u64>,
+}
+
+/// What an agent changed in its worktree since it branched off: committed and
+/// uncommitted work, untracked files included.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DiffStat {
+    pub files: u32,
+    pub additions: u32,
+    pub deletions: u32,
+}
+
+/// One changed file of an agent. `path` is relative to the agent's worktree.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct FileStat {
+    pub path: PathBuf,
+    pub additions: u32,
+    pub deletions: u32,
+}
+
+/// What one agent changed: the totals, and up to [`FILES_LISTED`] files, most changed
+/// lines first.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AgentChange {
+    pub agent: AgentId,
+    pub stat: DiffStat,
+    pub files: Vec<FileStat>,
 }
 
 /// Matches a reply to its request, so a late reply never answers a newer call.
@@ -307,6 +349,18 @@ pub enum Request {
         project: ProjectId,
         /// `None` uses the default from the settings.
         kind: Option<AgentKind>,
+    },
+    /// The newest messages of a task, or of a project's Start orchestrator when `task`
+    /// is `None`. Answered with [`Event::Messages`].
+    ListMessages {
+        call: CallId,
+        project: ProjectId,
+        task: Option<TaskId>,
+    },
+    /// Answered with [`Event::AgentChanges`].
+    AgentChanges {
+        call: CallId,
+        agents: Vec<AgentId>,
     },
 }
 
@@ -370,6 +424,21 @@ pub enum Event {
     /// Sent to every client for each message between agents.
     MessageSent {
         message: MessageInfo,
+    },
+    /// Up to [`MESSAGES_LISTED`] messages, oldest first.
+    Messages {
+        call: CallId,
+        messages: Vec<MessageInfo>,
+    },
+    /// Sent to every client when recipients got messages.
+    MessagesDelivered {
+        ids: Vec<MessageId>,
+        delivered_at: u64,
+    },
+    /// One entry per asked agent whose worktree could be read.
+    AgentChanges {
+        call: CallId,
+        changes: Vec<AgentChange>,
     },
 }
 

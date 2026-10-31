@@ -12,7 +12,8 @@ use gpui::{AnyWindowHandle, App, AsyncApp, Context, Window};
 use swarm_ui::theme::{self, Appearance};
 
 use crate::model::ProjectId;
-use crate::workspace::Workspace;
+use crate::swarm_view::InspectorTab;
+use crate::workspace::{View, Workspace};
 
 type OpenOverlay = fn(&mut Workspace, &mut Window, &mut Context<Workspace>);
 
@@ -26,6 +27,37 @@ fn open_start(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Worksp
 
 fn open_start_empty(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
     workspace.select_project(ProjectId(3), cx);
+}
+
+fn open_swarm(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
+    workspace.set_view(View::Swarm, cx);
+}
+
+fn show_pty_io(workspace: &mut Workspace, tab: InspectorTab, cx: &mut Context<Workspace>) {
+    let agent = workspace
+        .data
+        .agents
+        .iter()
+        .find(|agent| agent.name == "pty-io")
+        .map(|agent| agent.id);
+
+    workspace.set_view(View::Swarm, cx);
+    if let Some(agent) = agent {
+        workspace.select_swarm_agent(agent, cx);
+    }
+    workspace.select_inspector_tab(tab, cx);
+}
+
+fn open_swarm_messages(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
+    show_pty_io(workspace, InspectorTab::Messages, cx);
+}
+
+fn open_swarm_changes(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
+    show_pty_io(workspace, InspectorTab::Changes, cx);
+}
+
+fn open_swarm_terminal(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
+    show_pty_io(workspace, InspectorTab::Terminal, cx);
 }
 
 fn show_empty(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
@@ -42,6 +74,10 @@ fn show_unavailable(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<
 
 const SETTLE: Duration = Duration::from_millis(700);
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one flat list of shots reads best in one place"
+)]
 pub(crate) fn run(directory: PathBuf, cx: &mut App) {
     cx.spawn(async move |cx: &mut AsyncApp| {
         if let Err(error) = std::fs::create_dir_all(&directory) {
@@ -62,6 +98,46 @@ pub(crate) fn run(directory: PathBuf, cx: &mut App) {
                 Appearance::Dark,
                 "workspace-island-dark.png",
                 Some(open_island),
+            ),
+            (
+                Appearance::Light,
+                "workspace-swarm-light.png",
+                Some(open_swarm),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-swarm-dark.png",
+                Some(open_swarm),
+            ),
+            (
+                Appearance::Light,
+                "workspace-swarm-pty-io-light.png",
+                Some(open_swarm_messages),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-swarm-pty-io-dark.png",
+                Some(open_swarm_messages),
+            ),
+            (
+                Appearance::Light,
+                "workspace-swarm-changes-light.png",
+                Some(open_swarm_changes),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-swarm-changes-dark.png",
+                Some(open_swarm_changes),
+            ),
+            (
+                Appearance::Light,
+                "workspace-swarm-terminal-light.png",
+                Some(open_swarm_terminal),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-swarm-terminal-dark.png",
+                Some(open_swarm_terminal),
             ),
             (
                 Appearance::Light,

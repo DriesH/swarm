@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -78,11 +79,34 @@ pub(crate) struct ClientSink {
     frames: flume::Sender<Frame>,
     /// Closed when the queue is full, which ends the connection's reader too.
     stream: Option<UnixStream>,
+    changes_running: AtomicBool,
+}
+
+/// Held while an `AgentChanges` request of one client runs.
+pub(crate) struct ChangesGuard(Arc<ClientSink>);
+
+impl Drop for ChangesGuard {
+    fn drop(&mut self) {
+        self.0.changes_running.store(false, Ordering::Release);
+    }
 }
 
 impl ClientSink {
     pub(crate) fn new(id: u64, frames: flume::Sender<Frame>, stream: Option<UnixStream>) -> Self {
-        Self { id, frames, stream }
+        Self {
+            id,
+            frames,
+            stream,
+            changes_running: AtomicBool::new(false),
+        }
+    }
+
+    /// None while an earlier `AgentChanges` request of this client still runs.
+    pub(crate) fn begin_changes(self: &Arc<Self>) -> Option<ChangesGuard> {
+        self.changes_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            .then(|| ChangesGuard(Arc::clone(self)))
     }
 
     pub(crate) fn id(&self) -> u64 {
@@ -134,6 +158,12 @@ impl Clients {
         };
 
         lock(&self.sinks).retain(|sink| sink.send(&frame));
+    }
+
+    /// Stalls every broadcast until the guard drops.
+    #[cfg(test)]
+    pub(crate) fn stall(&self) -> MutexGuard<'_, Vec<Arc<ClientSink>>> {
+        lock(&self.sinks)
     }
 }
 
@@ -579,6 +609,18 @@ mod tests {
         state.deliver(&frame(2), Audience::Attached);
 
         assert_eq!(frames.try_iter().count(), 2);
+    }
+
+    #[test]
+    fn only_one_changes_request_runs_per_client() {
+        let (client, _frames) = sink(1, 8);
+
+        let first = client.begin_changes();
+        assert!(first.is_some());
+        assert!(client.begin_changes().is_none());
+
+        drop(first);
+        assert!(client.begin_changes().is_some());
     }
 
     #[test]

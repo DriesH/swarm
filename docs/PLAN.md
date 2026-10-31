@@ -108,8 +108,13 @@ Harness calls for the Start orchestrator:
 ### Swarm view
 
 - Graph: the orchestrator on top, workers below. Edges are colored by message type (task, question, report); dots on an edge are messages in flight.
-- Timeline under the graph: one lane per agent.
-- Inspector for the selected agent: agent kind, worktree, branch, running time, changes, its message thread, a live terminal preview, **Focus** (switches to Terminals with that tile focused) and **View diff** (Review filtered to that agent).
+- Inspector for the selected agent, on the right, resizable (320–640 px) by dragging its left border:
+  - Header: kind icon, name, status, **View diff** (Review filtered to that agent) and **Focus** (switches to Terminals with that tile focused). Under it one line with kind and model, running time and shared or own worktree, then the branch.
+  - Tabs **Messages**, **Changes** and **Terminal**, with counts on the first two.
+  - Messages: the agent's thread, newest at the bottom. Each message shows sender, recipient, a kind tag and the time or "In flight". The text is rendered as Markdown (paragraphs, headings, lists, inline code, links); long messages fold with **Show more**.
+  - Changes: total additions and deletions, then each changed file; a file opens Review at that file.
+  - Terminal: a live preview of the agent's terminal, then its process terminals with size and state.
+- No timeline: it was tried in phase 5 and removed because it added little.
 
 ### Settings
 
@@ -129,8 +134,8 @@ Four kinds:
 
 | Kind | Who types | Who resizes | Who kills |
 |---|---|---|---|
-| **Orchestrator** | user | layout | user |
-| **Worker** | output view; user can type in v1 (setting, may be off by default later) | its agent | orchestrator, user |
+| **Orchestrator** | user | layout: always large | user |
+| **Worker** | output view; user can type in v1 (setting, may be off by default later) | layout: small; grows when blocked or on `tile.grow` | orchestrator, user |
 | **Process** (dev server, tests, any command an agent starts) | nobody by default | the agent that started it | that agent, orchestrator, user |
 | **User** | user only | user only | user only |
 
@@ -138,6 +143,8 @@ Four kinds:
 - **Process terminals**: started with `swarm terminal spawn`. When the process exits or is killed, the terminal closes after a short delay (to show the exit code); a failed exit stays until the user closes it and the owner agent and the orchestrator get a `terminal.exited` event with who stopped it (`agent`, `user`, `process`) and the exit code or signal.
 - **Layout engine**: tiles fill the space. Priority: user terminals (fixed size), orchestrator, terminals that need attention (`blocked`, `error`), working agents, process terminals, done or idle agents. Each tile has a minimum size; tiles that don't fit move to the **tray**: chips on the left of the status bar, each with a restore icon. A tile that needs attention is promoted out of the tray. The user can pin or minimize any tile.
 - When the user resizes a user terminal, the other tiles reflow around it.
+- **Tile sizes**: the orchestrator always gets the main slot, at least half the width, and never goes to the tray. Workers are small by default (about 80×12). A blocked worker grows by itself and shrinks when it works again. The orchestrator can grow or shrink any of its workers with `tile.grow` / `tile.shrink`; a worker only itself. A tile the user pinned, minimized or resized ignores these calls until the user resets it.
+- **Font size**: one global setting (Settings › Terminals, 10–20 px, default 13) for every terminal. Process terminals keep their columns and rows, so their tiles change size with the font.
 
 ### Terminal harness (CLI + MCP)
 
@@ -149,6 +156,7 @@ Four kinds:
 | `terminal.wait {id, until: exit\|output-match, pattern?}` | owner agent, orchestrator | Waits for exit or for a line such as `ready in`. |
 | `terminal.kill {id, signal?}` | owner agent, orchestrator | Stops the process; the terminal closes. |
 | `terminal.list` | any agent | Lists terminals the caller may see (never user terminals). |
+| `tile.grow {agent?}` / `tile.shrink {agent?}` | orchestrator for its workers, worker for itself | Makes a worker's tile large or small again. Changes the layout only, never sends a message. |
 | event `terminal.exited {id, by, code\|signal}` | to owner + orchestrator | Sent when a process terminal ends for any reason. |
 
 ### Prompts
@@ -325,6 +333,12 @@ Reports in `docs/spikes/`. Code in `spikes/` (throwaway).
 - Start Codex with `-c check_for_update_on_startup=false`. Never type into an agent before it reports `idle`: startup prompts swallow input (a spike accepted a Codex update this way).
 - Codex's `workspace-write` sandbox blocks unix sockets and makes `.git` read-only. Codex agents use the `swarm` MCP tools (MCP servers run outside the sandbox, and Codex passes them only the env names listed in `env_vars`), and get the main repository's `.git` and their own `.git/worktrees/<name>` as writable roots so they can commit.
 - Both CLIs ask once per project whether to trust the folder; they key trust on the main repository root, so worktrees share the answer. Swarm never pre-trusts. While the dialog shows, the agent is blocked with "Trust this folder".
+
+**Swarm view**
+
+- Count an agent's changes with `git diff-index --numstat -z <base> --` and `GIT_OPTIONAL_LOCKS=0`. Porcelain `git diff` refreshes the index and takes `index.lock`, which can fail the agent's own commit.
+- Untracked files can be symlinks to FIFOs or `/dev/zero`: check `symlink_metadata`, read regular files only, and cap the bytes read.
+- The daemon broadcasts "delivered" while it holds the store lock, so it never overtakes "sent". The app still keeps deliveries for messages it has not seen yet, because history arrives on another channel.
 
 **Usage and menu bar**
 

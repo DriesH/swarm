@@ -1,10 +1,14 @@
 //! Runs the `git` binary. User text only ever travels as an argument, never through a shell.
 
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
+
+use swarm_protocol::{DiffStat, FILES_LISTED, FileStat};
 
 use crate::Error;
 
@@ -41,6 +45,8 @@ struct Output {
     success: bool,
     code: Option<i32>,
     stdout: String,
+    /// Untouched, for NUL-separated output.
+    raw: Vec<u8>,
     stderr: String,
 }
 
@@ -59,6 +65,7 @@ where
         .arg(directory)
         .args(&arguments)
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(std::process::Stdio::null())
         .output()
         .map_err(|source| Error::Io {
@@ -70,6 +77,7 @@ where
         success: output.status.success(),
         code: output.status.code(),
         stdout: String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+        raw: output.stdout,
         stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
     };
 
@@ -102,6 +110,195 @@ where
     }
 
     Ok(output.stdout)
+}
+
+/// Larger untracked files count as one file with no lines.
+const MAX_COUNTED_BYTES: u64 = 1 << 20;
+
+/// Git treats a file as binary when a NUL shows up in its first 8000 bytes.
+const BINARY_SNIFF: usize = 8000;
+
+/// Untracked files past this many get no line count.
+const MAX_COUNTED_FILES: usize = 2000;
+
+/// Untracked files past this many are not looked at.
+const MAX_UNTRACKED_FILES: usize = 10_000;
+
+/// Bytes read from untracked files per call; later files get no line count.
+const MAX_TOTAL_BYTES: u64 = 32 << 20;
+
+/// The commit `revision` points at.
+pub fn commit_of(root: &Path, revision: &str) -> Result<String, Error> {
+    let target = format!("{revision}^{{commit}}");
+
+    run(root, ["rev-parse", "--verify", "--end-of-options", &target])
+}
+
+/// The commit where `HEAD` and `revision` split.
+pub fn merge_base(worktree: &Path, revision: &str) -> Result<String, Error> {
+    run(
+        worktree,
+        ["merge-base", "--end-of-options", "HEAD", revision],
+    )
+}
+
+/// What the working tree of `worktree` changed since `base`: committed and uncommitted
+/// work, plus untracked files. A binary or huge untracked file counts as a file with no
+/// lines.
+pub fn diff_stat(worktree: &Path, base: &str) -> Result<DiffStat, Error> {
+    diff_files(worktree, base).map(|(stat, _)| stat)
+}
+
+/// The totals of [`diff_stat`] and the changed files, most changed lines first. The list
+/// stops at [`FILES_LISTED`] files; the totals count all of them.
+pub fn diff_files(worktree: &Path, base: &str) -> Result<(DiffStat, Vec<FileStat>), Error> {
+    // `diff-index` never writes the index, so it cannot block the agent's own git.
+    let (arguments, output) = execute(
+        worktree,
+        [
+            "diff-index",
+            "--numstat",
+            "-z",
+            "--no-renames",
+            "--end-of-options",
+            base,
+            "--",
+        ],
+    )?;
+    if !output.success {
+        return Err(failure(&arguments, &output));
+    }
+
+    // Keyed by the raw bytes, so names that are not UTF-8 never collide.
+    let mut files: HashMap<Vec<u8>, (u32, u32)> = HashMap::new();
+    let (mut additions, mut deletions) = (0_u32, 0_u32);
+
+    for entry in output
+        .raw
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let mut parts = entry.splitn(3, |byte| *byte == b'\t');
+        let (Some(added), Some(removed), Some(path)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+
+        let (added, removed) = (parse_count(added), parse_count(removed));
+
+        additions = additions.saturating_add(added);
+        deletions = deletions.saturating_add(removed);
+        files.insert(path.to_vec(), (added, removed));
+    }
+
+    let (arguments, output) = execute(
+        worktree,
+        ["ls-files", "--others", "--exclude-standard", "-z"],
+    )?;
+    if !output.success {
+        return Err(failure(&arguments, &output));
+    }
+
+    let mut budget = MAX_TOTAL_BYTES;
+    for (index, path) in output
+        .raw
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .take(MAX_UNTRACKED_FILES)
+        .enumerate()
+    {
+        let mut lines = 0;
+        if index < MAX_COUNTED_FILES {
+            lines = count_lines(&worktree.join(OsStr::from_bytes(path)), &mut budget);
+        }
+
+        additions = additions.saturating_add(lines);
+
+        // A path deleted from the index but still on disk is in both lists.
+        let entry = files.entry(path.to_vec()).or_default();
+        entry.0 = entry.0.saturating_add(lines);
+    }
+
+    let stat = DiffStat {
+        files: u32::try_from(files.len()).unwrap_or(u32::MAX),
+        additions,
+        deletions,
+    };
+
+    Ok((stat, listed_files(files)))
+}
+
+/// A numstat count; binary files print `-`.
+fn parse_count(count: &[u8]) -> u32 {
+    std::str::from_utf8(count)
+        .ok()
+        .and_then(|count| count.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Most changed lines first, ties by path so the order is stable. A name that is not
+/// UTF-8 is listed with replacement characters, because the wire format needs UTF-8.
+fn listed_files(files: HashMap<Vec<u8>, (u32, u32)>) -> Vec<FileStat> {
+    let mut sorted: Vec<(Vec<u8>, (u32, u32))> = files.into_iter().collect();
+
+    sorted.sort_by(|(one_path, one), (other_path, other)| {
+        let changed = |(added, removed): &(u32, u32)| u64::from(*added) + u64::from(*removed);
+
+        changed(other)
+            .cmp(&changed(one))
+            .then_with(|| one_path.cmp(other_path))
+    });
+    sorted.truncate(FILES_LISTED);
+
+    sorted
+        .into_iter()
+        .map(|(path, (additions, deletions))| FileStat {
+            path: PathBuf::from(String::from_utf8_lossy(&path).into_owned()),
+            additions,
+            deletions,
+        })
+        .collect()
+}
+
+/// Lines in a text file. A symlink is one line, like git sees it. Anything that is not a
+/// regular file, or is binary, huge, unreadable or past the byte `budget`, has none.
+fn count_lines(path: &Path, budget: &mut u64) -> u32 {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if meta.file_type().is_symlink() {
+        return 1;
+    }
+    if !meta.is_file() || meta.len() > MAX_COUNTED_BYTES || *budget == 0 {
+        return 0;
+    }
+
+    let Ok(file) = std::fs::File::open(path) else {
+        return 0;
+    };
+
+    // The file may grow after the check above.
+    let mut bytes = Vec::new();
+    if file
+        .take(MAX_COUNTED_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return 0;
+    }
+
+    *budget = budget.saturating_sub(bytes.len() as u64);
+    if bytes.len() as u64 > MAX_COUNTED_BYTES {
+        return 0;
+    }
+    if bytes[..bytes.len().min(BINARY_SNIFF)].contains(&0) {
+        return 0;
+    }
+
+    let newlines = bytes.split(|byte| *byte == b'\n').count() - 1;
+    let unterminated = bytes.last().is_some_and(|byte| *byte != b'\n');
+
+    u32::try_from(newlines + usize::from(unterminated)).unwrap_or(u32::MAX)
 }
 
 /// The top folder of the repository that contains `path`.
@@ -331,4 +528,23 @@ pub fn add_exclude_line(root: &Path, line: &str) -> Result<(), Error> {
     writeln!(file, "{separator}{line}").map_err(io_error("write"))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_that_are_not_utf8_stay_separate_entries() {
+        let mut files = HashMap::new();
+        files.insert(vec![b'a', 0xff], (1, 0));
+        files.insert(vec![b'a', 0xfe], (2, 0));
+        files.insert(b"a.txt".to_vec(), (3, 0));
+
+        let listed = listed_files(files);
+
+        assert_eq!(listed.len(), 3);
+        assert_eq!(listed[0].path, PathBuf::from("a.txt"));
+        assert_eq!(listed[1].path, PathBuf::from("a\u{fffd}"));
+    }
 }

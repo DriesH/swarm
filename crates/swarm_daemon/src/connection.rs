@@ -5,18 +5,22 @@ use std::io::{BufReader, BufWriter, ErrorKind, Write};
 use std::net::Shutdown;
 use std::os::fd::AsRawFd as _;
 use std::os::unix::net::UnixStream;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 
 use anyhow::Result;
 use swarm_protocol::{
-    CallId, Event, FrameError, Request, TaskInfo, TerminalId, VERSION, read, write,
+    CallId, Event, FrameError, MESSAGES_LISTED, Request, TaskInfo, TerminalId, VERSION, read, write,
 };
 use swarm_term::TerminalInput;
 
 use crate::Services;
 use crate::hub::{CREATE_HISTORY_LINES, ClientSink, Frame, Hub, QUEUE_FRAMES};
 use crate::tasks;
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// Longest parent chain the peer check follows.
 const MAX_ANCESTORS: usize = 256;
@@ -159,6 +163,38 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
                     Err(error) => send_error(sink, call, &error),
                 },
             );
+        }
+        Request::ListMessages {
+            call,
+            project,
+            task,
+        } => {
+            let store = Arc::clone(&services.store);
+            run_slow(sink, "list-messages", call, move |sink| {
+                let listed = lock(&store).list_messages(project, task, MESSAGES_LISTED);
+
+                match listed {
+                    Ok(messages) => {
+                        sink.send_event(&Event::Messages { call, messages });
+                    }
+                    Err(error) => send_error(sink, call, &error),
+                }
+            });
+        }
+        Request::AgentChanges { call, agents } => {
+            let Some(running) = sink.begin_changes() else {
+                send_error(sink, call, &"busy: the previous changes request still runs");
+
+                return;
+            };
+
+            let projects = Arc::clone(projects);
+            run_slow(sink, "agent-changes", call, move |sink| {
+                let changes = projects.agent_changes(&agents);
+                drop(running);
+
+                sink.send_event(&Event::AgentChanges { call, changes });
+            });
         }
         Request::ListProjects { call } => match projects.list() {
             Ok(projects) => {

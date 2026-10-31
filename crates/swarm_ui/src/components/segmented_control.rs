@@ -82,7 +82,7 @@ struct Glide {
 }
 
 /// The segment an arrow key selects, wrapping at both ends.
-fn neighbor(key: &str, selected: usize, count: usize) -> Option<usize> {
+pub(crate) fn neighbor(key: &str, selected: usize, count: usize) -> Option<usize> {
     if count == 0 {
         return None;
     }

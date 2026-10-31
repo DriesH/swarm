@@ -11,10 +11,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use swarm_protocol::{
-    AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, Client, ClientError,
-    CreateTask, CreateTerminal, Event, GridSize, MessageId, MessageInfo, MessageKind, ProjectId,
-    ProjectInfo, Request, TaskId, TaskInfo, TerminalId, TerminalInfo, TerminalKind, VERSION, read,
-    write,
+    AgentChange, AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, Client,
+    ClientError, CreateTask, CreateTerminal, DiffStat, Event, FileStat, GridSize, MessageEvent,
+    MessageId, MessageInfo, MessageKind, ProjectId, ProjectInfo, Request, TaskId, TaskInfo,
+    TerminalId, TerminalInfo, TerminalKind, VERSION, read, write,
 };
 use swarm_term::{Palette, Rgb, Size, TerminalInput, TerminalOutput};
 
@@ -640,6 +640,9 @@ fn agent_info(status: AgentStatus) -> AgentInfo {
         message: None,
         lifecycle: AgentLifecycle::Running,
         revision: 1,
+        created_at: 1_000,
+        started_at: Some(2_000),
+        ended_at: None,
     }
 }
 
@@ -718,7 +721,8 @@ fn start_orchestrator_reports_a_daemon_error() {
 
 #[test]
 fn task_terminal_and_message_broadcasts_reach_their_listeners() {
-    let socket = serve(|fake| {
+    let brief = brief_message();
+    let socket = serve(move |fake| {
         fake.handshake(VERSION);
         fake.send(&Event::TaskChanged { task: task_info() });
         fake.send(&Event::TerminalChanged {
@@ -728,17 +732,10 @@ fn task_terminal_and_message_broadcasts_reach_their_listeners() {
                 ..info(5)
             },
         });
-        fake.send(&Event::MessageSent {
-            message: MessageInfo {
-                id: MessageId(1),
-                project: ProjectId(2),
-                task: Some(TaskId(4)),
-                from: None,
-                to: AgentId(1),
-                kind: MessageKind::Brief,
-                text: "go".into(),
-                sent_at: 0,
-            },
+        fake.send(&Event::MessageSent { message: brief });
+        fake.send(&Event::MessagesDelivered {
+            ids: vec![MessageId(1)],
+            delivered_at: 5,
         });
         fake.drain();
     });
@@ -749,11 +746,104 @@ fn task_terminal_and_message_broadcasts_reach_their_listeners() {
         .terminal_events()
         .recv_timeout(WAIT)
         .expect("terminal");
-    let message = client.message_events().recv_timeout(WAIT).expect("message");
+    let sent = client.message_events().recv_timeout(WAIT).expect("sent");
+    let delivered = client
+        .message_events()
+        .recv_timeout(WAIT)
+        .expect("delivered");
 
     assert_eq!(task, task_info());
     assert_eq!(terminal.fixed_size, Some(GridSize { cols: 80, rows: 12 }));
-    assert_eq!(message.text, "go");
+    assert_eq!(sent, MessageEvent::Sent(brief_message()));
+    assert_eq!(
+        delivered,
+        MessageEvent::Delivered {
+            ids: vec![MessageId(1)],
+            delivered_at: 5,
+        }
+    );
+}
+
+fn brief_message() -> MessageInfo {
+    MessageInfo {
+        id: MessageId(1),
+        project: ProjectId(2),
+        task: Some(TaskId(4)),
+        from: None,
+        to: AgentId(1),
+        kind: MessageKind::Brief,
+        text: "go".into(),
+        sent_at: 0,
+        delivered_at: None,
+    }
+}
+
+#[test]
+fn list_messages_sends_the_task_and_returns_the_messages() {
+    let socket = serve(|fake| {
+        fake.handshake(VERSION);
+        let Some(Request::ListMessages {
+            call,
+            project,
+            task,
+        }) = fake.request()
+        else {
+            panic!("expected a ListMessages request");
+        };
+        assert_eq!((project, task), (ProjectId(2), Some(TaskId(4))));
+        fake.send(&Event::Messages {
+            call,
+            messages: vec![brief_message()],
+        });
+        fake.drain();
+    });
+    let client = Client::connect(&socket).expect("connect");
+
+    let messages = client
+        .list_messages(ProjectId(2), Some(TaskId(4)))
+        .expect("list messages");
+
+    assert_eq!(messages, vec![brief_message()]);
+}
+
+#[test]
+fn agent_changes_returns_each_diff_stat() {
+    let stat = DiffStat {
+        files: 2,
+        additions: 41,
+        deletions: 8,
+    };
+    let socket = serve(move |fake| {
+        fake.handshake(VERSION);
+        let Some(Request::AgentChanges { call, agents }) = fake.request() else {
+            panic!("expected an AgentChanges request");
+        };
+        assert_eq!(agents, vec![AgentId(1), AgentId(3)]);
+        fake.send(&Event::AgentChanges {
+            call,
+            changes: vec![change(stat)],
+        });
+        fake.drain();
+    });
+    let client = Client::connect(&socket).expect("connect");
+
+    let changes = client
+        .agent_changes(vec![AgentId(1), AgentId(3)])
+        .expect("agent changes");
+
+    assert_eq!(changes, vec![change(stat)]);
+}
+
+fn change(stat: DiffStat) -> AgentChange {
+    AgentChange {
+        agent: AgentId(1),
+        stat,
+        files: vec![FileStat {
+            path: PathBuf::from("src/pty.rs"),
+            additions: 39,
+            deletions: 8,
+        }],
+    }
 }
 
 #[test]

@@ -47,7 +47,7 @@ pub(crate) struct Resizing {
 
 pub(crate) fn render(
     workspace: &Workspace,
-    _window: &mut Window,
+    window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> AnyElement {
     if workspace.has_no_projects() {
@@ -56,7 +56,7 @@ pub(crate) fn render(
 
     match workspace.view {
         View::Terminals => terminals(workspace, cx).into_any_element(),
-        View::Swarm => centered("Swarm").into_any_element(),
+        View::Swarm => crate::swarm_view::render(workspace, window, cx),
         View::Review => centered("Review").into_any_element(),
     }
 }
@@ -955,6 +955,8 @@ mod tests {
                 TileKind::Worker,
                 TileKind::Worker,
                 TileKind::Worker,
+                TileKind::Process,
+                TileKind::Process,
                 TileKind::Process,
                 TileKind::Process,
             ]

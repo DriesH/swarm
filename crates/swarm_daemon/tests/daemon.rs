@@ -14,9 +14,10 @@ use std::time::{Duration, Instant};
 
 use swarm_core::store::Store;
 use swarm_protocol::{
-    AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, CallId, CreateTask,
-    CreateTerminal, Event, MessageInfo, MessageKind, ProjectId, ProjectInfo, Request, TaskInfo,
-    TerminalId, TerminalInfo, TerminalKind, VERSION, read, write,
+    AgentChange, AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, CallId,
+    CreateTask, CreateTerminal, DiffStat, Event, FileStat, MessageInfo, MessageKind, ProjectId,
+    ProjectInfo, Request, TaskId, TaskInfo, TerminalId, TerminalInfo, TerminalKind, VERSION, read,
+    write,
 };
 use swarm_term::{
     BlockedKind, ExitStatus, Palette, ProgramState, Rgb, Row, Size, TerminalInput, TerminalOutput,
@@ -1969,6 +1970,44 @@ esac"#,
 }
 
 #[test]
+fn the_daemon_refuses_a_message_over_64_kib() {
+    let fixture = fixture_with_helpers(
+        r#"BIG=$(head -c 70000 /dev/zero | tr '\0' x)
+case "$SWARM_ROLE" in
+orchestrator)
+  idle
+  IFS= read -r line
+  working
+  swarm spawn big --brief "$BIG" > "$OUT/big-brief.out" 2>&1
+  swarm spawn a --brief "report big" > "$OUT/spawn-a.out" 2>&1
+  swarm send a "$BIG" > "$OUT/big-send.out" 2>&1
+  echo done > "$OUT/orchestrator-done"
+  sleep 30
+  ;;
+worker)
+  idle
+  IFS= read -r line
+  working
+  swarm ask "$BIG" > "$OUT/big-ask.out" 2>&1
+  swarm report "$BIG" > "$OUT/big-report.out" 2>&1
+  sleep 30
+  ;;
+esac"#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (_client, _task) = start_task(&daemon, &repo);
+    fixture.read_when_written("orchestrator-done");
+
+    let said = |name: &str| fixture.read_when_written(name);
+    let refusal = "swarm: message is 69 KiB; the limit is 64 KiB: shorten it or write it to a file and send the path";
+    assert_eq!(said("big-brief.out").trim(), refusal);
+    assert_eq!(said("big-send.out").trim(), refusal);
+    assert_eq!(said("big-ask.out").trim(), refusal);
+    assert_eq!(said("big-report.out").trim(), refusal);
+}
+
+#[test]
 fn a_notice_blocks_the_agent_until_it_works_again() {
     let fixture = fixture_with_helpers(
         r#"idle
@@ -3065,4 +3104,168 @@ sleep 30"#,
     let lines: Vec<&str> = read.lines().collect();
     let expected: Vec<String> = (1..=500).map(|number| format!("line {number}")).collect();
     assert_eq!(lines, expected);
+}
+
+/// The worker reports at once; the orchestrator is pasted the report once it is idle.
+fn pasted_report_fixture() -> Fixture {
+    fixture_with_helpers(
+        r#"case "$SWARM_ROLE" in
+orchestrator)
+  idle
+  IFS= read -r line
+  working
+  swarm spawn api --brief "report at once" > "$OUT/spawn.out" 2>&1
+  while [ ! -f "$OUT/reported" ]; do sleep 0.1; done
+  idle
+  IFS= read -r header
+  IFS= read -r body
+  printf '%s\n%s\n' "$header" "$body" > "$OUT/pasted"
+  sleep 30
+  ;;
+worker)
+  idle
+  IFS= read -r line
+  working
+  swarm report "all green" > "$OUT/report.out" 2>&1
+  echo yes > "$OUT/reported"
+  sleep 30
+  ;;
+esac"#,
+    )
+}
+
+impl Client {
+    fn list_messages(&mut self, project: ProjectId, task: Option<TaskId>) -> Vec<MessageInfo> {
+        self.send(&Request::ListMessages {
+            call: CALL,
+            project,
+            task,
+        });
+
+        self.wait_for(|event| match event {
+            Event::Messages {
+                call: CALL,
+                messages,
+            } => Some(messages.clone()),
+            _ => None,
+        })
+    }
+}
+
+#[test]
+fn a_delivered_message_is_announced_to_the_app() {
+    let fixture = pasted_report_fixture();
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, _task) = start_task(&daemon, &repo);
+
+    let report = client.wait_for_message(|message| message.kind == MessageKind::Report);
+    let (ids, delivered_at) = client.wait_for(|event| match event {
+        Event::MessagesDelivered { ids, delivered_at } if ids.contains(&report.id) => {
+            Some((ids.clone(), *delivered_at))
+        }
+        _ => None,
+    });
+
+    assert_eq!(report.delivered_at, None);
+    assert_eq!(ids, vec![report.id]);
+    assert!(delivered_at >= report.sent_at);
+}
+
+#[test]
+fn listing_messages_returns_the_conversation_with_delivery_times() {
+    let fixture = pasted_report_fixture();
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, task) = start_task(&daemon, &repo);
+
+    fixture.read_when_written("pasted");
+    let report = client.wait_for_message(|message| message.kind == MessageKind::Report);
+    client.wait_for(|event| match event {
+        Event::MessagesDelivered { ids, .. } if ids.contains(&report.id) => Some(()),
+        _ => None,
+    });
+
+    let messages = client.list_messages(task.project, Some(task.id));
+    let kinds: Vec<MessageKind> = messages.iter().map(|message| message.kind).collect();
+
+    assert_eq!(kinds, [MessageKind::Brief, MessageKind::Report]);
+    assert!(messages.windows(2).all(|pair| pair[0].id < pair[1].id));
+    assert!(
+        messages
+            .iter()
+            .all(|message| message.delivered_at.is_some())
+    );
+    assert!(
+        client.list_messages(task.project, None).is_empty(),
+        "the Start orchestrator has no messages"
+    );
+    assert!(client.list_messages(ProjectId(999), None).is_empty());
+}
+
+#[test]
+fn agent_changes_measure_a_worker_against_its_fork_point() {
+    let fixture = fixture_with_helpers(
+        r#"case "$SWARM_ROLE" in
+orchestrator)
+  idle
+  IFS= read -r line
+  working
+  swarm spawn api --brief "write files" > "$OUT/spawn.out" 2>&1
+  sleep 30
+  ;;
+worker)
+  idle
+  IFS= read -r line
+  working
+  printf 'one\n' > api.txt
+  git add api.txt
+  commit "add api"
+  printf 'a\nb\n' > loose.txt
+  echo yes > "$OUT/wrote"
+  sleep 30
+  ;;
+esac"#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, _task) = start_task(&daemon, &repo);
+
+    let worker = client.wait_for_agent(|agent| agent.role == AgentRole::Worker);
+    fixture.read_when_written("wrote");
+    client.send(&Request::AgentChanges {
+        call: CALL,
+        agents: vec![worker.id, AgentId(9999)],
+    });
+    let changes = client.wait_for(|event| match event {
+        Event::AgentChanges {
+            call: CALL,
+            changes,
+        } => Some(changes.clone()),
+        _ => None,
+    });
+
+    assert_eq!(
+        changes,
+        vec![AgentChange {
+            agent: worker.id,
+            stat: DiffStat {
+                files: 2,
+                additions: 3,
+                deletions: 0,
+            },
+            files: vec![
+                FileStat {
+                    path: "loose.txt".into(),
+                    additions: 2,
+                    deletions: 0,
+                },
+                FileStat {
+                    path: "api.txt".into(),
+                    additions: 1,
+                    deletions: 0,
+                },
+            ],
+        }]
+    );
 }

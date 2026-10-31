@@ -17,7 +17,7 @@ use swarm_core::adapters::{self, LaunchSpec, Session};
 use swarm_core::agents::{StatusMerge, is_trust_prompt, new_session_id, new_token};
 use swarm_core::git;
 use swarm_core::prompts::{self, Harness, PromptFile};
-use swarm_core::store::{NewAgent, NewMessage, Store};
+use swarm_core::store::{NewAgent, NewMessage, Store, unix_millis};
 use swarm_protocol::agent::render_inbox;
 use swarm_protocol::{
     AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, CreateTerminal, Event,
@@ -554,6 +554,8 @@ impl Agents {
                 started.update(id, |live| {
                     live.info.terminal = Some(terminal);
                     live.info.lifecycle = AgentLifecycle::Running;
+                    live.info.ended_at = None;
+                    live.info.started_at = Some(unix_millis());
 
                     true
                 });
@@ -629,6 +631,7 @@ impl Agents {
 
         agent.merge.fail(message);
         agent.info.lifecycle = AgentLifecycle::Stopped;
+        agent.info.ended_at = Some(unix_millis());
         self.publish(&mut agent);
 
         self.tell_worker_stopped(&agent.info, &format!("failed: {message}"));
@@ -848,6 +851,7 @@ impl Agents {
             } else {
                 AgentLifecycle::Stopped
             };
+        agent.info.ended_at = Some(unix_millis());
         self.publish(&mut agent);
 
         let how = exit.map_or_else(|| "no exit status".to_owned(), exit_text);

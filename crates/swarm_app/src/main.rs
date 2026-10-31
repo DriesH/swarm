@@ -2,6 +2,7 @@
 
 mod actions;
 mod daemon;
+mod markdown;
 mod model;
 mod new_task;
 mod palette;
@@ -9,6 +10,7 @@ mod panels;
 mod settings;
 mod sidebar;
 mod status_bar;
+mod swarm_view;
 mod tab_bar;
 mod views;
 mod window_drag;

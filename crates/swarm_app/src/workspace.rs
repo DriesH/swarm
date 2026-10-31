@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use gpui::{
-    Bounds, Context, Entity, FocusHandle, Focusable, Pixels, SharedString, Size, Subscription,
-    Window, div, px,
+    AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable, Pixels, SharedString, Size,
+    Subscription, Window, div, px,
 };
 use swarm_protocol::Client;
 use swarm_ui::fonts::UI_FONT;
@@ -16,8 +16,11 @@ use crate::actions::{
     ShowTerminals, ToggleChanges, ToggleCommandPalette, ToggleFiles,
 };
 use crate::daemon::{DaemonLaunch, LiveTerminal};
-use crate::model::{FakeData, ProjectId, Task, TaskId, TaskStatus, TerminalId, TerminalKind};
+use crate::model::{
+    AgentId, FakeData, ProjectId, SAMPLE_NOW, Task, TaskId, TaskStatus, TerminalId, TerminalKind,
+};
 use crate::palette::Overlay;
+use crate::swarm_view::{DotGrid, INSPECTOR_WIDTH, InspectorTab, MessageThread, TerminalPreview};
 use crate::views::Resizing;
 use crate::{panels, sidebar, status_bar, tab_bar, views};
 
@@ -92,6 +95,33 @@ pub(crate) struct Workspace {
     pub(crate) sidebar_error: Option<SharedString>,
     pub(crate) orchestrator_input: Entity<TextInput>,
     _orchestrator_subscription: Subscription,
+    /// Replaces the system clock, so snapshots and tests show the same times.
+    pub(crate) fixed_now: Option<u64>,
+    /// The agent selected in the Swarm view, for each task.
+    pub(crate) swarm_selection: HashMap<TaskId, AgentId>,
+    pub(crate) swarm_focus: HashMap<AgentId, FocusHandle>,
+    pub(crate) swarm_zoom: f32,
+    /// The agent Review shows, set by View diff.
+    pub(crate) review_agent: Option<AgentId>,
+    /// The file Review opens at, set by a row of the Changes tab.
+    pub(crate) review_file: Option<PathBuf>,
+    /// The inspector tab, kept for the window and not for each agent.
+    pub(crate) inspector_tab: InspectorTab,
+    /// In memory only: `settings.toml` holds config, not window state.
+    pub(crate) inspector_width: f32,
+    /// The width of the Swarm view at the last paint, once known.
+    pub(crate) swarm_view_width: Option<f32>,
+    pub(crate) inspector_dragging: bool,
+    pub(crate) inspector_handle: FocusHandle,
+    pub(crate) thread: Entity<MessageThread>,
+    pub(crate) preview: Entity<TerminalPreview>,
+    pub(crate) dot_grid: Entity<DotGrid>,
+    _inspector_subscription: Subscription,
+    pub(crate) changes_poll: Option<gpui::Task<()>>,
+    /// The task the running poll asks about.
+    pub(crate) polled_task: Option<TaskId>,
+    _activation_subscription: Subscription,
+    pub(crate) swarm_clock: Option<gpui::Task<()>>,
 }
 
 impl Workspace {
@@ -102,7 +132,11 @@ impl Workspace {
 
     /// Fake projects, tasks and agents for snapshots and tests.
     pub(crate) fn with_sample(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self::with_data(DataSource::Sample, FakeData::sample(), window, cx)
+        let mut workspace = Self::with_data(DataSource::Sample, FakeData::sample(), window, cx);
+        workspace.fixed_now = Some(SAMPLE_NOW);
+        workspace.sync_inspector(cx);
+
+        workspace
     }
 
     fn with_data(
@@ -130,8 +164,15 @@ impl Workspace {
         window.focus(&focus_handle, cx);
 
         let (orchestrator_input, orchestrator_subscription) = views::orchestrator_input(cx);
+        let activation_subscription = cx.observe_window_activation(window, |this, window, cx| {
+            this.sync_swarm_tasks(window.is_window_active(), cx);
+        });
 
-        Self {
+        let inspector_subscription = cx.observe(&cx.entity(), |this, _, cx| {
+            this.sync_inspector(cx);
+        });
+
+        let mut workspace = Self {
             data,
             active_project,
             active_task,
@@ -164,7 +205,29 @@ impl Workspace {
             sidebar_error: None,
             orchestrator_input,
             _orchestrator_subscription: orchestrator_subscription,
-        }
+            fixed_now: None,
+            swarm_selection: HashMap::new(),
+            swarm_focus: HashMap::new(),
+            swarm_zoom: 1.,
+            review_agent: None,
+            review_file: None,
+            inspector_tab: InspectorTab::default(),
+            inspector_width: INSPECTOR_WIDTH,
+            swarm_view_width: None,
+            inspector_dragging: false,
+            inspector_handle: cx.focus_handle().tab_stop(true),
+            thread: cx.new(|_| MessageThread::new()),
+            preview: cx.new(|_| TerminalPreview::new()),
+            dot_grid: cx.new(|_| DotGrid),
+            _inspector_subscription: inspector_subscription,
+            changes_poll: None,
+            polled_task: None,
+            _activation_subscription: activation_subscription,
+            swarm_clock: None,
+        };
+        workspace.sync_inspector(cx);
+
+        workspace
     }
 
     /// True when no project is shown, so the main area shows the empty state.
@@ -240,8 +303,11 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Opening a view this way clears the agent filter of Review. Only View diff sets it.
     pub(crate) fn set_view(&mut self, view: View, cx: &mut Context<Self>) {
         self.view = view;
+        self.review_agent = None;
+        self.review_file = None;
         cx.notify();
     }
 
@@ -340,7 +406,11 @@ impl Workspace {
     /// panel before the area is measured again.
     pub(crate) fn terminal_area_size(&self) -> Option<Size<Pixels>> {
         let mut size = self.terminal_area?.size;
-        match (self.terminal_area_had_panel, self.visible_panel().is_some()) {
+        // The layout stays what the Terminals view shows, also while the Swarm view hides the panel.
+        match (
+            self.terminal_area_had_panel,
+            self.panel_in(View::Terminals).is_some(),
+        ) {
             (true, false) => size.width += RIGHT_PANEL_WIDTH,
             (false, true) => size.width -= RIGHT_PANEL_WIDTH,
             _ => {}
@@ -349,9 +419,14 @@ impl Workspace {
         Some(size)
     }
 
-    /// The right panel to show. A Start or Plan task has none, but the choice is kept.
+    /// The right panel to show. A Start or Plan task and the Swarm view have none, but the
+    /// choice is kept.
     pub(crate) fn visible_panel(&self) -> Option<RightPanel> {
-        if self.has_no_projects() || self.active_task().is_start {
+        self.panel_in(self.view)
+    }
+
+    fn panel_in(&self, view: View) -> Option<RightPanel> {
+        if self.has_no_projects() || self.active_task().is_start || view == View::Swarm {
             None
         } else {
             self.right_panel
@@ -387,8 +462,14 @@ impl Render for Workspace {
         let (ground, panel, line, fg) = (colors.ground, colors.panel, colors.line, colors.fg);
 
         self.start_orchestrator_if_needed(window, cx);
+        self.sync_swarm_tasks(window.is_window_active(), cx);
         self.apply_pending_focus(window, cx);
         self.ensure_focus_handles(cx);
+
+        if self.view == View::Swarm {
+            self.ensure_swarm_handles(cx);
+        }
+
         self.layout = views::compute_layout(self);
 
         let sidebar = sidebar::render(self, window, cx);
