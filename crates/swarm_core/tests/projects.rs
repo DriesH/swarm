@@ -1279,3 +1279,321 @@ fn a_worker_without_a_base_commit_is_measured_from_the_task_branch() {
         }]
     );
 }
+
+fn with_identity(repo: &Repo) {
+    repo.git(&["config", "user.name", "Dries"]);
+    repo.git(&["config", "user.email", "dries@example.com"]);
+}
+
+fn shared_worker(
+    projects: &Projects,
+    store: &Arc<Mutex<Store>>,
+    task: &TaskInfo,
+    name: &str,
+) -> AgentInfo {
+    projects
+        .create_shared_worker(task, name, |checkout| register_worker(store, checkout))
+        .expect("shared worker")
+        .agent
+}
+
+#[test]
+fn a_shared_worker_works_in_the_task_worktree_without_a_second_setup() {
+    let repo = Repo::new(CONFIG);
+    let (projects, store) = shared_projects();
+    let task = task_with_a_commit(&projects, &repo);
+    let branches_before = repo.branches();
+    let tip = repo.git(&["rev-parse", &task.branch]);
+
+    let shared = projects
+        .create_shared_worker(&task, "API Layer", |checkout| {
+            register_worker(&store, checkout)
+        })
+        .expect("shared worker");
+    let own = projects
+        .create_worker(&task, "ui", |checkout| register_worker(&store, checkout))
+        .expect("own worker");
+
+    assert_eq!(shared.agent.name, "api-layer");
+    assert_eq!(shared.agent.worktree, task.worktree);
+    assert_eq!(shared.agent.branch, task.branch);
+    assert_eq!(shared.setup, None, "the task worktree ran the setup");
+    assert!(
+        own.setup.is_some(),
+        "an own worktree still runs the setup script"
+    );
+    assert_ne!(own.agent.worktree, task.worktree);
+    assert_ne!(own.agent.branch, task.branch);
+    let recorded = store.lock().expect("lock").base_commit(shared.agent.id);
+    assert_eq!(recorded.expect("base").as_deref(), Some(tip.as_str()));
+    let new_branches: Vec<String> = repo
+        .branches()
+        .into_iter()
+        .filter(|branch| !branches_before.contains(branch))
+        .collect();
+    assert_eq!(new_branches, std::slice::from_ref(&own.agent.branch));
+}
+
+#[test]
+fn a_shared_worker_keeps_the_task_ports() {
+    let repo = Repo::new(CONFIG);
+    let (projects, store) = shared_projects();
+    let task = task_with_a_commit(&projects, &repo);
+
+    let worker = shared_worker(&projects, &store, &task, "api");
+
+    let env = projects.agent_env(&worker).expect("env");
+    assert!(env.contains(&("SWARM_PORT".to_owned(), task.ports[0].to_string())));
+}
+
+#[test]
+fn two_shared_workers_cannot_share_a_name() {
+    let repo = Repo::new("");
+    let (projects, store) = shared_projects();
+    let task = task_with_a_commit(&projects, &repo);
+    shared_worker(&projects, &store, &task, "api");
+
+    let result =
+        projects.create_shared_worker(&task, "API", |checkout| register_worker(&store, checkout));
+
+    assert!(matches!(result, Err(Error::Invalid(_))), "{result:?}");
+}
+
+#[test]
+fn discarding_a_shared_worker_keeps_the_task_worktree_and_branch() {
+    let repo = Repo::new("");
+    let (projects, store) = shared_projects();
+    let task = task_with_a_commit(&projects, &repo);
+    let worker = shared_worker(&projects, &store, &task, "api");
+
+    projects.discard_worker(&worker);
+
+    assert!(task.worktree.join("task-file").is_file());
+    assert!(repo.branches().contains(&task.branch));
+    let row = store.lock().expect("lock").agent(worker.id).expect("read");
+    assert!(row.is_none());
+}
+
+#[test]
+fn a_commit_takes_only_the_named_files_with_the_worker_as_author() {
+    let repo = Repo::new("");
+    with_identity(&repo);
+    let (projects, store) = shared_projects();
+    let task = task_with_a_commit(&projects, &repo);
+    let worker = shared_worker(&projects, &store, &task, "api");
+    std::fs::write(task.worktree.join("api.rs"), "fn api() {}\n").expect("file");
+    std::fs::write(task.worktree.join("ui.rs"), "fn ui() {}\n").expect("file");
+    git_in(&task.worktree, &["add", "ui.rs"]);
+
+    let commit = git::commit_paths(
+        &task.worktree,
+        &worker.name,
+        "feat: api",
+        &[PathBuf::from("api.rs")],
+    )
+    .expect("commit");
+
+    let head = git_in(&task.worktree, &["rev-parse", "HEAD"]);
+    assert_eq!(commit, head);
+    let author = git_in(
+        &task.worktree,
+        &[
+            "log",
+            "-1",
+            "--format=%an|%ae|%cn|%(trailers:key=Swarm-Agent,valueonly)",
+        ],
+    );
+    assert_eq!(author, "api (Swarm)|dries@example.com|Dries|api");
+    let files = git_in(
+        &task.worktree,
+        &["show", "--name-only", "--format=", "HEAD"],
+    );
+    assert_eq!(files, "api.rs");
+    let staged = git_in(&task.worktree, &["diff", "--cached", "--name-only"]);
+    assert_eq!(staged, "ui.rs", "another worker's staged file stays staged");
+}
+
+#[test]
+fn a_commit_refuses_paths_that_leave_the_worktree_or_enter_git() {
+    let repo = Repo::new("");
+    with_identity(&repo);
+    let (projects, _store) = shared_projects();
+    let task = task_with_a_commit(&projects, &repo);
+    let outside = Outside::new();
+    std::fs::write(outside.0.join("secret"), "x").expect("file");
+    std::os::unix::fs::symlink(&outside.0, task.worktree.join("link")).expect("symlink");
+
+    let refused = |paths: &[&str]| {
+        let paths: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+
+        git::commit_paths(&task.worktree, "api", "msg", &paths)
+            .expect_err("refused")
+            .to_string()
+    };
+
+    assert!(refused(&[]).contains("name the files"));
+    assert!(refused(&["/etc/passwd"]).contains("relative"));
+    assert!(refused(&[""]).contains("relative"));
+    assert!(refused(&["../outside.txt"]).contains("inside your worktree"));
+    assert!(refused(&["src/../../x"]).contains("inside your worktree"));
+    assert!(refused(&[".git/config"]).contains(".git"));
+    assert!(refused(&["sub/.GIT/hooks/pre-commit"]).contains(".git"));
+    assert!(refused(&["link/secret"]).contains("outside your worktree"));
+    assert_eq!(
+        git_in(&task.worktree, &["log", "--format=%s", "-1"]),
+        "task commit"
+    );
+}
+
+#[test]
+fn a_commit_without_a_message_or_without_changes_says_why() {
+    let repo = Repo::new("");
+    with_identity(&repo);
+    let (projects, _store) = shared_projects();
+    let task = task_with_a_commit(&projects, &repo);
+
+    let empty = git::commit_paths(&task.worktree, "api", "  ", &[PathBuf::from("task-file")])
+        .expect_err("empty message");
+    let unchanged = git::commit_paths(&task.worktree, "api", "msg", &[PathBuf::from("task-file")])
+        .expect_err("nothing to commit");
+    let missing = git::commit_paths(&task.worktree, "api", "msg", &[PathBuf::from("nope.rs")])
+        .expect_err("no such file");
+
+    assert!(empty.to_string().contains("message is empty"));
+    assert!(
+        unchanged.to_string().contains("git commit failed"),
+        "{unchanged}"
+    );
+    assert!(missing.to_string().contains("git add failed"), "{missing}");
+}
+
+#[test]
+fn a_path_that_looks_like_an_option_or_a_pattern_is_a_plain_file() {
+    let repo = Repo::new("");
+    with_identity(&repo);
+    let (projects, _store) = shared_projects();
+    let task = task_with_a_commit(&projects, &repo);
+    std::fs::write(task.worktree.join("-x"), "dash").expect("file");
+    std::fs::write(task.worktree.join("a.rs"), "a").expect("file");
+    std::fs::write(task.worktree.join("b.rs"), "b").expect("file");
+
+    git::commit_paths(&task.worktree, "api", "msg", &[PathBuf::from("-x")]).expect("dash");
+    let globbed = git::commit_paths(&task.worktree, "api", "msg", &[PathBuf::from("*.rs")]);
+
+    assert!(globbed.is_err(), "a glob must not match files");
+    let files = git_in(
+        &task.worktree,
+        &["show", "--name-only", "--format=", "HEAD"],
+    );
+    assert_eq!(files, "-x");
+}
+
+#[test]
+fn commits_at_once_in_one_worktree_all_succeed() {
+    let repo = Repo::new("");
+    with_identity(&repo);
+    let (projects, _store) = shared_projects();
+    let task = task_with_a_commit(&projects, &repo);
+    let names = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"];
+    for name in names {
+        std::fs::write(task.worktree.join(format!("{name}.rs")), name).expect("file");
+    }
+
+    let results: Vec<Result<String, Error>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = names
+            .iter()
+            .map(|name| {
+                let worktree = &task.worktree;
+                scope.spawn(move || {
+                    git::commit_paths(
+                        worktree,
+                        name,
+                        &format!("feat: {name}"),
+                        &[PathBuf::from(format!("{name}.rs"))],
+                    )
+                })
+            })
+            .collect();
+
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("thread"))
+            .collect()
+    });
+
+    for result in &results {
+        assert!(result.is_ok(), "{result:?}");
+    }
+    let subjects = git_in(&task.worktree, &["log", "--format=%s", "-6"]);
+    assert_eq!(subjects.lines().count(), 6);
+    assert!(git_in(&task.worktree, &["status", "--porcelain"]).is_empty());
+}
+
+#[test]
+fn a_shared_worker_is_measured_by_its_own_commits_only() {
+    let repo = Repo::new("");
+    with_identity(&repo);
+    let (projects, store) = shared_projects();
+    let task = task_with_a_commit(&projects, &repo);
+    let api = shared_worker(&projects, &store, &task, "api");
+    let ui = shared_worker(&projects, &store, &task, "ui");
+    std::fs::write(task.worktree.join("api.rs"), "1\n2\n3\n").expect("file");
+    std::fs::write(task.worktree.join("ui.rs"), "1\n").expect("file");
+    std::fs::write(task.worktree.join("loose.rs"), "x\ny\n").expect("file");
+    git::commit_paths(
+        &task.worktree,
+        "api",
+        "feat: api",
+        &[PathBuf::from("api.rs")],
+    )
+    .expect("api");
+    git::commit_paths(&task.worktree, "ui", "feat: ui", &[PathBuf::from("ui.rs")]).expect("ui");
+
+    let changes = projects.agent_changes(&[api.id, ui.id]);
+
+    let change = |agent, path: &str, additions| AgentChange {
+        agent,
+        stat: DiffStat {
+            files: 1,
+            additions,
+            deletions: 0,
+        },
+        files: vec![FileStat {
+            path: PathBuf::from(path),
+            additions,
+            deletions: 0,
+        }],
+    };
+    assert_eq!(
+        changes,
+        vec![change(api.id, "api.rs", 3), change(ui.id, "ui.rs", 1)]
+    );
+}
+
+#[test]
+fn a_commit_made_before_the_worker_started_is_not_counted() {
+    let repo = Repo::new("");
+    with_identity(&repo);
+    let (projects, store) = shared_projects();
+    let task = task_with_a_commit(&projects, &repo);
+    std::fs::write(task.worktree.join("old.rs"), "1\n").expect("file");
+    git::commit_paths(
+        &task.worktree,
+        "api",
+        "feat: old",
+        &[PathBuf::from("old.rs")],
+    )
+    .expect("old");
+    let api = shared_worker(&projects, &store, &task, "api");
+
+    let changes = projects.agent_changes(&[api.id]);
+
+    assert_eq!(
+        changes,
+        vec![AgentChange {
+            agent: api.id,
+            stat: DiffStat::default(),
+            files: Vec::new(),
+        }]
+    );
+}
