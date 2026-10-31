@@ -706,6 +706,8 @@ mod tests {
             message: None,
             lifecycle,
             revision: 1,
+            created_at: 0,
+            ended_at: None,
         };
 
         TaskInfo {

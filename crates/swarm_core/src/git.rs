@@ -1,10 +1,13 @@
 //! Runs the `git` binary. User text only ever travels as an argument, never through a shell.
 
+use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
+
+use swarm_protocol::DiffStat;
 
 use crate::Error;
 
@@ -41,6 +44,8 @@ struct Output {
     success: bool,
     code: Option<i32>,
     stdout: String,
+    /// Untouched, for NUL-separated output.
+    raw: Vec<u8>,
     stderr: String,
 }
 
@@ -70,6 +75,7 @@ where
         success: output.status.success(),
         code: output.status.code(),
         stdout: String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+        raw: output.stdout,
         stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
     };
 
@@ -102,6 +108,101 @@ where
     }
 
     Ok(output.stdout)
+}
+
+/// Larger untracked files count as one file with no lines.
+const MAX_COUNTED_BYTES: u64 = 1 << 20;
+
+/// Git treats a file as binary when a NUL shows up in its first 8000 bytes.
+const BINARY_SNIFF: usize = 8000;
+
+/// The commit `revision` points at.
+pub fn commit_of(root: &Path, revision: &str) -> Result<String, Error> {
+    let target = format!("{revision}^{{commit}}");
+
+    run(root, ["rev-parse", "--verify", "--end-of-options", &target])
+}
+
+/// The commit where `HEAD` and `revision` split.
+pub fn merge_base(worktree: &Path, revision: &str) -> Result<String, Error> {
+    run(worktree, ["merge-base", "HEAD", revision])
+}
+
+/// What the working tree of `worktree` changed since `base`: committed and uncommitted
+/// work, plus untracked files. A binary or huge untracked file counts as a file with no
+/// lines.
+pub fn diff_stat(worktree: &Path, base: &str) -> Result<DiffStat, Error> {
+    let (arguments, output) = execute(
+        worktree,
+        ["diff", "--numstat", "-z", "--no-renames", base, "--"],
+    )?;
+    if !output.success {
+        return Err(failure(&arguments, &output));
+    }
+
+    let mut files: HashSet<String> = HashSet::new();
+    let (mut additions, mut deletions) = (0_u32, 0_u32);
+
+    for entry in output
+        .raw
+        .split(|byte| *byte == 0)
+        .filter(|e| !e.is_empty())
+    {
+        let entry = String::from_utf8_lossy(entry);
+        let mut parts = entry.splitn(3, '\t');
+        let (Some(added), Some(removed), Some(path)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+
+        additions = additions.saturating_add(added.parse().unwrap_or(0));
+        deletions = deletions.saturating_add(removed.parse().unwrap_or(0));
+        files.insert(path.to_owned());
+    }
+
+    let (arguments, output) = execute(
+        worktree,
+        ["ls-files", "--others", "--exclude-standard", "-z"],
+    )?;
+    if !output.success {
+        return Err(failure(&arguments, &output));
+    }
+
+    for path in output
+        .raw
+        .split(|byte| *byte == 0)
+        .filter(|e| !e.is_empty())
+    {
+        let path = String::from_utf8_lossy(path).into_owned();
+        additions = additions.saturating_add(count_lines(&worktree.join(&path)));
+        files.insert(path);
+    }
+
+    Ok(DiffStat {
+        files: u32::try_from(files.len()).unwrap_or(u32::MAX),
+        additions,
+        deletions,
+    })
+}
+
+/// Lines in a text file; 0 for a binary, a huge or an unreadable one.
+fn count_lines(path: &Path) -> u32 {
+    let small = std::fs::metadata(path).is_ok_and(|meta| meta.len() <= MAX_COUNTED_BYTES);
+    if !small {
+        return 0;
+    }
+
+    let Ok(bytes) = std::fs::read(path) else {
+        return 0;
+    };
+    if bytes[..bytes.len().min(BINARY_SNIFF)].contains(&0) {
+        return 0;
+    }
+
+    let newlines = bytes.split(|byte| *byte == b'\n').count() - 1;
+    let unterminated = bytes.last().is_some_and(|byte| *byte != b'\n');
+
+    u32::try_from(newlines + usize::from(unterminated)).unwrap_or(u32::MAX)
 }
 
 /// The top folder of the repository that contains `path`.

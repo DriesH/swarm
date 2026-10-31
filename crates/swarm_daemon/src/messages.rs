@@ -38,8 +38,16 @@ impl Claim {
     pub(crate) fn commit(self) {
         let ids = self.ids();
 
-        if let Err(error) = lock(&self.owner.store).mark_delivered(&ids) {
-            log::error!("cannot mark messages as delivered: {error}");
+        let delivery = lock(&self.owner.store).mark_delivered(&ids);
+        match delivery {
+            Ok(delivery) if !delivery.ids.is_empty() => {
+                self.owner.clients.broadcast(&Event::MessagesDelivered {
+                    ids: delivery.ids,
+                    delivered_at: delivery.delivered_at,
+                });
+            }
+            Ok(_) => {}
+            Err(error) => log::error!("cannot mark messages as delivered: {error}"),
         }
     }
 

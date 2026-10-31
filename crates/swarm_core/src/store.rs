@@ -116,6 +116,9 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE terminals ADD COLUMN name TEXT;
     ALTER TABLE terminals ADD COLUMN fixed_cols INTEGER;
     ALTER TABLE terminals ADD COLUMN fixed_rows INTEGER",
+    "ALTER TABLE agents ADD COLUMN ended_at INTEGER;
+    ALTER TABLE agents ADD COLUMN base_commit TEXT;
+    UPDATE agents SET created_at = created_at * 1000",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,6 +207,14 @@ pub struct NewMessage<'a> {
     pub text: &'a str,
     /// The recipient got it another way, for example as its first message.
     pub delivered: bool,
+}
+
+/// Messages that just counted as delivered, with the time they did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Delivery {
+    pub ids: Vec<MessageId>,
+    /// Milliseconds since the Unix epoch.
+    pub delivered_at: u64,
 }
 
 /// An agent row with the session that [`AgentInfo`] does not carry.
@@ -574,6 +585,7 @@ impl Store {
         let lifecycle = AgentLifecycle::Starting;
 
         let task = agent.task.map(|task| to_row(task.0)).transpose()?;
+        let created_at = now_millis();
 
         self.connection.execute(
             "INSERT INTO agents (project, task, role, kind, model, session_id, status, lifecycle,
@@ -588,7 +600,7 @@ impl Store {
                 agent.session_id,
                 to_json(&status)?,
                 to_json(&lifecycle)?,
-                now_seconds(),
+                created_at,
                 agent.name,
                 agent.worktree.to_string_lossy(),
                 agent.branch,
@@ -611,7 +623,32 @@ impl Store {
             message: None,
             lifecycle,
             revision: 0,
+            created_at: from_row(created_at)?,
+            ended_at: None,
         })
+    }
+
+    /// The commit a worker branched from, to measure its changes against.
+    pub fn base_commit(&self, id: AgentId) -> Result<Option<String>, Error> {
+        let commit: Option<Option<String>> = self
+            .connection
+            .query_row(
+                "SELECT base_commit FROM agents WHERE id = ?1",
+                params![to_row(id.0)?],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        Ok(commit.flatten())
+    }
+
+    pub fn set_base_commit(&self, id: AgentId, commit: &str) -> Result<(), Error> {
+        self.connection.execute(
+            "UPDATE agents SET base_commit = ?1 WHERE id = ?2",
+            params![commit, to_row(id.0)?],
+        )?;
+
+        Ok(())
     }
 
     pub fn agent(&self, id: AgentId) -> Result<Option<StoredAgent>, Error> {
@@ -679,8 +716,8 @@ impl Store {
             .collect()
     }
 
-    /// Saves what changes while an agent runs: terminal, status, message, lifecycle and
-    /// revision. The caller raises the revision first.
+    /// Saves what changes while an agent runs: terminal, status, message, lifecycle,
+    /// end time and revision. The caller raises the revision first.
     pub fn save_agent(&self, agent: &AgentInfo) -> Result<(), Error> {
         let terminal = agent
             .terminal
@@ -689,14 +726,15 @@ impl Store {
 
         self.connection.execute(
             "UPDATE agents SET terminal = ?1, status = ?2, message = ?3, lifecycle = ?4,
-                 revision = ?5
-             WHERE id = ?6",
+                 revision = ?5, ended_at = ?6
+             WHERE id = ?7",
             params![
                 terminal,
                 to_json(&agent.status)?,
                 agent.message,
                 to_json(&agent.lifecycle)?,
                 to_row(agent.revision)?,
+                agent.ended_at.map(to_row).transpose()?,
                 to_row(agent.id.0)?
             ],
         )?;
@@ -751,6 +789,7 @@ impl Store {
                 agent.info.message = None;
             }
             agent.info.revision += 1;
+            agent.info.ended_at = Some(from_row(now_millis())?);
 
             self.save_agent(&agent.info)?;
         }
@@ -790,7 +829,51 @@ impl Store {
             kind: message.kind,
             text: message.text.to_owned(),
             sent_at: from_row(sent_at)?,
+            delivered_at: delivered_at.map(from_row).transpose()?,
         })
+    }
+
+    /// The newest `limit` messages of a task, or of the project's Start orchestrator
+    /// when `task` is `None`. Oldest first.
+    pub fn list_messages(
+        &self,
+        project: ProjectId,
+        task: Option<TaskId>,
+        limit: usize,
+    ) -> Result<Vec<MessageInfo>, Error> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, project, task, from_agent, to_agent, kind, text, sent_at, delivered_at
+             FROM messages WHERE project = ?1 AND task IS ?2
+             ORDER BY id DESC LIMIT ?3",
+        )?;
+        let task = task.map(|task| to_row(task.0)).transpose()?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = statement.query_map(params![to_row(project.0)?, task, limit], |row| {
+            let id: i64 = row.get(0)?;
+            let project: i64 = row.get(1)?;
+            let task: Option<i64> = row.get(2)?;
+            let from: Option<i64> = row.get(3)?;
+            let to: i64 = row.get(4)?;
+            let sent_at: i64 = row.get(7)?;
+            let delivered_at: Option<i64> = row.get(8)?;
+
+            Ok(MessageInfo {
+                id: MessageId(id.unsigned_abs()),
+                project: ProjectId(project.unsigned_abs()),
+                task: task.map(|task| TaskId(task.unsigned_abs())),
+                from: from.map(|agent| AgentId(agent.unsigned_abs())),
+                to: AgentId(to.unsigned_abs()),
+                kind: json_column(row, 5)?,
+                text: row.get(6)?,
+                sent_at: sent_at.unsigned_abs(),
+                delivered_at: delivered_at.map(i64::unsigned_abs),
+            })
+        })?;
+
+        let mut messages: Vec<MessageInfo> = rows.collect::<rusqlite::Result<_>>()?;
+        messages.reverse();
+
+        Ok(messages)
     }
 
     pub fn has_unread(&self, agent: AgentId) -> Result<bool, Error> {
@@ -829,27 +912,35 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Marks messages as delivered.
-    pub fn mark_delivered(&self, messages: &[MessageId]) -> Result<(), Error> {
+    /// Marks messages as delivered, all with one time. Messages that already count as
+    /// delivered stay as they are and are left out of the result.
+    pub fn mark_delivered(&self, messages: &[MessageId]) -> Result<Delivery, Error> {
         let now = now_millis();
+        let mut ids = Vec::new();
 
         for message in messages {
-            self.connection.execute(
+            let changed = self.connection.execute(
                 "UPDATE messages SET delivered_at = ?1 WHERE id = ?2 AND delivered_at IS NULL",
                 params![now, to_row(message.0)?],
             )?;
+            if changed > 0 {
+                ids.push(*message);
+            }
         }
 
-        Ok(())
+        Ok(Delivery {
+            ids,
+            delivered_at: from_row(now)?,
+        })
     }
 
     /// Takes the agent's unread messages, oldest first, and marks them delivered.
-    pub fn take_unread(&self, agent: AgentId) -> Result<Vec<InboxMessage>, Error> {
+    pub fn take_unread(&self, agent: AgentId) -> Result<(Vec<InboxMessage>, Delivery), Error> {
         let messages = self.unread(agent)?;
         let ids: Vec<MessageId> = messages.iter().map(|message| message.id).collect();
-        self.mark_delivered(&ids)?;
+        let delivery = self.mark_delivered(&ids)?;
 
-        Ok(messages)
+        Ok((messages, delivery))
     }
 
     pub fn set_setup_terminal(
@@ -906,7 +997,8 @@ impl Store {
 }
 
 const AGENT_COLUMNS: &str = "SELECT id, project, task, role, kind, model, session_id, terminal,
-    status, message, lifecycle, revision, session_confirmed, name, worktree, branch FROM agents";
+    status, message, lifecycle, revision, session_confirmed, name, worktree, branch,
+    created_at, ended_at FROM agents";
 
 fn agent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAgent> {
     let id: i64 = row.get(0)?;
@@ -915,6 +1007,8 @@ fn agent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAgent> {
     let terminal: Option<i64> = row.get(7)?;
     let revision: i64 = row.get(11)?;
     let worktree: String = row.get(14)?;
+    let created_at: i64 = row.get(16)?;
+    let ended_at: Option<i64> = row.get(17)?;
 
     Ok(StoredAgent {
         info: AgentInfo {
@@ -932,6 +1026,8 @@ fn agent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAgent> {
             message: row.get(9)?,
             lifecycle: json_column(row, 10)?,
             revision: revision.unsigned_abs(),
+            created_at: created_at.unsigned_abs(),
+            ended_at: ended_at.map(i64::unsigned_abs),
         },
         session_id: row.get(6)?,
         session_confirmed: row.get(12)?,
@@ -1025,6 +1121,11 @@ fn command_label(json: &str) -> String {
         Ok(Some(command)) => command.join(" "),
         _ => "login shell".to_owned(),
     }
+}
+
+/// Milliseconds since the Unix epoch.
+pub fn unix_millis() -> u64 {
+    u64::try_from(now_millis()).unwrap_or(0)
 }
 
 fn now_millis() -> i64 {
@@ -1784,17 +1885,18 @@ mod tests {
             .expect("other");
         assert!(store.has_unread(sender.id).expect("unread"));
 
-        let taken = store.take_unread(sender.id).expect("take");
+        let (taken, delivery) = store.take_unread(sender.id).expect("take");
 
         assert_eq!(taken.len(), 2);
+        assert_eq!(delivery.ids.len(), 2);
         assert_eq!(taken[0].text, "first");
         assert_eq!(taken[0].from_name, "api");
         assert_eq!(taken[0].from, Some(worker.id));
         assert_eq!(taken[1].from_name, "swarm");
         assert_eq!(taken[1].from, None);
-        assert!(store.take_unread(sender.id).expect("again").is_empty());
+        assert!(store.take_unread(sender.id).expect("again").0.is_empty());
         assert!(!store.has_unread(sender.id).expect("unread"));
-        assert_eq!(store.take_unread(worker.id).expect("other").len(), 1);
+        assert_eq!(store.take_unread(worker.id).expect("other").0.len(), 1);
     }
 
     #[test]
@@ -1822,6 +1924,185 @@ mod tests {
 
         store.add_message(&brief).expect("brief");
 
-        assert!(store.take_unread(agent.id).expect("take").is_empty());
+        assert!(store.take_unread(agent.id).expect("take").0.is_empty());
+    }
+
+    #[test]
+    fn the_end_migration_turns_agent_seconds_into_milliseconds() {
+        let connection = Connection::open_in_memory().expect("memory");
+        for migration in &MIGRATIONS[..MIGRATIONS.len() - 1] {
+            connection.execute_batch(migration).expect("schema");
+        }
+        connection
+            .execute(
+                "INSERT INTO projects (path, name, added_at) VALUES ('/p', 'p', 1)",
+                [],
+            )
+            .expect("project");
+        connection
+            .execute(
+                "INSERT INTO tasks (project, name, branch, base, worktree, ports, created_at)
+                 VALUES (1, 't', 'b', 'main', '/w', '', 1)",
+                [],
+            )
+            .expect("task");
+        connection
+            .execute(
+                "INSERT INTO agents (project, role, kind, model, status, lifecycle, created_at,
+                     name, worktree, branch, task)
+                 VALUES (1, '\"Worker\"', '\"ClaudeCode\"', 'm', '\"Unknown\"', '\"Stopped\"',
+                     1700000000, 'w', '/w', 'b', 1)",
+                [],
+            )
+            .expect("agent");
+        connection
+            .pragma_update(
+                None,
+                "user_version",
+                i64::try_from(MIGRATIONS.len() - 1).expect("count"),
+            )
+            .expect("version");
+
+        let store = Store::migrated(connection).expect("migrate");
+        let agent = store.agent(AgentId(1)).expect("query").expect("agent");
+
+        assert_eq!(agent.info.created_at, 1_700_000_000_000);
+        assert_eq!(agent.info.ended_at, None);
+        assert_eq!(store.base_commit(AgentId(1)).expect("base"), None);
+    }
+
+    #[test]
+    fn a_new_agent_has_a_creation_time_in_milliseconds() {
+        let (store, task) = store_with_task();
+        let before = unix_millis();
+
+        let agent = store.add_agent(&new_agent(task)).expect("agent");
+        let stored = store.agent(agent.id).expect("query").expect("agent");
+
+        assert!(agent.created_at >= before);
+        assert_eq!(stored.info.created_at, agent.created_at);
+        assert_eq!(stored.info.ended_at, None);
+    }
+
+    #[test]
+    fn the_end_time_is_saved_and_cleared() {
+        let (store, task) = store_with_task();
+        let mut agent = store.add_agent(&new_agent(task)).expect("agent");
+
+        agent.lifecycle = AgentLifecycle::Resumable;
+        agent.ended_at = Some(1234);
+        store.save_agent(&agent).expect("save");
+        let ended = store.agent(agent.id).expect("query").expect("agent");
+
+        agent.lifecycle = AgentLifecycle::Running;
+        agent.ended_at = None;
+        store.save_agent(&agent).expect("save");
+        let again = store.agent(agent.id).expect("query").expect("agent");
+
+        assert_eq!(ended.info.ended_at, Some(1234));
+        assert_eq!(again.info.ended_at, None);
+    }
+
+    #[test]
+    fn recovery_sets_the_end_time() {
+        let (store, task) = store_with_task();
+        let agent = running_agent(&store, &new_agent(task));
+
+        store.recover_agents().expect("recover");
+        let stored = store.agent(agent.id).expect("query").expect("agent");
+
+        assert!(stored.info.ended_at.is_some());
+    }
+
+    #[test]
+    fn the_base_commit_is_kept() {
+        let (store, task) = store_with_task();
+        let agent = store.add_agent(&new_agent(task)).expect("agent");
+
+        store.set_base_commit(agent.id, "abc123").expect("set");
+
+        assert_eq!(
+            store.base_commit(agent.id).expect("base").as_deref(),
+            Some("abc123")
+        );
+    }
+
+    #[test]
+    fn delivery_time_is_read_back_and_shared_by_a_batch() {
+        let (store, task) = store_with_task();
+        let agent = store.add_agent(&new_agent(task)).expect("agent");
+        let first = store
+            .add_message(&message(None, agent.id, "one"))
+            .expect("one");
+        let second = store
+            .add_message(&message(None, agent.id, "two"))
+            .expect("two");
+        assert_eq!(first.delivered_at, None);
+
+        let delivery = store.mark_delivered(&[first.id, second.id]).expect("mark");
+        let again = store.mark_delivered(&[first.id]).expect("again");
+        let listed = store
+            .list_messages(first.project, first.task, 10)
+            .expect("list");
+
+        assert_eq!(delivery.ids, vec![first.id, second.id]);
+        assert!(again.ids.is_empty());
+        assert_eq!(listed[0].delivered_at, Some(delivery.delivered_at));
+        assert_eq!(listed[1].delivered_at, Some(delivery.delivered_at));
+    }
+
+    #[test]
+    fn a_message_delivered_on_arrival_carries_its_delivery_time() {
+        let (store, task) = store_with_task();
+        let agent = store.add_agent(&new_agent(task)).expect("agent");
+        let mut brief = message(None, agent.id, "brief");
+        brief.delivered = true;
+
+        let info = store.add_message(&brief).expect("brief");
+
+        assert_eq!(info.delivered_at, Some(info.sent_at));
+    }
+
+    #[test]
+    fn listed_messages_are_the_newest_ones_oldest_first() {
+        let (store, task) = store_with_task();
+        let agent = store.add_agent(&new_agent(task)).expect("agent");
+        for number in 0..5 {
+            store
+                .add_message(&message(None, agent.id, &format!("m{number}")))
+                .expect("message");
+        }
+
+        let listed = store
+            .list_messages(agent.project, Some(task), 3)
+            .expect("list");
+        let texts: Vec<&str> = listed.iter().map(|message| message.text.as_str()).collect();
+
+        assert_eq!(texts, ["m2", "m3", "m4"]);
+    }
+
+    #[test]
+    fn messages_without_a_task_belong_to_the_start_orchestrator() {
+        let (store, task) = store_with_task();
+        let agent = store.add_agent(&new_agent(task)).expect("agent");
+        let project = agent.project;
+        let mut start = message(None, agent.id, "for start");
+        start.task = None;
+        store.add_message(&start).expect("start");
+        store
+            .add_message(&message(None, agent.id, "for task"))
+            .expect("task");
+
+        let start_messages = store.list_messages(project, None, 10).expect("start");
+        let task_messages = store.list_messages(project, Some(task), 10).expect("task");
+        let other = store
+            .list_messages(ProjectId(project.0 + 1), None, 10)
+            .expect("other");
+
+        assert_eq!(start_messages.len(), 1);
+        assert_eq!(start_messages[0].text, "for start");
+        assert_eq!(task_messages.len(), 1);
+        assert_eq!(task_messages[0].text, "for task");
+        assert!(other.is_empty());
     }
 }

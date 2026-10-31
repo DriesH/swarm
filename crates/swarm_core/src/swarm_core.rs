@@ -15,7 +15,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use swarm_protocol::{
-    AgentId, AgentInfo, AgentRole, CreateTask, ProjectId, ProjectInfo, TaskId, TaskInfo, TerminalId,
+    AgentId, AgentInfo, AgentRole, CreateTask, DiffStat, ProjectId, ProjectInfo, TaskId, TaskInfo,
+    TerminalId,
 };
 use swarm_term::ExitStatus;
 
@@ -337,6 +338,7 @@ impl Projects {
             )));
         }
         git::verify_start_point(&root, &task.branch)?;
+        let base_commit = git::commit_of(&root, &task.branch)?;
 
         let ports = self.reserve_ports(&config)?;
 
@@ -361,11 +363,70 @@ impl Projects {
             }
         };
 
+        if let Err(error) = lock(&self.store).set_base_commit(agent.id, &base_commit) {
+            log::warn!(
+                "cannot record where worker {} branched: {error}",
+                agent.id.0
+            );
+        }
+
         let setup =
             (!config.worktrees.setup.trim().is_empty()).then(|| config.worktrees.setup.clone());
         let env = ports_env(task.id, &checkout.ports);
 
         Ok(PreparedWorker { agent, setup, env })
+    }
+
+    /// What each agent changed in its worktree since it branched off. An agent whose
+    /// changes cannot be read is left out: a Start orchestrator, an unknown agent, a
+    /// missing worktree or a git failure.
+    pub fn agent_changes(&self, agents: &[AgentId]) -> Vec<(AgentId, DiffStat)> {
+        agents
+            .iter()
+            .filter_map(|id| match self.agent_change(*id) {
+                Ok(stat) => stat.map(|stat| (*id, stat)),
+                Err(error) => {
+                    log::debug!("cannot read the changes of agent {}: {error}", id.0);
+
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn agent_change(&self, id: AgentId) -> Result<Option<DiffStat>, Error> {
+        // The store lock is gone before git runs.
+        let (agent, worker_base, task_base) = {
+            let store = lock(&self.store);
+            let Some(agent) = store.agent(id)?.map(|stored| stored.info) else {
+                return Ok(None);
+            };
+            let worker_base = store.base_commit(id)?;
+            let task_base = match agent.task {
+                Some(task) => store.task(task)?.map(|task| task.base),
+                None => None,
+            };
+
+            (agent, worker_base, task_base)
+        };
+
+        if !agent.worktree.is_dir() {
+            return Ok(None);
+        }
+
+        let base = match agent.role {
+            AgentRole::Worker => worker_base,
+            AgentRole::Orchestrator => match task_base {
+                Some(base) => Some(git::merge_base(&agent.worktree, &base)?),
+                None => None,
+            },
+            AgentRole::StartOrchestrator => None,
+        };
+        let Some(base) = base else {
+            return Ok(None);
+        };
+
+        git::diff_stat(&agent.worktree, &base).map(Some)
     }
 
     /// Ports no task of any project uses, so two projects never share a port.
