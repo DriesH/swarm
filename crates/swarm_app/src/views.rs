@@ -173,12 +173,13 @@ fn tile_kind(kind: TerminalKind) -> TileKind {
 fn tile_spec(workspace: &Workspace, terminal: &Terminal, activity: Activity) -> TileSpec {
     let mut spec = TileSpec::new(TileId(terminal.id.0), tile_kind(terminal.kind), activity);
     spec.minimized = workspace.minimized.contains(&terminal.id);
-    spec.requested = match terminal.fixed_size {
-        Some((columns, rows)) => Some(fixed_size(workspace.cell_size, columns, rows)),
-        None => terminal
-            .requested_size
-            .map(|(columns, rows)| process_size(columns, rows)),
-    };
+    spec.requested = terminal
+        .requested_size
+        .map(|(columns, rows)| process_size(columns, rows));
+
+    if let Some((columns, rows)) = terminal.fixed_size {
+        spec.fixed = Some(fixed_size(workspace.cell_size, columns, rows));
+    }
 
     if terminal.kind == TerminalKind::User {
         spec.fixed = workspace

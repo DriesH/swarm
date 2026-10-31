@@ -102,9 +102,11 @@ pub struct TileSpec {
     pub id: TileId,
     pub kind: TileKind,
     pub activity: Activity,
-    /// A process terminal's requested size. Only the height is used.
+    /// A process terminal's requested height. Only the height is used.
     pub requested: Option<Size>,
-    /// The size of a user terminal the user resized. The layout never changes it.
+    /// The size a user terminal has after the user resized it, or a process
+    /// terminal has after its agent fixed it. A user terminal keeps it. A
+    /// process terminal gets the closest size that fits.
     pub fixed: Option<Size>,
     /// The user pinned the tile: keep it on screen if at all possible.
     pub pinned: bool,
@@ -182,16 +184,18 @@ pub fn layout(area: Rect, tiles: &[TileSpec], style: &LayoutStyle) -> Layout {
         .iter()
         .copied()
         .find(|&index| tiles[index].kind == TileKind::Orchestrator);
-    let (island_indices, flow_indices): (Vec<usize>, Vec<usize>) = visible
+    let (mut island_indices, flow_indices): (Vec<usize>, Vec<usize>) = visible
         .iter()
         .copied()
         .filter(|&index| Some(index) != orchestrator)
         .partition(|&index| is_island(&tiles[index]));
 
+    island_indices.sort_by_key(|&index| (Rank::of(&tiles[index]), index));
+
     let column_reserve = orchestrator
         .filter(|_| fits(metrics.min_orchestrator, content.size))
         .map(|_| metrics.min_orchestrator.width + metrics.gap);
-    let islands = Islands::place(content, tiles, &island_indices, column_reserve, metrics.gap);
+    let islands = Islands::place(content, tiles, &island_indices, column_reserve, &metrics);
     for &(index, rect) in &islands.rects {
         rects[index] = Some(rect);
     }
@@ -284,7 +288,15 @@ impl Metrics {
 }
 
 fn is_island(tile: &TileSpec) -> bool {
-    tile.kind == TileKind::User && tile.fixed.is_some()
+    matches!(tile.kind, TileKind::User | TileKind::Process) && tile.fixed.is_some()
+}
+
+/// `wanted`, raised to `min` and then cut down to `space`.
+fn clamp_size(wanted: Size, min: Size, space: Size) -> Size {
+    Size::new(
+        wanted.width.max(min.width).min(space.width),
+        wanted.height.max(min.height).min(space.height),
+    )
 }
 
 fn fits(size: Size, space: Size) -> bool {
@@ -309,7 +321,8 @@ fn flow_band(tiles: &[TileSpec], flow: &[usize]) -> Vec<usize> {
     band
 }
 
-/// User terminals at their fixed size, packed in rows from the top right.
+/// Fixed-size terminals, packed in rows from the top right. User terminals keep
+/// their size; process terminals shrink or grow to the closest size that fits.
 struct Islands {
     rects: Vec<(usize, Rect)>,
     content: Rect,
@@ -322,14 +335,20 @@ impl Islands {
         tiles: &[TileSpec],
         indices: &[usize],
         column_reserve: Option<f32>,
-        gap: f32,
+        metrics: &Metrics,
     ) -> Self {
-        let full = Self::pack(content, tiles, indices, content.size.width, gap);
+        let full = Self::pack(content, tiles, indices, content.size.width, metrics);
         let Some(reserve) = column_reserve else {
             return full;
         };
 
-        let narrow = Self::pack(content, tiles, indices, content.size.width - reserve, gap);
+        let narrow = Self::pack(
+            content,
+            tiles,
+            indices,
+            content.size.width - reserve,
+            metrics,
+        );
         if narrow.rects.len() >= full.rects.len() {
             narrow
         } else {
@@ -337,7 +356,15 @@ impl Islands {
         }
     }
 
-    fn pack(content: Rect, tiles: &[TileSpec], indices: &[usize], width: f32, gap: f32) -> Self {
+    fn pack(
+        content: Rect,
+        tiles: &[TileSpec],
+        indices: &[usize],
+        width: f32,
+        metrics: &Metrics,
+    ) -> Self {
+        let gap = metrics.gap;
+        let space = Size::new(width.max(0.0), content.size.height);
         let left_limit = content.right() - width;
         let fits_at = |size: Size, top: f32, right: f32| {
             right - size.width >= left_limit - EPSILON
@@ -351,12 +378,18 @@ impl Islands {
         let mut cursor = content.right();
 
         for &index in indices {
-            let Some(size) = tiles[index].fixed else {
+            let Some(wanted) = tiles[index].fixed else {
                 continue;
             };
-            if !(size.width > 0.0 && size.height > 0.0) {
+            if !(wanted.width > 0.0 && wanted.height > 0.0) {
                 continue;
             }
+
+            let size = if tiles[index].kind == TileKind::Process {
+                clamp_size(wanted, metrics.min_tile, space)
+            } else {
+                wanted
+            };
 
             if !fits_at(size, row_top, cursor) {
                 let next_top = row_top + row_height + gap;

@@ -32,7 +32,7 @@ let result = layout(Rect::new(0.0, 0.0, 1030.0, 790.0), &tiles, &LayoutStyle::de
 
 Tiles with the same priority keep their input order. A minimized tile always goes to the tray.
 
-**User terminals.** A user terminal with a fixed size is an island. The layout never resizes it. Islands go at the top right, side by side from right to left. When a row is full, the next island starts a new row below. An island goes to the tray only when it does not fit in the area. A user terminal without a fixed size is placed like any other tile, with the highest priority.
+**User terminals.** A user terminal with a fixed size is an island. The layout never resizes it. Islands go at the top right, side by side from right to left. When a row is full, the next island starts a new row below. An island goes to the tray only when it does not fit in the area. A process terminal whose agent fixed its size is an island too, but the layout grants it the closest size that fits: its size, at least `min_tile`, at most the free area (beside the orchestrator column when there is one). User islands are placed first, then process islands by priority. A user terminal without a fixed size is placed like any other tile, with the highest priority.
 
 **Orchestrator.** The orchestrator gets a full-height column on the left, `orchestrator_width` wide (400 px). Before any other tile goes to the tray, the column gets narrower, down to `min_orchestrator.width` (320 px). It gets only as narrow as it needs to. When no other tile is on screen, the column fills all the width left of the islands. The orchestrator goes to the tray only when the area is smaller than `min_orchestrator`.
 

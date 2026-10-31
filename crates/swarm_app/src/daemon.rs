@@ -492,7 +492,7 @@ impl Workspace {
     }
 
     /// Asks the daemon for the project's Start orchestrator once, when its Start tab
-    /// shows and none runs. The default kind comes from the settings.
+    /// shows and none runs. The daemon picks the kind from the settings.
     pub(crate) fn start_orchestrator_if_needed(
         &mut self,
         window: &mut Window,
@@ -517,9 +517,8 @@ impl Workspace {
 
         self.start_requested.insert(project);
 
-        let kind = swarm_protocol::AgentKind::from(self.default_orchestrator());
-        let starting = cx
-            .background_spawn(async move { client.start_orchestrator(daemon_project, Some(kind)) });
+        let starting =
+            cx.background_spawn(async move { client.start_orchestrator(daemon_project, None) });
 
         cx.spawn_in(window, async move |this, cx| {
             let result = starting.await;
@@ -1677,6 +1676,7 @@ mod tests {
     #[gpui::test]
     fn a_listed_user_terminal_of_a_known_task_gets_a_tile(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
+        cx.executor().allow_parking();
         let client = Client::connect(&fake_daemon()).expect("connect to the fake daemon");
         let listed = [
             info(1, DaemonKind::User, "swarm/terminal-renderer"),
@@ -1709,6 +1709,7 @@ mod tests {
     #[gpui::test]
     fn closing_a_live_tile_removes_it(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
+        cx.executor().allow_parking();
         let client = Client::connect(&fake_daemon()).expect("connect to the fake daemon");
         let listed = [info(1, DaemonKind::User, "swarm/terminal-renderer")];
         workspace.update_in(cx, |workspace, window, cx| {
@@ -1732,6 +1733,7 @@ mod tests {
     #[gpui::test]
     fn a_disconnected_event_marks_the_tile(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
+        cx.executor().allow_parking();
         let client = Client::connect(&fake_daemon()).expect("connect to the fake daemon");
         let listed = [info(1, DaemonKind::User, "swarm/terminal-renderer")];
         workspace.update_in(cx, |workspace, window, cx| {
@@ -1760,6 +1762,7 @@ mod tests {
     fn a_lost_daemon_stops_new_terminals_from_falling_back_to_fake(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
         let (socket, leave) = fake_daemon_that_leaves();
+        cx.executor().allow_parking();
         let client = Client::connect(&socket).expect("connect");
         leave.send(()).expect("the fake daemon is waiting");
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -1785,6 +1788,7 @@ mod tests {
     #[gpui::test]
     fn a_tile_whose_terminal_is_gone_is_removed_on_sync(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
+        cx.executor().allow_parking();
         let client = Client::connect(&fake_daemon()).expect("connect to the fake daemon");
         let listed = [info(1, DaemonKind::User, "swarm/terminal-renderer")];
         workspace.update_in(cx, |workspace, window, cx| {
@@ -1803,6 +1807,7 @@ mod tests {
     #[gpui::test]
     fn a_surviving_tile_is_reattached_on_sync(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
+        cx.executor().allow_parking();
         let client = Client::connect(&fake_daemon()).expect("connect to the fake daemon");
         let listed = [info(1, DaemonKind::User, "swarm/terminal-renderer")];
         workspace.update_in(cx, |workspace, window, cx| {
@@ -1875,6 +1880,7 @@ mod tests {
     #[gpui::test]
     fn a_real_task_gets_tiles_for_its_process_and_user_terminals(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
+        cx.executor().allow_parking();
         let client = Client::connect(&fake_daemon()).expect("connect to the fake daemon");
         use_projects(
             &workspace,
@@ -1913,6 +1919,7 @@ mod tests {
     #[gpui::test]
     fn a_created_task_adds_and_selects_a_tab(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
+        cx.executor().allow_parking();
         let client = Client::connect(&fake_daemon()).expect("connect to the fake daemon");
         use_projects(&workspace, &[project_info(5, "demo", Vec::new())], cx);
         workspace.update_in(cx, |workspace, window, cx| {
@@ -1965,6 +1972,7 @@ mod tests {
         cx: &'a mut TestAppContext,
     ) -> (Entity<Workspace>, &'a mut VisualTestContext, Client) {
         let (workspace, cx) = setup(cx);
+        cx.executor().allow_parking();
         let client = Client::connect(socket).expect("connect to the fake daemon");
         use_projects(
             &workspace,
@@ -2188,6 +2196,7 @@ mod tests {
         });
         let (workspace, cx, _client) = {
             let (workspace, cx) = setup(cx);
+            cx.executor().allow_parking();
             let client = Client::connect(&socket).expect("connect to the fake daemon");
             use_projects(&workspace, &[project_info(5, "demo", Vec::new())], cx);
             workspace.update_in(cx, |workspace, window, cx| {
@@ -2241,6 +2250,7 @@ mod tests {
             }),
             _ => None,
         });
+        cx.executor().allow_parking();
         let client = Client::connect(&socket).expect("connect to the fake daemon");
         use_projects(&workspace, &[project_info(5, "demo", Vec::new())], cx);
         workspace.update_in(cx, |workspace, window, cx| {
@@ -2279,6 +2289,7 @@ mod tests {
             }),
             _ => None,
         });
+        cx.executor().allow_parking();
         let client = Client::connect(&socket).expect("connect to the fake daemon");
         use_projects(&workspace, &[project_info(5, "demo", Vec::new())], cx);
         workspace.update_in(cx, |workspace, window, cx| {
@@ -2319,6 +2330,7 @@ mod tests {
             }
             _ => None,
         });
+        cx.executor().allow_parking();
         let client = Client::connect(&socket).expect("connect to the fake daemon");
         use_projects(&workspace, &[project_info(5, "demo", Vec::new())], cx);
         workspace.update_in(cx, |workspace, window, cx| {
@@ -2359,6 +2371,7 @@ mod tests {
             }),
             _ => None,
         });
+        cx.executor().allow_parking();
         let client = Client::connect(&socket).expect("connect to the fake daemon");
         use_projects(&workspace, &[project_info(5, "demo", Vec::new())], cx);
         workspace.update_in(cx, |workspace, window, cx| {
@@ -2391,6 +2404,7 @@ mod tests {
             }),
             _ => None,
         });
+        cx.executor().allow_parking();
         let client = Client::connect(&socket).expect("connect to the fake daemon");
         use_projects(&workspace, &[project_info(5, "demo", Vec::new())], cx);
         workspace.update_in(cx, |workspace, window, cx| {
@@ -2413,6 +2427,7 @@ mod tests {
     #[gpui::test]
     fn an_exited_process_tile_goes_away_after_three_seconds(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
+        cx.executor().allow_parking();
         let client = Client::connect(&fake_daemon()).expect("connect to the fake daemon");
         use_projects(
             &workspace,
@@ -2460,6 +2475,7 @@ mod tests {
     #[gpui::test]
     fn a_failed_process_tile_stays_until_closed(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
+        cx.executor().allow_parking();
         let client = Client::connect(&fake_daemon()).expect("connect to the fake daemon");
         use_projects(
             &workspace,
@@ -2529,6 +2545,7 @@ mod tests {
     #[gpui::test]
     fn a_setup_that_ended_before_its_tile_appeared_is_shown_then_removed(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
+        cx.executor().allow_parking();
         let client = Client::connect(&fake_daemon()).expect("connect to the fake daemon");
         use_projects(&workspace, &[project_info(5, "demo", Vec::new())], cx);
         workspace.update_in(cx, |workspace, window, cx| {
@@ -2552,6 +2569,7 @@ mod tests {
     #[gpui::test]
     fn a_failed_setup_that_ended_early_stays_until_closed(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
+        cx.executor().allow_parking();
         let client = Client::connect(&fake_daemon()).expect("connect to the fake daemon");
         use_projects(&workspace, &[project_info(5, "demo", Vec::new())], cx);
         workspace.update_in(cx, |workspace, window, cx| {
@@ -2592,6 +2610,7 @@ mod tests {
             }),
             _ => None,
         });
+        cx.executor().allow_parking();
         let client = Client::connect(&socket).expect("connect to the fake daemon");
         use_projects(
             &workspace,
@@ -2790,7 +2809,7 @@ mod tests {
                 let specs = crate::views::tile_specs(workspace);
 
                 (
-                    specs.last().and_then(|spec| spec.requested),
+                    specs.last().and_then(|spec| spec.fixed),
                     workspace.cell_size,
                 )
             })
@@ -2802,9 +2821,20 @@ mod tests {
         let (freed, _) = requested(&workspace, cx);
 
         let cell_height = cell.expect("the cell size was measured").1;
-        let height = size.expect("a requested size").height;
-        let expected = 12. * cell_height + 16. + CHROME_HEIGHT;
-        assert!((height - expected).abs() < 0.01, "{height} vs {expected}");
+        let size = size.expect("a fixed size");
+        let cell_width = cell.expect("the cell size was measured").0;
+        let expected = (
+            80. * cell_width + 16. + CHROME_WIDTH,
+            12. * cell_height + 16. + CHROME_HEIGHT,
+        );
+        assert!(
+            (size.width - expected.0).abs() < 0.01,
+            "{size:?} vs {expected:?}"
+        );
+        assert!(
+            (size.height - expected.1).abs() < 0.01,
+            "{size:?} vs {expected:?}"
+        );
         assert_eq!(freed, None);
         assert_eq!(process_tiles(&workspace, cx).len(), 1);
     }
@@ -3000,6 +3030,7 @@ mod tests {
             None
         });
         let (workspace, cx) = setup(cx);
+        cx.executor().allow_parking();
         let client = Client::connect(&socket).expect("connect to the fake daemon");
         use_projects(&workspace, &[project_info(5, "demo", tasks)], cx);
         workspace.update_in(cx, |workspace, window, cx| {
@@ -3018,11 +3049,9 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_start_tab_asks_for_its_orchestrator_once_with_the_default_kind(cx: &mut TestAppContext) {
-        let path = temp_settings_path("start");
-        let mut settings = swarm_settings::Settings::default();
-        settings.agents.orchestrator = swarm_settings::AgentKindSetting::Codex;
-        swarm_settings::save(&path, &settings).expect("write the settings");
+    fn a_start_tab_asks_for_its_orchestrator_once_and_lets_the_daemon_pick_the_kind(
+        cx: &mut TestAppContext,
+    ) {
         let (sent, requests) = flume::unbounded();
         let socket = fake_daemon_replying(move |request| {
             if let Request::StartOrchestrator { project, kind, .. } = request {
@@ -3032,10 +3061,8 @@ mod tests {
             None
         });
         let (workspace, cx) = setup(cx);
+        cx.executor().allow_parking();
         let client = Client::connect(&socket).expect("connect to the fake daemon");
-        workspace.update(cx, |workspace, _| {
-            workspace.settings_path = Some(path.clone());
-        });
         use_projects(&workspace, &[project_info(5, "demo", Vec::new())], cx);
         workspace.update_in(cx, |workspace, window, cx| {
             workspace.use_daemon(client, &[], window, cx);
@@ -3045,13 +3072,9 @@ mod tests {
         cx.run_until_parked();
         redraw(cx);
         redraw(cx);
-        std::fs::remove_file(&path).ok();
 
         let sent: Vec<_> = requests.try_iter().collect();
-        assert_eq!(
-            sent,
-            [(DaemonProjectId(5), Some(swarm_protocol::AgentKind::Codex))]
-        );
+        assert_eq!(sent, [(DaemonProjectId(5), None)]);
     }
 
     #[gpui::test]
