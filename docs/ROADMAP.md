@@ -125,13 +125,14 @@ Each phase ends with a pull request into `main`. A phase is done when every box 
 
 **Goal:** a signed app that someone else can install.
 
-**Scope:** welcome screen and system check, remaining settings pages (Terminals with the font size, Prompts), tile sizes (large orchestrator, small workers that grow when blocked, `tile.grow` / `tile.shrink`), easter eggs, full VoiceOver and keyboard audit, performance pass, app bundle signing and notarization, updates, docs website and product website.
+**Scope:** welcome screen and system check, remaining settings pages (Terminals with the font size, Prompts), tile sizes (large orchestrator, small workers that grow when blocked, `tile.grow` / `tile.shrink`), file-type icons in the style of vscode-icons for files and folders (Changes tab, Changes and Files panels, Review), easter eggs, full VoiceOver and keyboard audit, performance pass, app bundle signing and notarization, updates, docs website and product website.
 
 **Done when:**
 
 - [ ] First launch guides through the system check
 - [ ] The orchestrator tile is always the largest; a blocked worker grows and shrinks back when it works again
 - [ ] Changing the terminal font size in Settings resizes every terminal at once
+- [ ] Files and folders show file-type icons; the icon set's license terms are met (vscode-icons: CC BY-SA 4.0 for the icons, attribution in About, branded icons excluded)
 - [ ] VoiceOver audit passes on every screen (checklist in `crates/swarm_ui/README.md`)
 - [ ] Reduce Motion reaches GPUI and stops spinners and easter-egg animations
 - [ ] Disabled controls and plain text are announced by VoiceOver (needs GPUI support or a contribution upstream)
