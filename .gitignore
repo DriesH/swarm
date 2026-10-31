@@ -16,3 +16,6 @@ target/
 .env.*
 .claude/settings.local.json
 CLAUDE.local.md
+
+# Agent worktrees
+.claude/worktrees/
