@@ -12,6 +12,22 @@ use toml_edit::{DocumentMut, Item, Table, Value};
 #[serde(default)]
 pub struct Settings {
     pub agents: AgentSettings,
+    pub terminals: TerminalSettings,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(default)]
+pub struct TerminalSettings {
+    /// Lets the user type into worker terminals.
+    pub allow_worker_typing: bool,
+}
+
+impl Default for TerminalSettings {
+    fn default() -> Self {
+        Self {
+            allow_worker_typing: true,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -228,6 +244,12 @@ pub fn save(path: &Path, settings: &Settings) -> Result<(), SettingsError> {
     );
     set_cli(table_mut(agents, "codex"), &settings.agents.codex);
 
+    set_value(
+        table_mut(document.as_table_mut(), "terminals"),
+        "allow_worker_typing",
+        Value::from(settings.terminals.allow_worker_typing),
+    );
+
     if let Some(folder) = path.parent() {
         std::fs::create_dir_all(folder).map_err(io_error)?;
     }
@@ -328,6 +350,30 @@ mod tests {
         std::fs::remove_dir_all(&folder).unwrap();
 
         assert_eq!(loaded, settings);
+    }
+
+    #[test]
+    fn worker_typing_is_allowed_by_default() {
+        let settings: Settings = toml::from_str("[agents]\nskip_permissions = true\n").unwrap();
+
+        assert!(settings.terminals.allow_worker_typing);
+    }
+
+    #[test]
+    fn turning_worker_typing_off_is_saved_and_loaded() {
+        let folder =
+            std::env::temp_dir().join(format!("swarm-settings-typing-{}", std::process::id()));
+        let path = folder.join("settings.toml");
+        let mut settings = Settings::default();
+        settings.terminals.allow_worker_typing = false;
+
+        save(&path, &settings).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let loaded = load(&path).unwrap();
+        std::fs::remove_dir_all(&folder).unwrap();
+
+        assert!(text.contains("[terminals]\nallow_worker_typing = false"));
+        assert!(!loaded.terminals.allow_worker_typing);
     }
 
     #[test]
