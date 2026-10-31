@@ -57,7 +57,7 @@ The branch that collects the work of all workers in a task; the PR is opened fro
 _Avoid_: Integration branch, feature branch
 
 **Swarm view**:
-The view that shows a task's swarm as a graph of agents and the messages between them, with a timeline below.
+The view that shows a task's swarm as a graph of agents and the messages between them, with an inspector for the selected agent.
 _Avoid_: Graph view, map
 
 **Inspector**:

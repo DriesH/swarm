@@ -89,11 +89,11 @@ Each phase ends with a pull request into `main`. A phase is done when every box 
 
 **Goal:** see the swarm and its messages at a glance.
 
-**Scope:** graph of orchestrator and workers, message edges, timeline, agent inspector with live terminal preview.
+**Scope:** graph of orchestrator and workers, message edges, and a resizable agent inspector with Messages, Changes and Terminal tabs.
 
 **Done when:**
 
-- [ ] Graph and timeline update live from the daemon
+- [ ] Graph and inspector update live from the daemon
 - [ ] Inspector shows worktree, branch, changes and messages; **Focus** jumps to the agent's tile
 
 ## 6. Review and pull requests

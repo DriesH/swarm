@@ -108,8 +108,13 @@ Harness calls for the Start orchestrator:
 ### Swarm view
 
 - Graph: the orchestrator on top, workers below. Edges are colored by message type (task, question, report); dots on an edge are messages in flight.
-- Timeline under the graph: one lane per agent.
-- Inspector for the selected agent: agent kind, worktree, branch, running time, changes, its message thread, a live terminal preview, **Focus** (switches to Terminals with that tile focused) and **View diff** (Review filtered to that agent).
+- Inspector for the selected agent, on the right, resizable (320–640 px) by dragging its left border:
+  - Header: kind icon, name, status, **View diff** (Review filtered to that agent) and **Focus** (switches to Terminals with that tile focused). Under it one line with kind and model, running time and shared or own worktree, then the branch.
+  - Tabs **Messages**, **Changes** and **Terminal**, with counts on the first two.
+  - Messages: the agent's thread, newest at the bottom. Each message shows sender, recipient, a kind tag and the time or "In flight". The text is rendered as Markdown (paragraphs, headings, lists, inline code, links); long messages fold with **Show more**.
+  - Changes: total additions and deletions, then each changed file; a file opens Review at that file.
+  - Terminal: a live preview of the agent's terminal, then its process terminals with size and state.
+- No timeline: it was tried in phase 5 and removed because it added little.
 
 ### Settings
 
