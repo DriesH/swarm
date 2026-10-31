@@ -3,6 +3,7 @@
 
 mod emulator;
 mod keys;
+mod osc7501;
 mod pty;
 mod terminal_loop;
 

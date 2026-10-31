@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 use swarm_term::{TerminalChannels, TerminalInput, TerminalOutput};
 
 use crate::{
-    CallId, CreateTask, CreateTerminal, Event, FrameError, Paths, ProjectInfo, Request, TaskInfo,
-    TerminalId, TerminalInfo, VERSION, check_private_dir, read, write,
+    AgentInfo, CallId, CreateTask, CreateTerminal, Event, FrameError, Paths, ProjectInfo, Request,
+    TaskInfo, TerminalId, TerminalInfo, VERSION, check_private_dir, read, write,
 };
 
 const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -77,6 +77,7 @@ struct Shared {
     /// Set when this side hangs up, so the reader's end of stream is not a warning.
     closing: AtomicBool,
     next_generation: AtomicU64,
+    agents: flume::Sender<AgentInfo>,
 }
 
 impl Shared {
@@ -118,6 +119,7 @@ struct Inner {
     writer: flume::Sender<Request>,
     shared: Arc<Shared>,
     daemon_pid: u32,
+    agent_events: flume::Receiver<AgentInfo>,
 }
 
 impl Drop for Inner {
@@ -205,6 +207,7 @@ impl Client {
             }
         };
 
+        let (agent_sender, agent_receiver) = flume::unbounded();
         let shared = Arc::new(Shared {
             routes: Mutex::new(HashMap::new()),
             waiters: Mutex::new(HashMap::new()),
@@ -212,6 +215,7 @@ impl Client {
             connected: AtomicBool::new(true),
             closing: AtomicBool::new(false),
             next_generation: AtomicU64::new(0),
+            agents: agent_sender,
         });
         let (request_sender, request_receiver) = flume::unbounded();
 
@@ -242,6 +246,7 @@ impl Client {
                 writer: request_sender,
                 shared,
                 daemon_pid,
+                agent_events: agent_receiver,
             }),
             reply_timeout: REPLY_TIMEOUT,
         })
@@ -249,6 +254,12 @@ impl Client {
 
     pub fn daemon_pid(&self) -> u32 {
         self.inner.daemon_pid
+    }
+
+    /// Every `AgentChanged` the daemon sends. Clones of the receiver share the events,
+    /// so use one consumer.
+    pub fn agent_events(&self) -> flume::Receiver<AgentInfo> {
+        self.inner.agent_events.clone()
     }
 
     /// Changes how long calls wait (`create_task` waits at least 60 s) for the daemon.
@@ -549,6 +560,11 @@ fn read_events(
                 },
             ),
             Event::Hello { .. } => log::debug!("ignoring a repeated Hello"),
+            Event::AgentChanged { agent } => {
+                if shared.agents.send(agent).is_err() {
+                    log::debug!("agent event has no listener");
+                }
+            }
         }
     }
 

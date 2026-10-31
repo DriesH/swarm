@@ -59,7 +59,7 @@ impl ListRow {
     }
 
     /// What VoiceOver reads when the visible label is not enough, for example
-    /// "pty-io, waiting". Defaults to the label.
+    /// "pty-io, blocked". Defaults to the label.
     pub fn accessible_label(mut self, label: impl Into<SharedString>) -> Self {
         self.accessible_label = Some(label.into());
         self
@@ -161,7 +161,7 @@ impl Component for ListRow {
                 0,
             ),
             ("term-render", IconName::ClaudeCode, AgentStatus::Working, 1),
-            ("pty-io", IconName::Codex, AgentStatus::Waiting, 1),
+            ("pty-io", IconName::Codex, AgentStatus::Blocked, 1),
             ("ui-tokens", IconName::ClaudeCode, AgentStatus::Done, 1),
             ("bench", IconName::Codex, AgentStatus::Idle, 1),
             ("cargo test", IconName::Terminal, AgentStatus::Working, 2),

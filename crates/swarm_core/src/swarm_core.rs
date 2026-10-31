@@ -3,8 +3,11 @@
 //! No GPUI, no terminal emulator and no socket code: the daemon calls this crate and
 //! decides how to start the processes (ADR 0005).
 
+pub mod adapters;
+pub mod agents;
 pub mod config;
 pub mod git;
+pub mod prompts;
 pub mod store;
 pub mod task;
 

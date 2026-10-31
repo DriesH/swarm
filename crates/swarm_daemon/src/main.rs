@@ -1,5 +1,7 @@
 //! `swarm-daemon`: owns the terminals and serves them over a unix socket (ADR 0001).
 
+mod agent_socket;
+mod agents;
 mod connection;
 mod hub;
 mod recovery;
@@ -22,8 +24,23 @@ use swarm_core::Projects;
 use swarm_core::store::Store;
 use swarm_protocol::{Paths, check_private_dir};
 
-use crate::hub::Terminals;
+use crate::agents::{AgentConfig, Agents};
+use crate::hub::{Clients, Terminals};
 use crate::recovery::System;
+
+/// What every client connection works with.
+pub(crate) struct Services {
+    pub(crate) terminals: Arc<Terminals>,
+    pub(crate) projects: Arc<Projects>,
+    pub(crate) agents: Arc<Agents>,
+    pub(crate) clients: Arc<Clients>,
+}
+
+/// Where the daemon is told to keep its files and read its settings.
+struct Arguments {
+    data_dir: Option<PathBuf>,
+    settings: Option<PathBuf>,
+}
 
 /// How long terminals get to exit on SIGTERM before the daemon leaves anyway.
 /// Pause after a failed `accept`, so a persistent error does not spin.
@@ -52,7 +69,8 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<()> {
-    let paths = match data_dir_argument()? {
+    let arguments = arguments()?;
+    let paths = match arguments.data_dir {
         Some(dir) => Paths::in_dir(dir),
         None => Paths::new().context("cannot find the data folder")?,
     };
@@ -78,6 +96,9 @@ fn run() -> Result<()> {
     }
     let listener = UnixListener::bind(&paths.socket).context("cannot bind the socket")?;
     std::fs::set_permissions(&paths.socket, Permissions::from_mode(0o600))?;
+
+    let agent_socket_path = socket_dir.join("agent.sock");
+    let agent_listener = agent_socket::bind(&agent_socket_path)?;
     log::info!(
         "pid {} listening on {}",
         std::process::id(),
@@ -87,6 +108,7 @@ fn run() -> Result<()> {
     let store = Store::open(&paths.database)?;
     let leftovers = store.leftovers()?;
     store.clear_setup_terminals()?;
+    store.recover_agents()?;
     let store = Arc::new(Mutex::new(store));
 
     let recovery_store = Arc::clone(&store);
@@ -94,30 +116,70 @@ fn run() -> Result<()> {
         .name("recovery".into())
         .spawn(move || recovery::recover(&recovery_store, &leftovers, &System))?;
 
-    let projects = Arc::new(Projects::new(Arc::clone(&store)));
-    let terminals = Terminals::new(store);
-    watch_signals(Arc::clone(&terminals), paths.socket.clone())?;
+    let swarm = std::env::current_exe()
+        .context("cannot find the daemon's own path")?
+        .with_file_name("swarm");
+    if !swarm.is_file() {
+        log::warn!("{} is missing: agent hooks will not work", swarm.display());
+    }
 
-    serve(&listener, &terminals, &projects);
+    let projects = Arc::new(Projects::new(Arc::clone(&store)));
+    let terminals = Terminals::new(Arc::clone(&store));
+    let clients = Arc::new(Clients::default());
+    let agents = Agents::new(
+        AgentConfig {
+            data_dir: paths.data.clone(),
+            socket: agent_socket_path.clone(),
+            settings: arguments.settings.or_else(swarm_settings::default_path),
+            swarm,
+        },
+        store,
+        Arc::clone(&terminals),
+        Arc::clone(&clients),
+    );
+
+    let agent_server = Arc::clone(&agents);
+    thread::Builder::new()
+        .name("agent-socket".into())
+        .spawn(move || agent_socket::serve(&agent_listener, &agent_server))?;
+
+    watch_signals(
+        Arc::clone(&terminals),
+        vec![paths.socket.clone(), agent_socket_path],
+    )?;
+
+    let services = Arc::new(Services {
+        terminals,
+        projects,
+        agents,
+        clients,
+    });
+    serve(&listener, &services);
 
     Ok(())
 }
 
-/// The folder after `--data-dir`, if given.
-fn data_dir_argument() -> Result<Option<PathBuf>> {
-    let mut arguments = std::env::args_os().skip(1);
-    let mut data_dir = None;
+/// `--data-dir <folder>` and `--settings <file>`, both optional.
+fn arguments() -> Result<Arguments> {
+    let mut input = std::env::args_os().skip(1);
+    let mut parsed = Arguments {
+        data_dir: None,
+        settings: None,
+    };
 
-    while let Some(argument) = arguments.next() {
-        if argument != "--data-dir" {
+    while let Some(argument) = input.next() {
+        if argument == "--data-dir" {
+            let dir = input.next().context("--data-dir needs a folder")?;
+            parsed.data_dir = Some(PathBuf::from(dir));
+        } else if argument == "--settings" {
+            let file = input.next().context("--settings needs a file")?;
+            parsed.settings = Some(PathBuf::from(file));
+        } else {
             anyhow::bail!("unknown argument {}", argument.to_string_lossy());
         }
-
-        let dir = arguments.next().context("--data-dir needs a folder")?;
-        data_dir = Some(PathBuf::from(dir));
     }
 
-    Ok(data_dir)
+    Ok(parsed)
 }
 
 /// `None` when another process holds the lock.
@@ -171,7 +233,7 @@ fn ignore_hangup() -> Result<()> {
     Ok(())
 }
 
-fn serve(listener: &UnixListener, terminals: &Arc<Terminals>, projects: &Arc<Projects>) {
+fn serve(listener: &UnixListener, services: &Arc<Services>) {
     let next_client = AtomicU64::new(1);
 
     for stream in listener.incoming() {
@@ -185,12 +247,11 @@ fn serve(listener: &UnixListener, terminals: &Arc<Terminals>, projects: &Arc<Pro
         };
 
         let client = next_client.fetch_add(1, Ordering::Relaxed);
-        let terminals = Arc::clone(terminals);
-        let projects = Arc::clone(projects);
+        let services = Arc::clone(services);
         let spawned = thread::Builder::new()
             .name(format!("client-{client}"))
             .spawn(move || {
-                if let Err(error) = connection::serve(&terminals, &projects, client, stream) {
+                if let Err(error) = connection::serve(&services, client, stream) {
                     log::warn!("client {client}: {error:#}");
                 }
             });
@@ -221,8 +282,8 @@ extern "C" fn on_signal(_signal: libc::c_int) {
     }
 }
 
-/// SIGTERM and SIGINT kill every terminal, remove the socket and end the process.
-fn watch_signals(terminals: Arc<Terminals>, socket: PathBuf) -> Result<()> {
+/// SIGTERM and SIGINT kill every terminal, remove the sockets and end the process.
+fn watch_signals(terminals: Arc<Terminals>, sockets: Vec<PathBuf>) -> Result<()> {
     let mut descriptors = [0; 2];
     // SAFETY: pipe fills the two integers of the array.
     if unsafe { libc::pipe(descriptors.as_mut_ptr()) } != 0 {
@@ -255,8 +316,10 @@ fn watch_signals(terminals: Arc<Terminals>, socket: PathBuf) -> Result<()> {
                 log::warn!("some terminals did not exit in time");
             }
 
-            if let Err(error) = std::fs::remove_file(&socket) {
-                log::warn!("cannot remove the socket: {error}");
+            for socket in &sockets {
+                if let Err(error) = std::fs::remove_file(socket) {
+                    log::warn!("cannot remove {}: {error}", socket.display());
+                }
             }
             std::process::exit(0);
         })?;

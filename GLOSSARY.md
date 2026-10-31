@@ -33,8 +33,12 @@ Which CLI an agent runs: Claude Code or Codex.
 _Avoid_: Provider, model
 
 **Agent status**:
-What an agent is doing right now: working, waiting, done or idle.
-_Avoid_: State, phase
+What an agent is doing right now: unknown, idle, working, done, blocked (on a permission, a question or a login) or error.
+_Avoid_: State, phase, waiting
+
+**Agent model**:
+The AI model an agent runs, such as opus, sonnet or gpt-reserve. Orchestrators and workers have their own default.
+_Avoid_: Engine, LLM
 
 **Message**:
 Text sent between the orchestrator and a worker through Swarm.

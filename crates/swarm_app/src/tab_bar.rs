@@ -92,10 +92,10 @@ pub(crate) fn render(
         .into_any_element()
 }
 
-fn ring_status(status: TaskStatus) -> AgentStatus {
+pub(crate) fn ring_status(status: TaskStatus) -> AgentStatus {
     match status {
         TaskStatus::Working => AgentStatus::Working,
-        TaskStatus::NeedsYou => AgentStatus::Waiting,
+        TaskStatus::NeedsYou => AgentStatus::Blocked,
         TaskStatus::Idle => AgentStatus::Idle,
     }
 }

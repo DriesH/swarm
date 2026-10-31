@@ -9,21 +9,18 @@ use std::sync::Arc;
 use std::thread;
 
 use anyhow::Result;
-use swarm_core::Projects;
-use swarm_protocol::{CallId, Event, FrameError, Request, TerminalId, VERSION, read, write};
+use swarm_protocol::{
+    CallId, Event, FrameError, Request, TaskInfo, TerminalId, VERSION, read, write,
+};
 
-use crate::hub::{CREATE_HISTORY_LINES, ClientSink, Frame, QUEUE_FRAMES, Terminals};
+use crate::Services;
+use crate::hub::{CREATE_HISTORY_LINES, ClientSink, Frame, QUEUE_FRAMES};
 use crate::tasks;
 
 /// Longest parent chain the peer check follows.
 const MAX_ANCESTORS: usize = 256;
 
-pub(crate) fn serve(
-    terminals: &Arc<Terminals>,
-    projects: &Arc<Projects>,
-    client: u64,
-    mut stream: UnixStream,
-) -> Result<()> {
+pub(crate) fn serve(services: &Arc<Services>, client: u64, mut stream: UnixStream) -> Result<()> {
     if let Some(reason) = refusal(&stream) {
         log::warn!("client {client} refused: {reason}");
         write(
@@ -50,9 +47,11 @@ pub(crate) fn serve(
     let mut buffer = Vec::new();
 
     if handshake(&sink, &mut reader, &mut buffer) {
+        services.clients.add(&sink);
+
         loop {
             match read::<Request>(&mut reader, &mut buffer) {
-                Ok(request) => handle(terminals, projects, &sink, request),
+                Ok(request) => handle(services, &sink, request),
                 Err(FrameError::Io(error)) if error.kind() == ErrorKind::UnexpectedEof => break,
                 Err(error) => {
                     log::info!("client {client} ended: {error}");
@@ -62,7 +61,8 @@ pub(crate) fn serve(
         }
     }
 
-    terminals.detach_client(client);
+    services.clients.remove(client);
+    services.terminals.detach_client(client);
 
     Ok(())
 }
@@ -103,12 +103,9 @@ fn handshake(sink: &ClientSink, reader: &mut BufReader<UnixStream>, buffer: &mut
     accepted
 }
 
-fn handle(
-    terminals: &Arc<Terminals>,
-    projects: &Arc<Projects>,
-    sink: &Arc<ClientSink>,
-    request: Request,
-) {
+fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
+    let (terminals, projects) = (&services.terminals, &services.projects);
+
     match request {
         Request::Hello { .. } => {
             sink.send_event(&Event::Hello {
@@ -162,13 +159,17 @@ fn handle(
             });
         }
         Request::CreateTask { call, task } => {
-            let (terminals, projects) = (Arc::clone(terminals), Arc::clone(projects));
+            let services = Arc::clone(services);
             run_slow(sink, "create-task", call, move |sink| {
-                match tasks::create(&terminals, &projects, &task) {
-                    Ok(task) => {
-                        sink.send_event(&Event::TaskCreated { call, task });
-                    }
-                    Err(error) => send_error(sink, call, &error),
+                let reply = |task: &TaskInfo| {
+                    sink.send_event(&Event::TaskCreated {
+                        call,
+                        task: task.clone(),
+                    });
+                };
+
+                if let Err(error) = tasks::create(&services, &task, reply) {
+                    send_error(sink, call, &error);
                 }
             });
         }

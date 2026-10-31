@@ -1,7 +1,7 @@
 //! The daemon connection, its projects and the terminals it runs.
 //!
-//! Projects, tasks, user terminals and process terminals of real tasks come from the
-//! daemon. Agents and workers do not exist yet.
+//! Projects, tasks, agents, user terminals and process terminals of real tasks come from
+//! the daemon.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -12,7 +12,7 @@ use gpui::{
     Subscription, Window, px,
 };
 use swarm_protocol::{
-    Client, ClientError, CreateTerminal, Paths, ProjectInfo, TaskInfo,
+    AgentInfo, Client, ClientError, CreateTerminal, Paths, ProjectInfo, TaskInfo,
     TerminalId as DaemonTerminalId, TerminalInfo, TerminalKind as DaemonKind,
 };
 use swarm_term::{ExitStatus, TerminalChannels, TerminalInput};
@@ -256,6 +256,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.daemon = Some(client.clone());
+        Self::watch_agents(&client, window, cx);
+        self.drop_agent_terminals();
 
         let listed: HashSet<DaemonTerminalId> = terminals
             .iter()
@@ -288,8 +290,146 @@ impl Workspace {
         }
 
         self.attach_new_terminals(&client, terminals, window, cx);
+        self.attach_agents(window, cx);
 
         cx.notify();
+    }
+
+    /// Hands the daemon's agent changes to the workspace, until the connection ends.
+    fn watch_agents(client: &Client, window: &mut Window, cx: &mut Context<Self>) {
+        let events = client.agent_events();
+
+        cx.spawn_in(window, async move |this, cx| {
+            while let Ok(agent) = events.recv_async().await {
+                let updated = this.update_in(cx, |workspace, window, cx| {
+                    workspace.agent_changed(&agent, window, cx);
+                });
+
+                if updated.is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Applies an agent the daemon reports: status, model and terminal. An agent of a
+    /// task the app does not know yet waits until the task arrives.
+    pub(crate) fn agent_changed(
+        &mut self,
+        info: &AgentInfo,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((_, terminal)) = self.data.sync_agent(info) else {
+            let newer = self
+                .pending_agents
+                .get(&info.id)
+                .is_none_or(|waiting| waiting.revision < info.revision);
+            if newer {
+                self.pending_agents.insert(info.id, info.clone());
+            }
+
+            return;
+        };
+
+        self.pending_agents.remove(&info.id);
+        self.sync_agent_terminal(terminal, window, cx);
+        cx.notify();
+    }
+
+    fn apply_pending_agents(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pending = std::mem::take(&mut self.pending_agents);
+
+        for info in pending.values() {
+            self.agent_changed(info, window, cx);
+        }
+    }
+
+    /// Makes the live view of an agent's tile match the agent's terminal: attaches a new
+    /// one, and drops the view of a terminal that ended.
+    fn sync_agent_terminal(
+        &mut self,
+        terminal: TerminalId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(agent) = self
+            .data
+            .agents
+            .iter()
+            .find(|agent| agent.terminal == terminal)
+        else {
+            return;
+        };
+        let wanted = agent.daemon.as_ref().and_then(|daemon| daemon.terminal);
+        let name = SharedString::from(format!(
+            "{}, {}, {}",
+            agent.name,
+            agent.kind.label(),
+            agent.model
+        ));
+        let current = self
+            .live_terminals
+            .get(&terminal)
+            .map(|live| live.daemon_id);
+
+        if current == wanted {
+            return;
+        }
+
+        if current.is_some() {
+            self.drop_live_terminal(terminal);
+        }
+
+        let (Some(daemon_id), Some(client)) = (wanted, self.daemon.clone()) else {
+            return;
+        };
+
+        match client.attach(daemon_id, ATTACH_HISTORY) {
+            Ok(channels) => {
+                let live = self.live_terminal(terminal, daemon_id, name, channels, window, cx);
+                self.live_terminals.insert(terminal, live);
+            }
+            Err(error) => log::warn!("cannot attach agent terminal {}: {error}", daemon_id.0),
+        }
+    }
+
+    fn attach_agents(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_pending_agents(window, cx);
+
+        let terminals: Vec<TerminalId> = self
+            .data
+            .agents
+            .iter()
+            .filter(|agent| agent.daemon.is_some())
+            .map(|agent| agent.terminal)
+            .collect();
+
+        for terminal in terminals {
+            self.sync_agent_terminal(terminal, window, cx);
+        }
+    }
+
+    fn drop_live_terminal(&mut self, terminal: TerminalId) {
+        self.live_terminals.remove(&terminal);
+        self.terminal_focus.remove(&terminal);
+        self.disconnected.remove(&terminal);
+    }
+
+    /// Before a fresh connection: the old views are dead, `attach_agents` makes new ones.
+    fn drop_agent_terminals(&mut self) {
+        let terminals: Vec<TerminalId> = self
+            .data
+            .agents
+            .iter()
+            .filter(|agent| agent.daemon.is_some())
+            .map(|agent| agent.terminal)
+            .collect();
+
+        for terminal in terminals {
+            self.drop_live_terminal(terminal);
+        }
     }
 
     /// The task a listed terminal belongs on. User terminals fit any known task;
@@ -407,6 +547,7 @@ impl Workspace {
             self.attach_new_terminals(&client, terminals, window, cx);
         }
 
+        self.attach_agents(window, cx);
         self.show_setup_exit(task, cx);
         self.select_task(task, cx);
     }
@@ -503,6 +644,7 @@ impl Workspace {
             self.attach_new_terminals(&client, terminals, window, cx);
         }
 
+        self.attach_agents(window, cx);
         self.select_project(project, cx);
     }
 
@@ -811,16 +953,19 @@ mod tests {
     use std::io::{BufReader, BufWriter, Write};
     use std::os::unix::fs::DirBuilderExt as _;
     use std::os::unix::net::UnixListener;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
     use gpui::{TestAppContext, VisualTestContext};
+    use swarm_protocol::AgentStatus as DaemonAgentStatus;
     use swarm_protocol::{
         Event, ProjectId as DaemonProjectId, Request, TaskId as DaemonTaskId, VERSION, read, write,
     };
     use swarm_term_view::TerminalEvent;
+    use swarm_ui::AgentStatus;
 
     use super::*;
     use crate::actions::{self, NewTerminal};
+    use crate::model::TaskStatus;
     use crate::new_task::NewTaskDialog;
     use crate::palette::Overlay;
 
@@ -956,6 +1101,7 @@ mod tests {
             ports: Vec::new(),
             setup_terminal: Some(swarm_protocol::TerminalId(10)),
             setup_exit: None,
+            agents: Vec::new(),
         }
     }
 
@@ -1396,6 +1542,293 @@ mod tests {
         assert_eq!(active, "signup");
         assert_eq!(processes, 1);
         assert_eq!(tabs, 2);
+    }
+
+    static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
+
+    fn agent_info(id: u64, task: u64, status: DaemonAgentStatus) -> AgentInfo {
+        AgentInfo {
+            id: swarm_protocol::AgentId(id),
+            task: DaemonTaskId(task),
+            role: swarm_protocol::AgentRole::Orchestrator,
+            kind: swarm_protocol::AgentKind::ClaudeCode,
+            model: "opus".into(),
+            terminal: None,
+            status,
+            message: None,
+            lifecycle: swarm_protocol::AgentLifecycle::Running,
+            revision: NEXT_REVISION.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
+    fn real_task_workspace<'a>(
+        socket: &std::path::Path,
+        cx: &'a mut TestAppContext,
+    ) -> (Entity<Workspace>, &'a mut VisualTestContext, Client) {
+        let (workspace, cx) = setup(cx);
+        let client = Client::connect(socket).expect("connect to the fake daemon");
+        use_projects(
+            &workspace,
+            &[project_info(5, "demo", vec![task_info(7, 5, "login")])],
+            cx,
+        );
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.use_daemon(client.clone(), &[], window, cx);
+        });
+
+        (workspace, cx, client)
+    }
+
+    fn change_agent(workspace: &Entity<Workspace>, info: &AgentInfo, cx: &mut VisualTestContext) {
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.agent_changed(info, window, cx);
+        });
+    }
+
+    fn task_view(
+        workspace: &Entity<Workspace>,
+        cx: &VisualTestContext,
+    ) -> (AgentStatus, TaskStatus, AgentStatus, usize) {
+        workspace.read_with(cx, |workspace, _| {
+            let task = workspace.active_task();
+            let agent = task
+                .orchestrator
+                .and_then(|id| workspace.data.agent(id))
+                .map_or(AgentStatus::Idle, |agent| agent.status);
+
+            (
+                agent,
+                task.status,
+                crate::tab_bar::ring_status(task.status),
+                crate::views::tile_specs(workspace).len(),
+            )
+        })
+    }
+
+    #[gpui::test]
+    fn a_real_task_shows_an_orchestrator_tile_once_the_daemon_reports_it(cx: &mut TestAppContext) {
+        let (workspace, cx, _client) = real_task_workspace(&fake_daemon(), cx);
+        let before = task_view(&workspace, cx).3;
+
+        change_agent(&workspace, &agent_info(1, 7, DaemonAgentStatus::Idle), cx);
+
+        assert_eq!(before, 0);
+        assert_eq!(task_view(&workspace, cx).3, 1);
+    }
+
+    #[gpui::test]
+    fn an_agent_change_updates_the_tile_status_and_the_tab_ring(cx: &mut TestAppContext) {
+        let (workspace, cx, _client) = real_task_workspace(&fake_daemon(), cx);
+        change_agent(&workspace, &agent_info(1, 7, DaemonAgentStatus::Idle), cx);
+
+        change_agent(
+            &workspace,
+            &agent_info(1, 7, DaemonAgentStatus::Working),
+            cx,
+        );
+
+        let (tile, _, ring, _) = task_view(&workspace, cx);
+        assert_eq!(tile, AgentStatus::Working);
+        assert_eq!(ring, AgentStatus::Working);
+    }
+
+    #[gpui::test]
+    fn a_blocked_agent_makes_the_project_need_you(cx: &mut TestAppContext) {
+        let (workspace, cx, _client) = real_task_workspace(&fake_daemon(), cx);
+
+        change_agent(
+            &workspace,
+            &agent_info(
+                1,
+                7,
+                DaemonAgentStatus::Blocked(swarm_term::BlockedKind::Permission),
+            ),
+            cx,
+        );
+
+        let (tile, status, ring, _) = task_view(&workspace, cx);
+        assert_eq!(tile, AgentStatus::Blocked);
+        assert_eq!(status, TaskStatus::NeedsYou);
+        assert_eq!(ring, AgentStatus::Blocked);
+    }
+
+    #[gpui::test]
+    fn the_blocked_kind_and_message_show_in_the_tile_meta(cx: &mut TestAppContext) {
+        let (workspace, cx, _client) = real_task_workspace(&fake_daemon(), cx);
+        let mut info = agent_info(
+            1,
+            7,
+            DaemonAgentStatus::Blocked(swarm_term::BlockedKind::Question),
+        );
+        info.message = Some("which branch?".into());
+
+        change_agent(&workspace, &info, cx);
+
+        let (meta, label) = workspace.read_with(cx, |workspace, _| {
+            let agent = workspace.data.agents.first().expect("one agent");
+            (agent.meta().to_string(), agent.accessible_label())
+        });
+        assert_eq!(
+            meta,
+            "Claude Code \u{b7} opus \u{b7} question \u{b7} which branch?"
+        );
+        assert_eq!(
+            label,
+            "orchestrator, Claude Code, opus, needs you, question, which branch?"
+        );
+    }
+
+    #[gpui::test]
+    fn a_working_agent_becomes_idle_again_when_it_finishes(cx: &mut TestAppContext) {
+        let (workspace, cx, _client) = real_task_workspace(&fake_daemon(), cx);
+        change_agent(
+            &workspace,
+            &agent_info(1, 7, DaemonAgentStatus::Working),
+            cx,
+        );
+
+        change_agent(&workspace, &agent_info(1, 7, DaemonAgentStatus::Done), cx);
+
+        let (tile, status, _, _) = task_view(&workspace, cx);
+        assert_eq!(tile, AgentStatus::Done);
+        assert_eq!(status, TaskStatus::Idle);
+    }
+
+    #[gpui::test]
+    fn an_agent_of_an_unknown_task_waits_for_the_task(cx: &mut TestAppContext) {
+        let (workspace, cx, _client) = real_task_workspace(&fake_daemon(), cx);
+        change_agent(
+            &workspace,
+            &agent_info(2, 8, DaemonAgentStatus::Working),
+            cx,
+        );
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.task_created(&task_info(8, 5, "signup"), &[], window, cx);
+        });
+
+        let status = workspace.read_with(cx, |workspace, _| workspace.active_task().status);
+        assert_eq!(status, TaskStatus::Working);
+    }
+
+    #[gpui::test]
+    fn a_stopped_orchestrator_keeps_its_tile_without_a_terminal(cx: &mut TestAppContext) {
+        let socket = fake_daemon_replying(|_| None);
+        let (workspace, cx, _client) = real_task_workspace(&socket, cx);
+        let mut running = agent_info(1, 7, DaemonAgentStatus::Working);
+        running.terminal = Some(swarm_protocol::TerminalId(20));
+        change_agent(&workspace, &running, cx);
+        let live = workspace.read_with(cx, |workspace, _| workspace.live_terminals.len());
+
+        let mut stopped = agent_info(1, 7, DaemonAgentStatus::Done);
+        stopped.lifecycle = swarm_protocol::AgentLifecycle::Stopped;
+        change_agent(&workspace, &stopped, cx);
+
+        let (still_live, tiles) = workspace.read_with(cx, |workspace, _| {
+            (
+                workspace.live_terminals.len(),
+                crate::views::tile_specs(workspace).len(),
+            )
+        });
+        assert_eq!((live, still_live, tiles), (1, 0, 1));
+    }
+
+    #[gpui::test]
+    fn an_agent_event_from_the_daemon_reaches_the_tile(cx: &mut TestAppContext) {
+        let socket = fake_daemon_replying(|request| match request {
+            Request::Attach { .. } => Some(Event::AgentChanged {
+                agent: agent_info(1, 7, DaemonAgentStatus::Working),
+            }),
+            _ => None,
+        });
+        let (workspace, cx, client) = real_task_workspace(&socket, cx);
+
+        client
+            .attach(swarm_protocol::TerminalId(99), 0)
+            .expect("send the attach");
+        cx.executor().allow_parking();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while task_view(&workspace, cx).0 != AgentStatus::Working
+            && std::time::Instant::now() < deadline
+        {
+            cx.run_until_parked();
+            std::thread::yield_now();
+        }
+
+        let (tile, status, _, _) = task_view(&workspace, cx);
+        assert_eq!(tile, AgentStatus::Working);
+        assert_eq!(status, TaskStatus::Working);
+    }
+
+    fn temp_settings_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "swarm-app-{name}-{}-{}",
+            std::process::id(),
+            NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[gpui::test]
+    fn the_new_task_sheet_sends_the_chosen_kind_and_first_message(cx: &mut TestAppContext) {
+        let (sent, requests) = flume::unbounded();
+        let socket = fake_daemon_replying(move |request| match request {
+            Request::CreateTask { call, task } => {
+                sent.send(task).ok();
+
+                Some(Event::TaskCreated {
+                    call,
+                    task: task_info(8, 5, "login"),
+                })
+            }
+            Request::List { call } => Some(Event::Terminals {
+                call,
+                terminals: Vec::new(),
+            }),
+            _ => None,
+        });
+        let (workspace, cx, _client) = {
+            let (workspace, cx) = setup(cx);
+            let client = Client::connect(&socket).expect("connect to the fake daemon");
+            use_projects(&workspace, &[project_info(5, "demo", Vec::new())], cx);
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.use_daemon(client.clone(), &[], window, cx);
+            });
+
+            (workspace, cx, client)
+        };
+        let path = temp_settings_path("new-task");
+        let mut settings = swarm_settings::Settings::default();
+        settings.agents.orchestrator = swarm_settings::AgentKindSetting::Codex;
+        swarm_settings::save(&path, &settings).expect("write the settings");
+        workspace.update(cx, |workspace, _| {
+            workspace.settings_path = Some(path.clone());
+        });
+
+        cx.simulate_keystrokes("cmd-t");
+        cx.simulate_input("login");
+        let dialog = workspace.read_with(cx, |workspace, _| match &workspace.overlay {
+            Some(Overlay::NewTask { view, .. }) => Some(view.clone()),
+            _ => None,
+        });
+        let dialog = dialog.expect("the sheet is open");
+        let default_kind = dialog.read_with(cx, |dialog, _| dialog.orchestrator_kind());
+        dialog.update(cx, |dialog, cx| {
+            dialog.choose_orchestrator(crate::model::AgentKind::ClaudeCode);
+            dialog.type_message("  start with the tests ", cx);
+            dialog.create(cx);
+        });
+        cx.executor().allow_parking();
+        cx.run_until_parked();
+        std::fs::remove_file(&path).ok();
+
+        let task = requests.try_recv().expect("the daemon got CreateTask");
+        assert_eq!(default_kind, crate::model::AgentKind::Codex);
+        assert_eq!(
+            task.orchestrator,
+            Some(swarm_protocol::AgentKind::ClaudeCode)
+        );
+        assert_eq!(task.first_message.as_deref(), Some("start with the tests"));
     }
 
     #[gpui::test]

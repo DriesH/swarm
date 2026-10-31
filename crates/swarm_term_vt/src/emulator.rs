@@ -18,11 +18,12 @@ use libghostty_vt::{
     },
 };
 use swarm_term::{
-    BgSpan, Colors, Cursor, CursorStyle, History, Key, Palette, Rgb, Row, Screen, Size, Snapshot,
-    TerminalOutput, TextFlags, TextSpan, Update,
+    BgSpan, Colors, Cursor, CursorStyle, History, Key, Palette, ProgramStatus, Rgb, Row, Screen,
+    Size, Snapshot, TerminalOutput, TextFlags, TextSpan, Update,
 };
 
 use crate::keys::KeyEncoder;
+use crate::osc7501::{Parsed, Parser, QUERY_REPLY};
 
 /// Longest a synchronized update (mode 2026) holds back the screen, as in Ghostty.
 const SYNC_OUTPUT_CAP: Duration = Duration::from_secs(1);
@@ -41,6 +42,9 @@ pub(crate) struct Emulator {
     row_iterator: RowIterator<'static>,
     cell_iterator: CellIterator<'static>,
     key_encoder: KeyEncoder,
+    status_parser: Parser,
+    parsed: Vec<Parsed>,
+    replies: flume::Sender<Vec<u8>>,
     size: Size,
     /// The viewport as last sent; used to send only rows that really changed.
     rows: Vec<Row>,
@@ -71,6 +75,7 @@ impl Emulator {
         })?;
 
         let Sinks { replies, events } = sinks;
+        let query_replies = replies.clone();
         let title_events = events.clone();
         let pwd_events = events.clone();
         terminal
@@ -116,6 +121,9 @@ impl Emulator {
             row_iterator: RowIterator::new()?,
             cell_iterator: CellIterator::new()?,
             key_encoder: KeyEncoder::new()?,
+            status_parser: Parser::default(),
+            parsed: Vec::new(),
+            replies: query_replies,
             size,
             rows: Vec::new(),
             screen: None,
@@ -129,6 +137,28 @@ impl Emulator {
         emulator.set_palette(palette)?;
 
         Ok(emulator)
+    }
+
+    /// Finds OSC 7501 in a chunk and answers its support query. Call it before
+    /// `write` with the same bytes, so the answer goes out before libghostty's
+    /// replies to the same chunk.
+    pub(crate) fn scan_status(&mut self, bytes: &[u8]) -> Vec<ProgramStatus> {
+        self.parsed.clear();
+        self.status_parser.feed(bytes, &mut self.parsed);
+
+        let mut statuses = Vec::new();
+        for parsed in self.parsed.drain(..) {
+            match parsed {
+                Parsed::Report(status) => statuses.push(status),
+                Parsed::Query => {
+                    if self.replies.send(QUERY_REPLY.to_vec()).is_err() {
+                        log::debug!("dropping the OSC 7501 reply, the pty is gone");
+                    }
+                }
+            }
+        }
+
+        statuses
     }
 
     pub(crate) fn write(&mut self, bytes: &[u8]) {
@@ -589,6 +619,8 @@ fn push_text(
 
 #[cfg(test)]
 mod tests {
+    use swarm_term::ProgramState;
+
     use super::*;
 
     const RED: Rgb = Rgb(200, 10, 10);
@@ -893,6 +925,32 @@ mod tests {
 
         let reply = harness.replies.try_recv().expect("reply");
         assert!(reply.starts_with(b"\x1b[?"));
+    }
+
+    #[test]
+    fn support_query_is_answered_before_device_attributes() {
+        let mut harness = harness();
+        let chunk = b"\x1b]7501;?\x07\x1b[c";
+
+        harness.emulator.scan_status(chunk);
+        harness.emulator.write(chunk);
+
+        let first = harness.replies.try_recv().expect("first reply");
+        let second = harness.replies.try_recv().expect("second reply");
+        assert_eq!(first, b"\x1b]7501;?\x1b\\");
+        assert!(second.starts_with(b"\x1b[?"));
+    }
+
+    #[test]
+    fn scan_returns_reports_in_order() {
+        let mut harness = harness();
+
+        let statuses = harness
+            .emulator
+            .scan_status(b"\x1b]7501;state=working\x07\x1b]7501;state=done\x07");
+
+        let states: Vec<_> = statuses.iter().map(|status| status.state).collect();
+        assert_eq!(states, vec![ProgramState::Working, ProgramState::Done]);
     }
 
     #[test]

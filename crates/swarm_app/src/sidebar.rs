@@ -215,10 +215,10 @@ fn project_row(
     let end = h_flex()
         .gap(px(8.))
         .when(project.config_error.is_some(), |end| {
-            end.child(StatusPill::new(AgentStatus::Waiting).label("Config error"))
+            end.child(StatusPill::new(AgentStatus::Blocked).label("Config error"))
         })
         .when(needs_you, |end| {
-            end.child(StatusPill::new(AgentStatus::Waiting).label("Needs you"))
+            end.child(StatusPill::new(AgentStatus::Blocked).label("Needs you"))
         })
         .when(!needs_you && working, |end| {
             end.child(StatusRing::new(AgentStatus::Working))

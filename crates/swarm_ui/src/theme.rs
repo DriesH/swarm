@@ -81,7 +81,7 @@ pub struct ThemeColors {
     /// Done status and success.
     pub ok: Hsla,
     pub ok_bg: Hsla,
-    /// Waiting status and attention ring.
+    /// Blocked status and attention ring.
     pub warn: Hsla,
     pub warn_bg: Hsla,
     /// Diff additions and deletions.

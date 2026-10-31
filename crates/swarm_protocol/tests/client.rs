@@ -11,8 +11,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use swarm_protocol::{
-    Client, ClientError, CreateTask, CreateTerminal, Event, ProjectId, ProjectInfo, Request,
-    TaskId, TaskInfo, TerminalId, TerminalInfo, TerminalKind, VERSION, read, write,
+    AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, Client, ClientError,
+    CreateTask, CreateTerminal, Event, ProjectId, ProjectInfo, Request, TaskId, TaskInfo,
+    TerminalId, TerminalInfo, TerminalKind, VERSION, read, write,
 };
 use swarm_term::{Palette, Rgb, Size, TerminalInput, TerminalOutput};
 
@@ -476,6 +477,7 @@ fn task_info() -> TaskInfo {
         ports: vec![3000],
         setup_terminal: Some(TerminalId(9)),
         setup_exit: None,
+        agents: Vec::new(),
     }
 }
 
@@ -563,6 +565,8 @@ fn create_task_request() -> CreateTask {
         name: "login".into(),
         from: None,
         run_setup: true,
+        orchestrator: Some(AgentKind::Codex),
+        first_message: Some("start with the tests".into()),
     }
 }
 
@@ -608,4 +612,43 @@ fn create_task_reports_a_daemon_error() {
     let result = client.create_task(create_task_request());
 
     assert!(matches!(result, Err(ClientError::Daemon(message)) if message == "branch exists"));
+}
+
+fn agent_info(status: AgentStatus) -> AgentInfo {
+    AgentInfo {
+        id: AgentId(1),
+        task: TaskId(4),
+        role: AgentRole::Orchestrator,
+        kind: AgentKind::ClaudeCode,
+        model: "opus".into(),
+        terminal: Some(TerminalId(7)),
+        status,
+        message: None,
+        lifecycle: AgentLifecycle::Running,
+        revision: 1,
+    }
+}
+
+#[test]
+fn agent_changes_reach_the_agent_events() {
+    let socket = serve(|fake| {
+        fake.handshake(VERSION);
+        fake.send(&Event::AgentChanged {
+            agent: agent_info(AgentStatus::Working),
+        });
+        fake.send(&Event::AgentChanged {
+            agent: agent_info(AgentStatus::Done),
+        });
+        fake.drain();
+    });
+    let client = Client::connect(&socket).expect("connect");
+    let events = client.agent_events();
+
+    let first = events.recv_timeout(WAIT).expect("first event");
+    let second = events.recv_timeout(WAIT).expect("second event");
+
+    assert_eq!(
+        (first.status, second.status),
+        (AgentStatus::Working, AgentStatus::Done)
+    );
 }

@@ -32,7 +32,8 @@ Cargo workspace:
 | `swarm_core` | Projects, tasks, agents, worktrees, messages, state in SQLite |
 | `swarm_protocol` | Socket protocol between daemon and app (postcard frames) and the app's client. No libghostty |
 | `swarm_daemon` | Background process that owns PTYs and runs `swarm_core` |
-| `swarm_harness` | Unix socket API, `swarm` CLI and MCP server |
+| `swarm_settings` | User settings in `~/.config/swarm/settings.toml` (agents, default models), shared by app and daemon |
+| `swarm_cli` | The `swarm` CLI agents use (hooks now; spawn, send, ask and MCP next) over the daemon's agent socket (ADR 0008) |
 | `swarm_app` | Window, sidebar, tabs, Terminals / Swarm / Review views, panels, settings |
 | `swarm_usage` | Menu bar icon, popover and usage polling |
 
@@ -320,6 +321,7 @@ Reports in `docs/spikes/`. Code in `spikes/` (throwaway).
 - Claude Code: pick the session ID up front with `--session-id`; resume with `--resume <id>`. Hooks via `--settings <file>`, never by editing the user's settings.
 - Codex: `--dangerously-bypass-approvals-and-sandbox` to skip approvals; `-c developer_instructions=…` adds to AGENTS.md; `codex resume <id>` (pass `-m` again for `codex exec resume`); the session ID only arrives at the first prompt; hooks passed with `-c` need their trust hash passed too.
 - Start Codex with `-c check_for_update_on_startup=false`. Never type into an agent before it reports `idle`: startup prompts swallow input (a spike accepted a Codex update this way).
+- Both CLIs ask once per project whether to trust the folder; they key trust on the main repository root, so worktrees share the answer. Swarm never pre-trusts. While the dialog shows, the agent is blocked with "Trust this folder".
 
 **Usage and menu bar**
 

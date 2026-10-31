@@ -2,19 +2,25 @@
 
 #![expect(clippy::expect_used, reason = "test helpers panic on failure")]
 
-use std::os::unix::fs::DirBuilderExt as _;
+use std::io::{BufRead as _, BufReader, Write as _};
+use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Once;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use swarm_core::store::Store;
 use swarm_protocol::{
-    CallId, CreateTask, CreateTerminal, Event, ProjectInfo, Request, TaskInfo, TerminalId,
-    TerminalInfo, TerminalKind, VERSION, read, write,
+    AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentStatus, CallId, CreateTask, CreateTerminal,
+    Event, ProjectInfo, Request, TaskInfo, TerminalId, TerminalInfo, TerminalKind, VERSION, read,
+    write,
 };
-use swarm_term::{ExitStatus, Palette, Rgb, Row, Size, TerminalInput, TerminalOutput};
+use swarm_term::{
+    BlockedKind, ExitStatus, Palette, ProgramState, Rgb, Row, Size, TerminalInput, TerminalOutput,
+};
 
 static NEXT_HOME: AtomicU32 = AtomicU32::new(0);
 
@@ -38,6 +44,10 @@ impl Daemon {
 
     /// Starts the process without waiting for the socket.
     fn spawn_in(home: PathBuf) -> Self {
+        Self::spawn_with(home, None)
+    }
+
+    fn spawn_with(home: PathBuf, settings: Option<&Path>) -> Self {
         std::fs::create_dir_all(&home).expect("home");
         let log = std::fs::File::options()
             .create(true)
@@ -45,9 +55,13 @@ impl Daemon {
             .open(home.join("daemon.log"))
             .expect("log");
 
-        let child = Command::new(env!("CARGO_BIN_EXE_swarm-daemon"))
-            .arg("--data-dir")
-            .arg(&home)
+        let mut command = Command::new(env!("CARGO_BIN_EXE_swarm-daemon"));
+        command.arg("--data-dir").arg(&home);
+        if let Some(settings) = settings {
+            command.arg("--settings").arg(settings);
+        }
+
+        let child = command
             .env("RUST_LOG", "info")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -75,6 +89,18 @@ impl Daemon {
 
     fn start() -> Self {
         Self::start_in(Self::new_home())
+    }
+
+    fn start_with_settings(settings: &Path) -> Self {
+        swarm_binary();
+        let daemon = Self::spawn_with(Self::new_home(), Some(settings));
+        daemon.wait_until_listening();
+
+        daemon
+    }
+
+    fn agent_socket(&self) -> PathBuf {
+        self.home.join("agent.sock")
     }
 
     fn socket(&self) -> PathBuf {
@@ -639,7 +665,7 @@ impl Drop for Repo {
 }
 
 impl Client {
-    fn add_project(&mut self, path: &std::path::Path) -> ProjectInfo {
+    fn add_project(&mut self, path: &Path) -> ProjectInfo {
         self.send(&Request::AddProject {
             call: CALL,
             path: path.to_owned(),
@@ -703,6 +729,8 @@ fn a_task_runs_its_setup_script_in_a_process_terminal() {
         name: "First task".to_owned(),
         from: None,
         run_setup: true,
+        orchestrator: None,
+        first_message: None,
     });
 
     let setup = task.setup_terminal.expect("setup terminal");
@@ -750,6 +778,8 @@ fn a_slow_task_does_not_block_other_requests() {
             name: "Big".to_owned(),
             from: None,
             run_setup: false,
+            orchestrator: None,
+            first_message: None,
         },
     });
     client.send(&Request::List { call: CallId(3) });
@@ -799,6 +829,8 @@ fn a_task_for_an_unknown_project_is_reported_on_its_call() {
             name: "x".to_owned(),
             from: None,
             run_setup: false,
+            orchestrator: None,
+            first_message: None,
         },
     });
 
@@ -900,4 +932,622 @@ fn a_daemon_started_from_a_thread_that_blocks_signals_stops_on_sigterm() {
     }
 
     assert!(!alive, "the daemon ignored SIGTERM");
+}
+
+/// The `swarm` binary next to the daemon. `cargo test -p swarm_daemon` does not build
+/// it, so build it once when it is missing.
+fn swarm_binary() -> PathBuf {
+    static BUILT: Once = Once::new();
+
+    let path = Path::new(env!("CARGO_BIN_EXE_swarm-daemon")).with_file_name("swarm");
+    BUILT.call_once(|| {
+        if path.is_file() {
+            return;
+        }
+
+        let status = Command::new(env!("CARGO"))
+            .args(["build", "-p", "swarm_cli"])
+            .status()
+            .expect("run cargo build");
+        assert!(status.success(), "cannot build swarm_cli");
+    });
+    assert!(path.is_file(), "{} is missing", path.display());
+
+    path
+}
+
+/// A fake agent script and the settings file that points at it.
+struct Fixture {
+    dir: PathBuf,
+    out: PathBuf,
+}
+
+impl Fixture {
+    /// `body` runs as `/bin/sh` with `$OUT` (a folder) and `$SWARM` (the hook binary).
+    fn new(body: &str) -> Self {
+        let number = NEXT_HOME.fetch_add(1, Ordering::Relaxed);
+        let dir = PathBuf::from(format!("/tmp/swd-fx-{}-{number}", std::process::id()));
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).expect("fixture folders");
+
+        let script = dir.join("fake-agent.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nOUT='{}'\nSWARM='{}'\n{body}\n",
+                out.display(),
+                swarm_binary().display()
+            ),
+        )
+        .expect("script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("mode");
+
+        std::fs::write(
+            dir.join("settings.toml"),
+            format!(
+                "[agents.claude_code]\ncommand = \"{0}\"\norchestrator_model = \"opus\"\nworker_model = \"sonnet\"\n\
+                 [agents.codex]\ncommand = \"{0}\"\norchestrator_model = \"gpt-reserve\"\nworker_model = \"gpt-6-luna\"\n",
+                script.display()
+            ),
+        )
+        .expect("settings");
+
+        Self { dir, out }
+    }
+
+    fn settings(&self) -> PathBuf {
+        self.dir.join("settings.toml")
+    }
+
+    /// Waits for a file the script wrote and returns its text.
+    fn read_when_written(&self, name: &str) -> String {
+        let path = self.out.join(name);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&path)
+                && !text.is_empty()
+            {
+                return text;
+            }
+            assert!(Instant::now() < deadline, "{name} was never written");
+            thread::park_timeout(Duration::from_millis(30));
+        }
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.dir).ok();
+    }
+}
+
+fn orchestrator_task(project: swarm_protocol::ProjectId, run_setup: bool) -> CreateTask {
+    CreateTask {
+        project,
+        name: "Agent task".to_owned(),
+        from: None,
+        run_setup,
+        orchestrator: Some(AgentKind::ClaudeCode),
+        first_message: None,
+    }
+}
+
+impl Client {
+    /// Reads events until an agent change satisfies `pick`.
+    fn wait_for_agent(&mut self, pick: impl Fn(&AgentInfo) -> bool) -> AgentInfo {
+        self.wait_for(|event| match event {
+            Event::AgentChanged { agent } if pick(agent) => Some(agent.clone()),
+            _ => None,
+        })
+    }
+}
+
+fn database(daemon: &Daemon) -> Store {
+    Store::open(&daemon.home.join("swarm.db")).expect("open the database")
+}
+
+#[test]
+fn an_orchestrator_reports_idle_working_done_and_keeps_its_hook_session() {
+    let fixture = Fixture::new(
+        r#"printf '\033]7501;state=idle\007'
+IFS= read -r line
+printf '%s\n' "$line" > "$OUT/first-message"
+printf '\033]7501;state=working\007'
+printf '{"hook_event_name":"SessionStart","session_id":"hook-session-1"}' | "$SWARM" hook
+sleep 0.3
+printf '\033]7501;state=done\007'
+sleep 0.3
+exit 0"#,
+    );
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let mut watcher = daemon.connect();
+    watcher.hello();
+    let project = client.add_project(&repo.root);
+
+    let mut request = orchestrator_task(project.id, false);
+    request.first_message = Some("hello agent".to_owned());
+    let task = client.create_task(request);
+
+    assert_eq!(task.agents.len(), 1);
+    assert_eq!(task.agents[0].status, AgentStatus::Unknown);
+    let agent_id = task.agents[0].id;
+    let mut statuses = Vec::new();
+    let mut revisions = Vec::new();
+    let last = client.wait_for(|event| match event {
+        Event::AgentChanged { agent } if agent.id == agent_id => {
+            statuses.push(agent.status);
+            revisions.push(agent.revision);
+
+            (agent.lifecycle == AgentLifecycle::Resumable).then(|| agent.clone())
+        }
+        _ => None,
+    });
+
+    let mut seen: Vec<AgentStatus> = Vec::new();
+    for status in statuses {
+        if seen.last() != Some(&status) {
+            seen.push(status);
+        }
+    }
+    let wanted = [AgentStatus::Idle, AgentStatus::Working, AgentStatus::Done];
+    let mut position = 0;
+    for status in &seen {
+        if position < wanted.len() && *status == wanted[position] {
+            position += 1;
+        }
+    }
+    assert_eq!(position, wanted.len(), "statuses were {seen:?}");
+    assert_eq!(last.status, AgentStatus::Done);
+    assert_eq!(last.terminal, None);
+    assert_eq!(last.model, "opus");
+    assert!(
+        revisions.windows(2).all(|pair| pair[0] < pair[1]),
+        "revisions were {revisions:?}"
+    );
+    assert!(revisions.len() >= 4, "start, idle, working, done, exit");
+
+    assert_eq!(
+        fixture.read_when_written("first-message").trim(),
+        "hello agent"
+    );
+
+    let stored = database(&daemon)
+        .agent(agent_id)
+        .expect("read")
+        .expect("row");
+    assert_eq!(stored.session_id.as_deref(), Some("hook-session-1"));
+    assert!(stored.session_confirmed);
+    assert_eq!(stored.info.revision, last.revision);
+
+    let done = watcher.wait_for_agent(|agent| agent.status == AgentStatus::Done);
+    assert_eq!(done.id, agent_id, "every client gets agent changes");
+
+    let listed = client.projects();
+    assert_eq!(
+        listed[0].tasks[0].agents[0].lifecycle,
+        AgentLifecycle::Resumable
+    );
+    assert_eq!(listed[0].tasks[0].agents[0].revision, last.revision);
+}
+
+#[test]
+fn the_first_message_waits_for_the_agent_to_be_idle() {
+    let fixture = Fixture::new(
+        r#"sleep 1
+printf '\033]7501;state=idle\007'
+IFS= read -r line
+printf '%s\n' "$line" > "$OUT/first-message"
+sleep 30"#,
+    );
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+
+    let mut request = orchestrator_task(project.id, false);
+    request.first_message = Some("hello agent".to_owned());
+    client.create_task(request);
+    let running = client.wait_for_agent(|agent| agent.terminal.is_some());
+    client.send(&Request::Attach {
+        id: running.terminal.expect("terminal"),
+        history: 0,
+    });
+
+    let mut idle_seen = false;
+    let mut typed_early = false;
+    while !idle_seen {
+        let event = client.next();
+        let Event::Output { output, .. } = event else {
+            continue;
+        };
+        match output {
+            TerminalOutput::ProgramStatus(status) => {
+                idle_seen = status.state == ProgramState::Idle;
+            }
+            TerminalOutput::Snapshot(snapshot) => {
+                typed_early |= snapshot
+                    .rows
+                    .iter()
+                    .any(|row| row_text(row).contains("hello agent"));
+            }
+            TerminalOutput::Update(update) => {
+                typed_early |= update
+                    .rows
+                    .iter()
+                    .any(|(_, row)| row_text(row).contains("hello agent"));
+            }
+            _ => {}
+        }
+    }
+
+    assert!(
+        !typed_early,
+        "the message was typed before the agent was idle"
+    );
+    assert_eq!(
+        fixture.read_when_written("first-message").trim(),
+        "hello agent"
+    );
+}
+
+#[test]
+fn the_orchestrator_starts_only_after_the_setup_ended() {
+    let fixture = Fixture::new(
+        r#"if [ -f setup-done ]; then echo yes > "$OUT/saw-setup"; else echo no > "$OUT/saw-setup"; fi
+printf '\033]7501;state=idle\007'
+sleep 30"#,
+    );
+    let repo = Repo::new("[worktrees]\nsetup = \"sleep 1; echo ok > setup-done\"\n");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+
+    let task = client.create_task(orchestrator_task(project.id, true));
+
+    assert_eq!(task.agents[0].lifecycle, AgentLifecycle::Starting);
+    assert_eq!(fixture.read_when_written("saw-setup").trim(), "yes");
+    let running = client.wait_for_agent(|agent| agent.lifecycle == AgentLifecycle::Running);
+    assert!(running.terminal.is_some());
+}
+
+#[test]
+fn a_failed_setup_gives_an_error_and_starts_no_process() {
+    let fixture = Fixture::new(r#"echo ran > "$OUT/ran"; sleep 30"#);
+    let repo = Repo::new("[worktrees]\nsetup = \"exit 3\"\n");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+
+    let task = client.create_task(orchestrator_task(project.id, true));
+
+    let failed = client.wait_for_agent(|agent| agent.status == AgentStatus::Error);
+    assert_eq!(failed.id, task.agents[0].id);
+    assert_eq!(failed.message.as_deref(), Some("Setup failed"));
+    assert_eq!(failed.lifecycle, AgentLifecycle::Stopped);
+    assert_eq!(failed.terminal, None);
+
+    thread::park_timeout(Duration::from_millis(500));
+    assert!(
+        !fixture.out.join("ran").exists(),
+        "the agent started anyway"
+    );
+    let stored = database(&daemon)
+        .agent(failed.id)
+        .expect("read")
+        .expect("row");
+    assert_eq!(stored.info.status, AgentStatus::Error);
+}
+
+#[test]
+fn the_trust_dialog_blocks_the_agent_with_a_message() {
+    let fixture = Fixture::new(
+        r"printf 'Quick safety check\r\n  1. Yes, I trust this folder\r\n  2. No, exit\r\n'
+sleep 30",
+    );
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+
+    client.create_task(orchestrator_task(project.id, false));
+
+    let blocked =
+        client.wait_for_agent(|agent| agent.status == AgentStatus::Blocked(BlockedKind::Other));
+    assert_eq!(blocked.message.as_deref(), Some("Trust this folder"));
+}
+
+/// Sends one line to the agent socket and returns the parsed answer.
+fn agent_request(daemon: &Daemon, line: &[u8]) -> serde_json::Value {
+    let mut stream = UnixStream::connect(daemon.agent_socket()).expect("connect");
+    stream
+        .set_read_timeout(Some(READ_TIMEOUT))
+        .expect("timeout");
+    stream.write_all(line).expect("write");
+    stream.write_all(b"\n").expect("write");
+
+    let mut answer = String::new();
+    BufReader::new(stream)
+        .read_line(&mut answer)
+        .expect("answer");
+
+    serde_json::from_str(&answer).expect("json answer")
+}
+
+#[test]
+fn the_agent_socket_refuses_a_wrong_token_and_app_requests() {
+    let fixture = Fixture::new("sleep 30");
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let task = client.create_task(orchestrator_task(project.id, false));
+    let AgentId(agent) = task.agents[0].id;
+    client.wait_for_agent(|agent| agent.lifecycle == AgentLifecycle::Running);
+
+    let wrong = agent_request(
+        &daemon,
+        format!(
+            r#"{{"method":"hook","agent":{agent},"token":"wrong","event":{{"hook_event_name":"Stop"}}}}"#
+        )
+        .as_bytes(),
+    );
+    let unknown_agent = agent_request(
+        &daemon,
+        br#"{"method":"hook","agent":999,"token":"x","event":{}}"#,
+    );
+    let listing = agent_request(&daemon, br#"{"method":"list","agent":1,"token":"x"}"#);
+    let garbage = agent_request(&daemon, &[0x05, 0x00, 0x00, 0x00, 0x00, 0x01]);
+
+    for answer in [wrong, unknown_agent, listing, garbage] {
+        assert_eq!(answer["ok"], false, "{answer}");
+    }
+    assert_eq!(
+        std::fs::metadata(daemon.agent_socket())
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn a_created_agent_leaves_no_process_behind_after_the_daemon_stops() {
+    let fixture = Fixture::new("sleep 31");
+    let repo = Repo::new("");
+    let mut daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    client.create_task(orchestrator_task(project.id, false));
+    client.wait_for_agent(|agent| agent.lifecycle == AgentLifecycle::Running);
+
+    assert!(daemon.stops_on_sigterm(), "the daemon ignored SIGTERM");
+
+    thread::park_timeout(Duration::from_millis(300));
+    assert!(!pgrep("sleep 31"));
+}
+
+#[test]
+fn running_agents_become_resumable_after_a_daemon_crash() {
+    let fixture = Fixture::new(
+        r#"printf '\033]7501;state=working\007'
+printf '{"hook_event_name":"SessionStart","session_id":"hook-session-2"}' | "$SWARM" hook
+sleep 30"#,
+    );
+    let repo = Repo::new("");
+    let mut daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let task = client.create_task(orchestrator_task(project.id, false));
+    client.wait_for_agent(|agent| agent.status == AgentStatus::Working);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let before = loop {
+        let stored = database(&daemon)
+            .agent(task.agents[0].id)
+            .expect("read")
+            .expect("row");
+        if stored.session_confirmed {
+            break stored;
+        }
+        assert!(Instant::now() < deadline, "the session was never confirmed");
+        thread::park_timeout(Duration::from_millis(30));
+    };
+    drop(client);
+
+    daemon.crash();
+    let restarted = Daemon::start_in(daemon.home.clone());
+    let mut client = restarted.connect();
+    client.hello();
+
+    let agent = &client.projects()[0].tasks[0].agents[0];
+    assert_eq!(agent.id, task.agents[0].id);
+    assert_eq!(agent.lifecycle, AgentLifecycle::Resumable);
+    assert_eq!(agent.status, AgentStatus::Unknown);
+    assert_eq!(agent.message, None);
+    assert_eq!(agent.terminal, None);
+    assert!(agent.revision > before.info.revision);
+}
+
+#[test]
+fn an_agent_that_never_reported_a_session_is_stopped_after_a_daemon_crash() {
+    let fixture = Fixture::new(
+        r"printf '\033]7501;state=working\007'
+sleep 30",
+    );
+    let repo = Repo::new("");
+    let mut daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    client.create_task(orchestrator_task(project.id, false));
+    client.wait_for_agent(|agent| agent.status == AgentStatus::Working);
+    drop(client);
+
+    daemon.crash();
+    let restarted = Daemon::start_in(daemon.home.clone());
+    let mut client = restarted.connect();
+    client.hello();
+
+    let agent = &client.projects()[0].tasks[0].agents[0];
+    assert_eq!(agent.lifecycle, AgentLifecycle::Stopped);
+    assert_eq!(agent.status, AgentStatus::Unknown);
+}
+
+#[test]
+fn an_agent_that_exits_without_a_session_report_is_stopped() {
+    let fixture = Fixture::new("exit 0");
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    client.create_task(orchestrator_task(project.id, false));
+
+    let ended = client.wait_for_agent(|agent| {
+        agent.lifecycle == AgentLifecycle::Stopped || agent.lifecycle == AgentLifecycle::Resumable
+    });
+
+    assert_eq!(ended.lifecycle, AgentLifecycle::Stopped);
+}
+
+#[test]
+fn a_session_start_hook_types_the_first_message_when_no_osc_report_comes() {
+    let fixture = Fixture::new(
+        r#"printf '{"hook_event_name":"SessionStart","session_id":"s"}' | "$SWARM" hook
+IFS= read -r line
+printf '%s\n' "$line" > "$OUT/first-message"
+sleep 30"#,
+    );
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+
+    let mut request = orchestrator_task(project.id, false);
+    request.first_message = Some("hello agent".to_owned());
+    client.create_task(request);
+
+    assert_eq!(
+        fixture.read_when_written("first-message").trim(),
+        "hello agent"
+    );
+}
+
+#[test]
+fn the_codex_trust_dialog_blocks_the_agent_with_a_message() {
+    let fixture = Fixture::new(
+        r"printf 'Folder access\r\n  Trust this folder? Codex can read, edit, and run files here,\r\n> 1. Trust and continue\r\n  2. Quit\r\n'
+sleep 30",
+    );
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+
+    let mut request = orchestrator_task(project.id, false);
+    request.orchestrator = Some(AgentKind::Codex);
+    client.create_task(request);
+
+    let blocked =
+        client.wait_for_agent(|agent| agent.status == AgentStatus::Blocked(BlockedKind::Other));
+    assert_eq!(blocked.message.as_deref(), Some("Trust this folder"));
+}
+
+#[test]
+fn a_missing_command_gives_a_short_message() {
+    let fixture = Fixture::new("sleep 30");
+    std::fs::write(
+        fixture.settings(),
+        "[agents.claude_code]\ncommand = \"/nonexistent/claude\"\norchestrator_model = \"opus\"\nworker_model = \"sonnet\"\n",
+    )
+    .expect("settings");
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+
+    client.create_task(orchestrator_task(project.id, false));
+
+    let failed = client.wait_for_agent(|agent| agent.status == AgentStatus::Error);
+    assert_eq!(failed.message.as_deref(), Some("Command not found"));
+}
+
+#[test]
+fn an_agent_folder_and_its_files_are_private() {
+    let fixture = Fixture::new("sleep 30");
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let task = client.create_task(orchestrator_task(project.id, false));
+    client.wait_for_agent(|agent| agent.lifecycle == AgentLifecycle::Running);
+
+    let folder = daemon
+        .home
+        .join("agents")
+        .join(task.agents[0].id.0.to_string());
+    let mode = |path: &Path| {
+        std::fs::metadata(path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777
+    };
+
+    assert_eq!(mode(&folder), 0o700);
+    assert_eq!(mode(&folder.join("system-prompt.md")), 0o600);
+    assert_eq!(mode(&folder.join("claude-settings.json")), 0o600);
+}
+
+#[test]
+fn the_agent_socket_serves_at_most_64_connections() {
+    let daemon = Daemon::start();
+    let held: Vec<UnixStream> = (0..64)
+        .map(|_| UnixStream::connect(daemon.agent_socket()).expect("connect"))
+        .collect();
+
+    let mut extra = UnixStream::connect(daemon.agent_socket()).expect("connect");
+    extra
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    let mut buffer = [0_u8; 1];
+
+    let read = std::io::Read::read(&mut extra, &mut buffer);
+    assert!(
+        matches!(read, Ok(0)),
+        "the extra connection stayed open: {read:?}"
+    );
+
+    drop(held);
+    let after = agent_request(
+        &daemon,
+        br#"{"method":"hook","agent":1,"token":"x","event":{}}"#,
+    );
+    assert_eq!(after["error"], "refused");
+}
+
+#[test]
+fn the_agent_socket_accepts_lines_over_one_mebibyte() {
+    let daemon = Daemon::start();
+    let padding = "x".repeat(2 << 20);
+    let line =
+        format!(r#"{{"method":"hook","agent":1,"token":"x","event":{{"pad":"{padding}"}}}}"#);
+
+    let answer = agent_request(&daemon, line.as_bytes());
+
+    assert_eq!(answer["error"], "refused");
 }

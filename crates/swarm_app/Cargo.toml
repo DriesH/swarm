@@ -5,7 +5,7 @@ edition.workspace = true
 publish.workspace = true
 
 [[bin]]
-name = "swarm"
+name = "swarm-app"
 path = "src/main.rs"
 
 [lints]
@@ -21,6 +21,7 @@ image = { workspace = true, optional = true }
 log.workspace = true
 swarm_layout.workspace = true
 swarm_protocol.workspace = true
+swarm_settings.workspace = true
 swarm_term.workspace = true
 swarm_term_view.workspace = true
 swarm_ui.workspace = true

@@ -114,7 +114,7 @@ const DIGITS: [&str; 9] = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
 fn task_status(status: TaskStatus) -> (AgentStatus, Option<&'static str>) {
     match status {
         TaskStatus::Working => (AgentStatus::Working, None),
-        TaskStatus::NeedsYou => (AgentStatus::Waiting, Some("Needs you")),
+        TaskStatus::NeedsYou => (AgentStatus::Blocked, Some("Needs you")),
         TaskStatus::Idle => (AgentStatus::Idle, None),
     }
 }
