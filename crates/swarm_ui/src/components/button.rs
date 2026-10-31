@@ -118,6 +118,7 @@ impl ButtonVariant {
 pub struct Button {
     id: ElementId,
     label: SharedString,
+    accessible_label: Option<SharedString>,
     variant: ButtonVariant,
     size: ButtonSize,
     icon: Option<IconName>,
@@ -135,6 +136,7 @@ impl Button {
         Self {
             id: id.into(),
             label: label.into(),
+            accessible_label: None,
             variant: ButtonVariant::default(),
             size: ButtonSize::default(),
             icon: None,
@@ -155,6 +157,13 @@ impl Button {
 
     pub fn size(mut self, size: ButtonSize) -> Self {
         self.size = size;
+        self
+    }
+
+    /// What VoiceOver reads when the visible label does not say enough, for example
+    /// "Show diff, Cargo.lock". It should start with the visible label.
+    pub fn accessible_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.accessible_label = Some(label.into());
         self
     }
 
@@ -242,7 +251,11 @@ impl RenderOnce for Button {
         div()
             .id(self.id)
             .role(Role::Button)
-            .aria_label(self.label.clone())
+            .aria_label(
+                self.accessible_label
+                    .clone()
+                    .unwrap_or_else(|| self.label.clone()),
+            )
             .when_some(self.toggle_state, |button, on| {
                 button.aria_toggled(if on { Toggled::True } else { Toggled::False })
             })

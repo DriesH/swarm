@@ -305,3 +305,48 @@ fn resize_handle_is_a_splitter_with_its_width() {
         assert_eq!(info.node.max_numeric_value(), Some(640.));
     });
 }
+
+#[test]
+fn tree_row_is_a_tree_item_with_level_and_state() {
+    with_window(|window, cx| {
+        let folder = a11y_info(
+            TreeRow::new("folder", "crates")
+                .level(2)
+                .folder(false)
+                .toggle_state(true),
+            window,
+            cx,
+        );
+        let file = a11y_info(
+            TreeRow::new("file", "main.rs").accessible_label("main.rs, 3 additions"),
+            window,
+            cx,
+        );
+
+        assert_eq!(folder.role, Some(Role::TreeItem));
+        assert_eq!(folder.node.label(), Some("crates"));
+        assert_eq!(folder.node.level(), Some(3));
+        assert_eq!(folder.node.is_expanded(), Some(false));
+        assert_eq!(folder.node.is_selected(), Some(true));
+
+        assert_eq!(file.role, Some(Role::TreeItem));
+        assert_eq!(file.node.label(), Some("main.rs, 3 additions"));
+        assert_eq!(file.node.level(), Some(1));
+        assert_eq!(file.node.is_expanded(), None);
+        assert_eq!(file.node.is_selected(), Some(false));
+    });
+}
+
+#[test]
+fn button_accessible_label_replaces_the_visible_one_in_its_name() {
+    with_window(|window, cx| {
+        let info = a11y_info(
+            Button::new("show", "Show diff").accessible_label("Show diff, Cargo.lock"),
+            window,
+            cx,
+        );
+
+        assert_eq!(info.role, Some(Role::Button));
+        assert_eq!(info.node.label(), Some("Show diff, Cargo.lock"));
+    });
+}

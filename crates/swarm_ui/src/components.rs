@@ -25,6 +25,7 @@ pub(crate) mod text_input;
 mod tile_frame;
 mod tooltip;
 mod tray_chip;
+mod tree_row;
 
 pub use button::*;
 pub use check_row::*;
@@ -53,6 +54,7 @@ pub use text_input::*;
 pub use tile_frame::*;
 pub use tooltip::*;
 pub use tray_chip::*;
+pub use tree_row::*;
 
 use crate::component::ComponentEntry;
 
@@ -81,6 +83,7 @@ pub fn all_components() -> Vec<ComponentEntry> {
         ComponentEntry::of::<CheckRow>(),
         ComponentEntry::of::<OutputBlock>(),
         ComponentEntry::of::<ListRow>(),
+        ComponentEntry::of::<TreeRow>(),
         ComponentEntry::of::<TrayChip>(),
         ComponentEntry::of::<TrayMore>(),
         ComponentEntry::of::<Panel>(),
