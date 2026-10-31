@@ -221,6 +221,9 @@ pub struct NewAgent<'a> {
     pub ports: &'a [u16],
 }
 
+/// The most bytes of text one message, brief or report may hold.
+pub const MAX_MESSAGE_BYTES: usize = 64 << 10;
+
 /// A message to record.
 #[derive(Debug, Clone, Copy)]
 pub struct NewMessage<'a> {
@@ -285,6 +288,15 @@ impl Store {
         }
 
         Ok(Self { connection })
+    }
+
+    /// Runs `work` as one transaction: a failure undoes everything it wrote.
+    pub fn atomically<T>(&self, work: impl FnOnce(&Self) -> Result<T, Error>) -> Result<T, Error> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let value = work(self)?;
+        transaction.commit()?;
+
+        Ok(value)
     }
 
     /// Written before the process starts (ADR 0005). The row id is the terminal id,
@@ -2399,5 +2411,33 @@ mod tests {
         assert_eq!(task_messages.len(), 1);
         assert_eq!(task_messages[0].text, "for task");
         assert!(other.is_empty());
+    }
+
+    #[test]
+    fn a_failed_transaction_leaves_no_row_behind() {
+        let (store, task) = store_with_task();
+        let agent = store.add_agent(&new_agent(task)).expect("agent");
+
+        let failed: Result<(), Error> = store.atomically(|store| {
+            store.add_message(&message(None, agent.id, "lost"))?;
+
+            Err(Error::Invalid("second step failed".to_owned()))
+        });
+        assert!(failed.is_err());
+        assert!(
+            store
+                .list_messages(agent.project, Some(task), 10)
+                .expect("list")
+                .is_empty()
+        );
+
+        store
+            .atomically(|store| store.add_message(&message(None, agent.id, "kept")))
+            .expect("commit");
+        let kept = store
+            .list_messages(agent.project, Some(task), 10)
+            .expect("list");
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].text, "kept");
     }
 }

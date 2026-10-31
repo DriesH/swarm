@@ -4085,7 +4085,7 @@ fn a_live_comment_reaches_the_orchestrator_and_names_the_worker() {
     let id = changed(&events)[0].id;
     assert_eq!(
         messages[0].text,
-        format!("#{} for api · api.txt:2\n> two\nCache it.", id.0)
+        format!("#{} for api · \"api.txt\":2\n> two\nCache it.", id.0)
     );
     let sent = changed(&events);
     assert_eq!(sent.len(), 1);
@@ -4263,4 +4263,120 @@ fn deleting_a_pending_comment_deletes_its_replies_and_tells_everyone() {
     });
     assert_eq!(gone, [reply, parent]);
     assert!(client.list_comments(task.id).is_empty());
+}
+
+#[test]
+fn approving_waits_until_the_comments_are_sent() {
+    let fixture = Fixture::new("sleep 60");
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let task = client.create_task(orchestrator_task(project.id, false));
+    std::fs::write(task.worktree.join("api.txt"), "one\ntwo\n").expect("file");
+    commit_all(&task.worktree);
+    let fingerprint = client
+        .task_diff(task.id, ReviewSource::Merged, None)
+        .expect("diff")
+        .expect("a diff")
+        .fingerprint;
+    client
+        .add_comment(comment_at(&task, ReviewSource::Merged, 1, "one", "A"))
+        .expect("added");
+    let approve = Request::ApproveTask {
+        call: CALL,
+        task: task.id,
+        fingerprint,
+    };
+
+    let refused = client.until_done(&approve);
+    assert_eq!(refused.expect_err("refused"), "comments are pending");
+
+    client
+        .until_done(&Request::SendComments {
+            call: CALL,
+            task: task.id,
+        })
+        .expect("sent");
+    client.until_done(&approve).expect("approved");
+}
+
+#[test]
+fn a_stopped_orchestrator_gets_no_comment_and_nothing_is_stored() {
+    let fixture = Fixture::new("exit 0");
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let task = client.create_task(orchestrator_task(project.id, false));
+    client.wait_for_agent(|agent| agent.lifecycle == AgentLifecycle::Stopped);
+
+    let held = client
+        .add_comment(comment_at(&task, ReviewSource::Merged, 1, "one", "A"))
+        .expect("a comment that waits needs no orchestrator");
+    assert_eq!(changed(&held)[0].state, CommentState::Pending);
+
+    let live = client.add_comment(comment_at(&task, ReviewSource::Live, 1, "one", "B"));
+    let send = client.until_done(&Request::SendComments {
+        call: CALL,
+        task: task.id,
+    });
+
+    assert_eq!(live.expect_err("refused"), "the orchestrator is stopped");
+    assert_eq!(send.expect_err("refused"), "the orchestrator is stopped");
+    let listed = client.list_comments(task.id);
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].state, CommentState::Pending);
+}
+
+#[test]
+fn a_large_batch_goes_out_in_messages_of_at_most_64_kib() {
+    let fixture = Fixture::new("sleep 60");
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let task = client.create_task(orchestrator_task(project.id, false));
+    let body = "x".repeat(swarm_protocol::COMMENT_BYTES);
+    for _ in 0..5 {
+        client
+            .add_comment(comment_at(&task, ReviewSource::Merged, 1, "one", &body))
+            .expect("added");
+    }
+
+    let events = client
+        .until_done(&Request::SendComments {
+            call: CALL,
+            task: task.id,
+        })
+        .expect("sent");
+
+    let messages = comment_messages(&events);
+    assert_eq!(messages.len(), 2);
+    assert!(messages[0].text.starts_with("3 comments (1 of 2):\n\n"));
+    assert!(messages[1].text.starts_with("2 comments (2 of 2):\n\n"));
+    assert!(
+        messages
+            .iter()
+            .all(|message| message.text.len() <= 64 << 10)
+    );
+    let sent = changed(&events);
+    assert_eq!(sent.len(), 5);
+    assert!(
+        sent.iter()
+            .all(|comment| comment.state == CommentState::Sent)
+    );
+
+    let last_message = events
+        .iter()
+        .rposition(|event| matches!(event, Event::MessageSent { .. }))
+        .expect("a message");
+    let first_comment = events
+        .iter()
+        .position(|event| matches!(event, Event::CommentChanged { .. }))
+        .expect("a comment");
+    assert!(last_message < first_comment, "messages come first");
 }

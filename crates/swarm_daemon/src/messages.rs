@@ -99,10 +99,15 @@ impl Messages {
         });
         drop(store);
 
-        drop(lock(&self.wake));
-        self.arrived.notify_all();
+        self.wake();
 
         Ok(info)
+    }
+
+    /// Wakes the recipients that wait.
+    pub(crate) fn wake(&self) {
+        drop(lock(&self.wake));
+        self.arrived.notify_all();
     }
 
     /// Claims the agent's unread messages that nobody else holds.

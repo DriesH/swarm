@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::Value;
-use swarm_core::store::NewMessage;
+use swarm_core::store::{MAX_MESSAGE_BYTES, NewMessage};
 use swarm_core::{WorkerCheckout, git};
 use swarm_protocol::agent::{
     AgentRequest, AgentSummary, Call, Committed, Merged, Reply, Sent, TaskSummary, TaskUntil,
@@ -33,9 +33,6 @@ const DEFAULT_WAIT_SECS: u32 = 100;
 
 /// The longest `wait`.
 const MAX_WAIT_SECS: u32 = 600;
-
-/// The most bytes of text one message, brief or report may hold.
-const MAX_MESSAGE_BYTES: usize = 64 << 10;
 
 /// How often `task_wait` looks at the tasks again.
 const TASK_POLL: Duration = Duration::from_millis(100);
