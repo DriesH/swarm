@@ -35,6 +35,7 @@ pub(crate) fn render(
             heading("Projects", 14.).h(px(30.)).child(
                 IconButton::new("add-project", IconName::Plus, "Add project")
                     .size(IconButtonSize::Medium)
+                    .debug_selector(|| "add-project".to_owned())
                     .on_click(cx.listener(|_, _, window, cx| Workspace::pick_project(window, cx))),
             ),
         )
@@ -120,7 +121,7 @@ fn error_message(workspace: &Workspace, cx: &mut Context<Workspace>) -> Option<i
 fn window_row(window: &mut Window, cx: &mut App) -> impl IntoElement {
     h_flex()
         .h(WINDOW_ROW_HEIGHT)
-        .px(px(6.))
+        .pl(px(6.))
         .child(
             drag_region("sidebar-top-drag", window, cx)
                 .flex_1()
@@ -166,13 +167,14 @@ fn logo_row(window: &mut Window, cx: &mut App) -> impl IntoElement {
 
     h_flex()
         .h(px(32.))
-        .px(px(6.))
+        .pl(px(6.))
         .mt(px(4.))
         .gap(px(8.))
         .child(brand)
         .child(
             IconButton::new("search", IconName::Search, "Search")
                 .size(IconButtonSize::Medium)
+                .debug_selector(|| "sidebar-search".to_owned())
                 .color(Color::Muted)
                 .on_click(|_, window, cx| {
                     window.dispatch_action(Box::new(ToggleCommandPalette), cx);
@@ -181,7 +183,7 @@ fn logo_row(window: &mut Window, cx: &mut App) -> impl IntoElement {
 }
 
 fn heading(title: &'static str, top_margin: f32) -> gpui::Div {
-    h_flex().h(px(28.)).px(px(8.)).mt(px(top_margin)).child(
+    h_flex().h(px(28.)).pl(px(8.)).mt(px(top_margin)).child(
         div()
             .flex_1()
             .child(Label::new(title).size(LabelSize::Small).color(Color::Faint)),
@@ -458,6 +460,20 @@ mod tests {
         cx.update(swarm_ui::theme::init);
 
         cx.add_window_view(Workspace::with_sample)
+    }
+
+    #[gpui::test]
+    fn the_sidebar_buttons_end_where_the_project_rows_end(cx: &mut TestAppContext) {
+        let (_, cx) = setup(cx);
+        let mut right =
+            |selector: &'static str| cx.debug_bounds(selector).map(|bounds| bounds.right());
+
+        let row = right("project-row-1");
+
+        assert!(row.is_some());
+        for selector in ["toggle-sidebar", "sidebar-search", "add-project"] {
+            assert_eq!(right(selector), row, "{selector}");
+        }
     }
 
     #[gpui::test]
