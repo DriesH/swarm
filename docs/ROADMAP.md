@@ -9,7 +9,7 @@ Each phase ends with a pull request into `main`. A phase is done when every box 
 | 2 | App shell with fake data | Done ([PR #3](https://github.com/DriesH/swarm/pull/3)) |
 | 3 | Daemon, terminals and worktrees | Done ([#4](https://github.com/DriesH/swarm/pull/4), [#5](https://github.com/DriesH/swarm/pull/5), [#6](https://github.com/DriesH/swarm/pull/6)) |
 | 4 | Agents and harness | In progress |
-| 5 | Swarm view | Not started |
+| 5 | Swarm view | In progress |
 | 6 | Review and pull requests | Not started |
 | 7 | Menu bar, usage and notifications | Not started |
 | 8 | Polish and first release | Not started |

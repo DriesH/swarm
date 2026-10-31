@@ -326,6 +326,12 @@ Reports in `docs/spikes/`. Code in `spikes/` (throwaway).
 - Codex's `workspace-write` sandbox blocks unix sockets and makes `.git` read-only. Codex agents use the `swarm` MCP tools (MCP servers run outside the sandbox, and Codex passes them only the env names listed in `env_vars`), and get the main repository's `.git` and their own `.git/worktrees/<name>` as writable roots so they can commit.
 - Both CLIs ask once per project whether to trust the folder; they key trust on the main repository root, so worktrees share the answer. Swarm never pre-trusts. While the dialog shows, the agent is blocked with "Trust this folder".
 
+**Swarm view**
+
+- Count an agent's changes with `git diff-index --numstat -z <base> --` and `GIT_OPTIONAL_LOCKS=0`. Porcelain `git diff` refreshes the index and takes `index.lock`, which can fail the agent's own commit.
+- Untracked files can be symlinks to FIFOs or `/dev/zero`: check `symlink_metadata`, read regular files only, and cap the bytes read.
+- The daemon broadcasts "delivered" while it holds the store lock, so it never overtakes "sent". The app still keeps deliveries for messages it has not seen yet, because history arrives on another channel.
+
 **Usage and menu bar**
 
 - Claude usage: read `rate_limits` from the Claude Code status line data of agents Swarm runs. Fall back to `/api/oauth/usage` at most every 5 minutes, honor `Retry-After` and store it on disk. The endpoint shares a budget with the user's own sessions and returns 429 often.
