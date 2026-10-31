@@ -231,9 +231,7 @@ pub(crate) fn tile_specs(workspace: &Workspace) -> Vec<TileSpec> {
 }
 
 pub(crate) fn compute_layout(workspace: &Workspace) -> Layout {
-    let area = workspace
-        .terminal_area
-        .map_or(FIRST_FRAME_AREA, |bounds| bounds.size);
+    let area = workspace.terminal_area_size().unwrap_or(FIRST_FRAME_AREA);
 
     let specs = tile_specs(workspace);
 
@@ -301,10 +299,12 @@ impl Workspace {
 
     /// The size a new user terminal tile starts with.
     pub(crate) fn planned_user_size(&self) -> Size<Pixels> {
-        let size = self.terminal_area.map_or(DEFAULT_USER_SIZE, |bounds| Size {
-            width: DEFAULT_USER_SIZE.width.min(bounds.size.width - px(350.)),
-            height: DEFAULT_USER_SIZE.height.min(bounds.size.height - px(20.)),
-        });
+        let size = self
+            .terminal_area_size()
+            .map_or(DEFAULT_USER_SIZE, |area| Size {
+                width: DEFAULT_USER_SIZE.width.min(area.width - px(350.)),
+                height: DEFAULT_USER_SIZE.height.min(area.height - px(20.)),
+            });
 
         size.max(&MIN_TILE)
     }
@@ -374,10 +374,12 @@ impl Workspace {
         size: Size<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        let largest = self.terminal_area.map_or(FIRST_FRAME_AREA, |bounds| Size {
-            width: bounds.size.width - px(20.),
-            height: bounds.size.height - px(20.),
-        });
+        let largest = self
+            .terminal_area_size()
+            .map_or(FIRST_FRAME_AREA, |area| Size {
+                width: area.width - px(20.),
+                height: area.height - px(20.),
+            });
         let size = size.min(&largest).max(&MIN_TILE);
 
         if self.user_sizes.get(&terminal) != Some(&size) {
@@ -412,12 +414,19 @@ impl Workspace {
         cx.notify();
     }
 
-    fn set_terminal_area(&mut self, bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
-        let resized = self.terminal_area.map(|area| area.size) != Some(bounds.size);
+    fn set_terminal_area(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let resized = self.terminal_area_size() != Some(bounds.size);
         self.terminal_area = Some(bounds);
+        self.terminal_area_had_panel = self.visible_panel().is_some();
 
+        // A notify during prepaint can wait for the next input; this draws right away.
         if resized {
-            cx.notify();
+            cx.on_next_frame(window, |_, _, cx| cx.notify());
         }
     }
 
@@ -486,9 +495,11 @@ fn terminals(workspace: &Workspace, cx: &mut Context<Workspace>) -> impl IntoEle
         .collect();
 
     div()
-        .on_children_prepainted(move |bounds, _, cx| {
+        .on_children_prepainted(move |bounds, window, cx| {
             if let Some(first) = bounds.first() {
-                area.update(cx, |workspace, cx| workspace.set_terminal_area(*first, cx));
+                area.update(cx, |workspace, cx| {
+                    workspace.set_terminal_area(*first, window, cx);
+                });
             }
         })
         .id("terminals")
@@ -859,8 +870,8 @@ mod tests {
     use gpui::{TestAppContext, VisualTestContext};
 
     use super::*;
-    use crate::actions::{self, NewTerminal};
-    use crate::model::AgentId;
+    use crate::actions::{self, NewTerminal, PlanWithOrchestrator};
+    use crate::model::{AgentId, TaskId};
 
     fn setup(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
         cx.update(|cx| {
@@ -957,6 +968,23 @@ mod tests {
         let area = workspace.read_with(cx, |workspace, _| workspace.terminal_area);
 
         assert!(area.is_some());
+    }
+
+    #[gpui::test]
+    fn a_tab_switch_that_shows_the_panel_lays_out_for_the_new_area(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        cx.dispatch_action(PlanWithOrchestrator);
+        redraw(cx);
+
+        let before_measure = workspace.update(cx, |workspace, cx| {
+            workspace.select_task(TaskId(1), cx);
+            compute_layout(workspace)
+        });
+        redraw(cx);
+        let measured = workspace.read_with(cx, |workspace, _| workspace.layout.clone());
+
+        assert!(!measured.placed.is_empty());
+        assert_eq!(before_measure.placed, measured.placed);
     }
 
     #[gpui::test]

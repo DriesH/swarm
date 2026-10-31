@@ -21,6 +21,8 @@ use crate::palette::Overlay;
 use crate::views::Resizing;
 use crate::{panels, sidebar, status_bar, tab_bar, views};
 
+pub(crate) const RIGHT_PANEL_WIDTH: Pixels = px(320.);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum View {
     Terminals,
@@ -60,6 +62,8 @@ pub(crate) struct Workspace {
     pub(crate) terminal_focus: HashMap<TerminalId, FocusHandle>,
     pub(crate) overlay: Option<Overlay>,
     pub(crate) terminal_area: Option<Bounds<Pixels>>,
+    /// True when the right panel was shown as `terminal_area` was measured.
+    pub(crate) terminal_area_had_panel: bool,
     pub(crate) layout: swarm_layout::Layout,
     pub(crate) user_sizes: HashMap<TerminalId, Size<Pixels>>,
     pub(crate) resizing: Option<Resizing>,
@@ -140,6 +144,7 @@ impl Workspace {
             terminal_focus: HashMap::new(),
             overlay: None,
             terminal_area: None,
+            terminal_area_had_panel: false,
             layout: swarm_layout::Layout::default(),
             user_sizes: HashMap::new(),
             resizing: None,
@@ -331,6 +336,19 @@ impl Workspace {
         }
     }
 
+    /// The terminal area for the panel shown now. A tab switch can show or hide the
+    /// panel before the area is measured again.
+    pub(crate) fn terminal_area_size(&self) -> Option<Size<Pixels>> {
+        let mut size = self.terminal_area?.size;
+        match (self.terminal_area_had_panel, self.visible_panel().is_some()) {
+            (true, false) => size.width += RIGHT_PANEL_WIDTH,
+            (false, true) => size.width -= RIGHT_PANEL_WIDTH,
+            _ => {}
+        }
+
+        Some(size)
+    }
+
     /// The right panel to show. A Start or Plan task has none, but the choice is kept.
     pub(crate) fn visible_panel(&self) -> Option<RightPanel> {
         if self.has_no_projects() || self.active_task().is_start {
@@ -388,7 +406,7 @@ impl Render for Workspace {
             .child(div().flex_1().min_w_0().h_full().child(views))
             .children(right_panel.map(|panel_element| {
                 div()
-                    .w(px(320.))
+                    .w(RIGHT_PANEL_WIDTH)
                     .flex_none()
                     .h_full()
                     .border_l_1()
