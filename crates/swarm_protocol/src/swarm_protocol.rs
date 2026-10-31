@@ -219,6 +219,8 @@ pub enum MessageKind {
     TerminalExited,
     /// From Swarm: the user typed into a worker's terminal (ADR 0002).
     UserInput,
+    /// From Swarm: a worker failed to start, or its process ended.
+    WorkerStopped,
 }
 
 impl MessageKind {
@@ -231,6 +233,7 @@ impl MessageKind {
             Self::Report => "report",
             Self::TerminalExited => "terminal exited",
             Self::UserInput => "user input",
+            Self::WorkerStopped => "worker stopped",
         }
     }
 }

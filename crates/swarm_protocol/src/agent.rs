@@ -116,6 +116,33 @@ pub enum Call {
     TerminalList,
 }
 
+/// Every harness call as its MCP tool name and its CLI words.
+pub const HARNESS_CALLS: &[(&str, &str)] = &[
+    ("spawn", "spawn"),
+    ("send", "send"),
+    ("ask", "ask"),
+    ("report", "report"),
+    ("read", "read"),
+    ("wait", "wait"),
+    ("merge", "merge"),
+    ("notify", "notify"),
+    ("agents", "agents"),
+    ("confirm", "confirm"),
+    ("task_create", "task create"),
+    ("task_list", "task list"),
+    ("task_wait", "task wait"),
+    ("agent_exit", "exit"),
+    ("terminal_spawn", "terminal spawn"),
+    ("terminal_resize", "terminal resize"),
+    ("terminal_read", "terminal read"),
+    ("terminal_wait", "terminal wait"),
+    ("terminal_kill", "terminal kill"),
+    ("terminal_list", "terminal list"),
+];
+
+/// The tool that starts a program outside any sandbox. Adapters never pre-approve it.
+pub const PROMPTED_TOOL: &str = "terminal_spawn";
+
 /// One line back for each request.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Reply {
@@ -152,7 +179,7 @@ impl Reply {
 pub enum TaskUntil {
     /// The task orchestrator called `confirm`.
     Briefed,
-    /// The task orchestrator reported done, or stopped.
+    /// The task orchestrator stopped: its session ended or can only be resumed.
     Done,
 }
 
