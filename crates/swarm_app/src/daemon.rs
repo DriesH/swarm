@@ -4150,6 +4150,7 @@ mod tests {
             user_terminals: 2,
             uncommitted_files: 4,
             unmerged_workers: vec!["a".into(), "b".into()],
+            merged_branches: vec!["swarm/login-c".into()],
         });
         let (workspace, cx, _client) = real_task_workspace(&socket, cx);
         let task = workspace.read_with(cx, |workspace, _| workspace.active_task);
@@ -4179,6 +4180,7 @@ mod tests {
                 "Stops 3 agents",
                 "Stops 2 terminals",
                 "Deletes 4 uncommitted files",
+                "Deletes merged branch swarm/login-c",
                 "Keeps branch swarm/login",
                 "Not merged: a, b"
             ]

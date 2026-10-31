@@ -142,7 +142,16 @@ impl CloseTaskDialog {
             ));
         }
 
-        lines.push((format!("Keeps branch {}", self.branch), Color::Default));
+        for branch in &check.merged_branches {
+            lines.push((format!("Deletes merged branch {branch}"), Color::Default));
+        }
+        if !check
+            .merged_branches
+            .iter()
+            .any(|branch| *branch == *self.branch)
+        {
+            lines.push((format!("Keeps branch {}", self.branch), Color::Default));
+        }
 
         if !check.unmerged_workers.is_empty() {
             lines.push((
