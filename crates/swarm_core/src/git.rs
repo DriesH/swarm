@@ -1492,6 +1492,81 @@ pub fn attribution(worktree: &Path, base: &str) -> Result<HashMap<Vec<u8>, Strin
     Ok(agents)
 }
 
+/// The lines of a text file as the diff shows them, or `None` for a missing, binary,
+/// huge or unreadable file. A symlink is one line, its target, like git sees it. A path
+/// that leaves `worktree` through a linked folder is unreadable.
+pub fn working_file_lines(worktree: &Path, path: &Path) -> Option<Vec<String>> {
+    let full = worktree.join(path);
+    let meta = std::fs::symlink_metadata(&full).ok()?;
+
+    let root = worktree.canonicalize().ok()?;
+    if !full.parent()?.canonicalize().ok()?.starts_with(&root) {
+        return None;
+    }
+
+    if meta.file_type().is_symlink() {
+        let target = std::fs::read_link(&full).ok()?;
+
+        return Some(vec![cut_line(target.as_os_str().as_bytes())]);
+    }
+    if !meta.is_file() || meta.len() > MAX_COUNTED_BYTES {
+        return None;
+    }
+
+    let mut bytes = Vec::new();
+    std::fs::File::open(&full)
+        .and_then(|file| file.take(MAX_COUNTED_BYTES + 1).read_to_end(&mut bytes))
+        .ok()?;
+    if bytes.len() as u64 > MAX_COUNTED_BYTES {
+        return None;
+    }
+
+    text_lines(&bytes)
+}
+
+/// Like [`working_file_lines`] for the file as `revision` has it. `None` also when the
+/// revision has no such file.
+pub fn blob_lines(
+    worktree: &Path,
+    revision: &str,
+    path: &Path,
+) -> Result<Option<Vec<String>>, Error> {
+    let mut spec = OsString::from(format!("{revision}:"));
+    spec.push(path);
+
+    let (_, size) = execute(worktree, [OsStr::new("cat-file"), OsStr::new("-s"), &spec])?;
+    let too_big = size
+        .stdout
+        .parse::<u64>()
+        .map_or(true, |size| size > MAX_COUNTED_BYTES);
+    if !size.success || too_big {
+        return Ok(None);
+    }
+
+    let (_, blob) = execute(
+        worktree,
+        [OsStr::new("cat-file"), OsStr::new("blob"), &spec],
+    )?;
+    if !blob.success {
+        return Ok(None);
+    }
+
+    Ok(text_lines(&blob.raw))
+}
+
+fn text_lines(bytes: &[u8]) -> Option<Vec<String>> {
+    if bytes[..bytes.len().min(DIFF_BINARY_SNIFF)].contains(&0) {
+        return None;
+    }
+
+    let mut lines: Vec<&[u8]> = bytes.split(|byte| *byte == b'\n').collect();
+    if lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+
+    Some(lines.into_iter().map(cut_line).collect())
+}
+
 /// True when `ancestor` is `descendant` or reachable from it.
 pub fn is_ancestor(worktree: &Path, ancestor: &str, descendant: &str) -> Result<bool, Error> {
     let (arguments, output) = execute(

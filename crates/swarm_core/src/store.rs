@@ -1,5 +1,7 @@
 //! The daemon's SQLite database (ADR 0005). Only the daemon opens it.
 
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -8,9 +10,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use swarm_protocol::agent::InboxMessage;
 use swarm_protocol::{
-    AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, CreateTerminal,
-    GridSize, MessageId, MessageInfo, MessageKind, ProjectId, TaskId, TaskInfo, TerminalId,
-    TerminalKind,
+    AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, CommentAnchor,
+    CommentId, CommentState, CreateTerminal, GridSize, MessageId, MessageInfo, MessageKind,
+    NewComment, ProjectId, ReviewComment, TaskId, TaskInfo, TerminalId, TerminalKind,
 };
 use swarm_term::ExitStatus;
 
@@ -123,6 +125,26 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE tasks ADD COLUMN approved INTEGER;
     ALTER TABLE tasks ADD COLUMN closed_at INTEGER",
     "ALTER TABLE tasks ADD COLUMN closing_at INTEGER",
+    "CREATE TABLE comments (
+        id INTEGER PRIMARY KEY,
+        task INTEGER NOT NULL REFERENCES tasks(id),
+        parent INTEGER REFERENCES comments(id),
+        source TEXT NOT NULL,
+        worktree BLOB NOT NULL,
+        path BLOB NOT NULL,
+        side TEXT NOT NULL,
+        line INTEGER NOT NULL,
+        anchor_text TEXT NOT NULL,
+        before_text TEXT,
+        after_text TEXT,
+        body TEXT NOT NULL,
+        state TEXT NOT NULL,
+        to_agent INTEGER,
+        outdated INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        sent_at INTEGER
+    );
+    CREATE INDEX comments_task ON comments (task)",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -961,6 +983,132 @@ impl Store {
         Ok(messages)
     }
 
+    /// Records a comment, with the state the caller decided on.
+    pub fn add_comment(
+        &self,
+        comment: &NewComment,
+        state: CommentState,
+    ) -> Result<ReviewComment, Error> {
+        let created_at = now_millis();
+        let anchor = &comment.anchor;
+
+        self.connection.execute(
+            "INSERT INTO comments (task, parent, source, worktree, path, side, line, anchor_text,
+                 before_text, after_text, body, state, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                to_row(comment.task.0)?,
+                comment.parent.map(|parent| to_row(parent.0)).transpose()?,
+                to_json(&comment.source)?,
+                anchor.worktree.as_os_str().as_bytes(),
+                anchor.path.as_os_str().as_bytes(),
+                to_json(&anchor.side)?,
+                anchor.line,
+                anchor.text,
+                anchor.before,
+                anchor.after,
+                comment.body,
+                to_json(&state)?,
+                created_at,
+            ],
+        )?;
+
+        let id = CommentId(from_row(self.connection.last_insert_rowid())?);
+
+        self.comment(id)?
+            .ok_or_else(|| Error::Invalid(format!("comment {} vanished", id.0)))
+    }
+
+    pub fn comment(&self, id: CommentId) -> Result<Option<ReviewComment>, Error> {
+        Ok(self
+            .connection
+            .query_row(
+                &format!("{COMMENT_COLUMNS} WHERE id = ?1"),
+                params![to_row(id.0)?],
+                comment_from_row,
+            )
+            .optional()?)
+    }
+
+    /// The comments of an open task, oldest first. A closed task has none.
+    pub fn task_comments(&self, task: TaskId) -> Result<Vec<ReviewComment>, Error> {
+        let mut statement = self.connection.prepare(&format!(
+            "{COMMENT_COLUMNS} WHERE task = ?1
+             AND EXISTS (SELECT 1 FROM tasks WHERE tasks.id = comments.task AND closed_at IS NULL)
+             ORDER BY id"
+        ))?;
+        let rows = statement.query_map(params![to_row(task.0)?], comment_from_row)?;
+
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Where the anchored line is now, and whether it is gone.
+    pub fn set_comment_anchor(
+        &self,
+        id: CommentId,
+        line: u32,
+        outdated: bool,
+    ) -> Result<(), Error> {
+        self.connection.execute(
+            "UPDATE comments SET line = ?1, outdated = ?2 WHERE id = ?3",
+            params![line, outdated, to_row(id.0)?],
+        )?;
+
+        Ok(())
+    }
+
+    /// Marks a pending comment as sent, to the worker that owned its file.
+    pub fn mark_comment_sent(
+        &self,
+        id: CommentId,
+        to: Option<AgentId>,
+    ) -> Result<ReviewComment, Error> {
+        self.connection.execute(
+            "UPDATE comments SET state = ?1, to_agent = ?2, sent_at = ?3 WHERE id = ?4",
+            params![
+                to_json(&CommentState::Sent)?,
+                to.map(|agent| to_row(agent.0)).transpose()?,
+                now_millis(),
+                to_row(id.0)?,
+            ],
+        )?;
+
+        self.comment(id)?
+            .ok_or_else(|| Error::Invalid(format!("no comment with id {}", id.0)))
+    }
+
+    pub fn set_comment_state(&self, id: CommentId, state: CommentState) -> Result<(), Error> {
+        self.connection.execute(
+            "UPDATE comments SET state = ?1 WHERE id = ?2",
+            params![to_json(&state)?, to_row(id.0)?],
+        )?;
+
+        Ok(())
+    }
+
+    /// Deletes a comment with its replies. Returns every id it deleted, replies first.
+    pub fn delete_comment(&self, id: CommentId) -> Result<Vec<CommentId>, Error> {
+        let row = to_row(id.0)?;
+
+        let mut statement = self
+            .connection
+            .prepare("SELECT id FROM comments WHERE parent = ?1 ORDER BY id")?;
+        let mut deleted: Vec<CommentId> = statement
+            .query_map(params![row], |row| row.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .map(|reply| CommentId(reply.unsigned_abs()))
+            .collect();
+        deleted.push(id);
+
+        self.connection.execute(
+            "DELETE FROM comments WHERE parent = ?1 OR id = ?1",
+            params![row],
+        )?;
+
+        Ok(deleted)
+    }
+
     pub fn has_unread(&self, agent: AgentId) -> Result<bool, Error> {
         Ok(self.connection.query_row(
             "SELECT EXISTS (SELECT 1 FROM messages WHERE to_agent = ?1 AND delivered_at IS NULL)",
@@ -1181,6 +1329,43 @@ fn json_column<T: DeserializeOwned>(row: &rusqlite::Row<'_>, index: usize) -> ru
 
 fn to_json<T: Serialize>(value: &T) -> Result<String, Error> {
     Ok(serde_json::to_string(value)?)
+}
+
+const COMMENT_COLUMNS: &str = "SELECT id, task, parent, source, worktree, path, side, line,
+    anchor_text, before_text, after_text, body, state, to_agent, outdated, created_at, sent_at
+    FROM comments";
+
+fn comment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewComment> {
+    let id: i64 = row.get(0)?;
+    let task: i64 = row.get(1)?;
+    let parent: Option<i64> = row.get(2)?;
+    let worktree: Vec<u8> = row.get(4)?;
+    let path: Vec<u8> = row.get(5)?;
+    let to: Option<i64> = row.get(13)?;
+    let created_at: i64 = row.get(15)?;
+    let sent_at: Option<i64> = row.get(16)?;
+
+    Ok(ReviewComment {
+        id: CommentId(id.unsigned_abs()),
+        task: TaskId(task.unsigned_abs()),
+        parent: parent.map(|parent| CommentId(parent.unsigned_abs())),
+        source: json_column(row, 3)?,
+        anchor: CommentAnchor {
+            worktree: PathBuf::from(OsStr::from_bytes(&worktree)),
+            path: PathBuf::from(OsStr::from_bytes(&path)),
+            side: json_column(row, 6)?,
+            line: row.get(7)?,
+            text: row.get(8)?,
+            before: row.get(9)?,
+            after: row.get(10)?,
+        },
+        body: row.get(11)?,
+        state: json_column(row, 12)?,
+        to: to.map(|agent| AgentId(agent.unsigned_abs())),
+        outdated: row.get(14)?,
+        created_at: created_at.unsigned_abs(),
+        sent_at: sent_at.map(i64::unsigned_abs),
+    })
 }
 
 fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredProject> {

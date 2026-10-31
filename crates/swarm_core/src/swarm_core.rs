@@ -5,6 +5,7 @@
 
 pub mod adapters;
 pub mod agents;
+pub mod comments;
 pub mod config;
 pub mod git;
 pub mod prompts;
@@ -109,6 +110,8 @@ pub struct Projects {
     store: Arc<Mutex<Store>>,
     /// One task is made at a time, so two clients never pick the same name or ports.
     creating: Mutex<()>,
+    /// One comment change runs at a time, so a comment is never sent twice.
+    comments: Mutex<()>,
 }
 
 impl Projects {
@@ -116,6 +119,7 @@ impl Projects {
         Self {
             store,
             creating: Mutex::new(()),
+            comments: Mutex::new(()),
         }
     }
 
