@@ -1293,6 +1293,8 @@ fn blank_file(worktree: &Path, raw_path: &[u8], change: FileChange, binary: bool
         binary,
         hunks: Vec::new(),
         truncated: false,
+        digest: 0,
+        fold: None,
     }
 }
 

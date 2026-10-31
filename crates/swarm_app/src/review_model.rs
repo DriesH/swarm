@@ -1450,6 +1450,8 @@ pub(crate) fn generated_file(
         binary: false,
         hunks,
         truncated: false,
+        digest: 0,
+        fold: None,
     }
 }
 
@@ -1559,6 +1561,8 @@ mod tests {
                 lines,
             }],
             truncated: false,
+            digest: 0,
+            fold: None,
         }
     }
 

@@ -191,6 +191,7 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
             });
         }
         request @ (Request::TaskDiff { .. }
+        | Request::FileHunks { .. }
         | Request::ApproveTask { .. }
         | Request::CheckClose { .. }
         | Request::CloseTask { .. }) => handle_review(services, sink, request),
@@ -314,6 +315,9 @@ fn handle_review(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Requ
                     Err(error) => send_error(sink, call, &error),
                 }
             });
+        }
+        Request::FileHunks { call, .. } => {
+            send_error(sink, call, &"loading one file is not built yet");
         }
         Request::ApproveTask {
             call,

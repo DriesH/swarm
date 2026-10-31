@@ -182,7 +182,7 @@ Every agent belongs to a task. The daemon tracks every agent in SQLite (ADR 0005
 
 ### Review
 
-A third view next to Terminals and Swarm in the header switch (**Terminals | Swarm | Review**). It fills the main area; the sidebar and tabs stay. Left: changed files grouped by worker or folder. Right: the diff with inline comments. Ways in:
+A third view next to Terminals and Swarm in the header switch (**Terminals | Swarm | Review**). It fills the main area; the sidebar and tabs stay. Left: the changed files as a folder tree. Right: the diff with inline comments. The Changes panel does not open in Review, because the tree already lists the files; Files and Pull request still do. Ways in:
 
 - **Review** in the view switch (⌘⇧R)
 - **Review** button and any file in the Changes panel (the **Changes +N −N** header button opens that panel)
@@ -197,7 +197,9 @@ Two sources:
 
 Live comments are anchored to the code text, not line numbers. If the agent rewrites those lines, the comment is marked outdated.
 
-- Layout: the file list on the left (272 px) with "N files", "N / N viewed" and **By agent | By folder**; files no agent commit touched are in "Other changes". On the right a header with the agents' status, **Live | Merged**, **Unified | Split** and **Approve**, then one card per file.
+- Layout: the file tree on the left (272 px) with "N files" and "N / N viewed". On the right a header with the agents' status, **Live | Merged**, **Unified | Split** and **Approve**, then one card per file. The agent that changed a file shows in its card header.
+- File tree: like Zed's project panel. Folders first, then files, each sorted by name; chevrons, indent guides, and a folder with a single subfolder shown as one row (`crates/swarm_term/src`). A file row shows its name, +/− counts, open comments and the Viewed check. Arrow keys move and open or close folders. The Changes panel in the Terminals view uses the same tree.
+- Folded files: lock files, generated files (`linguist-generated` in `.gitattributes`, minified files, source maps) and files with more than 500 changed lines come without their lines, like GitHub. The card is one row with a tag (**Lock file**, **Generated**, **Large diff**) and **Show diff**, which loads that one file. Totals, the fingerprint and Approve still cover every line.
 - **Viewed** is per file and resets when the file's diff changes. A viewed file folds. Keys: `j` / `k` next or previous file, `v` viewed.
 - The source starts as Live while a worker of the task works, else Merged; the user's pick then stays for that task.
 - **Approve** works only on Merged. The daemon stores a fingerprint of the Merged diff (a hash of every changed line, file mode and blob). When the diff changes, the approval no longer counts and Review shows **Approve** again.

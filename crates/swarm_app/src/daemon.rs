@@ -4415,6 +4415,8 @@ pub(crate) mod tests {
                 }],
             }],
             truncated: false,
+            digest: 0,
+            fold: None,
         }];
         workspace.update(cx, |workspace, cx| {
             workspace.data.store_diff(diff);
