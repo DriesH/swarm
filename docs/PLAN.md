@@ -129,8 +129,8 @@ Four kinds:
 
 | Kind | Who types | Who resizes | Who kills |
 |---|---|---|---|
-| **Orchestrator** | user | layout | user |
-| **Worker** | output view; user can type in v1 (setting, may be off by default later) | its agent | orchestrator, user |
+| **Orchestrator** | user | layout: always large | user |
+| **Worker** | output view; user can type in v1 (setting, may be off by default later) | layout: small; grows when blocked or on `tile.grow` | orchestrator, user |
 | **Process** (dev server, tests, any command an agent starts) | nobody by default | the agent that started it | that agent, orchestrator, user |
 | **User** | user only | user only | user only |
 
@@ -138,6 +138,8 @@ Four kinds:
 - **Process terminals**: started with `swarm terminal spawn`. When the process exits or is killed, the terminal closes after a short delay (to show the exit code); a failed exit stays until the user closes it and the owner agent and the orchestrator get a `terminal.exited` event with who stopped it (`agent`, `user`, `process`) and the exit code or signal.
 - **Layout engine**: tiles fill the space. Priority: user terminals (fixed size), orchestrator, terminals that need attention (`blocked`, `error`), working agents, process terminals, done or idle agents. Each tile has a minimum size; tiles that don't fit move to the **tray**: chips on the left of the status bar, each with a restore icon. A tile that needs attention is promoted out of the tray. The user can pin or minimize any tile.
 - When the user resizes a user terminal, the other tiles reflow around it.
+- **Tile sizes**: the orchestrator always gets the main slot, at least half the width, and never goes to the tray. Workers are small by default (about 80×12). A blocked worker grows by itself and shrinks when it works again. The orchestrator can grow or shrink any of its workers with `tile.grow` / `tile.shrink`; a worker only itself. A tile the user pinned, minimized or resized ignores these calls until the user resets it.
+- **Font size**: one global setting (Settings › Terminals, 10–20 px, default 13) for every terminal. Process terminals keep their columns and rows, so their tiles change size with the font.
 
 ### Terminal harness (CLI + MCP)
 
@@ -149,6 +151,7 @@ Four kinds:
 | `terminal.wait {id, until: exit\|output-match, pattern?}` | owner agent, orchestrator | Waits for exit or for a line such as `ready in`. |
 | `terminal.kill {id, signal?}` | owner agent, orchestrator | Stops the process; the terminal closes. |
 | `terminal.list` | any agent | Lists terminals the caller may see (never user terminals). |
+| `tile.grow {agent?}` / `tile.shrink {agent?}` | orchestrator for its workers, worker for itself | Makes a worker's tile large or small again. Changes the layout only, never sends a message. |
 | event `terminal.exited {id, by, code\|signal}` | to owner + orchestrator | Sent when a process terminal ends for any reason. |
 
 ### Prompts
