@@ -10,7 +10,8 @@ use std::thread;
 
 use anyhow::Result;
 use swarm_protocol::{
-    CallId, Event, FrameError, MESSAGES_LISTED, Request, TaskInfo, TerminalId, VERSION, read, write,
+    CallId, CreateTerminal, Event, FrameError, MESSAGES_LISTED, Request, TaskInfo, TerminalId,
+    VERSION, read, write,
 };
 use swarm_term::TerminalInput;
 
@@ -124,15 +125,7 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
                 terminals: terminals.list(),
             });
         }
-        Request::Create { call, terminal } => match terminals.create(terminal) {
-            Ok(hub) => {
-                sink.send_event(&Event::Created { call, id: hub.id() });
-                if !hub.attach(sink, CREATE_HISTORY_LINES) {
-                    send_missing(sink, hub.id());
-                }
-            }
-            Err(error) => send_error(sink, call, &error),
-        },
+        Request::Create { call, terminal } => create_terminal(services, sink, call, terminal),
         Request::Attach { id, history } => match terminals.get(id) {
             Some(hub) if hub.attach(sink, history) => {}
             _ => send_missing(sink, id),
@@ -235,6 +228,29 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
     }
 }
 
+fn create_terminal(
+    services: &Services,
+    sink: &Arc<ClientSink>,
+    call: CallId,
+    terminal: CreateTerminal,
+) {
+    if services.agents.is_closing_key(terminal.task.as_deref()) {
+        send_error(sink, call, &"the task is closing");
+
+        return;
+    }
+
+    match services.terminals.create(terminal) {
+        Ok(hub) => {
+            sink.send_event(&Event::Created { call, id: hub.id() });
+            if !hub.attach(sink, CREATE_HISTORY_LINES) {
+                send_missing(sink, hub.id());
+            }
+        }
+        Err(error) => send_error(sink, call, &error),
+    }
+}
+
 /// Review and close: the requests that read a diff, approve or close a task.
 fn handle_review(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
     let projects = &services.projects;
@@ -246,7 +262,7 @@ fn handle_review(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Requ
             source,
             known,
         } => {
-            let Some(running) = sink.begin_diff() else {
+            let Some(running) = sink.begin_diff(task, source) else {
                 send_error(sink, call, &"busy: the previous diff request still runs");
 
                 return;
@@ -284,20 +300,27 @@ fn handle_review(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Requ
             });
         }
         Request::CheckClose { call, task } => {
-            let projects = Arc::clone(projects);
-            run_slow(sink, "check-close", call, move |sink| {
-                match projects.close_check(task) {
+            let services = Arc::clone(services);
+            run_slow(
+                sink,
+                "check-close",
+                call,
+                move |sink| match tasks::close_check(&services, task) {
                     Ok(check) => {
                         sink.send_event(&Event::CloseCheck { call, check });
                     }
                     Err(error) => send_error(sink, call, &error),
-                }
-            });
+                },
+            );
         }
-        Request::CloseTask { call, task } => {
+        Request::CloseTask {
+            call,
+            task,
+            confirmed,
+        } => {
             let services = Arc::clone(services);
             run_slow(sink, "close-task", call, move |sink| {
-                match tasks::close(&services, task) {
+                match tasks::close(&services, task, &confirmed) {
                     Ok(()) => {
                         sink.send_event(&Event::Done { call });
                     }

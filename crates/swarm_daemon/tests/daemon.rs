@@ -3419,9 +3419,71 @@ impl Client {
         }
     }
 
+    /// Closes the task with the check the user would just have seen.
     fn close_task(&mut self, task: TaskId) -> Result<Vec<Event>, String> {
-        self.until_done(&Request::CloseTask { call: CALL, task })
+        let confirmed = self.check_close(task);
+
+        self.close_task_confirmed(task, confirmed)
     }
+
+    fn close_task_confirmed(
+        &mut self,
+        task: TaskId,
+        confirmed: CloseCheck,
+    ) -> Result<Vec<Event>, String> {
+        self.until_done(&Request::CloseTask {
+            call: CALL,
+            task,
+            confirmed,
+        })
+    }
+
+    /// A user terminal that belongs to the task.
+    fn create_task_terminal(&mut self, task: TaskId, command: &[&str]) -> TerminalId {
+        self.send(&Request::Create {
+            call: CALL,
+            terminal: CreateTerminal {
+                kind: TerminalKind::User,
+                command: Some(command.iter().map(|part| (*part).to_owned()).collect()),
+                cwd: None,
+                size: Size {
+                    cols: 80,
+                    rows: 24,
+                    cell_width: 8,
+                    cell_height: 16,
+                },
+                palette: Palette {
+                    fg: Rgb(230, 230, 230),
+                    bg: Rgb(10, 10, 12),
+                    cursor: Rgb(255, 255, 255),
+                    ansi: [Rgb(120, 120, 120); 16],
+                },
+                task: Some(task.terminal_key()),
+            },
+        });
+
+        self.wait_for(|event| match event {
+            Event::Created { call: CALL, id } => Some(*id),
+            _ => None,
+        })
+    }
+}
+
+fn commit_all(folder: &Path) {
+    git_output(folder, &["add", "-A"]);
+    git_output(
+        folder,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "work",
+        ],
+    );
 }
 
 /// A task without agents, in a repository with a file to review.
@@ -3433,6 +3495,7 @@ fn reviewed_task(daemon: &Daemon, repo: &Repo) -> (Client, TaskInfo) {
     request.orchestrator = None;
     let task = client.create_task(request);
     std::fs::write(task.worktree.join("review.txt"), "one\ntwo\n").expect("file");
+    commit_all(&task.worktree);
 
     (client, task)
 }
@@ -3471,6 +3534,7 @@ fn a_task_diff_has_files_and_answers_none_for_a_known_fingerprint() {
     );
 
     std::fs::write(task.worktree.join("review.txt"), "one\nthree\n").expect("file");
+    commit_all(&task.worktree);
     let changed = client
         .task_diff(task.id, ReviewSource::Merged, Some(diff.fingerprint))
         .expect("changed")
@@ -3492,7 +3556,7 @@ fn a_second_diff_request_is_busy_while_the_first_runs() {
         client.send(&Request::TaskDiff {
             call,
             task: task.id,
-            source: ReviewSource::Merged,
+            source: ReviewSource::Live,
             known: None,
         });
     }
@@ -3517,8 +3581,42 @@ fn a_second_diff_request_is_busy_while_the_first_runs() {
     }
     assert_eq!((diffs, busy), (1, 1));
 
-    let after = client.task_diff(task.id, ReviewSource::Merged, None);
+    let after = client.task_diff(task.id, ReviewSource::Live, None);
     assert!(after.is_ok(), "the guard was released");
+}
+
+#[test]
+fn the_live_and_merged_diffs_of_a_task_run_side_by_side() {
+    let repo = Repo::new("");
+    repo.commit_many_files(300);
+    let daemon = Daemon::start();
+    let (mut client, task) = reviewed_task(&daemon, &repo);
+    for number in 0..300 {
+        std::fs::write(task.worktree.join(format!("new-{number}.txt")), "x\n").expect("file");
+    }
+
+    for (call, source) in [
+        (CallId(1), ReviewSource::Live),
+        (CallId(2), ReviewSource::Merged),
+    ] {
+        client.send(&Request::TaskDiff {
+            call,
+            task: task.id,
+            source,
+            known: None,
+        });
+    }
+
+    let mut answered = Vec::new();
+    while answered.len() < 2 {
+        match client.next() {
+            Event::TaskDiff { call, .. } => answered.push(call),
+            Event::Error { message, .. } => panic!("refused: {message}"),
+            _ => {}
+        }
+    }
+    answered.sort_by_key(|call| call.0);
+    assert_eq!(answered, [CallId(1), CallId(2)]);
 }
 
 #[test]
@@ -3612,9 +3710,18 @@ fn closing_a_task_stops_everything_removes_worktrees_and_survives_a_restart() {
         .parse()
         .expect("pid");
     std::fs::write(task.worktree.join("loose.txt"), "uncommitted\n").expect("file");
+    let user_pid_file = fixture.out.join("user-pid");
+    let user_script = format!("echo $$ > {}; exec sleep 300", user_pid_file.display());
+    client.create_task_terminal(task.id, &["/bin/sh", "-c", &user_script]);
+    let user_pid: i32 = fixture
+        .read_when_written("user-pid")
+        .trim()
+        .parse()
+        .expect("pid");
 
     let check = client.check_close(task.id);
     assert_eq!(check.running_agents, 2);
+    assert_eq!(check.user_terminals, 1);
     assert_eq!(check.uncommitted_files, 1);
     assert!(check.unmerged_workers.is_empty());
     assert!(process_alive(pid));
@@ -3622,6 +3729,7 @@ fn closing_a_task_stops_everything_removes_worktrees_and_survives_a_restart() {
     let events = client.close_task(task.id).expect("closed");
 
     assert!(!process_alive(pid), "the process terminal was stopped");
+    assert!(!process_alive(user_pid), "the user terminal was stopped");
     let stopped: Vec<AgentId> = events
         .iter()
         .filter_map(|event| match event {
@@ -3662,7 +3770,12 @@ fn closing_a_task_stops_everything_removes_worktrees_and_survives_a_restart() {
         )),
         "a close tells nobody: {messages:?}"
     );
-    assert!(client.close_task(task.id).is_err(), "closed already");
+    assert!(
+        client
+            .close_task_confirmed(task.id, CloseCheck::default())
+            .is_err(),
+        "closed already"
+    );
     assert!(
         client
             .task_diff(task.id, ReviewSource::Merged, None)
@@ -3779,4 +3892,80 @@ sleep 300"#,
         .expect("read")
         .expect("row");
     assert_eq!(stored.info.lifecycle, AgentLifecycle::Stopped);
+}
+
+#[test]
+fn closing_refuses_when_more_would_be_lost_than_shown_and_a_retry_works() {
+    let repo = Repo::new("");
+    let daemon = Daemon::start();
+    let (mut client, task) = reviewed_task(&daemon, &repo);
+    let shown = client.check_close(task.id);
+    std::fs::write(task.worktree.join("late.txt"), "new\n").expect("file");
+
+    let refused = client.close_task_confirmed(task.id, shown);
+
+    assert_eq!(
+        refused.expect_err("refused"),
+        "more would be lost than shown; check again"
+    );
+    assert!(task.worktree.exists());
+    assert_eq!(client.projects()[0].tasks.len(), 1);
+
+    client
+        .close_task(task.id)
+        .expect("closed after a new check");
+    assert!(!task.worktree.exists());
+}
+
+#[test]
+fn a_restart_finishes_a_close_that_stopped_half_way() {
+    let fixture = Fixture::new(
+        r#"printf '\033]7501;state=working\007'
+printf '{"hook_event_name":"SessionStart","session_id":"hook-session-4"}' | "$SWARM" hook
+sleep 300"#,
+    );
+    let repo = Repo::new("");
+    let mut daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let task = client.create_task(orchestrator_task(project.id, false));
+    let agent = task.agents[0].id;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !database(&daemon)
+        .agent(agent)
+        .expect("read")
+        .expect("row")
+        .session_confirmed
+    {
+        assert!(Instant::now() < deadline, "the session was never confirmed");
+        thread::park_timeout(Duration::from_millis(30));
+    }
+    drop(client);
+
+    daemon.crash();
+    {
+        let connection = rusqlite::Connection::open(daemon.home.join("swarm.db")).expect("open");
+        connection
+            .execute("UPDATE tasks SET closing_at = 1", [])
+            .expect("closing");
+    }
+    let restarted = Daemon::start_in(daemon.home.clone());
+    let mut client = restarted.connect();
+    client.hello();
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while task.worktree.exists() || !client.projects()[0].tasks.is_empty() {
+        assert!(Instant::now() < deadline, "the close was never finished");
+        thread::park_timeout(Duration::from_millis(50));
+    }
+    let stored = database(&restarted)
+        .agent(agent)
+        .expect("read")
+        .expect("row");
+    assert_eq!(
+        stored.info.lifecycle,
+        AgentLifecycle::Stopped,
+        "not resumed"
+    );
 }

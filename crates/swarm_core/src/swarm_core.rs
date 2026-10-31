@@ -11,7 +11,7 @@ pub mod prompts;
 pub mod store;
 pub mod task;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -547,23 +547,19 @@ impl Projects {
             .ok_or_else(|| Error::Invalid(format!("no open task with id {}", id.0)))
     }
 
-    /// The changes of a task. `Merged` is the task worktree against its base. `Live`
-    /// adds each worker with its own worktree that is not merged yet.
+    /// The changes of a task. `Merged` is the commits of the task branch since it left
+    /// its base. `Live` is the task worktree as it is now, and adds each worker with its
+    /// own worktree that is not merged yet.
     pub fn task_diff(&self, id: TaskId, source: ReviewSource) -> Result<TaskDiff, Error> {
         // The store lock is gone before git runs.
-        let (task, agents, bases) = {
+        let (task, agents) = {
             let store = lock(&self.store);
             let task = store
                 .task(id)?
                 .ok_or_else(|| Error::Invalid(format!("no open task with id {}", id.0)))?;
             let agents = store.list_agents(id)?;
 
-            let mut bases = HashMap::new();
-            for agent in &agents {
-                bases.insert(agent.id, store.base_commit(agent.id)?);
-            }
-
-            (task, agents, bases)
+            (task, agents)
         };
 
         if !task.worktree.is_dir() {
@@ -586,7 +582,7 @@ impl Projects {
                 .filter(|agent| agent.role == AgentRole::Worker)
                 .filter(|worker| worker.worktree != task.worktree && worker.worktree.is_dir())
             {
-                match unmerged_section(&task, worker, bases.get(&worker.id).cloned().flatten()) {
+                match unmerged_section(&task, worker) {
                     Ok(section) => sections.extend(section),
                     Err(error) => {
                         log::warn!("cannot review worker {}: {error}", worker.name);
@@ -601,6 +597,10 @@ impl Projects {
                 .cmp(other.worktree.as_os_str().as_bytes())
         });
 
+        let scope = match source {
+            ReviewSource::Live => git::DiffScope::WorkingTree,
+            ReviewSource::Merged => git::DiffScope::Committed,
+        };
         let names = unique_names(&agents);
         let mut budget = git::DiffBudget::default();
         let mut fingerprint = git::Fingerprint::default();
@@ -611,18 +611,25 @@ impl Projects {
 
         let (mut stat, mut files) = (DiffStat::default(), Vec::new());
         for section in &sections {
-            let changed = match git::worktree_diff(&section.worktree, &section.base, &mut budget) {
-                Ok(changed) => changed,
-                Err(error) if section.owner.is_some() => {
-                    log::warn!("cannot read {}: {error}", section.worktree.display());
+            let changed =
+                match git::worktree_diff(&section.worktree, &section.base, scope, &mut budget) {
+                    Ok(changed) => changed,
+                    Err(error) if section.owner.is_some() => {
+                        log::warn!("cannot read {}: {error}", section.worktree.display());
 
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            let trailers = match section.owner {
-                Some(_) => HashMap::new(),
-                None => git::attribution(&section.worktree, &section.base)?,
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+            let (trailers, uncommitted) = match section.owner {
+                Some(_) => (HashMap::new(), HashSet::new()),
+                None => (
+                    git::attribution(&section.worktree, &section.base)?,
+                    match source {
+                        ReviewSource::Live => git::uncommitted_paths(&section.worktree)?,
+                        ReviewSource::Merged => HashSet::new(),
+                    },
+                ),
             };
 
             for mut file in changed {
@@ -639,7 +646,12 @@ impl Projects {
                 stat.additions = stat.additions.saturating_add(file.diff.additions);
                 stat.deletions = stat.deletions.saturating_add(file.diff.deletions);
 
+                // Uncommitted work has no trailer, so it belongs to nobody.
                 file.diff.agent = section.owner.or_else(|| {
+                    if uncommitted.contains(&file.raw_path) {
+                        return None;
+                    }
+
                     trailers
                         .get(&file.raw_path)
                         .and_then(|name| names.get(name.as_str()).copied().flatten())
@@ -714,8 +726,33 @@ impl Projects {
 
     /// Runs the teardown script, removes the task worktree and the workers' own
     /// worktrees (uncommitted changes go with them), keeps every branch and marks the
-    /// task closed. The caller stopped the task's processes first.
+    /// task closed. The caller stopped the task's processes first. A failure leaves the
+    /// task marked as closing, so a retry or the next daemon start finishes it.
     pub fn close_task(&self, id: TaskId) -> Result<ClosedTask, Error> {
+        self.finish_close(id, true)
+    }
+
+    /// Finishes every close that did not end, for example after a crash. No teardown
+    /// script runs, because the task's processes are gone.
+    pub fn recover_closing(&self) {
+        let tasks = match lock(&self.store).closing_tasks() {
+            Ok(tasks) => tasks,
+            Err(error) => {
+                log::error!("cannot list the tasks that were closing: {error}");
+
+                return;
+            }
+        };
+
+        for task in tasks {
+            match self.finish_close(task, false) {
+                Ok(_) => log::info!("finished closing task {}", task.0),
+                Err(error) => log::error!("cannot finish closing task {}: {error}", task.0),
+            }
+        }
+    }
+
+    fn finish_close(&self, id: TaskId, teardown: bool) -> Result<ClosedTask, Error> {
         let (task, root) = {
             let store = lock(&self.store);
             let task = store
@@ -732,8 +769,11 @@ impl Projects {
             (task, root)
         };
 
+        lock(&self.store).begin_closing(id)?;
+
         let LoadedConfig { config, .. } = config::load(&root);
-        if task.worktree.is_dir()
+        if teardown
+            && task.worktree.is_dir()
             && !config.worktrees.teardown.trim().is_empty()
             && let Err(error) = run_teardown(&config.worktrees.teardown, &task)
         {
@@ -835,11 +875,7 @@ struct Section {
 
 /// The section of a worker with its own worktree, unless the task branch has all of its
 /// work already.
-fn unmerged_section(
-    task: &TaskInfo,
-    worker: &AgentInfo,
-    recorded_base: Option<String>,
-) -> Result<Option<Section>, Error> {
+fn unmerged_section(task: &TaskInfo, worker: &AgentInfo) -> Result<Option<Section>, Error> {
     let worker_head = git::commit_of(&worker.worktree, "HEAD")?;
     let task_head = git::commit_of(&task.worktree, "HEAD")?;
     if git::is_ancestor(&task.worktree, &worker_head, &task_head)?
@@ -848,11 +884,8 @@ fn unmerged_section(
         return Ok(None);
     }
 
-    let base = match recorded_base {
-        Some(base) => base,
-        // Made before the base commit was recorded.
-        None => git::merge_base(&worker.worktree, &task.branch)?,
-    };
+    // Not the recorded start commit: what the task branch took already must not show twice.
+    let base = git::merge_base(&worker.worktree, &task_head)?;
 
     Ok(Some(Section {
         worktree: worker.worktree.clone(),

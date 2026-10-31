@@ -282,6 +282,15 @@ impl Agents {
         lock(&self.closing).remove(&task);
     }
 
+    /// Like [`Self::is_closing`], for the `task` key of a terminal.
+    pub(crate) fn is_closing_key(&self, key: Option<&str>) -> bool {
+        key.is_some_and(|key| {
+            lock(&self.closing)
+                .iter()
+                .any(|task| task.terminal_key() == key)
+        })
+    }
+
     pub(crate) fn is_closing(&self, task: Option<TaskId>) -> bool {
         task.is_some_and(|task| lock(&self.closing).contains(&task))
     }

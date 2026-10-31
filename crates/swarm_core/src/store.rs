@@ -122,6 +122,7 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE agents ADD COLUMN started_at INTEGER",
     "ALTER TABLE tasks ADD COLUMN approved INTEGER;
     ALTER TABLE tasks ADD COLUMN closed_at INTEGER",
+    "ALTER TABLE tasks ADD COLUMN closing_at INTEGER",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -570,6 +571,31 @@ impl Store {
         Ok(())
     }
 
+    /// Records that closing the task began, so a crash or a failure half way is found
+    /// again. Keeps the first time when called twice.
+    pub fn begin_closing(&self, task: TaskId) -> Result<(), Error> {
+        self.connection.execute(
+            "UPDATE tasks SET closing_at = ?1 WHERE id = ?2 AND closing_at IS NULL",
+            params![now_millis(), to_row(task.0)?],
+        )?;
+
+        Ok(())
+    }
+
+    /// Tasks whose close began and did not finish.
+    pub fn closing_tasks(&self) -> Result<Vec<TaskId>, Error> {
+        let mut statement = self.connection.prepare(
+            "SELECT id FROM tasks WHERE closing_at IS NOT NULL AND closed_at IS NULL ORDER BY id",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, i64>(0))?;
+
+        Ok(rows
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .map(|id| TaskId(id.unsigned_abs()))
+            .collect())
+    }
+
     /// Closes the task and ends every agent of it that is not `Stopped` yet. Returns
     /// the agents it changed.
     pub fn close_task(&self, task: TaskId) -> Result<Vec<AgentInfo>, Error> {
@@ -825,9 +851,11 @@ impl Store {
         let rows = statement.query_map(params![alive[0], alive[1]], agent_from_row)?;
         let stored: Vec<StoredAgent> = rows.collect::<rusqlite::Result<_>>()?;
 
+        let closing = self.closing_tasks()?;
+
         for mut agent in stored {
             let task_closed = match agent.info.task {
-                Some(task) => self.task(task)?.is_none(),
+                Some(task) => self.task(task)?.is_none() || closing.contains(&task),
                 None => false,
             };
 

@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result};
 use swarm_core::store::{ProcessMeta, Store};
 use swarm_protocol::{
-    CreateTerminal, Event, GridSize, TerminalId, TerminalInfo, TerminalKind, encode,
+    CreateTerminal, Event, GridSize, ReviewSource, TaskId, TerminalId, TerminalInfo, TerminalKind,
+    encode,
 };
 use swarm_term::{ExitStatus, Size, TerminalInput, TerminalOutput, channels};
 use swarm_term_vt::{DEFAULT_SCROLLBACK_BYTES, LocalTerminal, SpawnOptions};
@@ -80,15 +81,25 @@ pub(crate) struct ClientSink {
     /// Closed when the queue is full, which ends the connection's reader too.
     stream: Option<UnixStream>,
     changes_running: AtomicBool,
-    diff_running: AtomicBool,
+    /// The `TaskDiff` requests of this client that run.
+    diffs_running: Mutex<Vec<(TaskId, ReviewSource)>>,
 }
 
-/// Held while an `AgentChanges` or `TaskDiff` request of one client runs.
-pub(crate) struct ChangesGuard(Arc<ClientSink>, fn(&ClientSink) -> &AtomicBool);
+/// Held while an `AgentChanges` request of one client runs.
+pub(crate) struct ChangesGuard(Arc<ClientSink>);
 
 impl Drop for ChangesGuard {
     fn drop(&mut self) {
-        (self.1)(&self.0).store(false, Ordering::Release);
+        self.0.changes_running.store(false, Ordering::Release);
+    }
+}
+
+/// Held while a `TaskDiff` request of one client runs for one task and source.
+pub(crate) struct DiffGuard(Arc<ClientSink>, (TaskId, ReviewSource));
+
+impl Drop for DiffGuard {
+    fn drop(&mut self) {
+        lock(&self.0.diffs_running).retain(|running| *running != self.1);
     }
 }
 
@@ -99,25 +110,34 @@ impl ClientSink {
             frames,
             stream,
             changes_running: AtomicBool::new(false),
-            diff_running: AtomicBool::new(false),
+            diffs_running: Mutex::default(),
         }
     }
 
     /// None while an earlier `AgentChanges` request of this client still runs.
     pub(crate) fn begin_changes(self: &Arc<Self>) -> Option<ChangesGuard> {
-        self.begin(|sink| &sink.changes_running)
-    }
-
-    /// None while an earlier `TaskDiff` request of this client still runs.
-    pub(crate) fn begin_diff(self: &Arc<Self>) -> Option<ChangesGuard> {
-        self.begin(|sink| &sink.diff_running)
-    }
-
-    fn begin(self: &Arc<Self>, flag: fn(&ClientSink) -> &AtomicBool) -> Option<ChangesGuard> {
-        flag(self)
+        self.changes_running
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
-            .then(|| ChangesGuard(Arc::clone(self), flag))
+            .then(|| ChangesGuard(Arc::clone(self)))
+    }
+
+    /// None while an earlier `TaskDiff` request of this client for the same task and
+    /// source still runs. Other tasks and sources run side by side.
+    pub(crate) fn begin_diff(
+        self: &Arc<Self>,
+        task: TaskId,
+        source: ReviewSource,
+    ) -> Option<DiffGuard> {
+        let key = (task, source);
+
+        let mut running = lock(&self.diffs_running);
+        if running.contains(&key) {
+            return None;
+        }
+        running.push(key);
+
+        Some(DiffGuard(Arc::clone(self), key))
     }
 
     pub(crate) fn id(&self) -> u64 {
@@ -635,16 +655,22 @@ mod tests {
     }
 
     #[test]
-    fn one_diff_request_runs_per_client_apart_from_changes() {
+    fn one_diff_request_runs_per_client_task_and_source() {
         let (client, _frames) = sink(1, 8);
+        let (task, other) = (TaskId(1), TaskId(2));
 
-        let first = client.begin_diff();
+        let first = client.begin_diff(task, ReviewSource::Live);
         assert!(first.is_some());
-        assert!(client.begin_diff().is_none());
+        assert!(client.begin_diff(task, ReviewSource::Live).is_none());
+        assert!(
+            client.begin_diff(task, ReviewSource::Merged).is_some(),
+            "another source"
+        );
+        assert!(client.begin_diff(other, ReviewSource::Live).is_some());
         assert!(client.begin_changes().is_some(), "another kind of request");
 
         drop(first);
-        assert!(client.begin_diff().is_some());
+        assert!(client.begin_diff(task, ReviewSource::Live).is_some());
     }
 
     #[test]

@@ -7,17 +7,17 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
-use swarm_core::{PreparedTask, PreparedWorker, Projects};
+use swarm_core::{PreparedTask, PreparedWorker};
 use swarm_protocol::{
-    AgentId, AgentInfo, AgentKind, AgentRole, CreateTask, CreateTerminal, Event, ProjectId, TaskId,
-    TaskInfo, TerminalId, TerminalKind,
+    AgentId, AgentInfo, AgentKind, AgentRole, CloseCheck, CreateTask, CreateTerminal, Event,
+    ProjectId, TaskId, TaskInfo, TerminalId, TerminalKind,
 };
 use swarm_term::TerminalInput;
 use swarm_term::{ExitStatus, Palette, Rgb, Size};
 
 use crate::Services;
 use crate::agents::{CommandNotFound, Place, Start};
-use crate::hub::{Extras, Terminals};
+use crate::hub::Extras;
 
 /// Default size and colors of a setup or agent terminal; the app resizes it when it
 /// attaches.
@@ -110,8 +110,7 @@ pub(crate) fn create(
     let setup = match setup {
         None => Setup::None,
         Some(script) => match start_setup(
-            &services.terminals,
-            &services.projects,
+            services,
             &SetupSite {
                 task: task.id,
                 cwd: &task.worktree,
@@ -148,15 +147,33 @@ pub(crate) fn create(
     Ok(())
 }
 
-/// Closes a task: stops its agents and process terminals, then removes its worktrees
+/// What closing the task would throw away, with the user's terminals the daemon hosts.
+pub(crate) fn close_check(services: &Services, id: TaskId) -> Result<CloseCheck> {
+    let mut check = services.projects.close_check(id)?;
+
+    let key = id.terminal_key();
+    let user_terminals = services
+        .terminals
+        .list()
+        .into_iter()
+        .filter(|info| info.task.as_deref() == Some(key.as_str()))
+        .filter(|info| info.kind == TerminalKind::User && info.exit.is_none())
+        .count();
+    check.user_terminals = u32::try_from(user_terminals).unwrap_or(u32::MAX);
+
+    Ok(check)
+}
+
+/// Closes a task: stops its agents and all its terminals, then removes its worktrees
 /// and tells every client. Nothing new starts in the task from the first step on.
-pub(crate) fn close(services: &Services, id: TaskId) -> Result<()> {
+/// `confirmed` is the check the user saw; closing refuses when it would lose more.
+pub(crate) fn close(services: &Services, id: TaskId, confirmed: &CloseCheck) -> Result<()> {
     services.projects.task(id)?;
     if !services.agents.begin_close(id) {
         bail!("task {} is closing already", id.0);
     }
 
-    let result = stop_and_close(services, id);
+    let result = stop_and_close(services, id, confirmed);
     if result.is_err() {
         services.agents.abort_close(id);
     }
@@ -164,8 +181,25 @@ pub(crate) fn close(services: &Services, id: TaskId) -> Result<()> {
     result
 }
 
-fn stop_and_close(services: &Services, id: TaskId) -> Result<()> {
-    stop_processes(services, id);
+/// True when closing would lose something `confirmed` did not show. Running agents and
+/// terminals are left out: they were stopped since.
+fn loses_more(confirmed: &CloseCheck, now: &CloseCheck) -> bool {
+    now.uncommitted_files > confirmed.uncommitted_files
+        || now
+            .unmerged_workers
+            .iter()
+            .any(|name| !confirmed.unmerged_workers.contains(name))
+}
+
+fn stop_and_close(services: &Services, id: TaskId, confirmed: &CloseCheck) -> Result<()> {
+    if !stop_processes(services, id) {
+        bail!("some processes of the task did not end; try again");
+    }
+
+    let now = close_check(services, id)?;
+    if loses_more(confirmed, &now) {
+        bail!("more would be lost than shown; check again");
+    }
 
     let closed = services.projects.close_task(id)?;
 
@@ -181,7 +215,8 @@ fn stop_and_close(services: &Services, id: TaskId) -> Result<()> {
 
 /// Ends every agent and process terminal of the task: SIGTERM, then SIGKILL after
 /// [`CLOSE_GRACE`]. Repeats while new ones show up from a request that was under way.
-fn stop_processes(services: &Services, task: TaskId) {
+/// False when something of the task is still alive at the end.
+fn stop_processes(services: &Services, task: TaskId) -> bool {
     let key = task.terminal_key();
 
     for _ in 0..3 {
@@ -192,14 +227,13 @@ fn stop_processes(services: &Services, task: TaskId) {
                 .list()
                 .into_iter()
                 .filter(|info| info.task.as_deref() == Some(key.as_str()))
-                .filter(|info| info.kind != TerminalKind::User)
                 .map(|info| info.id),
         );
         running.sort_unstable();
         running.dedup();
 
         if running.is_empty() && !services.agents.has_live(task) {
-            return;
+            return true;
         }
 
         for terminal in &running {
@@ -225,9 +259,21 @@ fn stop_processes(services: &Services, task: TaskId) {
         if !wait_until_ended(services, task, &running, CLOSE_KILL_WAIT) {
             log::warn!("task {} still has processes after SIGKILL", task.0);
 
-            return;
+            return false;
         }
     }
+
+    !services.agents.has_live(task) && !has_terminals(services, task)
+}
+
+fn has_terminals(services: &Services, task: TaskId) -> bool {
+    let key = task.terminal_key();
+
+    services
+        .terminals
+        .list()
+        .iter()
+        .any(|info| info.task.as_deref() == Some(key.as_str()))
 }
 
 /// True when the terminals are gone and their agents have ended, within `timeout`.
@@ -312,8 +358,7 @@ pub(crate) fn start_worker(
     let setup = match prepared.setup {
         None => Setup::None,
         Some(script) => match start_setup(
-            &services.terminals,
-            &services.projects,
+            services,
             &SetupSite {
                 task: task.id,
                 cwd: &prepared.agent.worktree,
@@ -391,12 +436,16 @@ struct SetupSite<'a> {
 }
 
 fn start_setup(
-    terminals: &Arc<Terminals>,
-    projects: &Arc<Projects>,
+    services: &Services,
     site: &SetupSite<'_>,
     script: String,
     env: Vec<(String, String)>,
 ) -> Result<(TerminalId, flume::Receiver<Option<ExitStatus>>)> {
+    if services.agents.is_closing(Some(site.task)) {
+        bail!("the task is closing");
+    }
+
+    let (terminals, projects) = (&services.terminals, &services.projects);
     let request = CreateTerminal {
         kind: TerminalKind::Process,
         command: Some(vec!["/bin/sh".to_owned(), "-lc".to_owned(), script]),

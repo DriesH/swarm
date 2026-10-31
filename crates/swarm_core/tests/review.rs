@@ -144,6 +144,14 @@ impl Setup {
             .expect("diff")
     }
 
+    fn commit_all(&self) {
+        git_in(&self.task.worktree, &["add", "-A"]);
+        git_in(
+            &self.task.worktree,
+            &["commit", "-q", "--allow-empty", "-m", "work"],
+        );
+    }
+
     fn live(&self) -> TaskDiff {
         self.projects
             .task_diff(self.task.id, ReviewSource::Live)
@@ -194,7 +202,7 @@ fn a_modified_file_has_hunks_with_context_and_a_section() {
     let setup = setup("");
     setup.write("README.md", "hello\nworld\n");
 
-    let diff = setup.merged();
+    let diff = setup.live();
 
     let readme = file(&diff, "README.md");
     assert_eq!(readme.change, FileChange::Modified);
@@ -229,7 +237,7 @@ fn a_deleted_file_and_the_missing_newline_marker() {
     std::fs::remove_file(setup.task.worktree.join("tail.txt")).expect("remove");
     setup.write("README.md", "hello");
 
-    let diff = setup.merged();
+    let diff = setup.live();
 
     let removed = file(&diff, "tail.txt");
     assert_eq!(removed.change, FileChange::Deleted);
@@ -238,7 +246,8 @@ fn a_deleted_file_and_the_missing_newline_marker() {
         lines(file(&diff, "README.md")),
         [
             (DiffLineKind::Deleted, "hello"),
-            (DiffLineKind::Added, "hello")
+            (DiffLineKind::Added, "hello"),
+            (DiffLineKind::NoNewline, "")
         ]
     );
 }
@@ -261,7 +270,7 @@ fn paths_with_a_space_a_non_ascii_letter_and_a_tab_are_exact() {
     }
     setup.write("new \u{e9}\tfile.txt", "fresh\n");
 
-    let diff = setup.merged();
+    let diff = setup.live();
 
     for name in names {
         assert_eq!(
@@ -282,7 +291,7 @@ fn untracked_text_and_binary_files_are_added_files() {
     setup.write("empty.txt", "");
     std::fs::write(setup.task.worktree.join("blob.bin"), [1_u8, 0, 2, 3]).expect("binary");
 
-    let diff = setup.merged();
+    let diff = setup.live();
 
     let notes = file(&diff, "notes.txt");
     assert_eq!(notes.change, FileChange::Added);
@@ -312,7 +321,7 @@ fn a_tracked_binary_change_has_no_lines() {
     let setup = setup_with("", &[("blob.bin", &[0_u8, 1])]);
     std::fs::write(setup.task.worktree.join("blob.bin"), [0_u8, 2, 3]).expect("binary");
 
-    let diff = setup.merged();
+    let diff = setup.live();
 
     let blob = file(&diff, "blob.bin");
     assert!(blob.binary);
@@ -344,11 +353,7 @@ fn a_fifo_and_a_link_to_it_do_not_hang_the_diff() {
     std::os::unix::fs::symlink("/dev/zero", setup.task.worktree.join("zeros")).expect("link");
 
     let (projects, task) = (setup.projects, setup.task.id);
-    let diff = within_seconds(move || {
-        projects
-            .task_diff(task, ReviewSource::Merged)
-            .expect("diff")
-    });
+    let diff = within_seconds(move || projects.task_diff(task, ReviewSource::Live).expect("diff"));
 
     assert_eq!(
         lines(file(&diff, "link")),
@@ -369,7 +374,7 @@ fn a_long_line_is_cut_on_a_character_boundary_and_bad_utf8_is_replaced() {
     bad.extend_from_slice(b"second\n");
     std::fs::write(setup.task.worktree.join("bad.txt"), bad).expect("write");
 
-    let diff = setup.merged();
+    let diff = setup.live();
 
     let line = &file(&diff, "long.txt").hunks[0].lines[0].text;
     assert_eq!(line.len(), DIFF_LINE_BYTES);
@@ -383,7 +388,7 @@ fn the_per_file_cap_marks_the_file_but_the_totals_stay_full() {
     let count = DIFF_LINES_PER_FILE + 10;
     setup.write("big.txt", &"x\n".repeat(count));
 
-    let diff = setup.merged();
+    let diff = setup.live();
 
     let big = file(&diff, "big.txt");
     assert!(big.truncated);
@@ -404,7 +409,7 @@ fn the_total_line_cap_and_the_file_cap_keep_the_totals() {
         setup.write(&format!("small-{index:04}.txt"), "y\n");
     }
 
-    let diff = setup.merged();
+    let diff = setup.live();
 
     let kept: usize = diff.files.iter().map(|file| lines(file).len()).sum();
     assert_eq!(kept, DIFF_LINES);
@@ -425,17 +430,12 @@ fn the_fingerprint_is_stable_and_follows_every_line_and_binary_change() {
     setup.write("a.txt", "one\ntwo\n");
     let binary = setup.task.worktree.join("blob.bin");
     std::fs::write(&binary, [0_u8, 1, 2]).expect("binary");
-    let first = setup.merged();
+    let first = setup.live();
 
-    assert_eq!(setup.merged().fingerprint, first.fingerprint);
-    assert_ne!(
-        setup.live().fingerprint,
-        first.fingerprint,
-        "the source counts"
-    );
+    assert_eq!(setup.live().fingerprint, first.fingerprint);
 
     setup.write("a.txt", "one\ntwo!\n");
-    let changed_line = setup.merged().fingerprint;
+    let changed_line = setup.live().fingerprint;
     assert_ne!(changed_line, first.fingerprint);
 
     // Same size, same lines: only the content and the time differ.
@@ -447,7 +447,7 @@ fn the_fingerprint_is_stable_and_follows_every_line_and_binary_change() {
         .expect("open");
     file.set_times(std::fs::FileTimes::new().set_modified(later))
         .expect("time");
-    assert_ne!(setup.merged().fingerprint, changed_line);
+    assert_ne!(setup.live().fingerprint, changed_line);
 }
 
 #[test]
@@ -455,12 +455,12 @@ fn a_change_in_a_line_past_the_caps_changes_the_fingerprint() {
     let setup = setup("");
     let mut text = "x\n".repeat(DIFF_LINES_PER_FILE + 5);
     setup.write("big.txt", &text);
-    let before = setup.merged().fingerprint;
+    let before = setup.live().fingerprint;
 
     text.replace_range(text.len() - 2.., "y\n");
     setup.write("big.txt", &text);
 
-    assert_ne!(setup.merged().fingerprint, before);
+    assert_ne!(setup.live().fingerprint, before);
 }
 
 #[test]
@@ -474,18 +474,20 @@ fn a_mode_only_change_and_a_type_change_do_not_break_the_diff() {
     std::fs::remove_file(setup.task.worktree.join("kind")).expect("remove");
     std::os::unix::fs::symlink("README.md", setup.task.worktree.join("kind")).expect("link");
 
-    let diff = setup.merged();
+    let diff = setup.live();
 
     let script = file(&diff, "run.sh");
     assert_eq!(script.change, FileChange::Modified);
     assert!(script.hunks.is_empty());
+    assert_eq!(script.mode_change, Some((0o100_644, 0o100_755)));
     let kind = file(&diff, "kind");
     assert_eq!(kind.change, FileChange::Modified);
     assert_eq!(
         lines(kind),
         [
             (DiffLineKind::Deleted, "text"),
-            (DiffLineKind::Added, "README.md")
+            (DiffLineKind::Added, "README.md"),
+            (DiffLineKind::NoNewline, "")
         ]
     );
 }
@@ -508,7 +510,7 @@ fn a_submodule_change_does_not_break_the_diff() {
     );
     setup.write("README.md", "hello\nmore\n");
 
-    let diff = setup.merged();
+    let diff = setup.live();
 
     assert_eq!(file(&diff, "sub").change, FileChange::Added);
     assert_eq!(file(&diff, "README.md").additions, 1);
@@ -533,7 +535,7 @@ fn files_are_attributed_by_the_newest_trailer_commit() {
     );
     setup.write("dirty.rs", "1\n");
 
-    let diff = setup.merged();
+    let diff = setup.live();
 
     assert_eq!(file(&diff, "api.rs").agent, Some(api.id));
     assert_eq!(file(&diff, "ui.rs").agent, Some(ui.id));
@@ -630,8 +632,10 @@ fn a_merged_worker_with_uncommitted_changes_stays_in_live() {
 fn approving_needs_the_current_fingerprint() {
     let setup = setup("");
     setup.write("a.txt", "1\n");
+    setup.commit_all();
     let reviewed = setup.merged().fingerprint;
     setup.write("a.txt", "2\n");
+    setup.commit_all();
 
     let stale = setup.projects.approve(setup.task.id, reviewed);
     let Err(Error::Invalid(message)) = stale else {
@@ -815,4 +819,227 @@ fn a_closed_agent_that_could_resume_is_stopped() {
 
     let ids: Vec<AgentId> = closed.stopped.iter().map(|agent| agent.id).collect();
     assert_eq!(ids, [ui.id]);
+}
+
+#[test]
+fn merged_holds_commits_only_and_live_holds_the_working_tree() {
+    let setup = setup("");
+    setup.write("done.txt", "1\n");
+    setup.commit_all();
+    let before = setup.merged().fingerprint;
+    setup.write("done.txt", "1\n2\n");
+    setup.write("fresh.txt", "x\n");
+
+    let merged = setup.merged();
+
+    assert_eq!(paths(&merged), [Path::new("done.txt")]);
+    assert_eq!(merged.stat.additions, 1);
+    assert_eq!(merged.fingerprint, before, "uncommitted work is not in it");
+    let live = setup.live();
+    assert_eq!(live.stat.files, 2);
+    assert_eq!(file(&live, "done.txt").additions, 2);
+}
+
+#[test]
+fn the_missing_newline_at_the_end_changes_the_fingerprint() {
+    let setup = setup("");
+    setup.write("a.txt", "one\ntwo\n");
+    setup.commit_all();
+    let with_newline = setup.merged().fingerprint;
+
+    setup.write("a.txt", "one\ntwo");
+    setup.commit_all();
+    let merged = setup.merged();
+
+    assert_ne!(merged.fingerprint, with_newline);
+    assert_eq!(
+        lines(file(&merged, "a.txt")),
+        [
+            (DiffLineKind::Added, "one"),
+            (DiffLineKind::Added, "two"),
+            (DiffLineKind::NoNewline, "")
+        ]
+    );
+
+    let untracked = {
+        setup.write("b.txt", "x");
+        setup.live()
+    };
+    assert_eq!(
+        lines(file(&untracked, "b.txt")),
+        [(DiffLineKind::Added, "x"), (DiffLineKind::NoNewline, "")]
+    );
+}
+
+#[test]
+fn a_mode_only_change_changes_the_merged_fingerprint() {
+    let setup = setup_with("", &[("run.sh", b"echo\n")]);
+    setup.write("other.txt", "1\n");
+    setup.commit_all();
+    let before = setup.merged().fingerprint;
+
+    std::fs::set_permissions(
+        setup.task.worktree.join("run.sh"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .expect("mode");
+    setup.commit_all();
+    let merged = setup.merged();
+
+    assert_ne!(merged.fingerprint, before);
+    assert_eq!(
+        file(&merged, "run.sh").mode_change,
+        Some((0o100_644, 0o100_755))
+    );
+}
+
+#[test]
+fn a_committed_binary_change_changes_the_fingerprint_without_a_new_mtime() {
+    let setup = setup("");
+    let binary = setup.task.worktree.join("blob.bin");
+    std::fs::write(&binary, [0_u8, 1, 2]).expect("binary");
+    setup.commit_all();
+    let first = setup.merged().fingerprint;
+    let modified = std::fs::metadata(&binary)
+        .and_then(|meta| meta.modified())
+        .expect("mtime");
+
+    std::fs::write(&binary, [0_u8, 1, 3]).expect("binary");
+    std::fs::File::options()
+        .write(true)
+        .open(&binary)
+        .and_then(|file| file.set_times(std::fs::FileTimes::new().set_modified(modified)))
+        .expect("time");
+    setup.commit_all();
+
+    let merged = setup.merged();
+    assert_ne!(merged.fingerprint, first);
+    assert!(file(&merged, "blob.bin").binary);
+}
+
+#[test]
+fn a_partly_merged_worker_shows_only_what_the_task_branch_lacks() {
+    let setup = setup("");
+    let ui = setup.worker("ui", true);
+    std::fs::write(ui.worktree.join("one.rs"), "1\n").expect("file");
+    commit("ui", &ui.worktree, &["one.rs"]);
+    git::merge_branch(&setup.task.worktree, &ui.branch).expect("merge");
+    std::fs::write(ui.worktree.join("two.rs"), "1\n").expect("file");
+    commit("ui", &ui.worktree, &["two.rs"]);
+
+    let live = setup.live();
+
+    let ones: Vec<_> = live
+        .files
+        .iter()
+        .filter(|file| file.path == Path::new("one.rs"))
+        .collect();
+    assert_eq!(ones.len(), 1);
+    assert_eq!(ones[0].worktree, setup.task.worktree);
+    assert_eq!(file(&live, "two.rs").worktree, ui.worktree);
+    assert_eq!(live.stat.files, 2);
+}
+
+#[test]
+fn uncommitted_work_in_the_task_worktree_has_no_agent_in_live() {
+    let setup = setup("");
+    let api = setup.worker("api", false);
+    setup.write("kept.rs", "1\n");
+    setup.write("edited.rs", "1\n");
+    commit("api", &setup.task.worktree, &["kept.rs", "edited.rs"]);
+    setup.write("edited.rs", "1\n2\n");
+
+    let live = setup.live();
+
+    assert_eq!(file(&live, "edited.rs").agent, None);
+    assert_eq!(file(&live, "kept.rs").agent, Some(api.id));
+}
+
+#[test]
+fn untracked_files_over_a_cap_are_left_out_not_binary() {
+    let setup = setup("");
+    let big = setup.task.worktree.join("big.txt");
+    std::fs::write(&big, "x".repeat((1 << 20) + 10)).expect("big");
+    setup.write("nul.bin", "a\0b");
+
+    let live = setup.live();
+
+    let left_out = file(&live, "big.txt");
+    assert!(left_out.truncated);
+    assert!(!left_out.binary);
+    assert!(left_out.hunks.is_empty());
+    assert!(file(&live, "nul.bin").binary);
+}
+
+#[test]
+fn untracked_files_past_the_listing_cap_still_count_and_are_hashed() {
+    let names: Vec<String> = (0..5).map(|index| format!("t{index}.txt")).collect();
+    let base: Vec<(&str, &[u8])> = names
+        .iter()
+        .map(|name| (name.as_str(), b"one\n".as_slice()))
+        .collect();
+    let setup = setup_with("", &base);
+    for name in &names {
+        setup.write(name, "two\n");
+    }
+    let many = setup.task.worktree.join("many");
+    std::fs::create_dir_all(&many).expect("folder");
+    for index in 0..10_002 {
+        std::fs::write(many.join(format!("f{index:05}.txt")), "x\n").expect("file");
+    }
+
+    let before = setup.live();
+
+    assert_eq!(before.stat.files, 5 + 10_002);
+    assert_eq!(
+        before.stat.additions,
+        5 + 10_000,
+        "tracked files do not use up the untracked allowance"
+    );
+
+    std::fs::write(many.join("f10001.txt"), "xyz\n").expect("file");
+    assert_ne!(
+        setup.live().fingerprint,
+        before.fingerprint,
+        "a file past the cap is hashed by size"
+    );
+}
+
+#[test]
+fn a_closing_task_is_finished_by_recovery() {
+    let setup = setup("");
+    let ui = setup.worker("ui", true);
+    {
+        let store = setup.store.lock().expect("lock");
+        let mut running = ui.clone();
+        running.lifecycle = AgentLifecycle::Running;
+        running.revision += 1;
+        store.save_agent(&running).expect("save");
+        store.set_agent_session(ui.id, "session").expect("session");
+        store.confirm_agent_session(ui.id).expect("confirm");
+        store.begin_closing(setup.task.id).expect("closing");
+        store.recover_agents().expect("recover");
+    }
+    let agents = setup.store.lock().expect("lock").list_agents(setup.task.id);
+    assert_eq!(
+        agents.expect("agents")[0].lifecycle,
+        AgentLifecycle::Stopped,
+        "no agent of a closing task resumes"
+    );
+    assert!(setup.task.worktree.exists());
+
+    setup.projects.recover_closing();
+
+    assert!(!setup.task.worktree.exists());
+    assert!(!ui.worktree.exists());
+    assert!(setup.projects.task(setup.task.id).is_err());
+    assert!(
+        setup
+            .store
+            .lock()
+            .expect("lock")
+            .closing_tasks()
+            .expect("closing")
+            .is_empty()
+    );
 }

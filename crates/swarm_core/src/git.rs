@@ -1,6 +1,6 @@
 //! Runs the `git` binary. User text only ever travels as an argument, never through a shell.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::io::{Read as _, Write as _};
 use std::os::unix::ffi::OsStrExt as _;
@@ -817,19 +817,29 @@ const DIFF_BINARY_SNIFF: usize = 8192;
 /// Marks the start of a commit in the attribution log; unlikely inside a path.
 const COMMIT_MARK: &[u8] = b"\x01\x02swarm-commit\x02\x01";
 
-/// What the working tree of `worktree` changed since `base`, as reviewable files:
-/// tracked changes from git's patch, untracked files as added files. Sorted by path.
-/// Spends `budget` on the hunk lines; files and lines past it are still counted and
-/// hashed. Retries once when the worktree changes while git runs.
+/// What a diff of a worktree compares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffScope {
+    /// The working tree against `base`: committed, uncommitted and untracked work.
+    WorkingTree,
+    /// `HEAD` against `base`: commits only.
+    Committed,
+}
+
+/// What `worktree` changed since `base`, as reviewable files: tracked changes from
+/// git's patch, and for [`DiffScope::WorkingTree`] untracked files as added files.
+/// Sorted by path. Spends `budget` on the hunk lines; files and lines past it are still
+/// counted and hashed. Retries once when the worktree changes while git runs.
 pub fn worktree_diff(
     worktree: &Path,
     base: &str,
+    scope: DiffScope,
     budget: &mut DiffBudget,
 ) -> Result<Vec<ChangedFile>, Error> {
     for _ in 0..2 {
         let mut attempt = *budget;
 
-        if let Some(files) = read_worktree_diff(worktree, base, &mut attempt)? {
+        if let Some(files) = read_worktree_diff(worktree, base, scope, &mut attempt)? {
             *budget = attempt;
 
             return Ok(files);
@@ -869,27 +879,36 @@ impl Item {
 fn read_worktree_diff(
     worktree: &Path,
     base: &str,
+    scope: DiffScope,
     budget: &mut DiffBudget,
 ) -> Result<Option<Vec<ChangedFile>>, Error> {
-    let numstat = diff_index(worktree, base, &["--numstat", "-z"])?;
-    let patch = diff_index(worktree, base, &["-p", "-U3", "--inter-hunk-context=0"])?;
+    let numstat = diff_command(worktree, base, scope, &["--numstat", "-z"])?;
+    let patch = diff_command(
+        worktree,
+        base,
+        scope,
+        &["-p", "-U3", "--full-index", "--inter-hunk-context=0"],
+    )?;
 
     let Some(mut items) = tracked_items(&numstat, &patch) else {
         return Ok(None);
     };
 
-    let untracked = untracked_paths(worktree)?;
-    items.retain(|item| match item {
-        Item::Tracked { path, .. } => !untracked.contains(path),
-        Item::Untracked { .. } => true,
-    });
-    items.extend(untracked.into_iter().map(|path| Item::Untracked { path }));
+    if scope == DiffScope::WorkingTree {
+        let untracked = untracked_paths(worktree)?;
+        items.retain(|item| match item {
+            Item::Tracked { path, .. } => !untracked.contains(path),
+            Item::Untracked { .. } => true,
+        });
+        items.extend(untracked.into_iter().map(|path| Item::Untracked { path }));
+    }
     items.sort_by(|one, other| one.path().cmp(other.path()));
 
     let mut untracked_budget = MAX_TOTAL_BYTES;
+    let mut untracked_seen = 0;
     let mut files = Vec::with_capacity(items.len());
 
-    for (index, item) in items.iter().enumerate() {
+    for item in &items {
         let mut collector = Collector::new(budget);
 
         let file = match item {
@@ -912,7 +931,9 @@ fn read_worktree_diff(
                 file
             }
             Item::Untracked { path } => {
-                let readable = index < MAX_UNTRACKED_FILES;
+                let readable = untracked_seen < MAX_UNTRACKED_FILES;
+                untracked_seen += 1;
+
                 let Some(file) = untracked_file(
                     worktree,
                     path,
@@ -927,16 +948,25 @@ fn read_worktree_diff(
             }
         };
 
-        files.push(collector.finish(worktree, file, budget));
+        files.push(collector.finish(worktree, scope, file, budget));
     }
 
     Ok(Some(files))
 }
 
-fn diff_index(worktree: &Path, base: &str, options: &[&str]) -> Result<Vec<u8>, Error> {
+fn diff_command(
+    worktree: &Path,
+    base: &str,
+    scope: DiffScope,
+    options: &[&str],
+) -> Result<Vec<u8>, Error> {
     // `diff-index` never writes the index, so it cannot block the agent's own git.
+    let command = match scope {
+        DiffScope::WorkingTree => "diff-index",
+        DiffScope::Committed => "diff",
+    };
     let mut arguments: Vec<&str> = vec![
-        "diff-index",
+        command,
         "--no-renames",
         "--no-color",
         "--no-ext-diff",
@@ -945,7 +975,11 @@ fn diff_index(worktree: &Path, base: &str, options: &[&str]) -> Result<Vec<u8>, 
         "--dst-prefix=b/",
     ];
     arguments.extend_from_slice(options);
-    arguments.extend(["--end-of-options", base, "--"]);
+    arguments.extend(["--end-of-options", base]);
+    if scope == DiffScope::Committed {
+        arguments.push("HEAD");
+    }
+    arguments.push("--");
 
     let (arguments, output) = execute(worktree, arguments)?;
     if !output.success {
@@ -955,7 +989,7 @@ fn diff_index(worktree: &Path, base: &str, options: &[&str]) -> Result<Vec<u8>, 
     Ok(output.raw)
 }
 
-fn untracked_paths(worktree: &Path) -> Result<std::collections::HashSet<Vec<u8>>, Error> {
+fn untracked_paths(worktree: &Path) -> Result<HashSet<Vec<u8>>, Error> {
     let (arguments, output) = execute(
         worktree,
         ["ls-files", "--others", "--exclude-standard", "-z"],
@@ -968,7 +1002,6 @@ fn untracked_paths(worktree: &Path) -> Result<std::collections::HashSet<Vec<u8>>
         .raw
         .split(|byte| *byte == 0)
         .filter(|path| !path.is_empty())
-        .take(MAX_UNTRACKED_FILES + 1)
         .map(<[u8]>::to_vec)
         .collect())
 }
@@ -1062,6 +1095,9 @@ struct Collector {
     truncated: bool,
     additions: u32,
     deletions: u32,
+    last_kept: bool,
+    /// The file was not read; its size and mtime stand in for its content.
+    left_out: bool,
 }
 
 impl Collector {
@@ -1081,7 +1117,20 @@ impl Collector {
             truncated: false,
             additions: 0,
             deletions: 0,
+            last_kept: false,
+            left_out: false,
         }
+    }
+
+    /// A header line of the file block (modes, blob hashes), hashed but never shown.
+    fn header(&mut self, line: &[u8]) {
+        self.digest.write_text(line);
+    }
+
+    /// The file is too large or over a cap, so it is shown without lines.
+    fn leave_out(&mut self) {
+        self.truncated = true;
+        self.left_out = true;
     }
 
     fn start_hunk(&mut self, hunk: DiffHunk) {
@@ -1103,21 +1152,38 @@ impl Collector {
             DiffLineKind::Context => 0,
             DiffLineKind::Added => 1,
             DiffLineKind::Deleted => 2,
+            DiffLineKind::NoNewline => 3,
         }]);
         self.digest.write_text(text);
+
+        if kind == DiffLineKind::NoNewline {
+            // The marker follows the line it belongs to, whatever the caps are.
+            if self.last_kept
+                && let Some(hunk) = self.hunks.last_mut()
+            {
+                hunk.lines.push(DiffLine {
+                    kind,
+                    text: String::new(),
+                });
+            }
+
+            return;
+        }
 
         match kind {
             DiffLineKind::Added => self.additions = self.additions.saturating_add(1),
             DiffLineKind::Deleted => self.deletions = self.deletions.saturating_add(1),
-            DiffLineKind::Context => {}
+            DiffLineKind::Context | DiffLineKind::NoNewline => {}
         }
 
         if self.kept >= self.limit {
             self.truncated = true;
+            self.last_kept = false;
 
             return;
         }
         self.kept += 1;
+        self.last_kept = true;
 
         if let Some(hunk) = self.pending.take() {
             self.hunks.push(hunk);
@@ -1132,11 +1198,19 @@ impl Collector {
         });
     }
 
-    fn finish(self, worktree: &Path, mut file: FileDiff, budget: &mut DiffBudget) -> ChangedFile {
+    fn finish(
+        self,
+        worktree: &Path,
+        scope: DiffScope,
+        mut file: FileDiff,
+        budget: &mut DiffBudget,
+    ) -> ChangedFile {
         let mut digest = self.digest;
         digest.write_u64(u64::from(file.binary));
 
-        if file.binary
+        // A committed binary change shows in its blob hashes; the working tree has none.
+        let by_stat = scope == DiffScope::WorkingTree && file.binary;
+        if (by_stat || self.left_out)
             && let Ok(meta) = std::fs::symlink_metadata(worktree.join(&file.path))
         {
             digest.write_u64(meta.len());
@@ -1148,7 +1222,7 @@ impl Collector {
         budget.lines = budget.lines.saturating_sub(self.kept);
 
         file.hunks = self.hunks;
-        file.truncated = self.truncated;
+        file.truncated |= self.truncated;
         if !file.binary {
             file.additions = self.additions;
             file.deletions = self.deletions;
@@ -1184,6 +1258,7 @@ fn blank_file(worktree: &Path, raw_path: &[u8], change: FileChange, binary: bool
         path: PathBuf::from(String::from_utf8_lossy(raw_path).into_owned()),
         agent: None,
         change,
+        mode_change: None,
         additions: 0,
         deletions: 0,
         binary,
@@ -1202,6 +1277,7 @@ fn tracked_file<'a>(
     collector: &mut Collector,
 ) -> Option<FileDiff> {
     let (mut created, mut removed) = (false, false);
+    let (mut old_mode, mut new_mode) = (None, None);
 
     for block in blocks {
         let mut in_hunks = false;
@@ -1221,11 +1297,15 @@ fn tracked_file<'a>(
             if !in_hunks {
                 created |= line.starts_with(b"new file mode ");
                 removed |= line.starts_with(b"deleted file mode ");
+                old_mode = old_mode.or_else(|| parse_mode(line, b"old mode "));
+                new_mode = new_mode.or_else(|| parse_mode(line, b"new mode "));
+                collector.header(line);
 
                 continue;
             }
 
             match line.first() {
+                Some(b'\\') => collector.push(DiffLineKind::NoNewline, b""),
                 Some(b'+') => collector.push(DiffLineKind::Added, &line[1..]),
                 Some(b'-') => collector.push(DiffLineKind::Deleted, &line[1..]),
                 Some(b' ') => collector.push(DiffLineKind::Context, &line[1..]),
@@ -1246,7 +1326,17 @@ fn tracked_file<'a>(
         return None;
     }
 
-    Some(blank_file(worktree, path, change, binary))
+    let mut file = blank_file(worktree, path, change, binary);
+    file.mode_change = old_mode.zip(new_mode);
+
+    Some(file)
+}
+
+/// The octal mode in a `old mode 100644` style header line.
+fn parse_mode(line: &[u8], prefix: &[u8]) -> Option<u32> {
+    let text = std::str::from_utf8(line.strip_prefix(prefix)?).ok()?;
+
+    u32::from_str_radix(text.trim(), 8).ok()
 }
 
 /// `@@ -1,2 +3,4 @@ section`
@@ -1298,24 +1388,36 @@ fn untracked_file(
     }
 
     // A FIFO or a folder (a nested repository) is never opened.
-    if !meta.is_file() || !readable || meta.len() > MAX_COUNTED_BYTES || *budget == 0 {
+    if !meta.is_file() {
         return Some(text_file(true));
+    }
+
+    if !readable || meta.len() > MAX_COUNTED_BYTES || *budget == 0 {
+        collector.leave_out();
+
+        return Some(text_file(false));
     }
 
     let mut bytes = Vec::new();
     let read = std::fs::File::open(&path)
         .and_then(|file| file.take(MAX_COUNTED_BYTES + 1).read_to_end(&mut bytes));
     if read.is_err() {
-        return Some(text_file(true));
+        collector.leave_out();
+
+        return Some(text_file(false));
     }
 
     *budget = budget.saturating_sub(bytes.len() as u64);
-    if bytes.len() as u64 > MAX_COUNTED_BYTES
-        || bytes[..bytes.len().min(DIFF_BINARY_SNIFF)].contains(&0)
-    {
+    if bytes[..bytes.len().min(DIFF_BINARY_SNIFF)].contains(&0) {
         return Some(text_file(true));
     }
+    if bytes.len() as u64 > MAX_COUNTED_BYTES {
+        collector.leave_out();
 
+        return Some(text_file(false));
+    }
+
+    let missing_newline = bytes.last().is_some_and(|last| *last != b'\n');
     let mut lines: Vec<&[u8]> = bytes.split(|byte| *byte == b'\n').collect();
     if lines.last().is_some_and(|line| line.is_empty()) {
         lines.pop();
@@ -1326,6 +1428,9 @@ fn untracked_file(
     }
     for line in lines {
         collector.push(DiffLineKind::Added, line);
+    }
+    if missing_newline {
+        collector.push(DiffLineKind::NoNewline, b"");
     }
 
     Some(text_file(false))
@@ -1407,8 +1512,16 @@ pub fn is_ancestor(worktree: &Path, ancestor: &str, descendant: &str) -> Result<
     }
 }
 
-/// Files with changes that are not committed, untracked ones included.
+/// Files with changes that are not committed, untracked ones included. Ignored files
+/// are not counted: closing a task deletes them without asking.
 pub fn uncommitted_files(worktree: &Path) -> Result<u32, Error> {
+    let count = uncommitted_paths(worktree)?.len();
+
+    Ok(u32::try_from(count).unwrap_or(u32::MAX))
+}
+
+/// The paths behind [`uncommitted_files`], as git printed them.
+pub fn uncommitted_paths(worktree: &Path) -> Result<HashSet<Vec<u8>>, Error> {
     let (arguments, output) = execute(
         worktree,
         [
@@ -1423,13 +1536,13 @@ pub fn uncommitted_files(worktree: &Path) -> Result<u32, Error> {
         return Err(failure(&arguments, &output));
     }
 
-    let count = output
+    // Each entry is `XY path`.
+    Ok(output
         .raw
         .split(|byte| *byte == 0)
-        .filter(|entry| !entry.is_empty())
-        .count();
-
-    Ok(u32::try_from(count).unwrap_or(u32::MAX))
+        .filter(|entry| entry.len() > 3)
+        .map(|entry| entry[3..].to_vec())
+        .collect())
 }
 
 /// Forgets worktrees whose folder is gone.
