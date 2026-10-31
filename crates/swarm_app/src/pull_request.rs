@@ -4,17 +4,21 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use gpui::{AppContext as _, Context, Entity, SharedString, Subscription, Window, div};
+use gpui::{
+    AppContext as _, Context, Entity, FocusHandle, Focusable as _, SharedString, Subscription,
+    Window, div,
+};
 use swarm_protocol::{
     CheckState, ChecksRun, Client, ClientError, GithubCheckState, GithubStatus, MergeMethod,
-    PrDraft, PrEvent, PrLink, PrState, PullRequest, TaskId as DaemonTaskId,
+    PrDraft, PrEvent, PrLink, PrPanel, PrState, PullRequest, TaskId as DaemonTaskId,
     TerminalId as DaemonTerminalId,
 };
 use swarm_term::ExitStatus;
 use swarm_ui::prelude::*;
 
 use crate::model::{
-    ProjectId, TaskId, TerminalId, sample_checks_run, sample_draft, sample_pull_request,
+    CheckConfig, ProjectId, TaskId, TerminalId, sample_check_config, sample_checks_run,
+    sample_draft, sample_pull_request,
 };
 use crate::palette::Overlay;
 use crate::review_comments::refusal;
@@ -23,8 +27,28 @@ use crate::workspace::{DataSource, RightPanel, View, Workspace};
 
 /// How often the status is read while a GitHub check queues or runs.
 pub(crate) const STATUS_FAST: Duration = Duration::from_secs(10);
-/// How often the status is read otherwise.
+/// How often the status is read otherwise, while the panel shows.
 pub(crate) const STATUS_SLOW: Duration = Duration::from_secs(30);
+/// How often the status is read while the panel is closed, to keep the header current.
+pub(crate) const STATUS_HIDDEN: Duration = Duration::from_secs(60);
+
+/// How long the status poll waits between reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StatusIntervals {
+    pub fast: Duration,
+    pub slow: Duration,
+    pub hidden: Duration,
+}
+
+impl Default for StatusIntervals {
+    fn default() -> Self {
+        Self {
+            fast: STATUS_FAST,
+            slow: STATUS_SLOW,
+            hidden: STATUS_HIDDEN,
+        }
+    }
+}
 
 /// What the Review header offers once the task is approved.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -67,6 +91,7 @@ pub(crate) enum Blocker {
     ChecksFailed,
     ChecksStopped,
     ChecksStale,
+    ChecksUnclean,
 }
 
 impl Blocker {
@@ -82,6 +107,7 @@ impl Blocker {
             Self::ChecksFailed => "Checks failed",
             Self::ChecksStopped => "Checks stopped",
             Self::ChecksStale => "Checks stale",
+            Self::ChecksUnclean => "Uncommitted changes",
         }
     }
 }
@@ -104,12 +130,55 @@ pub(crate) struct CreateInputs<'a> {
     pub pending_comments: u32,
     pub github_ready: bool,
     pub title_empty: bool,
-    pub checks: Option<&'a ChecksRun>,
-    pub stale: bool,
+    /// The project configures no local checks, so nothing waits for them.
+    pub no_checks: bool,
+    /// `[checks] required`. Without it, a failed or missing run only asks first.
+    pub required: bool,
+    pub run: Option<&'a ChecksRun>,
+    /// HEAD of the loaded Merged diff, once it is loaded.
+    pub head: Option<&'a str>,
 }
 
-/// Without a run the app does not know whether the checks are required, so it asks for
-/// one first.
+/// A run is over when a check failed, was skipped or stopped, or all passed. Only waiting
+/// and running checks without any of those mean it still runs.
+pub(crate) fn run_is_over(run: &ChecksRun) -> bool {
+    run.checks.iter().any(|check| {
+        matches!(
+            check.state,
+            CheckState::Failed | CheckState::Skipped | CheckState::Stopped
+        )
+    }) || run
+        .checks
+        .iter()
+        .all(|check| check.state == CheckState::Passed)
+}
+
+/// The run was made on the commit the task branch is on now.
+pub(crate) fn run_is_current(run: &ChecksRun, head: Option<&str>) -> bool {
+    head == Some(run.commit.as_str())
+}
+
+/// Why a run does not let a pull request through. `None` when it passed on the current
+/// commit with a clean worktree.
+pub(crate) fn run_problem(run: &ChecksRun, head: Option<&str>) -> Option<Blocker> {
+    let has = |state| run.checks.iter().any(|check| check.state == state);
+
+    if !run_is_over(run) {
+        Some(Blocker::ChecksRunning)
+    } else if !run_is_current(run, head) {
+        Some(Blocker::ChecksStale)
+    } else if !run.clean {
+        Some(Blocker::ChecksUnclean)
+    } else if has(CheckState::Failed) || has(CheckState::Skipped) {
+        Some(Blocker::ChecksFailed)
+    } else if has(CheckState::Stopped) {
+        Some(Blocker::ChecksStopped)
+    } else {
+        None
+    }
+}
+
+/// Without a run the app does not know whether the checks pass, so it asks for one first.
 pub(crate) fn create_state(input: &CreateInputs<'_>) -> CreateState {
     if input.creating {
         return CreateState::Blocked(Blocker::Creating);
@@ -126,29 +195,19 @@ pub(crate) fn create_state(input: &CreateInputs<'_>) -> CreateState {
     if input.title_empty {
         return CreateState::Blocked(Blocker::NoTitle);
     }
-
-    let Some(run) = input.checks else {
-        return CreateState::Blocked(Blocker::ChecksNotRun);
-    };
-    let has = |state| run.checks.iter().any(|check| check.state == state);
-
-    if has(CheckState::Waiting) || has(CheckState::Running) {
-        return CreateState::Blocked(Blocker::ChecksRunning);
+    if input.no_checks {
+        return CreateState::Ready;
     }
 
-    let problem = if input.stale {
-        Some(Blocker::ChecksStale)
-    } else if has(CheckState::Failed) {
-        Some(Blocker::ChecksFailed)
-    } else if has(CheckState::Stopped) {
-        Some(Blocker::ChecksStopped)
-    } else {
-        None
+    let problem = match input.run {
+        None => Some(Blocker::ChecksNotRun),
+        Some(run) => run_problem(run, input.head),
     };
 
     match problem {
         None => CreateState::Ready,
-        Some(blocker) if run.required => CreateState::Blocked(blocker),
+        Some(Blocker::ChecksRunning) => CreateState::Blocked(Blocker::ChecksRunning),
+        Some(blocker) if input.required => CreateState::Blocked(blocker),
         Some(blocker) => CreateState::Anyway(blocker),
     }
 }
@@ -166,13 +225,21 @@ pub(crate) fn checks_running(pull_request: &PullRequest) -> bool {
 /// The wait before the status is read again.
 pub(crate) fn status_interval(
     pull_request: Option<&PullRequest>,
-    (fast, slow): (Duration, Duration),
+    panel: bool,
+    intervals: StatusIntervals,
 ) -> Duration {
-    if pull_request.is_some_and(checks_running) {
-        fast
+    if !panel {
+        intervals.hidden
+    } else if pull_request.is_some_and(checks_running) {
+        intervals.fast
     } else {
-        slow
+        intervals.slow
     }
+}
+
+/// The pull request is merged or closed, so its status no longer changes.
+pub(crate) fn is_finished(pull_request: Option<&PullRequest>) -> bool {
+    pull_request.is_some_and(|status| matches!(status.state, PrState::Merged | PrState::Closed))
 }
 
 /// The state shown after the number in the header: "checks running", "ready to merge".
@@ -305,6 +372,7 @@ enum Follow {
     AfterSignIn(Option<(SharedString, Option<TerminalId>)>),
 }
 
+/// The last call that creates or updates the pull request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CreateStatus {
     Idle,
@@ -333,10 +401,16 @@ pub(crate) enum ActionKind {
 pub(crate) enum PanelAction {
     Idle,
     Busy(ActionKind),
+    /// The merge went through but GitHub holds the pull request in its merge queue.
+    MergeQueued,
     Failed(SharedString),
 }
 
 /// What the user typed and chose for one task's pull request.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent options and flags of one form, not one state"
+)]
 pub(crate) struct PrForm {
     pub(crate) title: Entity<TextInput>,
     pub(crate) description: Entity<TextArea>,
@@ -353,6 +427,8 @@ pub(crate) struct PrForm {
     pub(crate) checks_error: Option<SharedString>,
     pub(crate) method: MergeMethod,
     pub(crate) action: PanelAction,
+    /// The closed pull request is being replaced, so the panel shows the new form.
+    pub(crate) replacing: bool,
     _subscriptions: [Subscription; 3],
 }
 
@@ -398,13 +474,15 @@ impl PrForm {
     }
 }
 
-/// A running read of one pull request's status. Dropping it stops the poll.
+/// A running read of one pull request's status, with or without the panel. Dropping it
+/// stops the poll.
 pub(crate) struct StatusPoll {
-    key: DaemonTaskId,
+    key: (DaemonTaskId, bool),
     _task: gpui::Task<()>,
 }
 
 /// Everything the pull request panels keep besides the daemon's data.
+#[derive(Default)]
 pub(crate) struct PullRequests {
     forms: HashMap<TaskId, PrForm>,
     /// The project whose GitHub status was asked for while Review or the panel shows.
@@ -412,31 +490,17 @@ pub(crate) struct PullRequests {
     pub(crate) setups: HashMap<ProjectId, GithubSetup>,
     /// The terminal of each running setup step.
     setup_terminals: HashMap<TerminalId, (ProjectId, SetupStep)>,
-    /// Checks lists on their way; `true` once an event came, so the list is out of date.
-    listing: HashMap<DaemonTaskId, bool>,
-    /// The checks list asked for while the panel shows, and the diff it was asked for.
-    checks_asked: Option<(DaemonTaskId, Option<u64>)>,
-    /// Tasks whose pull request status was read once without the panel.
-    status_asked: Vec<DaemonTaskId>,
+    /// Panel reads on their way; `true` once an event came, so the answer is out of date.
+    loading: HashMap<DaemonTaskId, bool>,
+    /// The task the panel data was asked for while the panel shows, and the Merged head
+    /// it was asked at.
+    panel_asked: Option<(DaemonTaskId, Option<String>)>,
     poll: Option<StatusPoll>,
-    /// How often the status is read: while checks run, and otherwise.
-    pub(crate) status_intervals: (Duration, Duration),
-}
-
-impl Default for PullRequests {
-    fn default() -> Self {
-        Self {
-            forms: HashMap::new(),
-            github_asked: None,
-            setups: HashMap::new(),
-            setup_terminals: HashMap::new(),
-            listing: HashMap::new(),
-            checks_asked: None,
-            status_asked: Vec::new(),
-            poll: None,
-            status_intervals: (STATUS_FAST, STATUS_SLOW),
-        }
-    }
+    pub(crate) status_intervals: StatusIntervals,
+    /// Moves keyboard focus into the panel at the next frame.
+    focus_wanted: bool,
+    /// The panel itself, so focus can enter it when no field takes it.
+    panel_focus: Option<FocusHandle>,
 }
 
 impl PullRequests {
@@ -449,13 +513,42 @@ impl PullRequests {
         self.forms.remove(&task);
     }
 
+    /// The panel itself, which holds keyboard focus when no field does.
+    pub(crate) fn panel_focus(&self) -> Option<&FocusHandle> {
+        self.panel_focus.as_ref()
+    }
+
     #[cfg(test)]
     pub(crate) fn polling(&self) -> bool {
         self.poll.is_some()
     }
 }
 
-/// Asks before a pull request opens without passing checks.
+/// What the Create button of the panel does: opens the pull request, or pushes new
+/// commits to the open one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PrAction {
+    Create,
+    Update,
+}
+
+impl PrAction {
+    fn anyway_title(self) -> &'static str {
+        match self {
+            Self::Create => "Create PR anyway?",
+            Self::Update => "Push changes anyway?",
+        }
+    }
+
+    fn anyway_confirm(self) -> &'static str {
+        match self {
+            Self::Create => "Create PR anyway",
+            Self::Update => "Push anyway",
+        }
+    }
+}
+
+/// Asks before a pull request opens or changes without passing checks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AnywayEvent {
     Dismissed,
@@ -464,18 +557,25 @@ pub(crate) enum AnywayEvent {
 
 pub(crate) struct AnywayDialog {
     problem: Blocker,
-    focus_handle: gpui::FocusHandle,
+    action: PrAction,
+    focus_handle: FocusHandle,
 }
 
 impl gpui::EventEmitter<AnywayEvent> for AnywayDialog {}
 
 impl AnywayDialog {
-    fn new(problem: Blocker, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        problem: Blocker,
+        action: PrAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
 
         Self {
             problem,
+            action,
             focus_handle,
         }
     }
@@ -494,7 +594,7 @@ impl Render for AnywayDialog {
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(AnywayEvent::Dismissed))),
             )
             .child(
-                Button::new("create-anyway-confirm", "Create PR anyway")
+                Button::new("create-anyway-confirm", self.action.anyway_confirm())
                     .variant(ButtonVariant::Primary)
                     .debug_selector(|| "create-anyway-confirm".to_owned())
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(AnywayEvent::Confirmed))),
@@ -502,7 +602,7 @@ impl Render for AnywayDialog {
 
         Dialog::new(
             "create-anyway-dialog",
-            "Create PR anyway?",
+            self.action.anyway_title(),
             &self.focus_handle,
         )
         .width(gpui::px(380.))
@@ -544,6 +644,9 @@ impl Workspace {
 
     /// Creates the task's form when its panel shows.
     fn ensure_form(&mut self, task: TaskId, cx: &mut Context<Self>) {
+        if self.pull_requests.panel_focus.is_none() {
+            self.pull_requests.panel_focus = Some(cx.focus_handle());
+        }
         if self.pull_requests.forms.contains_key(&task) {
             return;
         }
@@ -590,6 +693,7 @@ impl Workspace {
             checks_error: None,
             method: MergeMethod::Squash,
             action: PanelAction::Idle,
+            replacing: false,
             _subscriptions: [on_title, on_description, on_reviewers],
         };
 
@@ -604,9 +708,33 @@ impl Workspace {
         self.pull_requests.forms.insert(task, form);
     }
 
+    /// The panel shows the form for a new pull request: the task has none yet, or the user
+    /// chose to replace the closed one.
+    pub(crate) fn shows_new_pull_request(&self, task: TaskId) -> bool {
+        let has_link = self
+            .data
+            .task(task)
+            .is_some_and(|entry| entry.pull_request.is_some());
+        if !has_link {
+            return true;
+        }
+
+        let closed = self
+            .data
+            .pull_request_status(task)
+            .is_some_and(|status| status.state == PrState::Closed);
+        let replacing = self
+            .pull_requests
+            .forms
+            .get(&task)
+            .is_some_and(|form| form.replacing);
+
+        closed && replacing
+    }
+
     /// Keeps the pull request work running only while it is needed: GitHub's status while
-    /// Review or the panel shows, the draft and the checks while the panel asks for a new
-    /// pull request, and the status poll while the panel shows one in an active window.
+    /// Review or the panel shows, the checks and the draft while the panel shows, and the
+    /// status poll while the task has an open pull request in an active window.
     pub(crate) fn sync_pull_requests(
         &mut self,
         window_active: bool,
@@ -630,31 +758,32 @@ impl Workspace {
             self.rest_panel();
         }
 
+        if panel && let Some(diff_id) = self.data.diff_id(task) {
+            self.sync_panel_load(task, diff_id, cx);
+
+            if self.shows_new_pull_request(task) {
+                self.request_draft_if_needed(task, diff_id, cx);
+            }
+        }
+
         let has_link = self
             .data
             .task(task)
             .is_some_and(|task| task.pull_request.is_some());
-
-        if panel && !has_link {
-            if let Some(id) = self.data.diff_id(task) {
-                self.request_draft_if_needed(task, id, cx);
-                self.sync_checks_listing(task, id, cx);
-            }
-        } else {
-            self.pull_requests.checks_asked = None;
-        }
+        let finished = is_finished(self.data.pull_request_status(task));
 
         match id {
-            Some(id) if has_link => self.sync_status_reads(id, panel && window_active, cx),
+            Some(id) if has_link && window_active && !finished => {
+                self.sync_status_poll(id, panel, cx);
+            }
             _ => self.pull_requests.poll = None,
         }
     }
 
-    /// The panel closed: the next open lists the checks again and asks for a draft again
-    /// when the last ask was refused.
+    /// The panel closed: the next open reads the panel data again and asks for a draft
+    /// again when the last ask was refused.
     fn rest_panel(&mut self) {
-        self.pull_requests.checks_asked = None;
-        self.pull_requests.poll = None;
+        self.pull_requests.panel_asked = None;
 
         for form in self.pull_requests.forms.values_mut() {
             if matches!(form.draft_wait, DraftWait::Refused(_)) {
@@ -749,9 +878,16 @@ impl Workspace {
     // Drafts
 
     /// Asks the orchestrator for a draft once, when the panel shows an approved task that
-    /// has none.
+    /// has none. The daemon's stored draft comes first, with the panel data.
     fn request_draft_if_needed(&mut self, task: TaskId, id: DaemonTaskId, cx: &mut Context<Self>) {
+        let panel_read = self
+            .pull_requests
+            .panel_asked
+            .as_ref()
+            .is_some_and(|(asked, _)| *asked == id)
+            && !self.pull_requests.loading.contains_key(&id);
         let wanted = self.pr_available(task)
+            && panel_read
             && !self.data.drafts.contains_key(&id)
             && self
                 .pull_requests
@@ -848,7 +984,7 @@ impl Workspace {
     pub(crate) fn pr_event(&mut self, event: PrEvent, cx: &mut Context<Self>) {
         match event {
             PrEvent::Checks(run) => {
-                if let Some(superseded) = self.pull_requests.listing.get_mut(&run.task) {
+                if let Some(superseded) = self.pull_requests.loading.get_mut(&run.task) {
                     *superseded = true;
                 }
 
@@ -861,47 +997,80 @@ impl Workspace {
 
     // Local checks
 
-    /// Lists the task's checks when the panel opens and after each new Merged diff.
-    fn sync_checks_listing(&mut self, task: TaskId, id: DaemonTaskId, cx: &mut Context<Self>) {
-        let key = (id, self.data.merged_fingerprint(task));
+    /// Reads the checks, the latest run and the stored draft when the panel opens, and
+    /// again when the task branch moves to a new commit.
+    fn sync_panel_load(&mut self, task: TaskId, id: DaemonTaskId, cx: &mut Context<Self>) {
+        let head = self.data.merged_head(task).map(str::to_owned);
 
-        if self.pull_requests.checks_asked == Some(key) {
+        let previous = self.pull_requests.panel_asked.take();
+        let (reload, kept) = match previous {
+            // The first head arrives after the first read. Only a move to another commit
+            // reads again.
+            Some((asked, known)) if asked == id => {
+                let moved = known.is_some() && head.is_some() && known != head;
+
+                (moved, head.or(known))
+            }
+            _ => (true, head),
+        };
+
+        self.pull_requests.panel_asked = Some((id, kept));
+        if !reload {
             return;
         }
 
-        self.pull_requests.checks_asked = Some(key);
         let Some(client) = self.connected_client() else {
+            if self.source == DataSource::Sample {
+                self.data.set_check_config(id, sample_check_config());
+            }
+
             return;
         };
 
-        self.pull_requests.listing.insert(id, false);
-        let listing = cx.background_spawn(async move { client.list_checks(id) });
+        self.pull_requests.loading.insert(id, false);
+        let loading = cx.background_spawn(async move { client.pr_panel(id) });
 
         cx.spawn(async move |this, cx| {
-            let result = listing.await;
+            let result = loading.await;
             let updated = this.update(cx, |workspace, cx| {
-                workspace.listed_checks(id, result, cx);
+                workspace.panel_loaded(id, result, cx);
             });
 
             if let Err(error) = updated {
-                log::debug!("the window closed before the checks were listed: {error}");
+                log::debug!("the window closed before the panel was read: {error}");
             }
         })
         .detach();
     }
 
-    fn listed_checks(
+    fn panel_loaded(
         &mut self,
         id: DaemonTaskId,
-        result: Result<Option<ChecksRun>, ClientError>,
+        result: Result<PrPanel, ClientError>,
         cx: &mut Context<Self>,
     ) {
-        let superseded = self.pull_requests.listing.remove(&id).unwrap_or(false);
+        let superseded = self.pull_requests.loading.remove(&id).unwrap_or(false);
 
         match result {
-            Ok(Some(run)) if !superseded => self.data.set_checks(run),
-            Ok(_) => {}
-            Err(error) => log::debug!("cannot list the checks: {error}"),
+            Ok(panel) => {
+                self.data.set_check_config(
+                    id,
+                    CheckConfig {
+                        commands: panel.commands,
+                        required: panel.required,
+                        pre_push_hook: panel.pre_push_hook,
+                    },
+                );
+                if !superseded {
+                    self.data.replace_run(id, panel.run);
+                }
+                if let Some(draft) = panel.draft
+                    && self.data.drafts.get(&id) != Some(&draft)
+                {
+                    self.draft_arrived(id, draft, cx);
+                }
+            }
+            Err(error) => log::debug!("cannot read the pull request panel: {error}"),
         }
 
         cx.notify();
@@ -980,20 +1149,57 @@ impl Workspace {
 
     // Create
 
-    /// What the Create button does now.
-    pub(crate) fn create_state(&self, task: TaskId, cx: &App) -> CreateState {
-        let form = self.pull_requests.forms.get(&task);
-        let checks = self.data.checks_of(task).map(|checks| &checks.run);
+    /// The facts the Create and Push buttons read.
+    fn create_inputs(&self, task: TaskId, creating: bool, title_empty: bool) -> CreateInputs<'_> {
+        let checks = self.data.checks_of(task);
+        let config = checks.and_then(|checks| checks.config.as_ref());
+        let run = checks.and_then(|checks| checks.run.as_ref());
+        let required = config
+            .map(|config| config.required)
+            .or_else(|| run.map(|run| run.required))
+            .unwrap_or(true);
 
-        create_state(&CreateInputs {
-            creating: form.is_some_and(|form| form.create == CreateStatus::Creating),
+        CreateInputs {
+            creating,
             approved: self.data.approval_holds(task),
             pending_comments: count_comments(&self.data.task_comments(task)).pending,
             github_ready: github_ready(self.data.github_of(task)),
-            title_empty: form.is_none_or(|form| form.title.read(cx).text().trim().is_empty()),
-            checks,
-            stale: self.data.checks_are_stale(task),
-        })
+            title_empty,
+            no_checks: config.is_some_and(|config| config.commands.is_empty()),
+            required,
+            run,
+            head: self.data.merged_head(task),
+        }
+    }
+
+    /// What the Create button does now.
+    pub(crate) fn create_state(&self, task: TaskId, cx: &App) -> CreateState {
+        let form = self.pull_requests.forms.get(&task);
+        let creating = form.is_some_and(|form| form.create == CreateStatus::Creating);
+        let title_empty = form.is_none_or(|form| form.title.read(cx).text().trim().is_empty());
+
+        create_state(&self.create_inputs(task, creating, title_empty))
+    }
+
+    /// What the Push changes button does now.
+    pub(crate) fn update_state(&self, task: TaskId) -> CreateState {
+        create_state(&self.create_inputs(task, false, false))
+    }
+
+    /// The project configures local checks, or the app does not know yet.
+    pub(crate) fn has_local_checks(&self, task: TaskId) -> bool {
+        self.data
+            .checks_of(task)
+            .and_then(|checks| checks.config.as_ref())
+            .is_none_or(|config| !config.commands.is_empty())
+    }
+
+    /// The task has an open pull request and commits that were not pushed to it.
+    pub(crate) fn update_offered(&self, task: TaskId) -> bool {
+        self.data
+            .pull_request_status(task)
+            .is_none_or(|status| status.state == PrState::Open)
+            && self.data.has_new_commits(task)
     }
 
     /// Opens the panel for a new pull request, from Review or the palette.
@@ -1008,9 +1214,7 @@ impl Workspace {
         }
 
         self.ensure_form(self.active_task, cx);
-        if let Some(id) = self.real_task(self.active_task) {
-            self.request_draft_if_needed(self.active_task, id, cx);
-        }
+        self.pull_requests.focus_wanted = true;
 
         cx.notify();
     }
@@ -1019,21 +1223,66 @@ impl Workspace {
     pub(crate) fn create_pull_request(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.create_state(self.active_task, cx) {
             CreateState::Ready => self.send_create(false, cx),
-            CreateState::Anyway(problem) => self.ask_create_anyway(problem, window, cx),
+            CreateState::Anyway(problem) => {
+                self.ask_anyway(problem, PrAction::Create, window, cx);
+            }
             CreateState::Blocked(_) => {}
         }
     }
 
-    fn ask_create_anyway(&mut self, problem: Blocker, window: &mut Window, cx: &mut Context<Self>) {
-        let view = cx.new(|cx| AnywayDialog::new(problem, window, cx));
+    /// The Push changes button: sends the new commits, or asks first when the checks did
+    /// not pass.
+    pub(crate) fn update_pull_request(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let task = self.active_task;
+        if !self.update_offered(task) {
+            return;
+        }
+
+        match self.update_state(task) {
+            CreateState::Ready => self.send_update(false, cx),
+            CreateState::Anyway(problem) => {
+                self.ask_anyway(problem, PrAction::Update, window, cx);
+            }
+            CreateState::Blocked(_) => {}
+        }
+    }
+
+    /// The Create PR button of a closed pull request: the panel shows the new form again.
+    pub(crate) fn replace_closed_pull_request(&mut self, cx: &mut Context<Self>) {
+        let task = self.active_task;
+
+        if let Some(form) = self.pull_requests.forms.get_mut(&task) {
+            form.replacing = true;
+            form.create = CreateStatus::Idle;
+            self.pull_requests.focus_wanted = true;
+            cx.notify();
+        }
+    }
+
+    fn ask_anyway(
+        &mut self,
+        problem: Blocker,
+        action: PrAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = cx.new(|cx| AnywayDialog::new(problem, action, window, cx));
         let subscription =
-            cx.subscribe_in(&view, window, |this, _, event, window, cx| match event {
-                AnywayEvent::Dismissed => this.close_overlay(window, cx),
-                AnywayEvent::Confirmed => {
-                    this.close_overlay(window, cx);
-                    this.send_create(true, cx);
-                }
-            });
+            cx.subscribe_in(
+                &view,
+                window,
+                move |this, _, event, window, cx| match event {
+                    AnywayEvent::Dismissed => this.close_overlay(window, cx),
+                    AnywayEvent::Confirmed => {
+                        this.close_overlay(window, cx);
+
+                        match action {
+                            PrAction::Create => this.send_create(true, cx),
+                            PrAction::Update => this.send_update(true, cx),
+                        }
+                    }
+                },
+            );
 
         self.overlay = Some(Overlay::CreateAnyway {
             view,
@@ -1071,6 +1320,7 @@ impl Workspace {
 
         form.create = CreateStatus::Creating;
         form.lock(true, cx);
+        self.pull_requests.focus_wanted = true;
         cx.notify();
 
         let creating = cx.background_spawn(async move {
@@ -1106,8 +1356,75 @@ impl Workspace {
                     CreateStatus::Failed(full_text(error))
                 }
             };
+            form.replacing &= result.is_err();
         }
 
+        self.pull_requests.focus_wanted = true;
+        if result.is_ok() {
+            self.read_pr_status(id, cx);
+        }
+
+        cx.notify();
+    }
+
+    fn send_update(&mut self, skip_checks: bool, cx: &mut Context<Self>) {
+        let task = self.active_task;
+        let Some(id) = self.data.diff_id(task) else {
+            return;
+        };
+        let client = self.connected_client();
+        let Some(form) = self.pull_requests.forms.get_mut(&task) else {
+            return;
+        };
+        if form.create == CreateStatus::Creating {
+            return;
+        }
+
+        let Some(client) = client else {
+            if self.source == DataSource::Sample {
+                self.update_sample_pull_request(task, cx);
+            }
+
+            return;
+        };
+
+        form.create = CreateStatus::Creating;
+        self.pull_requests.focus_wanted = true;
+        cx.notify();
+
+        let pushing = cx.background_spawn(async move { client.update_pr(id, skip_checks) });
+
+        cx.spawn(async move |this, cx| {
+            let result = pushing.await;
+            let updated = this.update(cx, |workspace, cx| {
+                workspace.pull_request_updated(task, id, result, cx);
+            });
+
+            if let Err(error) = updated {
+                log::debug!("the window closed before the changes were pushed: {error}");
+            }
+        })
+        .detach();
+    }
+
+    fn pull_request_updated(
+        &mut self,
+        task: TaskId,
+        id: DaemonTaskId,
+        result: Result<(), ClientError>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(form) = self.pull_requests.forms.get_mut(&task) {
+            form.create = match &result {
+                Ok(()) => CreateStatus::Idle,
+                Err(error) => {
+                    log::warn!("cannot push the changes: {error}");
+                    CreateStatus::Failed(full_text(error))
+                }
+            };
+        }
+
+        self.pull_requests.focus_wanted = true;
         if result.is_ok() {
             self.read_pr_status(id, cx);
         }
@@ -1125,59 +1442,94 @@ impl Workspace {
     ) {
         let mut pull_request = sample_pull_request();
         pull_request.title.clone_from(&draft.title);
+        let head = self.data.merged_head(task).unwrap_or("sample").to_owned();
 
         if let Some(entry) = self.data.tasks.iter_mut().find(|entry| entry.id == task) {
             entry.pull_request = Some(PrLink {
                 number: pull_request.number,
                 url: pull_request.url.clone(),
+                head,
             });
         }
         self.data.pull_requests.insert(id, pull_request);
         cx.notify();
     }
 
-    // Status
+    /// Marks the new commits as pushed on sample data.
+    fn update_sample_pull_request(&mut self, task: TaskId, cx: &mut Context<Self>) {
+        let head = self.data.merged_head(task).map(str::to_owned);
 
-    /// Reads the status of a task that has a pull request. The poll runs while the panel
-    /// shows in an active window. Without the panel the status is read once, so the
-    /// header has a state to show.
-    fn sync_status_reads(&mut self, id: DaemonTaskId, polling: bool, cx: &mut Context<Self>) {
-        if !polling {
-            self.pull_requests.poll = None;
+        if let Some(link) = self
+            .data
+            .tasks
+            .iter_mut()
+            .find(|entry| entry.id == task)
+            .and_then(|entry| entry.pull_request.as_mut())
+            && let Some(head) = head
+        {
+            link.head = head;
+        }
 
-            if !self.pull_requests.status_asked.contains(&id)
-                && !self.data.pull_requests.contains_key(&id)
-            {
-                self.pull_requests.status_asked.push(id);
-                self.read_pr_status(id, cx);
-            }
+        cx.notify();
+    }
 
+    // Focus
+
+    /// Moves keyboard focus into the panel after Create or Push changes: to the title when
+    /// the form is open for typing, else to the first control of the panel.
+    pub(crate) fn apply_pending_pr_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.pull_requests.focus_wanted || self.overlay.is_some() {
             return;
         }
 
-        let merged = self
-            .data
-            .pull_requests
-            .get(&id)
-            .is_some_and(|status| status.state == PrState::Merged);
+        self.pull_requests.focus_wanted = false;
+        if self.visible_panel() != Some(RightPanel::PullRequest) {
+            return;
+        }
+
+        let task = self.active_task;
+        let Some(form) = self.pull_requests.forms.get(&task) else {
+            return;
+        };
+
+        if self.shows_new_pull_request(task) && form.create != CreateStatus::Creating {
+            let title = form.title.focus_handle(cx);
+
+            window.focus(&title, cx);
+        } else if let Some(panel) = self.pull_requests.panel_focus.clone() {
+            window.focus(&panel, cx);
+            window.focus_next(cx);
+        }
+    }
+
+    // Status
+
+    /// Keeps one poll of the open pull request's status, with or without the panel. A new
+    /// poll reads at once.
+    fn sync_status_poll(&mut self, id: DaemonTaskId, panel: bool, cx: &mut Context<Self>) {
+        let key = (id, panel);
 
         if self
             .pull_requests
             .poll
             .as_ref()
-            .is_some_and(|poll| poll.key == id)
-            || merged
+            .is_some_and(|poll| poll.key == key)
         {
             return;
         }
 
         self.pull_requests.poll = Some(StatusPoll {
-            key: id,
-            _task: Self::poll_status(id, cx),
+            key,
+            _task: Self::poll_status(self.active_task, id, panel, cx),
         });
     }
 
-    fn poll_status(id: DaemonTaskId, cx: &mut Context<Self>) -> gpui::Task<()> {
+    fn poll_status(
+        task: TaskId,
+        id: DaemonTaskId,
+        panel: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Task<()> {
         cx.spawn(async move |this, cx| {
             loop {
                 let Ok(client) = this.update(cx, |workspace, _| workspace.connected_client())
@@ -1194,11 +1546,10 @@ impl Workspace {
                     let Ok(wait) = this.update(cx, |workspace, cx| {
                         workspace.read_status(id, result, cx);
 
-                        let status = workspace.data.pull_requests.get(&id);
-                        let merged = status.is_some_and(|status| status.state == PrState::Merged);
+                        let status = workspace.data.pull_request_status(task);
                         let intervals = workspace.pull_requests.status_intervals;
 
-                        (!merged).then(|| status_interval(status, intervals))
+                        (!is_finished(status)).then(|| status_interval(status, panel, intervals))
                     }) else {
                         return;
                     };
@@ -1217,7 +1568,8 @@ impl Workspace {
                     return;
                 };
 
-                cx.background_executor().timer(intervals.1).await;
+                let wait = status_interval(None, panel, intervals);
+                cx.background_executor().timer(wait).await;
             }
         })
     }
@@ -1297,7 +1649,7 @@ impl Workspace {
         cx.spawn(async move |this, cx| {
             let result = running.await;
             let updated = this.update(cx, |workspace, cx| {
-                workspace.panel_call_done(task, id, &result, cx);
+                workspace.panel_call_done(task, id, kind, &result, cx);
             });
 
             if let Err(error) = updated {
@@ -1311,18 +1663,76 @@ impl Workspace {
         &mut self,
         task: TaskId,
         id: DaemonTaskId,
+        kind: ActionKind,
         result: &Result<(), ClientError>,
         cx: &mut Context<Self>,
     ) {
+        let merge = kind == ActionKind::Merge;
+
         if let Some(form) = self.pull_requests.forms.get_mut(&task) {
             form.action = match result {
+                // The merge settles once the status is read: it may sit in a queue.
+                Ok(()) if merge => PanelAction::Busy(kind),
                 Ok(()) => PanelAction::Idle,
                 Err(error) => PanelAction::Failed(full_text(error)),
             };
         }
 
-        if result.is_ok() {
+        if merge {
+            self.read_status_after_merge(task, id, result.is_ok(), cx);
+        } else if result.is_ok() {
             self.read_pr_status(id, cx);
+        }
+
+        cx.notify();
+    }
+
+    /// Reads the status after a merge call, also when the call failed: the pull request
+    /// may be merged although the task did not close.
+    fn read_status_after_merge(
+        &mut self,
+        task: TaskId,
+        id: DaemonTaskId,
+        merged: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.connected_client() else {
+            return;
+        };
+
+        let reading = cx.background_spawn(async move { client.pr_status(id) });
+
+        cx.spawn(async move |this, cx| {
+            let result = reading.await;
+            let updated = this.update(cx, |workspace, cx| {
+                let read = result.is_ok();
+
+                workspace.read_status(id, result, cx);
+                workspace.merge_settled(task, merged && read, cx);
+            });
+
+            if let Err(error) = updated {
+                log::debug!("the window closed before the status came: {error}");
+            }
+        })
+        .detach();
+    }
+
+    /// A merge that went through leaves the pull request open only in a merge queue.
+    fn merge_settled(&mut self, task: TaskId, merged: bool, cx: &mut Context<Self>) {
+        let open = self
+            .data
+            .pull_request_status(task)
+            .is_some_and(|status| status.state == PrState::Open);
+
+        if let Some(form) = self.pull_requests.forms.get_mut(&task)
+            && form.action == PanelAction::Busy(ActionKind::Merge)
+        {
+            form.action = if merged && open {
+                PanelAction::MergeQueued
+            } else {
+                PanelAction::Idle
+            };
         }
 
         cx.notify();
@@ -1504,10 +1914,7 @@ impl Workspace {
 
         match &entry.pull_request {
             Some(link) => {
-                let status = self
-                    .data
-                    .diff_id(task)
-                    .and_then(|id| self.data.pull_requests.get(&id));
+                let status = self.data.pull_request_status(task);
 
                 Some(toggle_label(link, status).into())
             }
@@ -1532,13 +1939,10 @@ impl Workspace {
 
     // GitHub setup
 
-    /// The panel shows a new pull request, so the Merged diff tells when its checks go stale.
+    /// The panel shows, so the Merged diff tells when the checks are stale and when the
+    /// branch has commits the pull request lacks.
     pub(crate) fn pr_panel_needs_merged_diff(&self) -> bool {
         self.visible_panel() == Some(RightPanel::PullRequest)
-            && self
-                .data
-                .task(self.active_task)
-                .is_some_and(|task| task.pull_request.is_none())
     }
 
     /// Starts the next step of the GitHub setup in a user terminal: the install when `gh`
@@ -1766,6 +2170,7 @@ mod tests {
         ChecksRun {
             task: DaemonTaskId(7),
             commit: "abc".into(),
+            clean: true,
             required,
             checks: checks
                 .iter()
@@ -1781,16 +2186,39 @@ mod tests {
         }
     }
 
-    fn inputs(checks: Option<&ChecksRun>) -> CreateInputs<'_> {
+    fn inputs(run: Option<&ChecksRun>) -> CreateInputs<'_> {
         CreateInputs {
             creating: false,
             approved: true,
             pending_comments: 0,
             github_ready: true,
             title_empty: false,
-            checks,
-            stale: false,
+            no_checks: false,
+            required: true,
+            run,
+            head: Some("abc"),
         }
+    }
+
+    fn without_checks(run: Option<&ChecksRun>) -> CreateInputs<'_> {
+        CreateInputs {
+            no_checks: true,
+            ..inputs(run)
+        }
+    }
+
+    fn optional(run: Option<&ChecksRun>) -> CreateInputs<'_> {
+        CreateInputs {
+            required: false,
+            ..inputs(run)
+        }
+    }
+
+    fn state_of(run: &ChecksRun, change: impl FnOnce(&mut CreateInputs<'_>)) -> CreateState {
+        let mut input = inputs(Some(run));
+        change(&mut input);
+
+        create_state(&input)
     }
 
     #[test]
@@ -1801,53 +2229,104 @@ mod tests {
     }
 
     #[test]
-    fn a_task_without_checks_is_ready() {
+    fn a_run_without_checks_is_ready() {
         let none = run(&[], true);
 
         assert_eq!(create_state(&inputs(Some(&none))), CreateState::Ready);
     }
 
     #[test]
+    fn a_project_without_configured_checks_never_waits_for_them() {
+        let failed = run(&[CheckState::Failed], true);
+
+        assert_eq!(create_state(&without_checks(None)), CreateState::Ready);
+        assert_eq!(
+            create_state(&without_checks(Some(&failed))),
+            CreateState::Ready
+        );
+        assert_eq!(
+            create_state(&CreateInputs {
+                no_checks: true,
+                approved: false,
+                ..inputs(None)
+            }),
+            CreateState::Blocked(Blocker::NotApproved),
+            "the other rules still hold"
+        );
+    }
+
+    #[test]
     fn approval_comments_github_and_title_come_first() {
         let passed = run(&[CheckState::Passed], true);
-        let blocked = |change: fn(&mut CreateInputs<'_>)| {
-            let mut input = inputs(Some(&passed));
-            change(&mut input);
-
-            create_state(&input)
-        };
 
         assert_eq!(
-            blocked(|input| input.approved = false),
+            state_of(&passed, |input| input.approved = false),
             CreateState::Blocked(Blocker::NotApproved)
         );
         assert_eq!(
-            blocked(|input| input.pending_comments = 2),
+            state_of(&passed, |input| input.pending_comments = 2),
             CreateState::Blocked(Blocker::CommentsPending)
         );
         assert_eq!(
-            blocked(|input| input.github_ready = false),
+            state_of(&passed, |input| input.github_ready = false),
             CreateState::Blocked(Blocker::GithubNotReady)
         );
         assert_eq!(
-            blocked(|input| input.title_empty = true),
+            state_of(&passed, |input| input.title_empty = true),
             CreateState::Blocked(Blocker::NoTitle)
         );
         assert_eq!(
-            blocked(|input| input.creating = true),
+            state_of(&passed, |input| input.creating = true),
             CreateState::Blocked(Blocker::Creating)
         );
     }
 
     #[test]
-    fn missing_failed_stale_and_running_checks_block_a_required_run() {
+    fn a_run_with_a_failed_check_is_over_even_while_others_wait_or_skip() {
+        let real_shape = run(
+            &[CheckState::Passed, CheckState::Failed, CheckState::Skipped],
+            true,
+        );
+        let skipped_last = run(&[CheckState::Failed, CheckState::Skipped], true);
+        let stopped = run(&[CheckState::Passed, CheckState::Stopped], true);
+        let passed = run(&[CheckState::Passed, CheckState::Passed], true);
+        let running = run(&[CheckState::Passed, CheckState::Running], true);
+        let waiting = run(&[CheckState::Running, CheckState::Waiting], true);
+
+        assert!(run_is_over(&real_shape));
+        assert!(run_is_over(&skipped_last));
+        assert!(run_is_over(&stopped));
+        assert!(run_is_over(&passed));
+        assert!(!run_is_over(&running));
+        assert!(!run_is_over(&waiting));
+    }
+
+    #[test]
+    fn a_failed_run_with_skipped_checks_reads_as_failed_not_running() {
+        let real_shape = run(
+            &[CheckState::Passed, CheckState::Failed, CheckState::Skipped],
+            true,
+        );
+
+        assert_eq!(
+            run_problem(&real_shape, Some("abc")),
+            Some(Blocker::ChecksFailed)
+        );
+        assert_eq!(
+            create_state(&inputs(Some(&real_shape))),
+            CreateState::Blocked(Blocker::ChecksFailed)
+        );
+    }
+
+    #[test]
+    fn missing_failed_stale_unclean_and_running_checks_block_a_required_run() {
         let failed = run(&[CheckState::Passed, CheckState::Failed], true);
         let stopped = run(&[CheckState::Stopped], true);
         let running = run(&[CheckState::Running], false);
         let passed = run(&[CheckState::Passed], true);
-        let stale = CreateInputs {
-            stale: true,
-            ..inputs(Some(&passed))
+        let dirty = ChecksRun {
+            clean: false,
+            ..run(&[CheckState::Passed], true)
         };
 
         assert_eq!(
@@ -1867,29 +2346,83 @@ mod tests {
             CreateState::Blocked(Blocker::ChecksRunning)
         );
         assert_eq!(
-            create_state(&stale),
+            state_of(&passed, |input| input.head = Some("def")),
             CreateState::Blocked(Blocker::ChecksStale)
         );
+        assert_eq!(
+            state_of(&passed, |input| input.head = None),
+            CreateState::Blocked(Blocker::ChecksStale),
+            "a head that is not loaded yet proves nothing"
+        );
+        assert_eq!(
+            create_state(&inputs(Some(&dirty))),
+            CreateState::Blocked(Blocker::ChecksUnclean)
+        );
+    }
+
+    #[test]
+    fn a_run_passes_only_when_current_clean_and_all_passed() {
+        let passed = run(&[CheckState::Passed], true);
+        let dirty = ChecksRun {
+            clean: false,
+            ..run(&[CheckState::Passed], true)
+        };
+        let failed = run(&[CheckState::Failed], true);
+
+        assert_eq!(run_problem(&passed, Some("abc")), None);
+        assert_eq!(
+            run_problem(&passed, Some("def")),
+            Some(Blocker::ChecksStale)
+        );
+        assert_eq!(
+            run_problem(&dirty, Some("abc")),
+            Some(Blocker::ChecksUnclean)
+        );
+        assert_eq!(
+            run_problem(&failed, Some("def")),
+            Some(Blocker::ChecksStale),
+            "a failed run on an old commit only needs a new run"
+        );
+        assert!(run_is_current(&passed, Some("abc")));
+        assert!(!run_is_current(&passed, Some("def")));
+        assert!(!run_is_current(&passed, None));
     }
 
     #[test]
     fn checks_that_are_not_required_turn_the_button_into_create_anyway() {
         let failed = run(&[CheckState::Failed], false);
         let passed = run(&[CheckState::Passed], false);
-        let stale = CreateInputs {
-            stale: true,
-            ..inputs(Some(&passed))
+        let running = run(&[CheckState::Running], false);
+        let dirty = ChecksRun {
+            clean: false,
+            ..run(&[CheckState::Passed], false)
         };
 
         assert_eq!(
-            create_state(&inputs(Some(&failed))),
+            create_state(&optional(Some(&failed))),
             CreateState::Anyway(Blocker::ChecksFailed)
         );
         assert_eq!(
-            create_state(&stale),
+            create_state(&optional(None)),
+            CreateState::Anyway(Blocker::ChecksNotRun)
+        );
+        assert_eq!(
+            create_state(&CreateInputs {
+                head: Some("def"),
+                ..optional(Some(&passed))
+            }),
             CreateState::Anyway(Blocker::ChecksStale)
         );
-        assert_eq!(create_state(&inputs(Some(&passed))), CreateState::Ready);
+        assert_eq!(
+            create_state(&optional(Some(&dirty))),
+            CreateState::Anyway(Blocker::ChecksUnclean)
+        );
+        assert_eq!(
+            create_state(&optional(Some(&running))),
+            CreateState::Blocked(Blocker::ChecksRunning),
+            "a run that still runs is waited for"
+        );
+        assert_eq!(create_state(&optional(Some(&passed))), CreateState::Ready);
     }
 
     #[test]
@@ -1937,6 +2470,7 @@ mod tests {
         let link = PrLink {
             number: 42,
             url: "https://github.com/a/b/pull/42".into(),
+            head: "abc".into(),
         };
         let word = |checks: &[GithubCheckState], draft, mergeable| {
             toggle_label(&link, Some(&pull_request(checks, draft, mergeable)))
@@ -1984,16 +2518,37 @@ mod tests {
     }
 
     #[test]
-    fn the_status_is_read_faster_while_checks_run() {
-        let intervals = (STATUS_FAST, STATUS_SLOW);
+    fn the_status_is_read_faster_while_checks_run_and_slowest_without_the_panel() {
+        let intervals = StatusIntervals::default();
         let running = pull_request(&[GithubCheckState::Running], false, false);
         let queued = pull_request(&[GithubCheckState::Queued], false, false);
         let done = pull_request(&[GithubCheckState::Passed], false, false);
 
-        assert_eq!(status_interval(Some(&running), intervals), STATUS_FAST);
-        assert_eq!(status_interval(Some(&queued), intervals), STATUS_FAST);
-        assert_eq!(status_interval(Some(&done), intervals), STATUS_SLOW);
-        assert_eq!(status_interval(None, intervals), STATUS_SLOW);
+        assert_eq!(
+            status_interval(Some(&running), true, intervals),
+            STATUS_FAST
+        );
+        assert_eq!(status_interval(Some(&queued), true, intervals), STATUS_FAST);
+        assert_eq!(status_interval(Some(&done), true, intervals), STATUS_SLOW);
+        assert_eq!(status_interval(None, true, intervals), STATUS_SLOW);
+        assert_eq!(
+            status_interval(Some(&running), false, intervals),
+            STATUS_HIDDEN
+        );
+        assert_eq!(status_interval(None, false, intervals), STATUS_HIDDEN);
+    }
+
+    #[test]
+    fn a_merged_or_closed_pull_request_is_finished() {
+        let with_state = |state| PullRequest {
+            state,
+            ..pull_request(&[], false, false)
+        };
+
+        assert!(is_finished(Some(&with_state(PrState::Merged))));
+        assert!(is_finished(Some(&with_state(PrState::Closed))));
+        assert!(!is_finished(Some(&with_state(PrState::Open))));
+        assert!(!is_finished(None));
     }
 
     #[test]

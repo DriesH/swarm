@@ -166,6 +166,8 @@ pub(crate) struct Workspace {
     pub(crate) pending_review_focus: bool,
     pub(crate) review_poll: Option<DiffPoll>,
     pub(crate) live_poll: Option<DiffPoll>,
+    /// The Merged diff, while the pull request panel needs it and Review does not poll it.
+    pub(crate) pr_poll: Option<DiffPoll>,
     /// How often the visible Review source and the open task's Live diff are asked for.
     pub(crate) diff_intervals: (std::time::Duration, std::time::Duration),
     pub(crate) pull_requests: PullRequests,
@@ -298,6 +300,7 @@ impl Workspace {
             pending_review_focus: false,
             review_poll: None,
             live_poll: None,
+            pr_poll: None,
             diff_intervals: (crate::daemon::REVIEW_INTERVAL, crate::daemon::LIVE_INTERVAL),
             pull_requests: PullRequests::default(),
         };
@@ -577,6 +580,7 @@ impl Render for Workspace {
         self.sync_pull_requests(window.is_window_active(), window, cx);
         self.apply_pending_focus(window, cx);
         self.apply_pending_review_focus(window, cx);
+        self.apply_pending_pr_focus(window, cx);
         self.ensure_focus_handles(cx);
 
         if self.view == View::Swarm {

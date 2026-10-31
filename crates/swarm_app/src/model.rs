@@ -106,6 +106,8 @@ pub(crate) struct DaemonTask {
     pub worktree: PathBuf,
     /// The branch the task started from.
     pub base: SharedString,
+    /// The branch its pull request merges into.
+    pub pr_base: SharedString,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -418,12 +420,26 @@ pub(crate) fn sample_checks_run(task: swarm_protocol::TaskId, commit: &str) -> C
     ChecksRun {
         task,
         commit: commit.to_owned(),
+        clean: true,
         required: true,
         checks: vec![
             check("cargo test --workspace", 38_000),
             check("cargo clippy -- -D warnings", 21_000),
             check("cargo fmt --check", 900),
         ],
+        pre_push_hook: Some("husky".to_owned()),
+    }
+}
+
+/// The checks the sample project configures.
+pub(crate) fn sample_check_config() -> CheckConfig {
+    CheckConfig {
+        commands: vec![
+            "cargo test --workspace".to_owned(),
+            "cargo clippy -- -D warnings".to_owned(),
+            "cargo fmt --check".to_owned(),
+        ],
+        required: true,
         pre_push_hook: Some("husky".to_owned()),
     }
 }
@@ -521,15 +537,20 @@ fn sample_file_tree() -> Vec<TreeEntry> {
     ]
 }
 
-/// A checks run with the Merged diff that was loaded when the app first saw it.
-///
-/// The protocol has no head commit for the app to compare with `run.commit`. A run is
-/// stale once the Merged diff differs from the one it was first seen with: the task
-/// branch got new commits.
+/// The configured local checks of a task, as the daemon reads them now.
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CheckConfig {
+    pub commands: Vec<String>,
+    pub required: bool,
+    pub pre_push_hook: Option<String>,
+}
+
+/// What the app knows about the local checks of a task.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TaskChecks {
-    pub run: ChecksRun,
-    pub seen_at: Option<u64>,
+    /// Set once the daemon answered the pull request panel.
+    pub config: Option<CheckConfig>,
+    pub run: Option<ChecksRun>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1278,6 +1299,7 @@ impl FakeData {
             setup_exit: info.setup_exit.clone(),
             worktree: info.worktree.clone(),
             base: SharedString::new(&info.base),
+            pr_base: SharedString::new(&info.pr_base),
         };
         let existing = self.tasks.iter_mut().find(|task| {
             task.daemon
@@ -1523,15 +1545,9 @@ impl FakeData {
         if self
             .diffs
             .get(&key)
-            .is_some_and(|known| known.fingerprint == diff.fingerprint)
+            .is_some_and(|known| known.fingerprint == diff.fingerprint && known.head == diff.head)
         {
             return false;
-        }
-
-        if diff.source == ReviewSource::Merged
-            && let Some(checks) = self.checks.get_mut(&diff.task)
-        {
-            checks.seen_at = checks.seen_at.or(Some(diff.fingerprint));
         }
 
         self.diffs.insert(key, Rc::new(diff));
@@ -1543,6 +1559,12 @@ impl FakeData {
     pub(crate) fn merged_fingerprint(&self, task: TaskId) -> Option<u64> {
         self.task_diff(task, ReviewSource::Merged)
             .map(|diff| diff.fingerprint)
+    }
+
+    /// The commit at HEAD of the task worktree when the loaded Merged diff was read.
+    pub(crate) fn merged_head(&self, task: TaskId) -> Option<&str> {
+        self.task_diff(task, ReviewSource::Merged)
+            .map(|diff| diff.head.as_str())
     }
 
     /// The approval counts: the task is approved and the loaded Merged diff, when there
@@ -1561,32 +1583,44 @@ impl FakeData {
         self.github.get(&self.task(task)?.project)
     }
 
-    /// The task's latest local checks run.
+    /// What the app knows about the task's local checks.
     pub(crate) fn checks_of(&self, task: TaskId) -> Option<&TaskChecks> {
         self.checks.get(&self.diff_id(task)?)
     }
 
-    /// Keeps a checks run the daemon sent. A run for the same commit keeps the diff it
-    /// was first seen with.
+    /// Keeps a checks run the daemon sent.
     pub(crate) fn set_checks(&mut self, run: ChecksRun) {
-        let loaded = self
-            .diffs
-            .get(&(run.task, ReviewSource::Merged))
-            .map(|diff| diff.fingerprint);
-        let seen_at = match self.checks.get(&run.task) {
-            Some(known) if known.run.commit == run.commit => known.seen_at.or(loaded),
-            _ => loaded,
-        };
+        let task = run.task;
 
-        self.checks.insert(run.task, TaskChecks { run, seen_at });
+        self.checks.entry(task).or_default().run = Some(run);
     }
 
-    /// The run was made on an older commit than the task branch has now.
-    pub(crate) fn checks_are_stale(&self, task: TaskId) -> bool {
-        let seen = self.checks_of(task).and_then(|checks| checks.seen_at);
+    /// Keeps the checks as configured now.
+    pub(crate) fn set_check_config(&mut self, task: swarm_protocol::TaskId, config: CheckConfig) {
+        self.checks.entry(task).or_default().config = Some(config);
+    }
 
-        seen.zip(self.merged_fingerprint(task))
-            .is_some_and(|(seen, loaded)| seen != loaded)
+    /// Replaces the latest run, also with none.
+    pub(crate) fn replace_run(&mut self, task: swarm_protocol::TaskId, run: Option<ChecksRun>) {
+        self.checks.entry(task).or_default().run = run;
+    }
+
+    /// The pull request as GitHub reported it last, when it is the one the task links.
+    pub(crate) fn pull_request_status(&self, task: TaskId) -> Option<&PullRequest> {
+        let number = self.task(task)?.pull_request.as_ref()?.number;
+
+        self.pull_requests
+            .get(&self.diff_id(task)?)
+            .filter(|status| status.number == number)
+    }
+
+    /// The task branch has commits that Swarm did not push to its pull request yet.
+    pub(crate) fn has_new_commits(&self, task: TaskId) -> bool {
+        let Some(link) = self.task(task).and_then(|task| task.pull_request.as_ref()) else {
+            return false;
+        };
+
+        self.merged_head(task).is_some_and(|head| head != link.head)
     }
 
     /// The pull request task can be created for: approved, no pull request yet and a
@@ -2453,6 +2487,7 @@ mod tests {
             name: "login".into(),
             branch: "swarm/login".into(),
             base: "main".into(),
+            pr_base: "main".into(),
             worktree: PathBuf::from("/tmp/worktree"),
             ports: Vec::new(),
             setup_terminal: None,

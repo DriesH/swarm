@@ -9,8 +9,8 @@ use std::time::Duration;
 use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext};
 use swarm_protocol::{
     CheckState, ChecksRun, Client, Event, GithubCheck, GithubCheckState, GithubStatus, LocalCheck,
-    MergeMethod, PrDraft, PrEvent, PrLink, PrState, PullRequest, Request, ReviewSource,
-    TaskId as DaemonTaskId, TerminalId as DaemonTerminalId, TerminalInfo, TerminalKind,
+    MergeMethod, PrDraft, PrEvent, PrLink, PrPanel, PrState, PullRequest, Request, ReviewSource,
+    TaskDiff, TaskId as DaemonTaskId, TerminalId as DaemonTerminalId, TerminalInfo, TerminalKind,
 };
 use swarm_term::ExitStatus;
 use swarm_term_view::TerminalEvent;
@@ -205,6 +205,7 @@ fn checks_run(commit: &str, required: bool, checks: Vec<LocalCheck>) -> ChecksRu
     ChecksRun {
         task: TASK,
         commit: commit.to_owned(),
+        clean: true,
         required,
         checks,
         pre_push_hook: Some("husky".to_owned()),
@@ -223,13 +224,15 @@ fn create_state_of(workspace: &Entity<Workspace>, cx: &VisualTestContext) -> Cre
 }
 
 #[gpui::test]
-fn opening_the_panel_reads_github_lists_the_checks_and_asks_for_one_draft(cx: &mut TestAppContext) {
+fn opening_the_panel_reads_github_and_the_panel_data_then_asks_for_one_draft(
+    cx: &mut TestAppContext,
+) {
     let (socket, seen) = recording_daemon(github_reply);
     let (workspace, cx, _client) = approved(&socket, cx);
 
     let asked = wait_for(cx, &seen, |seen, _| {
         seen.count(|request| matches!(request, Request::GithubStatus { .. })) >= 1
-            && seen.count(|request| matches!(request, Request::ListChecks { .. })) >= 1
+            && seen.count(|request| matches!(request, Request::PrPanel { .. })) >= 1
             && seen.count(|request| matches!(request, Request::DraftPr { .. })) >= 1
     });
     for _ in 0..4 {
@@ -249,15 +252,28 @@ fn opening_the_panel_reads_github_lists_the_checks_and_asks_for_one_draft(cx: &m
                 .map(|form| form.draft_wait.clone()),
         )
     });
+    let order: Vec<&str> = {
+        seen.drain();
+        seen.all
+            .borrow()
+            .iter()
+            .filter_map(|request| match request {
+                Request::PrPanel { .. } => Some("panel"),
+                Request::DraftPr { .. } => Some("draft"),
+                _ => None,
+            })
+            .collect()
+    };
     assert!(asked);
     assert_eq!(
         seen.count(|request| matches!(request, Request::DraftPr { .. })),
         1
     );
     assert_eq!(
-        seen.count(|request| matches!(request, Request::ListChecks { .. })),
+        seen.count(|request| matches!(request, Request::PrPanel { .. })),
         1
     );
+    assert_eq!(order, ["panel", "draft"], "the stored draft comes first");
     assert_eq!(repository.as_deref(), Some("swarm-labs/swarm"));
     assert_eq!(waiting, Some(DraftWait::Waiting));
 }
@@ -350,24 +366,44 @@ fn a_refused_draft_shows_the_reason_and_the_fields_stay_empty(cx: &mut TestAppCo
     assert_eq!(title_of(&workspace, cx), "");
 }
 
+fn merged_at(head: &str, fingerprint: u64) -> TaskDiff {
+    TaskDiff {
+        head: head.to_owned(),
+        ..diff_of(7, ReviewSource::Merged, fingerprint)
+    }
+}
+
+/// Why the loaded run does not let a pull request through.
+fn problem_of(workspace: &Entity<Workspace>, cx: &VisualTestContext) -> Option<Blocker> {
+    workspace.read_with(cx, |workspace, _| {
+        let run = workspace
+            .data
+            .checks_of(APP_TASK)
+            .and_then(|checks| checks.run.as_ref())?;
+
+        run_problem(run, workspace.data.merged_head(APP_TASK))
+    })
+}
+
 #[gpui::test]
-fn the_checks_list_shows_a_row_each_and_a_new_diff_makes_it_stale(cx: &mut TestAppContext) {
-    let (socket, seen) = recording_daemon(github_reply);
+fn the_checks_list_shows_a_row_each_and_a_new_head_makes_it_stale(cx: &mut TestAppContext) {
+    let run = checks_run(
+        "abc",
+        true,
+        vec![
+            local_check("cargo test --workspace", CheckState::Passed),
+            local_check("cargo clippy", CheckState::Passed),
+            local_check("cargo fmt --check", CheckState::Passed),
+        ],
+    );
+    let panel = PrPanel {
+        run: Some(run.clone()),
+        ..panel_with(&["cargo test"], true)
+    };
+    let (socket, seen) = recording_daemon(panel_reply(panel, |_| None));
     let (workspace, cx, _client) = approved(&socket, cx);
 
-    send_checks(
-        &workspace,
-        checks_run(
-            "abc",
-            true,
-            vec![
-                local_check("cargo test --workspace", CheckState::Passed),
-                local_check("cargo clippy", CheckState::Failed),
-                local_check("cargo fmt --check", CheckState::Waiting),
-            ],
-        ),
-        cx,
-    );
+    send_checks(&workspace, run, cx);
     let rows = (0..3)
         .filter(|index| {
             let selector: &'static str = Box::leak(format!("local-check-{index}").into_boxed_str());
@@ -375,21 +411,27 @@ fn the_checks_list_shows_a_row_each_and_a_new_diff_makes_it_stale(cx: &mut TestA
             cx.debug_bounds(selector).is_some()
         })
         .count();
-    let fresh = workspace.read_with(cx, |workspace, _| workspace.data.checks_are_stale(APP_TASK));
+    let fresh = problem_of(&workspace, cx);
 
-    let before = seen.count(|request| matches!(request, Request::ListChecks { .. }));
+    let first_read = wait_for(cx, &seen, |seen, _| {
+        seen.count(|request| matches!(request, Request::PrPanel { .. })) == 1
+    });
     workspace.update(cx, |workspace, cx| {
-        workspace.apply_diff(diff_of(7, ReviewSource::Merged, MERGED + 1), cx);
+        workspace.apply_diff(merged_at("def", MERGED), cx);
     });
-    let listed_again = wait_for(cx, &seen, |seen, _| {
-        seen.count(|request| matches!(request, Request::ListChecks { .. })) > before
+    let read_again = wait_for(cx, &seen, |seen, _| {
+        seen.count(|request| matches!(request, Request::PrPanel { .. })) == 2
     });
-    let stale = workspace.read_with(cx, |workspace, _| workspace.data.checks_are_stale(APP_TASK));
+    let stale = problem_of(&workspace, cx);
 
     assert_eq!(rows, 3);
-    assert!(!fresh);
-    assert!(listed_again, "a new Merged diff lists the checks again");
-    assert!(stale);
+    assert_eq!(fresh, None);
+    assert!(first_read);
+    assert!(
+        read_again,
+        "a new head reads the panel data again, also with the same fingerprint"
+    );
+    assert_eq!(stale, Some(Blocker::ChecksStale));
 }
 
 #[gpui::test]
@@ -535,6 +577,7 @@ fn create_sends_the_fields_and_the_options_and_the_panel_shows_the_pull_request(
             task.pull_request = Some(PrLink {
                 number: 42,
                 url: "https://github.com/swarm-labs/swarm/pull/42".into(),
+                head: "abc".into(),
             });
         }
         cx.notify();
@@ -597,23 +640,61 @@ fn the_create_button_waits_for_approval_comments_and_passing_checks(cx: &mut Tes
     assert!(cx.debug_bounds("create-pr-button").is_some());
 }
 
+fn panel_with(commands: &[&str], required: bool) -> PrPanel {
+    PrPanel {
+        commands: commands
+            .iter()
+            .map(|command| (*command).to_owned())
+            .collect(),
+        required,
+        pre_push_hook: None,
+        run: None,
+        draft: None,
+    }
+}
+
+/// Answers the panel read with `panel`, and defers every other request to `other`.
+fn panel_reply(
+    panel: PrPanel,
+    other: impl Fn(&Request) -> Option<Event> + Send + 'static,
+) -> impl Fn(&Request) -> Option<Event> + Send + 'static {
+    move |request| match request {
+        Request::PrPanel { call, .. } => Some(Event::PrPanel {
+            call: *call,
+            panel: panel.clone(),
+        }),
+        request => other(request).or_else(|| github_reply(request)),
+    }
+}
+
+fn accept_create(request: &Request) -> Option<Event> {
+    match request {
+        Request::CreatePr { call, .. } => Some(Event::Done { call: *call }),
+        _ => None,
+    }
+}
+
 #[gpui::test]
 fn without_required_checks_create_anyway_asks_first_and_skips_the_checks(cx: &mut TestAppContext) {
-    let (socket, seen) = recording_daemon(|request| match request {
-        Request::CreatePr { call, .. } => Some(Event::Done { call: *call }),
-        other => github_reply(other),
-    });
+    let (socket, seen) = recording_daemon(panel_reply(
+        panel_with(&["cargo test"], false),
+        accept_create,
+    ));
     let (workspace, cx, _client) = approved(&socket, cx);
     send_draft(&workspace, draft("feat: add it", "body"), cx);
     send_checks(
         &workspace,
         checks_run(
             "abc",
-            false,
+            true,
             vec![local_check("cargo test", CheckState::Failed)],
         ),
         cx,
     );
+    wait_for(cx, &seen, |seen, _| {
+        seen.count(|request| matches!(request, Request::PrPanel { .. })) >= 1
+    });
+    redraw(cx);
 
     let state = create_state_of(&workspace, cx);
     click("create-pr-button", cx);
@@ -642,6 +723,44 @@ fn without_required_checks_create_anyway_asks_first_and_skips_the_checks(cx: &mu
     assert_eq!(sent_early, 0);
     assert_eq!(after_cancel, 0);
     assert!(sent);
+}
+
+#[gpui::test]
+fn checks_that_are_required_by_the_project_never_offer_create_anyway(cx: &mut TestAppContext) {
+    let (socket, seen) = recording_daemon(panel_reply(
+        panel_with(&["cargo test"], true),
+        accept_create,
+    ));
+    let (workspace, cx, _client) = approved(&socket, cx);
+    send_draft(&workspace, draft("feat: add it", "body"), cx);
+    send_checks(
+        &workspace,
+        checks_run(
+            "abc",
+            false,
+            vec![local_check("cargo test", CheckState::Failed)],
+        ),
+        cx,
+    );
+    wait_for(cx, &seen, |seen, _| {
+        seen.count(|request| matches!(request, Request::PrPanel { .. })) >= 1
+    });
+    redraw(cx);
+
+    click("create-pr-button", cx);
+    wait_a_little();
+    redraw(cx);
+
+    assert_eq!(
+        create_state_of(&workspace, cx),
+        CreateState::Blocked(Blocker::ChecksFailed),
+        "the project's setting wins over the run's copy of it"
+    );
+    assert!(cx.debug_bounds("create-anyway-confirm").is_none());
+    assert_eq!(
+        seen.count(|request| matches!(request, Request::CreatePr { .. })),
+        0
+    );
 }
 
 #[gpui::test]
@@ -720,22 +839,38 @@ fn with_pull_request(
     reads: Arc<AtomicUsize>,
     cx: &mut TestAppContext,
 ) -> (Entity<Workspace>, &mut VisualTestContext, Client, Seen) {
-    let (socket, seen) = recording_daemon(move |request| match request {
-        Request::PrStatus { call, .. } => {
-            reads.fetch_add(1, Ordering::SeqCst);
+    with_pull_request_replying(status, reads, |_| None, cx)
+}
 
-            Some(Event::PrStatus {
-                call: *call,
-                pull_request: status
-                    .lock()
-                    .map_or_else(|_| open_pull_request(42), |status| status.clone()),
-            })
+/// Like [`with_pull_request`], with `extra` answering first.
+fn with_pull_request_replying(
+    status: Arc<Mutex<PullRequest>>,
+    reads: Arc<AtomicUsize>,
+    extra: impl Fn(&Request) -> Option<Event> + Send + 'static,
+    cx: &mut TestAppContext,
+) -> (Entity<Workspace>, &mut VisualTestContext, Client, Seen) {
+    let (socket, seen) = recording_daemon(move |request| {
+        if let Some(event) = extra(request) {
+            return Some(event);
         }
-        Request::MarkPrReady { call, .. }
-        | Request::AddReviewers { call, .. }
-        | Request::MergePr { call, .. }
-        | Request::SetCloseAfterMerge { call, .. } => Some(Event::Done { call: *call }),
-        other => github_reply(other),
+
+        match request {
+            Request::PrStatus { call, .. } => {
+                reads.fetch_add(1, Ordering::SeqCst);
+
+                Some(Event::PrStatus {
+                    call: *call,
+                    pull_request: status
+                        .lock()
+                        .map_or_else(|_| open_pull_request(42), |status| status.clone()),
+                })
+            }
+            Request::MarkPrReady { call, .. }
+            | Request::AddReviewers { call, .. }
+            | Request::MergePr { call, .. }
+            | Request::SetCloseAfterMerge { call, .. } => Some(Event::Done { call: *call }),
+            other => github_reply(other),
+        }
     });
     let (workspace, cx, client) = approved(&socket, cx);
 
@@ -744,6 +879,7 @@ fn with_pull_request(
             task.pull_request = Some(PrLink {
                 number: 42,
                 url: "https://github.com/swarm-labs/swarm/pull/42".into(),
+                head: "abc".into(),
             });
         }
         cx.notify();
@@ -825,11 +961,54 @@ fn the_status_is_read_every_10_seconds_while_checks_run_then_every_30(cx: &mut T
     assert!(slow);
 }
 
+fn advance(seconds: u64, cx: &mut VisualTestContext) {
+    cx.executor().advance_clock(Duration::from_secs(seconds));
+    redraw(cx);
+}
+
+/// The read count once it stopped growing.
+fn settled(reads: &AtomicUsize, cx: &mut VisualTestContext) -> usize {
+    let mut last = reads.load(Ordering::SeqCst);
+
+    for _ in 0..20 {
+        wait_a_little();
+        redraw(cx);
+
+        let now = reads.load(Ordering::SeqCst);
+        if now == last && now > 0 {
+            break;
+        }
+        last = now;
+    }
+
+    last
+}
+
 #[gpui::test]
-fn the_status_poll_stops_with_the_panel_the_window_and_a_merge(cx: &mut TestAppContext) {
-    let status = Arc::new(Mutex::new(open_pull_request(42)));
+fn the_status_poll_stops_with_the_window_and_a_merge(cx: &mut TestAppContext) {
+    let status = Arc::new(Mutex::new(PullRequest {
+        draft: false,
+        mergeable: true,
+        checks: vec![github_check("build", GithubCheckState::Passed)],
+        ..open_pull_request(42)
+    }));
     let reads = Arc::new(AtomicUsize::new(0));
-    let (workspace, cx, _client, _seen) = with_pull_request(Arc::clone(&status), reads, cx);
+    let merging = Arc::clone(&status);
+    let (workspace, cx, _client, seen) = with_pull_request_replying(
+        Arc::clone(&status),
+        Arc::clone(&reads),
+        move |request| match request {
+            Request::MergePr { call, .. } => {
+                if let Ok(mut status) = merging.lock() {
+                    status.state = PrState::Merged;
+                }
+
+                Some(Event::Done { call: *call })
+            }
+            _ => None,
+        },
+        cx,
+    );
     wait_until(cx, |cx| {
         redraw(cx);
         status_of(&workspace, cx).is_some()
@@ -845,16 +1024,127 @@ fn the_status_poll_stops_with_the_panel_the_window_and_a_merge(cx: &mut TestAppC
     redraw(cx);
     let back = polling(&workspace, cx);
 
-    workspace.update(cx, |workspace, cx| {
-        workspace.toggle_panel(RightPanel::PullRequest, cx);
+    click("merge", cx);
+    let sent = wait_for(cx, &seen, |seen, _| {
+        seen.count(|request| matches!(request, Request::MergePr { .. })) == 1
     });
+    let merged = wait_until(cx, |cx| {
+        redraw(cx);
+        status_of(&workspace, cx).is_some_and(|status| status.state == PrState::Merged)
+    });
+    let reads_at_merge = settled(&reads, cx);
+    let stopped = polling(&workspace, cx);
+
+    advance(120, cx);
+    wait_a_little();
     redraw(cx);
-    let closed = polling(&workspace, cx);
 
     assert!(shown);
     assert!(!inactive);
     assert!(back);
-    assert!(!closed);
+    assert!(sent);
+    assert!(merged, "the fake status turned MERGED");
+    assert!(!stopped, "a merged pull request is not polled");
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        reads_at_merge,
+        "no read after the merge"
+    );
+}
+
+#[gpui::test]
+fn the_header_status_is_read_every_60_seconds_without_the_panel_until_it_is_merged(
+    cx: &mut TestAppContext,
+) {
+    let status = Arc::new(Mutex::new(open_pull_request(42)));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (workspace, cx, _client, _seen) =
+        with_pull_request(Arc::clone(&status), Arc::clone(&reads), cx);
+    workspace.update(cx, |workspace, cx| {
+        workspace.toggle_panel(RightPanel::PullRequest, cx);
+    });
+    redraw(cx);
+    let before = settled(&reads, cx);
+
+    let closed = polling(&workspace, cx);
+    advance(59, cx);
+    wait_a_little();
+    redraw(cx);
+    let at_59 = reads.load(Ordering::SeqCst);
+
+    advance(2, cx);
+    let at_61 = wait_until(cx, |cx| {
+        redraw(cx);
+        reads.load(Ordering::SeqCst) == before + 1
+    });
+
+    if let Ok(mut status) = status.lock() {
+        status.state = PrState::Merged;
+    }
+    advance(60, cx);
+    let merged = wait_until(cx, |cx| {
+        redraw(cx);
+        status_of(&workspace, cx).is_some_and(|status| status.state == PrState::Merged)
+    });
+    let label = workspace.read_with(cx, |workspace, _| {
+        workspace.pull_request_toggle_label(APP_TASK)
+    });
+    let after_merge = settled(&reads, cx);
+    advance(180, cx);
+    wait_a_little();
+    redraw(cx);
+
+    assert!(closed, "the poll goes on without the panel");
+    assert_eq!(at_59, before, "nothing is read before 60 s");
+    assert!(at_61, "read again after 60 s");
+    assert!(merged);
+    assert_eq!(label.as_deref(), Some("#42 \u{b7} merged"));
+    assert_eq!(reads.load(Ordering::SeqCst), after_merge);
+    assert!(!polling(&workspace, cx));
+}
+
+#[gpui::test]
+fn a_closed_pull_request_stops_the_poll_and_an_inactive_window_pauses_it(cx: &mut TestAppContext) {
+    let status = Arc::new(Mutex::new(open_pull_request(42)));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (workspace, cx, _client, _seen) =
+        with_pull_request(Arc::clone(&status), Arc::clone(&reads), cx);
+    settled(&reads, cx);
+
+    cx.deactivate_window();
+    redraw(cx);
+    let paused_at = reads.load(Ordering::SeqCst);
+    advance(300, cx);
+    wait_a_little();
+    redraw(cx);
+    let paused = reads.load(Ordering::SeqCst);
+
+    cx.update(|window, _| window.activate_window());
+    redraw(cx);
+    let resumed = wait_until(cx, |cx| {
+        redraw(cx);
+        reads.load(Ordering::SeqCst) > paused
+    });
+    settled(&reads, cx);
+
+    if let Ok(mut status) = status.lock() {
+        status.state = PrState::Closed;
+    }
+    advance(60, cx);
+    let closed = wait_until(cx, |cx| {
+        redraw(cx);
+        status_of(&workspace, cx).is_some_and(|status| status.state == PrState::Closed)
+    });
+    let after_close = settled(&reads, cx);
+    advance(300, cx);
+    wait_a_little();
+    redraw(cx);
+
+    assert_eq!(paused, paused_at, "an inactive window reads nothing");
+    assert!(resumed, "the window reads again when it is active");
+    assert!(closed);
+    assert_eq!(reads.load(Ordering::SeqCst), after_close);
+    assert!(!polling(&workspace, cx));
 }
 
 #[gpui::test]
@@ -1559,6 +1849,7 @@ fn the_palette_offers_create_pull_request_only_when_allowed(cx: &mut TestAppCont
             task.pull_request = Some(PrLink {
                 number: 42,
                 url: "https://github.com/swarm-labs/swarm/pull/42".into(),
+                head: "abc".into(),
             });
         }
     });
@@ -1620,4 +1911,748 @@ fn the_sheet_keeps_the_branch_the_user_picked_when_the_full_list_arrives(cx: &mu
 
     assert_eq!(before.len(), 2, "the base and the open tab's branch");
     assert_eq!(chosen.as_deref(), Some("swarm/b"));
+}
+
+// Local checks
+
+fn passed_run() -> ChecksRun {
+    checks_run(
+        "abc",
+        true,
+        vec![local_check("cargo test", CheckState::Passed)],
+    )
+}
+
+fn update_state_of(workspace: &Entity<Workspace>, cx: &VisualTestContext) -> CreateState {
+    workspace.read_with(cx, |workspace, _| workspace.update_state(APP_TASK))
+}
+
+fn accept_runs(request: &Request) -> Option<Event> {
+    match request {
+        Request::RunChecks { call, .. } => Some(Event::Done { call: *call }),
+        _ => None,
+    }
+}
+
+#[gpui::test]
+fn a_failed_run_with_skipped_checks_is_over_so_run_again_works(cx: &mut TestAppContext) {
+    let (socket, seen) =
+        recording_daemon(panel_reply(panel_with(&["a", "b", "c"], true), accept_runs));
+    let (workspace, cx, _client) = approved(&socket, cx);
+    let run_requests =
+        |seen: &Seen| seen.count(|request| matches!(request, Request::RunChecks { .. }));
+
+    send_checks(
+        &workspace,
+        checks_run(
+            "abc",
+            true,
+            vec![
+                local_check("cargo fmt", CheckState::Passed),
+                local_check("cargo test", CheckState::Failed),
+                local_check("cargo clippy", CheckState::Skipped),
+            ],
+        ),
+        cx,
+    );
+    let rows = (0..3)
+        .filter(|index| {
+            let selector: &'static str = Box::leak(format!("local-check-{index}").into_boxed_str());
+
+            cx.debug_bounds(selector).is_some()
+        })
+        .count();
+
+    click("run-checks", cx);
+    let again = wait_for(cx, &seen, |seen, _| run_requests(seen) == 1);
+
+    send_checks(
+        &workspace,
+        checks_run(
+            "abc",
+            true,
+            vec![
+                local_check("cargo fmt", CheckState::Passed),
+                local_check("cargo test", CheckState::Running),
+                local_check("cargo clippy", CheckState::Waiting),
+            ],
+        ),
+        cx,
+    );
+    click("run-checks", cx);
+    wait_a_little();
+    redraw(cx);
+
+    assert_eq!(rows, 3);
+    assert!(again, "a run that failed is over");
+    assert_eq!(
+        run_requests(&seen),
+        1,
+        "a run that still runs cannot restart"
+    );
+}
+
+#[gpui::test]
+fn an_unclean_or_stale_run_does_not_let_a_pull_request_through(cx: &mut TestAppContext) {
+    let (socket, seen) = recording_daemon(panel_reply(panel_with(&["cargo test"], true), |_| None));
+    let (workspace, cx, _client) = approved(&socket, cx);
+    send_draft(&workspace, draft("feat: add it", "body"), cx);
+    wait_for(cx, &seen, |seen, _| {
+        seen.count(|request| matches!(request, Request::PrPanel { .. })) >= 1
+    });
+
+    send_checks(&workspace, passed_run(), cx);
+    let passed = create_state_of(&workspace, cx);
+
+    send_checks(
+        &workspace,
+        ChecksRun {
+            clean: false,
+            ..passed_run()
+        },
+        cx,
+    );
+    let dirty = create_state_of(&workspace, cx);
+
+    send_checks(&workspace, checks_run("old", true, passed_run().checks), cx);
+    let stale = create_state_of(&workspace, cx);
+
+    assert_eq!(passed, CreateState::Ready);
+    assert_eq!(dirty, CreateState::Blocked(Blocker::ChecksUnclean));
+    assert_eq!(stale, CreateState::Blocked(Blocker::ChecksStale));
+}
+
+#[gpui::test]
+fn without_configured_checks_the_section_is_hidden_and_create_is_not_blocked(
+    cx: &mut TestAppContext,
+) {
+    let (socket, seen) = recording_daemon(panel_reply(panel_with(&[], true), accept_create));
+    let (workspace, cx, _client) = approved(&socket, cx);
+    send_draft(&workspace, draft("feat: add it", "body"), cx);
+    wait_for(cx, &seen, |seen, _| {
+        seen.count(|request| matches!(request, Request::PrPanel { .. })) >= 1
+    });
+    redraw(cx);
+
+    let state = create_state_of(&workspace, cx);
+    let hidden = cx.debug_bounds("run-checks").is_none();
+    click("create-pr-button", cx);
+    let sent = wait_for(cx, &seen, |seen, _| {
+        seen.count(|request| matches!(request, Request::CreatePr { .. })) == 1
+    });
+
+    assert!(hidden);
+    assert_eq!(state, CreateState::Ready);
+    assert!(sent);
+}
+
+#[gpui::test]
+fn checks_that_are_not_required_let_a_missing_run_create_anyway(cx: &mut TestAppContext) {
+    let (socket, seen) = recording_daemon(panel_reply(
+        panel_with(&["cargo test"], false),
+        accept_create,
+    ));
+    let (workspace, cx, _client) = approved(&socket, cx);
+    send_draft(&workspace, draft("feat: add it", "body"), cx);
+    wait_for(cx, &seen, |seen, _| {
+        seen.count(|request| matches!(request, Request::PrPanel { .. })) >= 1
+    });
+    redraw(cx);
+
+    let missing = create_state_of(&workspace, cx);
+    click("create-pr-button", cx);
+    click("create-anyway-confirm", cx);
+    let sent = wait_for(cx, &seen, |seen, _| {
+        seen.count(|request| {
+            matches!(
+                request,
+                Request::CreatePr {
+                    skip_checks: true,
+                    ..
+                }
+            )
+        }) == 1
+    });
+
+    assert_eq!(missing, CreateState::Anyway(Blocker::ChecksNotRun));
+    assert!(sent);
+}
+
+#[gpui::test]
+fn the_stored_draft_comes_with_the_panel_so_it_survives_a_restart(cx: &mut TestAppContext) {
+    let panel = PrPanel {
+        draft: Some(draft("stored title", "stored body")),
+        ..panel_with(&["cargo test"], true)
+    };
+    let (socket, seen) = recording_daemon(panel_reply(panel, |_| None));
+    let (workspace, cx, _client) = approved(&socket, cx);
+
+    let filled = wait_for(cx, &seen, |_, cx| {
+        title_of(&workspace, cx) == "stored title"
+    });
+    for _ in 0..4 {
+        redraw(cx);
+    }
+
+    assert!(filled);
+    assert_eq!(body_of(&workspace, cx), "stored body");
+    assert_eq!(
+        seen.count(|request| matches!(request, Request::DraftPr { .. })),
+        0,
+        "the orchestrator is not asked for what the daemon kept"
+    );
+    assert!(cx.debug_bounds("new-draft").is_none());
+}
+
+#[gpui::test]
+fn the_panels_show_the_pr_base_not_the_branch_the_task_started_from(cx: &mut TestAppContext) {
+    let (socket, _seen) = recording_daemon(github_reply);
+    let (workspace, cx, _client) = approved(&socket, cx);
+
+    workspace.update(cx, |workspace, _| {
+        if let Some(daemon) = workspace
+            .data
+            .tasks
+            .first_mut()
+            .and_then(|task| task.daemon.as_mut())
+        {
+            daemon.base = "main".into();
+            daemon.pr_base = "release/1.0".into();
+        }
+    });
+
+    let base = workspace.read_with(cx, |workspace, _| {
+        crate::pull_request_panel::base_of(workspace, workspace.active_task())
+    });
+
+    assert_eq!(base.as_ref(), "release/1.0");
+}
+
+#[gpui::test]
+fn the_merged_diff_is_polled_while_the_panel_shows_also_when_review_shows_live(
+    cx: &mut TestAppContext,
+) {
+    let (socket, seen) = recording_daemon(github_reply);
+    let (workspace, cx, _client) = approved(&socket, cx);
+    workspace.update(cx, |workspace, cx| {
+        workspace.diff_intervals = (Duration::from_millis(20), Duration::from_millis(20));
+        workspace.set_view(View::Review, cx);
+        workspace.set_review_source(ReviewSource::Live, cx);
+    });
+    redraw(cx);
+
+    let asks = |source: ReviewSource| {
+        move |seen: &Seen, _: &VisualTestContext| {
+            seen.count(
+                |request| matches!(request, Request::TaskDiff { source: asked, .. } if *asked == source),
+            ) >= 1
+        }
+    };
+    let merged = wait_for(cx, &seen, asks(ReviewSource::Merged));
+    let live = wait_for(cx, &seen, asks(ReviewSource::Live));
+
+    workspace.update(cx, |workspace, cx| {
+        workspace.toggle_panel(RightPanel::PullRequest, cx);
+    });
+    redraw(cx);
+    let stopped = workspace.read_with(cx, |workspace, _| workspace.pr_poll.is_none());
+
+    assert!(merged, "the head commit needs the Merged diff");
+    assert!(live);
+    assert!(stopped, "the Merged poll ends with the panel");
+}
+
+// Follow-up commits
+
+fn set_link_head(workspace: &Entity<Workspace>, head: &str, cx: &mut VisualTestContext) {
+    workspace.update(cx, |workspace, cx| {
+        if let Some(link) = workspace
+            .data
+            .tasks
+            .first_mut()
+            .and_then(|task| task.pull_request.as_mut())
+        {
+            link.head = head.to_owned();
+        }
+        cx.notify();
+    });
+    redraw(cx);
+}
+
+fn accept_update(request: &Request) -> Option<Event> {
+    match request {
+        Request::UpdatePr { call, .. } => Some(Event::Done { call: *call }),
+        _ => None,
+    }
+}
+
+fn ready_pull_request() -> Arc<Mutex<PullRequest>> {
+    Arc::new(Mutex::new(PullRequest {
+        draft: false,
+        ..open_pull_request(42)
+    }))
+}
+
+fn update_requests(seen: &Seen) -> Vec<bool> {
+    seen.drain();
+
+    seen.all
+        .borrow()
+        .iter()
+        .filter_map(|request| match request {
+            Request::UpdatePr { skip_checks, .. } => Some(*skip_checks),
+            _ => None,
+        })
+        .collect()
+}
+
+#[gpui::test]
+fn merge_waits_until_new_commits_are_pushed(cx: &mut TestAppContext) {
+    let mergeable = Arc::new(Mutex::new(PullRequest {
+        draft: false,
+        mergeable: true,
+        ..open_pull_request(42)
+    }));
+    let (workspace, cx, _client, seen) =
+        with_pull_request_replying(mergeable, Arc::new(AtomicUsize::new(0)), accept_update, cx);
+    wait_until(cx, |cx| {
+        redraw(cx);
+        status_of(&workspace, cx).is_some()
+    });
+    let pushed = workspace.read_with(cx, |workspace, _| {
+        workspace
+            .data
+            .tasks
+            .first()
+            .and_then(|task| task.pull_request.as_ref())
+            .map(|link| link.head.clone())
+            .unwrap_or_default()
+    });
+    let merges = |seen: &Seen| seen.count(|request| matches!(request, Request::MergePr { .. }));
+
+    set_link_head(&workspace, "old", cx);
+    click("merge", cx);
+    wait_a_little();
+    redraw(cx);
+    let while_new = merges(&seen);
+
+    set_link_head(&workspace, &pushed, cx);
+    click("merge", cx);
+    let after_push = wait_for(cx, &seen, |seen, _| merges(seen) == 1);
+
+    assert_eq!(while_new, 0, "unpushed commits go first");
+    assert!(after_push, "nothing new to push: merge works");
+}
+
+#[gpui::test]
+fn new_commits_offer_push_changes_under_the_same_rules_as_create(cx: &mut TestAppContext) {
+    let (workspace, cx, _client, seen) = with_pull_request_replying(
+        ready_pull_request(),
+        Arc::new(AtomicUsize::new(0)),
+        accept_update,
+        cx,
+    );
+    wait_until(cx, |cx| {
+        redraw(cx);
+        status_of(&workspace, cx).is_some()
+    });
+
+    let nothing_new = cx.debug_bounds("push-changes").is_none();
+
+    set_link_head(&workspace, "old", cx);
+    let offered =
+        cx.debug_bounds("new-commits").is_some() && cx.debug_bounds("push-changes").is_some();
+    let without_run = update_state_of(&workspace, cx);
+    click("push-changes", cx);
+    wait_a_little();
+    redraw(cx);
+    let blocked_sent = update_requests(&seen).len();
+
+    send_checks(&workspace, passed_run(), cx);
+    let ready = update_state_of(&workspace, cx);
+    click("push-changes", cx);
+    let sent = wait_for(cx, &seen, |seen, _| update_requests(seen) == [false]);
+
+    workspace.update(cx, |workspace, _| {
+        if let Some(task) = workspace.data.tasks.first_mut() {
+            task.approved = Some(MERGED + 1);
+        }
+    });
+    let unapproved = update_state_of(&workspace, cx);
+
+    assert!(nothing_new, "the branch is where the pull request is");
+    assert!(offered);
+    assert_eq!(without_run, CreateState::Blocked(Blocker::ChecksNotRun));
+    assert_eq!(blocked_sent, 0);
+    assert_eq!(ready, CreateState::Ready);
+    assert!(sent);
+    assert_eq!(unapproved, CreateState::Blocked(Blocker::NotApproved));
+}
+
+#[gpui::test]
+fn push_changes_asks_first_when_checks_are_not_required_and_failed(cx: &mut TestAppContext) {
+    let (workspace, cx, _client, seen) = with_pull_request_replying(
+        ready_pull_request(),
+        Arc::new(AtomicUsize::new(0)),
+        |request| match request {
+            Request::PrPanel { call, .. } => Some(Event::PrPanel {
+                call: *call,
+                panel: panel_with(&["cargo test"], false),
+            }),
+            other => accept_update(other),
+        },
+        cx,
+    );
+    wait_until(cx, |cx| {
+        redraw(cx);
+        status_of(&workspace, cx).is_some()
+    });
+    set_link_head(&workspace, "old", cx);
+    wait_for(cx, &seen, |seen, _| {
+        seen.count(|request| matches!(request, Request::PrPanel { .. })) >= 1
+    });
+    send_checks(
+        &workspace,
+        checks_run(
+            "abc",
+            false,
+            vec![local_check("cargo test", CheckState::Failed)],
+        ),
+        cx,
+    );
+    redraw(cx);
+
+    let state = update_state_of(&workspace, cx);
+    click("push-changes", cx);
+    let asked = cx.debug_bounds("create-anyway-confirm").is_some();
+    let early = update_requests(&seen).len();
+    click("create-anyway-cancel", cx);
+    let after_cancel = update_requests(&seen).len();
+
+    click("push-changes", cx);
+    click("create-anyway-confirm", cx);
+    let sent = wait_for(cx, &seen, |seen, _| update_requests(seen) == [true]);
+
+    assert_eq!(state, CreateState::Anyway(Blocker::ChecksFailed));
+    assert!(asked);
+    assert_eq!((early, after_cancel), (0, 0));
+    assert!(sent);
+}
+
+#[gpui::test]
+fn a_failed_push_shows_every_line_of_the_daemons_text(cx: &mut TestAppContext) {
+    let output = "remote: error: hook declined\nremote: line two\nerror: failed to push";
+    let (workspace, cx, _client, seen) = with_pull_request_replying(
+        ready_pull_request(),
+        Arc::new(AtomicUsize::new(0)),
+        move |request| match request {
+            Request::UpdatePr { call, .. } => Some(Event::Error {
+                call: Some(*call),
+                id: None,
+                message: output.into(),
+            }),
+            _ => None,
+        },
+        cx,
+    );
+    wait_until(cx, |cx| {
+        redraw(cx);
+        status_of(&workspace, cx).is_some()
+    });
+    set_link_head(&workspace, "old", cx);
+    send_checks(&workspace, passed_run(), cx);
+
+    click("push-changes", cx);
+    let failed = wait_for(cx, &seen, |_, cx| {
+        workspace.read_with(cx, |workspace, _| {
+            workspace
+                .pull_requests
+                .form(APP_TASK)
+                .is_some_and(|form| matches!(form.create, CreateStatus::Failed(_)))
+        })
+    });
+
+    let status = workspace.read_with(cx, |workspace, _| {
+        workspace
+            .pull_requests
+            .form(APP_TASK)
+            .map(|form| form.create.clone())
+    });
+    assert!(failed);
+    assert_eq!(status, Some(CreateStatus::Failed(output.into())));
+    assert!(cx.debug_bounds("push-error").is_some());
+    assert!(
+        cx.debug_bounds("push-changes").is_some(),
+        "it can be tried again"
+    );
+}
+
+#[gpui::test]
+fn push_changes_moves_keyboard_focus_into_the_panel(cx: &mut TestAppContext) {
+    let (workspace, cx, _client, seen) = with_pull_request_replying(
+        ready_pull_request(),
+        Arc::new(AtomicUsize::new(0)),
+        accept_update,
+        cx,
+    );
+    wait_until(cx, |cx| {
+        redraw(cx);
+        status_of(&workspace, cx).is_some()
+    });
+    set_link_head(&workspace, "old", cx);
+    send_checks(&workspace, passed_run(), cx);
+    let inside = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace
+                .pull_requests
+                .panel_focus()
+                .is_some_and(|panel| panel.contains_focused(window, cx))
+        })
+    };
+    workspace.update_in(cx, |workspace, window, cx| {
+        let outside = workspace.focus_handle(cx);
+
+        window.focus(&outside, cx);
+    });
+    redraw(cx);
+    let before = inside(&workspace, cx);
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.update_pull_request(window, cx);
+    });
+    wait_for(cx, &seen, |seen, _| update_requests(seen).len() == 1);
+    redraw(cx);
+
+    assert!(!before);
+    assert!(inside(&workspace, cx));
+}
+
+#[gpui::test]
+fn create_pr_from_review_moves_keyboard_focus_to_the_title(cx: &mut TestAppContext) {
+    let (workspace, cx) = sample_workspace(cx);
+    approve_in_review(&workspace, cx);
+
+    click("review-create-pr", cx);
+    redraw(cx);
+
+    let focused = workspace.update_in(cx, |workspace, window, cx| {
+        workspace
+            .pull_requests
+            .form(APP_TASK)
+            .is_some_and(|form| form.title.focus_handle(cx).is_focused(window))
+    });
+    assert!(focused);
+}
+
+// Closed pull requests
+
+fn closed_pull_request(state: PrState) -> Arc<Mutex<PullRequest>> {
+    Arc::new(Mutex::new(PullRequest {
+        state,
+        draft: false,
+        ..open_pull_request(42)
+    }))
+}
+
+#[gpui::test]
+fn a_closed_pull_request_offers_create_pr_again_and_opens_the_new_form(cx: &mut TestAppContext) {
+    let (workspace, cx, _client, seen) = with_pull_request_replying(
+        closed_pull_request(PrState::Closed),
+        Arc::new(AtomicUsize::new(0)),
+        accept_create,
+        cx,
+    );
+    wait_until(cx, |cx| {
+        redraw(cx);
+        status_of(&workspace, cx).is_some()
+    });
+    send_draft(&workspace, draft("feat: add it", "body"), cx);
+    send_checks(&workspace, passed_run(), cx);
+
+    let offered = cx.debug_bounds("create-pr-again").is_some();
+    let status_only =
+        cx.debug_bounds("merge").is_none() && cx.debug_bounds("create-pr-button").is_none();
+
+    click("create-pr-again", cx);
+    let form = cx.debug_bounds("create-pr-button").is_some()
+        && cx.debug_bounds("create-pr-again").is_none();
+    click("create-pr-button", cx);
+    let sent = wait_for(cx, &seen, |seen, _| {
+        seen.count(|request| matches!(request, Request::CreatePr { .. })) == 1
+    });
+
+    workspace.update(cx, |workspace, cx| {
+        if let Some(task) = workspace.data.tasks.first_mut() {
+            task.pull_request = Some(PrLink {
+                number: 43,
+                url: "https://github.com/swarm-labs/swarm/pull/43".into(),
+                head: "abc".into(),
+            });
+        }
+        cx.notify();
+    });
+    redraw(cx);
+    let label = workspace.read_with(cx, |workspace, _| {
+        workspace.pull_request_toggle_label(APP_TASK)
+    });
+
+    assert!(offered);
+    assert!(status_only);
+    assert!(form, "the new form replaces the closed pull request");
+    assert!(sent);
+    assert!(cx.debug_bounds("create-pr-button").is_none());
+    assert!(cx.debug_bounds("open-on-github").is_some());
+    assert_eq!(
+        label.as_deref(),
+        Some("#43"),
+        "the old status is not shown for the new number"
+    );
+}
+
+#[gpui::test]
+fn a_merged_pull_request_does_not_offer_create_pr_again(cx: &mut TestAppContext) {
+    let (workspace, cx, _client, _seen) = with_pull_request(
+        closed_pull_request(PrState::Merged),
+        Arc::new(AtomicUsize::new(0)),
+        cx,
+    );
+    wait_until(cx, |cx| {
+        redraw(cx);
+        status_of(&workspace, cx).is_some()
+    });
+
+    assert!(cx.debug_bounds("create-pr-again").is_none());
+    assert!(cx.debug_bounds("open-on-github").is_some());
+}
+
+// Merge results
+
+fn mergeable_pull_request() -> Arc<Mutex<PullRequest>> {
+    Arc::new(Mutex::new(PullRequest {
+        draft: false,
+        mergeable: true,
+        checks: vec![github_check("build", GithubCheckState::Passed)],
+        ..open_pull_request(42)
+    }))
+}
+
+#[gpui::test]
+fn after_a_merge_the_status_is_read_and_a_queued_merge_says_so(cx: &mut TestAppContext) {
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (workspace, cx, _client, seen) =
+        with_pull_request(mergeable_pull_request(), Arc::clone(&reads), cx);
+    wait_until(cx, |cx| {
+        redraw(cx);
+        status_of(&workspace, cx).is_some()
+    });
+    let before = settled(&reads, cx);
+    let quiet = cx.debug_bounds("merge-queued").is_none();
+
+    click("merge", cx);
+    wait_for(cx, &seen, |seen, _| {
+        seen.count(|request| matches!(request, Request::MergePr { .. })) == 1
+    });
+    let refreshed = wait_until(cx, |cx| {
+        redraw(cx);
+        reads.load(Ordering::SeqCst) > before && cx.debug_bounds("merge-queued").is_some()
+    });
+
+    assert!(quiet);
+    assert!(
+        refreshed,
+        "the status is read again and the pull request is still open"
+    );
+}
+
+#[gpui::test]
+fn a_merge_that_went_through_shows_no_queue_note(cx: &mut TestAppContext) {
+    let status = mergeable_pull_request();
+    let merging = Arc::clone(&status);
+    let (workspace, cx, _client, seen) = with_pull_request_replying(
+        status,
+        Arc::new(AtomicUsize::new(0)),
+        move |request| match request {
+            Request::MergePr { call, .. } => {
+                if let Ok(mut status) = merging.lock() {
+                    status.state = PrState::Merged;
+                }
+
+                Some(Event::Done { call: *call })
+            }
+            _ => None,
+        },
+        cx,
+    );
+    wait_until(cx, |cx| {
+        redraw(cx);
+        status_of(&workspace, cx).is_some()
+    });
+
+    click("merge", cx);
+    wait_for(cx, &seen, |seen, _| {
+        seen.count(|request| matches!(request, Request::MergePr { .. })) == 1
+    });
+    let merged = wait_until(cx, |cx| {
+        redraw(cx);
+        status_of(&workspace, cx).is_some_and(|status| status.state == PrState::Merged)
+    });
+    let action = workspace.read_with(cx, |workspace, _| {
+        workspace
+            .pull_requests
+            .form(APP_TASK)
+            .map(|form| form.action.clone())
+    });
+
+    assert!(merged);
+    assert_eq!(action, Some(PanelAction::Idle));
+    assert!(cx.debug_bounds("merge-queued").is_none());
+}
+
+#[gpui::test]
+fn a_task_kept_open_after_a_merge_shows_the_daemons_text_and_the_merged_status(
+    cx: &mut TestAppContext,
+) {
+    let text =
+        "the pull request is merged, but the task did not close: 2 files have uncommitted changes";
+    let status = mergeable_pull_request();
+    let merging = Arc::clone(&status);
+    let (workspace, cx, _client, _seen) = with_pull_request_replying(
+        status,
+        Arc::new(AtomicUsize::new(0)),
+        move |request| match request {
+            Request::MergePr { call, .. } => {
+                if let Ok(mut status) = merging.lock() {
+                    status.state = PrState::Merged;
+                }
+
+                Some(Event::Error {
+                    call: Some(*call),
+                    id: None,
+                    message: text.into(),
+                })
+            }
+            _ => None,
+        },
+        cx,
+    );
+    wait_until(cx, |cx| {
+        redraw(cx);
+        status_of(&workspace, cx).is_some()
+    });
+
+    click("merge", cx);
+    let shown = wait_until(cx, |cx| {
+        redraw(cx);
+        cx.debug_bounds("pull-request-error").is_some()
+            && status_of(&workspace, cx).is_some_and(|status| status.state == PrState::Merged)
+    });
+    let action = workspace.read_with(cx, |workspace, _| {
+        workspace
+            .pull_requests
+            .form(APP_TASK)
+            .map(|form| form.action.clone())
+    });
+
+    assert!(shown, "the status is read after a failed merge call too");
+    assert_eq!(action, Some(PanelAction::Failed(text.into())));
 }

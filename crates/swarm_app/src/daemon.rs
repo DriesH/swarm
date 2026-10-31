@@ -790,9 +790,10 @@ impl Workspace {
     }
 
     /// Keeps the diff polls running only while they are needed: the visible Review source
-    /// while Review shows, and the open task's Live diff for the header and the Changes
-    /// panel. Both need an active window and a connected daemon. A poll restarts, and so
-    /// asks at once, when its task or source changes.
+    /// while Review shows, the open task's Live diff for the header and the Changes
+    /// panel, and the Merged diff while the pull request panel shows. They need an active
+    /// window and a connected daemon. A poll restarts, and so asks at once, when its task
+    /// or source changes.
     pub(crate) fn sync_diff_polls(&mut self, window_active: bool, cx: &mut Context<Self>) {
         let connected = window_active && !self.has_no_projects() && self.daemon.is_some();
         let open = self
@@ -804,18 +805,20 @@ impl Workspace {
 
         let (review_every, live_every) = self.diff_intervals;
 
-        // The pull request panel needs the Merged diff to know when the checks are stale.
-        let review = open.and_then(|id| {
-            if self.view == View::Review {
-                Some((id, self.review_source(self.active_task), review_every))
-            } else {
-                self.pr_panel_needs_merged_diff()
-                    .then_some((id, ReviewSource::Merged, live_every))
-            }
-        });
+        let review = open
+            .filter(|_| self.view == View::Review)
+            .map(|id| (id, self.review_source(self.active_task), review_every));
+        let review_key = review.map(|(id, source, _)| (id, source));
+
+        // The pull request panel needs the Merged diff for the head commit, also while
+        // Review shows the Live diff.
+        let merged = open
+            .filter(|_| self.pr_panel_needs_merged_diff())
+            .map(|id| (id, ReviewSource::Merged))
+            .filter(|key| Some(*key) != review_key);
         let live = open
             .map(|id| (id, ReviewSource::Live))
-            .filter(|key| Some(*key) != review.map(|(id, source, _)| (id, source)));
+            .filter(|key| Some(*key) != review_key);
 
         Self::sync_poll(
             &mut self.review_poll,
@@ -823,6 +826,7 @@ impl Workspace {
             cx,
         );
         Self::sync_poll(&mut self.live_poll, live.map(|key| (key, live_every)), cx);
+        Self::sync_poll(&mut self.pr_poll, merged.map(|key| (key, live_every)), cx);
     }
 
     fn sync_poll(
@@ -1793,9 +1797,15 @@ pub(crate) mod tests {
                 call: *call,
                 branches: Vec::new(),
             }),
-            Request::ListChecks { call, .. } => Some(Event::Checks {
+            Request::PrPanel { call, .. } => Some(Event::PrPanel {
                 call: *call,
-                run: None,
+                panel: swarm_protocol::PrPanel {
+                    commands: vec!["cargo test".to_owned()],
+                    required: true,
+                    pre_push_hook: None,
+                    run: None,
+                    draft: None,
+                },
             }),
             Request::DraftPr { call, .. } => Some(Event::Done { call: *call }),
             Request::PrStatus { call, .. } => Some(Event::Error {
@@ -1832,11 +1842,7 @@ pub(crate) mod tests {
     }
 
     fn spawn_fake_daemon(leave: Option<flume::Receiver<()>>) -> PathBuf {
-        let folder = PathBuf::from(format!(
-            "/tmp/swa-{}-{}",
-            std::process::id(),
-            NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
-        ));
+        let folder = test_socket_folder();
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(&folder)
@@ -1885,15 +1891,24 @@ pub(crate) mod tests {
         socket
     }
 
+    /// A fresh private folder. A reused process ID must not meet an old folder.
+    fn test_socket_folder() -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.subsec_nanos());
+
+        PathBuf::from(format!(
+            "/tmp/swa-{}-{}-{nanos}",
+            std::process::id(),
+            NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
     /// A daemon that answers every request with what `reply` returns.
     pub(crate) fn fake_daemon_replying(
         reply: impl Fn(Request) -> Option<Event> + Send + 'static,
     ) -> PathBuf {
-        let folder = PathBuf::from(format!(
-            "/tmp/swa-{}-{}",
-            std::process::id(),
-            NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
-        ));
+        let folder = test_socket_folder();
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(&folder)
@@ -1944,6 +1959,7 @@ pub(crate) mod tests {
             name: name.into(),
             branch: format!("swarm/{name}"),
             base: "main".into(),
+            pr_base: "main".into(),
             worktree: PathBuf::from("/tmp/worktree"),
             ports: Vec::new(),
             setup_terminal: Some(swarm_protocol::TerminalId(10)),
@@ -4087,6 +4103,7 @@ pub(crate) mod tests {
             task: DaemonTaskId(task),
             source,
             fingerprint,
+            head: "abc".into(),
             stat: DiffStat {
                 files: 0,
                 additions: 3,
