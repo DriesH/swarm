@@ -566,6 +566,31 @@ mod tests {
                 ("ground", colors.ground),
                 &[("fg", colors.fg)],
             );
+
+            // Destructive button label.
+            check(
+                &mut failures,
+                &theme,
+                TEXT_AA,
+                ("ground", colors.ground),
+                &[("del", colors.del)],
+            );
+
+            // Diff lines: code, line numbers and signs sit on the add and delete tints.
+            for tint in [("add_bg", colors.add_bg), ("del_bg", colors.del_bg)] {
+                let tinted: Vec<(&str, Hsla)> = [("panel", colors.panel), ("term", colors.term)]
+                    .into_iter()
+                    .map(|(name, surface)| (name, composite(surface, tint.1)))
+                    .collect();
+
+                for text in [
+                    ("fg", colors.fg),
+                    ("muted", colors.muted),
+                    ("faint", colors.faint),
+                ] {
+                    check(&mut failures, &theme, TEXT_AA, text, &tinted);
+                }
+            }
         }
 
         assert!(failures.is_empty(), "{}", failures.join("\n"));

@@ -32,6 +32,9 @@ const SWARM_STEP_WAIT: Duration = Duration::from_millis(16);
 const THREAD_MESSAGES: u64 = 200;
 const SWARM_RESIZES: usize = 30;
 const SWARM_SCROLLS: usize = 40;
+const REVIEW_SCROLLS: usize = 60;
+const REVIEW_FILES: usize = 60;
+const REVIEW_LINES: u32 = 800;
 
 #[derive(Default)]
 struct StepStats {
@@ -128,11 +131,17 @@ async fn run_pass(
     let window = recorder.window;
 
     if first_round {
-        with_workspace(window, cx, |workspace, _, _| add_long_thread(workspace))?;
+        with_workspace(window, cx, |workspace, _, _| {
+            add_long_thread(workspace);
+            add_big_diff(workspace);
+        })?;
     }
 
     if std::env::var_os("SWARM_FRAME_SWARM_ONLY").is_some() {
         return swarm_steps(recorder, cx).await;
+    }
+    if std::env::var_os("SWARM_FRAME_REVIEW_ONLY").is_some() {
+        return review_steps(recorder, cx).await;
     }
 
     let tasks: Vec<_> = with_workspace(window, cx, |workspace, _, _| {
@@ -185,6 +194,7 @@ async fn run_pass(
         .await?;
 
     swarm_steps(recorder, cx).await?;
+    review_steps(recorder, cx).await?;
 
     for (width, height) in [(1200., 800.), (1600., 1000.)] {
         let apply = move |_: &mut Workspace, window: &mut Window, _: &mut Context<Workspace>| {
@@ -333,6 +343,92 @@ async fn swarm_steps(recorder: &mut Recorder, cx: &mut AsyncApp) -> anyhow::Resu
     recorder
         .step_after(
             "swarm idle",
+            |workspace, _, cx| workspace.set_view(View::Terminals, cx),
+            STEP_WAIT,
+            cx,
+        )
+        .await
+}
+
+/// Gives the open task a diff of about 48,000 lines in both sources.
+fn add_big_diff(workspace: &mut Workspace) {
+    use swarm_protocol::{DiffStat, FileChange, ReviewSource, TaskDiff};
+
+    let Some(task) = workspace.data.diff_id(workspace.active_task) else {
+        return;
+    };
+
+    for source in [ReviewSource::Live, ReviewSource::Merged] {
+        let files: Vec<_> = (0..REVIEW_FILES)
+            .map(|index| {
+                crate::review_model::generated_file(
+                    std::path::PathBuf::from("/work/swarm/big"),
+                    &format!("crates/big/src/file_{index:02}.rs"),
+                    None,
+                    FileChange::Modified,
+                    REVIEW_LINES / 2,
+                    REVIEW_LINES / 2,
+                )
+            })
+            .collect();
+        let stat = DiffStat {
+            files: u32::try_from(files.len()).unwrap_or(u32::MAX),
+            additions: files.iter().map(|file| file.additions).sum(),
+            deletions: files.iter().map(|file| file.deletions).sum(),
+        };
+
+        workspace.data.store_diff(TaskDiff {
+            task,
+            source,
+            fingerprint: 0xB16,
+            stat,
+            files,
+        });
+    }
+}
+
+/// Scrolls the big diff in the unified and the split style.
+async fn review_steps(recorder: &mut Recorder, cx: &mut AsyncApp) -> anyhow::Result<()> {
+    for (label, style) in [
+        ("review scroll", crate::review_model::DiffStyle::Unified),
+        ("review scroll split", crate::review_model::DiffStyle::Split),
+    ] {
+        let show =
+            move |workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>| {
+                window.resize(size(px(1600.), px(1000.)));
+                workspace.set_view(View::Review, cx);
+                workspace.set_review_source(swarm_protocol::ReviewSource::Merged, cx);
+                workspace
+                    .review
+                    .update(cx, |review, cx| review.set_style(style, cx));
+            };
+        recorder.step_after("review idle", show, SETTLE, cx).await?;
+
+        for index in 0..REVIEW_SCROLLS {
+            let direction = if index < REVIEW_SCROLLS / 2 {
+                160.
+            } else {
+                -160.
+            };
+            recorder.window.update(cx, |_, window, cx| {
+                window.dispatch_event(
+                    PlatformInput::Scroll(ScrollEvent {
+                        position: point(px(900.), px(500.)),
+                        delta: ScrollDelta::Pixels(point(px(0.), px(direction))),
+                        modifiers: Modifiers::default(),
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+            })?;
+            cx.background_executor().timer(SWARM_STEP_WAIT).await;
+            recorder.record(label, cx)?;
+        }
+    }
+
+    recorder
+        .step_after(
+            "review idle",
             |workspace, _, cx| workspace.set_view(View::Terminals, cx),
             STEP_WAIT,
             cx,

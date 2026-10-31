@@ -8,7 +8,7 @@ use gpui::{Hsla, SharedString, rgb};
 use swarm_protocol::{
     AgentId as DaemonAgentId, AgentInfo, AgentLifecycle, AgentRole,
     AgentStatus as DaemonAgentStatus, DiffStat, FileStat, MessageId, MessageInfo, MessageKind,
-    ProjectInfo, TaskInfo, TerminalId as DaemonTerminalId, TerminalInfo,
+    ProjectInfo, ReviewSource, TaskDiff, TaskInfo, TerminalId as DaemonTerminalId, TerminalInfo,
 };
 use swarm_term::{BlockedKind, ExitStatus};
 use swarm_ui::AgentStatus;
@@ -102,6 +102,8 @@ pub(crate) struct DaemonTask {
     pub setup_terminal: Option<DaemonTerminalId>,
     pub setup_exit: Option<ExitStatus>,
     pub worktree: PathBuf,
+    /// The branch the task started from.
+    pub base: SharedString,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,8 +125,8 @@ pub(crate) struct Task {
     pub workers: Vec<AgentId>,
     pub processes: Vec<TerminalId>,
     pub user_terminals: Vec<TerminalId>,
-    pub additions: u32,
-    pub deletions: u32,
+    /// The fingerprint of the Merged diff the user approved.
+    pub approved: Option<u64>,
     /// A Start or Plan task: its orchestrator splits a request into tasks. It has no worktree.
     pub is_start: bool,
     /// Set for a task the daemon knows.
@@ -265,6 +267,20 @@ impl Agent {
         SharedString::from(parts.join(" \u{b7} "))
     }
 
+    /// True while the agent's process runs and it works or waits for the user.
+    pub(crate) fn is_working(&self) -> bool {
+        match &self.daemon {
+            Some(daemon) => {
+                daemon.lifecycle == AgentLifecycle::Running
+                    && matches!(
+                        daemon.status,
+                        DaemonAgentStatus::Working | DaemonAgentStatus::Blocked(_)
+                    )
+            }
+            None => matches!(self.status, AgentStatus::Working | AgentStatus::Blocked),
+        }
+    }
+
     /// The status word for screen readers, for example "needs you, permission".
     pub(crate) fn status_text(&self) -> String {
         let Some(daemon) = &self.daemon else {
@@ -332,16 +348,6 @@ pub(crate) struct Terminal {
     /// How a process ended. `None` while it runs. A live terminal's view knows it too.
     pub exit: Option<ExitStatus>,
     pub lines: Vec<FakeLine>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct ChangedFile {
-    pub task: TaskId,
-    pub path: SharedString,
-    pub worker: AgentId,
-    pub additions: u32,
-    pub deletions: u32,
-    pub editing: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -467,7 +473,6 @@ pub(crate) struct FakeData {
     pub tasks: Vec<Task>,
     pub agents: Vec<Agent>,
     pub terminals: Vec<Terminal>,
-    pub changes: Vec<ChangedFile>,
     pub usage: Vec<(SharedString, f32)>,
     pub file_tree: Vec<TreeEntry>,
     pub pull_request: Option<FakePullRequest>,
@@ -481,6 +486,8 @@ pub(crate) struct FakeData {
     pub early_deliveries: VecDeque<(MessageId, u64)>,
     /// The latest changes of each agent's worktree. Missing while unknown.
     pub agent_changes: HashMap<AgentId, AgentChanges>,
+    /// The latest diff of each task and source, see [`FakeData::diff_id`].
+    pub diffs: HashMap<(swarm_protocol::TaskId, ReviewSource), Rc<TaskDiff>>,
 }
 
 /// What an agent changed: the totals and the files, most changed lines first.
@@ -576,8 +583,7 @@ impl Builder {
             workers: Vec::new(),
             processes: Vec::new(),
             user_terminals: Vec::new(),
-            additions: 0,
-            deletions: 0,
+            approved: None,
             is_start: false,
             daemon: None,
         });
@@ -681,24 +687,6 @@ impl Builder {
         if let Some(terminal) = self.data.terminals.last_mut() {
             terminal.exit = Some(ExitStatus::Code(code));
         }
-    }
-
-    fn change(
-        &mut self,
-        task: TaskId,
-        worker: AgentId,
-        path: &str,
-        (additions, deletions): (u32, u32),
-        editing: bool,
-    ) {
-        self.data().changes.push(ChangedFile {
-            task,
-            path: SharedString::new(path),
-            worker,
-            additions,
-            deletions,
-            editing,
-        });
     }
 }
 
@@ -900,54 +888,6 @@ impl FakeData {
         );
         builder.exited(0);
 
-        let src = "crates/swarm-term/src";
-        builder.change(
-            renderer,
-            term_render,
-            &format!("{src}/element.rs"),
-            (48, 12),
-            true,
-        );
-        builder.change(
-            renderer,
-            term_render,
-            &format!("{src}/grid.rs"),
-            (22, 9),
-            false,
-        );
-        builder.change(
-            renderer,
-            term_render,
-            &format!("{src}/font.rs"),
-            (18, 0),
-            false,
-        );
-        builder.change(renderer, term_render, "benches/grid.rs", (6, 0), false);
-        builder.change(renderer, pty_io, &format!("{src}/pty.rs"), (31, 6), false);
-        builder.change(
-            renderer,
-            pty_io,
-            "crates/swarm-term/Cargo.toml",
-            (2, 0),
-            false,
-        );
-        let ui = "crates/swarm-ui/src";
-        builder.change(
-            renderer,
-            ui_tokens,
-            &format!("{ui}/tokens.rs"),
-            (142, 0),
-            false,
-        );
-        builder.change(
-            renderer,
-            ui_tokens,
-            &format!("{ui}/theme.rs"),
-            (38, 12),
-            false,
-        );
-        builder.change(renderer, ui_tokens, &format!("{ui}/lib.rs"), (6, 0), false);
-
         builder.task(
             swarm,
             "menu-bar-usage",
@@ -998,12 +938,24 @@ impl FakeData {
         data.file_tree = sample_file_tree();
         data.usage = sample_usage();
 
-        if let Some(task) = data.tasks.iter_mut().find(|task| task.id == renderer) {
-            task.additions = 312;
-            task.deletions = 48;
-        }
-
         data
+    }
+
+    /// The Live and Merged diff of the sample task, with the files its workers changed.
+    fn add_sample_diffs(&mut self, team: &SampleSwarm) {
+        let agents = [
+            (team.term_render, "term-render"),
+            (team.pty_io, "pty-io"),
+            (team.ui_tokens, "ui-tokens"),
+        ]
+        .map(|(agent, _)| DaemonAgentId(u64::from(agent.0)));
+        let task = swarm_protocol::TaskId(u64::from(team.task.0));
+
+        for source in [ReviewSource::Live, ReviewSource::Merged] {
+            let diff = crate::review_model::sample_diff(task, source, agents);
+
+            self.diffs.insert((task, source), Rc::new(diff));
+        }
     }
 
     /// What each worker of the sample task changed.
@@ -1078,6 +1030,7 @@ impl FakeData {
         }
 
         self.add_sample_changes(team);
+        self.add_sample_diffs(team);
 
         let Some(key) = self.message_key(team.task) else {
             return;
@@ -1238,6 +1191,7 @@ impl FakeData {
             setup_terminal: info.setup_terminal,
             setup_exit: info.setup_exit.clone(),
             worktree: info.worktree.clone(),
+            base: SharedString::new(&info.base),
         };
         let existing = self.tasks.iter_mut().find(|task| {
             task.daemon
@@ -1248,6 +1202,7 @@ impl FakeData {
         if let Some(task) = existing {
             task.name = SharedString::new(&info.name);
             task.branch = SharedString::new(&info.branch);
+            task.approved = info.approved;
             let known = task.daemon.as_ref().and_then(|old| old.setup_terminal);
             task.daemon = Some(DaemonTask {
                 setup_terminal: info.setup_terminal.or(known),
@@ -1278,8 +1233,7 @@ impl FakeData {
             workers: Vec::new(),
             processes: Vec::new(),
             user_terminals: Vec::new(),
-            additions: 0,
-            deletions: 0,
+            approved: info.approved,
             is_start: false,
             daemon: Some(daemon),
         });
@@ -1414,6 +1368,60 @@ impl FakeData {
         }
 
         (id, terminal)
+    }
+
+    /// The id Review calls and diffs use for a tab: the daemon's, or one made from the
+    /// fake id. A Start or Plan tab has none.
+    pub(crate) fn diff_id(&self, task: TaskId) -> Option<swarm_protocol::TaskId> {
+        let task = self.task(task).filter(|task| !task.is_start)?;
+
+        Some(
+            task.daemon
+                .as_ref()
+                .map_or(swarm_protocol::TaskId(u64::from(task.id.0)), |daemon| {
+                    daemon.id
+                }),
+        )
+    }
+
+    /// The latest diff of a tab from one source.
+    pub(crate) fn task_diff(&self, task: TaskId, source: ReviewSource) -> Option<&Rc<TaskDiff>> {
+        self.diffs.get(&(self.diff_id(task)?, source))
+    }
+
+    /// The totals of a tab's Live diff, zero while it is unknown.
+    pub(crate) fn live_stat(&self, task: TaskId) -> DiffStat {
+        self.task_diff(task, ReviewSource::Live)
+            .map(|diff| diff.stat)
+            .unwrap_or_default()
+    }
+
+    /// Keeps a diff the daemon sent. Returns false when it is the one already kept.
+    pub(crate) fn store_diff(&mut self, diff: TaskDiff) -> bool {
+        let key = (diff.task, diff.source);
+
+        if self
+            .diffs
+            .get(&key)
+            .is_some_and(|known| known.fingerprint == diff.fingerprint)
+        {
+            return false;
+        }
+
+        self.diffs.insert(key, Rc::new(diff));
+
+        true
+    }
+
+    /// How many workers of a tab work or wait for the user.
+    pub(crate) fn working_workers(&self, task: TaskId) -> usize {
+        self.task(task).map_or(0, |task| {
+            task.workers
+                .iter()
+                .filter_map(|id| self.agent(*id))
+                .filter(|agent| agent.is_working())
+                .count()
+        })
     }
 
     pub(crate) fn has_daemon_task(&self, id: swarm_protocol::TaskId) -> bool {
@@ -1555,6 +1563,10 @@ impl FakeData {
 
     /// Removes a tab with its agents and terminals. Returns the terminals.
     pub(crate) fn remove_task(&mut self, task: TaskId) -> Vec<TerminalId> {
+        if let Some(id) = self.diff_id(task) {
+            self.diffs.retain(|(other, _), _| *other != id);
+        }
+
         let mut gone = self.remove_agents_of(task);
 
         if let Some(entry) = self.task(task) {
@@ -1979,8 +1991,7 @@ impl FakeData {
             workers: Vec::new(),
             processes: Vec::new(),
             user_terminals: Vec::new(),
-            additions: 0,
-            deletions: 0,
+            approved: None,
             is_start: false,
             daemon: None,
         });
@@ -2044,8 +2055,7 @@ impl FakeData {
             workers: Vec::new(),
             processes: Vec::new(),
             user_terminals: Vec::new(),
-            additions: 0,
-            deletions: 0,
+            approved: None,
             is_start: false,
             daemon: None,
         });
@@ -2252,6 +2262,8 @@ mod tests {
             agents,
             created_by: None,
             briefed: false,
+            approved: None,
+            closed: false,
         }
     }
 

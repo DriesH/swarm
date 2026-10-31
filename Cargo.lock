@@ -5257,6 +5257,7 @@ dependencies = [
 name = "swarm_core"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "log",
  "rusqlite",
  "serde",
@@ -5277,6 +5278,7 @@ dependencies = [
  "flume",
  "libc",
  "log",
+ "rusqlite",
  "serde",
  "serde_json",
  "swarm_core",

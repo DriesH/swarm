@@ -17,6 +17,8 @@ pub enum ButtonVariant {
     Secondary,
     /// Text only, for quiet actions.
     Ghost,
+    /// Filled with `del`: an action that throws something away.
+    Destructive,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -98,6 +100,13 @@ impl ButtonVariant {
                 border: gpui::transparent_black(),
                 hover_background: colors.active,
                 hover_text: colors.fg,
+            },
+            Self::Destructive => ButtonColors {
+                background: colors.del,
+                text: colors.ground,
+                border: colors.del,
+                hover_background: colors.del.opacity(0.88),
+                hover_text: colors.ground,
             },
         }
     }
@@ -198,7 +207,10 @@ impl RenderOnce for Button {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let mut colors = self.variant.colors(cx);
         let (accent, ground) = (cx.theme().colors().accent, cx.theme().colors().ground);
-        let filled = self.variant == ButtonVariant::Primary;
+        let filled = matches!(
+            self.variant,
+            ButtonVariant::Primary | ButtonVariant::Destructive
+        );
         let toggled = self.toggle_state == Some(true);
 
         let weight = if self.variant == ButtonVariant::Primary && self.size == ButtonSize::Medium {
@@ -299,6 +311,7 @@ impl Component for Button {
             ("Primary", ButtonVariant::Primary),
             ("Secondary", ButtonVariant::Secondary),
             ("Ghost", ButtonVariant::Ghost),
+            ("Destructive", ButtonVariant::Destructive),
         ];
 
         v_flex()

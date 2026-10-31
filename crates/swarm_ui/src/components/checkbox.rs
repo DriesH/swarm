@@ -20,6 +20,7 @@ pub struct Checkbox {
     checked: bool,
     disabled: bool,
     show_label: bool,
+    display_label: Option<SharedString>,
     on_toggle: Option<ToggleHandler>,
 }
 
@@ -31,6 +32,7 @@ impl Checkbox {
             checked: false,
             disabled: false,
             show_label: true,
+            display_label: None,
             on_toggle: None,
         }
     }
@@ -38,6 +40,12 @@ impl Checkbox {
     /// Hides the visible label. VoiceOver still reads it.
     pub fn show_label(mut self, show: bool) -> Self {
         self.show_label = show;
+        self
+    }
+
+    /// Shows this text instead of the label. VoiceOver still reads the label.
+    pub fn display_label(mut self, text: impl Into<SharedString>) -> Self {
+        self.display_label = Some(text.into());
         self
     }
 
@@ -118,7 +126,9 @@ impl RenderOnce for Checkbox {
             .items_center()
             .gap(px(8.))
             .child(square)
-            .when(self.show_label, |row| row.child(Label::new(self.label)))
+            .when(self.show_label, |row| {
+                row.child(Label::new(self.display_label.unwrap_or(self.label)))
+            })
             .map(|row| {
                 if self.disabled {
                     row.opacity(0.5)

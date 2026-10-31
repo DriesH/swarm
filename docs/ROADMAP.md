@@ -10,7 +10,7 @@ Each phase ends with a pull request into `main`. A phase is done when every box 
 | 3 | Daemon, terminals and worktrees | Done ([#4](https://github.com/DriesH/swarm/pull/4), [#5](https://github.com/DriesH/swarm/pull/5), [#6](https://github.com/DriesH/swarm/pull/6)) |
 | 4 | Agents and harness | In progress |
 | 5 | Swarm view | In progress |
-| 6 | Review and pull requests | Not started |
+| 6 | Review and pull requests | In progress |
 | 7 | Menu bar, usage and notifications | Not started |
 | 8 | Polish and first release | Not started |
 | 9 | After first release | Not started |
@@ -100,9 +100,15 @@ Each phase ends with a pull request into `main`. A phase is done when every box 
 
 **Goal:** read the code, then ship it.
 
-**Scope:** Changes panel, Review view (Live and Merged, by agent or folder, unified or split), inline comments routed through the orchestrator, outdated comments, Approve, local checks from `.swarm/config.toml`, `gh` PR create, PR status (GitHub checks, reviewers, merge), system check for `gh`.
+**Scope:** Changes panel, Review view (Live and Merged, by agent or folder, unified or split), inline comments routed through the orchestrator, outdated comments, Approve, Close task, local checks from `.swarm/config.toml`, `gh` PR create, PR status (GitHub checks, reviewers, merge), system check for `gh`.
+
+Three parts: 1. Review view, Approve, Changes panel and Close task. 2. Comments. 3. Pull requests, and **New task** from any branch.
 
 **Done when:**
+
+- [ ] Review shows Live and Merged diffs that update while agents work, and Approve stops counting when the Merged diff changes
+- [ ] Close task stops the agents, removes the worktrees and deletes only branches merged into the base branch, after a dialog that shows what is lost
+- [ ] **New task** can branch from any local branch, so a closed task's branch can be picked up again
 
 - [ ] A comment on live code reaches the worker that wrote it
 - [ ] **Create PR** appears only after **Approve** and only when required checks pass

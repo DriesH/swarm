@@ -1,6 +1,13 @@
 //! The right panel: changes, files and pull request.
 
-use gpui::{AnyElement, Context, Entity, FontWeight, Role, SharedString, Window, div, px};
+use std::ops::Range;
+use std::rc::Rc;
+
+use gpui::{
+    AnyElement, Context, Entity, FontWeight, Role, SharedString, UniformListScrollHandle,
+    WeakEntity, Window, div, px, uniform_list,
+};
+use swarm_protocol::{FileDiff, ReviewSource, TaskDiff};
 use swarm_ui::prelude::*;
 use swarm_ui::styles::focus_ring;
 
@@ -8,6 +15,8 @@ use crate::model::{
     AgentKind, CheckState, FakePullRequest, FileMark, PULL_REQUEST_DESCRIPTION, PULL_REQUEST_TITLE,
     TreeEntry, sample_pull_request,
 };
+use crate::review_model::{AgentLabel, GroupKind, Grouping, group_files, plural, visible_files};
+use crate::swarm_view::full_size;
 use crate::workspace::{RightPanel, View, Workspace};
 
 const LOCAL_CHECKS: [(&str, &str); 3] = [
@@ -68,122 +77,8 @@ fn pill(text: SharedString, cx: &App) -> impl IntoElement {
         .child(mono(text))
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "one flat element tree reads best in one place"
-)]
 fn changes(workspace: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
-    let colors = cx.theme().colors();
-    let (raised, accent) = (colors.raised, colors.accent);
-
-    let task = workspace.active_task;
-    let changed: Vec<_> = workspace
-        .data
-        .changes
-        .iter()
-        .filter(|file| file.task == task)
-        .collect();
-
-    let count = if changed.len() == 1 {
-        "1 file".to_owned()
-    } else {
-        format!("{} files", changed.len())
-    };
-
-    let mut list = v_flex().flex_1().min_h_0().overflow_hidden().p(px(6.));
-    let mut index = 0_usize;
-
-    for agent in workspace.data.agents_of(task) {
-        let files: Vec<_> = changed
-            .iter()
-            .filter(|file| file.worker == agent.id)
-            .collect();
-
-        if files.is_empty() {
-            continue;
-        }
-
-        let additions = files.iter().map(|file| file.additions).sum();
-        let deletions = files.iter().map(|file| file.deletions).sum();
-        let icon = match agent.kind {
-            AgentKind::ClaudeCode => IconName::ClaudeCode,
-            AgentKind::Codex => IconName::Codex,
-        };
-
-        list = list.child(
-            h_flex()
-                .h(px(30.))
-                .mt(px(4.))
-                .px(px(8.))
-                .gap(px(8.))
-                .child(Icon::new(icon).size(IconSize::Medium).color(Color::Muted))
-                .child(
-                    div().flex_1().min_w_0().flex().child(
-                        Label::new(agent.name.clone())
-                            .size(LabelSize::Small)
-                            .weight(FontWeight::MEDIUM)
-                            .truncate(),
-                    ),
-                )
-                .child(delta(additions, deletions)),
-        );
-
-        for file in files {
-            let (directory, name) = file
-                .path
-                .rsplit_once('/')
-                .map_or(("", file.path.as_ref()), |(directory, name)| {
-                    (directory, name)
-                });
-            let summary = format!("{}, +{} −{}", file.path, file.additions, file.deletions);
-
-            list = list.child(
-                h_flex()
-                    .id(("change", index))
-                    .role(Role::Button)
-                    .aria_label(summary)
-                    .focusable()
-                    .tab_stop(true)
-                    .cursor_pointer()
-                    .h(px(28.))
-                    .pl(px(30.))
-                    .pr(px(8.))
-                    .gap(px(8.))
-                    .rounded(px(7.))
-                    .hover(move |style| style.bg(raised))
-                    .focus_visible(move |style| focus_ring(style, accent))
-                    .on_click(cx.listener(|this, _, _, cx| this.set_view(View::Review, cx)))
-                    .child(
-                        div().min_w_0().flex().child(
-                            Label::new(name.to_owned())
-                                .size(LabelSize::Default)
-                                .truncate(),
-                        ),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .child(mono(directory.to_owned()).color(Color::Faint).truncate()),
-                    )
-                    .when(file.editing, |row| {
-                        row.child(
-                            div()
-                                .id(("editing", index))
-                                .role(Role::Image)
-                                .aria_label("Editing")
-                                .flex_none()
-                                .size(px(6.))
-                                .rounded_full()
-                                .bg(accent),
-                        )
-                    })
-                    .child(delta(file.additions, file.deletions)),
-            );
-            index += 1;
-        }
-    }
+    let stat = workspace.data.live_stat(workspace.active_task);
 
     v_flex()
         .size_full()
@@ -191,7 +86,7 @@ fn changes(workspace: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
             header(cx)
                 .h(px(40.))
                 .child(Label::new("Changes").weight(FontWeight::MEDIUM))
-                .child(mono(count).color(Color::Faint))
+                .child(mono(plural(stat.files, "file", "files")).color(Color::Faint))
                 .child(div().flex_1())
                 .child(
                     Button::new("review", "Review")
@@ -202,8 +97,281 @@ fn changes(workspace: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                         })),
                 ),
         )
-        .child(list)
+        .child(
+            div()
+                .id("changes-list")
+                .role(Role::List)
+                .aria_label("Changed files")
+                .flex_1()
+                .min_h_0()
+                .child(workspace.changes_list.clone().cached(full_size())),
+        )
         .into_any_element()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PanelItem {
+    Group {
+        title: SharedString,
+        kind: GroupKind,
+        additions: u32,
+        deletions: u32,
+    },
+    File {
+        file: usize,
+    },
+}
+
+/// The files of the open task's Live diff, grouped by agent. It owns its list, so a scroll
+/// does not redraw the workspace.
+pub(crate) struct ChangesList {
+    workspace: WeakEntity<Workspace>,
+    diff: Option<Rc<TaskDiff>>,
+    agents: Rc<[AgentLabel]>,
+    items: Rc<[PanelItem]>,
+    scroll: UniformListScrollHandle,
+}
+
+impl ChangesList {
+    pub(crate) fn new(workspace: WeakEntity<Workspace>) -> Self {
+        Self {
+            workspace,
+            diff: None,
+            agents: Rc::from([]),
+            items: Rc::from([]),
+            scroll: UniformListScrollHandle::new(),
+        }
+    }
+
+    pub(crate) fn show(
+        &mut self,
+        diff: Option<Rc<TaskDiff>>,
+        agents: Rc<[AgentLabel]>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.diff == diff && self.agents == agents {
+            return;
+        }
+
+        self.diff = diff;
+        self.agents = agents;
+        self.items = self.group().into();
+        cx.notify();
+    }
+
+    fn group(&self) -> Vec<PanelItem> {
+        let Some(diff) = &self.diff else {
+            return Vec::new();
+        };
+        let visible = visible_files(diff, None);
+        let mut items = Vec::new();
+
+        for group in group_files(&diff.files, &visible, Grouping::ByAgent, &self.agents) {
+            let files = group.files.iter().filter_map(|file| diff.files.get(*file));
+
+            items.push(PanelItem::Group {
+                title: group.title,
+                kind: group.kind,
+                additions: files.clone().map(|file| file.additions).sum(),
+                deletions: files.map(|file| file.deletions).sum(),
+            });
+            items.extend(group.files.into_iter().map(|file| PanelItem::File { file }));
+        }
+
+        items
+    }
+
+    /// The titles of the groups, for tests.
+    #[cfg(test)]
+    pub(crate) fn group_titles(&self) -> Vec<SharedString> {
+        self.items
+            .iter()
+            .filter_map(|item| match item {
+                PanelItem::Group { title, .. } => Some(title.clone()),
+                PanelItem::File { .. } => None,
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn file_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|item| matches!(item, PanelItem::File { .. }))
+            .count()
+    }
+
+    fn rows(&mut self, range: Range<usize>, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let items = Rc::clone(&self.items);
+        let Some(diff) = self.diff.clone() else {
+            return Vec::new();
+        };
+
+        range
+            .filter_map(|index| items.get(index).map(|item| (index, item)))
+            .map(|(index, item)| match item {
+                PanelItem::Group {
+                    title,
+                    kind,
+                    additions,
+                    deletions,
+                } => group_row(index, title, *kind, *additions, *deletions),
+                PanelItem::File { file } => diff.files.get(*file).map_or_else(
+                    || div().into_any_element(),
+                    |data| self.file_row(index, data, cx),
+                ),
+            })
+            .collect()
+    }
+
+    fn file_row(&self, index: usize, file: &FileDiff, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors();
+        let (raised, accent) = (colors.raised, colors.accent);
+
+        let name = file
+            .path
+            .file_name()
+            .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+        let folder = file
+            .path
+            .parent()
+            .map(|folder| folder.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let summary = format!(
+            "{}, +{} \u{2212}{}",
+            file.path.display(),
+            file.additions,
+            file.deletions
+        );
+        let (worktree, path) = (file.worktree.clone(), file.path.clone());
+        let workspace = self.workspace.clone();
+
+        h_flex()
+            .id(("change", index))
+            .role(Role::Button)
+            .aria_label(summary)
+            .focusable()
+            .tab_stop(true)
+            .cursor_pointer()
+            .h(px(28.))
+            .mx(px(6.))
+            .pl(px(30.))
+            .pr(px(8.))
+            .gap(px(8.))
+            .rounded(px(7.))
+            .hover(move |style| style.bg(raised))
+            .focus_visible(move |style| focus_ring(style, accent))
+            .on_click(move |_, _, cx| {
+                let (worktree, path) = (worktree.clone(), path.clone());
+
+                if let Err(error) = workspace.update(cx, |workspace, cx| {
+                    workspace.open_changed_file(worktree, path, cx);
+                }) {
+                    log::debug!("the window closed before the file opened: {error}");
+                }
+            })
+            .child(
+                div()
+                    .min_w_0()
+                    .flex()
+                    .child(Label::new(name).size(LabelSize::Default).truncate()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .child(mono(folder).color(Color::Faint).truncate()),
+            )
+            .child(delta(file.additions, file.deletions))
+            .into_any_element()
+    }
+}
+
+fn group_row(
+    index: usize,
+    title: &SharedString,
+    kind: GroupKind,
+    additions: u32,
+    deletions: u32,
+) -> AnyElement {
+    h_flex()
+        .id(("change-group", index))
+        .role(Role::Group)
+        .aria_label(format!(
+            "{title}, {additions} additions, {deletions} deletions"
+        ))
+        .h(px(34.))
+        .pt(px(4.))
+        .px(px(14.))
+        .gap(px(8.))
+        .child(match kind {
+            GroupKind::Agent(kind) => Icon::new(match kind {
+                AgentKind::ClaudeCode => IconName::ClaudeCode,
+                AgentKind::Codex => IconName::Codex,
+            })
+            .size(IconSize::Medium)
+            .color(Color::Muted)
+            .into_any_element(),
+            GroupKind::Folder | GroupKind::Other => div().into_any_element(),
+        })
+        .child(
+            div().flex_1().min_w_0().flex().child(
+                Label::new(title.clone())
+                    .size(LabelSize::Small)
+                    .weight(FontWeight::MEDIUM)
+                    .truncate(),
+            ),
+        )
+        .child(delta(additions, deletions))
+        .into_any_element()
+}
+
+impl Render for ChangesList {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.items.is_empty() {
+            return div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(Label::new("No changes").color(Color::Faint))
+                .into_any_element();
+        }
+
+        uniform_list(
+            "changes-files",
+            self.items.len(),
+            cx.processor(|this, range: Range<usize>, _, cx| this.rows(range, cx)),
+        )
+        .track_scroll(&self.scroll)
+        .size_full()
+        .into_any_element()
+    }
+}
+
+impl Workspace {
+    /// Hands the Changes panel the open task's Live diff.
+    pub(crate) fn sync_changes_list(&mut self, cx: &mut Context<Self>) {
+        if self.visible_panel() != Some(RightPanel::Changes) {
+            return;
+        }
+
+        let task = self.active_task;
+        let diff = self.data.task_diff(task, ReviewSource::Live).cloned();
+        let agents: Rc<[AgentLabel]> = self
+            .data
+            .agents_of(task)
+            .map(|agent| AgentLabel {
+                id: agent.protocol_id(),
+                name: agent.name.clone(),
+                kind: agent.kind,
+            })
+            .collect();
+
+        self.changes_list
+            .update(cx, |list, cx| list.show(diff, agents, cx));
+    }
 }
 
 fn visible_rows(tree: &[TreeEntry]) -> Vec<usize> {

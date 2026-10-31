@@ -23,6 +23,7 @@ pub struct Dialog {
     footer: Option<AnyElement>,
     focus_handle: FocusHandle,
     on_dismiss: Option<DismissHandler>,
+    close_disabled: bool,
 }
 
 impl Dialog {
@@ -40,6 +41,7 @@ impl Dialog {
             footer: None,
             focus_handle: focus_handle.clone(),
             on_dismiss: None,
+            close_disabled: false,
         }
     }
 
@@ -50,6 +52,12 @@ impl Dialog {
 
     pub fn width(mut self, width: Pixels) -> Self {
         self.width = width;
+        self
+    }
+
+    /// Disables the close button, for a dialog that must stay open while it works.
+    pub fn close_disabled(mut self, disabled: bool) -> Self {
+        self.close_disabled = disabled;
         self
     }
 
@@ -80,6 +88,7 @@ impl Dialog {
         let close = self.on_dismiss.clone();
         let on_scrim = self.on_dismiss.clone();
         let on_action = self.on_dismiss;
+        let close_disabled = self.close_disabled;
 
         let panel = v_flex()
             .id("dialog-panel")
@@ -116,13 +125,13 @@ impl Dialog {
                     )
                     .child(div().flex_1())
                     .child(
-                        IconButton::new("dialog-close", IconName::Close, "Close").on_click(
-                            move |_, window, cx| {
+                        IconButton::new("dialog-close", IconName::Close, "Close")
+                            .disabled(close_disabled)
+                            .on_click(move |_, window, cx| {
                                 if let Some(handler) = &close {
                                     handler(window, cx);
                                 }
-                            },
-                        ),
+                            }),
                     ),
             )
             .child(

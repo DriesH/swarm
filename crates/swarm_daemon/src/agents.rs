@@ -3,7 +3,7 @@
 //! The row is written before the process starts (ADR 0005). Every change goes to
 //! SQLite and to every connected app client as [`Event::AgentChanged`].
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use serde_json::Value;
 use swarm_core::adapters::{self, LaunchSpec, Session};
 use swarm_core::agents::{StatusMerge, is_trust_prompt, new_session_id, new_token};
@@ -241,6 +241,8 @@ pub(crate) struct Agents {
     paste: Mutex<()>,
     /// Told when an agent's process ended.
     on_end: Mutex<Vec<EndObserver>>,
+    /// Tasks being closed: nothing new starts in them, and their agents end quietly.
+    closing: Mutex<HashSet<TaskId>>,
 }
 
 type EndObserver = Box<dyn Fn(AgentId) + Send + Sync>;
@@ -266,7 +268,72 @@ impl Agents {
             live: Mutex::default(),
             paste: Mutex::new(()),
             on_end: Mutex::default(),
+            closing: Mutex::default(),
         })
+    }
+
+    /// Starts closing the task. False when it is closing already.
+    pub(crate) fn begin_close(&self, task: TaskId) -> bool {
+        lock(&self.closing).insert(task)
+    }
+
+    /// The close failed; the task takes new agents again.
+    pub(crate) fn abort_close(&self, task: TaskId) {
+        lock(&self.closing).remove(&task);
+    }
+
+    /// Like [`Self::is_closing`], for the `task` key of a terminal.
+    pub(crate) fn is_closing_key(&self, key: Option<&str>) -> bool {
+        key.is_some_and(|key| {
+            lock(&self.closing)
+                .iter()
+                .any(|task| task.terminal_key() == key)
+        })
+    }
+
+    pub(crate) fn is_closing(&self, task: Option<TaskId>) -> bool {
+        task.is_some_and(|task| lock(&self.closing).contains(&task))
+    }
+
+    /// Marks the live agents of the task as stopped on purpose, so their end counts as
+    /// `Stopped` and tells nobody. Returns the terminals of those that run. An agent
+    /// that never started ends here.
+    pub(crate) fn stop_task_agents(&self, task: TaskId) -> Vec<TerminalId> {
+        let mut terminals = Vec::new();
+        let mut unstarted = Vec::new();
+
+        {
+            let mut live = lock(&self.live);
+            for agent in live
+                .values_mut()
+                .filter(|agent| agent.info.task == Some(task))
+            {
+                agent.stop_requested = true;
+                match agent.info.terminal {
+                    Some(terminal) => terminals.push(terminal),
+                    None => unstarted.push(agent.info.id),
+                }
+            }
+        }
+
+        for id in unstarted {
+            let Some(mut agent) = lock(&self.live).remove(&id) else {
+                continue;
+            };
+
+            agent.info.lifecycle = AgentLifecycle::Stopped;
+            agent.info.ended_at = Some(unix_millis());
+            self.publish(&mut agent);
+        }
+
+        terminals
+    }
+
+    /// True while an agent of the task still has a live entry.
+    pub(crate) fn has_live(&self, task: TaskId) -> bool {
+        lock(&self.live)
+            .values()
+            .any(|agent| agent.info.task == Some(task))
     }
 
     /// Calls `observer` with the ID of every agent whose process ends.
@@ -318,6 +385,10 @@ impl Agents {
 
     /// Writes the agent's row and makes it known to the agent socket. Nothing runs yet.
     pub(crate) fn register(&self, place: &Place<'_>, plan: Plan) -> Result<AgentInfo> {
+        if self.is_closing(place.task) {
+            bail!("the task is closing");
+        }
+
         let session_id = match plan.kind {
             AgentKind::ClaudeCode => Some(new_session_id().context("cannot make a session ID")?),
             AgentKind::Codex => None,
@@ -478,6 +549,11 @@ impl Agents {
     /// Starts the agent's process in the task worktree.
     pub(crate) fn start(self: &Arc<Self>, start: Start) -> Result<()> {
         let id = start.agent;
+        let task = self.info(id).and_then(|info| info.task);
+        if self.is_closing(task) {
+            bail!("the task is closing");
+        }
+
         let (plan, token, session_id) = {
             let live = lock(&self.live);
             let entry = live.get(&id).context("the agent is not registered")?;
@@ -579,6 +655,16 @@ impl Agents {
             .create_with(request, extras)
             .context("cannot start the agent")?;
 
+        // A close that began while the process started has not seen this terminal.
+        if self.is_closing(info.task) {
+            self.update(id, |live| {
+                live.stop_requested = true;
+
+                false
+            });
+            hub.send_input(TerminalInput::Kill);
+        }
+
         if let (Some(message), Some(receiver)) = (start.first_message, ready) {
             self.type_when_ready(id, hub, message, receiver);
         }
@@ -634,7 +720,9 @@ impl Agents {
         agent.info.ended_at = Some(unix_millis());
         self.publish(&mut agent);
 
-        self.tell_worker_stopped(&agent.info, &format!("failed: {message}"));
+        if !self.is_closing(agent.info.task) {
+            self.tell_worker_stopped(&agent.info, &format!("failed: {message}"));
+        }
     }
 
     /// The orchestrator hears that one of its workers failed to start or ended.
@@ -854,8 +942,10 @@ impl Agents {
         agent.info.ended_at = Some(unix_millis());
         self.publish(&mut agent);
 
-        let how = exit.map_or_else(|| "no exit status".to_owned(), exit_text);
-        self.tell_worker_stopped(&agent.info, &format!("stopped, {how}"));
+        if !self.is_closing(agent.info.task) {
+            let how = exit.map_or_else(|| "no exit status".to_owned(), exit_text);
+            self.tell_worker_stopped(&agent.info, &format!("stopped, {how}"));
+        }
 
         for observer in lock(&self.on_end).iter() {
             observer(id);

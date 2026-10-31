@@ -20,13 +20,26 @@ mod client;
 pub use client::{Client, ClientError, MessageEvent};
 
 /// Bumped on every incompatible change; the daemon refuses other versions.
-pub const VERSION: u32 = 7;
+pub const VERSION: u32 = 8;
 
 /// The most messages [`Request::ListMessages`] returns.
 pub const MESSAGES_LISTED: usize = 500;
 
 /// The most files one [`AgentChange`] lists.
 pub const FILES_LISTED: usize = 500;
+
+/// The most files one [`TaskDiff`] lists. Its totals still count every file.
+pub const DIFF_FILES: usize = 1_000;
+
+/// The most lines one [`FileDiff`] carries; the rest is left out and the file is
+/// marked truncated.
+pub const DIFF_LINES_PER_FILE: usize = 5_000;
+
+/// The most lines one [`TaskDiff`] carries over all its files.
+pub const DIFF_LINES: usize = 50_000;
+
+/// Longer lines are cut to this many bytes, on a character boundary.
+pub const DIFF_LINE_BYTES: usize = 1_000;
 
 /// Guards against a corrupt length prefix allocating gigabytes.
 const MAX_FRAME: usize = 256 << 20;
@@ -186,6 +199,12 @@ pub struct TaskInfo {
     pub created_by: Option<AgentId>,
     /// The task's orchestrator confirmed the brief it started with.
     pub briefed: bool,
+    /// The [`TaskDiff::fingerprint`] of the Merged diff the user approved. The approval
+    /// holds while the Merged diff still has this fingerprint.
+    pub approved: Option<u64>,
+    /// The task was closed: its agents stopped and its worktrees are gone. Sent once in
+    /// a `TaskChanged`; closed tasks are never listed.
+    pub closed: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -294,6 +313,109 @@ pub struct AgentChange {
     pub files: Vec<FileStat>,
 }
 
+/// Where Review reads the changes of a task from.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReviewSource {
+    /// The task worktree against the base branch, plus each worker with its own
+    /// worktree that is not merged yet, against the commit it started from.
+    Live,
+    /// The commits of the task branch since it left the base branch: what the pull
+    /// request would hold. Uncommitted work is left out.
+    Merged,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileChange {
+    Added,
+    Modified,
+    Deleted,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffLineKind {
+    Context,
+    Added,
+    Deleted,
+    /// The line before has no line end (git's `\ No newline at end of file`). Its
+    /// text is empty.
+    NoNewline,
+}
+
+/// One line of a hunk, without the leading `+`, `-` or space and without the line end.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct DiffLine {
+    pub kind: DiffLineKind,
+    pub text: String,
+}
+
+/// One `@@ -old_start,old_lines +new_start,new_lines @@ section` block.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct DiffHunk {
+    pub old_start: u32,
+    pub old_lines: u32,
+    pub new_start: u32,
+    pub new_lines: u32,
+    /// The text git prints after the second `@@`, usually the enclosing function.
+    pub section: String,
+    pub lines: Vec<DiffLine>,
+}
+
+/// One changed file in Review.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct FileDiff {
+    /// The worktree the file is in: the task worktree, or a worker's own worktree.
+    pub worktree: PathBuf,
+    /// Relative to `worktree`. A rename shows as a deleted and an added file.
+    pub path: PathBuf,
+    /// The agent whose `swarm commit` last touched the file, or the worker that owns
+    /// the worktree. `None` when no agent commit touched it.
+    pub agent: Option<AgentId>,
+    pub change: FileChange,
+    /// The old and new file mode (for example `0o100644` and `0o100755`) when the mode
+    /// changed.
+    pub mode_change: Option<(u32, u32)>,
+    pub additions: u32,
+    pub deletions: u32,
+    pub binary: bool,
+    pub hunks: Vec<DiffHunk>,
+    /// Lines were left out because of [`DIFF_LINES_PER_FILE`] or [`DIFF_LINES`], or
+    /// the whole file because it is too large to read. A file left out whole has no
+    /// hunks and is not binary.
+    pub truncated: bool,
+}
+
+/// The changes of a task from one [`ReviewSource`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct TaskDiff {
+    pub task: TaskId,
+    pub source: ReviewSource,
+    /// A hash of every changed line, file mode and blob, also of lines left out by
+    /// the caps. Equal fingerprints mean equal changes. Stable across daemon restarts.
+    pub fingerprint: u64,
+    /// Totals over every changed file, also files past [`DIFF_FILES`].
+    pub stat: DiffStat,
+    /// Up to [`DIFF_FILES`] files, sorted by worktree, then path.
+    pub files: Vec<FileDiff>,
+}
+
+/// What closing a task would throw away, so the app can ask first.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct CloseCheck {
+    /// Agents of the task whose process runs.
+    pub running_agents: u32,
+    /// The user's own terminals in the task. Closing stops them.
+    pub user_terminals: u32,
+    /// Files with changes that are not committed, in the task worktree and in workers'
+    /// own worktrees. Closing deletes them.
+    pub uncommitted_files: u32,
+    /// Names of workers with their own worktree whose commits are not merged into the
+    /// task branch. Their branches stay.
+    pub unmerged_workers: Vec<String>,
+    /// The task branch and workers' own branches that are merged into the base branch.
+    /// Closing deletes them; every other branch stays.
+    pub merged_branches: Vec<String>,
+}
+
 /// Matches a reply to its request, so a late reply never answers a newer call.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CallId(pub u32);
@@ -361,6 +483,38 @@ pub enum Request {
     AgentChanges {
         call: CallId,
         agents: Vec<AgentId>,
+    },
+    /// Answered with [`Event::TaskDiff`]. With `known` set to the fingerprint the
+    /// client already has, an unchanged diff is answered with `diff: None`.
+    TaskDiff {
+        call: CallId,
+        task: TaskId,
+        source: ReviewSource,
+        known: Option<u64>,
+    },
+    /// Approves the Merged diff with this fingerprint. Refused when the Merged diff
+    /// changed since. Answered with [`Event::TaskChanged`] to every client, then
+    /// [`Event::Done`].
+    ApproveTask {
+        call: CallId,
+        task: TaskId,
+        fingerprint: u64,
+    },
+    /// Answered with [`Event::CloseCheck`].
+    CheckClose {
+        call: CallId,
+        task: TaskId,
+    },
+    /// Stops the task's agents and all its terminals, runs the teardown script, and
+    /// removes the task worktree and workers' own worktrees, uncommitted changes
+    /// included. Branches merged into the base branch are deleted; the others stay. Once the agents stopped, the daemon checks again and
+    /// refuses when closing would lose more than `confirmed`, the check the user saw.
+    /// Answered with a `TaskChanged` with `closed: true` to every client, then
+    /// [`Event::Done`].
+    CloseTask {
+        call: CallId,
+        task: TaskId,
+        confirmed: CloseCheck,
     },
 }
 
@@ -439,6 +593,19 @@ pub enum Event {
     AgentChanges {
         call: CallId,
         changes: Vec<AgentChange>,
+    },
+    /// `None` when the diff still has the fingerprint the request named.
+    TaskDiff {
+        call: CallId,
+        diff: Option<TaskDiff>,
+    },
+    CloseCheck {
+        call: CallId,
+        check: CloseCheck,
+    },
+    /// A request that has no other answer succeeded.
+    Done {
+        call: CallId,
     },
 }
 

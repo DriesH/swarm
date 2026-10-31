@@ -48,6 +48,7 @@ pub struct IconButton {
     debug_selector: Option<String>,
     color: Color,
     toggle_state: Option<bool>,
+    reveal_group: Option<SharedString>,
     disabled: bool,
     on_click: Option<ClickHandler>,
 }
@@ -61,6 +62,7 @@ impl IconButton {
             size: IconButtonSize::default(),
             color: Color::Faint,
             toggle_state: None,
+            reveal_group: None,
             debug_selector: None,
             disabled: false,
             on_click: None,
@@ -80,6 +82,13 @@ impl IconButton {
     /// Name for `VisualTestContext::debug_bounds`. Only recorded in test builds.
     pub fn debug_selector(mut self, selector: impl FnOnce() -> String) -> Self {
         self.debug_selector = Some(selector());
+        self
+    }
+
+    /// Hides the button until its parent `group` is hovered or the button has keyboard
+    /// focus. It stays in the tab order.
+    pub fn reveal_with_group(mut self, group: impl Into<SharedString>) -> Self {
+        self.reveal_group = Some(group.into());
         self
     }
 }
@@ -112,6 +121,7 @@ impl RenderOnce for IconButton {
         let (active, accent) = (colors.active, colors.accent);
 
         let pressed = self.toggle_state == Some(true);
+        let reveals = self.reveal_group.is_some();
 
         let color = if pressed { Color::Default } else { self.color };
 
@@ -147,7 +157,16 @@ impl RenderOnce for IconButton {
                         .tab_stop(true)
                         .cursor_pointer()
                         .hover(|style| style.bg(active))
-                        .focus_visible(|style| focus_ring(style, accent))
+                        .when_some(self.reveal_group.clone(), |button, group| {
+                            button
+                                .opacity(0.)
+                                .group_hover(group, |style| style.opacity(1.))
+                        })
+                        .focus_visible(|style| {
+                            let style = focus_ring(style, accent);
+
+                            if reveals { style.opacity(1.) } else { style }
+                        })
                         .when_some(self.on_click, |button, handler| button.on_click(handler))
                 }
             })

@@ -1,12 +1,15 @@
 //! `swarm`: the Swarm app.
 
 mod actions;
+mod close_task;
 mod daemon;
 mod markdown;
 mod model;
 mod new_task;
 mod palette;
 mod panels;
+mod review_model;
+mod review_view;
 mod settings;
 mod sidebar;
 mod status_bar;

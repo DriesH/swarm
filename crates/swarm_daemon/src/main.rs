@@ -122,7 +122,7 @@ fn run() -> Result<()> {
     let store = Arc::new(Mutex::new(store));
 
     let recovery_store = Arc::clone(&store);
-    thread::Builder::new()
+    let recovery = thread::Builder::new()
         .name("recovery".into())
         .spawn(move || recovery::recover(&recovery_store, &leftovers, &System))?;
 
@@ -134,6 +134,17 @@ fn run() -> Result<()> {
     }
 
     let projects = Arc::new(Projects::new(Arc::clone(&store)));
+
+    // Waits for the old processes to end, so no worktree goes away under one.
+    let closing = Arc::clone(&projects);
+    thread::Builder::new()
+        .name("recover-closing".into())
+        .spawn(move || {
+            if recovery.join().is_err() {
+                log::error!("the process recovery failed");
+            }
+            closing.recover_closing();
+        })?;
     let terminals = Terminals::new(Arc::clone(&store));
     let clients = Arc::new(Clients::default());
     let messages = Messages::new(Arc::clone(&store), Arc::clone(&clients));
