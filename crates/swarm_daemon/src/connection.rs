@@ -182,9 +182,16 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
             });
         }
         Request::AgentChanges { call, agents } => {
+            let Some(running) = sink.begin_changes() else {
+                send_error(sink, call, &"busy: the previous changes request still runs");
+
+                return;
+            };
+
             let projects = Arc::clone(projects);
             run_slow(sink, "agent-changes", call, move |sink| {
                 let changes = projects.agent_changes(&agents);
+                drop(running);
 
                 sink.send_event(&Event::AgentChanges { call, changes });
             });

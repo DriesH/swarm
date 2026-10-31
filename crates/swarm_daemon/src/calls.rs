@@ -707,6 +707,7 @@ mod tests {
             lifecycle,
             revision: 1,
             created_at: 0,
+            started_at: None,
             ended_at: None,
         };
 

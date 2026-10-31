@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -64,6 +64,7 @@ where
         .arg(directory)
         .args(&arguments)
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(std::process::Stdio::null())
         .output()
         .map_err(|source| Error::Io {
@@ -116,6 +117,15 @@ const MAX_COUNTED_BYTES: u64 = 1 << 20;
 /// Git treats a file as binary when a NUL shows up in its first 8000 bytes.
 const BINARY_SNIFF: usize = 8000;
 
+/// Untracked files past this many get no line count.
+const MAX_COUNTED_FILES: usize = 2000;
+
+/// Untracked files past this many are not looked at.
+const MAX_UNTRACKED_FILES: usize = 10_000;
+
+/// Bytes read from untracked files per call; later files get no line count.
+const MAX_TOTAL_BYTES: u64 = 32 << 20;
+
 /// The commit `revision` points at.
 pub fn commit_of(root: &Path, revision: &str) -> Result<String, Error> {
     let target = format!("{revision}^{{commit}}");
@@ -125,16 +135,28 @@ pub fn commit_of(root: &Path, revision: &str) -> Result<String, Error> {
 
 /// The commit where `HEAD` and `revision` split.
 pub fn merge_base(worktree: &Path, revision: &str) -> Result<String, Error> {
-    run(worktree, ["merge-base", "HEAD", revision])
+    run(
+        worktree,
+        ["merge-base", "--end-of-options", "HEAD", revision],
+    )
 }
 
 /// What the working tree of `worktree` changed since `base`: committed and uncommitted
 /// work, plus untracked files. A binary or huge untracked file counts as a file with no
 /// lines.
 pub fn diff_stat(worktree: &Path, base: &str) -> Result<DiffStat, Error> {
+    // `diff-index` never writes the index, so it cannot block the agent's own git.
     let (arguments, output) = execute(
         worktree,
-        ["diff", "--numstat", "-z", "--no-renames", base, "--"],
+        [
+            "diff-index",
+            "--numstat",
+            "-z",
+            "--no-renames",
+            "--end-of-options",
+            base,
+            "--",
+        ],
     )?;
     if !output.success {
         return Err(failure(&arguments, &output));
@@ -146,7 +168,7 @@ pub fn diff_stat(worktree: &Path, base: &str) -> Result<DiffStat, Error> {
     for entry in output
         .raw
         .split(|byte| *byte == 0)
-        .filter(|e| !e.is_empty())
+        .filter(|entry| !entry.is_empty())
     {
         let entry = String::from_utf8_lossy(entry);
         let mut parts = entry.splitn(3, '\t');
@@ -168,13 +190,18 @@ pub fn diff_stat(worktree: &Path, base: &str) -> Result<DiffStat, Error> {
         return Err(failure(&arguments, &output));
     }
 
-    for path in output
+    let mut budget = MAX_TOTAL_BYTES;
+    for (index, path) in output
         .raw
         .split(|byte| *byte == 0)
-        .filter(|e| !e.is_empty())
+        .filter(|path| !path.is_empty())
+        .take(MAX_UNTRACKED_FILES)
+        .enumerate()
     {
         let path = String::from_utf8_lossy(path).into_owned();
-        additions = additions.saturating_add(count_lines(&worktree.join(&path)));
+        if index < MAX_COUNTED_FILES {
+            additions = additions.saturating_add(count_lines(&worktree.join(&path), &mut budget));
+        }
         files.insert(path);
     }
 
@@ -185,16 +212,37 @@ pub fn diff_stat(worktree: &Path, base: &str) -> Result<DiffStat, Error> {
     })
 }
 
-/// Lines in a text file; 0 for a binary, a huge or an unreadable one.
-fn count_lines(path: &Path) -> u32 {
-    let small = std::fs::metadata(path).is_ok_and(|meta| meta.len() <= MAX_COUNTED_BYTES);
-    if !small {
+/// Lines in a text file. A symlink is one line, like git sees it. Anything that is not a
+/// regular file, or is binary, huge, unreadable or past the byte `budget`, has none.
+fn count_lines(path: &Path, budget: &mut u64) -> u32 {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if meta.file_type().is_symlink() {
+        return 1;
+    }
+    if !meta.is_file() || meta.len() > MAX_COUNTED_BYTES || *budget == 0 {
         return 0;
     }
 
-    let Ok(bytes) = std::fs::read(path) else {
+    let Ok(file) = std::fs::File::open(path) else {
         return 0;
     };
+
+    // The file may grow after the check above.
+    let mut bytes = Vec::new();
+    if file
+        .take(MAX_COUNTED_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return 0;
+    }
+
+    *budget = budget.saturating_sub(bytes.len() as u64);
+    if bytes.len() as u64 > MAX_COUNTED_BYTES {
+        return 0;
+    }
     if bytes[..bytes.len().min(BINARY_SNIFF)].contains(&0) {
         return 0;
     }

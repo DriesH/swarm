@@ -119,6 +119,7 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE agents ADD COLUMN ended_at INTEGER;
     ALTER TABLE agents ADD COLUMN base_commit TEXT;
     UPDATE agents SET created_at = created_at * 1000",
+    "ALTER TABLE agents ADD COLUMN started_at INTEGER",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -624,6 +625,7 @@ impl Store {
             lifecycle,
             revision: 0,
             created_at: from_row(created_at)?,
+            started_at: None,
             ended_at: None,
         })
     }
@@ -726,8 +728,8 @@ impl Store {
 
         self.connection.execute(
             "UPDATE agents SET terminal = ?1, status = ?2, message = ?3, lifecycle = ?4,
-                 revision = ?5, ended_at = ?6
-             WHERE id = ?7",
+                 revision = ?5, ended_at = ?6, started_at = ?7
+             WHERE id = ?8",
             params![
                 terminal,
                 to_json(&agent.status)?,
@@ -735,6 +737,7 @@ impl Store {
                 to_json(&agent.lifecycle)?,
                 to_row(agent.revision)?,
                 agent.ended_at.map(to_row).transpose()?,
+                agent.started_at.map(to_row).transpose()?,
                 to_row(agent.id.0)?
             ],
         )?;
@@ -998,7 +1001,7 @@ impl Store {
 
 const AGENT_COLUMNS: &str = "SELECT id, project, task, role, kind, model, session_id, terminal,
     status, message, lifecycle, revision, session_confirmed, name, worktree, branch,
-    created_at, ended_at FROM agents";
+    created_at, ended_at, started_at FROM agents";
 
 fn agent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAgent> {
     let id: i64 = row.get(0)?;
@@ -1009,6 +1012,7 @@ fn agent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAgent> {
     let worktree: String = row.get(14)?;
     let created_at: i64 = row.get(16)?;
     let ended_at: Option<i64> = row.get(17)?;
+    let started_at: Option<i64> = row.get(18)?;
 
     Ok(StoredAgent {
         info: AgentInfo {
@@ -1027,6 +1031,7 @@ fn agent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAgent> {
             lifecycle: json_column(row, 10)?,
             revision: revision.unsigned_abs(),
             created_at: created_at.unsigned_abs(),
+            started_at: started_at.map(i64::unsigned_abs),
             ended_at: ended_at.map(i64::unsigned_abs),
         },
         session_id: row.get(6)?,
@@ -1930,7 +1935,7 @@ mod tests {
     #[test]
     fn the_end_migration_turns_agent_seconds_into_milliseconds() {
         let connection = Connection::open_in_memory().expect("memory");
-        for migration in &MIGRATIONS[..MIGRATIONS.len() - 1] {
+        for migration in &MIGRATIONS[..MIGRATIONS.len() - 2] {
             connection.execute_batch(migration).expect("schema");
         }
         connection
@@ -1959,7 +1964,7 @@ mod tests {
             .pragma_update(
                 None,
                 "user_version",
-                i64::try_from(MIGRATIONS.len() - 1).expect("count"),
+                i64::try_from(MIGRATIONS.len() - 2).expect("count"),
             )
             .expect("version");
 
@@ -1982,6 +1987,19 @@ mod tests {
         assert!(agent.created_at >= before);
         assert_eq!(stored.info.created_at, agent.created_at);
         assert_eq!(stored.info.ended_at, None);
+    }
+
+    #[test]
+    fn the_start_time_is_saved() {
+        let (store, task) = store_with_task();
+        let mut agent = store.add_agent(&new_agent(task)).expect("agent");
+        assert_eq!(agent.started_at, None);
+
+        agent.started_at = Some(4321);
+        store.save_agent(&agent).expect("save");
+        let stored = store.agent(agent.id).expect("query").expect("agent");
+
+        assert_eq!(stored.info.started_at, Some(4321));
     }
 
     #[test]

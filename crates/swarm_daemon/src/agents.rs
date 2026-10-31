@@ -555,6 +555,7 @@ impl Agents {
                     live.info.terminal = Some(terminal);
                     live.info.lifecycle = AgentLifecycle::Running;
                     live.info.ended_at = None;
+                    live.info.started_at = Some(unix_millis());
 
                     true
                 });

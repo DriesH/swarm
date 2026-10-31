@@ -989,3 +989,210 @@ fn a_worker_with_a_missing_worktree_is_left_out() {
 
     assert!(projects.agent_changes(&[worker.id]).is_empty());
 }
+
+/// Runs `work` on a thread and fails instead of hanging when it never returns.
+fn within_seconds<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || sender.send(work()).ok());
+
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("the diff stat hung")
+}
+
+#[test]
+fn an_untracked_symlink_to_a_fifo_does_not_block() {
+    let repo = ignoring_setup_files();
+    let base = repo.git(&["rev-parse", "HEAD"]);
+    let fifo = repo.root.join("pipe");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo")
+            .success()
+    );
+    std::os::unix::fs::symlink(&fifo, repo.root.join("link-to-pipe")).expect("link");
+
+    let root = repo.root.clone();
+    let stat = within_seconds(move || git::diff_stat(&root, &base).expect("stat"));
+
+    assert_eq!((stat.files, stat.additions), (1, 1));
+}
+
+#[test]
+fn an_untracked_symlink_to_dev_zero_does_not_read_forever() {
+    let repo = ignoring_setup_files();
+    let base = repo.git(&["rev-parse", "HEAD"]);
+    std::os::unix::fs::symlink("/dev/zero", repo.root.join("zeros")).expect("link");
+
+    let root = repo.root.clone();
+    let stat = within_seconds(move || git::diff_stat(&root, &base).expect("stat"));
+
+    assert_eq!((stat.files, stat.additions), (1, 1));
+}
+
+#[test]
+fn a_symlink_counts_as_one_file_with_one_line() {
+    let repo = ignoring_setup_files();
+    let base = repo.git(&["rev-parse", "HEAD"]);
+    std::fs::write(repo.root.join("target.txt"), "a\nb\nc\n").expect("target");
+    std::os::unix::fs::symlink("target.txt", repo.root.join("alias")).expect("link");
+
+    let stat = git::diff_stat(&repo.root, &base).expect("stat");
+
+    assert_eq!((stat.files, stat.additions), (2, 3 + 1));
+}
+
+#[test]
+fn the_diff_stat_does_not_touch_the_index() {
+    let repo = ignoring_setup_files();
+    let base = repo.git(&["rev-parse", "HEAD"]);
+    let readme = repo.root.join("README.md");
+    let earlier = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    std::fs::File::options()
+        .write(true)
+        .open(&readme)
+        .and_then(|file| file.set_modified(earlier))
+        .expect("new mtime, same content");
+    let index = repo.root.join(".git/index");
+    let before = (
+        std::fs::read(&index).expect("index"),
+        std::fs::metadata(&index)
+            .and_then(|meta| meta.modified())
+            .expect("mtime"),
+    );
+
+    let stat = git::diff_stat(&repo.root, &base).expect("stat");
+
+    let after = (
+        std::fs::read(&index).expect("index"),
+        std::fs::metadata(&index)
+            .and_then(|meta| meta.modified())
+            .expect("mtime"),
+    );
+    assert_eq!(stat, DiffStat::default());
+    assert!(before == after, "the index was rewritten");
+}
+
+#[test]
+fn untracked_files_past_the_count_limit_have_no_line_count() {
+    let repo = ignoring_setup_files();
+    let base = repo.git(&["rev-parse", "HEAD"]);
+    std::fs::create_dir(repo.root.join("many")).expect("folder");
+    for number in 0..2100 {
+        std::fs::write(repo.root.join(format!("many/{number:05}")), "x\n").expect("file");
+    }
+
+    let stat = git::diff_stat(&repo.root, &base).expect("stat");
+
+    assert_eq!((stat.files, stat.additions), (2100, 2000));
+}
+
+#[test]
+fn untracked_files_past_the_file_limit_are_not_listed() {
+    let repo = ignoring_setup_files();
+    let base = repo.git(&["rev-parse", "HEAD"]);
+    std::fs::create_dir(repo.root.join("many")).expect("folder");
+    for number in 0..10_050 {
+        std::fs::write(repo.root.join(format!("many/{number:05}")), "").expect("file");
+    }
+
+    let stat = git::diff_stat(&repo.root, &base).expect("stat");
+
+    assert_eq!(stat.files, 10_000);
+}
+
+#[test]
+fn untracked_files_stop_counting_lines_after_the_byte_budget() {
+    let repo = ignoring_setup_files();
+    let base = repo.git(&["rev-parse", "HEAD"]);
+    let megabyte = "x\n".repeat(1 << 19);
+    for number in 0..34 {
+        std::fs::write(repo.root.join(format!("big-{number:02}.txt")), &megabyte).expect("file");
+    }
+
+    let stat = git::diff_stat(&repo.root, &base).expect("stat");
+
+    assert_eq!(stat.files, 34);
+    assert_eq!(stat.additions, 32 * (1 << 19));
+}
+
+#[test]
+fn paths_with_a_tab_and_a_newline_are_counted_once() {
+    let repo = ignoring_setup_files();
+    let base = repo.git(&["rev-parse", "HEAD"]);
+    std::fs::write(repo.root.join("tracked\tname\nhere.txt"), "a\nb\n").expect("tracked");
+    git_in(&repo.root, &["add", "--all"]);
+    git_in(&repo.root, &["commit", "-q", "-m", "odd name"]);
+    std::fs::write(repo.root.join("loose\tname\nhere.txt"), "c\n").expect("loose");
+
+    let stat = git::diff_stat(&repo.root, &base).expect("stat");
+
+    assert_eq!(
+        stat,
+        DiffStat {
+            files: 2,
+            additions: 3,
+            deletions: 0,
+        }
+    );
+}
+
+#[test]
+fn a_merge_base_ref_that_looks_like_an_option_is_not_an_option() {
+    let repo = ignoring_setup_files();
+
+    assert!(git::merge_base(&repo.root, "--all").is_err());
+}
+
+#[test]
+fn a_worker_without_a_base_commit_is_measured_from_the_task_branch() {
+    let repo = Repo::new("");
+    let (projects, store) = shared_projects();
+    let task = task_with_a_commit(&projects, &repo);
+    let worktree = task.worktree.with_file_name("old-worker");
+    git_in(
+        &repo.root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "old-worker-branch",
+            "--end-of-options",
+            worktree.to_str().expect("path"),
+            &task.branch,
+        ],
+    );
+    let worker = store
+        .lock()
+        .expect("lock")
+        .add_agent(&NewAgent {
+            project: task.project,
+            task: Some(task.id),
+            role: AgentRole::Worker,
+            kind: AgentKind::ClaudeCode,
+            model: "sonnet",
+            session_id: None,
+            name: "old",
+            worktree: &worktree,
+            branch: "old-worker-branch",
+            ports: &[],
+        })
+        .expect("agent");
+    std::fs::write(worktree.join("work.txt"), "1\n2\n").expect("work");
+
+    let changes = projects.agent_changes(&[worker.id]);
+
+    assert_eq!(
+        changes,
+        vec![(
+            worker.id,
+            DiffStat {
+                files: 1,
+                additions: 2,
+                deletions: 0,
+            }
+        )]
+    );
+}

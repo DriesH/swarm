@@ -38,8 +38,9 @@ impl Claim {
     pub(crate) fn commit(self) {
         let ids = self.ids();
 
-        let delivery = lock(&self.owner.store).mark_delivered(&ids);
-        match delivery {
+        // Broadcasting under the store lock keeps "sent" ahead of "delivered".
+        let store = lock(&self.owner.store);
+        match store.mark_delivered(&ids) {
             Ok(delivery) if !delivery.ids.is_empty() => {
                 self.owner.clients.broadcast(&Event::MessagesDelivered {
                     ids: delivery.ids,
@@ -89,11 +90,15 @@ impl Messages {
 
     /// Stores the message, tells the app and wakes the recipient if it waits.
     pub(crate) fn post(&self, message: &NewMessage<'_>) -> Result<MessageInfo> {
-        let info = lock(&self.store).add_message(message)?;
+        let store = lock(&self.store);
+        let info = store.add_message(message)?;
 
+        // Under the store lock, so a claim cannot announce "delivered" first.
         self.clients.broadcast(&Event::MessageSent {
             message: info.clone(),
         });
+        drop(store);
+
         drop(lock(&self.wake));
         self.arrived.notify_all();
 
@@ -320,5 +325,62 @@ mod tests {
         messages.post(&new_message(1, "hello")).expect("post");
 
         assert_eq!(receiver.try_iter().count(), 1);
+    }
+
+    /// The store stays locked while a broadcast waits, so no other thread can announce
+    /// "delivered" ahead of "sent".
+    fn store_is_locked_while_broadcast_stalls(
+        action: impl FnOnce(&Arc<Messages>) + Send + 'static,
+    ) {
+        let store = Store::open_in_memory().expect("store");
+        store
+            .add_project(std::path::Path::new("/repo"), "repo")
+            .expect("project");
+        let clients = Arc::new(Clients::default());
+        let messages = Messages::new(Arc::new(Mutex::new(store)), Arc::clone(&clients));
+
+        let stalled = clients.stall();
+        let worker = Arc::clone(&messages);
+        let running = thread::spawn(move || action(&worker));
+        thread::park_timeout(Duration::from_millis(200));
+
+        assert!(
+            messages.store.try_lock().is_err(),
+            "the store lock was released early"
+        );
+
+        drop(stalled);
+        running.join().expect("action");
+    }
+
+    #[test]
+    fn a_post_broadcasts_under_the_store_lock() {
+        store_is_locked_while_broadcast_stalls(|messages| {
+            messages.post(&new_message(1, "x")).expect("post");
+        });
+    }
+
+    #[test]
+    fn a_commit_broadcasts_under_the_store_lock() {
+        let store = Store::open_in_memory().expect("store");
+        store
+            .add_project(std::path::Path::new("/repo"), "repo")
+            .expect("project");
+        let clients = Arc::new(Clients::default());
+        let messages = Messages::new(Arc::new(Mutex::new(store)), Arc::clone(&clients));
+        messages.post(&new_message(1, "x")).expect("post");
+        let claim = messages.claim(AgentId(1)).expect("claim");
+
+        let stalled = clients.stall();
+        let running = thread::spawn(move || claim.commit());
+        thread::park_timeout(Duration::from_millis(200));
+
+        assert!(
+            messages.store.try_lock().is_err(),
+            "the store lock was released early"
+        );
+
+        drop(stalled);
+        running.join().expect("commit");
     }
 }

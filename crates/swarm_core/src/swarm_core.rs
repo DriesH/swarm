@@ -342,7 +342,7 @@ impl Projects {
 
         let ports = self.reserve_ports(&config)?;
 
-        git::worktree_add(&root, &branch, &worktree, &task.branch)?;
+        git::worktree_add(&root, &branch, &worktree, &base_commit)?;
 
         let checkout = WorkerCheckout {
             project: task.project,
@@ -396,18 +396,20 @@ impl Projects {
 
     fn agent_change(&self, id: AgentId) -> Result<Option<DiffStat>, Error> {
         // The store lock is gone before git runs.
-        let (agent, worker_base, task_base) = {
+        let (agent, worker_base, task_base, task_branch) = {
             let store = lock(&self.store);
             let Some(agent) = store.agent(id)?.map(|stored| stored.info) else {
                 return Ok(None);
             };
             let worker_base = store.base_commit(id)?;
-            let task_base = match agent.task {
-                Some(task) => store.task(task)?.map(|task| task.base),
+            let task = match agent.task {
+                Some(task) => store.task(task)?,
                 None => None,
             };
+            let task_base = task.as_ref().map(|task| task.base.clone());
+            let task_branch = task.map(|task| task.branch);
 
-            (agent, worker_base, task_base)
+            (agent, worker_base, task_base, task_branch)
         };
 
         if !agent.worktree.is_dir() {
@@ -415,7 +417,12 @@ impl Projects {
         }
 
         let base = match agent.role {
-            AgentRole::Worker => worker_base,
+            AgentRole::Worker => match (worker_base, task_branch) {
+                (Some(base), _) => Some(base),
+                // Made before the base commit was recorded.
+                (None, Some(branch)) => Some(git::merge_base(&agent.worktree, &branch)?),
+                (None, None) => None,
+            },
             AgentRole::Orchestrator => match task_base {
                 Some(base) => Some(git::merge_base(&agent.worktree, &base)?),
                 None => None,
