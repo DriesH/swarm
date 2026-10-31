@@ -1,14 +1,13 @@
 //! The main window's root view.
 
-use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use gpui::{
-    Bounds, Context, Entity, FocusHandle, Focusable, ListAlignment, ListState, Pixels,
-    SharedString, Size, Subscription, Window, div, px,
+    AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable, Pixels, SharedString, Size,
+    Subscription, Window, div, px,
 };
-use swarm_protocol::{Client, MessageId};
+use swarm_protocol::Client;
 use swarm_ui::fonts::UI_FONT;
 use swarm_ui::prelude::*;
 
@@ -21,6 +20,7 @@ use crate::model::{
     AgentId, FakeData, ProjectId, SAMPLE_NOW, Task, TaskId, TaskStatus, TerminalId, TerminalKind,
 };
 use crate::palette::Overlay;
+use crate::swarm_view::{DotGrid, MessageThread, TerminalPreview};
 use crate::views::Resizing;
 use crate::{panels, sidebar, status_bar, tab_bar, views};
 
@@ -103,9 +103,10 @@ pub(crate) struct Workspace {
     pub(crate) swarm_zoom: f32,
     /// The agent Review shows, set by View diff.
     pub(crate) review_agent: Option<AgentId>,
-    pub(crate) messages_list: ListState,
-    /// The agent and newest message the thread was last scrolled for.
-    pub(crate) messages_scroll_key: Cell<Option<(AgentId, Option<MessageId>)>>,
+    pub(crate) thread: Entity<MessageThread>,
+    pub(crate) preview: Entity<TerminalPreview>,
+    pub(crate) dot_grid: Entity<DotGrid>,
+    _inspector_subscription: Subscription,
     pub(crate) changes_poll: Option<gpui::Task<()>>,
     /// The task the running poll asks about.
     pub(crate) polled_task: Option<TaskId>,
@@ -123,6 +124,7 @@ impl Workspace {
     pub(crate) fn with_sample(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut workspace = Self::with_data(DataSource::Sample, FakeData::sample(), window, cx);
         workspace.fixed_now = Some(SAMPLE_NOW);
+        workspace.sync_inspector(cx);
 
         workspace
     }
@@ -156,7 +158,11 @@ impl Workspace {
             this.sync_swarm_tasks(window.is_window_active(), cx);
         });
 
-        Self {
+        let inspector_subscription = cx.observe(&cx.entity(), |this, _, cx| {
+            this.sync_inspector(cx);
+        });
+
+        let mut workspace = Self {
             data,
             active_project,
             active_task,
@@ -194,13 +200,18 @@ impl Workspace {
             swarm_focus: HashMap::new(),
             swarm_zoom: 1.,
             review_agent: None,
-            messages_list: ListState::new(0, ListAlignment::Top, px(200.)),
-            messages_scroll_key: Cell::new(None),
+            thread: cx.new(|_| MessageThread::new()),
+            preview: cx.new(|_| TerminalPreview::new()),
+            dot_grid: cx.new(|_| DotGrid),
+            _inspector_subscription: inspector_subscription,
             changes_poll: None,
             polled_task: None,
             _activation_subscription: activation_subscription,
             swarm_clock: None,
-        }
+        };
+        workspace.sync_inspector(cx);
+
+        workspace
     }
 
     /// True when no project is shown, so the main area shows the empty state.

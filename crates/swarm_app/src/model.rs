@@ -463,6 +463,8 @@ pub(crate) struct FakeData {
     /// orchestrator's messages sit under its project with no task.
     pub messages:
         HashMap<(swarm_protocol::ProjectId, Option<swarm_protocol::TaskId>), VecDeque<Message>>,
+    /// Counts every change to `messages`, so a view can tell when its copy is stale.
+    pub messages_revision: u64,
     /// Delivery times that came before their message, newest last.
     pub early_deliveries: VecDeque<(MessageId, u64)>,
     /// The latest changes of each agent's worktree. Missing while unknown.
@@ -1470,6 +1472,7 @@ impl FakeData {
     /// Keeps a message, up to the last [`MESSAGES_PER_TASK`] of its task, in id order.
     /// A copy of a kept message only fills in `delivered_at`.
     pub(crate) fn record_message(&mut self, info: &MessageInfo) {
+        self.messages_revision += 1;
         let early = self.take_early_delivery(info.id);
         let delivered_at = info.delivered_at.or(early);
 
@@ -1504,6 +1507,7 @@ impl FakeData {
     /// Sets `delivered_at` on the kept messages with these ids. Ids not kept yet are
     /// remembered, so a message that arrives later is not left in flight.
     pub(crate) fn mark_delivered(&mut self, ids: &[MessageId], delivered_at: u64) {
+        self.messages_revision += 1;
         let mut missing: Vec<MessageId> = ids.to_vec();
 
         for message in self.messages.values_mut().flatten() {

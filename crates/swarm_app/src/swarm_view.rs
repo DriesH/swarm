@@ -1,14 +1,16 @@
-//! The Swarm view: the task's agents as a graph, a timeline below and the inspector.
+//! The Swarm view: the task's agents as a graph and the inspector.
 
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    AnyElement, Bounds, ClickEvent, Context, FollowMode, FontWeight, Hsla, KeyDownEvent, Pixels,
-    Role, SharedString, Window, canvas, div, fill, list, point, px, relative, size,
+    AnyElement, Bounds, ClickEvent, Context, Entity, FollowMode, FontWeight, Hsla, KeyDownEvent,
+    ListAlignment, ListState, Pixels, Role, SharedString, StyleRefinement, Subscription, Window,
+    canvas, div, list, point, px,
 };
 use swarm_protocol::{AgentId as DaemonAgentId, MessageId, MessageKind};
+use swarm_term_view::TerminalView;
 use swarm_ui::fonts::MONO_FONT;
 use swarm_ui::prelude::*;
 use swarm_ui::styles::focus_ring;
@@ -30,9 +32,8 @@ const EDGE_WIDTH: f32 = 1.5;
 const FLIGHT_DOT: f32 = 7.;
 const MAX_FLIGHT_DOTS: usize = 4;
 const DOT_SPACING: f32 = 18.;
+const DOT_SIZE: f32 = 1.5;
 const INSPECTOR_WIDTH: f32 = 320.;
-const TIMELINE_HEIGHT: f32 = 168.;
-const LANE_HEIGHT: f32 = 26.;
 const PREVIEW_ROWS: usize = 5;
 const MIN_ZOOM: f32 = 0.6;
 const MAX_ZOOM: f32 = 1.4;
@@ -167,30 +168,6 @@ fn relative_time(sent_at: u64, now: u64) -> String {
     }
 }
 
-/// The messages on an agent's lane: the ones it sent, and the ones Swarm sent to it.
-fn lane_marks<'a>(
-    messages: &'a [&'a Message],
-    agent: DaemonAgentId,
-) -> impl Iterator<Item = &'a Message> {
-    messages.iter().copied().filter(move |message| {
-        message.from == Some(agent) || (message.from.is_none() && message.to == agent)
-    })
-}
-
-/// Where a time falls between the start and the end of the timeline, from 0 to 1.
-fn timeline_fraction(time: u64, start: u64, end: u64) -> f32 {
-    let span = end.saturating_sub(start).max(1);
-    let offset = time.saturating_sub(start).min(span);
-
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "the fraction only places a mark on screen"
-    )]
-    let fraction = offset as f32 / span as f32;
-
-    fraction
-}
-
 fn step_zoom(zoom: f32, steps: i8) -> f32 {
     let next = zoom + ZOOM_STEP * f32::from(steps);
 
@@ -272,38 +249,46 @@ impl Workspace {
         }
     }
 
-    /// Fits the thread's list to the messages. The list follows the newest message when the
-    /// agent changed, or when it was already at the bottom, so reading older ones is safe.
-    fn sync_messages_list(&self, agent: AgentId, thread: &[Message]) {
-        let key = scroll_key(agent, thread);
-        let previous = self.messages_scroll_key.get();
-        let known = self.messages_list.item_count();
-
-        if previous == Some(key) && known == thread.len() {
+    /// Hands the inspector's entities what they show. It runs after every notify of the
+    /// workspace, and only changed input reaches them, so a scroll or a terminal tick that
+    /// notifies one entity does not redo the work here.
+    pub(crate) fn sync_inspector(&mut self, cx: &mut Context<Self>) {
+        let Some(agent) = self.selected_agent().and_then(|id| self.data.agent(id)) else {
             return;
-        }
+        };
+        let (id, name) = (agent.id, agent.name.clone());
+        let fallback = self.fake_preview(agent);
+        let live = self
+            .live_terminals
+            .get(&agent.terminal)
+            .map(|live| live.view.clone());
 
-        let same_agent = previous.is_some_and(|(previous_agent, _)| previous_agent == agent);
-        let following = !same_agent || self.messages_list.is_following_tail();
-        let appended = same_agent
-            && thread.len() > known
-            && (known == 0
-                || previous.is_some_and(|(_, newest)| {
-                    thread.get(known - 1).map(|message| message.id) == newest
-                }));
+        let revision = self.data.messages_revision;
+        let thread = self.thread.clone();
+        let messages = (!thread.read(cx).shows(id, revision))
+            .then(|| Rc::<[Message]>::from(self.thread_of(id)));
+        let names = self.agent_names();
+        let now = self.now_ms();
 
-        if appended {
-            self.messages_list
-                .splice(known..known, thread.len() - known);
-        } else {
-            self.messages_list.reset(thread.len());
-        }
+        thread.update(cx, |thread, cx| {
+            thread.show(id, revision, messages, names, now, cx);
+        });
+        self.preview.update(cx, |preview, cx| {
+            preview.show(name, live, fallback, cx);
+        });
+    }
 
-        if following {
-            self.messages_list.set_follow_mode(FollowMode::Tail);
-        }
+    fn agent_names(&self) -> Rc<HashMap<DaemonAgentId, SharedString>> {
+        let task = self.active_task();
 
-        self.messages_scroll_key.set(Some(key));
+        Rc::new(
+            task.orchestrator
+                .into_iter()
+                .chain(task.workers.iter().copied())
+                .filter_map(|id| self.data.agent(id))
+                .map(|agent| (agent.protocol_id(), agent.name.clone()))
+                .collect(),
+        )
     }
 
     pub(crate) fn zoom_swarm(&mut self, steps: i8, cx: &mut Context<Self>) {
@@ -405,30 +390,8 @@ impl Workspace {
         }
     }
 
-    /// The last rows of the agent's terminal, its grid size and whether it runs.
-    fn terminal_preview(&self, agent: &Agent, cx: &App) -> Preview {
-        let live = self.live_terminals.get(&agent.terminal);
-
-        if let Some(live) = live {
-            let view = live.view.read(cx);
-            let text = view.visible_text();
-            let rows: Vec<&str> = text.lines().collect();
-            let used = rows
-                .iter()
-                .rposition(|row| !row.trim().is_empty())
-                .map_or(0, |last| last + 1);
-            let first = used.saturating_sub(PREVIEW_ROWS);
-
-            return Preview {
-                lines: rows[first..used]
-                    .iter()
-                    .map(|row| ((*row).to_owned().into(), Color::Default))
-                    .collect(),
-                grid: view.grid_size(),
-                running: view.exit_status().is_none(),
-            };
-        }
-
+    /// The preview of an agent without a live terminal: the last rows of its fake lines.
+    fn fake_preview(&self, agent: &Agent) -> Preview {
         let terminal = self.data.terminal(agent.terminal);
         let lines = terminal.map_or_else(Vec::new, |terminal| {
             let first = terminal.lines.len().saturating_sub(PREVIEW_ROWS);
@@ -451,17 +414,296 @@ impl Workspace {
     }
 }
 
+#[derive(Clone, Default, PartialEq)]
 struct Preview {
     lines: Vec<(SharedString, Color)>,
     grid: Option<(u16, u16)>,
     running: bool,
 }
 
+/// The last rows of the selected agent's terminal. It reads a live terminal's text only
+/// when that terminal changes, not on every frame of the window.
+pub(crate) struct TerminalPreview {
+    agent_name: SharedString,
+    live: Option<(Entity<TerminalView>, Subscription)>,
+    fallback: Preview,
+    shown: Preview,
+}
+
+impl TerminalPreview {
+    pub(crate) fn new() -> Self {
+        Self {
+            agent_name: SharedString::default(),
+            live: None,
+            fallback: Preview::default(),
+            shown: Preview::default(),
+        }
+    }
+
+    fn show(
+        &mut self,
+        agent_name: SharedString,
+        live: Option<Entity<TerminalView>>,
+        fallback: Preview,
+        cx: &mut Context<Self>,
+    ) {
+        let same_live = self.live.as_ref().map(|(view, _)| view.entity_id())
+            == live.as_ref().map(Entity::entity_id);
+        let changed = !same_live || self.agent_name != agent_name || self.fallback != fallback;
+
+        if !changed {
+            return;
+        }
+
+        if !same_live {
+            self.live = live.map(|view| {
+                let subscription = cx.observe(&view, |this, _, cx| this.refresh(cx));
+
+                (view, subscription)
+            });
+        }
+        self.agent_name = agent_name;
+        self.fallback = fallback;
+
+        self.refresh(cx);
+    }
+
+    fn refresh(&mut self, cx: &mut Context<Self>) {
+        let Some((view, _)) = &self.live else {
+            self.shown = self.fallback.clone();
+            cx.notify();
+            return;
+        };
+
+        let view = view.read(cx);
+        let text = view.visible_text();
+        let rows: Vec<&str> = text.lines().collect();
+        let used = rows
+            .iter()
+            .rposition(|row| !row.trim().is_empty())
+            .map_or(0, |last| last + 1);
+        let first = used.saturating_sub(PREVIEW_ROWS);
+
+        self.shown = Preview {
+            lines: rows[first..used]
+                .iter()
+                .map(|row| ((*row).to_owned().into(), Color::Default))
+                .collect(),
+            grid: view.grid_size(),
+            running: view.exit_status().is_none(),
+        };
+        cx.notify();
+    }
+}
+
+impl Render for TerminalPreview {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors().clone();
+        let preview = &self.shown;
+
+        let rows: Vec<AnyElement> = preview
+            .lines
+            .iter()
+            .map(|(text, color)| {
+                let text = if text.is_empty() {
+                    SharedString::new_static(" ")
+                } else {
+                    text.clone()
+                };
+
+                div()
+                    .whitespace_nowrap()
+                    .text_color(color.hsla(cx))
+                    .child(text)
+                    .into_any_element()
+            })
+            .collect();
+
+        v_flex()
+            .flex_none()
+            .gap(px(6.))
+            .px(px(14.))
+            .pt(px(12.))
+            .child(
+                h_flex()
+                    .gap(px(6.))
+                    .child(div().size(px(6.)).rounded(px(6.)).bg(if preview.running {
+                        colors.ok
+                    } else {
+                        colors.faint
+                    }))
+                    .child(
+                        Label::new("Live terminal")
+                            .size(LabelSize::Small)
+                            .color(Color::Faint),
+                    )
+                    .child(div().flex_1())
+                    .children(preview.grid.map(|(columns, rows)| {
+                        Label::new(format!("{columns}\u{d7}{rows}"))
+                            .mono()
+                            .size(LabelSize::XSmall)
+                            .color(Color::Faint)
+                    })),
+            )
+            .child(
+                div()
+                    .id("terminal-preview")
+                    .role(Role::Group)
+                    .aria_label(format!("{} terminal preview", self.agent_name))
+                    .h(px(118.))
+                    .px(px(10.))
+                    .py(px(8.))
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(colors.line)
+                    .bg(colors.term)
+                    .overflow_hidden()
+                    .font_family(MONO_FONT)
+                    .text_size(px(11.))
+                    .line_height(px(17.6))
+                    .children(rows),
+            )
+    }
+}
+
+/// The message thread of the selected agent. It owns its list, so a scroll notifies only
+/// this entity, and it is cached, so a frame that leaves it alone reuses its last paint.
+pub(crate) struct MessageThread {
+    list: ListState,
+    agent: Option<AgentId>,
+    revision: u64,
+    messages: Rc<[Message]>,
+    names: Rc<HashMap<DaemonAgentId, SharedString>>,
+    now: u64,
+    scroll_key: Option<(AgentId, Option<MessageId>)>,
+}
+
+impl MessageThread {
+    pub(crate) fn new() -> Self {
+        Self {
+            list: ListState::new(0, ListAlignment::Top, px(200.)),
+            agent: None,
+            revision: 0,
+            messages: Rc::from([]),
+            names: Rc::default(),
+            now: 0,
+            scroll_key: None,
+        }
+    }
+
+    /// True when the thread already holds this agent's messages at this revision.
+    fn shows(&self, agent: AgentId, revision: u64) -> bool {
+        self.agent == Some(agent) && self.revision == revision
+    }
+
+    /// Takes the new messages, if any, and what the rows need to read. The list follows the
+    /// newest message when the agent changed, or when it was already at the bottom, so
+    /// reading older ones is safe.
+    fn show(
+        &mut self,
+        agent: AgentId,
+        revision: u64,
+        messages: Option<Rc<[Message]>>,
+        names: Rc<HashMap<DaemonAgentId, SharedString>>,
+        now: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let mut changed = false;
+
+        if let Some(messages) = messages {
+            self.fit_list(agent, &messages);
+            self.messages = messages;
+            changed = true;
+        }
+        if self.agent != Some(agent) || self.revision != revision {
+            self.agent = Some(agent);
+            self.revision = revision;
+            changed = true;
+        }
+        if *self.names != *names {
+            self.names = names;
+            changed = true;
+        }
+        if self.now / MINUTE != now / MINUTE {
+            changed = true;
+        }
+        self.now = now;
+
+        if changed {
+            cx.notify();
+        }
+    }
+
+    fn fit_list(&mut self, agent: AgentId, thread: &[Message]) {
+        let key = scroll_key(agent, thread);
+        let previous = self.scroll_key;
+        let known = self.list.item_count();
+
+        if previous == Some(key) && known == thread.len() {
+            return;
+        }
+
+        let same_agent = previous.is_some_and(|(previous_agent, _)| previous_agent == agent);
+        let following = !same_agent || self.list.is_following_tail();
+        let appended = same_agent
+            && thread.len() > known
+            && (known == 0
+                || previous.is_some_and(|(_, newest)| {
+                    thread.get(known - 1).map(|message| message.id) == newest
+                }));
+
+        if appended {
+            self.list.splice(known..known, thread.len() - known);
+        } else {
+            self.list.reset(thread.len());
+        }
+
+        if following {
+            self.list.set_follow_mode(FollowMode::Tail);
+        }
+
+        self.scroll_key = Some(key);
+    }
+}
+
+impl Render for MessageThread {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors().clone();
+        let (messages, names, now) = (Rc::clone(&self.messages), Rc::clone(&self.names), self.now);
+
+        list(self.list.clone(), move |index, _, _| {
+            messages.get(index).map_or_else(
+                || div().into_any_element(),
+                |message| message_row(index, message, now, &names, &colors),
+            )
+        })
+        .size_full()
+    }
+}
+
+/// Paints the dots behind the graph. It is cached, so only a resize paints them again.
+pub(crate) struct DotGrid;
+
+impl Render for DotGrid {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let color = cx.theme().colors().dot;
+
+        canvas(
+            |_, _, _| (),
+            move |bounds, (), window, _| paint_dot_grid(bounds, color, window),
+        )
+        .size_full()
+    }
+}
+
+fn full_size() -> StyleRefinement {
+    StyleRefinement::default().size_full()
+}
+
 /// Everything the view shows, read once per frame.
 struct SwarmData<'a> {
     agents: Vec<&'a Agent>,
     messages: Vec<&'a Message>,
-    names: Rc<HashMap<DaemonAgentId, SharedString>>,
     in_flight: HashMap<DaemonAgentId, u32>,
     now: u64,
     selected: Option<AgentId>,
@@ -481,10 +723,6 @@ pub(crate) fn render(
         .collect();
     let messages: Vec<&Message> = workspace.data.task_messages(task.id).collect();
 
-    let names = agents
-        .iter()
-        .map(|agent| (agent.protocol_id(), agent.name.clone()))
-        .collect();
     let mut in_flight: HashMap<DaemonAgentId, u32> = HashMap::new();
     for message in messages
         .iter()
@@ -498,7 +736,6 @@ pub(crate) fn render(
     let data = SwarmData {
         agents,
         messages,
-        names: Rc::new(names),
         in_flight,
         now: workspace.now_ms(),
         selected: workspace.selected_agent(),
@@ -513,8 +750,7 @@ pub(crate) fn render(
                 .flex_1()
                 .min_w_0()
                 .h_full()
-                .child(graph(workspace, &data, cx))
-                .child(timeline(&data, cx)),
+                .child(graph(workspace, &data, cx)),
         )
         .child(inspector(workspace, &data, cx))
         .into_any_element()
@@ -637,7 +873,6 @@ fn graph(workspace: &Workspace, data: &SwarmData, cx: &mut Context<Workspace>) -
     }
 
     let paint_edges: Vec<(Curve, Hsla, bool)> = edges;
-    let dot_color = colors.dot;
 
     let zoom_buttons = h_flex()
         .absolute()
@@ -691,14 +926,7 @@ fn graph(workspace: &Workspace, data: &SwarmData, cx: &mut Context<Workspace>) -
         .min_h_0()
         .bg(colors.term)
         .overflow_hidden()
-        .child(
-            canvas(
-                |_, _, _| (),
-                move |bounds, (), window, _| paint_dot_grid(bounds, dot_color, window),
-            )
-            .absolute()
-            .size_full(),
-        )
+        .child(workspace.dot_grid.clone().cached(full_size().absolute()))
         .child(
             div()
                 .id("graph-scroll")
@@ -711,23 +939,37 @@ fn graph(workspace: &Workspace, data: &SwarmData, cx: &mut Context<Workspace>) -
         .into_any_element()
 }
 
+/// Paints every dot as two triangles of one path. Thousands of quads would each cost a
+/// scene insert every frame, even when the cached view replays them.
 fn paint_dot_grid(bounds: Bounds<Pixels>, color: Hsla, window: &mut Window) {
     let step = px(DOT_SPACING);
-    let mut y = bounds.origin.y + step / 2.;
+    let dot = px(DOT_SIZE);
+    let solid = point(0., 1.);
 
-    while y < bounds.bottom() {
-        let mut x = bounds.origin.x + step / 2.;
+    let mut path = gpui::Path::new(bounds.origin + point(step / 2., step / 2.));
+    let mut top = bounds.origin.y + step / 2.;
 
-        while x < bounds.right() {
-            window.paint_quad(fill(
-                Bounds::new(point(x, y), size(px(1.5), px(1.5))),
-                color,
-            ));
-            x += step;
+    while top < bounds.bottom() {
+        let mut left = bounds.origin.x + step / 2.;
+
+        while left < bounds.right() {
+            let (right, bottom) = (left + dot, top + dot);
+            let corners = [
+                point(left, top),
+                point(right, top),
+                point(right, bottom),
+                point(left, bottom),
+            ];
+
+            path.push_triangle((corners[0], corners[1], corners[2]), (solid, solid, solid));
+            path.push_triangle((corners[0], corners[2], corners[3]), (solid, solid, solid));
+            left += step;
         }
 
-        y += step;
+        top += step;
     }
+
+    window.paint_path(path, color);
 }
 
 fn paint_edge(
@@ -944,143 +1186,6 @@ fn card(
     .into_any_element()
 }
 
-fn timeline(data: &SwarmData, cx: &mut Context<Workspace>) -> AnyElement {
-    let colors = cx.theme().colors().clone();
-
-    let start = data
-        .agents
-        .iter()
-        .map(|agent| agent.running_since())
-        .filter(|since| *since > 0)
-        .min()
-        .unwrap_or(data.now);
-    let minutes = data.now.saturating_sub(start) / MINUTE;
-
-    let lanes: Vec<AnyElement> = data
-        .agents
-        .iter()
-        .map(|agent| lane(agent, data, start, cx))
-        .collect();
-
-    v_flex()
-        .id("timeline")
-        .role(Role::Region)
-        .aria_label("Timeline")
-        .h(px(TIMELINE_HEIGHT))
-        .flex_none()
-        .border_t_1()
-        .border_color(colors.line)
-        .child(
-            h_flex()
-                .h(px(30.))
-                .flex_none()
-                .gap(px(10.))
-                .px(px(14.))
-                .child(
-                    div().w(px(96.)).flex_none().child(
-                        Label::new("Timeline")
-                            .size(LabelSize::Small)
-                            .weight(FontWeight::MEDIUM),
-                    ),
-                )
-                .child(
-                    Label::new("0m")
-                        .mono()
-                        .size(LabelSize::XSmall)
-                        .color(Color::Faint),
-                )
-                .child(div().flex_1())
-                .child(
-                    Label::new(format!("{minutes}m"))
-                        .mono()
-                        .size(LabelSize::XSmall)
-                        .color(Color::Faint),
-                ),
-        )
-        .child(
-            v_flex()
-                .id("timeline-lanes")
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .children(lanes),
-        )
-        .into_any_element()
-}
-
-fn lane(agent: &Agent, data: &SwarmData, start: u64, cx: &mut Context<Workspace>) -> AnyElement {
-    let colors = cx.theme().colors().clone();
-    let marks: Vec<&Message> = lane_marks(&data.messages, agent.protocol_id()).collect();
-
-    let from = timeline_fraction(agent.running_since(), start, data.now);
-    let to = timeline_fraction(agent.ended_at.unwrap_or(data.now), start, data.now);
-
-    let rings: Vec<AnyElement> = marks
-        .iter()
-        .map(|message| {
-            let at = timeline_fraction(message.sent_at, start, data.now);
-
-            div()
-                .absolute()
-                .top(px(2.))
-                .left(relative(at))
-                .ml(px(-5.))
-                .size(px(10.))
-                .rounded(px(10.))
-                .border_2()
-                .border_color(kind_color(message.kind, &colors))
-                .bg(colors.panel)
-                .into_any_element()
-        })
-        .collect();
-
-    h_flex()
-        .id(("lane", agent.id.0 as usize))
-        .role(Role::Group)
-        .aria_label(format!(
-            "{}, {}",
-            agent.name,
-            plural(
-                u32::try_from(marks.len()).unwrap_or(u32::MAX),
-                "message",
-                "messages"
-            )
-        ))
-        .h(px(LANE_HEIGHT))
-        .flex_none()
-        .px(px(14.))
-        .gap(px(10.))
-        .child(
-            div().w(px(96.)).flex_none().child(
-                Label::new(agent.name.clone())
-                    .mono()
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted)
-                    .truncate(),
-            ),
-        )
-        .child(
-            div()
-                .flex_1()
-                .relative()
-                .h(px(14.))
-                .when(agent.running_since() > 0, |track| {
-                    track.child(
-                        div()
-                            .absolute()
-                            .top(px(6.))
-                            .h(px(2.))
-                            .rounded(px(1.))
-                            .left(relative(from))
-                            .w(relative((to - from).max(0.)))
-                            .bg(agent.status.background(cx)),
-                    )
-                })
-                .children(rings),
-        )
-        .into_any_element()
-}
-
 fn inspector(workspace: &Workspace, data: &SwarmData, cx: &mut Context<Workspace>) -> AnyElement {
     let colors = cx.theme().colors().clone();
 
@@ -1128,10 +1233,6 @@ fn definition(label: &'static str, value: impl IntoElement, colors: &ThemeColors
         .into_any_element()
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "one flat element tree reads best in one place"
-)]
 fn inspector_body(
     workspace: &Workspace,
     agent: &Agent,
@@ -1205,19 +1306,6 @@ fn inspector_body(
         .child(definition("Running", running, &colors))
         .child(definition("Changes", changes, &colors));
 
-    let thread = workspace.thread_of(id);
-    workspace.sync_messages_list(id, &thread);
-
-    let names = Rc::clone(&data.names);
-    let (now, row_colors) = (data.now, colors.clone());
-    let rows = list(workspace.messages_list.clone(), move |index, _, _| {
-        thread.get(index).map_or_else(
-            || div().into_any_element(),
-            |message| message_row(index, message, now, &names, &row_colors),
-        )
-    })
-    .size_full();
-
     let messages = v_flex()
         .flex_1()
         .min_h_0()
@@ -1236,70 +1324,7 @@ fn inspector_body(
                 .aria_label("Messages")
                 .flex_1()
                 .min_h_0()
-                .child(rows),
-        );
-
-    let preview = workspace.terminal_preview(agent, cx);
-    let rows: Vec<AnyElement> = preview
-        .lines
-        .iter()
-        .map(|(text, color)| {
-            let text = if text.is_empty() {
-                SharedString::new_static(" ")
-            } else {
-                text.clone()
-            };
-
-            div()
-                .whitespace_nowrap()
-                .text_color(color.hsla(cx))
-                .child(text)
-                .into_any_element()
-        })
-        .collect();
-    let terminal = v_flex()
-        .flex_none()
-        .gap(px(6.))
-        .px(px(14.))
-        .pt(px(12.))
-        .child(
-            h_flex()
-                .gap(px(6.))
-                .child(div().size(px(6.)).rounded(px(6.)).bg(if preview.running {
-                    colors.ok
-                } else {
-                    colors.faint
-                }))
-                .child(
-                    Label::new("Live terminal")
-                        .size(LabelSize::Small)
-                        .color(Color::Faint),
-                )
-                .child(div().flex_1())
-                .children(preview.grid.map(|(columns, rows)| {
-                    Label::new(format!("{columns}\u{d7}{rows}"))
-                        .mono()
-                        .size(LabelSize::XSmall)
-                        .color(Color::Faint)
-                })),
-        )
-        .child(
-            div()
-                .id("terminal-preview")
-                .role(Role::Group)
-                .aria_label(format!("{} terminal preview", agent.name))
-                .h(px(118.))
-                .px(px(10.))
-                .py(px(8.))
-                .rounded(px(8.))
-                .border_1()
-                .border_color(colors.line)
-                .bg(colors.term)
-                .overflow_hidden()
-                .font_family(MONO_FONT)
-                .text_size(px(11.))
-                .line_height(px(17.6))
-                .children(rows),
+                .child(workspace.thread.clone().cached(full_size())),
         );
 
     let buttons = h_flex()
@@ -1333,7 +1358,7 @@ fn inspector_body(
         .child(header)
         .child(definitions)
         .child(messages)
-        .child(terminal)
+        .child(workspace.preview.clone())
         .child(buttons)
         .into_any_element()
 }
@@ -1407,8 +1432,9 @@ mod tests {
     use crate::model::{SAMPLE_NOW, TaskId, TerminalId};
     use crate::workspace::RightPanel;
     use gpui::{TestAppContext, VisualTestContext};
+    use std::cell::Cell;
 
-    fn setup(cx: &mut TestAppContext) -> (gpui::Entity<Workspace>, &mut VisualTestContext) {
+    fn setup(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
         cx.update(|cx| {
             swarm_ui::init(cx);
             actions::bind_keys(cx);
@@ -1536,37 +1562,6 @@ mod tests {
         assert_eq!(relative_time(start, start + 6 * 60_000), "6m");
         assert_eq!(relative_time(start, start + 30_000), "now");
         assert_eq!(relative_time(start, start + 2 * 3_600_000), "2h");
-    }
-
-    #[test]
-    fn timeline_marks_sit_between_start_and_end() {
-        assert!((timeline_fraction(150, 100, 200) - 0.5).abs() < 1e-6);
-        assert!(timeline_fraction(50, 100, 200).abs() < 1e-6);
-        assert!((timeline_fraction(500, 100, 200) - 1.).abs() < 1e-6);
-    }
-
-    #[gpui::test]
-    fn a_lane_holds_what_the_agent_sent_and_what_swarm_sent_it(cx: &mut TestAppContext) {
-        let (workspace, cx) = setup(cx);
-
-        let (orchestrator, pty_io, mark) = workspace.read_with(cx, |workspace, _| {
-            let messages: Vec<&Message> = workspace
-                .data
-                .task_messages(workspace.active_task)
-                .collect();
-            let count = |name| lane_marks(&messages, id_of(workspace, name)).count();
-            let first = lane_marks(&messages, id_of(workspace, "orchestrator")).next();
-            let start = SAMPLE_NOW - 840_000;
-
-            (
-                count("orchestrator"),
-                count("pty-io"),
-                first.map(|message| timeline_fraction(message.sent_at, start, SAMPLE_NOW)),
-            )
-        });
-
-        assert_eq!((orchestrator, pty_io), (4, 1));
-        assert!(mark.is_some_and(|fraction| fraction > 0.05 && fraction < 0.07));
     }
 
     #[gpui::test]
@@ -1749,11 +1744,11 @@ mod tests {
     }
 
     fn add_thread_messages(
-        workspace: &gpui::Entity<Workspace>,
+        workspace: &Entity<Workspace>,
         range: std::ops::Range<u64>,
         cx: &mut VisualTestContext,
     ) {
-        workspace.update(cx, |workspace, _| {
+        workspace.update(cx, |workspace, cx| {
             let orchestrator = id_of(workspace, "orchestrator");
             let Some((project, task)) = workspace.data.message_key(workspace.active_task) else {
                 return;
@@ -1772,21 +1767,23 @@ mod tests {
                     delivered_at: Some(SAMPLE_NOW),
                 });
             }
+
+            cx.notify();
         });
     }
 
-    fn following(workspace: &gpui::Entity<Workspace>, cx: &mut VisualTestContext) -> bool {
-        workspace.read_with(cx, |workspace, _| {
-            workspace.messages_list.is_following_tail()
+    fn following(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> bool {
+        workspace.read_with(cx, |workspace, cx| {
+            workspace.thread.read(cx).list.is_following_tail()
         })
     }
 
     fn scroll_position(
-        workspace: &gpui::Entity<Workspace>,
+        workspace: &Entity<Workspace>,
         cx: &mut VisualTestContext,
     ) -> gpui::ListOffset {
-        workspace.read_with(cx, |workspace, _| {
-            workspace.messages_list.logical_scroll_top()
+        workspace.read_with(cx, |workspace, cx| {
+            workspace.thread.read(cx).list.logical_scroll_top()
         })
     }
 
@@ -1803,8 +1800,8 @@ mod tests {
         redraw(cx);
         assert!(following(&workspace, cx));
 
-        workspace.read_with(cx, |workspace, _| {
-            workspace.messages_list.scroll_by(px(-600.));
+        workspace.read_with(cx, |workspace, cx| {
+            workspace.thread.read(cx).list.scroll_by(px(-600.));
         });
         redraw(cx);
         let reading = scroll_position(&workspace, cx);
@@ -1815,6 +1812,65 @@ mod tests {
         redraw(cx);
         assert!(!following(&workspace, cx));
         assert_eq!(scroll_position(&workspace, cx).item_ix, reading.item_ix);
+    }
+
+    #[gpui::test]
+    fn scrolling_the_thread_notifies_the_thread_and_not_the_workspace(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        add_thread_messages(&workspace, 100..140, cx);
+        redraw(cx);
+        redraw(cx);
+
+        let thread = workspace.read_with(cx, |workspace, _| workspace.thread.clone());
+        let counts = Rc::new(Cell::new((0_u32, 0_u32)));
+        let seen = Rc::clone(&counts);
+        let _workspace_watch = cx.update(|_, cx| {
+            cx.observe(&workspace, move |_, _| {
+                seen.set((seen.get().0 + 1, seen.get().1));
+            })
+        });
+        let seen = Rc::clone(&counts);
+        let _thread_watch = cx.update(|_, cx| {
+            cx.observe(&thread, move |_, _| {
+                seen.set((seen.get().0, seen.get().1 + 1));
+            })
+        });
+
+        let list = thread.read_with(cx, |thread, _| thread.list.clone());
+        let bounds = list.viewport_bounds();
+        assert!(bounds.size.height > px(0.));
+        cx.simulate_event(gpui::ScrollEvent {
+            position: bounds.center(),
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(120.))),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+
+        let (workspace_notifies, thread_notifies) = counts.get();
+        assert_eq!(workspace_notifies, 0);
+        assert!(thread_notifies > 0);
+        assert!(!list.is_following_tail());
+    }
+
+    #[gpui::test]
+    fn the_thread_follows_the_selected_agent(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let worker = workspace.read_with(cx, |workspace, _| workspace.active_task().workers[0]);
+
+        workspace.update(cx, |workspace, cx| workspace.select_swarm_agent(worker, cx));
+
+        let (agent, count, expected) = workspace.read_with(cx, |workspace, cx| {
+            let thread = workspace.thread.read(cx);
+
+            (
+                thread.agent,
+                thread.messages.len(),
+                workspace.thread_of(worker).len(),
+            )
+        });
+        assert_eq!(agent, Some(worker));
+        assert_eq!(count, expected);
+        assert!(count > 0);
     }
 
     #[gpui::test]

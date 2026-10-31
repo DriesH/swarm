@@ -10,9 +10,14 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use anyhow::anyhow;
-use gpui::{AnyWindowHandle, App, AsyncApp, Context, DebugFrameOverlayMode, Window, px, size};
+use gpui::{
+    AnyWindowHandle, App, AsyncApp, Context, DebugFrameOverlayMode, Modifiers, PlatformInput,
+    ScrollDelta, ScrollEvent, Window, point, px, size,
+};
+use swarm_protocol::{MessageId, MessageInfo, MessageKind};
 use swarm_ui::theme::{self, Appearance};
 
+use crate::model::Agent;
 use crate::workspace::{RightPanel, View, Workspace};
 
 const ROUNDS: usize = 20;
@@ -21,17 +26,27 @@ const STEP_WAIT: Duration = Duration::from_millis(50);
 const REFRESH_EVERY: Duration = Duration::from_millis(8);
 const STEADY_REFRESHES: usize = 125;
 const BUDGET_NS: u64 = 8_000_000;
+const THRESHOLDS_MS: [u64; 5] = [1, 2, 4, 8, 16];
+const PRESENT_THRESHOLDS_MS: [u64; 3] = [8, 16, 33];
+const SWARM_STEP_WAIT: Duration = Duration::from_millis(16);
+const THREAD_MESSAGES: u64 = 200;
+const SWARM_RESIZES: usize = 30;
+const SWARM_SCROLLS: usize = 40;
 
 #[derive(Default)]
 struct StepStats {
     runs: u64,
-    over_budget: u64,
+    over: [u64; 5],
+    present_runs: u64,
+    present_over: [u64; 3],
 }
 
 struct Recorder {
     window: AnyWindowHandle,
     last_len: u64,
-    last_over: u64,
+    last_over: [u64; 5],
+    last_present_len: u64,
+    last_present_over: [u64; 3],
     steps: BTreeMap<&'static str, StepStats>,
 }
 
@@ -112,6 +127,14 @@ async fn run_pass(
 ) -> anyhow::Result<()> {
     let window = recorder.window;
 
+    if first_round {
+        with_workspace(window, cx, |workspace, _, _| add_long_thread(workspace))?;
+    }
+
+    if std::env::var_os("SWARM_FRAME_SWARM_ONLY").is_some() {
+        return swarm_steps(recorder, cx).await;
+    }
+
     let tasks: Vec<_> = with_workspace(window, cx, |workspace, _, _| {
         workspace
             .data
@@ -161,6 +184,8 @@ async fn run_pass(
         .step("close new task", Workspace::close_overlay, cx)
         .await?;
 
+    swarm_steps(recorder, cx).await?;
+
     for (width, height) in [(1200., 800.), (1600., 1000.)] {
         let apply = move |_: &mut Workspace, window: &mut Window, _: &mut Context<Workspace>| {
             window.resize(size(px(width), px(height)));
@@ -207,6 +232,114 @@ async fn run_pass(
     Ok(())
 }
 
+/// Gives the orchestrator a long thread: short tasks and long multi-paragraph briefs.
+fn add_long_thread(workspace: &mut Workspace) {
+    let Some(orchestrator) = workspace.active_task().orchestrator else {
+        return;
+    };
+    let workers = workspace.active_task().workers.clone();
+    let Some((project, task)) = workspace.data.message_key(workspace.active_task) else {
+        return;
+    };
+    let Some(orchestrator) = workspace.data.agent(orchestrator).map(Agent::protocol_id) else {
+        return;
+    };
+    let workers: Vec<_> = workers
+        .into_iter()
+        .filter_map(|id| workspace.data.agent(id).map(Agent::protocol_id))
+        .collect();
+    if workers.is_empty() {
+        return;
+    }
+
+    let paragraph = "Build the part you own and keep the interface small. Read the plan first, \
+        then write the code and its tests. Run the checks before you report. If a rule in the \
+        conventions conflicts with the plan, ask me before you decide.";
+
+    for id in 100..100 + THREAD_MESSAGES {
+        let worker = workers[usize::try_from(id).unwrap_or(0) % workers.len()];
+        let brief = id % 5 == 0;
+        let text = if brief {
+            format!("Brief {id}\n\n{paragraph}\n\n{paragraph}\n\n{paragraph}\n\n{paragraph}")
+        } else {
+            format!("Short note {id}: report when the build passes.")
+        };
+        let (from, to) = if id % 3 == 0 {
+            (Some(worker), orchestrator)
+        } else {
+            (Some(orchestrator), worker)
+        };
+
+        workspace.data.record_message(&MessageInfo {
+            id: MessageId(id),
+            project,
+            task,
+            from,
+            to,
+            kind: if brief {
+                MessageKind::Brief
+            } else {
+                MessageKind::Task
+            },
+            text,
+            sent_at: 1_000 + id,
+            delivered_at: Some(1_000 + id),
+        });
+    }
+}
+
+async fn swarm_steps(recorder: &mut Recorder, cx: &mut AsyncApp) -> anyhow::Result<()> {
+    let show = |workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>| {
+        window.resize(size(px(1600.), px(1000.)));
+        workspace.set_view(View::Swarm, cx);
+    };
+    recorder.step_after("swarm idle", show, SETTLE, cx).await?;
+
+    for index in 0..SWARM_RESIZES {
+        #[expect(clippy::cast_precision_loss, reason = "a small step count")]
+        let width = 1100. + 25. * ((index % 20) as f32 + 1.);
+        let apply = move |_: &mut Workspace, window: &mut Window, _: &mut Context<Workspace>| {
+            window.resize(size(px(width), px(800. + (width - 1100.) / 2.)));
+        };
+        recorder
+            .step_after("swarm resize", apply, SWARM_STEP_WAIT, cx)
+            .await?;
+    }
+
+    let restore = |_: &mut Workspace, window: &mut Window, _: &mut Context<Workspace>| {
+        window.resize(size(px(1600.), px(1000.)));
+    };
+    recorder
+        .step_after("swarm idle", restore, SETTLE, cx)
+        .await?;
+
+    for index in 0..SWARM_SCROLLS {
+        let direction = if index < SWARM_SCROLLS / 2 { 48. } else { -48. };
+        recorder.window.update(cx, |_, window, cx| {
+            window.dispatch_event(
+                PlatformInput::Scroll(ScrollEvent {
+                    position: point(px(1440.), px(450.)),
+                    delta: ScrollDelta::Pixels(point(px(0.), px(direction))),
+                    modifiers: Modifiers::default(),
+                    ..Default::default()
+                }),
+                cx,
+            );
+        })?;
+        cx.background_executor().timer(SWARM_STEP_WAIT).await;
+        recorder.record("swarm scroll", cx)?;
+    }
+
+    recorder
+        .step_after(
+            "swarm idle",
+            |workspace, _, cx| workspace.set_view(View::Terminals, cx),
+            STEP_WAIT,
+            cx,
+        )
+        .await
+}
+
 fn with_workspace<R>(
     window: AnyWindowHandle,
     cx: &mut AsyncApp,
@@ -226,7 +359,9 @@ impl Recorder {
         Self {
             window,
             last_len: 0,
-            last_over: 0,
+            last_over: [0; 5],
+            last_present_len: 0,
+            last_present_over: [0; 3],
             steps: BTreeMap::new(),
         }
     }
@@ -242,6 +377,19 @@ impl Recorder {
         self.settle(label, cx).await
     }
 
+    async fn step_after(
+        &mut self,
+        label: &'static str,
+        apply: impl FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>),
+        wait: Duration,
+        cx: &mut AsyncApp,
+    ) -> anyhow::Result<()> {
+        with_workspace(self.window, cx, apply)?;
+        cx.background_executor().timer(wait).await;
+
+        self.record(label, cx)
+    }
+
     async fn settle(&mut self, label: &'static str, cx: &mut AsyncApp) -> anyhow::Result<()> {
         cx.background_executor().timer(STEP_WAIT).await;
 
@@ -250,20 +398,33 @@ impl Recorder {
 
     // Draw times only accumulate, so slow frames are attributed to the step before them.
     fn record(&mut self, label: &'static str, cx: &mut AsyncApp) -> anyhow::Result<()> {
-        let histogram = self
+        let snapshot = self
             .window
-            .update(cx, |_, window, _| window.frame_duration_snapshot())?
-            .draw_duration_histogram;
+            .update(cx, |_, window, _| window.frame_duration_snapshot())?;
+        let histogram = snapshot.draw_duration_histogram;
+        let present = snapshot.dirty_to_present_histogram;
 
         let len = histogram.len();
-        let over = len - histogram.count_between(0, BUDGET_NS);
+        let over = THRESHOLDS_MS.map(|ms| len - histogram.count_between(0, ms * 1_000_000));
 
         let stats = self.steps.entry(label).or_default();
         stats.runs += len.saturating_sub(self.last_len);
-        stats.over_budget += over.saturating_sub(self.last_over);
+        for (index, count) in over.iter().enumerate() {
+            stats.over[index] += count.saturating_sub(self.last_over[index]);
+        }
+
+        let present_len = present.len();
+        let present_over =
+            PRESENT_THRESHOLDS_MS.map(|ms| present_len - present.count_between(0, ms * 1_000_000));
+        stats.present_runs += present_len.saturating_sub(self.last_present_len);
+        for (index, count) in present_over.iter().enumerate() {
+            stats.present_over[index] += count.saturating_sub(self.last_present_over[index]);
+        }
 
         self.last_len = len;
         self.last_over = over;
+        self.last_present_len = present_len;
+        self.last_present_over = present_over;
 
         Ok(())
     }
@@ -292,9 +453,11 @@ fn report(recorder: &Recorder, cx: &mut AsyncApp) -> anyhow::Result<()> {
 
     for (label, stats) in &recorder.steps {
         log::info!(
-            "step {label}: draw frames {} | over 8 ms: {}",
+            "step {label}: draw frames {} | over 1/2/4/8/16 ms: {:?} | dirty to present frames {} over 8/16/33 ms: {:?}",
             stats.runs,
-            stats.over_budget,
+            stats.over,
+            stats.present_runs,
+            stats.present_over,
         );
     }
 
