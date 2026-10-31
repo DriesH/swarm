@@ -333,7 +333,7 @@ impl Workspace {
 
         if let Some(client) = self.daemon.clone() {
             if client.is_connected() {
-                self.create_live_terminal(client, task, window, cx);
+                self.create_live_terminal(client, task, None, None, window, cx);
             } else {
                 log::warn!("the daemon is disconnected, cannot open a terminal");
             }
@@ -369,6 +369,7 @@ impl Workspace {
             live.kill_if_running(cx);
         }
 
+        self.github_terminal_closed(terminal, cx);
         self.data.close_user_terminal(task, terminal);
         self.disconnected.remove(&terminal);
         self.terminal_focus.remove(&terminal);

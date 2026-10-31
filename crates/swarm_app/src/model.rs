@@ -7,9 +7,10 @@ use std::rc::Rc;
 use gpui::{Hsla, SharedString, rgb};
 use swarm_protocol::{
     AgentId as DaemonAgentId, AgentInfo, AgentLifecycle, AgentRole,
-    AgentStatus as DaemonAgentStatus, CommentEvent, DiffStat, FileStat, MessageId, MessageInfo,
-    MessageKind, ProjectInfo, ReviewComment, ReviewSource, TaskDiff, TaskInfo,
-    TerminalId as DaemonTerminalId, TerminalInfo,
+    AgentStatus as DaemonAgentStatus, CheckState, ChecksRun, CommentEvent, DiffStat, FileStat,
+    GithubCheck, GithubCheckState, GithubStatus, LocalCheck, MessageId, MessageInfo, MessageKind,
+    PrDraft, PrLink, PrState, ProjectInfo, PullRequest, ReviewComment, ReviewSource, ReviewState,
+    Reviewer, TaskDiff, TaskInfo, TerminalId as DaemonTerminalId, TerminalInfo,
 };
 use swarm_term::{BlockedKind, ExitStatus};
 use swarm_ui::AgentStatus;
@@ -128,6 +129,10 @@ pub(crate) struct Task {
     pub user_terminals: Vec<TerminalId>,
     /// The fingerprint of the Merged diff the user approved.
     pub approved: Option<u64>,
+    /// The pull request made from the task branch, once it exists.
+    pub pull_request: Option<PrLink>,
+    /// Close the task once its pull request is merged.
+    pub close_after_merge: bool,
     /// A Start or Plan task: its orchestrator splits a request into tasks. It has no worktree.
     pub is_start: bool,
     /// Set for a task the daemon knows.
@@ -366,22 +371,6 @@ pub(crate) struct TreeEntry {
     pub mark: Option<FileMark>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CheckState {
-    Running,
-    Passed,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct FakePullRequest {
-    pub number: u32,
-    pub title: SharedString,
-    pub base: SharedString,
-    pub head: SharedString,
-    /// Name, state and duration.
-    pub checks: Vec<(SharedString, CheckState, SharedString)>,
-}
-
 pub(crate) const PULL_REQUEST_TITLE: &str =
     "feat(term): render terminals with libghostty-vt in GPUI";
 
@@ -408,22 +397,86 @@ const PTY_BRIEF: &str = "Wire PTY read and write on a background thread in `crat
 - Resize with `TIOCSWINSZ` when the grid changes.
 - Add tests for spawn, resize and exit.";
 
-/// The `PRStatus` mockup's pull request.
-pub(crate) fn sample_pull_request() -> FakePullRequest {
-    let check = |name: &str, state: CheckState, duration: &str| {
-        (SharedString::new(name), state, SharedString::new(duration))
+/// The orchestrator's draft in the `PRCreate` mockup.
+pub(crate) fn sample_draft() -> PrDraft {
+    PrDraft {
+        title: PULL_REQUEST_TITLE.to_owned(),
+        body: PULL_REQUEST_DESCRIPTION.to_owned(),
+    }
+}
+
+/// The local checks of the `PRCreate` mockup, all passed on `commit`.
+pub(crate) fn sample_checks_run(task: swarm_protocol::TaskId, commit: &str) -> ChecksRun {
+    let check = |command: &str, duration_ms: u64| LocalCheck {
+        command: command.to_owned(),
+        state: CheckState::Passed,
+        terminal: None,
+        exit: Some(ExitStatus::Code(0)),
+        duration_ms: Some(duration_ms),
     };
 
-    FakePullRequest {
-        number: 42,
-        title: PULL_REQUEST_TITLE.into(),
-        base: "main".into(),
-        head: "swarm/terminal-renderer".into(),
+    ChecksRun {
+        task,
+        commit: commit.to_owned(),
+        required: true,
         checks: vec![
-            check("build-macos", CheckState::Running, "2m 10s"),
-            check("cargo test --workspace", CheckState::Running, "1m 02s"),
-            check("cargo clippy", CheckState::Passed, "41s"),
-            check("cargo fmt --check", CheckState::Passed, "12s"),
+            check("cargo test --workspace", 38_000),
+            check("cargo clippy -- -D warnings", 21_000),
+            check("cargo fmt --check", 900),
+        ],
+        pre_push_hook: Some("husky".to_owned()),
+    }
+}
+
+/// The `PRStatus` mockup's pull request.
+pub(crate) fn sample_pull_request() -> PullRequest {
+    let check = |name: &str, state: GithubCheckState, duration_secs: u32| GithubCheck {
+        name: name.to_owned(),
+        state,
+        duration_secs: Some(duration_secs),
+        url: None,
+    };
+
+    PullRequest {
+        number: 42,
+        url: "https://github.com/swarm-labs/swarm/pull/42".to_owned(),
+        title: PULL_REQUEST_TITLE.to_owned(),
+        state: PrState::Open,
+        draft: true,
+        checks: vec![
+            check("build-macos", GithubCheckState::Running, 130),
+            check("cargo test --workspace", GithubCheckState::Running, 62),
+            check("cargo clippy", GithubCheckState::Passed, 41),
+            check("cargo fmt --check", GithubCheckState::Passed, 12),
+        ],
+        reviewers: vec![
+            Reviewer {
+                login: "mara".to_owned(),
+                state: ReviewState::Requested,
+            },
+            Reviewer {
+                login: "jonas".to_owned(),
+                state: ReviewState::Approved,
+            },
+        ],
+        mergeable: false,
+        read_at: SAMPLE_NOW,
+    }
+}
+
+/// A project with a GitHub repository, `gh` installed and signed in.
+pub(crate) fn sample_github() -> GithubStatus {
+    GithubStatus {
+        gh: Some(PathBuf::from("/opt/homebrew/bin/gh")),
+        gh_version: Some("2.60.0".to_owned()),
+        signed_in: true,
+        repository: Some("swarm-labs/swarm".to_owned()),
+        install: vec!["brew".to_owned(), "install".to_owned(), "gh".to_owned()],
+        sign_in: vec![
+            "gh".to_owned(),
+            "auth".to_owned(),
+            "login".to_owned(),
+            "--web".to_owned(),
         ],
     }
 }
@@ -468,6 +521,17 @@ fn sample_file_tree() -> Vec<TreeEntry> {
     ]
 }
 
+/// A checks run with the Merged diff that was loaded when the app first saw it.
+///
+/// The protocol has no head commit for the app to compare with `run.commit`. A run is
+/// stale once the Merged diff differs from the one it was first seen with: the task
+/// branch got new commits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TaskChecks {
+    pub run: ChecksRun,
+    pub seen_at: Option<u64>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct FakeData {
     pub projects: Vec<Project>,
@@ -476,7 +540,14 @@ pub(crate) struct FakeData {
     pub terminals: Vec<Terminal>,
     pub usage: Vec<(SharedString, f32)>,
     pub file_tree: Vec<TreeEntry>,
-    pub pull_request: Option<FakePullRequest>,
+    /// The GitHub setup of each project, once the daemon answered.
+    pub github: HashMap<ProjectId, GithubStatus>,
+    /// The latest local checks run of each task, under [`FakeData::diff_id`].
+    pub checks: HashMap<swarm_protocol::TaskId, TaskChecks>,
+    /// The orchestrator's latest pull request draft of each task.
+    pub drafts: HashMap<swarm_protocol::TaskId, PrDraft>,
+    /// The pull request as GitHub reported it last, for each task that has one.
+    pub pull_requests: HashMap<swarm_protocol::TaskId, PullRequest>,
     /// The last [`MESSAGES_PER_TASK`] messages of each task, oldest first. A Start
     /// orchestrator's messages sit under its project with no task.
     pub messages:
@@ -587,6 +658,8 @@ impl Builder {
             processes: Vec::new(),
             user_terminals: Vec::new(),
             approved: None,
+            pull_request: None,
+            close_after_merge: false,
             is_start: false,
             daemon: None,
         });
@@ -938,6 +1011,7 @@ impl FakeData {
 
         let mut data = builder.data;
         data.add_sample_swarm(&team);
+        data.github.insert(swarm, sample_github());
         data.file_tree = sample_file_tree();
         data.usage = sample_usage();
 
@@ -1215,6 +1289,8 @@ impl FakeData {
             task.name = SharedString::new(&info.name);
             task.branch = SharedString::new(&info.branch);
             task.approved = info.approved;
+            task.pull_request.clone_from(&info.pull_request);
+            task.close_after_merge = info.close_after_merge;
             let known = task.daemon.as_ref().and_then(|old| old.setup_terminal);
             task.daemon = Some(DaemonTask {
                 setup_terminal: info.setup_terminal.or(known),
@@ -1246,6 +1322,8 @@ impl FakeData {
             processes: Vec::new(),
             user_terminals: Vec::new(),
             approved: info.approved,
+            pull_request: info.pull_request.clone(),
+            close_after_merge: info.close_after_merge,
             is_start: false,
             daemon: Some(daemon),
         });
@@ -1450,9 +1528,79 @@ impl FakeData {
             return false;
         }
 
+        if diff.source == ReviewSource::Merged
+            && let Some(checks) = self.checks.get_mut(&diff.task)
+        {
+            checks.seen_at = checks.seen_at.or(Some(diff.fingerprint));
+        }
+
         self.diffs.insert(key, Rc::new(diff));
 
         true
+    }
+
+    /// The fingerprint of the Merged diff the app has loaded for a tab.
+    pub(crate) fn merged_fingerprint(&self, task: TaskId) -> Option<u64> {
+        self.task_diff(task, ReviewSource::Merged)
+            .map(|diff| diff.fingerprint)
+    }
+
+    /// The approval counts: the task is approved and the loaded Merged diff, when there
+    /// is one, is the diff that was approved.
+    pub(crate) fn approval_holds(&self, task: TaskId) -> bool {
+        let Some(approved) = self.task(task).and_then(|task| task.approved) else {
+            return false;
+        };
+
+        self.merged_fingerprint(task)
+            .is_none_or(|loaded| loaded == approved)
+    }
+
+    /// The GitHub setup of the project a tab belongs to, once known.
+    pub(crate) fn github_of(&self, task: TaskId) -> Option<&GithubStatus> {
+        self.github.get(&self.task(task)?.project)
+    }
+
+    /// The task's latest local checks run.
+    pub(crate) fn checks_of(&self, task: TaskId) -> Option<&TaskChecks> {
+        self.checks.get(&self.diff_id(task)?)
+    }
+
+    /// Keeps a checks run the daemon sent. A run for the same commit keeps the diff it
+    /// was first seen with.
+    pub(crate) fn set_checks(&mut self, run: ChecksRun) {
+        let loaded = self
+            .diffs
+            .get(&(run.task, ReviewSource::Merged))
+            .map(|diff| diff.fingerprint);
+        let seen_at = match self.checks.get(&run.task) {
+            Some(known) if known.run.commit == run.commit => known.seen_at.or(loaded),
+            _ => loaded,
+        };
+
+        self.checks.insert(run.task, TaskChecks { run, seen_at });
+    }
+
+    /// The run was made on an older commit than the task branch has now.
+    pub(crate) fn checks_are_stale(&self, task: TaskId) -> bool {
+        let seen = self.checks_of(task).and_then(|checks| checks.seen_at);
+
+        seen.zip(self.merged_fingerprint(task))
+            .is_some_and(|(seen, loaded)| seen != loaded)
+    }
+
+    /// The pull request task can be created for: approved, no pull request yet and a
+    /// GitHub repository.
+    pub(crate) fn can_create_pr(&self, task: TaskId) -> bool {
+        let Some(entry) = self.task(task).filter(|task| !task.is_start) else {
+            return false;
+        };
+
+        entry.pull_request.is_none()
+            && self.approval_holds(task)
+            && self
+                .github_of(task)
+                .is_some_and(|github| github.repository.is_some())
     }
 
     /// How many workers of a tab work or wait for the user.
@@ -2035,6 +2183,8 @@ impl FakeData {
             processes: Vec::new(),
             user_terminals: Vec::new(),
             approved: None,
+            pull_request: None,
+            close_after_merge: false,
             is_start: false,
             daemon: None,
         });
@@ -2099,6 +2249,8 @@ impl FakeData {
             processes: Vec::new(),
             user_terminals: Vec::new(),
             approved: None,
+            pull_request: None,
+            close_after_merge: false,
             is_start: false,
             daemon: None,
         });
@@ -2172,7 +2324,10 @@ mod tests {
 
     #[test]
     fn there_is_no_pull_request_at_first() {
-        assert!(FakeData::sample().pull_request.is_none());
+        let data = FakeData::sample();
+
+        assert!(data.pull_requests.is_empty());
+        assert!(data.tasks.iter().all(|task| task.pull_request.is_none()));
     }
 
     #[test]
@@ -2307,6 +2462,8 @@ mod tests {
             briefed: false,
             approved: None,
             closed: false,
+            pull_request: None,
+            close_after_merge: false,
         }
     }
 

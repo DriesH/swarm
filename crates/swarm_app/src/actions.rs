@@ -11,6 +11,8 @@ actions!(
         ShowReview,
         ToggleFiles,
         ToggleChanges,
+        CreatePullRequest,
+        SetUpGithub,
         NewTask,
         PlanWithOrchestrator,
         NewTerminal,

@@ -17,7 +17,7 @@ use swarm_ui::theme::{self, Appearance};
 use crate::model::{AgentKind, ProjectId, TaskId, TaskStatus};
 use crate::review_model::{DiffStyle, LinePos};
 use crate::swarm_view::InspectorTab;
-use crate::workspace::{View, Workspace};
+use crate::workspace::{RightPanel, View, Workspace};
 
 type OpenOverlay = fn(&mut Workspace, &mut Window, &mut Context<Workspace>);
 
@@ -180,6 +180,110 @@ fn open_review_live_comments(
     cx: &mut Context<Workspace>,
 ) {
     review_element(workspace, ReviewSource::Live, cx);
+}
+
+/// Approves the open task's Merged diff and drops the sample's pending comments.
+fn approve_sample(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
+    let task = workspace.active_task;
+    let fingerprint = workspace.data.merged_fingerprint(task);
+
+    if let Some(entry) = workspace
+        .data
+        .tasks
+        .iter_mut()
+        .find(|entry| entry.id == task)
+    {
+        entry.approved = fingerprint;
+    }
+    workspace.data.comments.clear();
+    workspace.set_view(View::Review, cx);
+    workspace.set_review_source(ReviewSource::Merged, cx);
+    workspace.right_panel = Some(RightPanel::PullRequest);
+}
+
+/// A new pull request: the orchestrator's draft and local checks that passed.
+fn open_pull_request_new(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
+    approve_sample(workspace, cx);
+
+    if let Some(id) = workspace.data.diff_id(workspace.active_task) {
+        workspace
+            .data
+            .set_checks(crate::model::sample_checks_run(id, "sample"));
+    }
+}
+
+/// A pull request #42 whose GitHub checks run.
+fn open_pull_request_status(
+    workspace: &mut Workspace,
+    _: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    approve_sample(workspace, cx);
+    workspace.set_view(View::Terminals, cx);
+
+    let task = workspace.active_task;
+    let Some(id) = workspace.data.diff_id(task) else {
+        return;
+    };
+    let pull_request = crate::model::sample_pull_request();
+
+    if let Some(entry) = workspace
+        .data
+        .tasks
+        .iter_mut()
+        .find(|entry| entry.id == task)
+    {
+        entry.pull_request = Some(swarm_protocol::PrLink {
+            number: pull_request.number,
+            url: pull_request.url.clone(),
+        });
+    }
+    workspace.data.pull_requests.insert(id, pull_request);
+}
+
+/// GitHub CLI is missing: Review and the panel offer Set up GitHub.
+fn open_pull_request_setup(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
+    approve_sample(workspace, cx);
+
+    let project = workspace.active_project;
+    let mut github = crate::model::sample_github();
+    github.gh = None;
+    github.signed_in = false;
+    workspace.data.github.insert(project, github);
+}
+
+/// The install step runs in a user terminal.
+fn open_pull_request_setup_running(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    open_pull_request_setup(workspace, window, cx);
+
+    let project = workspace.active_project;
+    workspace.pull_requests.setups.insert(
+        project,
+        crate::pull_request::GithubSetup::Running(crate::pull_request::SetupStep::Install),
+    );
+}
+
+/// The sign-in step failed.
+fn open_pull_request_setup_failed(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    open_pull_request_setup(workspace, window, cx);
+
+    let project = workspace.active_project;
+    workspace.pull_requests.setups.insert(
+        project,
+        crate::pull_request::GithubSetup::Failed {
+            step: crate::pull_request::SetupStep::SignIn,
+            reason: "exit 1".into(),
+            tile: None,
+        },
+    );
 }
 
 fn open_close_task(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
@@ -405,6 +509,56 @@ pub(crate) fn run(directory: PathBuf, cx: &mut App) {
                 Appearance::Dark,
                 "workspace-close-task-dark.png",
                 Some(open_close_task),
+            ),
+            (
+                Appearance::Light,
+                "workspace-pull-request-new-light.png",
+                Some(open_pull_request_new),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-pull-request-new-dark.png",
+                Some(open_pull_request_new),
+            ),
+            (
+                Appearance::Light,
+                "workspace-pull-request-status-light.png",
+                Some(open_pull_request_status),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-pull-request-status-dark.png",
+                Some(open_pull_request_status),
+            ),
+            (
+                Appearance::Light,
+                "workspace-pull-request-setup-light.png",
+                Some(open_pull_request_setup),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-pull-request-setup-dark.png",
+                Some(open_pull_request_setup),
+            ),
+            (
+                Appearance::Light,
+                "workspace-pull-request-setup-running-light.png",
+                Some(open_pull_request_setup_running),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-pull-request-setup-running-dark.png",
+                Some(open_pull_request_setup_running),
+            ),
+            (
+                Appearance::Light,
+                "workspace-pull-request-setup-failed-light.png",
+                Some(open_pull_request_setup_failed),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-pull-request-setup-failed-dark.png",
+                Some(open_pull_request_setup_failed),
             ),
             (
                 Appearance::Light,

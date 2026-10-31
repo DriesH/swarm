@@ -12,11 +12,13 @@ use swarm_ui::{
 };
 
 use crate::actions::{
-    FocusAgent, NewTask, NewTerminal, OpenSettings, PlanWithOrchestrator, ShowReview,
+    CreatePullRequest, FocusAgent, NewTask, NewTerminal, OpenSettings, PlanWithOrchestrator,
+    ShowReview,
 };
 use crate::close_task::CloseTaskDialog;
 use crate::model::{AgentKind, FakeData, ProjectId, TaskId, TaskStatus, TerminalId};
 use crate::new_task::NewTaskDialog;
+use crate::pull_request::AnywayDialog;
 use crate::review_view::ReviewView;
 use crate::workspace::{View, Workspace};
 
@@ -38,6 +40,7 @@ pub(crate) enum Command {
     ToggleViewed,
     CommentOnLine,
     CloseTask,
+    CreatePullRequest,
     Task(TaskId),
     Agent(TerminalId),
 }
@@ -174,6 +177,18 @@ pub(crate) fn rows(data: &FakeData, project: ProjectId, task: TaskId, view: View
         )
         .keys(&[KEY_COMMAND, KEY_SHIFT, "T"]),
     ];
+
+    if data.can_create_pr(task) {
+        rows.insert(
+            1,
+            Row::new(
+                Group::Suggested,
+                IconName::PullRequest,
+                "Create pull request",
+                Command::CreatePullRequest,
+            ),
+        );
+    }
 
     rows.extend(data.tasks_of(project).map(|entry| {
         let (status, label) = task_status(entry.status);
@@ -625,6 +640,10 @@ pub(crate) enum Overlay {
         view: Entity<CloseTaskDialog>,
         _subscription: Subscription,
     },
+    CreateAnyway {
+        view: Entity<AnywayDialog>,
+        _subscription: Subscription,
+    },
 }
 
 impl Overlay {
@@ -633,6 +652,7 @@ impl Overlay {
             Self::Palette { view, .. } => view.clone().into_any_element(),
             Self::NewTask { view, .. } => view.clone().into_any_element(),
             Self::CloseTask { view, .. } => view.clone().into_any_element(),
+            Self::CreateAnyway { view, .. } => view.clone().into_any_element(),
         }
     }
 }
@@ -687,6 +707,7 @@ impl Workspace {
             Command::ToggleViewed => self.review.update(cx, ReviewView::toggle_selected_viewed),
             Command::CommentOnLine => self.review.update(cx, ReviewView::comment_on_line),
             Command::CloseTask => self.open_close_task(self.active_task, window, cx),
+            Command::CreatePullRequest => window.dispatch_action(Box::new(CreatePullRequest), cx),
         }
     }
 }

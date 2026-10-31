@@ -2,7 +2,7 @@
 
 use gpui::{
     AppContext as _, Context, Div, Entity, EventEmitter, FocusHandle, Focusable as _, Role,
-    SharedString, Subscription, Window, div, px,
+    SharedString, Subscription, WeakEntity, Window, div, px,
 };
 use swarm_protocol::{ClientError, CreateTask};
 use swarm_ui::prelude::*;
@@ -104,6 +104,34 @@ impl NewTaskDialog {
         }
     }
 
+    /// Takes the full list of branches, and keeps the branch the user picked.
+    pub(crate) fn set_branches(&mut self, branches: Vec<SharedString>, cx: &mut Context<Self>) {
+        let picked = self.branches.get(self.branch).cloned();
+
+        self.branches = branches;
+        self.branch = picked
+            .and_then(|picked| self.branches.iter().position(|branch| *branch == picked))
+            .unwrap_or(0);
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn branch_names(&self) -> Vec<SharedString> {
+        self.branches.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn choose_branch(&mut self, name: &str) {
+        if let Some(index) = self.branches.iter().position(|branch| branch == name) {
+            self.branch = index;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn chosen_branch(&self) -> Option<SharedString> {
+        self.branches.get(self.branch).cloned()
+    }
+
     fn can_create(&self, cx: &App) -> bool {
         !self.busy && !self.name.read(cx).text().trim().is_empty()
     }
@@ -173,6 +201,28 @@ impl NewTaskDialog {
             run_setup: self.run_setup,
         }));
     }
+}
+
+/// The branches a task can start from: the base branch, the open tab's branch, then
+/// every other local branch in the daemon's order.
+pub(crate) fn branch_choices(
+    base: &SharedString,
+    current: Option<&SharedString>,
+    all: &[String],
+) -> Vec<SharedString> {
+    let mut choices: Vec<SharedString> = Vec::new();
+    let listed = all.iter().map(|branch| SharedString::from(branch.clone()));
+
+    for branch in std::iter::once(base.clone())
+        .chain(current.cloned())
+        .chain(listed)
+    {
+        if !branch.is_empty() && !choices.contains(&branch) {
+            choices.push(branch);
+        }
+    }
+
+    choices
 }
 
 fn field(label: &'static str, control: impl IntoElement) -> Div {
@@ -292,14 +342,13 @@ impl Workspace {
             return;
         };
 
-        let mut branches = vec![project.base_branch.clone()];
-        branches.extend(
-            self.data
-                .task(self.active_task)
-                .map(|task| task.branch.clone())
-                .filter(|branch| !branch.is_empty()),
-        );
-        branches.dedup();
+        let current = self
+            .data
+            .task(self.active_task)
+            .map(|task| task.branch.clone())
+            .filter(|branch| !branch.is_empty());
+        let base = project.base_branch.clone();
+        let branches = branch_choices(&base, current.as_ref(), &[]);
 
         let project = self.active_project;
         let default_kind = self.default_orchestrator();
@@ -313,10 +362,49 @@ impl Workspace {
             });
 
         self.overlay = Some(Overlay::NewTask {
-            view,
+            view: view.clone(),
             _subscription: subscription,
         });
+        self.list_branches(project, base, current, view.downgrade(), cx);
         cx.notify();
+    }
+
+    /// Asks the daemon for every local branch and gives the open sheet the list.
+    fn list_branches(
+        &mut self,
+        project: ProjectId,
+        base: SharedString,
+        current: Option<SharedString>,
+        dialog: WeakEntity<NewTaskDialog>,
+        cx: &mut Context<Self>,
+    ) {
+        let daemon = self
+            .data
+            .project(project)
+            .and_then(|project| project.daemon);
+        let (Some(client), Some(daemon)) = (self.daemon.clone(), daemon) else {
+            return;
+        };
+
+        let listing = cx.background_spawn(async move { client.list_branches(daemon) });
+
+        cx.spawn(async move |_, cx| {
+            let all = match listing.await {
+                Ok(all) => all,
+                Err(error) => {
+                    log::debug!("cannot list the branches: {error}");
+                    return;
+                }
+            };
+
+            let choices = branch_choices(&base, current.as_ref(), &all);
+            let updated = dialog.update(cx, |dialog, cx| dialog.set_branches(choices, cx));
+
+            if let Err(error) = updated {
+                log::debug!("the sheet closed before the branches came: {error}");
+            }
+        })
+        .detach();
     }
 
     /// The orchestrator kind from the settings file, Claude Code when there is none.
@@ -435,5 +523,37 @@ impl Workspace {
             .data
             .add_task(request.project, &request.name, request.kind, lines);
         self.select_task(task, cx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(choices: &[SharedString]) -> Vec<&str> {
+        choices.iter().map(AsRef::as_ref).collect()
+    }
+
+    #[test]
+    fn the_base_branch_comes_first_then_the_open_tabs_branch_then_the_rest() {
+        let all = ["old", "main", "swarm/login", "feature/x"].map(String::from);
+        let choices = branch_choices(&"main".into(), Some(&"swarm/login".into()), &all);
+
+        assert_eq!(names(&choices), ["main", "swarm/login", "old", "feature/x"]);
+    }
+
+    #[test]
+    fn a_branch_is_listed_once_and_an_empty_name_is_left_out() {
+        let all = ["swarm/a", "swarm/a", "", "main"].map(String::from);
+        let choices = branch_choices(&"main".into(), None, &all);
+
+        assert_eq!(names(&choices), ["main", "swarm/a"]);
+    }
+
+    #[test]
+    fn without_a_list_the_two_known_branches_show() {
+        let choices = branch_choices(&"main".into(), Some(&"swarm/login".into()), &[]);
+
+        assert_eq!(names(&choices), ["main", "swarm/login"]);
     }
 }

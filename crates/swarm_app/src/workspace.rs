@@ -12,8 +12,9 @@ use swarm_ui::fonts::UI_FONT;
 use swarm_ui::prelude::*;
 
 use crate::actions::{
-    FocusAgent, NewTask, NewTerminal, OpenSettings, PlanWithOrchestrator, ShowReview, ShowSwarm,
-    ShowTerminals, ToggleChanges, ToggleCommandPalette, ToggleFiles,
+    CreatePullRequest, FocusAgent, NewTask, NewTerminal, OpenSettings, PlanWithOrchestrator,
+    SetUpGithub, ShowReview, ShowSwarm, ShowTerminals, ToggleChanges, ToggleCommandPalette,
+    ToggleFiles,
 };
 use crate::daemon::DiffPoll;
 use crate::daemon::{DaemonLaunch, LiveTerminal};
@@ -22,6 +23,7 @@ use crate::model::{
 };
 use crate::palette::Overlay;
 use crate::panels::ChangesList;
+use crate::pull_request::PullRequests;
 use crate::review_view::ReviewView;
 use crate::swarm_view::{
     Clicked, DotGrid, INSPECTOR_WIDTH, InspectorTab, MessageThread, TerminalPreview,
@@ -166,6 +168,7 @@ pub(crate) struct Workspace {
     pub(crate) live_poll: Option<DiffPoll>,
     /// How often the visible Review source and the open task's Live diff are asked for.
     pub(crate) diff_intervals: (std::time::Duration, std::time::Duration),
+    pub(crate) pull_requests: PullRequests,
 }
 
 impl Workspace {
@@ -296,6 +299,7 @@ impl Workspace {
             review_poll: None,
             live_poll: None,
             diff_intervals: (crate::daemon::REVIEW_INTERVAL, crate::daemon::LIVE_INTERVAL),
+            pull_requests: PullRequests::default(),
         };
         workspace.sync_inspector(cx);
         workspace.sync_changes_list(cx);
@@ -390,7 +394,7 @@ impl Workspace {
 
     /// Opens the panel, or closes it when it is already open.
     pub(crate) fn toggle_panel(&mut self, panel: RightPanel, cx: &mut Context<Self>) {
-        self.right_panel = if self.right_panel == Some(panel) {
+        self.right_panel = if self.panel_in(View::Terminals) == Some(panel) {
             None
         } else {
             Some(panel)
@@ -523,9 +527,15 @@ impl Workspace {
 
     fn panel_in(&self, view: View) -> Option<RightPanel> {
         if self.has_no_projects() || self.active_task().is_start || view == View::Swarm {
-            None
-        } else {
-            self.right_panel
+            return None;
+        }
+
+        // A task that is not approved has no pull request panel: Changes shows instead.
+        match self.right_panel {
+            Some(RightPanel::PullRequest) if !self.pr_available(self.active_task) => {
+                Some(RightPanel::Changes)
+            }
+            panel => panel,
         }
     }
 }
@@ -541,6 +551,8 @@ static NO_TASK: Task = Task {
     processes: Vec::new(),
     user_terminals: Vec::new(),
     approved: None,
+    pull_request: None,
+    close_after_merge: false,
     is_start: false,
     daemon: None,
 };
@@ -552,12 +564,17 @@ impl Focusable for Workspace {
 }
 
 impl Render for Workspace {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one flat element tree reads best in one place"
+    )]
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
         let (ground, panel, line, fg) = (colors.ground, colors.panel, colors.line, colors.fg);
 
         self.start_orchestrator_if_needed(window, cx);
         self.sync_swarm_tasks(window.is_window_active(), cx);
+        self.sync_pull_requests(window.is_window_active(), window, cx);
         self.apply_pending_focus(window, cx);
         self.apply_pending_review_focus(window, cx);
         self.ensure_focus_handles(cx);
@@ -611,6 +628,12 @@ impl Render for Workspace {
                 }))
                 .on_action(cx.listener(|this, _: &ToggleChanges, _, cx| {
                     this.toggle_panel(RightPanel::Changes, cx);
+                }))
+                .on_action(cx.listener(|this, _: &CreatePullRequest, _, cx| {
+                    this.open_pull_request(cx);
+                }))
+                .on_action(cx.listener(|this, _: &SetUpGithub, window, cx| {
+                    this.start_github_setup(window, cx);
                 }))
                 .on_action(cx.listener(|this, action: &FocusAgent, _, cx| {
                     this.focus_agent(action.index, cx);
