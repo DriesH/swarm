@@ -82,6 +82,51 @@ fn button_toggled_on_reports_true() {
 }
 
 #[test]
+fn a_check_row_reads_its_name_status_and_value() {
+    with_window(|window, cx| {
+        let info = a11y_info(
+            CheckRow::new("check", "cargo test", CheckStatus::Failed).value("exit 1"),
+            window,
+            cx,
+        );
+
+        assert_eq!(info.role, Some(Role::ListItem));
+        assert_eq!(info.node.label(), Some("cargo test, Failed, exit 1"));
+
+        let stopped = a11y_info(
+            CheckRow::new("stopped", "cargo fmt", CheckStatus::Cancelled).status_label("Stopped"),
+            window,
+            cx,
+        );
+
+        assert_eq!(stopped.node.label(), Some("cargo fmt, Stopped"));
+
+        let skipped = a11y_info(
+            CheckRow::new("skipped", "cargo clippy", CheckStatus::Skipped),
+            window,
+            cx,
+        );
+
+        assert_eq!(skipped.node.label(), Some("cargo clippy, Skipped"));
+    });
+}
+
+#[test]
+fn an_output_block_is_a_labelled_log_with_its_text() {
+    with_window(|window, cx| {
+        let info = a11y_info(
+            OutputBlock::new("output", "Push output", "error: hook failed"),
+            window,
+            cx,
+        );
+
+        assert_eq!(info.role, Some(Role::Log));
+        assert_eq!(info.node.label(), Some("Push output"));
+        assert_eq!(info.node.value(), Some("error: hook failed"));
+    });
+}
+
+#[test]
 fn kbd_is_a_label_with_a_spoken_name() {
     with_window(|window, cx| {
         let info = a11y_info(Kbd::new("kbd", ["\u{2318}", "\u{21e7}", "R"]), window, cx);

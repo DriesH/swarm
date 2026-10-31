@@ -1393,6 +1393,7 @@ pub(crate) fn sample_diff(
             ReviewSource::Live => 0x11,
             ReviewSource::Merged => 0x22,
         },
+        head: "sample".to_owned(),
         stat,
         files,
     }
@@ -1563,6 +1564,7 @@ mod tests {
             task: TaskId(1),
             source: ReviewSource::Merged,
             fingerprint: 7,
+            head: "abc".to_owned(),
             stat: DiffStat::default(),
             files,
         }

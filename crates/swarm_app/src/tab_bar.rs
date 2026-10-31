@@ -1,6 +1,6 @@
 //! Tab bar: the project's tasks, the view switch and the panel toggles.
 
-use gpui::{ClickEvent, Context, Window, px};
+use gpui::{ClickEvent, Context, SharedString, Window, px};
 use swarm_ui::prelude::*;
 
 use crate::actions::{NewTask, PlanWithOrchestrator};
@@ -34,6 +34,7 @@ pub(crate) fn render(
     let stat = workspace.data.live_stat(task.id);
     let panel = workspace.visible_panel();
     let panels_disabled = workspace.view == View::Swarm;
+    let pull_request = workspace.pull_request_toggle_label(task.id);
 
     h_flex()
         .size_full()
@@ -77,6 +78,18 @@ pub(crate) fn render(
                             )
                             .end_slot(changes_count(stat.additions, stat.deletions)),
                         )
+                        .children(pull_request.map(|label| {
+                            panel_toggle(
+                                "pull-request",
+                                label,
+                                IconName::PullRequest,
+                                panel == Some(RightPanel::PullRequest),
+                                panels_disabled,
+                                cx.listener(|workspace, _, _, cx| {
+                                    workspace.toggle_panel(RightPanel::PullRequest, cx);
+                                }),
+                            )
+                        }))
                 }),
         )
         .into_any_element()
@@ -173,7 +186,7 @@ fn new_tab_menu() -> PopoverMenu {
 
 fn panel_toggle(
     id: &'static str,
-    label: &'static str,
+    label: impl Into<SharedString>,
     icon: IconName,
     open: bool,
     disabled: bool,

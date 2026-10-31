@@ -295,3 +295,70 @@ fn tab_never_leaves_an_open_dialog(cx: &mut TestAppContext) {
         }
     }
 }
+
+struct LogHarness;
+
+impl Render for LogHarness {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let long: String = (1..=30)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        v_flex()
+            .size_full()
+            .child(Button::new("before", "Before"))
+            .child(
+                gpui::div().w(px(300.)).child(
+                    OutputBlock::new("log", "Push output", long)
+                        .max_height(px(64.))
+                        .debug_selector(|| "log".to_owned()),
+                ),
+            )
+    }
+}
+
+fn text_top(cx: &mut VisualTestContext) -> f32 {
+    cx.debug_bounds("log-text")
+        .map_or(f32::NAN, |bounds| f32::from(bounds.origin.y))
+}
+
+#[gpui::test]
+fn an_output_block_is_a_tab_stop_and_scrolls_with_the_keyboard(cx: &mut TestAppContext) {
+    cx.update(swarm_ui::theme::init);
+    let (_, cx) = cx.add_window_view(|_, _| LogHarness);
+    cx.run_until_parked();
+
+    let start = text_top(cx);
+
+    cx.update(gpui::Window::focus_next);
+    cx.update(gpui::Window::focus_next);
+    cx.run_until_parked();
+    cx.simulate_keystrokes("down");
+    let one_line = text_top(cx);
+
+    cx.simulate_keystrokes("pagedown");
+    let one_page = text_top(cx);
+
+    cx.simulate_keystrokes("end");
+    let end = text_top(cx);
+
+    cx.simulate_keystrokes("pageup");
+    let back_a_page = text_top(cx);
+
+    cx.simulate_keystrokes("home");
+    let home = text_top(cx);
+
+    cx.simulate_keystrokes("up");
+    let clamped = text_top(cx);
+
+    assert!((one_line - (start - 16.)).abs() < 0.5, "down moves a line");
+    assert!(one_page < one_line - 16., "page down moves further");
+    assert!(end < one_page, "end goes to the bottom");
+    assert!(back_a_page > end, "page up goes back");
+    assert!((home - start).abs() < 0.5, "home goes to the top");
+    assert!(
+        (clamped - start).abs() < 0.5,
+        "it never scrolls above the top"
+    );
+}

@@ -16,11 +16,19 @@ use std::time::{Duration, Instant};
 use swarm_term::{TerminalChannels, TerminalInput, TerminalOutput};
 
 use crate::{
-    AgentChange, AgentId, AgentInfo, AgentKind, CallId, CloseCheck, CommentId, CreateTask,
-    CreateTerminal, Event, FrameError, MessageId, MessageInfo, NewComment, Paths, ProjectId,
-    ProjectInfo, Request, ReviewComment, ReviewSource, TaskDiff, TaskId, TaskInfo, TerminalId,
+    AgentChange, AgentId, AgentInfo, AgentKind, CallId, ChecksRun, CloseCheck, CommentId,
+    CreateTask, CreateTerminal, Event, FrameError, GH_SECS, GithubStatus, MergeMethod, MessageId,
+    MessageInfo, NewComment, PUSH_SECS, Paths, PrDraft, PrPanel, ProjectId, ProjectInfo,
+    PullRequest, Request, ReviewComment, ReviewSource, TaskDiff, TaskId, TaskInfo, TerminalId,
     TerminalInfo, VERSION, check_private_dir, read, write,
 };
+
+/// Local checks moved on, or the orchestrator sent a pull request draft.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrEvent {
+    Checks(Box<ChecksRun>),
+    Draft { task: TaskId, draft: PrDraft },
+}
 
 /// A review comment was added, changed or deleted.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,11 +55,23 @@ const SPAWN_TIMEOUT: Duration = Duration::from_secs(3);
 const GIT_TIMEOUT: Duration = Duration::from_secs(60);
 /// Closing waits for agents to stop, then runs the teardown script (60 s at most).
 const CLOSE_TASK_TIMEOUT: Duration = Duration::from_secs(180);
+/// Creating or updating a pull request pushes first, then calls `gh` a few times.
+const CREATE_PR_TIMEOUT: Duration = Duration::from_secs(PUSH_SECS + 4 * GH_SECS + 30);
+/// Merging calls `gh` a few times and may then close the task.
+const MERGE_PR_TIMEOUT: Duration = Duration::from_secs(180 + 4 * GH_SECS + 30);
 const SPAWN_POLL: Duration = Duration::from_millis(50);
 
 /// The only variables the daemon inherits from the app.
-const DAEMON_ENV: [&str; 7] = [
-    "HOME", "USER", "LOGNAME", "PATH", "LANG", "TMPDIR", "RUST_LOG",
+/// `SSH_AUTH_SOCK` lets the daemon's `git push` use the user's ssh agent.
+const DAEMON_ENV: [&str; 8] = [
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "PATH",
+    "LANG",
+    "TMPDIR",
+    "RUST_LOG",
+    "SSH_AUTH_SOCK",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -105,6 +125,7 @@ struct Shared {
     terminals: flume::Sender<TerminalInfo>,
     messages: flume::Sender<MessageEvent>,
     comments: flume::Sender<CommentEvent>,
+    pull_requests: flume::Sender<PrEvent>,
     /// Terminals whose size an agent owns: their `Resize` input is dropped.
     size_locked: Mutex<HashSet<TerminalId>>,
 }
@@ -153,6 +174,7 @@ struct Inner {
     terminal_events: flume::Receiver<TerminalInfo>,
     message_events: flume::Receiver<MessageEvent>,
     comment_events: flume::Receiver<CommentEvent>,
+    pr_events: flume::Receiver<PrEvent>,
 }
 
 impl Drop for Inner {
@@ -245,6 +267,7 @@ impl Client {
         let (terminal_sender, terminal_receiver) = flume::unbounded();
         let (message_sender, message_receiver) = flume::unbounded();
         let (comment_sender, comment_receiver) = flume::unbounded();
+        let (pr_sender, pr_receiver) = flume::unbounded();
         let shared = Arc::new(Shared {
             routes: Mutex::new(HashMap::new()),
             waiters: Mutex::new(HashMap::new()),
@@ -257,6 +280,7 @@ impl Client {
             terminals: terminal_sender,
             messages: message_sender,
             comments: comment_sender,
+            pull_requests: pr_sender,
             size_locked: Mutex::new(HashSet::new()),
         });
         let (request_sender, request_receiver) = flume::unbounded();
@@ -293,6 +317,7 @@ impl Client {
                 terminal_events: terminal_receiver,
                 message_events: message_receiver,
                 comment_events: comment_receiver,
+                pr_events: pr_receiver,
             }),
             reply_timeout: REPLY_TIMEOUT,
         })
@@ -340,6 +365,11 @@ impl Client {
     /// Every `CommentChanged` and `CommentDeleted` the daemon sends. Use one consumer.
     pub fn comment_events(&self) -> flume::Receiver<CommentEvent> {
         self.inner.comment_events.clone()
+    }
+
+    /// Every `ChecksChanged` and `PrDraftChanged` the daemon sends. Use one consumer.
+    pub fn pr_events(&self) -> flume::Receiver<PrEvent> {
+        self.inner.pr_events.clone()
     }
 
     /// Changes how long calls wait (`create_task` waits at least 60 s) for the daemon.
@@ -529,6 +559,144 @@ impl Client {
         match self.call_with_timeout(|call| Request::SendComments { call, task }, None, timeout)? {
             Event::Done { .. } => Ok(()),
             other => Err(unexpected("SendComments", &other)),
+        }
+    }
+
+    pub fn github_status(&self, project: ProjectId) -> Result<GithubStatus, ClientError> {
+        let timeout = self.reply_timeout.max(GIT_TIMEOUT);
+        let request = |call| Request::GithubStatus { call, project };
+
+        match self.call_with_timeout(request, None, timeout)? {
+            Event::GithubStatus { status, .. } => Ok(status),
+            other => Err(unexpected("GithubStatus", &other)),
+        }
+    }
+
+    /// The project's local branches, newest commit first.
+    pub fn list_branches(&self, project: ProjectId) -> Result<Vec<String>, ClientError> {
+        let timeout = self.reply_timeout.max(GIT_TIMEOUT);
+        let request = |call| Request::ListBranches { call, project };
+
+        match self.call_with_timeout(request, None, timeout)? {
+            Event::Branches { branches, .. } => Ok(branches),
+            other => Err(unexpected("ListBranches", &other)),
+        }
+    }
+
+    /// Starts the local checks; progress arrives through [`Client::pr_events`].
+    pub fn run_checks(&self, task: TaskId) -> Result<(), ClientError> {
+        let timeout = self.reply_timeout.max(GIT_TIMEOUT);
+
+        self.done(
+            |call| Request::RunChecks { call, task },
+            "RunChecks",
+            timeout,
+        )
+    }
+
+    /// The configured checks, the latest run and the latest draft of a task.
+    pub fn pr_panel(&self, task: TaskId) -> Result<PrPanel, ClientError> {
+        let timeout = self.reply_timeout.max(GIT_TIMEOUT);
+
+        match self.call_with_timeout(|call| Request::PrPanel { call, task }, None, timeout)? {
+            Event::PrPanel { panel, .. } => Ok(panel),
+            other => Err(unexpected("PrPanel", &other)),
+        }
+    }
+
+    /// Asks the orchestrator for a draft; it arrives through [`Client::pr_events`].
+    pub fn draft_pr(&self, task: TaskId) -> Result<(), ClientError> {
+        self.done(
+            |call| Request::DraftPr { call, task },
+            "DraftPr",
+            self.reply_timeout,
+        )
+    }
+
+    /// Pushes the task branch and opens the pull request. The task with its pull request
+    /// arrives through [`Client::task_events`].
+    pub fn create_pr(
+        &self,
+        task: TaskId,
+        draft: PrDraft,
+        as_draft: bool,
+        close_after_merge: bool,
+        skip_checks: bool,
+    ) -> Result<(), ClientError> {
+        let timeout = self.reply_timeout.max(CREATE_PR_TIMEOUT);
+        let request = |call| Request::CreatePr {
+            call,
+            task,
+            draft,
+            as_draft,
+            close_after_merge,
+            skip_checks,
+        };
+
+        self.done(request, "CreatePr", timeout)
+    }
+
+    /// Pushes new commits to the task's open pull request.
+    pub fn update_pr(&self, task: TaskId, skip_checks: bool) -> Result<(), ClientError> {
+        let timeout = self.reply_timeout.max(CREATE_PR_TIMEOUT);
+        let request = |call| Request::UpdatePr {
+            call,
+            task,
+            skip_checks,
+        };
+
+        self.done(request, "UpdatePr", timeout)
+    }
+
+    pub fn pr_status(&self, task: TaskId) -> Result<PullRequest, ClientError> {
+        let timeout = self.reply_timeout.max(GIT_TIMEOUT);
+
+        match self.call_with_timeout(|call| Request::PrStatus { call, task }, None, timeout)? {
+            Event::PrStatus { pull_request, .. } => Ok(pull_request),
+            other => Err(unexpected("PrStatus", &other)),
+        }
+    }
+
+    pub fn mark_pr_ready(&self, task: TaskId) -> Result<(), ClientError> {
+        let timeout = self.reply_timeout.max(GIT_TIMEOUT);
+
+        self.done(
+            |call| Request::MarkPrReady { call, task },
+            "MarkPrReady",
+            timeout,
+        )
+    }
+
+    pub fn request_review(&self, task: TaskId, logins: Vec<String>) -> Result<(), ClientError> {
+        let timeout = self.reply_timeout.max(GIT_TIMEOUT);
+        let request = |call| Request::AddReviewers { call, task, logins };
+
+        self.done(request, "AddReviewers", timeout)
+    }
+
+    /// Merges the pull request; with close after merge, the task may close too.
+    pub fn merge_pr(&self, task: TaskId, method: MergeMethod) -> Result<(), ClientError> {
+        let timeout = self.reply_timeout.max(MERGE_PR_TIMEOUT);
+        let request = |call| Request::MergePr { call, task, method };
+
+        self.done(request, "MergePr", timeout)
+    }
+
+    pub fn set_close_after_merge(&self, task: TaskId, close: bool) -> Result<(), ClientError> {
+        let request = |call| Request::SetCloseAfterMerge { call, task, close };
+
+        self.done(request, "SetCloseAfterMerge", self.reply_timeout)
+    }
+
+    fn done(
+        &self,
+        build: impl FnOnce(CallId) -> Request,
+        name: &str,
+        timeout: Duration,
+    ) -> Result<(), ClientError> {
+        match self.call_with_timeout(build, None, timeout)? {
+            Event::Done { .. } => Ok(()),
+            other => Err(unexpected(name, &other)),
         }
     }
 
@@ -873,6 +1041,34 @@ fn read_events(
                     .is_err()
                 {
                     log::debug!("comment event has no listener");
+                }
+            }
+            Event::GithubStatus { call, status } => {
+                deliver(shared, call, Event::GithubStatus { call, status });
+            }
+            Event::Branches { call, branches } => {
+                deliver(shared, call, Event::Branches { call, branches });
+            }
+            Event::PrPanel { call, panel } => deliver(shared, call, Event::PrPanel { call, panel }),
+            Event::PrStatus { call, pull_request } => {
+                deliver(shared, call, Event::PrStatus { call, pull_request });
+            }
+            Event::ChecksChanged { run } => {
+                if shared
+                    .pull_requests
+                    .send(PrEvent::Checks(Box::new(run)))
+                    .is_err()
+                {
+                    log::debug!("checks event has no listener");
+                }
+            }
+            Event::PrDraftChanged { task, draft } => {
+                if shared
+                    .pull_requests
+                    .send(PrEvent::Draft { task, draft })
+                    .is_err()
+                {
+                    log::debug!("draft event has no listener");
                 }
             }
             Event::CommentDeleted { task, id } => {

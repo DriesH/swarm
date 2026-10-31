@@ -16,6 +16,7 @@ use serde_json::Value;
 use swarm_core::adapters::{self, LaunchSpec, Session};
 use swarm_core::agents::{StatusMerge, is_trust_prompt, new_session_id, new_token};
 use swarm_core::git;
+use swarm_core::github::Github;
 use swarm_core::prompts::{self, Harness, PromptFile};
 use swarm_core::store::{NewAgent, NewMessage, Store, unix_millis};
 use swarm_protocol::agent::render_inbox;
@@ -52,6 +53,8 @@ pub(crate) struct AgentConfig {
     pub(crate) settings: Option<PathBuf>,
     /// The `swarm` binary the hooks run.
     pub(crate) swarm: PathBuf,
+    /// Where `gh` is: agents get it, and Swarm's own bin folder, on their `PATH`.
+    pub(crate) github: Github,
 }
 
 /// Where an agent works and what it is called.
@@ -680,7 +683,8 @@ impl Agents {
         Ok(())
     }
 
-    /// `PATH` with the folder of the `swarm` binary first, so agents can run `swarm`.
+    /// `PATH` with the folder of the `swarm` binary first, so agents can run `swarm`. The
+    /// folder of `gh` and Swarm's own bin folder come last.
     fn agent_path(&self) -> String {
         let mut folders: Vec<PathBuf> = self
             .config
@@ -694,6 +698,19 @@ impl Agents {
                 .iter()
                 .flat_map(std::env::split_paths),
         );
+
+        let github = &self.config.github;
+        let gh_folder = github
+            .find()
+            .and_then(|gh| gh.parent().map(Path::to_path_buf));
+        for folder in gh_folder
+            .into_iter()
+            .chain([github.bin_dir().to_path_buf()])
+        {
+            if !folders.contains(&folder) {
+                folders.push(folder);
+            }
+        }
 
         std::env::join_paths(folders).map_or_else(
             |_| std::env::var("PATH").unwrap_or_default(),

@@ -20,11 +20,12 @@ use swarm_ui::styles::focus_ring;
 use swarm_ui::{StatusPill, ThemeColors};
 
 use crate::actions::{
-    CancelComment, CommentOnLine, NextFile, NextLine, PreviousFile, PreviousLine,
-    REVIEW_BODY_CONTEXT, REVIEW_CONTEXT, ToggleViewed,
+    CancelComment, CommentOnLine, CreatePullRequest, NextFile, NextLine, PreviousFile,
+    PreviousLine, REVIEW_BODY_CONTEXT, REVIEW_CONTEXT, SetUpGithub, ToggleViewed,
 };
 use crate::markdown::Markdown;
 use crate::model::{AgentKind, TaskId};
+use crate::pull_request::PrOffer;
 use crate::review_comments::refusal;
 use crate::review_model::{
     AgentLabel, BodyRows, DiffStyle, FileGroup, FileInfo, FileKey, GroupKind, Grouping, LinePos,
@@ -74,6 +75,8 @@ pub(crate) struct ReviewInput {
     pub base: SharedString,
     pub branch: SharedString,
     pub approved: Option<u64>,
+    /// What an approved task offers next: Create PR, Set up GitHub, or nothing.
+    pub offer: PrOffer,
     pub approving: bool,
     pub approve_error: Option<SharedString>,
     pub jump: Option<Jump>,
@@ -161,6 +164,45 @@ fn update_workspace(
 ) {
     if let Err(error) = workspace.update(cx, apply) {
         log::debug!("the window closed before Review answered: {error}");
+    }
+}
+
+/// Approve, then once the Merged diff is approved: Create PR, Set up GitHub, or Approved.
+fn next_step_button(
+    approved: bool,
+    enabled: bool,
+    offer: PrOffer,
+    workspace: WeakEntity<Workspace>,
+) -> Button {
+    let next = approved
+        .then_some(offer)
+        .filter(|offer| *offer != PrOffer::None);
+
+    // One id for the whole step, so keyboard focus stays when Approve turns into Create PR.
+    match next {
+        Some(PrOffer::Create) => Button::new("review-approve", "Create PR")
+            .variant(ButtonVariant::Primary)
+            .debug_selector(|| "review-create-pr".to_owned())
+            .on_click(|_, window, cx| {
+                window.dispatch_action(Box::new(CreatePullRequest), cx);
+            }),
+        Some(_) => Button::new("review-approve", "Set up GitHub")
+            .variant(ButtonVariant::Primary)
+            .debug_selector(|| "review-set-up-github".to_owned())
+            .on_click(|_, window, cx| {
+                window.dispatch_action(Box::new(SetUpGithub), cx);
+            }),
+        None => Button::new(
+            "review-approve",
+            if approved { "Approved" } else { "Approve" },
+        )
+        .variant(ButtonVariant::Primary)
+        .debug_selector(|| "review-approve".to_owned())
+        .when(approved, |button| button.icon(IconName::Check))
+        .disabled(!enabled)
+        .on_click(move |_, _, cx| {
+            update_workspace(&workspace, cx, Workspace::approve_review);
+        }),
     }
 }
 
@@ -1029,7 +1071,6 @@ impl ReviewView {
         let pending = count_comments(&input.comments).pending;
         let approved = merged && loaded.is_some() && input.approved == loaded;
         let enabled = merged && loaded.is_some() && !approved && !input.approving && pending == 0;
-        let workspace = self.workspace.clone();
 
         let request_workspace = self.workspace.clone();
         let request = merged.then(|| {
@@ -1048,17 +1089,7 @@ impl ReviewView {
                 })
         });
 
-        let approve = Button::new(
-            "review-approve",
-            if approved { "Approved" } else { "Approve" },
-        )
-        .variant(ButtonVariant::Primary)
-        .debug_selector(|| "review-approve".to_owned())
-        .when(approved, |button| button.icon(IconName::Check))
-        .disabled(!enabled)
-        .on_click(move |_, _, cx| {
-            update_workspace(&workspace, cx, Workspace::approve_review);
-        });
+        let approve = next_step_button(approved, enabled, input.offer, self.workspace.clone());
 
         let error = input.approve_error.clone().map(|message| {
             div()
@@ -1993,6 +2024,7 @@ impl Workspace {
             base,
             branch: entry.branch.clone(),
             approved: entry.approved,
+            offer: self.review_offer(task),
             approving: self.review_approving.contains(&task),
             approve_error: self
                 .review_error
@@ -2452,10 +2484,11 @@ mod tests {
         redraw(cx);
         click("review-approve", cx);
         let in_merged = approve_state(&workspace, cx);
-        click("review-approve", cx);
+        let next = cx.debug_bounds("review-create-pr").is_some();
 
         assert_eq!(in_live, None);
         assert_eq!(in_merged, Some(0x22));
+        assert!(next, "an approved task offers Create PR");
     }
 
     #[gpui::test]

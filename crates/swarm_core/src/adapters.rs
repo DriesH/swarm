@@ -353,6 +353,14 @@ pub fn find_command(command: &str, path: Option<&OsStr>, home: Option<&Path>) ->
         return is_executable(&given).then_some(given);
     }
 
+    search_folders(path, home)
+        .into_iter()
+        .map(|folder| folder.join(command))
+        .find(|candidate| is_executable(candidate))
+}
+
+/// Where a program is looked up: `PATH`, then the usual install folders.
+pub fn search_folders(path: Option<&OsStr>, home: Option<&Path>) -> Vec<PathBuf> {
     let from_path = path.into_iter().flat_map(std::env::split_paths);
     let system = SYSTEM_FOLDERS.iter().map(PathBuf::from);
     let from_home = home.into_iter().flat_map(|home| {
@@ -362,14 +370,10 @@ pub fn find_command(command: &str, path: Option<&OsStr>, home: Option<&Path>) ->
             .collect::<Vec<_>>()
     });
 
-    from_path
-        .chain(system)
-        .chain(from_home)
-        .map(|folder| folder.join(command))
-        .find(|candidate| is_executable(candidate))
+    from_path.chain(system).chain(from_home).collect()
 }
 
-fn is_executable(path: &Path) -> bool {
+pub(crate) fn is_executable(path: &Path) -> bool {
     std::fs::metadata(path)
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }

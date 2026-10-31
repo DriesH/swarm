@@ -45,10 +45,10 @@ impl Daemon {
 
     /// Starts the process without waiting for the socket.
     fn spawn_in(home: PathBuf) -> Self {
-        Self::spawn_with(home, None)
+        Self::spawn_with(home, None, None)
     }
 
-    fn spawn_with(home: PathBuf, settings: Option<&Path>) -> Self {
+    fn spawn_with(home: PathBuf, settings: Option<&Path>, gh: Option<&Path>) -> Self {
         std::fs::create_dir_all(&home).expect("home");
         let log = std::fs::File::options()
             .create(true)
@@ -60,6 +60,9 @@ impl Daemon {
         command.arg("--data-dir").arg(&home);
         if let Some(settings) = settings {
             command.arg("--settings").arg(settings);
+        }
+        if let Some(gh) = gh {
+            command.arg("--gh").arg(gh);
         }
 
         let child = command
@@ -94,7 +97,51 @@ impl Daemon {
 
     fn start_with_settings(settings: &Path) -> Self {
         swarm_binary();
-        let daemon = Self::spawn_with(Self::new_home(), Some(settings));
+        let daemon = Self::spawn_with(Self::new_home(), Some(settings), None);
+        daemon.wait_until_listening();
+
+        daemon
+    }
+
+    /// A daemon that uses `gh` as it is, wherever it is.
+    fn start_with_gh(gh: &Path) -> Self {
+        let daemon = Self::spawn_with(Self::new_home(), None, Some(gh));
+        daemon.wait_until_listening();
+
+        daemon
+    }
+
+    /// Like [`Daemon::start_with_gh`], with one more variable in the daemon's environment.
+    fn start_with_gh_and_env(gh: &Path, (name, value): (&str, &str)) -> Self {
+        let home = Self::new_home();
+        std::fs::create_dir_all(&home).expect("home");
+        let log = std::fs::File::options()
+            .create(true)
+            .append(true)
+            .open(home.join("daemon.log"))
+            .expect("log");
+        let child = Command::new(env!("CARGO_BIN_EXE_swarm-daemon"))
+            .arg("--data-dir")
+            .arg(&home)
+            .arg("--gh")
+            .arg(gh)
+            .env("RUST_LOG", "info")
+            .env(name, value)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(log)
+            .spawn()
+            .expect("start the daemon");
+        let daemon = Self { home, child };
+        daemon.wait_until_listening();
+
+        daemon
+    }
+
+    /// A daemon with fake agents and a fake `gh`.
+    fn start_with_settings_and_gh(settings: &Path, gh: &Path) -> Self {
+        swarm_binary();
+        let daemon = Self::spawn_with(Self::new_home(), Some(settings), Some(gh));
         daemon.wait_until_listening();
 
         daemon
@@ -2173,6 +2220,7 @@ sleep 30"#,
             "notify",
             "agents",
             "confirm",
+            "pr_draft",
             "terminal_spawn",
             "terminal_resize",
             "terminal_read",
@@ -3472,6 +3520,11 @@ impl Client {
     fn until_done(&mut self, request: &Request) -> Result<Vec<Event>, String> {
         self.send(request);
 
+        self.await_done()
+    }
+
+    /// Reads events up to the `Done` or the error of the request sent last.
+    fn await_done(&mut self) -> Result<Vec<Event>, String> {
         let mut seen = Vec::new();
         loop {
             match self.next() {
@@ -3580,6 +3633,7 @@ fn a_task_diff_has_files_and_answers_none_for_a_known_fingerprint() {
 
     assert_eq!(diff.task, task.id);
     assert_eq!(diff.source, ReviewSource::Merged);
+    assert_eq!(diff.head, head_of(&task.worktree));
     assert_eq!(diff.files.len(), 1);
     assert_eq!(diff.files[0].path, Path::new("review.txt"));
     assert_eq!(diff.files[0].additions, 2);
@@ -3594,6 +3648,7 @@ fn a_task_diff_has_files_and_answers_none_for_a_known_fingerprint() {
         .expect("live")
         .expect("another source has another fingerprint");
     assert_eq!(live.source, ReviewSource::Live);
+    assert_eq!(live.head, head_of(&task.worktree));
     assert!(
         client
             .task_diff(TaskId(999), ReviewSource::Merged, None)
@@ -3607,6 +3662,45 @@ fn a_task_diff_has_files_and_answers_none_for_a_known_fingerprint() {
         .expect("changed")
         .expect("the diff changed");
     assert_ne!(changed.fingerprint, diff.fingerprint);
+}
+
+#[test]
+fn a_new_commit_with_the_same_changes_is_still_sent() {
+    let repo = Repo::new("");
+    let daemon = Daemon::start();
+    let (mut client, task) = reviewed_task(&daemon, &repo);
+    let diff = client
+        .task_diff(task.id, ReviewSource::Merged, None)
+        .expect("diff")
+        .expect("a diff");
+
+    git_output(
+        &task.worktree,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "empty",
+        ],
+    );
+    let moved = client
+        .task_diff(task.id, ReviewSource::Merged, Some(diff.fingerprint))
+        .expect("moved")
+        .expect("a new head is sent");
+
+    assert_eq!(moved.fingerprint, diff.fingerprint);
+    assert_ne!(moved.head, diff.head);
+    assert_eq!(
+        client
+            .task_diff(task.id, ReviewSource::Merged, Some(moved.fingerprint))
+            .expect("known"),
+        None
+    );
 }
 
 #[test]
@@ -4441,4 +4535,2221 @@ fn a_large_batch_goes_out_in_messages_of_at_most_64_kib() {
         .position(|event| matches!(event, Event::CommentChanged { .. }))
         .expect("a comment");
     assert!(last_message < first_comment, "messages come first");
+}
+
+// Pull requests, local checks and GitHub. A fake `gh` stands in for the real one; a push
+// goes to a bare repository on disk. Nothing reaches the network.
+
+const FAKE_GH: &str = r#"#!/bin/sh
+dir=$(dirname "$0")
+key="$1-$2"
+{
+  printf 'ARGS'
+  for argument in "$@"; do printf '\t%s' "$argument"; done
+  printf '\n'
+  printf 'REPO\t%s\n' "${GH_REPO-}"
+} >> "$dir/calls.log"
+cat > "$dir/stdin.$key"
+if [ "$1" = "--version" ]; then
+  echo "gh version 2.62.0 (2024-11-14)"
+fi
+if [ "$key" = "pr-merge" ] && [ -f "$dir/head.pr" ]; then
+  want=$(cat "$dir/head.pr")
+  previous=""
+  for argument in "$@"; do
+    if [ "$previous" = "--match-head-commit" ] && [ "$argument" != "$want" ]; then
+      echo "Head branch was modified. Review and try the merge again." >&2
+      exit 1
+    fi
+    previous=$argument
+  done
+fi
+if [ -f "$dir/sleep.$key" ]; then
+  touch "$dir/started.$key"
+  sleep "$(cat "$dir/sleep.$key")"
+fi
+if [ -f "$dir/out.$key" ]; then cat "$dir/out.$key"; fi
+if [ -f "$dir/err.$key" ]; then cat "$dir/err.$key" >&2; fi
+if [ -f "$dir/exit.$key" ]; then exit "$(cat "$dir/exit.$key")"; fi
+exit 0
+"#;
+
+/// A fake `gh` that logs its calls and answers from files next to it.
+struct FakeGh {
+    dir: PathBuf,
+}
+
+impl FakeGh {
+    fn new() -> Self {
+        let number = NEXT_HOME.fetch_add(1, Ordering::Relaxed);
+        let dir = PathBuf::from(format!("/tmp/swd-gh-{}-{number}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("gh folder");
+        let script = dir.join("gh");
+        std::fs::write(&script, FAKE_GH).expect("gh script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("mode");
+
+        Self { dir }
+    }
+
+    fn path(&self) -> PathBuf {
+        self.dir.join("gh")
+    }
+
+    fn answer(&self, key: &str, out: &str) {
+        std::fs::write(self.dir.join(format!("out.{key}")), out).expect("out");
+    }
+
+    fn fail(&self, key: &str, message: &str) {
+        std::fs::write(self.dir.join(format!("err.{key}")), message).expect("err");
+        std::fs::write(self.dir.join(format!("exit.{key}")), "1").expect("exit");
+    }
+
+    /// GitHub's head of the pull request: a merge that names another commit fails.
+    fn pull_request_head(&self, commit: &str) {
+        std::fs::write(self.dir.join("head.pr"), commit).expect("head");
+    }
+
+    /// The call takes this many seconds.
+    fn slow(&self, key: &str, seconds: u32) {
+        std::fs::write(self.dir.join(format!("sleep.{key}")), seconds.to_string()).expect("sleep");
+    }
+
+    fn started(&self, key: &str) -> bool {
+        self.dir.join(format!("started.{key}")).exists()
+    }
+
+    /// Swarm deletes the remote branch itself: `gh` is never asked to.
+    fn assert_no_branch_deleted_by_gh(&self) {
+        for call in self.calls() {
+            assert!(
+                call.iter().all(|argument| argument != "--delete-branch"),
+                "{call:?}"
+            );
+            assert!(call[0] != "api", "{call:?}");
+        }
+    }
+
+    fn calls(&self) -> Vec<Vec<String>> {
+        let log = std::fs::read_to_string(self.dir.join("calls.log")).unwrap_or_default();
+
+        log.lines()
+            .filter_map(|line| line.strip_prefix("ARGS"))
+            .map(|line| line.split('\t').skip(1).map(str::to_owned).collect())
+            .collect()
+    }
+
+    /// The calls that start with these words.
+    fn calls_of(&self, words: &[&str]) -> Vec<Vec<String>> {
+        self.calls()
+            .into_iter()
+            .filter(|call| {
+                call.iter()
+                    .map(String::as_str)
+                    .take(words.len())
+                    .eq(words.iter().copied())
+            })
+            .collect()
+    }
+
+    fn stdin(&self, key: &str) -> String {
+        std::fs::read_to_string(self.dir.join(format!("stdin.{key}"))).unwrap_or_default()
+    }
+
+    fn repositories(&self) -> Vec<String> {
+        let log = std::fs::read_to_string(self.dir.join("calls.log")).unwrap_or_default();
+
+        log.lines()
+            .filter_map(|line| line.strip_prefix("REPO\t"))
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+impl Drop for FakeGh {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.dir).ok();
+    }
+}
+
+/// A bare repository, removed on drop.
+struct Bare(PathBuf);
+
+impl Bare {
+    fn has_branch(&self, branch: &str) -> bool {
+        !git_output(&self.0, &["branch", "--list", branch]).is_empty()
+    }
+}
+
+impl Drop for Bare {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).ok();
+    }
+}
+
+/// A repository whose `origin` is on GitHub as far as Swarm can tell, while a push goes to
+/// a bare repository on disk.
+fn github_repo(config: &str) -> (Repo, Bare) {
+    let repo = Repo::new(config);
+    let number = NEXT_HOME.fetch_add(1, Ordering::Relaxed);
+    let bare = PathBuf::from(format!("/tmp/swd-bare-{}-{number}.git", std::process::id()));
+    let made = Command::new("git")
+        .args(["init", "-q", "--bare"])
+        .arg(&bare)
+        .status()
+        .expect("run git");
+    assert!(made.success());
+
+    let url = "https://github.com/acme/widgets.git";
+    repo.git(&["remote", "add", "origin", url]);
+    repo.git(&[
+        "config",
+        &format!("url.{}.pushInsteadOf", bare.display()),
+        url,
+    ]);
+
+    (repo, Bare(bare))
+}
+
+fn head_of(folder: &Path) -> String {
+    git_output(folder, &["rev-parse", "HEAD"])
+}
+
+fn commit_more(folder: &Path, name: &str) {
+    std::fs::write(folder.join(name), "more\n").expect("file");
+    commit_all(folder);
+}
+
+impl Client {
+    fn github_status(&mut self, project: ProjectId) -> swarm_protocol::GithubStatus {
+        self.send(&Request::GithubStatus {
+            call: CALL,
+            project,
+        });
+
+        self.wait_for(|event| match event {
+            Event::GithubStatus { call: CALL, status } => Some(status.clone()),
+            _ => None,
+        })
+    }
+
+    fn list_branches(&mut self, project: ProjectId) -> Vec<String> {
+        self.send(&Request::ListBranches {
+            call: CALL,
+            project,
+        });
+
+        self.wait_for(|event| match event {
+            Event::Branches {
+                call: CALL,
+                branches,
+            } => Some(branches.clone()),
+            _ => None,
+        })
+    }
+
+    fn approve(&mut self, task: TaskId) {
+        let fingerprint = self
+            .task_diff(task, ReviewSource::Merged, None)
+            .expect("diff")
+            .expect("a diff")
+            .fingerprint;
+
+        self.until_done(&Request::ApproveTask {
+            call: CALL,
+            task,
+            fingerprint,
+        })
+        .expect("approved");
+    }
+
+    /// Starts the checks. Returns the runs announced up to the reply.
+    fn run_checks(&mut self, task: TaskId) -> Result<Vec<swarm_protocol::ChecksRun>, String> {
+        let events = self.until_done(&Request::RunChecks { call: CALL, task })?;
+
+        Ok(events
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::ChecksChanged { run } => Some(run),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// Reads announced runs until the last one satisfies `done`.
+    fn checks_until(
+        &mut self,
+        history: &mut Vec<swarm_protocol::ChecksRun>,
+        done: impl Fn(&swarm_protocol::ChecksRun) -> bool,
+    ) {
+        while !history.last().is_some_and(&done) {
+            if let Event::ChecksChanged { run } = self.next() {
+                history.push(run);
+            }
+        }
+    }
+
+    fn pr_panel(&mut self, task: TaskId) -> Result<swarm_protocol::PrPanel, String> {
+        self.send(&Request::PrPanel { call: CALL, task });
+
+        self.wait_for(|event| match event {
+            Event::PrPanel { call: CALL, panel } => Some(Ok(panel.clone())),
+            Event::Error {
+                call: Some(CALL),
+                message,
+                ..
+            } => Some(Err(message.clone())),
+            _ => None,
+        })
+    }
+
+    fn list_checks(&mut self, task: TaskId) -> Option<swarm_protocol::ChecksRun> {
+        self.pr_panel(task).expect("panel").run
+    }
+
+    fn pr_status(&mut self, task: TaskId) -> Result<swarm_protocol::PullRequest, String> {
+        self.send(&Request::PrStatus { call: CALL, task });
+
+        self.wait_for(|event| match event {
+            Event::PrStatus {
+                call: CALL,
+                pull_request,
+            } => Some(Ok(pull_request.clone())),
+            Event::Error {
+                call: Some(CALL),
+                message,
+                ..
+            } => Some(Err(message.clone())),
+            _ => None,
+        })
+    }
+}
+
+/// No check is running or waiting to run.
+fn checks_are_over(run: &swarm_protocol::ChecksRun) -> bool {
+    use swarm_protocol::CheckState;
+
+    let busy = run
+        .checks
+        .iter()
+        .any(|check| check.state == CheckState::Running);
+    let ended = run
+        .checks
+        .iter()
+        .any(|check| matches!(check.state, CheckState::Failed | CheckState::Stopped))
+        || run
+            .checks
+            .iter()
+            .all(|check| check.state == CheckState::Passed);
+
+    !busy && ended
+}
+
+#[test]
+fn the_github_status_reports_gh_the_sign_in_the_repository_and_the_commands() {
+    let gh = FakeGh::new();
+    let (repo, _bare) = github_repo("");
+    let daemon = Daemon::start_with_gh(&gh.path());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+
+    let status = client.github_status(project.id);
+
+    assert_eq!(status.gh, Some(gh.path()));
+    assert_eq!(status.gh_version.as_deref(), Some("2.62.0"));
+    assert!(status.signed_in);
+    assert_eq!(status.repository.as_deref(), Some("acme/widgets"));
+    assert_eq!(
+        status.sign_in,
+        [
+            gh.path().to_string_lossy().as_ref(),
+            "auth",
+            "login",
+            "--web",
+            "--hostname",
+            "github.com"
+        ]
+    );
+    let install_ok = match status.install.as_slice() {
+        [brew, install, gh] => brew.ends_with("/brew") && install == "install" && gh == "gh",
+        [sh, flag, script, name, bin] => {
+            sh == "/bin/sh"
+                && flag == "-c"
+                && script.contains("shasum -a 256")
+                && name == "swarm-install-gh"
+                && *bin == daemon.home.join("bin").to_string_lossy()
+        }
+        _ => false,
+    };
+    assert!(install_ok, "{:?}", status.install);
+}
+
+#[test]
+fn a_signed_out_gh_and_a_missing_gh_show_in_the_status() {
+    let signed_out = FakeGh::new();
+    signed_out.fail("auth-status", "not logged in");
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_gh(&signed_out.path());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+
+    let status = client.github_status(project.id);
+
+    assert_eq!(status.gh, Some(signed_out.path()));
+    assert!(!status.signed_in);
+    assert_eq!(status.repository, None, "this repository has no origin");
+
+    let missing = Daemon::start_with_gh(Path::new("/nonexistent/gh"));
+    let mut client = missing.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+
+    let status = client.github_status(project.id);
+
+    assert_eq!(status.gh, None);
+    assert_eq!(status.gh_version, None);
+    assert!(!status.signed_in);
+    assert!(!status.install.is_empty());
+    assert_eq!(status.sign_in.len(), 6);
+}
+
+#[test]
+fn the_branches_of_a_project_come_newest_first() {
+    let repo = Repo::new("");
+    let dated = |branch: &str, date: &str| {
+        repo.git(&["switch", "-q", "-c", branch]);
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&repo.root)
+            .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+            .args(["commit", "-q", "--allow-empty", "-m", branch])
+            .env("GIT_COMMITTER_DATE", date)
+            .env("GIT_AUTHOR_DATE", date)
+            .status()
+            .expect("run git");
+        assert!(status.success());
+    };
+    let first = git_output(&repo.root, &["branch", "--show-current"]);
+    dated("older", "2031-01-01T10:00:00Z");
+    dated("newest", "2032-01-01T10:00:00Z");
+    repo.git(&["switch", "-q", &first]);
+    let daemon = Daemon::start();
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+
+    let branches = client.list_branches(project.id);
+
+    assert_eq!(branches[..2], ["newest", "older"]);
+    assert!(branches.contains(&first));
+}
+
+#[test]
+fn local_checks_run_one_after_the_other_each_in_its_own_process_terminal() {
+    use swarm_protocol::CheckState;
+
+    let repo = Repo::new(
+        "[checks]\nbefore_pr = [\"echo one > one.txt; sleep 0.3\", \"echo two > two.txt; echo $SWARM_TASK > task-id\"]\nrequired = true\n",
+    );
+    let daemon = Daemon::start();
+    let (mut client, task) = reviewed_task(&daemon, &repo);
+
+    let mut history = client.run_checks(task.id).expect("started");
+    client.checks_until(&mut history, checks_are_over);
+
+    let last = history.last().expect("a run").clone();
+    assert_eq!(last.task, task.id);
+    assert_eq!(last.commit, head_of(&task.worktree));
+    assert!(last.required);
+    assert_eq!(last.pre_push_hook, None);
+    assert_eq!(last.checks.len(), 2);
+    assert!(
+        last.checks
+            .iter()
+            .all(|check| check.state == CheckState::Passed)
+    );
+    assert!(
+        last.checks
+            .iter()
+            .all(|check| check.exit == Some(ExitStatus::Code(0)) && check.duration_ms.is_some())
+    );
+    assert_ne!(last.checks[0].terminal, last.checks[1].terminal);
+    assert!(last.checks[0].terminal.is_some());
+    assert!(last.checks[0].duration_ms.expect("duration") >= 250);
+
+    for run in &history {
+        let running = run
+            .checks
+            .iter()
+            .filter(|check| check.state == CheckState::Running)
+            .count();
+        assert!(running <= 1, "{run:?}");
+        if run.checks[1].state != CheckState::Waiting {
+            assert_eq!(run.checks[0].state, CheckState::Passed, "{run:?}");
+        }
+    }
+    assert!(
+        !last.clean,
+        "the checks left untracked files, so they did not test exactly the commit"
+    );
+    assert!(task.worktree.join("one.txt").is_file());
+    assert_eq!(
+        std::fs::read_to_string(task.worktree.join("task-id"))
+            .expect("task-id")
+            .trim(),
+        task.id.0.to_string(),
+        "a check gets the task environment like the setup script"
+    );
+    assert_eq!(client.list_checks(task.id), Some(last));
+}
+
+#[test]
+fn a_failed_check_stops_the_run_and_skips_the_rest() {
+    use swarm_protocol::CheckState;
+
+    let repo = Repo::new(
+        "[checks]\nbefore_pr = [\"true\", \"exit 3\", \"echo never > never.txt\"]\nrequired = true\n",
+    );
+    let daemon = Daemon::start();
+    let (mut client, task) = reviewed_task(&daemon, &repo);
+
+    let mut history = client.run_checks(task.id).expect("started");
+    client.checks_until(&mut history, checks_are_over);
+
+    let states: Vec<CheckState> = history
+        .last()
+        .expect("a run")
+        .checks
+        .iter()
+        .map(|check| check.state)
+        .collect();
+    assert_eq!(
+        states,
+        [CheckState::Passed, CheckState::Failed, CheckState::Skipped]
+    );
+    assert_eq!(
+        history.last().expect("a run").checks[1].exit,
+        Some(ExitStatus::Code(3))
+    );
+    thread::park_timeout(Duration::from_millis(300));
+    assert!(!task.worktree.join("never.txt").exists());
+}
+
+#[test]
+fn a_check_terminal_is_a_process_terminal_of_the_task_that_no_agent_owns() {
+    let repo = Repo::new("[checks]\nbefore_pr = [\"sleep 30\"]\n");
+    let daemon = Daemon::start();
+    let (mut client, task) = reviewed_task(&daemon, &repo);
+
+    let mut history = client.run_checks(task.id).expect("started");
+    client.checks_until(&mut history, |run| run.checks[0].terminal.is_some());
+    let terminal = history.last().expect("a run").checks[0]
+        .terminal
+        .expect("terminal");
+
+    let listed = client.terminals();
+    let info = listed
+        .iter()
+        .find(|info| info.id == terminal)
+        .expect("the check terminal is listed");
+    assert_eq!(info.kind, TerminalKind::Process);
+    assert_eq!(info.owner, None, "Swarm owns it, not an agent");
+    assert_eq!(info.task.as_deref(), Some(task.id.terminal_key().as_str()));
+}
+
+#[test]
+fn a_new_run_stops_the_running_one() {
+    use swarm_protocol::CheckState;
+
+    let repo = Repo::new("[checks]\nbefore_pr = [\"sleep 30\", \"true\"]\n");
+    let daemon = Daemon::start();
+    let (mut client, task) = reviewed_task(&daemon, &repo);
+
+    let mut first = client.run_checks(task.id).expect("started");
+    client.checks_until(&mut first, |run| run.checks[0].state == CheckState::Running);
+    let first_terminal = first.last().expect("a run").checks[0]
+        .terminal
+        .expect("terminal");
+
+    let mut second = client.run_checks(task.id).expect("restarted");
+    client.checks_until(&mut second, |run| {
+        run.checks[0].state == CheckState::Running
+    });
+
+    let stopped = second
+        .iter()
+        .find(|run| run.checks[0].state == CheckState::Stopped)
+        .expect("the replaced run is announced as stopped");
+    assert_eq!(stopped.checks[0].terminal, Some(first_terminal));
+    assert_eq!(stopped.checks[1].state, CheckState::Stopped);
+    let current = second.last().expect("a run");
+    assert_ne!(current.checks[0].terminal, Some(first_terminal));
+    assert_eq!(current.checks[1].state, CheckState::Waiting);
+    assert!(
+        client
+            .terminals()
+            .iter()
+            .all(|info| info.id != first_terminal),
+        "the old process ended"
+    );
+}
+
+#[test]
+fn closing_a_check_terminal_stops_the_run() {
+    use swarm_protocol::CheckState;
+
+    let repo = Repo::new(
+        "[checks]\nbefore_pr = [\"sleep 30\", \"echo never > never.txt\"]\nrequired = true\n",
+    );
+    let daemon = Daemon::start();
+    let (mut client, task) = reviewed_task(&daemon, &repo);
+    let mut history = client.run_checks(task.id).expect("started");
+    client.checks_until(&mut history, |run| {
+        run.checks[0].state == CheckState::Running
+    });
+    let terminal = history.last().expect("a run").checks[0]
+        .terminal
+        .expect("terminal");
+
+    client.send(&Request::Input {
+        id: terminal,
+        input: TerminalInput::Kill,
+    });
+    client.checks_until(&mut history, checks_are_over);
+
+    let last = history.last().expect("a run");
+    assert_eq!(last.checks[0].state, CheckState::Stopped);
+    assert_eq!(last.checks[1].state, CheckState::Stopped);
+    thread::park_timeout(Duration::from_millis(300));
+    assert!(!task.worktree.join("never.txt").exists());
+    assert_eq!(client.list_checks(task.id), Some(last.clone()));
+}
+
+#[test]
+fn a_run_is_clean_only_when_the_worktree_is_untouched_from_start_to_end() {
+    let repo = Repo::new("");
+    let daemon = Daemon::start();
+    let (mut client, task) = reviewed_task(&daemon, &repo);
+    std::fs::write(task.worktree.join(".gitignore"), "ignored.txt\n").expect("ignore");
+    commit_all(&task.worktree);
+    let mut run_with = |check: &str| {
+        std::fs::write(
+            repo.root.join(".swarm/config.toml"),
+            format!("[checks]\nbefore_pr = [{check:?}]\nrequired = true\n"),
+        )
+        .expect("config");
+        let mut history = client.run_checks(task.id).expect("started");
+        client.checks_until(&mut history, checks_are_over);
+
+        history
+    };
+
+    let clean = run_with("true");
+    assert!(clean.iter().all(|run| run.clean));
+    assert_eq!(clean.last().expect("a run").commit, head_of(&task.worktree));
+
+    let ignored = run_with("echo built > ignored.txt");
+    assert!(
+        ignored.last().expect("a run").clean,
+        "ignored files do not count"
+    );
+
+    let left_behind = run_with("touch left-behind.txt");
+    assert!(
+        left_behind.first().expect("a run").clean,
+        "clean when it started"
+    );
+    assert!(
+        !left_behind.last().expect("a run").clean,
+        "an untracked file appeared during the run"
+    );
+    std::fs::remove_file(task.worktree.join("left-behind.txt")).expect("remove");
+
+    let before = head_of(&task.worktree);
+    let moved =
+        run_with("git -c user.name=T -c user.email=t@example.com commit -q --allow-empty -m moved");
+    let last = moved.last().expect("a run");
+    assert_eq!(
+        last.commit, before,
+        "the run is of the commit it started on"
+    );
+    assert_ne!(head_of(&task.worktree), before);
+    assert!(!last.clean, "HEAD moved during the run");
+
+    std::fs::write(task.worktree.join("loose.txt"), "uncommitted\n").expect("file");
+    let dirty = run_with("true");
+    assert!(dirty.iter().all(|run| !run.clean), "dirty from the start");
+}
+
+#[test]
+fn a_project_without_checks_has_a_run_with_none_and_a_task_that_never_ran_has_no_run() {
+    let repo = Repo::new("");
+    let daemon = Daemon::start();
+    let (mut client, task) = reviewed_task(&daemon, &repo);
+    assert_eq!(client.list_checks(task.id), None);
+
+    let history = client.run_checks(task.id).expect("started");
+
+    let run = history.last().expect("announced");
+    assert!(run.checks.is_empty());
+    assert!(!run.required);
+    assert_eq!(client.list_checks(task.id).as_ref(), Some(run));
+}
+
+#[test]
+fn the_run_names_the_pre_push_hook() {
+    let repo = Repo::new("");
+    let daemon = Daemon::start();
+    let (mut client, task) = reviewed_task(&daemon, &repo);
+    let hook = repo.root.join(".git/hooks/pre-push");
+    std::fs::write(&hook, "#!/bin/sh\ncall_lefthook run pre-push\n").expect("hook");
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).expect("mode");
+
+    let history = client.run_checks(task.id).expect("started");
+
+    assert_eq!(
+        history.last().expect("a run").pre_push_hook.as_deref(),
+        Some("lefthook")
+    );
+}
+
+#[test]
+fn a_config_with_a_problem_is_refused_instead_of_counting_as_no_checks() {
+    let repo = Repo::new("");
+    let daemon = Daemon::start();
+    let (mut client, task) = reviewed_task(&daemon, &repo);
+    std::fs::write(repo.root.join(".swarm/config.toml"), "[checks\n").expect("broken");
+
+    let refused = client.run_checks(task.id);
+
+    assert!(
+        refused
+            .expect_err("refused")
+            .contains("the project config has a problem")
+    );
+}
+
+#[test]
+fn the_panel_names_the_configured_checks_even_before_a_run_and_without_checks() {
+    let none = Repo::new("");
+    let daemon = Daemon::start();
+    let (mut client, task) = reviewed_task(&daemon, &none);
+
+    let panel = client.pr_panel(task.id).expect("panel");
+
+    assert!(panel.commands.is_empty());
+    assert!(!panel.required);
+    assert_eq!(panel.pre_push_hook, None);
+    assert_eq!((panel.run, panel.draft), (None, None));
+
+    let repo = Repo::new(
+        "[checks]\nbefore_pr = [\"cargo test\", \"  \", \" cargo clippy \"]\nrequired = true\n",
+    );
+    let (mut client, task) = reviewed_task(&daemon, &repo);
+    let hook = repo.root.join(".git/hooks/pre-push");
+    std::fs::write(&hook, "#!/bin/sh\nlefthook run pre-push\n").expect("hook");
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).expect("mode");
+
+    let panel = client.pr_panel(task.id).expect("panel");
+
+    assert_eq!(panel.commands, ["cargo test", "cargo clippy"]);
+    assert!(panel.required);
+    assert_eq!(panel.pre_push_hook.as_deref(), Some("lefthook"));
+    assert_eq!(panel.run, None, "the commands show before any run");
+}
+
+#[test]
+fn the_panel_returns_the_latest_run_and_a_broken_config_is_an_error() {
+    let repo = Repo::new("[checks]\nbefore_pr = [\"true\"]\n");
+    let daemon = Daemon::start();
+    let (mut client, task) = reviewed_task(&daemon, &repo);
+    let mut history = client.run_checks(task.id).expect("started");
+    client.checks_until(&mut history, checks_are_over);
+
+    let panel = client.pr_panel(task.id).expect("panel");
+
+    assert_eq!(panel.run.as_ref(), history.last());
+    assert_eq!(panel.commands, ["true"]);
+
+    std::fs::write(repo.root.join(".swarm/config.toml"), "[checks\n").expect("broken");
+    let error = client.pr_panel(task.id).expect_err("broken");
+    assert!(
+        error.contains("the project config has a problem"),
+        "{error}"
+    );
+    let gone = client.pr_panel(TaskId(999)).expect_err("no task");
+    assert!(gone.contains("no open task"), "{gone}");
+}
+
+#[test]
+fn a_run_with_uncommitted_changes_never_lets_a_pull_request_through() {
+    let mut env = pr_env("[checks]\nbefore_pr = [\"true\"]\nrequired = true\n");
+    env.approve_task();
+    std::fs::write(env.task.worktree.join("loose.txt"), "uncommitted\n").expect("file");
+    let mut history = env.client.run_checks(env.task.id).expect("started");
+    env.client.checks_until(&mut history, checks_are_over);
+    let run = history.last().expect("a run").clone();
+    assert!(!run.clean);
+    assert_eq!(run.checks[0].state, swarm_protocol::CheckState::Passed);
+
+    let refused = env.create();
+    assert_eq!(
+        refused.expect_err("refused"),
+        "the local checks ran with uncommitted changes: commit them and run them again"
+    );
+    assert!(!env.pushed());
+
+    std::fs::remove_file(env.task.worktree.join("loose.txt")).expect("remove");
+    let mut history = env.client.run_checks(env.task.id).expect("started");
+    env.client.checks_until(&mut history, checks_are_over);
+    assert!(history.last().expect("a run").clean);
+    env.create().expect("a clean run counts");
+}
+
+fn pr_draft_orchestrator() -> Fixture {
+    fixture_with_helpers(
+        r###"case "$SWARM_ROLE" in
+orchestrator)
+  idle
+  IFS= read -r line
+  working
+  swarm confirm > /dev/null 2>&1
+  swarm spawn api --brief "try to draft" > "$OUT/spawn.out" 2>&1
+  swarm pr draft --title "Too early" --body "x" > "$OUT/early.out" 2>&1
+  echo yes > "$OUT/early.done"
+  idle
+  while IFS= read -r l; do
+    printf '%s\n' "$l" >> "$OUT/inbox"
+    case "$l" in
+      *"attribution lines"*)
+        swarm pr draft --title "Add review file" --body-file - > "$OUT/draft.out" 2>&1 <<'BODY'
+## What
+
+- adds `review.txt` with $(not run) and "quotes" and 'single'
+BODY
+        printf '%s\n' \
+          '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}' \
+          '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"pr_draft","arguments":{"title":"Via MCP","body":"## What\n\n- by tool"}}}' \
+          | swarm mcp > "$OUT/mcp.out" 2> "$OUT/mcp.err"
+        echo yes > "$OUT/answered"
+        ;;
+    esac
+  done
+  ;;
+worker)
+  idle
+  IFS= read -r line
+  working
+  swarm pr draft --title "From a worker" --body "x" > "$OUT/worker.out" 2>&1
+  echo yes > "$OUT/worker.done"
+  sleep 30
+  ;;
+esac"###,
+    )
+}
+
+#[test]
+fn the_orchestrator_is_asked_for_a_draft_and_answers_with_swarm_pr_draft_or_the_tool() {
+    let fixture = pr_draft_orchestrator();
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, task) = start_task(&daemon, &repo);
+    let mut watcher = daemon.connect();
+    watcher.hello();
+    std::fs::write(task.worktree.join("review.txt"), "one\n").expect("file");
+    commit_all(&task.worktree);
+    fixture.read_when_written("early.done");
+    fixture.read_when_written("worker.done");
+
+    let early = fixture.read_when_written("early.out");
+    assert!(early.contains("not approved"), "{early}");
+    let from_worker = fixture.read_when_written("worker.out");
+    assert!(
+        from_worker.contains("only a task's orchestrator"),
+        "{from_worker}"
+    );
+
+    client.approve(task.id);
+    client
+        .until_done(&Request::DraftPr {
+            call: CALL,
+            task: task.id,
+        })
+        .expect("asked");
+
+    let messages = client.list_messages(task.project, Some(task.id));
+    let request = messages
+        .iter()
+        .find(|message| message.kind == MessageKind::PrDraft)
+        .expect("a pr draft message");
+    assert_eq!(request.from, None, "Swarm sends it");
+    assert_eq!(request.to, task.agents[0].id);
+    assert!(request.text.contains(&format!("branch `{}`", task.branch)));
+    assert!(request.text.contains("## Notes for reviewers"));
+    assert!(request.text.contains("swarm pr draft --title"));
+
+    fixture.read_when_written("answered");
+    let inbox = fixture.read_when_written("inbox");
+    assert!(inbox.contains("[swarm] pr draft from swarm:"), "{inbox}");
+    let drafts: Vec<(String, String)> = {
+        let mut seen = Vec::new();
+        while seen.len() < 2 {
+            let found = watcher.wait_for(|event| match event {
+                Event::PrDraftChanged { task: id, draft } if *id == task.id => {
+                    Some((draft.title.clone(), draft.body.clone()))
+                }
+                _ => None,
+            });
+            seen.push(found);
+        }
+        seen
+    };
+    assert_eq!(drafts[0].0, "Add review file");
+    assert_eq!(
+        drafts[0].1,
+        "## What\n\n- adds `review.txt` with $(not run) and \"quotes\" and 'single'\n"
+    );
+    assert_eq!(drafts[1].0, "Via MCP");
+    assert_eq!(drafts[1].1, "## What\n\n- by tool");
+    let stored = client
+        .pr_panel(task.id)
+        .expect("panel")
+        .draft
+        .expect("draft");
+    assert_eq!(
+        (stored.title.as_str(), stored.body.as_str()),
+        ("Via MCP", "## What\n\n- by tool"),
+        "the panel gets the latest draft"
+    );
+    assert!(
+        fixture
+            .read_when_written("draft.out")
+            .contains("draft sent")
+    );
+}
+
+#[test]
+fn a_draft_is_refused_before_the_approval_and_without_an_orchestrator_that_runs() {
+    let fixture = Fixture::new("exit 0");
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let task = client.create_task(orchestrator_task(project.id, false));
+    std::fs::write(task.worktree.join("review.txt"), "one\n").expect("file");
+    commit_all(&task.worktree);
+    client.wait_for_agent(|agent| agent.lifecycle == AgentLifecycle::Stopped);
+    let ask = Request::DraftPr {
+        call: CALL,
+        task: task.id,
+    };
+
+    let before = client.until_done(&ask);
+    assert!(before.expect_err("refused").contains("not approved"));
+
+    client.approve(task.id);
+    let stopped = client.until_done(&ask);
+    assert_eq!(stopped.expect_err("refused"), "the orchestrator is stopped");
+
+    commit_more(&task.worktree, "more.txt");
+    let changed = client.until_done(&ask);
+    assert!(changed.expect_err("refused").contains("changed since"));
+    let messages = client.list_messages(task.project, Some(task.id));
+    assert!(
+        messages
+            .iter()
+            .all(|message| message.kind != MessageKind::PrDraft),
+        "nothing was sent"
+    );
+}
+
+/// A task in a GitHub-like repository with a fake `gh` that is signed in.
+struct PrEnv {
+    client: Client,
+    task: TaskInfo,
+    repo: Repo,
+    bare: Bare,
+    gh: FakeGh,
+    daemon: Daemon,
+}
+
+fn pr_env(config: &str) -> PrEnv {
+    let gh = FakeGh::new();
+    gh.answer("pr-create", "https://github.com/acme/widgets/pull/42\n");
+    let (repo, bare) = github_repo(config);
+    let daemon = Daemon::start_with_gh(&gh.path());
+    let (client, task) = reviewed_task(&daemon, &repo);
+
+    PrEnv {
+        client,
+        task,
+        repo,
+        bare,
+        gh,
+        daemon,
+    }
+}
+
+impl PrEnv {
+    fn create_with(
+        &mut self,
+        title: &str,
+        as_draft: bool,
+        close_after_merge: bool,
+        skip_checks: bool,
+    ) -> Result<Vec<Event>, String> {
+        let request = Request::CreatePr {
+            call: CALL,
+            task: self.task.id,
+            draft: swarm_protocol::PrDraft {
+                title: title.to_owned(),
+                body: "## What\n\n- a `quoted` \"body\" with $(not run)\n".to_owned(),
+            },
+            as_draft,
+            close_after_merge,
+            skip_checks,
+        };
+
+        self.client.until_done(&request)
+    }
+
+    fn create(&mut self) -> Result<Vec<Event>, String> {
+        self.create_with("Add review file", true, false, false)
+    }
+
+    fn pushed(&self) -> bool {
+        self.bare.has_branch(&self.task.branch)
+    }
+
+    fn created(&self) -> bool {
+        !self.gh.calls_of(&["pr", "create"]).is_empty()
+    }
+
+    fn task_now(&mut self) -> TaskInfo {
+        self.client.projects()[0].tasks[0].clone()
+    }
+
+    fn approve_task(&mut self) {
+        self.client.approve(self.task.id);
+    }
+
+    /// A new commit in the task worktree, approved.
+    fn commit_and_approve(&mut self, name: &str) -> String {
+        commit_more(&self.task.worktree, name);
+        self.approve_task();
+
+        head_of(&self.task.worktree)
+    }
+
+    /// What `gh pr view` answers from now on.
+    fn view(&self, state: &str) {
+        self.gh.answer("pr-view", &view_json(42, state));
+    }
+
+    fn merge_with(&mut self, method: swarm_protocol::MergeMethod) -> Result<Vec<Event>, String> {
+        self.client.until_done(&Request::MergePr {
+            call: CALL,
+            task: self.task.id,
+            method,
+        })
+    }
+
+    fn merge(&mut self) -> Result<Vec<Event>, String> {
+        self.merge_with(swarm_protocol::MergeMethod::Squash)
+    }
+
+    fn update(&mut self, skip_checks: bool) -> Result<Vec<Event>, String> {
+        self.client.until_done(&Request::UpdatePr {
+            call: CALL,
+            task: self.task.id,
+            skip_checks,
+        })
+    }
+
+    fn local_branches(&self) -> Vec<String> {
+        git_output(&self.repo.root, &["branch", "--format=%(refname:short)"])
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+/// What `gh pr view` prints: enough for the status and for a lookup by branch.
+fn view_json(number: u64, state: &str) -> String {
+    format!(
+        r#"{{"number":{number},"url":"https://github.com/acme/widgets/pull/{number}",
+        "title":"Add review file","state":"{state}","isDraft":false,"mergeable":"MERGEABLE",
+        "mergeStateStatus":"CLEAN","statusCheckRollup":[],"reviewRequests":[],
+        "latestReviews":[],"headRefOid":"abc"}}"#
+    )
+}
+
+#[test]
+fn creating_the_pull_request_pushes_the_branch_runs_gh_and_records_the_link() {
+    let mut env = pr_env("");
+    env.approve_task();
+
+    let events = env
+        .create_with("Add review file; rm -rf /", true, true, false)
+        .expect("created");
+
+    let changed = events
+        .iter()
+        .find_map(|event| match event {
+            Event::TaskChanged { task } => Some(task.clone()),
+            _ => None,
+        })
+        .expect("TaskChanged before Done");
+    let pushed = head_of(&env.task.worktree);
+    assert_eq!(
+        changed.pull_request,
+        Some(swarm_protocol::PrLink {
+            number: 42,
+            url: "https://github.com/acme/widgets/pull/42".to_owned(),
+            head: pushed.clone(),
+        })
+    );
+    assert!(changed.close_after_merge);
+    assert!(env.pushed(), "the branch is on origin");
+    assert_eq!(
+        git_output(&env.bare.0, &["rev-parse", &env.task.branch]),
+        pushed
+    );
+    assert_eq!(
+        git_output(
+            &env.task.worktree,
+            &["rev-parse", "--abbrev-ref", "@{upstream}"]
+        ),
+        format!("origin/{}", env.task.branch)
+    );
+    assert_eq!(
+        env.gh.calls_of(&["pr", "create"]),
+        [[
+            "pr",
+            "create",
+            "--base",
+            env.task.pr_base.as_str(),
+            "--head",
+            env.task.branch.as_str(),
+            "--title",
+            "Add review file; rm -rf /",
+            "--body-file",
+            "-",
+            "--draft"
+        ]
+        .map(str::to_owned)
+        .to_vec()]
+    );
+    assert_eq!(
+        env.gh.stdin("pr-create"),
+        "## What\n\n- a `quoted` \"body\" with $(not run)\n"
+    );
+    assert_eq!(
+        env.gh.repositories().last().map(String::as_str),
+        Some("acme/widgets"),
+        "gh runs for the repository of origin"
+    );
+    let stored = env.task_now();
+    assert_eq!(stored.pull_request, changed.pull_request);
+    assert!(stored.close_after_merge);
+
+    env.view("OPEN");
+    let again = env.create();
+    assert_eq!(
+        again.expect_err("refused"),
+        "open pull request #42 exists; push changes instead"
+    );
+}
+
+#[test]
+fn a_pull_request_that_is_not_a_draft_leaves_out_the_draft_flag() {
+    let mut env = pr_env("");
+    env.approve_task();
+
+    env.create_with("Ready", false, false, false)
+        .expect("created");
+
+    let call = &env.gh.calls_of(&["pr", "create"])[0];
+    assert!(!call.contains(&"--draft".to_owned()), "{call:?}");
+    assert!(!env.task_now().close_after_merge);
+}
+
+#[test]
+fn creating_is_refused_until_the_review_is_approved_and_clean() {
+    let mut env = pr_env("");
+
+    let unapproved = env.create();
+    assert!(unapproved.expect_err("refused").contains("not approved"));
+
+    env.approve_task();
+    commit_more(&env.task.worktree, "more.txt");
+    let changed = env.create();
+    assert!(
+        changed
+            .expect_err("refused")
+            .contains("changed since you approved")
+    );
+
+    env.approve_task();
+    env.client
+        .add_comment(comment_at(&env.task, ReviewSource::Merged, 1, "one", "A"))
+        .expect("added");
+    let pending = env.create();
+    assert_eq!(
+        pending.expect_err("refused"),
+        "1 comment is pending: send or delete it first"
+    );
+
+    let empty = env.create_with("   ", true, false, false);
+    assert_eq!(empty.expect_err("refused"), "the title is empty");
+    let long = env.create_with(&"x".repeat(257), true, false, false);
+    assert!(long.expect_err("refused").contains("longer than 256"));
+
+    assert!(!env.pushed(), "nothing was pushed");
+    assert!(!env.created(), "gh made nothing");
+    assert_eq!(env.task_now().pull_request, None);
+}
+
+#[test]
+fn creating_needs_a_github_origin_and_a_gh_that_is_signed_in() {
+    let plain = Repo::new("");
+    let gh = FakeGh::new();
+    let daemon = Daemon::start_with_gh(&gh.path());
+    let (mut client, task) = reviewed_task(&daemon, &plain);
+    client.approve(task.id);
+    let request = |client: &mut Client, task: TaskId| {
+        client.until_done(&Request::CreatePr {
+            call: CALL,
+            task,
+            draft: swarm_protocol::PrDraft {
+                title: "T".to_owned(),
+                body: "B".to_owned(),
+            },
+            as_draft: true,
+            close_after_merge: false,
+            skip_checks: false,
+        })
+    };
+
+    let no_origin = request(&mut client, task.id);
+    assert_eq!(
+        no_origin.expect_err("refused"),
+        "the project's origin is not on GitHub"
+    );
+
+    let (repo, _bare) = github_repo("");
+    let missing = Daemon::start_with_gh(Path::new("/nonexistent/gh"));
+    let (mut client, task) = reviewed_task(&missing, &repo);
+    client.approve(task.id);
+    let no_gh = request(&mut client, task.id);
+    assert!(no_gh.expect_err("refused").contains("not installed"));
+
+    gh.fail("auth-status", "not logged in");
+    let (repo, _bare) = github_repo("");
+    let signed_out = Daemon::start_with_gh(&gh.path());
+    let (mut client, task) = reviewed_task(&signed_out, &repo);
+    client.approve(task.id);
+    let not_signed_in = request(&mut client, task.id);
+    assert!(
+        not_signed_in
+            .expect_err("refused")
+            .contains("not signed in")
+    );
+    assert!(gh.calls_of(&["pr", "create"]).is_empty());
+}
+
+#[test]
+fn the_worktree_must_be_on_the_task_branch_to_create_or_update() {
+    let mut env = pr_env("");
+    env.approve_task();
+    let head = head_of(&env.task.worktree);
+
+    git_output(&env.task.worktree, &["checkout", "-q", "--detach"]);
+    let detached = env.create();
+    assert!(
+        detached
+            .expect_err("refused")
+            .contains("not on the task branch"),
+        "detached HEAD"
+    );
+
+    git_output(&env.task.worktree, &["checkout", "-q", "-b", "other"]);
+    let other = env.create();
+    assert!(
+        other
+            .expect_err("refused")
+            .contains("not on the task branch"),
+        "another branch"
+    );
+    assert!(!env.pushed());
+    assert!(!env.created());
+
+    git_output(&env.task.worktree, &["checkout", "-q", &env.task.branch]);
+    assert_eq!(head_of(&env.task.worktree), head);
+    env.create().expect("created on the task branch");
+}
+
+#[test]
+fn the_link_records_the_pushed_commit_not_the_head_after_the_push() {
+    let mut env = pr_env("");
+    env.approve_task();
+    let reviewed = head_of(&env.task.worktree);
+    let hook = env.repo.root.join(".git/hooks/pre-push");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\ngit -c user.name=T -c user.email=t@example.com commit -q --allow-empty -m moved\n",
+    )
+    .expect("hook");
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).expect("mode");
+
+    env.create().expect("created");
+
+    assert_ne!(
+        head_of(&env.task.worktree),
+        reviewed,
+        "the hook moved the branch"
+    );
+    assert_eq!(
+        git_output(&env.bare.0, &["rev-parse", &env.task.branch]),
+        reviewed,
+        "origin has the reviewed commit"
+    );
+    assert_eq!(env.task_now().pull_request.expect("link").head, reviewed);
+}
+
+#[test]
+fn the_daemons_ssh_agent_reaches_the_push() {
+    let gh = FakeGh::new();
+    gh.answer("pr-create", "https://github.com/acme/widgets/pull/42\n");
+    let (repo, _bare) = github_repo("");
+    let daemon =
+        Daemon::start_with_gh_and_env(&gh.path(), ("SSH_AUTH_SOCK", "/tmp/swd-agent.sock"));
+    let (mut client, task) = reviewed_task(&daemon, &repo);
+    client.approve(task.id);
+    let seen = repo.root.join("seen-socket");
+    let hook = repo.root.join(".git/hooks/pre-push");
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\nprintf '%s' \"$SSH_AUTH_SOCK\" > {}\n",
+            seen.display()
+        ),
+    )
+    .expect("hook");
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).expect("mode");
+
+    client
+        .until_done(&Request::CreatePr {
+            call: CALL,
+            task: task.id,
+            draft: swarm_protocol::PrDraft {
+                title: "T".to_owned(),
+                body: "B".to_owned(),
+            },
+            as_draft: true,
+            close_after_merge: false,
+            skip_checks: false,
+        })
+        .expect("created");
+
+    assert_eq!(
+        std::fs::read_to_string(seen).expect("the hook ran"),
+        "/tmp/swd-agent.sock"
+    );
+}
+
+#[test]
+fn a_closed_pull_request_is_replaced_and_an_open_or_merged_one_blocks_creating() {
+    let mut env = env_with_pull_request(false);
+    commit_more(&env.task.worktree, "more.txt");
+    env.approve_task();
+
+    env.view("OPEN");
+    assert_eq!(
+        env.create().expect_err("open"),
+        "open pull request #42 exists; push changes instead"
+    );
+    env.view("MERGED");
+    assert_eq!(
+        env.create().expect_err("merged"),
+        "pull request #42 is merged already"
+    );
+    assert_eq!(
+        env.gh.calls_of(&["pr", "create"]).len(),
+        1,
+        "only the first"
+    );
+
+    env.view("CLOSED");
+    env.gh
+        .answer("pr-create", "https://github.com/acme/widgets/pull/43\n");
+    let events = env
+        .create_with("Second try", false, true, false)
+        .expect("a closed pull request is replaced");
+
+    let changed = events
+        .iter()
+        .find_map(|event| match event {
+            Event::TaskChanged { task } => Some(task.clone()),
+            _ => None,
+        })
+        .expect("TaskChanged");
+    let link = changed.pull_request.expect("link");
+    assert_eq!(link.number, 43);
+    assert_eq!(link.head, head_of(&env.task.worktree));
+    assert!(changed.close_after_merge);
+    assert_eq!(env.gh.calls_of(&["pr", "create"]).len(), 2);
+}
+
+#[test]
+fn an_open_pull_request_swarm_did_not_record_is_taken_over() {
+    let mut env = pr_env("");
+    env.approve_task();
+    env.gh.fail(
+        "pr-create",
+        "a pull request for branch \"swarm/x\" into branch \"main\" already exists:\nhttps://github.com/acme/widgets/pull/9",
+    );
+    env.gh.answer("pr-view", &view_json(9, "OPEN"));
+
+    env.create().expect("taken over");
+
+    let link = env.task_now().pull_request.expect("link");
+    assert_eq!(link.number, 9);
+    assert_eq!(link.url, "https://github.com/acme/widgets/pull/9");
+    assert_eq!(link.head, head_of(&env.task.worktree));
+    assert_eq!(
+        env.gh.calls_of(&["pr", "view"]),
+        [[
+            "pr",
+            "view",
+            env.task.branch.as_str(),
+            "--json",
+            "number,url,state,headRefOid"
+        ]
+        .map(str::to_owned)
+        .to_vec()]
+    );
+}
+
+#[test]
+fn a_failed_create_stays_an_error_unless_the_lookup_finds_an_open_pull_request() {
+    let mut env = pr_env("");
+    env.approve_task();
+    env.gh
+        .fail("pr-create", "GraphQL: something else went wrong");
+
+    env.gh.answer("pr-view", &view_json(9, "CLOSED"));
+    let closed = env.create().expect_err("only a closed one");
+    assert!(closed.starts_with("gh pr create failed: "), "{closed}");
+    assert!(closed.contains("something else"), "{closed}");
+
+    env.gh
+        .fail("pr-view", "no pull requests found for branch \"x\"");
+    let none = env.create().expect_err("none at all");
+    assert!(none.contains("something else"), "{none}");
+
+    env.gh.fail("pr-view", "HTTP 502");
+    let down = env.create().expect_err("lookup failed");
+    assert!(down.contains("something else"), "{down}");
+    assert_eq!(env.task_now().pull_request, None);
+}
+
+#[test]
+fn updating_pushes_the_new_commit_and_records_it_for_the_merge() {
+    let mut env = env_with_pull_request(false);
+    let first = head_of(&env.task.worktree);
+    let second = env.commit_and_approve("fix.txt");
+
+    let events = env.update(false).expect("updated");
+
+    let changed = events
+        .iter()
+        .find_map(|event| match event {
+            Event::TaskChanged { task } => Some(task.clone()),
+            _ => None,
+        })
+        .expect("TaskChanged before Done");
+    assert_eq!(changed.pull_request.expect("link").head, second);
+    assert_eq!(env.task_now().pull_request.expect("link").head, second);
+    assert_ne!(first, second);
+    assert_eq!(
+        git_output(&env.bare.0, &["rev-parse", &env.task.branch]),
+        second
+    );
+    assert_eq!(
+        env.gh.calls_of(&["pr", "create"]).len(),
+        1,
+        "no second pull request"
+    );
+
+    env.view("MERGED");
+    env.gh.pull_request_head(&second);
+    env.merge().expect("the update is what merges");
+}
+
+#[test]
+fn updating_needs_an_open_pull_request() {
+    let mut env = pr_env("");
+    env.approve_task();
+    assert_eq!(
+        env.update(false).expect_err("none"),
+        "the task has no pull request"
+    );
+
+    env.create().expect("created");
+    env.commit_and_approve("fix.txt");
+    env.view("MERGED");
+    assert_eq!(
+        env.update(false).expect_err("merged"),
+        "pull request #42 is merged already"
+    );
+    env.view("CLOSED");
+    assert_eq!(
+        env.update(false).expect_err("closed"),
+        "pull request #42 is closed: create a new one"
+    );
+    assert_ne!(
+        git_output(&env.bare.0, &["rev-parse", &env.task.branch]),
+        head_of(&env.task.worktree)
+    );
+}
+
+#[test]
+fn updating_follows_the_same_approval_comment_and_checks_rules_as_creating() {
+    let mut env = pr_env("[checks]\nbefore_pr = [\"true\"]\nrequired = true\n");
+    env.approve_task();
+    let mut history = env.client.run_checks(env.task.id).expect("started");
+    env.client.checks_until(&mut history, checks_are_over);
+    env.create().expect("created");
+    env.view("OPEN");
+    let pushed = head_of(&env.task.worktree);
+
+    commit_more(&env.task.worktree, "fix.txt");
+    let unapproved = env.update(false);
+    assert!(
+        unapproved
+            .expect_err("refused")
+            .contains("changed since you approved"),
+        "the new commit was not reviewed"
+    );
+
+    env.approve_task();
+    env.client
+        .add_comment(comment_at(&env.task, ReviewSource::Merged, 1, "one", "A"))
+        .expect("added");
+    assert_eq!(
+        env.update(false).expect_err("refused"),
+        "1 comment is pending: send or delete it first"
+    );
+    let comment = env.client.list_comments(env.task.id)[0].id;
+    env.client
+        .until_done(&Request::DeleteComment {
+            call: CALL,
+            id: comment,
+        })
+        .expect("deleted");
+    env.approve_task();
+
+    assert!(
+        env.update(false)
+            .expect_err("refused")
+            .contains("older commit"),
+        "the checks ran on the first commit"
+    );
+    assert_eq!(
+        git_output(&env.bare.0, &["rev-parse", &env.task.branch]),
+        pushed
+    );
+
+    let mut history = env.client.run_checks(env.task.id).expect("started");
+    env.client.checks_until(&mut history, checks_are_over);
+    env.update(false)
+        .expect("updated once everything is current");
+    assert_eq!(
+        git_output(&env.bare.0, &["rev-parse", &env.task.branch]),
+        head_of(&env.task.worktree)
+    );
+}
+
+#[test]
+fn an_update_that_is_not_a_fast_forward_is_an_error_with_the_output() {
+    let mut env = env_with_pull_request(false);
+    let pushed = head_of(&env.task.worktree);
+    git_output(
+        &env.task.worktree,
+        &[
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "-q",
+            "--amend",
+            "-m",
+            "rewritten",
+        ],
+    );
+    env.approve_task();
+
+    let rejected = env.update(false).expect_err("rejected");
+
+    assert!(rejected.starts_with("git push failed:\n"), "{rejected}");
+    assert!(rejected.contains("rejected"), "{rejected}");
+    assert_eq!(
+        git_output(&env.bare.0, &["rev-parse", &env.task.branch]),
+        pushed
+    );
+    assert_eq!(env.task_now().pull_request.expect("link").head, pushed);
+}
+
+#[test]
+fn a_task_cannot_close_while_its_branch_is_being_pushed() {
+    let mut env = pr_env("");
+    env.approve_task();
+    let started = env.repo.root.join("hook-started");
+    let hook = env.repo.root.join(".git/hooks/pre-push");
+    std::fs::write(
+        &hook,
+        format!("#!/bin/sh\ntouch {}\nsleep 2\n", started.display()),
+    )
+    .expect("hook");
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).expect("mode");
+    let mut other = env.daemon.connect();
+    other.hello();
+    let confirmed = other.check_close(env.task.id);
+
+    env.client.send(&Request::CreatePr {
+        call: CALL,
+        task: env.task.id,
+        draft: swarm_protocol::PrDraft {
+            title: "T".to_owned(),
+            body: "B".to_owned(),
+        },
+        as_draft: true,
+        close_after_merge: false,
+        skip_checks: false,
+    });
+    wait_until(|| started.exists());
+    let refused = other.close_task_confirmed(env.task.id, confirmed);
+    env.client.await_done().expect("created");
+
+    assert_eq!(
+        refused.expect_err("refused"),
+        "a pull request change of this task is running; try again"
+    );
+    assert!(env.task.worktree.is_dir());
+    assert!(env.task_now().pull_request.is_some());
+}
+
+#[test]
+fn a_pull_request_goes_into_the_branch_the_task_started_from_when_origin_has_it() {
+    let gh = FakeGh::new();
+    gh.answer("pr-create", "https://github.com/acme/widgets/pull/42\n");
+    let (repo, _bare) = github_repo("");
+    repo.git(&["branch", "feature"]);
+    repo.git(&["push", "-q", "origin", "feature"]);
+    repo.git(&["branch", "local-only"]);
+    let daemon = Daemon::start_with_gh(&gh.path());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let make = |client: &mut Client, name: &str, from: &str| {
+        let mut request = orchestrator_task(project.id, false);
+        request.name = name.to_owned();
+        request.from = Some(from.to_owned());
+        request.orchestrator = None;
+
+        client.create_task(request)
+    };
+
+    let tracked = make(&mut client, "Tracked", "feature");
+    let local = make(&mut client, "Local", "local-only");
+
+    assert_eq!(
+        (tracked.base.as_str(), tracked.pr_base.as_str()),
+        ("feature", "feature")
+    );
+    assert_eq!(local.base, "local-only");
+    assert_eq!(local.pr_base, project.base_branch);
+
+    std::fs::write(tracked.worktree.join("review.txt"), "one\n").expect("file");
+    commit_all(&tracked.worktree);
+    client.approve(tracked.id);
+    client
+        .until_done(&Request::CreatePr {
+            call: CALL,
+            task: tracked.id,
+            draft: swarm_protocol::PrDraft {
+                title: "T".to_owned(),
+                body: "B".to_owned(),
+            },
+            as_draft: false,
+            close_after_merge: false,
+            skip_checks: false,
+        })
+        .expect("created");
+
+    let call = &gh.calls_of(&["pr", "create"])[0];
+    assert_eq!(call[2..4], ["--base", "feature"]);
+}
+
+#[test]
+fn the_local_checks_must_have_passed_on_the_current_commit() {
+    use swarm_protocol::CheckState;
+
+    let mut env = pr_env("[checks]\nbefore_pr = [\"true\"]\nrequired = true\n");
+    env.approve_task();
+
+    let never_ran = env.create();
+    assert_eq!(
+        never_ran.expect_err("refused"),
+        "run the local checks first"
+    );
+
+    let mut history = env.client.run_checks(env.task.id).expect("started");
+    env.client.checks_until(&mut history, checks_are_over);
+    assert_eq!(
+        history.last().expect("a run").checks[0].state,
+        CheckState::Passed
+    );
+    commit_more(&env.task.worktree, "more.txt");
+    env.approve_task();
+    let stale = env.create();
+    assert!(stale.expect_err("refused").contains("older commit"));
+
+    let mut history = env.client.run_checks(env.task.id).expect("started");
+    env.client.checks_until(&mut history, checks_are_over);
+    std::fs::write(
+        env.repo.root.join(".swarm/config.toml"),
+        "[checks]\nbefore_pr = [\"true\", \"true\"]\nrequired = true\n",
+    )
+    .expect("config");
+    let changed = env.create();
+    assert!(changed.expect_err("refused").contains("config changed"));
+
+    std::fs::write(
+        env.repo.root.join(".swarm/config.toml"),
+        "[checks]\nbefore_pr = [\"true\"]\nrequired = true\n",
+    )
+    .expect("config");
+    assert!(!env.pushed());
+    env.create().expect("created on the current commit");
+    assert!(env.pushed());
+}
+
+#[test]
+fn failed_checks_block_unless_they_are_not_required_and_skipped() {
+    let mut env = pr_env("[checks]\nbefore_pr = [\"exit 1\"]\nrequired = true\n");
+    env.approve_task();
+    let mut history = env.client.run_checks(env.task.id).expect("started");
+    env.client.checks_until(&mut history, checks_are_over);
+
+    let failed = env.create();
+    assert_eq!(
+        failed.expect_err("refused"),
+        "the local check `exit 1` failed"
+    );
+    let skipped_but_required = env.create_with("T", true, false, true);
+    assert_eq!(
+        skipped_but_required.expect_err("refused"),
+        "the local check `exit 1` failed"
+    );
+
+    std::fs::write(
+        env.repo.root.join(".swarm/config.toml"),
+        "[checks]\nbefore_pr = [\"exit 1\"]\nrequired = false\n",
+    )
+    .expect("config");
+    let not_skipped = env.create();
+    assert_eq!(
+        not_skipped.expect_err("refused"),
+        "the local check `exit 1` failed"
+    );
+    assert!(!env.created());
+
+    env.create_with("T", true, false, true)
+        .expect("skipped on purpose");
+    assert!(env.created());
+}
+
+#[test]
+fn skipping_also_allows_checks_that_never_ran_when_they_are_not_required() {
+    let mut env = pr_env("[checks]\nbefore_pr = [\"true\"]\nrequired = false\n");
+    env.approve_task();
+
+    let refused = env.create();
+    assert_eq!(refused.expect_err("refused"), "run the local checks first");
+
+    env.create_with("T", true, false, true).expect("skipped");
+}
+
+#[test]
+fn a_failing_pre_push_hook_puts_its_output_in_the_error_and_stops_before_gh() {
+    let mut env = pr_env("");
+    env.approve_task();
+    let hook = env.repo.root.join(".git/hooks/pre-push");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\nfor n in $(seq 1 60); do echo \"hook line $n\"; done\necho 'tests failed' >&2\nexit 1\n",
+    )
+    .expect("hook");
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).expect("mode");
+
+    let failed = env.create().expect_err("the hook fails");
+
+    assert!(failed.starts_with("git push failed:\n"), "{failed}");
+    assert!(failed.contains("tests failed"), "{failed}");
+    assert!(failed.contains("hook line 60"), "{failed}");
+    assert!(!failed.contains("hook line 10\n"), "only the last lines");
+    assert!(!env.pushed());
+    assert!(!env.created());
+    assert_eq!(env.task_now().pull_request, None);
+}
+
+#[test]
+fn a_gh_failure_shows_its_output_and_leaves_the_pushed_branch() {
+    let mut env = pr_env("");
+    env.approve_task();
+    env.gh.fail(
+        "pr-create",
+        "GraphQL: Head sha can't be blank, Base sha can't be blank",
+    );
+
+    let failed = env.create().expect_err("gh fails");
+
+    assert!(failed.starts_with("gh pr create failed: "), "{failed}");
+    assert!(failed.contains("Head sha can't be blank"), "{failed}");
+    assert!(env.pushed());
+    assert_eq!(env.task_now().pull_request, None);
+}
+
+const VIEW_JSON: &str = r#"{"number":42,"url":"https://github.com/acme/widgets/pull/42",
+    "title":"Add review file","state":"OPEN","isDraft":false,"mergeable":"MERGEABLE",
+    "mergeStateStatus":"CLEAN",
+    "statusCheckRollup":[
+      {"__typename":"CheckRun","name":"build","workflowName":"CI","status":"COMPLETED",
+       "conclusion":"SUCCESS","startedAt":"2024-05-01T10:00:00Z",
+       "completedAt":"2024-05-01T10:02:05Z","detailsUrl":"https://example.com/run/1"},
+      {"__typename":"StatusContext","context":"deploy","state":"PENDING","targetUrl":"",
+       "startedAt":"2024-05-01T10:00:00Z"}],
+    "reviewRequests":[{"__typename":"User","login":"alice"}],
+    "latestReviews":[{"author":{"login":"bob"},"state":"CHANGES_REQUESTED"}]}"#;
+
+fn env_with_pull_request(close_after_merge: bool) -> PrEnv {
+    let mut env = pr_env("");
+    env.approve_task();
+    env.create_with("Add review file", true, close_after_merge, false)
+        .expect("created");
+    env.view("OPEN");
+
+    env
+}
+
+#[test]
+fn the_status_maps_what_gh_pr_view_prints() {
+    use swarm_protocol::{GithubCheckState, PrState, ReviewState};
+
+    let mut env = env_with_pull_request(false);
+    env.gh.answer("pr-view", VIEW_JSON);
+
+    let pull_request = env.client.pr_status(env.task.id).expect("status");
+
+    assert_eq!(
+        env.gh.calls_of(&["pr", "view"]),
+        [[
+            "pr",
+            "view",
+            "42",
+            "--json",
+            "number,url,title,state,isDraft,mergeable,mergeStateStatus,statusCheckRollup,reviewRequests,latestReviews"
+        ]
+        .map(str::to_owned)
+        .to_vec()]
+    );
+    assert_eq!(pull_request.number, 42);
+    assert_eq!(pull_request.title, "Add review file");
+    assert_eq!(pull_request.state, PrState::Open);
+    assert!(pull_request.mergeable);
+    assert_eq!(pull_request.checks.len(), 2);
+    assert_eq!(pull_request.checks[0].name, "CI / build");
+    assert_eq!(pull_request.checks[0].state, GithubCheckState::Passed);
+    assert_eq!(pull_request.checks[0].duration_secs, Some(125));
+    assert_eq!(pull_request.checks[1].state, GithubCheckState::Running);
+    assert_eq!(
+        pull_request
+            .reviewers
+            .iter()
+            .map(|reviewer| (reviewer.login.as_str(), reviewer.state))
+            .collect::<Vec<_>>(),
+        [
+            ("alice", ReviewState::Requested),
+            ("bob", ReviewState::ChangesRequested)
+        ]
+    );
+
+    env.gh.answer(
+        "pr-view",
+        r#"{"number":42,"url":"u","title":"t","state":"MERGED","isDraft":false,"mergeable":"UNKNOWN","mergeStateStatus":"UNKNOWN","statusCheckRollup":null,"reviewRequests":[],"latestReviews":[]}"#,
+    );
+    let merged = env.client.pr_status(env.task.id).expect("status");
+    assert_eq!(merged.state, PrState::Merged);
+    assert!(!merged.mergeable);
+}
+
+#[test]
+fn the_status_of_a_task_without_a_pull_request_is_an_error() {
+    let mut env = pr_env("");
+
+    let error = env.client.pr_status(env.task.id).expect_err("none yet");
+
+    assert_eq!(error, "the task has no pull request");
+}
+
+#[test]
+fn ready_reviewers_and_merge_call_gh_with_the_documented_arguments() {
+    let mut env = env_with_pull_request(false);
+    let task = env.task.id;
+    let pushed = head_of(&env.task.worktree);
+
+    env.client
+        .until_done(&Request::MarkPrReady { call: CALL, task })
+        .expect("ready");
+    env.client
+        .until_done(&Request::AddReviewers {
+            call: CALL,
+            task,
+            logins: vec!["alice".to_owned(), "bob-2".to_owned()],
+        })
+        .expect("reviewers");
+    env.view("MERGED");
+    for method in [
+        swarm_protocol::MergeMethod::Merge,
+        swarm_protocol::MergeMethod::Rebase,
+        swarm_protocol::MergeMethod::Squash,
+    ] {
+        env.merge_with(method).expect("merged");
+    }
+
+    let calls: Vec<Vec<String>> = env
+        .gh
+        .calls()
+        .into_iter()
+        .filter(|call| call[0] == "pr" && call[1] != "create")
+        .collect();
+    let merge = |flag: &str| {
+        vec![
+            "pr",
+            "merge",
+            "42",
+            flag,
+            "--match-head-commit",
+            pushed.as_str(),
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>()
+    };
+    let view = |call: &[String]| call[..3] == ["pr", "view", "42"];
+    assert_eq!(calls[0], ["pr", "ready", "42"]);
+    assert_eq!(
+        calls[1],
+        ["pr", "edit", "42", "--add-reviewer", "alice,bob-2"]
+    );
+    assert_eq!(calls[2], merge("--merge"));
+    assert!(view(&calls[3]));
+    assert_eq!(calls[4], merge("--rebase"));
+    assert!(view(&calls[5]));
+    assert_eq!(calls[6], merge("--squash"));
+    assert!(view(&calls[7]));
+    assert_eq!(calls.len(), 8);
+    env.gh.assert_no_branch_deleted_by_gh();
+}
+
+#[test]
+fn a_reviewer_that_is_not_a_login_is_refused_before_gh_runs() {
+    let mut env = env_with_pull_request(false);
+
+    let refused = env.client.until_done(&Request::AddReviewers {
+        call: CALL,
+        task: env.task.id,
+        logins: vec!["--assignee".to_owned()],
+    });
+
+    assert!(
+        refused
+            .expect_err("refused")
+            .contains("is not a GitHub login")
+    );
+    assert!(env.gh.calls_of(&["pr", "edit"]).is_empty());
+}
+
+#[test]
+fn the_choice_to_close_after_merge_is_stored_and_announced() {
+    let mut env = env_with_pull_request(false);
+    let mut watcher = env.daemon.connect();
+    watcher.hello();
+
+    let events = env
+        .client
+        .until_done(&Request::SetCloseAfterMerge {
+            call: CALL,
+            task: env.task.id,
+            close: true,
+        })
+        .expect("set");
+
+    let changed = events
+        .iter()
+        .find_map(|event| match event {
+            Event::TaskChanged { task } => Some(task.clone()),
+            _ => None,
+        })
+        .expect("TaskChanged before Done");
+    assert!(changed.close_after_merge);
+    assert!(changed.pull_request.is_some());
+    let seen = watcher.wait_for(|event| match event {
+        Event::TaskChanged { task } => Some(task.clone()),
+        _ => None,
+    });
+    assert!(seen.close_after_merge);
+    assert!(env.task_now().close_after_merge);
+}
+
+#[test]
+fn merging_with_close_after_merge_closes_the_task_and_deletes_both_branches() {
+    let mut env = env_with_pull_request(true);
+    env.view("MERGED");
+    let branch = env.task.branch.clone();
+    assert!(env.local_branches().contains(&branch));
+    assert!(env.pushed());
+
+    let events = env.merge().expect("merged");
+
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::TaskChanged { task } if task.closed))
+    );
+    assert!(!env.task.worktree.exists());
+    assert!(
+        !env.local_branches().contains(&branch),
+        "the merged task branch is deleted"
+    );
+    assert!(!env.pushed(), "Swarm deleted the remote branch");
+    assert!(env.client.projects()[0].tasks.is_empty());
+    assert!(
+        env.client.pr_panel(env.task.id).is_err(),
+        "the task is closed"
+    );
+    env.gh.assert_no_branch_deleted_by_gh();
+}
+
+#[test]
+fn merging_keeps_the_task_when_uncommitted_work_would_be_lost() {
+    let mut env = env_with_pull_request(true);
+    env.view("MERGED");
+    std::fs::write(env.task.worktree.join("loose.txt"), "uncommitted\n").expect("file");
+
+    let events = env.merge().expect("merged");
+
+    let kept = events
+        .iter()
+        .find_map(|event| match event {
+            Event::TaskChanged { task } => Some(task.clone()),
+            _ => None,
+        })
+        .expect("TaskChanged");
+    assert!(!kept.closed);
+    assert!(kept.pull_request.is_some());
+    assert!(env.task.worktree.join("loose.txt").is_file());
+    assert!(env.local_branches().contains(&env.task.branch));
+    assert!(!env.pushed(), "the remote branch is still deleted");
+    assert_eq!(env.client.projects()[0].tasks.len(), 1);
+}
+
+#[test]
+fn merging_without_close_after_merge_keeps_the_task_and_its_pull_request() {
+    let mut env = env_with_pull_request(false);
+    env.view("MERGED");
+
+    let events = env.merge().expect("merged");
+
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::TaskChanged { task } if !task.closed))
+    );
+    let task = env.task_now();
+    assert!(!task.closed);
+    assert_eq!(task.pull_request.expect("link").number, 42);
+    assert!(env.task.worktree.is_dir());
+    assert!(env.local_branches().contains(&env.task.branch));
+}
+
+#[test]
+fn a_merge_names_the_pushed_commit_and_gh_never_deletes_a_branch() {
+    let mut env = env_with_pull_request(false);
+    env.view("MERGED");
+    let pushed = head_of(&env.task.worktree);
+    env.gh.pull_request_head(&pushed);
+
+    env.merge().expect("merged");
+
+    assert_eq!(
+        env.gh.calls_of(&["pr", "merge"]),
+        [[
+            "pr",
+            "merge",
+            "42",
+            "--squash",
+            "--match-head-commit",
+            pushed.as_str()
+        ]
+        .map(str::to_owned)
+        .to_vec()]
+    );
+    env.gh.assert_no_branch_deleted_by_gh();
+    assert!(!env.pushed(), "the remote branch went through git");
+}
+
+#[test]
+fn a_merge_is_refused_when_the_pull_request_head_is_not_the_pushed_commit() {
+    let mut env = env_with_pull_request(true);
+    env.view("MERGED");
+    env.gh
+        .pull_request_head("0123456789012345678901234567890123456789");
+
+    let refused = env.merge().expect_err("refused");
+
+    assert!(refused.contains("Head branch was modified"), "{refused}");
+    assert!(env.pushed(), "nothing was deleted");
+    assert!(env.task.worktree.is_dir());
+    assert!(env.local_branches().contains(&env.task.branch));
+    assert_eq!(env.task_now().pull_request.expect("link").number, 42);
+}
+
+#[test]
+fn a_merge_queue_leaves_the_pull_request_open_and_the_task_alone() {
+    let mut env = env_with_pull_request(true);
+    let mut watcher = env.daemon.connect();
+    watcher.hello();
+    env.view("OPEN");
+
+    let events = env.merge().expect("queued is fine");
+
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::TaskChanged { task } if !task.closed)),
+        "the task is announced"
+    );
+    let seen = watcher.wait_for(|event| match event {
+        Event::TaskChanged { task } => Some(task.clone()),
+        _ => None,
+    });
+    assert!(!seen.closed);
+    assert!(env.pushed(), "the branch stays until GitHub merges");
+    assert!(env.task.worktree.is_dir());
+    assert!(env.local_branches().contains(&env.task.branch));
+    env.gh.assert_no_branch_deleted_by_gh();
+}
+
+#[test]
+fn a_merge_keeps_the_task_and_counts_local_commits_that_are_not_in_the_pull_request() {
+    let mut env = env_with_pull_request(true);
+    env.view("MERGED");
+    commit_more(&env.task.worktree, "after-the-push-1.txt");
+    commit_more(&env.task.worktree, "after-the-push-2.txt");
+    let local_tip = head_of(&env.task.worktree);
+
+    let error = env.merge().expect_err("not closed");
+
+    assert_eq!(
+        error,
+        "the pull request is merged, but the task stays open: 2 local commits are not in it"
+    );
+    assert!(env.task.worktree.is_dir());
+    assert_eq!(head_of(&env.task.worktree), local_tip);
+    assert_eq!(
+        git_output(&env.repo.root, &["rev-parse", &env.task.branch]),
+        local_tip,
+        "the local branch keeps its commits"
+    );
+    assert_eq!(env.client.projects()[0].tasks.len(), 1);
+    assert!(!env.pushed(), "the remote branch still goes");
+}
+
+#[test]
+fn a_remote_branch_that_is_gone_already_does_not_fail_the_merge() {
+    let mut env = env_with_pull_request(false);
+    env.view("MERGED");
+    git_output(&env.bare.0, &["branch", "-D", &env.task.branch]);
+
+    env.merge().expect("merged");
+    env.merge().expect("merged again");
+}
+
+#[test]
+fn a_task_cannot_close_while_its_pull_request_is_being_merged() {
+    let mut env = env_with_pull_request(false);
+    env.view("MERGED");
+    env.gh.slow("pr-merge", 3);
+    let mut other = env.daemon.connect();
+    other.hello();
+    let confirmed = other.check_close(env.task.id);
+
+    env.client.send(&Request::MergePr {
+        call: CALL,
+        task: env.task.id,
+        method: swarm_protocol::MergeMethod::Squash,
+    });
+    wait_until(|| env.gh.started("pr-merge"));
+    let refused = other.close_task_confirmed(env.task.id, confirmed.clone());
+    env.client.await_done().expect("merged");
+
+    assert_eq!(
+        refused.expect_err("refused"),
+        "a pull request change of this task is running; try again"
+    );
+    other
+        .close_task_confirmed(env.task.id, confirmed)
+        .expect("closes once the merge is over");
+}
+
+/// Waits up to ten seconds for `done`.
+fn wait_until(mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out");
+        thread::park_timeout(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn agents_get_swarms_bin_folder_and_the_folder_of_gh_on_their_path() {
+    let fixture = Fixture::new("printf '%s' \"$PATH\" > \"$OUT/path\"; sleep 30");
+    let gh = FakeGh::new();
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings_and_gh(&fixture.settings(), &gh.path());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    client.create_task(orchestrator_task(project.id, false));
+
+    let path = fixture.read_when_written("path");
+
+    let folders: Vec<PathBuf> = std::env::split_paths(&path).collect();
+    assert_eq!(
+        folders.last(),
+        Some(&daemon.home.join("bin")),
+        "Swarm's bin folder is last: {path}"
+    );
+    assert!(folders.contains(&gh.dir), "{path}");
+    assert_eq!(
+        folders[0],
+        Path::new(env!("CARGO_BIN_EXE_swarm-daemon")).with_file_name(""),
+        "the swarm binary comes first"
+    );
 }

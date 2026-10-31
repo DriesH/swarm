@@ -12,12 +12,15 @@ use swarm_protocol::{AgentId, AgentKind, AgentRole, TaskId};
 const ORCHESTRATOR: &str = include_str!("../prompts/orchestrator.md");
 const WORKER: &str = include_str!("../prompts/worker.md");
 const START: &str = include_str!("../prompts/start.md");
+const PR: &str = include_str!("../prompts/pr.md");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptFile {
     Orchestrator,
     Worker,
     Start,
+    /// The pull request description, sent to the orchestrator inside a `pr draft` message.
+    Pr,
 }
 
 impl PromptFile {
@@ -34,6 +37,7 @@ impl PromptFile {
             Self::Orchestrator => "orchestrator.md",
             Self::Worker => "worker.md",
             Self::Start => "start.md",
+            Self::Pr => "pr.md",
         }
     }
 
@@ -42,6 +46,7 @@ impl PromptFile {
             Self::Orchestrator => ORCHESTRATOR,
             Self::Worker => WORKER,
             Self::Start => START,
+            Self::Pr => PR,
         }
     }
 }
@@ -70,6 +75,7 @@ const ORCHESTRATOR_COMMANDS: &[&str] = &[
     "`swarm agents`: list your workers",
     "`swarm notify <text>`: ask the user for attention",
     "`swarm confirm`: say that you understood your brief",
+    "`swarm pr draft --title <title> (--body <text> | --body-file <path|->)`: send the pull request title and description the `pr draft` message asks for (only after the user approved the task)",
 ];
 
 /// Every role can run process terminals (dev servers, tests) in its worktree.
@@ -157,6 +163,16 @@ pub fn build(
     config_dir: Option<&Path>,
     project_root: &Path,
 ) -> String {
+    format!(
+        "{}\n\n{}\n",
+        harness.block(),
+        layered(file, config_dir, project_root)
+    )
+}
+
+/// The text of a prompt file: the last layer that has it, from the built-in text, then
+/// `<config_dir>/prompts/`, then `<project_root>/.swarm/prompts/`.
+pub fn layered(file: PromptFile, config_dir: Option<&Path>, project_root: &Path) -> String {
     let mut body = file.built_in().trim().to_owned();
 
     let layers = [
@@ -172,7 +188,7 @@ pub fn build(
         }
     }
 
-    format!("{}\n\n{body}\n", harness.block())
+    body
 }
 
 #[cfg(test)]
@@ -456,9 +472,79 @@ mod tests {
 
     #[test]
     fn the_orchestrator_knows_what_to_do_with_every_swarm_message() {
-        for kind in ["user input", "terminal exited", "worker stopped", "comment"] {
+        for kind in [
+            "user input",
+            "terminal exited",
+            "worker stopped",
+            "comment",
+            "pr draft",
+        ] {
             assert!(ORCHESTRATOR.contains(&format!("`{kind}`")), "{kind}");
         }
+    }
+
+    #[test]
+    fn the_orchestrator_drafts_the_pull_request_from_the_diff_and_sends_it_back() {
+        assert!(ORCHESTRATOR.contains("git diff <base>...HEAD"));
+        assert!(ORCHESTRATOR.contains("swarm pr draft --title"));
+        assert!(ORCHESTRATOR.contains("local checks"));
+        assert!(ORCHESTRATOR.contains("before you report the task done"));
+    }
+
+    #[test]
+    fn the_orchestrator_sends_the_draft_without_the_shell_reading_it() {
+        assert!(ORCHESTRATOR.contains("Prefer the `pr_draft` tool"));
+        assert!(ORCHESTRATOR.contains("swarm pr draft --title '<title>' --body-file - <<'EOF'"));
+        assert!(ORCHESTRATOR.contains("single quotes"));
+        assert!(ORCHESTRATOR.contains("backticks or `$`"));
+        assert!(!ORCHESTRATOR.contains("--title \"<title>\""));
+    }
+
+    #[test]
+    fn the_orchestrator_harness_lists_pr_draft_and_the_others_do_not() {
+        let block = |role| {
+            Harness {
+                role,
+                ..harness(Path::new("/s"))
+            }
+            .block()
+        };
+
+        assert!(block(AgentRole::Orchestrator).contains("- `swarm pr draft --title <title>"));
+        assert!(!block(AgentRole::Worker).contains("swarm pr draft"));
+        assert!(!block(AgentRole::StartOrchestrator).contains("swarm pr draft"));
+    }
+
+    #[test]
+    fn the_pr_prompt_has_the_four_sections_and_no_attribution() {
+        for heading in [
+            "## What",
+            "## Why",
+            "## Notes for reviewers",
+            "## Open tasks",
+        ] {
+            assert!(PR.contains(heading), "{heading}");
+        }
+        assert!(PR.contains("- [ ]"));
+        assert!(PR.contains("Do not add attribution lines"));
+        assert!(!PR.contains("Co-Authored"));
+    }
+
+    #[test]
+    fn the_pr_prompt_is_layered_like_the_others() {
+        let folders = Folders::new("pr");
+
+        let built_in = layered(PromptFile::Pr, Some(&folders.config()), &folders.project());
+        Folders::write(&folders.config(), "pr.md", "User PR text");
+        let user = layered(PromptFile::Pr, Some(&folders.config()), &folders.project());
+        let project_prompts = folders.project().join(".swarm");
+        Folders::write(&project_prompts, "pr.md", "Project PR text");
+        let project = layered(PromptFile::Pr, Some(&folders.config()), &folders.project());
+
+        assert!(built_in.contains("## What"));
+        assert_eq!(user, "User PR text");
+        assert_eq!(project, "Project PR text");
+        assert_eq!(PromptFile::Pr.file_name(), "pr.md");
     }
 
     #[test]

@@ -22,6 +22,7 @@ use swarm_term_view::{TerminalEvent, TerminalView, palette_for};
 use swarm_ui::ActiveTheme as _;
 
 use crate::model::{AgentChanges, FakeData, ProjectId, TaskId, TerminalId, TerminalKind};
+use crate::pull_request::SetupStep;
 use crate::workspace::{DataSource, View, Workspace};
 
 /// Scrollback lines requested when attaching.
@@ -79,6 +80,7 @@ impl DaemonLaunch {
 /// A running poll for one diff. Dropping it stops the poll.
 pub(crate) struct DiffPoll {
     key: (swarm_protocol::TaskId, ReviewSource),
+    interval: Duration,
     _task: gpui::Task<()>,
 }
 
@@ -360,6 +362,9 @@ impl Workspace {
                 workspace.comment_event(&event, cx);
             },
         );
+        Self::forward(client.pr_events(), window, cx, |workspace, event, _, cx| {
+            workspace.pr_event(event, cx);
+        });
     }
 
     fn forward<T: 'static>(
@@ -628,6 +633,7 @@ impl Workspace {
         self.previous_tabs.retain(|_, other| *other != task);
         self.review_approving.remove(&task);
         self.review_requesting.remove(&task);
+        self.pull_requests.forget_task(task);
 
         if was_open {
             let next = tabs
@@ -784,9 +790,10 @@ impl Workspace {
     }
 
     /// Keeps the diff polls running only while they are needed: the visible Review source
-    /// while Review shows, and the open task's Live diff for the header and the Changes
-    /// panel. Both need an active window and a connected daemon. A poll restarts, and so
-    /// asks at once, when its task or source changes.
+    /// while Review shows, the open task's Live diff for the header and the Changes
+    /// panel, and the Merged diff while the pull request panel shows. They need an active
+    /// window and a connected daemon. A poll restarts, and so asks at once, when its task
+    /// or source changes.
     pub(crate) fn sync_diff_polls(&mut self, window_active: bool, cx: &mut Context<Self>) {
         let connected = window_active && !self.has_no_projects() && self.daemon.is_some();
         let open = self
@@ -796,30 +803,47 @@ impl Workspace {
             .map(|daemon| daemon.id)
             .filter(|_| connected);
 
-        let review = open
-            .filter(|_| self.view == View::Review)
-            .map(|id| (id, self.review_source(self.active_task)));
-        let live = open
-            .map(|id| (id, ReviewSource::Live))
-            .filter(|key| Some(*key) != review);
         let (review_every, live_every) = self.diff_intervals;
 
-        Self::sync_poll(&mut self.review_poll, review, review_every, cx);
-        Self::sync_poll(&mut self.live_poll, live, live_every, cx);
+        let review = open
+            .filter(|_| self.view == View::Review)
+            .map(|id| (id, self.review_source(self.active_task), review_every));
+        let review_key = review.map(|(id, source, _)| (id, source));
+
+        // The pull request panel needs the Merged diff for the head commit, also while
+        // Review shows the Live diff.
+        let merged = open
+            .filter(|_| self.pr_panel_needs_merged_diff())
+            .map(|id| (id, ReviewSource::Merged))
+            .filter(|key| Some(*key) != review_key);
+        let live = open
+            .map(|id| (id, ReviewSource::Live))
+            .filter(|key| Some(*key) != review_key);
+
+        Self::sync_poll(
+            &mut self.review_poll,
+            review.map(|(id, source, every)| ((id, source), every)),
+            cx,
+        );
+        Self::sync_poll(&mut self.live_poll, live.map(|key| (key, live_every)), cx);
+        Self::sync_poll(&mut self.pr_poll, merged.map(|key| (key, live_every)), cx);
     }
 
     fn sync_poll(
         slot: &mut Option<DiffPoll>,
-        wanted: Option<(swarm_protocol::TaskId, ReviewSource)>,
-        interval: Duration,
+        wanted: Option<((swarm_protocol::TaskId, ReviewSource), Duration)>,
         cx: &mut Context<Self>,
     ) {
         match wanted {
             None => *slot = None,
-            Some(key) if slot.as_ref().is_some_and(|poll| poll.key == key) => {}
-            Some(key) => {
+            Some((key, interval))
+                if slot
+                    .as_ref()
+                    .is_some_and(|poll| poll.key == key && poll.interval == interval) => {}
+            Some((key, interval)) => {
                 *slot = Some(DiffPoll {
                     key,
+                    interval,
                     _task: Self::poll_diff(key, interval, cx),
                 });
             }
@@ -1367,10 +1391,15 @@ impl Workspace {
     }
 
     /// Asks the daemon for a new user terminal. The tile appears when it answers.
+    ///
+    /// `command` runs instead of the login shell. `setup` marks a GitHub setup step, whose
+    /// end the pull request panel follows.
     pub(crate) fn create_live_terminal(
         &mut self,
         client: Client,
         task: TaskId,
+        command: Option<Vec<String>>,
+        setup: Option<(ProjectId, SetupStep)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1380,7 +1409,7 @@ impl Workspace {
 
         let request = CreateTerminal {
             kind: DaemonKind::User,
-            command: None,
+            command,
             cwd: self
                 .data
                 .worktree_of(task)
@@ -1395,16 +1424,33 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| match creating.await {
             Ok((daemon_id, channels)) => {
                 let added = this.update_in(cx, |workspace, window, cx| {
+                    let title = setup.map(|(_, step)| step.title());
                     let terminal =
-                        workspace.add_live_terminal(task, daemon_id, None, channels, window, cx);
+                        workspace.add_live_terminal(task, daemon_id, title, channels, window, cx);
                     workspace.focus_terminal(terminal, cx);
+
+                    if let Some((project, step)) = setup {
+                        workspace.setup_terminal_added(terminal, project, step);
+                    }
                 });
 
                 if let Err(error) = added {
                     log::debug!("the window closed before the terminal was ready: {error}");
                 }
             }
-            Err(error) => log::error!("cannot create a user terminal: {error}"),
+            Err(error) => {
+                log::error!("cannot create a user terminal: {error}");
+
+                if let Some((project, step)) = setup {
+                    let failed = this.update(cx, |workspace, cx| {
+                        workspace.setup_terminal_failed(project, step, &error, cx);
+                    });
+
+                    if let Err(error) = failed {
+                        log::debug!("the window closed before the setup failed: {error}");
+                    }
+                }
+            }
         })
         .detach();
     }
@@ -1618,7 +1664,7 @@ impl Workspace {
         }
     }
 
-    fn on_terminal_event(
+    pub(crate) fn on_terminal_event(
         &mut self,
         terminal: TerminalId,
         event: &TerminalEvent,
@@ -1626,7 +1672,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         match event {
-            TerminalEvent::Exited(status) => self.on_exited(terminal, status, cx),
+            TerminalEvent::Exited(status) => {
+                if !self.github_terminal_exited(terminal, status, window, cx) {
+                    self.on_exited(terminal, status, cx);
+                }
+            }
             TerminalEvent::Disconnected
                 if self.is_process(terminal)
                     && self.daemon.as_ref().is_some_and(Client::is_connected) =>
@@ -1675,7 +1725,7 @@ fn connect(launch: &DaemonLaunch) -> Result<Connected, ClientError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::io::{BufReader, BufWriter, Write};
     use std::os::unix::fs::DirBuilderExt as _;
     use std::os::unix::net::UnixListener;
@@ -1698,7 +1748,7 @@ mod tests {
 
     static NEXT_SOCKET: AtomicU32 = AtomicU32::new(0);
 
-    fn setup(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
+    pub(crate) fn setup(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
         cx.update(|cx| {
             swarm_ui::init(cx);
             actions::bind_keys(cx);
@@ -1739,6 +1789,30 @@ mod tests {
                 call: *call,
                 comments: Vec::new(),
             }),
+            Request::GithubStatus { call, .. } => Some(Event::GithubStatus {
+                call: *call,
+                status: swarm_protocol::GithubStatus::default(),
+            }),
+            Request::ListBranches { call, .. } => Some(Event::Branches {
+                call: *call,
+                branches: Vec::new(),
+            }),
+            Request::PrPanel { call, .. } => Some(Event::PrPanel {
+                call: *call,
+                panel: swarm_protocol::PrPanel {
+                    commands: vec!["cargo test".to_owned()],
+                    required: true,
+                    pre_push_hook: None,
+                    run: None,
+                    draft: None,
+                },
+            }),
+            Request::DraftPr { call, .. } => Some(Event::Done { call: *call }),
+            Request::PrStatus { call, .. } => Some(Event::Error {
+                call: Some(*call),
+                id: None,
+                message: "no pull request".into(),
+            }),
             _ => None,
         }
     }
@@ -1768,11 +1842,7 @@ mod tests {
     }
 
     fn spawn_fake_daemon(leave: Option<flume::Receiver<()>>) -> PathBuf {
-        let folder = PathBuf::from(format!(
-            "/tmp/swa-{}-{}",
-            std::process::id(),
-            NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
-        ));
+        let folder = test_socket_folder();
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(&folder)
@@ -1821,13 +1891,24 @@ mod tests {
         socket
     }
 
-    /// A daemon that answers every request with what `reply` returns.
-    fn fake_daemon_replying(reply: impl Fn(Request) -> Option<Event> + Send + 'static) -> PathBuf {
-        let folder = PathBuf::from(format!(
-            "/tmp/swa-{}-{}",
+    /// A fresh private folder. A reused process ID must not meet an old folder.
+    fn test_socket_folder() -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.subsec_nanos());
+
+        PathBuf::from(format!(
+            "/tmp/swa-{}-{}-{nanos}",
             std::process::id(),
             NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
-        ));
+        ))
+    }
+
+    /// A daemon that answers every request with what `reply` returns.
+    pub(crate) fn fake_daemon_replying(
+        reply: impl Fn(Request) -> Option<Event> + Send + 'static,
+    ) -> PathBuf {
+        let folder = test_socket_folder();
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(&folder)
@@ -1871,13 +1952,14 @@ mod tests {
         socket
     }
 
-    fn task_info(id: u64, project: u64, name: &str) -> TaskInfo {
+    pub(crate) fn task_info(id: u64, project: u64, name: &str) -> TaskInfo {
         TaskInfo {
             id: DaemonTaskId(id),
             project: DaemonProjectId(project),
             name: name.into(),
             branch: format!("swarm/{name}"),
             base: "main".into(),
+            pr_base: "main".into(),
             worktree: PathBuf::from("/tmp/worktree"),
             ports: Vec::new(),
             setup_terminal: Some(swarm_protocol::TerminalId(10)),
@@ -1887,10 +1969,12 @@ mod tests {
             briefed: false,
             approved: None,
             closed: false,
+            pull_request: None,
+            close_after_merge: false,
         }
     }
 
-    fn project_info(id: u64, name: &str, tasks: Vec<TaskInfo>) -> ProjectInfo {
+    pub(crate) fn project_info(id: u64, name: &str, tasks: Vec<TaskInfo>) -> ProjectInfo {
         ProjectInfo {
             id: DaemonProjectId(id),
             name: name.into(),
@@ -1902,7 +1986,7 @@ mod tests {
         }
     }
 
-    fn use_projects(
+    pub(crate) fn use_projects(
         workspace: &Entity<Workspace>,
         projects: &[ProjectInfo],
         cx: &mut VisualTestContext,
@@ -1910,7 +1994,7 @@ mod tests {
         workspace.update(cx, |workspace, cx| workspace.use_projects(projects, cx));
     }
 
-    fn info(id: u64, kind: DaemonKind, task: &str) -> TerminalInfo {
+    pub(crate) fn info(id: u64, kind: DaemonKind, task: &str) -> TerminalInfo {
         TerminalInfo {
             id: swarm_protocol::TerminalId(id),
             kind,
@@ -2343,7 +2427,7 @@ mod tests {
 
     static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
 
-    fn agent_info(id: u64, task: u64, status: DaemonAgentStatus) -> AgentInfo {
+    pub(crate) fn agent_info(id: u64, task: u64, status: DaemonAgentStatus) -> AgentInfo {
         AgentInfo {
             id: swarm_protocol::AgentId(id),
             project: DaemonProjectId(5),
@@ -2365,7 +2449,7 @@ mod tests {
         }
     }
 
-    fn real_task_workspace<'a>(
+    pub(crate) fn real_task_workspace<'a>(
         socket: &std::path::Path,
         cx: &'a mut TestAppContext,
     ) -> (Entity<Workspace>, &'a mut VisualTestContext, Client) {
@@ -3419,7 +3503,7 @@ mod tests {
         clippy::disallowed_methods,
         reason = "the fake daemon answers on its own thread"
     )]
-    fn wait_a_little() {
+    pub(crate) fn wait_a_little() {
         std::thread::sleep(Duration::from_millis(20));
     }
 
@@ -3431,7 +3515,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(500));
     }
 
-    fn wait_until(
+    pub(crate) fn wait_until(
         cx: &mut VisualTestContext,
         done: impl Fn(&mut VisualTestContext) -> bool,
     ) -> bool {
@@ -3756,7 +3840,7 @@ mod tests {
         (workspace, cx, requests)
     }
 
-    fn redraw(cx: &mut VisualTestContext) {
+    pub(crate) fn redraw(cx: &mut VisualTestContext) {
         cx.update(|window, cx| window.draw(cx).clear(cx));
         cx.executor().allow_parking();
         cx.run_until_parked();
@@ -4014,11 +4098,12 @@ mod tests {
         );
     }
 
-    fn diff_of(task: u64, source: ReviewSource, fingerprint: u64) -> TaskDiff {
+    pub(crate) fn diff_of(task: u64, source: ReviewSource, fingerprint: u64) -> TaskDiff {
         TaskDiff {
             task: DaemonTaskId(task),
             source,
             fingerprint,
+            head: "abc".into(),
             stat: DiffStat {
                 files: 0,
                 additions: 3,
@@ -4317,7 +4402,7 @@ mod tests {
         assert_eq!(kept, 1);
     }
 
-    fn pending_comment(id: u64, body: &str) -> swarm_protocol::ReviewComment {
+    pub(crate) fn pending_comment(id: u64, body: &str) -> swarm_protocol::ReviewComment {
         swarm_protocol::ReviewComment {
             id: swarm_protocol::CommentId(id),
             task: DaemonTaskId(7),

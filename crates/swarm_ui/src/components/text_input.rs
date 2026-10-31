@@ -285,16 +285,29 @@ impl<const MULTILINE: bool> TextField<MULTILINE> {
     /// Replaces the text, puts the cursor at the end and clears undo history.
     /// Does not emit [`TextInputEvent::Changed`].
     pub fn set_text(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
-        let text = Self::sanitize(&text.into());
-        let end = text.len();
+        self.replace_text(text.into(), false, cx);
+    }
+
+    /// Like [`Self::set_text`], with the cursor at the start, so the field shows the
+    /// beginning of a long text.
+    pub fn set_text_at_start(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.replace_text(text.into(), true, cx);
+    }
+
+    fn replace_text(&mut self, text: SharedString, at_start: bool, cx: &mut Context<Self>) {
+        let text = Self::sanitize(&text);
+        let cursor = if at_start { 0 } else { text.len() };
 
         self.buffer = Buffer {
             text,
-            selection: end..end,
+            selection: cursor..cursor,
             ..Buffer::default()
         };
         self.layout = None;
-        self.scroll.follow_cursor = true;
+        self.scroll = Scroll {
+            follow_cursor: true,
+            ..Scroll::default()
+        };
         cx.notify();
     }
 

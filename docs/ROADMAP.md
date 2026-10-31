@@ -144,6 +144,7 @@ Three parts: 1. Review view, Approve, Changes panel and Close task. 2. Comments.
 - [ ] Reduce Motion reaches GPUI and stops spinners and easter-egg animations
 - [ ] Disabled controls and plain text are announced by VoiceOver (needs GPUI support or a contribution upstream)
 - [ ] Signed and notarized build installs on a clean Mac
+- [ ] The daemon's app socket accepts only the signed Swarm app: it reads the caller's audit token from the socket and checks its code signature, so a process an agent detached from its parent cannot get in (ADR 0008)
 - [ ] Docs website and product website are live
 
 ## 9. After first release

@@ -8,6 +8,7 @@ use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::time::Duration;
 
 use swarm_protocol::{
     DIFF_FILES, DIFF_LINE_BYTES, DIFF_LINES, DIFF_LINES_PER_FILE, DiffHunk, DiffLine, DiffLineKind,
@@ -15,6 +16,7 @@ use swarm_protocol::{
 };
 
 use crate::Error;
+use crate::process;
 
 /// Apps started from Finder get a minimal `PATH`, so known install folders come second.
 const FALLBACK_BINARIES: [&str; 3] = [
@@ -153,10 +155,35 @@ pub fn commit_of(root: &Path, revision: &str) -> Result<String, Error> {
 
 /// The commit where `HEAD` and `revision` split.
 pub fn merge_base(worktree: &Path, revision: &str) -> Result<String, Error> {
-    run(
+    merge_base_at(worktree, "HEAD", revision)
+}
+
+/// The commit where `tip` and `revision` split.
+pub fn merge_base_at(worktree: &Path, tip: &str, revision: &str) -> Result<String, Error> {
+    run(worktree, ["merge-base", "--end-of-options", tip, revision])
+}
+
+/// The commit at `HEAD` of `worktree`, read together with the branch `HEAD` points at,
+/// which must be `branch`. A detached `HEAD` or another branch is an error.
+pub fn branch_head(worktree: &Path, branch: &str) -> Result<String, Error> {
+    let printed = run(
         worktree,
-        ["merge-base", "--end-of-options", "HEAD", revision],
-    )
+        ["rev-parse", "HEAD", "--symbolic-full-name", "HEAD"],
+    )?;
+    let mut lines = printed.lines();
+    let (Some(commit), Some(reference)) = (lines.next(), lines.next()) else {
+        return Err(Error::Invalid(
+            "git did not print the commit at HEAD".to_owned(),
+        ));
+    };
+
+    if reference != format!("refs/heads/{branch}") {
+        return Err(Error::Invalid(format!(
+            "the task worktree is not on the task branch `{branch}`: check it out first"
+        )));
+    }
+
+    Ok(commit.to_owned())
 }
 
 /// What the working tree of `worktree` changed since `base`: committed and uncommitted
@@ -822,24 +849,26 @@ const COMMIT_MARK: &[u8] = b"\x01\x02swarm-commit\x02\x01";
 pub enum DiffScope {
     /// The working tree against `base`: committed, uncommitted and untracked work.
     WorkingTree,
-    /// `HEAD` against `base`: commits only.
+    /// The tip commit against `base`: commits only.
     Committed,
 }
 
 /// What `worktree` changed since `base`, as reviewable files: tracked changes from
 /// git's patch, and for [`DiffScope::WorkingTree`] untracked files as added files.
-/// Sorted by path. Spends `budget` on the hunk lines; files and lines past it are still
-/// counted and hashed. Retries once when the worktree changes while git runs.
+/// Sorted by path. [`DiffScope::Committed`] reads the commit `tip`. Spends `budget` on
+/// the hunk lines; files and lines past it are still counted and hashed. Retries once
+/// when the worktree changes while git runs.
 pub fn worktree_diff(
     worktree: &Path,
     base: &str,
+    tip: &str,
     scope: DiffScope,
     budget: &mut DiffBudget,
 ) -> Result<Vec<ChangedFile>, Error> {
     for _ in 0..2 {
         let mut attempt = *budget;
 
-        if let Some(files) = read_worktree_diff(worktree, base, scope, &mut attempt)? {
+        if let Some(files) = read_worktree_diff(worktree, (base, tip), scope, &mut attempt)? {
             *budget = attempt;
 
             return Ok(files);
@@ -878,14 +907,14 @@ impl Item {
 /// `None` when the patch and the numstat disagree.
 fn read_worktree_diff(
     worktree: &Path,
-    base: &str,
+    (base, tip): (&str, &str),
     scope: DiffScope,
     budget: &mut DiffBudget,
 ) -> Result<Option<Vec<ChangedFile>>, Error> {
-    let numstat = diff_command(worktree, base, scope, &["--numstat", "-z"])?;
+    let numstat = diff_command(worktree, (base, tip), scope, &["--numstat", "-z"])?;
     let patch = diff_command(
         worktree,
-        base,
+        (base, tip),
         scope,
         &["-p", "-U3", "--full-index", "--inter-hunk-context=0"],
     )?;
@@ -956,7 +985,7 @@ fn read_worktree_diff(
 
 fn diff_command(
     worktree: &Path,
-    base: &str,
+    (base, tip): (&str, &str),
     scope: DiffScope,
     options: &[&str],
 ) -> Result<Vec<u8>, Error> {
@@ -977,7 +1006,7 @@ fn diff_command(
     arguments.extend_from_slice(options);
     arguments.extend(["--end-of-options", base]);
     if scope == DiffScope::Committed {
-        arguments.push("HEAD");
+        arguments.push(tip);
     }
     arguments.push("--");
 
@@ -1450,8 +1479,17 @@ fn added_hunk(lines: u32) -> DiffHunk {
 /// The agent behind the newest commit in `base..HEAD` that carries a `Swarm-Agent`
 /// trailer and touched the path.
 pub fn attribution(worktree: &Path, base: &str) -> Result<HashMap<Vec<u8>, String>, Error> {
+    attribution_at(worktree, base, "HEAD")
+}
+
+/// Like [`attribution`], for the commits in `base..tip`.
+pub fn attribution_at(
+    worktree: &Path,
+    base: &str,
+    tip: &str,
+) -> Result<HashMap<Vec<u8>, String>, Error> {
     let format = "--format=%x01%x02swarm-commit%x02%x01%(trailers:key=Swarm-Agent,valueonly,unfold,separator=%x03)";
-    let range = format!("{base}..HEAD");
+    let range = format!("{base}..{tip}");
 
     let (arguments, output) = execute(
         worktree,
@@ -1635,6 +1673,235 @@ pub fn uncommitted_paths(worktree: &Path) -> Result<HashSet<Vec<u8>>, Error> {
         .collect())
 }
 
+/// The project's local branches, newest commit first.
+pub fn local_branches(root: &Path) -> Result<Vec<String>, Error> {
+    let listed = run(
+        root,
+        [
+            "for-each-ref",
+            "--sort=-committerdate",
+            "refs/heads",
+            "--format=%(refname:short)",
+        ],
+    )?;
+
+    Ok(listed
+        .lines()
+        .map(str::trim)
+        .filter(|branch| !branch.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+/// The URL of the `origin` remote, as git would use it. `None` without that remote.
+pub fn origin_url(root: &Path) -> Option<String> {
+    run(root, ["remote", "get-url", "origin"])
+        .ok()
+        .filter(|url| !url.is_empty())
+}
+
+/// The tool behind the `pre-push` hook git runs in `worktree`: "husky", "lefthook", or
+/// "pre-push" for any other executable hook. `None` without one.
+pub fn pre_push_hook(worktree: &Path) -> Option<String> {
+    let configured = run(
+        worktree,
+        ["config", "--type=path", "--get", "core.hooksPath"],
+    )
+    .ok()
+    .filter(|path| !path.is_empty())
+    .map(PathBuf::from);
+
+    let folder = match configured {
+        Some(path) if path.is_absolute() => path,
+        // Hooks run from the top of the worktree.
+        Some(path) => {
+            PathBuf::from(run(worktree, ["rev-parse", "--show-toplevel"]).ok()?).join(path)
+        }
+        None => PathBuf::from(
+            run(
+                worktree,
+                ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            )
+            .ok()?,
+        )
+        .join("hooks"),
+    };
+
+    let hook = folder.join("pre-push");
+    // Git skips a hook that is not executable.
+    if !crate::adapters::is_executable(&hook) {
+        return None;
+    }
+
+    if folder
+        .components()
+        .any(|part| part.as_os_str() == OsStr::new(".husky"))
+    {
+        return Some("husky".to_owned());
+    }
+
+    let mut head = Vec::new();
+    if let Ok(file) = std::fs::File::open(&hook)
+        && let Err(error) = file.take(8192).read_to_end(&mut head)
+    {
+        log::debug!("cannot read {}: {error}", hook.display());
+    }
+    let head = String::from_utf8_lossy(&head).to_lowercase();
+
+    let name = if head.contains("lefthook") {
+        "lefthook"
+    } else if head.contains("husky") {
+        "husky"
+    } else {
+        "pre-push"
+    };
+
+    Some(name.to_owned())
+}
+
+/// How many lines of a failed push the error carries.
+const PUSH_ERROR_LINES: usize = 40;
+
+/// A `git` that talks to `origin` from `worktree`: no prompts, and the daemon's own ssh
+/// agent when it has one.
+fn remote_command(worktree: &Path) -> Result<Command, Error> {
+    let mut command = Command::new(binary()?);
+    command
+        .arg("-C")
+        .arg(worktree)
+        .env("GIT_TERMINAL_PROMPT", "0");
+    if let Some(socket) = std::env::var_os("SSH_AUTH_SOCK") {
+        command.env("SSH_AUTH_SOCK", socket);
+    }
+
+    Ok(command)
+}
+
+/// Runs a push and returns what git and the hooks printed, or the last lines of it in an
+/// error. The push is killed after `timeout`.
+fn push(command: Command, timeout: Duration) -> Result<String, Error> {
+    let captured = process::capture(command, None, timeout, true).map_err(|source| Error::Io {
+        action: "run git push".to_owned(),
+        source,
+    })?;
+
+    let output = String::from_utf8_lossy(&captured.stdout);
+    let tail = process::last_lines(output.trim(), PUSH_ERROR_LINES);
+    if captured.success() {
+        return Ok(tail);
+    }
+
+    let what = if captured.status.is_none() {
+        format!(
+            "git push took longer than {} minutes",
+            timeout.as_secs().div_ceil(60)
+        )
+    } else {
+        "git push failed".to_owned()
+    };
+
+    Err(Error::Invalid(if tail.is_empty() {
+        what
+    } else {
+        format!("{what}:\n{tail}")
+    }))
+}
+
+/// Pushes exactly `commit` to `branch` on `origin`, as a fast-forward: a branch that
+/// moved on elsewhere is an error. The repository's `pre-push` hook runs as usual. A
+/// failure carries the last lines of what git and the hook printed; the push is killed
+/// after `timeout`.
+pub fn push_commit(
+    worktree: &Path,
+    commit: &str,
+    branch: &str,
+    timeout: Duration,
+) -> Result<(), Error> {
+    if branch.starts_with('-') {
+        return Err(Error::Invalid(format!(
+            "the branch {branch:?} must not start with \"-\""
+        )));
+    }
+    if commit.len() < 40 || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Error::Invalid(format!(
+            "{commit:?} is not a full commit id"
+        )));
+    }
+
+    let mut command = remote_command(worktree)?;
+    command
+        .args(["push", "--end-of-options", "origin"])
+        .arg(format!("{commit}:refs/heads/{branch}"));
+    push(command, timeout)?;
+
+    Ok(())
+}
+
+/// Makes `origin/<branch>` the upstream of the local `branch`, so `git status` in the
+/// worktree compares with it. Needs the remote-tracking branch, which a push updates.
+pub fn track_origin(worktree: &Path, branch: &str) -> Result<(), Error> {
+    run(
+        worktree,
+        [
+            "branch",
+            &format!("--set-upstream-to=origin/{branch}"),
+            "--end-of-options",
+            branch,
+        ],
+    )?;
+
+    Ok(())
+}
+
+/// Deletes `branch` on `origin`. A branch that is not there is fine. The `pre-push` hook
+/// is skipped: it has nothing to check for a deletion.
+pub fn delete_remote_branch(worktree: &Path, branch: &str, timeout: Duration) -> Result<(), Error> {
+    if branch.starts_with('-') {
+        return Err(Error::Invalid(format!(
+            "the branch {branch:?} must not start with \"-\""
+        )));
+    }
+
+    let mut command = remote_command(worktree)?;
+    command
+        .args([
+            "push",
+            "--no-verify",
+            "--delete",
+            "--end-of-options",
+            "origin",
+        ])
+        .arg(format!("refs/heads/{branch}"));
+
+    match push(command, timeout) {
+        Err(Error::Invalid(message)) if message.contains("remote ref does not exist") => Ok(()),
+        other => other.map(|_| ()),
+    }
+}
+
+/// How many commits `tip` has that `head` does not.
+pub fn commits_not_in(root: &Path, tip: &str, head: &str) -> Result<u32, Error> {
+    let range = format!("{head}..{tip}");
+    let counted = run(root, ["rev-list", "--count", "--end-of-options", &range])?;
+
+    counted
+        .parse()
+        .map_err(|_| Error::Invalid(format!("git counted {counted:?} commits")))
+}
+
+/// True when this repository has the remote-tracking branch `origin/<branch>`. Reads local
+/// refs only.
+pub fn origin_has_branch(root: &Path, branch: &str) -> Result<bool, Error> {
+    let reference = format!("refs/remotes/origin/{branch}");
+    let (arguments, output) = execute(root, ["show-ref", "--verify", "--quiet", &reference])?;
+
+    match (output.success, output.code) {
+        (true, _) => Ok(true),
+        (false, Some(1)) => Ok(false),
+        (false, _) => Err(failure(&arguments, &output)),
+    }
+}
+
 /// Forgets worktrees whose folder is gone.
 pub fn worktree_prune(root: &Path) -> Result<(), Error> {
     run(root, ["worktree", "prune"])?;
@@ -1692,7 +1959,7 @@ mod tests {
         std::thread::spawn(move || sender.send(work()).ok());
 
         receiver
-            .recv_timeout(std::time::Duration::from_secs(10))
+            .recv_timeout(Duration::from_secs(10))
             .expect("the call blocked")
     }
 

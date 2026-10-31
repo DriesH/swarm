@@ -415,6 +415,7 @@ fn add_big_diff(workspace: &mut Workspace) {
             task,
             source,
             fingerprint: 0xB16,
+            head: "big".to_owned(),
             stat,
             files,
         });

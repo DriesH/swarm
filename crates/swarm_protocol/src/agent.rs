@@ -72,6 +72,10 @@ pub enum Call {
     Agents,
     /// Task orchestrator: confirms the brief it started with (see `task_wait`).
     Confirm,
+    /// Task orchestrator: the pull request title and description the `pr draft` message
+    /// asked for. Refused unless the user approved the task as it is now. The app shows
+    /// the draft in its pull request panel. Returns nothing.
+    PrDraft { title: String, body: String },
 
     /// Start orchestrator: makes a task (branch, task worktree, tab, setup) and starts
     /// its orchestrator with `brief` as the first message. Returns [`TaskSummary`].
@@ -139,6 +143,7 @@ pub const HARNESS_CALLS: &[(&str, &str)] = &[
     ("notify", "notify"),
     ("agents", "agents"),
     ("confirm", "confirm"),
+    ("pr_draft", "pr draft"),
     ("task_create", "task create"),
     ("task_list", "task list"),
     ("task_wait", "task wait"),
@@ -413,6 +418,25 @@ mod tests {
                 "params": { "message": "feat: api", "paths": ["src/api.rs"] },
             })
         );
+    }
+
+    #[test]
+    fn a_pr_draft_carries_a_title_and_a_body() {
+        let call = Call::PrDraft {
+            title: "Add login".to_owned(),
+            body: "## What\n\n- login".to_owned(),
+        };
+
+        let value = serde_json::to_value(&call).expect("encode");
+
+        assert_eq!(
+            value,
+            json!({
+                "method": "pr_draft",
+                "params": { "title": "Add login", "body": "## What\n\n- login" },
+            })
+        );
+        assert!(HARNESS_CALLS.contains(&("pr_draft", "pr draft")));
     }
 
     #[test]

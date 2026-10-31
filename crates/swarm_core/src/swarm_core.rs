@@ -8,6 +8,8 @@ pub mod agents;
 pub mod comments;
 pub mod config;
 pub mod git;
+pub mod github;
+mod process;
 pub mod prompts;
 pub mod store;
 pub mod task;
@@ -22,12 +24,13 @@ use std::time::{Duration, Instant};
 
 use swarm_protocol::{
     AgentChange, AgentId, AgentInfo, AgentLifecycle, AgentRole, CloseCheck, CreateTask, DIFF_FILES,
-    DiffStat, FileChange, ProjectId, ProjectInfo, ReviewSource, TaskDiff, TaskId, TaskInfo,
-    TerminalId,
+    DiffStat, FileChange, GithubStatus, PrLink, ProjectId, ProjectInfo, ReviewSource, TaskDiff,
+    TaskId, TaskInfo, TerminalId,
 };
 use swarm_term::ExitStatus;
 
-use crate::config::{LoadedConfig, ProjectConfig};
+use crate::config::{ChecksConfig, LoadedConfig, ProjectConfig};
+use crate::github::Github;
 use crate::store::{NewTask, Store, StoredProject};
 use crate::task::BRANCH_PREFIX;
 
@@ -37,6 +40,8 @@ pub enum Error {
     GitMissing,
     #[error("{}", git_message(.command, .stderr))]
     Git { command: String, stderr: String },
+    #[error("{}", gh_message(.command, .output))]
+    Gh { command: String, output: String },
     #[error("cannot {action}: {source}")]
     Io {
         action: String,
@@ -59,6 +64,14 @@ fn git_message(command: &str, stderr: &str) -> String {
         format!("git {command} failed")
     } else {
         format!("git {command} failed: {stderr}")
+    }
+}
+
+fn gh_message(command: &str, output: &str) -> String {
+    if output.is_empty() {
+        format!("gh {command} failed")
+    } else {
+        format!("gh {command} failed: {output}")
     }
 }
 
@@ -288,6 +301,10 @@ impl Projects {
             None => git::default_base_branch(&root, config.worktrees.base_branch.as_deref()),
         };
         git::verify_start_point(&root, &base)?;
+        let pr_base = match &request.from {
+            Some(from) if git::origin_has_branch(&root, from).unwrap_or(false) => from.clone(),
+            _ => git::default_base_branch(&root, config.worktrees.base_branch.as_deref()),
+        };
 
         let folder = root.join(&config.worktrees.folder);
         task::create_folder_inside(&root, &folder)?;
@@ -308,7 +325,18 @@ impl Projects {
         git::worktree_add(&root, &branch, &worktree, &base)?;
 
         let recorded = self.record(
-            &root, &config, request, name, &branch, &base, &worktree, &ports, created_by,
+            &root,
+            &config,
+            request,
+            &TaskNames {
+                name,
+                branch: &branch,
+                base: &base,
+                pr_base: &pr_base,
+            },
+            &worktree,
+            &ports,
+            created_by,
         );
         let task = match recorded {
             Ok(task) => task,
@@ -546,15 +574,41 @@ impl Projects {
 
     /// An open task. Unknown and closed tasks are errors.
     pub fn task(&self, id: TaskId) -> Result<TaskInfo, Error> {
-        lock(&self.store)
+        let mut task = lock(&self.store)
             .task(id)?
-            .ok_or_else(|| Error::Invalid(format!("no open task with id {}", id.0)))
+            .ok_or_else(|| Error::Invalid(format!("no open task with id {}", id.0)))?;
+        self.fill_pr_base(&mut task);
+
+        Ok(task)
+    }
+
+    /// A task from before `pr_base` was recorded gets the project's base branch.
+    fn fill_pr_base(&self, task: &mut TaskInfo) {
+        if !task.pr_base.is_empty() {
+            return;
+        }
+
+        task.pr_base = match self.project_root(task.project) {
+            Some(root) => project_base_branch(&root),
+            None => task.base.clone(),
+        };
     }
 
     /// The changes of a task. `Merged` is the commits of the task branch since it left
     /// its base. `Live` is the task worktree as it is now, and adds each worker with its
     /// own worktree that is not merged yet.
     pub fn task_diff(&self, id: TaskId, source: ReviewSource) -> Result<TaskDiff, Error> {
+        self.diff_at(id, source, None)
+    }
+
+    /// Like [`Projects::task_diff`]. With `commit`, `Merged` reads that commit instead of
+    /// the current `HEAD` of the task worktree.
+    fn diff_at(
+        &self,
+        id: TaskId,
+        source: ReviewSource,
+        commit: Option<&str>,
+    ) -> Result<TaskDiff, Error> {
         // The store lock is gone before git runs.
         let (task, agents) = {
             let store = lock(&self.store);
@@ -573,7 +627,11 @@ impl Projects {
             )));
         }
 
-        let base = git::merge_base(&task.worktree, &task.base)?;
+        let head = match commit {
+            Some(commit) => commit.to_owned(),
+            None => git::commit_of(&task.worktree, "HEAD")?,
+        };
+        let base = git::merge_base_at(&task.worktree, &head, &task.base)?;
         let mut sections = vec![Section {
             worktree: task.worktree.clone(),
             base,
@@ -615,8 +673,14 @@ impl Projects {
 
         let (mut stat, mut files) = (DiffStat::default(), Vec::new());
         for section in &sections {
+            let tip = if section.owner.is_some() {
+                "HEAD"
+            } else {
+                head.as_str()
+            };
             let changed =
-                match git::worktree_diff(&section.worktree, &section.base, scope, &mut budget) {
+                match git::worktree_diff(&section.worktree, &section.base, tip, scope, &mut budget)
+                {
                     Ok(changed) => changed,
                     Err(error) if section.owner.is_some() => {
                         log::warn!("cannot read {}: {error}", section.worktree.display());
@@ -628,7 +692,7 @@ impl Projects {
             let (trailers, uncommitted) = match section.owner {
                 Some(_) => (HashMap::new(), HashSet::new()),
                 None => (
-                    git::attribution(&section.worktree, &section.base)?,
+                    git::attribution_at(&section.worktree, &section.base, &head)?,
                     match source {
                         ReviewSource::Live => git::uncommitted_paths(&section.worktree)?,
                         ReviewSource::Merged => HashSet::new(),
@@ -670,6 +734,7 @@ impl Projects {
             task: id,
             source,
             fingerprint: fingerprint.finish(),
+            head,
             stat,
             files,
         })
@@ -693,6 +758,128 @@ impl Projects {
         lock(&self.store).set_approved(id, fingerprint)?;
 
         self.task(id)
+    }
+
+    /// The task, when the user approved the Merged changes as they are now.
+    pub fn check_approved(&self, id: TaskId) -> Result<TaskInfo, Error> {
+        let head = git::commit_of(&self.task(id)?.worktree, "HEAD")?;
+
+        self.check_approved_at(id, &head)
+    }
+
+    /// The task, when the user approved the Merged changes as they are at `commit`.
+    pub fn check_approved_at(&self, id: TaskId, commit: &str) -> Result<TaskInfo, Error> {
+        let task = self.task(id)?;
+        let Some(approved) = task.approved else {
+            return Err(Error::Invalid(
+                "the task is not approved: approve its changes in Review first".to_owned(),
+            ));
+        };
+
+        let current = self.diff_at(id, ReviewSource::Merged, Some(commit))?;
+        if current.fingerprint != approved {
+            return Err(Error::Invalid(
+                "the changes changed since you approved them: approve them again".to_owned(),
+            ));
+        }
+
+        Ok(task)
+    }
+
+    /// The folder of the project's repository.
+    pub fn project_path(&self, project: ProjectId) -> Result<PathBuf, Error> {
+        lock(&self.store)
+            .project(project)?
+            .map(|stored| stored.path)
+            .ok_or(Error::UnknownProject(project.0))
+    }
+
+    /// `gh`, its sign-in and the `origin` remote of the project.
+    pub fn github_status(
+        &self,
+        github: &Github,
+        project: ProjectId,
+    ) -> Result<GithubStatus, Error> {
+        let root = self.project_path(project)?;
+
+        Ok(github.status(&root))
+    }
+
+    /// The project's local branches, newest commit first.
+    pub fn local_branches(&self, project: ProjectId) -> Result<Vec<String>, Error> {
+        git::local_branches(&self.project_path(project)?)
+    }
+
+    /// `owner/name` of the project's `origin`, when it is on github.com.
+    pub fn repository(&self, project: ProjectId) -> Result<Option<String>, Error> {
+        let root = self.project_path(project)?;
+
+        Ok(git::origin_url(&root).and_then(|url| github::parse_repository(&url)))
+    }
+
+    /// `[checks]` of the project's config. A config with a problem is an error, so a
+    /// broken file never counts as "no checks".
+    pub fn checks_config(&self, project: ProjectId) -> Result<ChecksConfig, Error> {
+        let LoadedConfig { config, error } = config::load(&self.project_path(project)?);
+        if let Some(error) = error {
+            return Err(Error::Invalid(format!(
+                "the project config has a problem: {error}"
+            )));
+        }
+
+        Ok(config.checks)
+    }
+
+    /// Records the pull request of the task.
+    pub fn set_pull_request(
+        &self,
+        id: TaskId,
+        link: &PrLink,
+        close_after_merge: bool,
+    ) -> Result<TaskInfo, Error> {
+        lock(&self.store).set_pull_request(id, link, close_after_merge)?;
+
+        self.task(id)
+    }
+
+    /// Records the commit last pushed to the task's pull request.
+    pub fn set_pull_request_head(&self, id: TaskId, head: &str) -> Result<TaskInfo, Error> {
+        self.task(id)?;
+        lock(&self.store).set_pull_request_head(id, head)?;
+
+        self.task(id)
+    }
+
+    /// How many commits the local branch has that `head` does not.
+    pub fn commits_outside(
+        &self,
+        project: ProjectId,
+        branch: &str,
+        head: &str,
+    ) -> Result<u32, Error> {
+        let root = self.project_path(project)?;
+
+        git::commits_not_in(&root, &format!("refs/heads/{branch}"), head)
+    }
+
+    pub fn set_close_after_merge(&self, id: TaskId, close: bool) -> Result<TaskInfo, Error> {
+        self.task(id)?;
+        lock(&self.store).set_close_after_merge(id, close)?;
+
+        self.task(id)
+    }
+
+    /// Deletes a local branch whose commits are all in a merged pull request. A squash
+    /// merge leaves the branch looking unmerged, so closing a task keeps it. The caller
+    /// checked that no commit is lost. Missing branches are fine.
+    pub fn delete_merged_branch(&self, project: ProjectId, branch: &str) -> Result<(), Error> {
+        let root = self.project_path(project)?;
+
+        if git::branch_exists(&root, branch)? {
+            git::branch_delete(&root, branch)?;
+        }
+
+        Ok(())
     }
 
     /// What closing the task would throw away.
@@ -823,9 +1010,10 @@ impl Projects {
         }
 
         let stopped = lock(&self.store).close_task(id)?;
-        let task = lock(&self.store)
+        let mut task = lock(&self.store)
             .task_including_closed(id)?
             .ok_or_else(|| Error::Invalid(format!("no task with id {}", id.0)))?;
+        self.fill_pr_base(&mut task);
 
         Ok(ClosedTask { task, stopped })
     }
@@ -851,9 +1039,7 @@ impl Projects {
         root: &Path,
         config: &ProjectConfig,
         request: &CreateTask,
-        name: &str,
-        branch: &str,
-        base: &str,
+        names: &TaskNames<'_>,
         worktree: &Path,
         ports: &[u16],
         created_by: Option<AgentId>,
@@ -863,9 +1049,10 @@ impl Projects {
         lock(&self.store).add_task_by(
             &NewTask {
                 project: request.project,
-                name,
-                branch,
-                base,
+                name: names.name,
+                branch: names.branch,
+                base: names.base,
+                pr_base: names.pr_base,
                 worktree,
                 ports,
             },
@@ -877,7 +1064,12 @@ impl Projects {
         let LoadedConfig { config, error } = config::load(&project.path);
         let base_branch =
             git::default_base_branch(&project.path, config.worktrees.base_branch.as_deref());
-        let tasks = lock(&self.store).list_tasks(project.id)?;
+        let mut tasks = lock(&self.store).list_tasks(project.id)?;
+        for task in &mut tasks {
+            if task.pr_base.is_empty() {
+                task.pr_base.clone_from(&base_branch);
+            }
+        }
 
         Ok(ProjectInfo {
             id: project.id,
@@ -889,6 +1081,22 @@ impl Projects {
             start: lock(&self.store).start_agent(project.id)?,
         })
     }
+}
+
+/// The names a task is recorded with.
+struct TaskNames<'a> {
+    name: &'a str,
+    branch: &'a str,
+    base: &'a str,
+    pr_base: &'a str,
+}
+
+/// The branch the project's pull requests merge into: the configured one, else the one
+/// `origin/HEAD` points at, else the current branch.
+fn project_base_branch(root: &Path) -> String {
+    let LoadedConfig { config, .. } = config::load(root);
+
+    git::default_base_branch(root, config.worktrees.base_branch.as_deref())
 }
 
 /// One worktree of a task diff and who owns its files.
@@ -1032,7 +1240,9 @@ fn remove_task_leftovers(root: &Path, branch: &str, worktree: &Path) {
     }
 }
 
-fn task_env(task: &TaskInfo) -> Vec<(String, String)> {
+/// `SWARM_TASK`, `SWARM_PORT` and `SWARM_PORTS` of a task: the environment of its setup
+/// script and of its local checks.
+pub fn task_env(task: &TaskInfo) -> Vec<(String, String)> {
     ports_env(task.id, &task.ports)
 }
 

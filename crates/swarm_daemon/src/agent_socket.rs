@@ -311,14 +311,17 @@ mod tests {
         use std::sync::Mutex;
 
         use swarm_core::Projects;
+        use swarm_core::github::Github;
         use swarm_core::store::{NewTask, Store};
         use swarm_protocol::{AgentKind, AgentRole};
 
         use crate::Services;
         use crate::agents::{AgentConfig, Agents, Place};
+        use crate::checks::Checks;
         use crate::hub::{Clients, Terminals};
         use crate::messages::Messages;
         use crate::processes::Processes;
+        use crate::pull_requests::PullRequests;
 
         let store = Store::open_in_memory().expect("store");
         let project = store
@@ -330,6 +333,7 @@ mod tests {
                 name: "Task",
                 branch: "swarm/task",
                 base: "main",
+                pr_base: "main",
                 worktree: Path::new("/repo/.worktrees/task"),
                 ports: &[],
             })
@@ -344,6 +348,7 @@ mod tests {
                 socket: PathBuf::from("/tmp/none.sock"),
                 settings: None,
                 swarm: PathBuf::from("/tmp/swarm"),
+                github: Github::with_folders(PathBuf::from("/tmp/none-bin"), None, Vec::new()),
             },
             Arc::clone(&store),
             Arc::clone(&terminals),
@@ -358,6 +363,8 @@ mod tests {
             .expect("register");
         let token = agents.token_for_test(agent.id).expect("token");
 
+        let projects = Arc::new(Projects::new(Arc::clone(&store)));
+        let github = Github::with_folders(PathBuf::from("/tmp/none-bin"), None, Vec::new());
         let services = Arc::new(Services {
             processes: Processes::new(
                 Arc::clone(&store),
@@ -366,8 +373,15 @@ mod tests {
                 Arc::clone(&messages),
                 Arc::clone(&agents),
             ),
+            checks: Checks::new(
+                Arc::clone(&projects),
+                Arc::clone(&terminals),
+                Arc::clone(&clients),
+                Arc::clone(&agents),
+            ),
+            pull_requests: PullRequests::new(github, None),
             terminals,
-            projects: Arc::new(Projects::new(Arc::clone(&store))),
+            projects,
             agents,
             clients,
             messages: Arc::clone(&messages),

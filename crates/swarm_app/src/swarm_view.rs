@@ -118,7 +118,9 @@ impl Curve {
 
 fn kind_color(kind: MessageKind, colors: &ThemeColors) -> Hsla {
     match kind {
-        MessageKind::Brief | MessageKind::Task | MessageKind::Comment => colors.accent,
+        MessageKind::Brief | MessageKind::Task | MessageKind::Comment | MessageKind::PrDraft => {
+            colors.accent
+        }
         MessageKind::Question => colors.warn,
         MessageKind::Report => colors.ok,
         MessageKind::TerminalExited | MessageKind::UserInput | MessageKind::WorkerStopped => {
@@ -2069,7 +2071,7 @@ fn capitalised(word: &str) -> String {
 /// The text and fill of a message kind's tag.
 fn kind_tag_colors(kind: MessageKind, colors: &ThemeColors) -> (Hsla, Hsla) {
     match kind {
-        MessageKind::Brief | MessageKind::Task | MessageKind::Comment => {
+        MessageKind::Brief | MessageKind::Task | MessageKind::Comment | MessageKind::PrDraft => {
             (colors.accent, colors.accent_bg)
         }
         MessageKind::Question => (colors.warn, colors.warn_bg),
