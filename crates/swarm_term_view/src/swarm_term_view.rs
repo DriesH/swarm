@@ -68,6 +68,7 @@ pub struct TerminalView {
 #[derive(Default)]
 struct PaintInfo {
     cursor_bounds: Option<Bounds<Pixels>>,
+    paints: u64,
 }
 
 impl TerminalView {
@@ -152,8 +153,20 @@ impl TerminalView {
         Metrics::measure(window).grid_for(bounds)
     }
 
-    /// Lets `allowed` decide, for every key, paste and text input, whether it reaches the
-    /// program. Without it all typing is allowed. Scrolling and focus work either way, and
+    /// The exact size of one cell, as the view paints it. The cell sizes in
+    /// [`size_for`](Self::size_for) are whole pixels, which is too narrow for a tile that
+    /// must hold a number of columns.
+    pub fn cell_size(window: &Window, _cx: &App) -> Size<Pixels> {
+        let metrics = Metrics::measure(window);
+
+        Size {
+            width: metrics.cell_width,
+            height: metrics.line_height,
+        }
+    }
+
+    /// Lets `allowed` decide, for every key, paste, text input and composing text, whether it
+    /// reaches the program. Without it all typing is allowed. Scrolling and focus work either way, and
     /// a key that is not allowed bubbles up like a key the view does not handle.
     pub fn set_typing_gate(&mut self, allowed: impl Fn(&App) -> bool + 'static) {
         self.typing_gate = Some(Rc::new(allowed));
@@ -161,6 +174,12 @@ impl TerminalView {
 
     fn typing_allowed(&self, cx: &App) -> bool {
         self.typing_gate.as_ref().is_none_or(|allowed| allowed(cx))
+    }
+
+    /// How many times the view was painted. Tests use it to see that a view is drawn once
+    /// per frame, and only where it is shown.
+    pub fn paint_count(&self) -> u64 {
+        self.paint_info.paints
     }
 
     /// How many lines the view is scrolled back from the bottom.
@@ -677,7 +696,8 @@ impl EntityInputHandler for TerminalView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.marked_text = (!new_text.is_empty()).then(|| new_text.to_owned());
+        let shown = !new_text.is_empty() && self.typing_allowed(cx);
+        self.marked_text = shown.then(|| new_text.to_owned());
         cx.notify();
     }
 

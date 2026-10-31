@@ -81,8 +81,8 @@ impl Metrics {
         let width = bounds.width - PADDING * 2.;
         let height = bounds.height - PADDING * 2.;
 
-        let cols = (width / self.cell_width).floor().max(2.);
-        let rows = (height / self.line_height).floor().max(1.);
+        let cols = whole_cells(width / self.cell_width).max(2.);
+        let rows = whole_cells(height / self.line_height).max(1.);
 
         swarm_term::Size {
             cols: to_u16(cols),
@@ -91,6 +91,11 @@ impl Metrics {
             cell_height: to_u16(f32::from(self.line_height)),
         }
     }
+}
+
+/// Rounds down, but forgives the float error of a bounds that is exactly n cells wide.
+fn whole_cells(cells: f32) -> f32 {
+    (cells + 1e-3).floor()
 }
 
 #[expect(
@@ -478,6 +483,8 @@ impl Element for TerminalElement {
                 origin.y + metrics.line_height * f32::from(u16::try_from(row).unwrap_or(u16::MAX)),
             )
         };
+
+        self.view.update(cx, |view, _| view.paint_info.paints += 1);
 
         let focus_handle = self.view.read(cx).focus_handle.clone();
         window.handle_input(

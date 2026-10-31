@@ -372,6 +372,32 @@ fn a_closed_typing_gate_keeps_typing_from_the_program(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn a_closed_typing_gate_keeps_composing_text_off_the_screen(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    let open = Rc::new(Cell::new(false));
+    gate(&mut setup, &open);
+    let terminal = setup.terminal.clone();
+    let mark = |setup: &mut Setup<'_>| {
+        setup.cx.update(|window, cx| {
+            terminal.update(cx, |view, cx| {
+                view.replace_and_mark_text_in_range(None, "か", None, window, cx);
+            });
+        });
+
+        setup
+            .cx
+            .update(|window, cx| terminal.update(cx, |view, cx| view.marked_text_range(window, cx)))
+    };
+
+    let closed = mark(&mut setup);
+    open.set(true);
+    let opened = mark(&mut setup);
+
+    assert_eq!(closed, None);
+    assert_eq!(opened, Some(0..1));
+}
+
+#[gpui::test]
 fn an_open_typing_gate_lets_typing_through_again(cx: &mut TestAppContext) {
     let mut setup = setup(cx);
     let open = Rc::new(Cell::new(false));
