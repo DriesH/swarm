@@ -7,8 +7,9 @@ use std::rc::Rc;
 use gpui::{Hsla, SharedString, rgb};
 use swarm_protocol::{
     AgentId as DaemonAgentId, AgentInfo, AgentLifecycle, AgentRole,
-    AgentStatus as DaemonAgentStatus, DiffStat, FileStat, MessageId, MessageInfo, MessageKind,
-    ProjectInfo, ReviewSource, TaskDiff, TaskInfo, TerminalId as DaemonTerminalId, TerminalInfo,
+    AgentStatus as DaemonAgentStatus, CommentEvent, DiffStat, FileStat, MessageId, MessageInfo,
+    MessageKind, ProjectInfo, ReviewComment, ReviewSource, TaskDiff, TaskInfo,
+    TerminalId as DaemonTerminalId, TerminalInfo,
 };
 use swarm_term::{BlockedKind, ExitStatus};
 use swarm_ui::AgentStatus;
@@ -488,6 +489,8 @@ pub(crate) struct FakeData {
     pub agent_changes: HashMap<AgentId, AgentChanges>,
     /// The latest diff of each task and source, see [`FakeData::diff_id`].
     pub diffs: HashMap<(swarm_protocol::TaskId, ReviewSource), Rc<TaskDiff>>,
+    /// The review comments of each task, oldest first, under [`FakeData::diff_id`].
+    pub comments: HashMap<swarm_protocol::TaskId, Rc<[ReviewComment]>>,
 }
 
 /// What an agent changed: the totals and the files, most changed lines first.
@@ -956,6 +959,15 @@ impl FakeData {
 
             self.diffs.insert((task, source), Rc::new(diff));
         }
+
+        if let (Some(live), Some(merged)) = (
+            self.diffs.get(&(task, ReviewSource::Live)),
+            self.diffs.get(&(task, ReviewSource::Merged)),
+        ) {
+            let comments = crate::review_model::sample_comments(live, merged, agents, SAMPLE_NOW);
+
+            self.comments.insert(task, comments.into());
+        }
     }
 
     /// What each worker of the sample task changed.
@@ -1389,6 +1401,36 @@ impl FakeData {
         self.diffs.get(&(self.diff_id(task)?, source))
     }
 
+    /// The review comments of a tab, oldest first.
+    pub(crate) fn task_comments(&self, task: TaskId) -> Rc<[ReviewComment]> {
+        self.diff_id(task)
+            .and_then(|id| self.comments.get(&id))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The comments of a task by its daemon id.
+    pub(crate) fn task_list(&self, task: swarm_protocol::TaskId) -> Rc<[ReviewComment]> {
+        self.comments.get(&task).cloned().unwrap_or_default()
+    }
+
+    /// Replaces a task's comments with the daemon's list.
+    pub(crate) fn set_comments(&mut self, task: swarm_protocol::TaskId, list: Vec<ReviewComment>) {
+        self.comments.insert(task, list.into());
+    }
+
+    /// Applies a comment event of the daemon.
+    pub(crate) fn apply_comment_event(&mut self, event: &CommentEvent) {
+        let task = match event {
+            CommentEvent::Changed(comment) => comment.task,
+            CommentEvent::Deleted { task, .. } => *task,
+        };
+        let mut list = self.task_list(task).to_vec();
+
+        crate::review_model::apply_comment_event(&mut list, event);
+        self.set_comments(task, list);
+    }
+
     /// The totals of a tab's Live diff, zero while it is unknown.
     pub(crate) fn live_stat(&self, task: TaskId) -> DiffStat {
         self.task_diff(task, ReviewSource::Live)
@@ -1565,6 +1607,7 @@ impl FakeData {
     pub(crate) fn remove_task(&mut self, task: TaskId) -> Vec<TerminalId> {
         if let Some(id) = self.diff_id(task) {
             self.diffs.retain(|(other, _), _| *other != id);
+            self.comments.remove(&id);
         }
 
         let mut gone = self.remove_agents_of(task);

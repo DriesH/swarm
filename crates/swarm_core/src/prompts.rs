@@ -456,7 +456,7 @@ mod tests {
 
     #[test]
     fn the_orchestrator_knows_what_to_do_with_every_swarm_message() {
-        for kind in ["user input", "terminal exited", "worker stopped"] {
+        for kind in ["user input", "terminal exited", "worker stopped", "comment"] {
             assert!(ORCHESTRATOR.contains(&format!("`{kind}`")), "{kind}");
         }
     }

@@ -197,6 +197,11 @@ Live comments are anchored to the code text, not line numbers. If the agent rewr
 - **Viewed** is per file and resets when the file's diff changes. A viewed file folds. Keys: `j` / `k` next or previous file, `v` viewed.
 - The source starts as Live while a worker of the task works, else Merged; the user's pick then stays for that task.
 - **Approve** works only on Merged. The daemon stores a fingerprint of the Merged diff (a hash of every changed line, file mode and blob). When the diff changes, the approval no longer counts and Review shows **Approve** again.
+- **Comments**: the **+** on a line's gutter, or `c` on the line cursor (moved with ↑ / ↓), opens a comment box under the line; ⌘↩ adds it and Esc cancels. On Live the comment goes at once; on Merged it waits as **Pending** until **Request changes · N** sends all pending comments, packed into messages of at most 64 KiB. A comment holds at most 16 KiB, so the orchestrator can pass it on with its header. **Approve** stays off while comments are pending, and the daemon refuses it too. Sending is refused while the task's orchestrator is stopped.
+- Comments go to the task orchestrator as `comment` messages (ADR 0002). Each names the worker that owns the file (its own worktree, or the newest `swarm commit` of the file), and the orchestrator passes it on or handles it.
+- A thread shows the state (**Pending**, **Sent** with its time, **Resolved**), the route (`→ orchestrator → term-render`) and the user's replies. A reply follows its thread: it is sent at once unless the thread still waits. **Resolve** folds the thread. A pending comment can be deleted.
+- Anchors: a comment keeps the line's text and its neighbors. Each time the comments are listed, the daemon finds the line again in the file as it is now, preferring a match with the same neighbors and the one nearest to where it was. When the text is gone, the comment is **Outdated** and shows at the top of its file card.
+- Agents do not reply to comments in v1; they answer through the orchestrator's normal messages.
 - Large diffs: at most 1,000 files, 5,000 lines per file and 50,000 lines in total are sent; the totals still count everything. The list is virtualized.
 
 ### Pull requests

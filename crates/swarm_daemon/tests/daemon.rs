@@ -15,9 +15,9 @@ use std::time::{Duration, Instant};
 use swarm_core::store::Store;
 use swarm_protocol::{
     AgentChange, AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, CallId,
-    CloseCheck, CreateTask, CreateTerminal, DiffStat, Event, FileStat, MessageInfo, MessageKind,
-    ProjectId, ProjectInfo, Request, ReviewSource, TaskDiff, TaskId, TaskInfo, TerminalId,
-    TerminalInfo, TerminalKind, VERSION, read, write,
+    CloseCheck, CommentId, CommentState, CreateTask, CreateTerminal, DiffStat, Event, FileStat,
+    MessageInfo, MessageKind, ProjectId, ProjectInfo, Request, ReviewSource, TaskDiff, TaskId,
+    TaskInfo, TerminalId, TerminalInfo, TerminalKind, VERSION, read, write,
 };
 use swarm_term::{
     BlockedKind, ExitStatus, Palette, ProgramState, Rgb, Row, Size, TerminalInput, TerminalOutput,
@@ -1002,11 +1002,16 @@ impl Fixture {
 
     /// Waits for a file the script wrote and returns its text.
     fn read_when_written(&self, name: &str) -> String {
+        self.read_when(name, |text| !text.is_empty())
+    }
+
+    /// The fake agent writes in pieces, so wait for the text the test needs.
+    fn read_when(&self, name: &str, done: impl Fn(&str) -> bool) -> String {
         let path = self.out.join(name);
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             if let Ok(text) = std::fs::read_to_string(&path)
-                && !text.is_empty()
+                && done(&text)
             {
                 return text;
             }
@@ -3968,4 +3973,410 @@ sleep 300"#,
         AgentLifecycle::Stopped,
         "not resumed"
     );
+}
+
+fn comment_at(
+    task: &TaskInfo,
+    source: ReviewSource,
+    line: u32,
+    text: &str,
+    body: &str,
+) -> swarm_protocol::NewComment {
+    swarm_protocol::NewComment {
+        task: task.id,
+        parent: None,
+        source,
+        anchor: swarm_protocol::CommentAnchor {
+            worktree: task.worktree.clone(),
+            path: PathBuf::from("api.txt"),
+            side: swarm_protocol::DiffSide::New,
+            line,
+            text: text.to_owned(),
+            before: None,
+            after: None,
+        },
+        body: body.to_owned(),
+    }
+}
+
+fn changed(events: &[Event]) -> Vec<swarm_protocol::ReviewComment> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::CommentChanged { comment } => Some(comment.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn comment_messages(events: &[Event]) -> Vec<MessageInfo> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::MessageSent { message } if message.kind == MessageKind::Comment => {
+                Some(message.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+impl Client {
+    fn list_comments(&mut self, task: TaskId) -> Vec<swarm_protocol::ReviewComment> {
+        self.send(&Request::ListComments { call: CALL, task });
+
+        self.wait_for(|event| match event {
+            Event::Comments {
+                call: CALL,
+                comments,
+            } => Some(comments.clone()),
+            _ => None,
+        })
+    }
+
+    fn add_comment(&mut self, comment: swarm_protocol::NewComment) -> Result<Vec<Event>, String> {
+        self.until_done(&Request::AddComment {
+            call: CALL,
+            comment,
+        })
+    }
+}
+
+const COMMENT_ORCHESTRATOR: &str = r#"case "$SWARM_ROLE" in
+orchestrator)
+  printf '\033]7501;state=idle\007'
+  IFS= read -r line
+  printf '\033]7501;state=working\007'
+  swarm confirm > "$OUT/confirm.out" 2>&1
+  swarm spawn api --brief "build the api" > "$OUT/spawn.out" 2>&1
+  swarm wait --timeout 60 > "$OUT/report.out" 2>&1
+  printf '\033]7501;state=idle\007'
+  while IFS= read -r l; do printf '%s\n' "$l" >> "$OUT/inbox"; done
+  ;;
+worker)
+  printf '\033]7501;state=idle\007'
+  IFS= read -r line
+  printf '\033]7501;state=working\007'
+  printf 'one\ntwo\n' > api.txt
+  swarm commit -m "feat: api" api.txt > "$OUT/commit.out" 2>&1
+  swarm report "done" > "$OUT/report-sent.out" 2>&1
+  printf '\033]7501;state=idle\007'
+  sleep 30
+  ;;
+esac"#;
+
+#[test]
+fn a_live_comment_reaches_the_orchestrator_and_names_the_worker() {
+    let fixture = Fixture::new(COMMENT_ORCHESTRATOR);
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, task) = start_task(&daemon, &repo);
+    let report = client.wait_for_message(|message| message.kind == MessageKind::Report);
+    let worker = report.from.expect("the worker wrote the report");
+
+    let events = client
+        .add_comment(comment_at(&task, ReviewSource::Live, 2, "two", "Cache it."))
+        .expect("added");
+
+    let messages = comment_messages(&events);
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].from, None);
+    assert_eq!(messages[0].to, task.agents[0].id);
+    let id = changed(&events)[0].id;
+    assert_eq!(
+        messages[0].text,
+        format!("#{} for api · \"api.txt\":2\n> two\nCache it.", id.0)
+    );
+    let sent = changed(&events);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].state, CommentState::Sent);
+    assert_eq!(sent[0].to, Some(worker));
+    assert!(sent[0].sent_at.is_some());
+
+    let delivered = events.iter().any(|event| {
+        matches!(event, Event::MessagesDelivered { ids, .. } if ids.contains(&messages[0].id))
+    });
+    if !delivered {
+        client.wait_for(|event| match event {
+            Event::MessagesDelivered { ids, .. } if ids.contains(&messages[0].id) => Some(()),
+            _ => None,
+        });
+    }
+    let inbox = fixture.read_when("inbox", |text| text.contains("Cache it."));
+    assert!(inbox.contains("Cache it."), "{inbox}");
+
+    assert_eq!(client.list_comments(task.id)[0].id, id);
+}
+
+#[test]
+fn merged_comments_wait_and_are_sent_together() {
+    let fixture = Fixture::new("sleep 60");
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let task = client.create_task(orchestrator_task(project.id, false));
+    std::fs::write(task.worktree.join("api.txt"), "one\ntwo\n").expect("file");
+    commit_all(&task.worktree);
+
+    let first = client
+        .add_comment(comment_at(&task, ReviewSource::Merged, 1, "one", "A"))
+        .expect("first");
+    let second = client
+        .add_comment(comment_at(&task, ReviewSource::Merged, 2, "two", "B"))
+        .expect("second");
+
+    assert!(comment_messages(&first).is_empty());
+    assert_eq!(changed(&first)[0].state, CommentState::Pending);
+    let (one, two) = (changed(&first)[0].id, changed(&second)[0].id);
+
+    let reply = client
+        .until_done(&Request::AddComment {
+            call: CALL,
+            comment: swarm_protocol::NewComment {
+                parent: Some(one),
+                ..comment_at(&task, ReviewSource::Live, 9, "ignored", "R")
+            },
+        })
+        .expect("reply");
+    assert!(comment_messages(&reply).is_empty(), "the parent waits");
+    assert_eq!(changed(&reply)[0].anchor.text, "one");
+    let reply_id = changed(&reply)[0].id;
+
+    let events = client
+        .until_done(&Request::SendComments {
+            call: CALL,
+            task: task.id,
+        })
+        .expect("sent");
+
+    let messages = comment_messages(&events);
+    assert_eq!(messages.len(), 1);
+    assert!(
+        messages[0].text.starts_with("3 comments:\n\n"),
+        "{}",
+        messages[0].text
+    );
+    assert_eq!(
+        changed(&events)
+            .iter()
+            .map(|comment| comment.id)
+            .collect::<Vec<_>>(),
+        [one, two, reply_id]
+    );
+    assert!(
+        changed(&events)
+            .iter()
+            .all(|comment| comment.state == CommentState::Sent)
+    );
+    assert!(
+        client
+            .until_done(&Request::SendComments {
+                call: CALL,
+                task: task.id,
+            })
+            .is_err(),
+        "nothing waits"
+    );
+
+    let resolved = client
+        .until_done(&Request::ResolveComment {
+            call: CALL,
+            id: one,
+            resolved: true,
+        })
+        .expect("resolved");
+    assert_eq!(changed(&resolved)[0].state, CommentState::Resolved);
+    assert!(
+        client
+            .until_done(&Request::ResolveComment {
+                call: CALL,
+                id: reply_id,
+                resolved: true,
+            })
+            .is_err()
+    );
+    assert!(
+        client
+            .until_done(&Request::DeleteComment {
+                call: CALL,
+                id: two,
+            })
+            .is_err(),
+        "sent comments stay"
+    );
+
+    client.close_task(task.id).expect("closed");
+    assert!(client.list_comments(task.id).is_empty());
+}
+
+#[test]
+fn deleting_a_pending_comment_deletes_its_replies_and_tells_everyone() {
+    let fixture = Fixture::new("sleep 60");
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let mut watcher = daemon.connect();
+    watcher.hello();
+    let project = client.add_project(&repo.root);
+    let task = client.create_task(orchestrator_task(project.id, false));
+    let parent = changed(
+        &client
+            .add_comment(comment_at(&task, ReviewSource::Merged, 1, "one", "A"))
+            .expect("parent"),
+    )[0]
+    .id;
+    let reply = changed(
+        &client
+            .until_done(&Request::AddComment {
+                call: CALL,
+                comment: swarm_protocol::NewComment {
+                    parent: Some(parent),
+                    ..comment_at(&task, ReviewSource::Merged, 1, "one", "R")
+                },
+            })
+            .expect("reply"),
+    )[0]
+    .id;
+
+    client
+        .until_done(&Request::DeleteComment {
+            call: CALL,
+            id: parent,
+        })
+        .expect("deleted");
+
+    let mut gone: Vec<CommentId> = Vec::new();
+    watcher.wait_for(|event| {
+        if let Event::CommentDeleted {
+            task: id,
+            id: comment,
+        } = event
+        {
+            assert_eq!(*id, task.id);
+            gone.push(*comment);
+        }
+
+        (gone.len() == 2).then_some(())
+    });
+    assert_eq!(gone, [reply, parent]);
+    assert!(client.list_comments(task.id).is_empty());
+}
+
+#[test]
+fn approving_waits_until_the_comments_are_sent() {
+    let fixture = Fixture::new("sleep 60");
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let task = client.create_task(orchestrator_task(project.id, false));
+    std::fs::write(task.worktree.join("api.txt"), "one\ntwo\n").expect("file");
+    commit_all(&task.worktree);
+    let fingerprint = client
+        .task_diff(task.id, ReviewSource::Merged, None)
+        .expect("diff")
+        .expect("a diff")
+        .fingerprint;
+    client
+        .add_comment(comment_at(&task, ReviewSource::Merged, 1, "one", "A"))
+        .expect("added");
+    let approve = Request::ApproveTask {
+        call: CALL,
+        task: task.id,
+        fingerprint,
+    };
+
+    let refused = client.until_done(&approve);
+    assert_eq!(refused.expect_err("refused"), "comments are pending");
+
+    client
+        .until_done(&Request::SendComments {
+            call: CALL,
+            task: task.id,
+        })
+        .expect("sent");
+    client.until_done(&approve).expect("approved");
+}
+
+#[test]
+fn a_stopped_orchestrator_gets_no_comment_and_nothing_is_stored() {
+    let fixture = Fixture::new("exit 0");
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let task = client.create_task(orchestrator_task(project.id, false));
+    client.wait_for_agent(|agent| agent.lifecycle == AgentLifecycle::Stopped);
+
+    let held = client
+        .add_comment(comment_at(&task, ReviewSource::Merged, 1, "one", "A"))
+        .expect("a comment that waits needs no orchestrator");
+    assert_eq!(changed(&held)[0].state, CommentState::Pending);
+
+    let live = client.add_comment(comment_at(&task, ReviewSource::Live, 1, "one", "B"));
+    let send = client.until_done(&Request::SendComments {
+        call: CALL,
+        task: task.id,
+    });
+
+    assert_eq!(live.expect_err("refused"), "the orchestrator is stopped");
+    assert_eq!(send.expect_err("refused"), "the orchestrator is stopped");
+    let listed = client.list_comments(task.id);
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].state, CommentState::Pending);
+}
+
+#[test]
+fn a_large_batch_goes_out_in_messages_of_at_most_64_kib() {
+    let fixture = Fixture::new("sleep 60");
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let task = client.create_task(orchestrator_task(project.id, false));
+    let body = "x".repeat(swarm_protocol::COMMENT_BYTES);
+    for _ in 0..5 {
+        client
+            .add_comment(comment_at(&task, ReviewSource::Merged, 1, "one", &body))
+            .expect("added");
+    }
+
+    let events = client
+        .until_done(&Request::SendComments {
+            call: CALL,
+            task: task.id,
+        })
+        .expect("sent");
+
+    let messages = comment_messages(&events);
+    assert_eq!(messages.len(), 2);
+    assert!(messages[0].text.starts_with("3 comments (1 of 2):\n\n"));
+    assert!(messages[1].text.starts_with("2 comments (2 of 2):\n\n"));
+    assert!(
+        messages
+            .iter()
+            .all(|message| message.text.len() <= 64 << 10)
+    );
+    let sent = changed(&events);
+    assert_eq!(sent.len(), 5);
+    assert!(
+        sent.iter()
+            .all(|comment| comment.state == CommentState::Sent)
+    );
+
+    let last_message = events
+        .iter()
+        .rposition(|event| matches!(event, Event::MessageSent { .. }))
+        .expect("a message");
+    let first_comment = events
+        .iter()
+        .position(|event| matches!(event, Event::CommentChanged { .. }))
+        .expect("a comment");
+    assert!(last_message < first_comment, "messages come first");
 }

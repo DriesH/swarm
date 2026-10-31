@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::io::{Read as _, Write as _};
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -356,7 +356,7 @@ fn count_lines(path: &Path, budget: &mut u64) -> u32 {
         return 0;
     }
 
-    let Ok(file) = std::fs::File::open(path) else {
+    let Some(file) = open_regular(path) else {
         return 0;
     };
 
@@ -1492,6 +1492,96 @@ pub fn attribution(worktree: &Path, base: &str) -> Result<HashMap<Vec<u8>, Strin
     Ok(agents)
 }
 
+/// The lines of a text file as the diff shows them, or `None` for a missing, binary,
+/// huge or unreadable file. A symlink is one line, its target, like git sees it. A path
+/// that leaves `worktree` through a linked folder is unreadable.
+pub fn working_file_lines(worktree: &Path, path: &Path) -> Option<Vec<String>> {
+    let full = worktree.join(path);
+    let meta = std::fs::symlink_metadata(&full).ok()?;
+
+    let root = worktree.canonicalize().ok()?;
+    if !full.parent()?.canonicalize().ok()?.starts_with(&root) {
+        return None;
+    }
+
+    if meta.file_type().is_symlink() {
+        let target = std::fs::read_link(&full).ok()?;
+
+        return Some(vec![cut_line(target.as_os_str().as_bytes())]);
+    }
+
+    let file = open_regular(&full)?;
+    if file.metadata().ok()?.len() > MAX_COUNTED_BYTES {
+        return None;
+    }
+
+    let mut bytes = Vec::new();
+    file.take(MAX_COUNTED_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_COUNTED_BYTES {
+        return None;
+    }
+
+    text_lines(&bytes)
+}
+
+/// Opens a regular file without waiting and without following a link. A worker can swap
+/// the path for a FIFO or a link after it was checked, so the opened descriptor is
+/// checked too.
+fn open_regular(path: &Path) -> Option<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)
+        .ok()?;
+
+    file.metadata().ok()?.is_file().then_some(file)
+}
+
+/// Like [`working_file_lines`] for the file as `revision` has it. `None` also when the
+/// revision has no such file.
+pub fn blob_lines(
+    worktree: &Path,
+    revision: &str,
+    path: &Path,
+) -> Result<Option<Vec<String>>, Error> {
+    let mut spec = OsString::from(format!("{revision}:"));
+    spec.push(path);
+
+    let (_, size) = execute(worktree, [OsStr::new("cat-file"), OsStr::new("-s"), &spec])?;
+    let too_big = size
+        .stdout
+        .parse::<u64>()
+        .map_or(true, |size| size > MAX_COUNTED_BYTES);
+    if !size.success || too_big {
+        return Ok(None);
+    }
+
+    let (_, blob) = execute(
+        worktree,
+        [OsStr::new("cat-file"), OsStr::new("blob"), &spec],
+    )?;
+    if !blob.success {
+        return Ok(None);
+    }
+
+    Ok(text_lines(&blob.raw))
+}
+
+fn text_lines(bytes: &[u8]) -> Option<Vec<String>> {
+    if bytes[..bytes.len().min(DIFF_BINARY_SNIFF)].contains(&0) {
+        return None;
+    }
+
+    let mut lines: Vec<&[u8]> = bytes.split(|byte| *byte == b'\n').collect();
+    if lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+
+    Some(lines.into_iter().map(cut_line).collect())
+}
+
 /// True when `ancestor` is `descendant` or reachable from it.
 pub fn is_ancestor(worktree: &Path, ancestor: &str, descendant: &str) -> Result<bool, Error> {
     let (arguments, output) = execute(
@@ -1568,5 +1658,74 @@ mod tests {
         assert_eq!(listed.len(), 3);
         assert_eq!(listed[0].path, PathBuf::from("a.txt"));
         assert_eq!(listed[1].path, PathBuf::from("a\u{fffd}"));
+    }
+
+    struct Folder(PathBuf);
+
+    impl Folder {
+        fn new(name: &str) -> Self {
+            let folder =
+                std::env::temp_dir().join(format!("swarm-git-unit-{name}-{}", std::process::id()));
+            std::fs::create_dir_all(&folder).expect("folder");
+
+            Self(folder.canonicalize().expect("real path"))
+        }
+    }
+
+    impl Drop for Folder {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    fn make_fifo(path: &Path) {
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("name");
+
+        // SAFETY: `name` is a valid NUL-terminated path.
+        let made = unsafe { libc::mkfifo(name.as_ptr(), 0o600) };
+        assert_eq!(made, 0, "mkfifo failed");
+    }
+
+    /// Runs `work` on a thread, so a call that blocks forever fails the test.
+    fn within_seconds<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || sender.send(work()).ok());
+
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the call blocked")
+    }
+
+    #[test]
+    fn a_fifo_swapped_in_after_the_check_is_not_waited_for() {
+        let folder = Folder::new("fifo");
+        let fifo = folder.0.join("pipe");
+        make_fifo(&fifo);
+
+        let opened = within_seconds(move || open_regular(&fifo).is_some());
+
+        assert!(!opened);
+    }
+
+    #[test]
+    fn a_link_swapped_in_after_the_check_is_not_followed() {
+        let folder = Folder::new("link");
+        std::fs::write(folder.0.join("real"), "x\n").expect("file");
+        std::os::unix::fs::symlink(folder.0.join("real"), folder.0.join("link")).expect("link");
+
+        assert!(open_regular(&folder.0.join("link")).is_none());
+        assert!(open_regular(&folder.0.join("real")).is_some());
+        assert!(open_regular(&folder.0).is_none(), "a folder is no file");
+    }
+
+    #[test]
+    fn a_fifo_has_no_lines() {
+        let folder = Folder::new("lines");
+        make_fifo(&folder.0.join("pipe"));
+        let worktree = folder.0.clone();
+
+        let lines = within_seconds(move || working_file_lines(&worktree, Path::new("pipe")));
+
+        assert_eq!(lines, None);
     }
 }

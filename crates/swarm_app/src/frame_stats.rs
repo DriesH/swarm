@@ -377,6 +377,8 @@ fn add_big_diff(workspace: &mut Workspace) {
             deletions: files.iter().map(|file| file.deletions).sum(),
         };
 
+        let comments = big_comments(task, source, &files);
+
         workspace.data.store_diff(TaskDiff {
             task,
             source,
@@ -384,7 +386,48 @@ fn add_big_diff(workspace: &mut Workspace) {
             stat,
             files,
         });
+        let mut all = workspace.data.task_list(task).to_vec();
+        all.extend(comments);
+        workspace.data.set_comments(task, all);
     }
+}
+
+/// One thread on every fifth file of the big diff, so scrolling meets comment rows.
+fn big_comments(
+    task: swarm_protocol::TaskId,
+    source: swarm_protocol::ReviewSource,
+    files: &[swarm_protocol::FileDiff],
+) -> Vec<swarm_protocol::ReviewComment> {
+    use swarm_protocol::{CommentId, CommentState, ReviewComment};
+
+    files
+        .iter()
+        .enumerate()
+        .step_by(5)
+        .filter_map(|(index, file)| {
+            let at = crate::review_model::first_changed_line(file, index)?;
+            let anchor =
+                crate::review_model::anchor_for(file, at.hunk as usize, at.line as usize, at.side)?;
+
+            Some(ReviewComment {
+                id: CommentId(
+                    1_000
+                        + index as u64 * 2
+                        + u64::from(source == swarm_protocol::ReviewSource::Merged),
+                ),
+                task,
+                parent: None,
+                source,
+                anchor,
+                body: "Cache shaped lines per row and only reshape dirty rows.".to_owned(),
+                state: CommentState::Pending,
+                to: None,
+                outdated: false,
+                created_at: 0,
+                sent_at: None,
+            })
+        })
+        .collect()
 }
 
 /// Scrolls the big diff in the unified and the split style.

@@ -17,16 +17,20 @@ use swarm_term::{Palette, Size, TerminalInput, TerminalOutput};
 pub mod agent;
 mod client;
 
-pub use client::{Client, ClientError, MessageEvent};
+pub use client::{Client, ClientError, CommentEvent, MessageEvent};
 
 /// Bumped on every incompatible change; the daemon refuses other versions.
-pub const VERSION: u32 = 8;
+pub const VERSION: u32 = 9;
 
 /// The most messages [`Request::ListMessages`] returns.
 pub const MESSAGES_LISTED: usize = 500;
 
 /// The most files one [`AgentChange`] lists.
 pub const FILES_LISTED: usize = 500;
+
+/// The longest comment body, in bytes. A quarter of a message, so the orchestrator can
+/// pass a comment on with its header and quoted line.
+pub const COMMENT_BYTES: usize = 16 << 10;
 
 /// The most files one [`TaskDiff`] lists. Its totals still count every file.
 pub const DIFF_FILES: usize = 1_000;
@@ -254,6 +258,9 @@ pub enum MessageKind {
     UserInput,
     /// From Swarm: a worker failed to start, or its process ended.
     WorkerStopped,
+    /// From Swarm: the user's review comments, to the task orchestrator, which passes
+    /// each one on to the worker it names.
+    Comment,
 }
 
 impl MessageKind {
@@ -267,6 +274,7 @@ impl MessageKind {
             Self::TerminalExited => "terminal exited",
             Self::UserInput => "user input",
             Self::WorkerStopped => "worker stopped",
+            Self::Comment => "comment",
         }
     }
 }
@@ -398,6 +406,75 @@ pub struct TaskDiff {
     pub files: Vec<FileDiff>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CommentId(pub u64);
+
+/// The side of a diff a line is on: the base version, or the changed version.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DiffSide {
+    Old,
+    New,
+}
+
+/// Where a comment sits: a line found by its text, not its number, so it follows the
+/// code while agents edit around it.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct CommentAnchor {
+    /// The worktree of the [`FileDiff`] the comment was made on.
+    pub worktree: PathBuf,
+    /// Relative to `worktree`.
+    pub path: PathBuf,
+    pub side: DiffSide,
+    /// 1-based line number on `side`. The daemon moves it when the text moves.
+    pub line: u32,
+    /// The text of the line, as in [`DiffLine::text`].
+    pub text: String,
+    /// The lines just before and after, used to pick between equal lines.
+    pub before: Option<String>,
+    pub after: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommentState {
+    /// Made on Merged and waiting for [`Request::SendComments`].
+    Pending,
+    /// Sent to the task orchestrator.
+    Sent,
+    /// The user marked the thread done. Only a thread's first comment is resolved.
+    Resolved,
+}
+
+/// A review comment by the user. A reply has a `parent` and the parent's anchor.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ReviewComment {
+    pub id: CommentId,
+    pub task: TaskId,
+    pub parent: Option<CommentId>,
+    /// The source it was made on. Live comments are sent at once; Merged ones wait.
+    pub source: ReviewSource,
+    pub anchor: CommentAnchor,
+    pub body: String,
+    pub state: CommentState,
+    /// The worker it was meant for when sent: the agent that owns the file. `None`
+    /// before it is sent, or when no worker owns the file and the orchestrator has it.
+    pub to: Option<AgentId>,
+    /// The anchored line is gone from the file; `anchor.line` is where it last was.
+    pub outdated: bool,
+    /// Milliseconds since the Unix epoch.
+    pub created_at: u64,
+    pub sent_at: Option<u64>,
+}
+
+/// A new comment. `parent` makes it a reply, which takes the parent's anchor.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct NewComment {
+    pub task: TaskId,
+    pub parent: Option<CommentId>,
+    pub source: ReviewSource,
+    pub anchor: CommentAnchor,
+    pub body: String,
+}
+
 /// What closing a task would throw away, so the app can ask first.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct CloseCheck {
@@ -493,7 +570,7 @@ pub enum Request {
         known: Option<u64>,
     },
     /// Approves the Merged diff with this fingerprint. Refused when the Merged diff
-    /// changed since. Answered with [`Event::TaskChanged`] to every client, then
+    /// changed since, or while comments of the task are pending. Answered with [`Event::TaskChanged`] to every client, then
     /// [`Event::Done`].
     ApproveTask {
         call: CallId,
@@ -502,6 +579,41 @@ pub enum Request {
     },
     /// Answered with [`Event::CloseCheck`].
     CheckClose {
+        call: CallId,
+        task: TaskId,
+    },
+    /// The task's comments, oldest first, with each anchor checked against the files
+    /// as they are now. Answered with [`Event::Comments`].
+    ListComments {
+        call: CallId,
+        task: TaskId,
+    },
+    /// Adds a comment. On Live it goes to the task orchestrator at once as a `Comment`
+    /// message; on Merged it waits as `Pending`. A reply follows its parent: it waits
+    /// while the parent waits, else it is sent at once. Answered with
+    /// [`Event::CommentChanged`] to every client, then [`Event::Done`].
+    AddComment {
+        call: CallId,
+        comment: NewComment,
+    },
+    /// Deletes a `Pending` comment and its replies. Answered with
+    /// [`Event::CommentDeleted`] to every client, then [`Event::Done`].
+    DeleteComment {
+        call: CallId,
+        id: CommentId,
+    },
+    /// Marks a sent thread resolved, or sent again. Answered with
+    /// [`Event::CommentChanged`] to every client, then [`Event::Done`].
+    ResolveComment {
+        call: CallId,
+        id: CommentId,
+        resolved: bool,
+    },
+    /// Sends every `Pending` comment of the task to its orchestrator in `Comment`
+    /// messages of at most 64 KiB each. Refused when none waits, when the orchestrator
+    /// is stopped, or when the task has no orchestrator. Answered with a [`Event::CommentChanged`] per
+    /// comment to every client, then [`Event::Done`].
+    SendComments {
         call: CallId,
         task: TaskId,
     },
@@ -606,6 +718,19 @@ pub enum Event {
     /// A request that has no other answer succeeded.
     Done {
         call: CallId,
+    },
+    Comments {
+        call: CallId,
+        comments: Vec<ReviewComment>,
+    },
+    /// Sent to every client when a comment is added, sent or resolved.
+    CommentChanged {
+        comment: ReviewComment,
+    },
+    /// Sent to every client when a comment is deleted.
+    CommentDeleted {
+        task: TaskId,
+        id: CommentId,
     },
 }
 

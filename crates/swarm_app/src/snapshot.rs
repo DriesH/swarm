@@ -6,6 +6,7 @@
 //! runs, so the window is minimized first; the last frame stays available.
 
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{AnyWindowHandle, App, AsyncApp, Context, Window};
@@ -13,7 +14,7 @@ use swarm_protocol::ReviewSource;
 use swarm_ui::theme::{self, Appearance};
 
 use crate::model::ProjectId;
-use crate::review_model::DiffStyle;
+use crate::review_model::{DiffStyle, LinePos};
 use crate::swarm_view::InspectorTab;
 use crate::workspace::{View, Workspace};
 
@@ -72,6 +73,69 @@ fn open_review_split(workspace: &mut Workspace, _: &mut Window, cx: &mut Context
     workspace
         .review
         .update(cx, |review, cx| review.set_style(DiffStyle::Split, cx));
+}
+
+/// Opens Review on `source`, scrolled to element.rs. Returns the file's index.
+fn review_element(
+    workspace: &mut Workspace,
+    source: ReviewSource,
+    cx: &mut Context<Workspace>,
+) -> Option<usize> {
+    workspace.set_view(View::Review, cx);
+    workspace.set_review_source(source, cx);
+    workspace.sync_review(cx);
+
+    let diff = workspace
+        .data
+        .task_diff(workspace.active_task, source)
+        .map(Rc::clone)?;
+    let index = diff
+        .files
+        .iter()
+        .position(|file| file.path.ends_with("element.rs"))?;
+
+    workspace
+        .review
+        .update(cx, |review, cx| review.select_file(index, cx));
+
+    Some(index)
+}
+
+fn open_review_comment_box(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
+    let Some(file) = review_element(workspace, ReviewSource::Merged, cx) else {
+        return;
+    };
+    let added = workspace
+        .data
+        .task_diff(workspace.active_task, ReviewSource::Merged)
+        .and_then(|diff| diff.files.get(file))
+        .and_then(|data| data.hunks.first())
+        .and_then(|hunk| {
+            hunk.lines
+                .iter()
+                .position(|line| line.kind == swarm_protocol::DiffLineKind::Added)
+        });
+
+    if let Some(line) = added {
+        let pos = LinePos {
+            file: u32::try_from(file).unwrap_or(0),
+            hunk: 0,
+            line: u32::try_from(line + 1).unwrap_or(0),
+            side: swarm_protocol::DiffSide::New,
+        };
+
+        workspace
+            .review
+            .update(cx, |review, cx| review.open_composer(pos, cx));
+    }
+}
+
+fn open_review_live_comments(
+    workspace: &mut Workspace,
+    _: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    review_element(workspace, ReviewSource::Live, cx);
 }
 
 fn open_close_task(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
@@ -218,6 +282,26 @@ pub(crate) fn run(directory: PathBuf, cx: &mut App) {
                 Appearance::Dark,
                 "workspace-review-split-dark.png",
                 Some(open_review_split),
+            ),
+            (
+                Appearance::Light,
+                "workspace-review-comment-light.png",
+                Some(open_review_comment_box),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-review-comment-dark.png",
+                Some(open_review_comment_box),
+            ),
+            (
+                Appearance::Light,
+                "workspace-review-live-comments-light.png",
+                Some(open_review_live_comments),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-review-live-comments-dark.png",
+                Some(open_review_live_comments),
             ),
             (
                 Appearance::Light,
