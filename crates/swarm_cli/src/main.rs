@@ -23,7 +23,7 @@ use crate::session::Session;
     name = "swarm",
     version,
     about = "Talk to Swarm from an agent terminal",
-    long_about = "Talk to Swarm from an agent terminal.\n\nWhich commands work depends on your role: orchestrators spawn, send, merge, notify, agents and confirm; workers ask and report; workers and orchestrators commit; the Start orchestrator makes tasks; every agent can read, wait, exit and run terminals.\nA text of - is read from stdin."
+    long_about = "Talk to Swarm from an agent terminal.\n\nWhich commands work depends on your role: orchestrators spawn, send, merge, notify, agents, confirm and pr draft; workers ask and report; workers and orchestrators commit; the Start orchestrator makes tasks; every agent can read, wait, exit and run terminals.\nA text of - is read from stdin."
 )]
 struct Cli {
     /// Print the raw result as JSON.
@@ -106,6 +106,11 @@ enum Action {
     Agents,
     /// Say that you understood your brief (orchestrator).
     Confirm,
+    /// Work on the task's pull request (orchestrator).
+    Pr {
+        #[command(subcommand)]
+        action: PrAction,
+    },
     /// Make, list and wait for tasks (Start orchestrator).
     Task {
         #[command(subcommand)]
@@ -122,6 +127,27 @@ enum Action {
     Mcp,
     /// Forward an agent hook event (JSON on stdin) to Swarm.
     Hook,
+}
+
+#[derive(Subcommand, Debug)]
+enum PrAction {
+    /// Send the pull request title and description the `pr draft` message asks for. The
+    /// user must have approved the task.
+    Draft {
+        /// One line that says what the change does.
+        #[arg(long)]
+        title: String,
+        /// The description.
+        #[arg(
+            long,
+            conflicts_with = "body_file",
+            required_unless_present = "body_file"
+        )]
+        body: Option<String>,
+        /// A file that holds the description; - reads stdin.
+        #[arg(long, value_name = "PATH")]
+        body_file: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -287,6 +313,7 @@ impl Action {
             Self::Merge { worker } => Command::Merge { worker },
             Self::Agents => Command::Agents,
             Self::Confirm => Command::Confirm,
+            Self::Pr { action } => action.command(stdin)?,
             Self::Task { action } => action.command(stdin)?,
             Self::Exit => Command::Exit,
             Self::Terminal { action } => action.command(),
@@ -294,6 +321,32 @@ impl Action {
         };
 
         Ok(Some(command))
+    }
+}
+
+impl PrAction {
+    fn command(self, stdin: &mut impl std::io::Read) -> Result<Command, String> {
+        let Self::Draft {
+            title,
+            body,
+            body_file,
+        } = self;
+
+        let body = match (body, body_file) {
+            (Some(body), _) => body,
+            (None, Some(path)) if path.as_os_str() == "-" => read_all(stdin)?,
+            (None, Some(path)) => {
+                let mut file = std::fs::File::open(&path)
+                    .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+
+                read_all(&mut file)?
+            }
+            (None, None) => {
+                return Err("give the description with --body or --body-file".to_owned());
+            }
+        };
+
+        Ok(Command::PrDraft { title, body })
     }
 }
 
@@ -771,6 +824,101 @@ mod tests {
             }
         );
         assert_eq!(command(&["terminal", "list"], ""), Command::TerminalList);
+    }
+
+    #[test]
+    fn pr_draft_takes_a_title_and_a_body() {
+        assert_eq!(
+            command(
+                &["pr", "draft", "--title", "Add login", "--body", "## What"],
+                ""
+            ),
+            Command::PrDraft {
+                title: "Add login".to_owned(),
+                body: "## What".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn pr_draft_reads_the_body_from_stdin_with_a_dash() {
+        assert_eq!(
+            command(
+                &["pr", "draft", "--title", "T", "--body-file", "-"],
+                "line one\nline two\n"
+            ),
+            Command::PrDraft {
+                title: "T".to_owned(),
+                body: "line one\nline two\n".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn pr_draft_reads_the_body_from_a_file() {
+        let path = std::env::temp_dir().join(format!("swarm-cli-body-{}.md", std::process::id()));
+        std::fs::write(&path, "from a file\n").expect("file");
+
+        let command = command(
+            &[
+                "pr",
+                "draft",
+                "--title",
+                "T",
+                "--body-file",
+                path.to_str().expect("utf8"),
+            ],
+            "",
+        );
+        std::fs::remove_file(&path).expect("cleanup");
+
+        assert_eq!(
+            command,
+            Command::PrDraft {
+                title: "T".to_owned(),
+                body: "from a file\n".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn pr_draft_needs_a_title_and_exactly_one_body_source() {
+        assert!(parse(&["pr", "draft", "--body", "x"]).is_err());
+        assert!(parse(&["pr", "draft", "--title", "T"]).is_err());
+        assert!(
+            parse(&[
+                "pr",
+                "draft",
+                "--title",
+                "T",
+                "--body",
+                "x",
+                "--body-file",
+                "-"
+            ])
+            .is_err()
+        );
+        assert!(parse(&["pr"]).is_err());
+    }
+
+    #[test]
+    fn pr_draft_with_a_missing_file_says_which_file() {
+        let action = parse(&[
+            "pr",
+            "draft",
+            "--title",
+            "T",
+            "--body-file",
+            "/nonexistent/body.md",
+        ])
+        .expect("parse")
+        .command;
+
+        let error = action
+            .command(&mut std::io::empty())
+            .expect_err("no such file");
+
+        assert!(error.contains("/nonexistent/body.md"), "{error}");
     }
 
     #[test]

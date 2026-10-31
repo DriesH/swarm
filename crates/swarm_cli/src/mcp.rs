@@ -259,6 +259,34 @@ const TOOLS: &[Tool] = &[
         build: |_| Ok(Command::Confirm),
     },
     Tool {
+        name: "pr_draft",
+        description: "Send the pull request title and description that the `pr draft` message asked for. Refused until the user approved the task.",
+        audience: Audience::Only(&[Role::Orchestrator]),
+        schema: || {
+            schema(
+                &[
+                    (
+                        "title",
+                        "string",
+                        "One line, at most 256 characters, that says what the change does.",
+                    ),
+                    (
+                        "body",
+                        "string",
+                        "The description, in the format the message gives.",
+                    ),
+                ],
+                &["title", "body"],
+            )
+        },
+        build: |arguments| {
+            Ok(Command::PrDraft {
+                title: required(arguments, "title")?,
+                body: required(arguments, "body")?,
+            })
+        },
+    },
+    Tool {
         name: "task_create",
         description: "Make a task: a branch, a task worktree and a tab, with an orchestrator that starts on your brief. The brief states the goal, the scope and what done means.",
         audience: Audience::Only(&[Role::StartOrchestrator]),
@@ -1060,7 +1088,8 @@ mod tests {
         assert_eq!(
             tool_names(Role::Orchestrator),
             [
-                "spawn", "send", "commit", "read", "wait", "merge", "notify", "agents", "confirm"
+                "spawn", "send", "commit", "read", "wait", "merge", "notify", "agents", "confirm",
+                "pr_draft"
             ]
             .into_iter()
             .chain(TERMINAL_TOOLS)

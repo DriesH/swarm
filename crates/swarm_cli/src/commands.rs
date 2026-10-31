@@ -54,6 +54,10 @@ pub(crate) enum Command {
     },
     Agents,
     Confirm,
+    PrDraft {
+        title: String,
+        body: String,
+    },
     TaskCreate {
         name: String,
         from: Option<String>,
@@ -165,6 +169,11 @@ impl Command {
                 let result = session.call(Call::Confirm)?;
 
                 Ok(output(result, "ok".to_owned()))
+            }
+            Self::PrDraft { title, body } => {
+                let result = session.call(Call::PrDraft { title, body })?;
+
+                Ok(output(result, "pull request draft sent".to_owned()))
             }
             Self::TaskCreate { .. } | Self::TaskList | Self::TaskWait { .. } | Self::Exit => {
                 self.run_task(session)

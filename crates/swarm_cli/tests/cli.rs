@@ -393,7 +393,7 @@ fn help_lists_every_command() {
     let text = String::from_utf8_lossy(&output.stdout);
     for command in [
         "spawn", "send", "ask", "report", "commit", "notify", "read", "wait", "merge", "agents",
-        "confirm", "mcp", "hook",
+        "confirm", "pr", "mcp", "hook",
     ] {
         assert!(text.contains(command), "{command} is missing:\n{text}");
     }
@@ -536,6 +536,87 @@ fn spawn_sends_the_reason_for_its_own_worktree() {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(requests[0]["method"], "spawn");
     assert_eq!(requests[0]["params"]["own_worktree"], "same files");
+}
+
+#[test]
+fn pr_draft_sends_the_title_and_the_body_from_stdin() {
+    let (socket, daemon) = fake_daemon(
+        "pr-draft",
+        vec![serde_json::json!({ "ok": true, "result": null })],
+    );
+    let mut command = agent_command(&socket);
+    command.args(["pr", "draft", "--title", "Add login", "--body-file", "-"]);
+
+    let output = run(command, "## What\n\n- login\n");
+    let requests = daemon.join().expect("daemon");
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "pull request draft sent"
+    );
+    assert_eq!(requests[0]["method"], "pr_draft");
+    assert_eq!(requests[0]["agent"], 3);
+    assert_eq!(requests[0]["params"]["title"], "Add login");
+    assert_eq!(requests[0]["params"]["body"], "## What\n\n- login\n");
+}
+
+#[test]
+fn a_refused_pr_draft_goes_to_stderr_with_exit_code_one() {
+    let (socket, daemon) = fake_daemon(
+        "pr-draft-refused",
+        vec![serde_json::json!({ "ok": false, "error": "the task is not approved" })],
+    );
+    let mut command = agent_command(&socket);
+    command.args(["pr", "draft", "--title", "T", "--body", "B"]);
+
+    let output = run(command, "");
+    daemon.join().expect("daemon");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("the task is not approved"));
+}
+
+#[test]
+fn an_mcp_pr_draft_sends_the_title_and_body() {
+    let (socket, daemon) = fake_daemon(
+        "mcp-pr-draft",
+        vec![serde_json::json!({ "ok": true, "result": null })],
+    );
+    let lines = [
+        serde_json::json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+        "params": { "name": "pr_draft", "arguments": {
+            "title": "Add login", "body": "## What\n\n- login" } } }),
+    ];
+
+    let replies = mcp_session(&socket, "orchestrator", &lines);
+    let requests = daemon.join().expect("daemon");
+
+    assert_eq!(requests[0]["method"], "pr_draft");
+    assert_eq!(requests[0]["params"]["title"], "Add login");
+    assert_eq!(requests[0]["params"]["body"], "## What\n\n- login");
+    assert_eq!(replies[0]["result"]["isError"], false);
+    assert_eq!(
+        replies[0]["result"]["content"][0]["text"],
+        "pull request draft sent"
+    );
+}
+
+#[test]
+fn a_worker_does_not_get_the_pr_draft_tool() {
+    let lines = [
+        serde_json::json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+        "params": { "name": "pr_draft", "arguments": { "title": "T", "body": "B" } } }),
+    ];
+
+    let replies = mcp_session(std::path::Path::new("/tmp/none.sock"), "worker", &lines);
+
+    assert!(
+        replies[0]["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("pr_draft")
+    );
 }
 
 #[test]
