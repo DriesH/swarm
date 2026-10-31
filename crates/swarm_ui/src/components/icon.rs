@@ -22,6 +22,7 @@ pub enum IconName {
     File,
     Lock,
     Minimize,
+    Minus,
     Plus,
     PlusSquare,
     PullRequest,
@@ -57,7 +58,7 @@ macro_rules! fill_icon {
 }
 
 impl IconName {
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 25] = [
         Self::Agent,
         Self::Bee,
         Self::Branch,
@@ -72,6 +73,7 @@ impl IconName {
         Self::File,
         Self::Lock,
         Self::Minimize,
+        Self::Minus,
         Self::Plus,
         Self::PlusSquare,
         Self::PullRequest,
@@ -100,6 +102,7 @@ impl IconName {
             Self::File => "file",
             Self::Lock => "lock",
             Self::Minimize => "minimize",
+            Self::Minus => "minus",
             Self::Plus => "plus",
             Self::PlusSquare => "plus_square",
             Self::PullRequest => "pull_request",
@@ -154,6 +157,7 @@ impl IconName {
                 r#"<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>"#
             ),
             Self::Minimize => stroke_icon!("2", r#"<path d="M5 18h14"/>"#),
+            Self::Minus => stroke_icon!("1.8", r#"<path d="M5 12h14"/>"#),
             Self::Plus => stroke_icon!("1.8", r#"<path d="M12 5v14M5 12h14"/>"#),
             Self::PlusSquare => stroke_icon!(
                 "1.8",

@@ -55,6 +55,11 @@ impl AgentStatus {
         }
     }
 
+    /// The soft fill that goes with [`Self::color`], for bars and pills.
+    pub fn background(self, cx: &App) -> Hsla {
+        self.pill_colors(cx).1
+    }
+
     fn pill_colors(self, cx: &App) -> (Hsla, Hsla) {
         let colors = cx.theme().colors();
 
