@@ -83,6 +83,9 @@ pub(crate) struct ClientSink {
     changes_running: AtomicBool,
     /// The `TaskDiff` requests of this client that run.
     diffs_running: Mutex<Vec<(TaskId, ReviewSource)>>,
+    /// The head of the last diff sent to this client per task and source, so a new
+    /// commit with the same changes (an amend, an empty commit) is still sent.
+    diff_heads: Mutex<HashMap<(TaskId, ReviewSource), String>>,
 }
 
 /// Held while an `AgentChanges` request of one client runs.
@@ -111,6 +114,7 @@ impl ClientSink {
             stream,
             changes_running: AtomicBool::new(false),
             diffs_running: Mutex::default(),
+            diff_heads: Mutex::default(),
         }
     }
 
@@ -138,6 +142,27 @@ impl ClientSink {
         running.push(key);
 
         Some(DiffGuard(Arc::clone(self), key))
+    }
+
+    /// Whether a diff with `fingerprint` at `head` must go to this client, given the
+    /// fingerprint it says it has. Records `head` when it must.
+    pub(crate) fn needs_diff(
+        &self,
+        task: TaskId,
+        source: ReviewSource,
+        known: Option<u64>,
+        fingerprint: u64,
+        head: &str,
+    ) -> bool {
+        let mut heads = lock(&self.diff_heads);
+        let same_head = heads.get(&(task, source)).is_some_and(|sent| sent == head);
+        if known == Some(fingerprint) && same_head {
+            return false;
+        }
+
+        heads.insert((task, source), head.to_owned());
+
+        true
     }
 
     pub(crate) fn id(&self) -> u64 {

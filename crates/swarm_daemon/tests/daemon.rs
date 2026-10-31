@@ -3665,6 +3665,45 @@ fn a_task_diff_has_files_and_answers_none_for_a_known_fingerprint() {
 }
 
 #[test]
+fn a_new_commit_with_the_same_changes_is_still_sent() {
+    let repo = Repo::new("");
+    let daemon = Daemon::start();
+    let (mut client, task) = reviewed_task(&daemon, &repo);
+    let diff = client
+        .task_diff(task.id, ReviewSource::Merged, None)
+        .expect("diff")
+        .expect("a diff");
+
+    git_output(
+        &task.worktree,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "empty",
+        ],
+    );
+    let moved = client
+        .task_diff(task.id, ReviewSource::Merged, Some(diff.fingerprint))
+        .expect("moved")
+        .expect("a new head is sent");
+
+    assert_eq!(moved.fingerprint, diff.fingerprint);
+    assert_ne!(moved.head, diff.head);
+    assert_eq!(
+        client
+            .task_diff(task.id, ReviewSource::Merged, Some(moved.fingerprint))
+            .expect("known"),
+        None
+    );
+}
+
+#[test]
 fn a_second_diff_request_is_busy_while_the_first_runs() {
     let repo = Repo::new("");
     repo.commit_many_files(300);

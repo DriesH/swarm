@@ -305,7 +305,9 @@ fn handle_review(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Requ
 
                 match diff {
                     Ok(diff) => {
-                        let diff = (known != Some(diff.fingerprint)).then_some(diff);
+                        let send =
+                            sink.needs_diff(task, source, known, diff.fingerprint, &diff.head);
+                        let diff = send.then_some(diff);
 
                         sink.send_event(&Event::TaskDiff { call, diff });
                     }
