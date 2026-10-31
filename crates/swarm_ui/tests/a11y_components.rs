@@ -100,6 +100,14 @@ fn a_check_row_reads_its_name_status_and_value() {
         );
 
         assert_eq!(stopped.node.label(), Some("cargo fmt, Stopped"));
+
+        let skipped = a11y_info(
+            CheckRow::new("skipped", "cargo clippy", CheckStatus::Skipped),
+            window,
+            cx,
+        );
+
+        assert_eq!(skipped.node.label(), Some("cargo clippy, Skipped"));
     });
 }
 

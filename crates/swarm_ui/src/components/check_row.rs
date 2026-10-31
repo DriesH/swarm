@@ -122,23 +122,33 @@ impl CheckRow {
         self
     }
 
+    fn status_word(&self) -> &str {
+        self.status_label
+            .as_deref()
+            .unwrap_or_else(|| self.status.label())
+    }
+
     /// What VoiceOver reads: "name, status, value".
     fn spoken(&self) -> String {
-        let status = self
-            .status_label
-            .as_deref()
-            .unwrap_or_else(|| self.status.label());
+        let status = self.status_word();
 
         match &self.value {
             Some(value) => format!("{}, {status}, {value}", self.name),
             None => format!("{}, {status}", self.name),
         }
     }
+
+    /// A check that did not run has no value, so the row says so in words.
+    fn shown_word(&self) -> Option<SharedString> {
+        matches!(self.status, CheckStatus::Skipped | CheckStatus::Cancelled)
+            .then(|| SharedString::from(self.status_word().to_owned()))
+    }
 }
 
 impl RenderOnce for CheckRow {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
         let spoken = self.spoken();
+        let word = self.shown_word();
         let name = Label::new(self.name).size(LabelSize::Small).truncate();
         let name = if self.mono { name.mono() } else { name };
 
@@ -160,6 +170,12 @@ impl RenderOnce for CheckRow {
                     .child(self.status.mark()),
             )
             .child(div().flex_1().min_w_0().flex().child(name))
+            .children(word.map(|word| {
+                Label::new(word)
+                    .mono()
+                    .size(LabelSize::XSmall)
+                    .color(Color::Faint)
+            }))
             .children(self.value.map(|value| {
                 Label::new(value)
                     .mono()

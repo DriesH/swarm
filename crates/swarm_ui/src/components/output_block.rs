@@ -1,11 +1,17 @@
-use gpui::{AnyElement, App, ElementId, Pixels, Role, SharedString, Window, div, px};
+use gpui::{
+    AnyElement, App, ElementId, Pixels, Role, ScrollHandle, SharedString, Window, div, point, px,
+};
 
 use crate::component::{Component, example};
 use crate::fonts::MONO_FONT;
 use crate::prelude::*;
+use crate::styles::focus_ring;
+
+const LINE_HEIGHT: Pixels = px(16.);
 
 /// A block of command output in the mono font. It scrolls when it is taller than
-/// its maximum height.
+/// its maximum height. It takes keyboard focus; arrow keys, Page Up, Page Down, Home
+/// and End scroll it.
 #[derive(IntoElement)]
 #[must_use]
 pub struct OutputBlock {
@@ -39,7 +45,8 @@ impl OutputBlock {
         self
     }
 
-    /// Name for `VisualTestContext::debug_bounds`. Only recorded in test builds.
+    /// Name for `VisualTestContext::debug_bounds`. Only recorded in test builds. The text
+    /// inside is recorded as `<name>-text`.
     pub fn debug_selector(mut self, selector: impl FnOnce() -> String) -> Self {
         self.debug_selector = Some(selector());
         self
@@ -52,9 +59,41 @@ impl OutputBlock {
     }
 }
 
+/// Moves the scroll offset for a navigation key. Returns false for any other key.
+fn scroll_for_key(scroll: &ScrollHandle, key: &str) -> bool {
+    let top = scroll.offset();
+    let bottom = -scroll.max_offset().y;
+    let page = (scroll.bounds().size.height - LINE_HEIGHT).max(LINE_HEIGHT);
+
+    let target = match key {
+        "up" => top.y + LINE_HEIGHT,
+        "down" => top.y - LINE_HEIGHT,
+        "pageup" => top.y + page,
+        "pagedown" => top.y - page,
+        "home" => px(0.),
+        "end" => bottom,
+        _ => return false,
+    };
+
+    scroll.set_offset(point(top.x, target.min(px(0.)).max(bottom)));
+
+    true
+}
+
 impl RenderOnce for OutputBlock {
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let scroll = window
+            .use_keyed_state((self.id.clone(), "scroll"), cx, |_, _| ScrollHandle::new())
+            .read(cx)
+            .clone();
+        let on_key = scroll.clone();
+        let text_selector = self
+            .debug_selector
+            .as_ref()
+            .map(|selector| format!("{selector}-text"));
+
         let colors = cx.theme().colors();
+        let accent = colors.accent;
 
         div()
             .id(self.id)
@@ -64,6 +103,15 @@ impl RenderOnce for OutputBlock {
             .role(Role::Log)
             .aria_label(self.label)
             .aria_value(self.text.clone())
+            .focusable()
+            .tab_stop(true)
+            .track_scroll(&scroll)
+            .on_key_down(move |event, window, cx| {
+                if scroll_for_key(&on_key, event.keystroke.key.as_str()) {
+                    window.refresh();
+                    cx.stop_propagation();
+                }
+            })
             .w_full()
             .max_h(self.max_height)
             .overflow_y_scroll()
@@ -72,11 +120,18 @@ impl RenderOnce for OutputBlock {
             .border_1()
             .border_color(colors.line)
             .bg(colors.raised)
+            .focus_visible(move |style| focus_ring(style, accent))
             .font_family(MONO_FONT)
             .text_size(px(11.))
-            .line_height(px(16.))
+            .line_height(LINE_HEIGHT)
             .text_color(self.tone.hsla(cx))
-            .child(self.text)
+            .child(
+                div()
+                    .when_some(text_selector, |text, selector| {
+                        text.debug_selector(move || selector)
+                    })
+                    .child(self.text),
+            )
     }
 }
 
