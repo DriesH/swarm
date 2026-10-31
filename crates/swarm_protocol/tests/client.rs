@@ -11,10 +11,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use swarm_protocol::{
-    AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, Client, ClientError,
-    CreateTask, CreateTerminal, DiffStat, Event, GridSize, MessageEvent, MessageId, MessageInfo,
-    MessageKind, ProjectId, ProjectInfo, Request, TaskId, TaskInfo, TerminalId, TerminalInfo,
-    TerminalKind, VERSION, read, write,
+    AgentChange, AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, Client,
+    ClientError, CreateTask, CreateTerminal, DiffStat, Event, FileStat, GridSize, MessageEvent,
+    MessageId, MessageInfo, MessageKind, ProjectId, ProjectInfo, Request, TaskId, TaskInfo,
+    TerminalId, TerminalInfo, TerminalKind, VERSION, read, write,
 };
 use swarm_term::{Palette, Rgb, Size, TerminalInput, TerminalOutput};
 
@@ -821,7 +821,7 @@ fn agent_changes_returns_each_diff_stat() {
         assert_eq!(agents, vec![AgentId(1), AgentId(3)]);
         fake.send(&Event::AgentChanges {
             call,
-            changes: vec![(AgentId(1), stat)],
+            changes: vec![change(stat)],
         });
         fake.drain();
     });
@@ -831,7 +831,19 @@ fn agent_changes_returns_each_diff_stat() {
         .agent_changes(vec![AgentId(1), AgentId(3)])
         .expect("agent changes");
 
-    assert_eq!(changes, vec![(AgentId(1), stat)]);
+    assert_eq!(changes, vec![change(stat)]);
+}
+
+fn change(stat: DiffStat) -> AgentChange {
+    AgentChange {
+        agent: AgentId(1),
+        stat,
+        files: vec![FileStat {
+            path: PathBuf::from("src/pty.rs"),
+            additions: 39,
+            deletions: 8,
+        }],
+    }
 }
 
 #[test]

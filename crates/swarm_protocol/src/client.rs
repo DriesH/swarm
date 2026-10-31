@@ -16,9 +16,9 @@ use std::time::{Duration, Instant};
 use swarm_term::{TerminalChannels, TerminalInput, TerminalOutput};
 
 use crate::{
-    AgentId, AgentInfo, AgentKind, CallId, CreateTask, CreateTerminal, DiffStat, Event, FrameError,
-    MessageId, MessageInfo, Paths, ProjectId, ProjectInfo, Request, TaskId, TaskInfo, TerminalId,
-    TerminalInfo, VERSION, check_private_dir, read, write,
+    AgentChange, AgentId, AgentInfo, AgentKind, CallId, CreateTask, CreateTerminal, Event,
+    FrameError, MessageId, MessageInfo, Paths, ProjectId, ProjectInfo, Request, TaskId, TaskInfo,
+    TerminalId, TerminalInfo, VERSION, check_private_dir, read, write,
 };
 
 /// A message was sent or delivered, in the order the daemon sent the events.
@@ -411,10 +411,7 @@ impl Client {
 
     /// What each agent changed in its worktree. Agents whose worktree cannot be read
     /// are left out.
-    pub fn agent_changes(
-        &self,
-        agents: Vec<AgentId>,
-    ) -> Result<Vec<(AgentId, DiffStat)>, ClientError> {
+    pub fn agent_changes(&self, agents: Vec<AgentId>) -> Result<Vec<AgentChange>, ClientError> {
         match self.call(|call| Request::AgentChanges { call, agents }, None)? {
             Event::AgentChanges { changes, .. } => Ok(changes),
             other => Err(unexpected("AgentChanges", &other)),

@@ -25,6 +25,9 @@ pub const VERSION: u32 = 6;
 /// The most messages [`Request::ListMessages`] returns.
 pub const MESSAGES_LISTED: usize = 500;
 
+/// The most files one [`AgentChange`] lists.
+pub const FILES_LISTED: usize = 500;
+
 /// Guards against a corrupt length prefix allocating gigabytes.
 const MAX_FRAME: usize = 256 << 20;
 
@@ -274,6 +277,23 @@ pub struct DiffStat {
     pub deletions: u32,
 }
 
+/// One changed file of an agent. `path` is relative to the agent's worktree.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct FileStat {
+    pub path: PathBuf,
+    pub additions: u32,
+    pub deletions: u32,
+}
+
+/// What one agent changed: the totals, and up to [`FILES_LISTED`] files, most changed
+/// lines first.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AgentChange {
+    pub agent: AgentId,
+    pub stat: DiffStat,
+    pub files: Vec<FileStat>,
+}
+
 /// Matches a reply to its request, so a late reply never answers a newer call.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CallId(pub u32);
@@ -418,7 +438,7 @@ pub enum Event {
     /// One entry per asked agent whose worktree could be read.
     AgentChanges {
         call: CallId,
-        changes: Vec<(AgentId, DiffStat)>,
+        changes: Vec<AgentChange>,
     },
 }
 
