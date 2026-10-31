@@ -36,7 +36,7 @@ use crate::workspace::{View, Workspace};
 
 mod comments;
 
-use comments::{Composer, ReplyBox};
+use comments::{Composer, ReplyBox, ReplyFocus};
 
 const NAV_WIDTH: f32 = 272.;
 const NAV_ROW: f32 = 30.;
@@ -155,6 +155,10 @@ pub(crate) struct ReviewView {
     focus_composer: bool,
     /// Focus the diff body at the next frame.
     focus_body: bool,
+    /// Focus a reply field or its button at the next frame.
+    focus_reply: Option<ReplyFocus>,
+    /// Redraws the relative times of delivered comments.
+    clock: Option<gpui::Task<()>>,
 }
 
 fn update_workspace(
@@ -236,6 +240,8 @@ impl ReviewView {
             unfolded: HashSet::new(),
             focus_composer: false,
             focus_body: false,
+            focus_reply: None,
+            clock: None,
         }
     }
 
@@ -279,6 +285,7 @@ impl ReviewView {
         }
 
         self.apply_jump(&input);
+        self.sync_clock(cx);
         cx.notify();
     }
 
@@ -315,6 +322,7 @@ impl ReviewView {
         }
 
         self.input = None;
+        self.clock = None;
         self.rebuild(false);
         cx.notify();
     }
@@ -717,6 +725,8 @@ impl Render for ReviewView {
             window.focus(&self.composer.input.focus_handle(cx), cx);
         } else if std::mem::take(&mut self.focus_body) {
             window.focus(&self.body_focus, cx);
+        } else {
+            self.apply_reply_focus(window, cx);
         }
 
         let root = h_flex()
@@ -3489,6 +3499,301 @@ mod tests {
         assert_eq!(comments_of(&workspace, cx).len(), before);
     }
 
+    /// Changes a comment as a daemon event would and draws the result.
+    fn change_comment(
+        workspace: &Entity<Workspace>,
+        id: CommentId,
+        change: impl FnOnce(&mut ReviewComment),
+        cx: &mut VisualTestContext,
+    ) {
+        let mut comment = comments_of(workspace, cx)
+            .into_iter()
+            .find(|comment| comment.id == id)
+            .expect("the sample has the comment");
+        change(&mut comment);
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.comment_event(&CommentEvent::Changed(Box::new(comment)), cx);
+        });
+        redraw(cx);
+    }
+
+    fn comment_state(
+        workspace: &Entity<Workspace>,
+        id: CommentId,
+        cx: &VisualTestContext,
+    ) -> swarm_protocol::CommentState {
+        comments_of(workspace, cx)
+            .into_iter()
+            .find(|comment| comment.id == id)
+            .map(|comment| comment.state)
+            .expect("the sample has the comment")
+    }
+
+    fn focused(handle: &FocusHandle, cx: &mut VisualTestContext) -> bool {
+        cx.update(|window, _| handle.is_focused(window))
+    }
+
+    /// The sample's sent Live thread, open on screen.
+    fn thread_three(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> Entity<ReviewView> {
+        let review = open_review(workspace, cx);
+        let file = review.read_with(cx, |review, _| review.file_of_thread(CommentId(3)));
+
+        review.update(cx, |review, cx| review.select_file(file.unwrap_or(0), cx));
+        redraw(cx);
+        assert!(
+            cx.debug_bounds("comment-thread-3").is_some(),
+            "thread 3 is not on screen"
+        );
+
+        review
+    }
+
+    #[gpui::test]
+    fn reply_opens_a_field_that_takes_focus_and_cancel_gives_focus_back(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = thread_three(&workspace, cx);
+        let root = CommentId(3);
+        let button = review.update(cx, |review, cx| review.reply_button_focus(root, cx));
+        let input = review.update(cx, |review, cx| review.reply_input_for_test(root, cx));
+        let field = input.read_with(cx, |_, cx| input.focus_handle(cx));
+        let closed = cx.debug_bounds("comment-reply-3").is_none();
+
+        click("comment-reply-open-3", cx);
+        let (open, in_field) = (
+            review.read_with(cx, |review, _| review.reply_is_open(root)),
+            focused(&field, cx),
+        );
+        cx.simulate_input("jkvc");
+        let typed = input.read_with(cx, |input, _| input.text());
+        let viewed = review.read_with(cx, |review, _| review.viewed_count());
+        let composer = review.read_with(cx, |review, _| review.composer_is_open());
+
+        cx.simulate_keystrokes("escape");
+        redraw(cx);
+        let (open_after, text_after, on_button) = (
+            review.read_with(cx, |review, _| review.reply_is_open(root)),
+            input.read_with(cx, |input, _| input.text()),
+            focused(&button, cx),
+        );
+
+        assert!(closed && cx.debug_bounds("comment-reply-3").is_none());
+        assert!(open && in_field, "the field opens with focus in it");
+        assert_eq!(typed, "jkvc", "plain keys type in the field");
+        assert_eq!(viewed, 0);
+        assert!(!composer);
+        assert!(!open_after && !focused(&field, cx));
+        assert_eq!(text_after, "");
+        assert!(on_button, "focus did not go back to the Reply button");
+    }
+
+    #[gpui::test]
+    fn the_cancel_button_closes_the_field_and_restores_focus(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = thread_three(&workspace, cx);
+        let root = CommentId(3);
+        let button = review.update(cx, |review, cx| review.reply_button_focus(root, cx));
+        let before = comments_of(&workspace, cx).len();
+
+        click("comment-reply-open-3", cx);
+        cx.simulate_input("half a thought");
+        click("comment-reply-cancel-3", cx);
+
+        assert!(!review.read_with(cx, |review, _| review.reply_is_open(root)));
+        assert!(cx.debug_bounds("comment-reply-3").is_none());
+        assert!(focused(&button, cx));
+        assert_eq!(
+            comments_of(&workspace, cx).len(),
+            before,
+            "nothing was sent"
+        );
+        assert_eq!(
+            review
+                .update(cx, |review, cx| review.reply_input_for_test(root, cx))
+                .read_with(cx, |input, _| input.text()),
+            ""
+        );
+    }
+
+    #[gpui::test]
+    fn send_sends_a_reply_once_and_closes_the_field(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = thread_three(&workspace, cx);
+        let root = CommentId(3);
+        let button = review.update(cx, |review, cx| review.reply_button_focus(root, cx));
+        let before = comments_of(&workspace, cx).len();
+
+        click("comment-reply-open-3", cx);
+        click("comment-reply-send-3", cx);
+        let empty = comments_of(&workspace, cx).len();
+
+        click("comment-reply-open-3", cx);
+        cx.simulate_input("Thanks");
+        review.update(cx, |review, cx| {
+            review.submit_reply(root, cx);
+            review.submit_reply(root, cx);
+        });
+        cx.run_until_parked();
+        redraw(cx);
+        let replies = comments_of(&workspace, cx);
+
+        assert_eq!(empty, before, "an empty reply was sent");
+        assert_eq!(replies.len(), before + 1, "sent twice or not at all");
+        let reply = replies.last().expect("the reply");
+        assert_eq!(reply.parent, Some(root));
+        assert_eq!(reply.state, swarm_protocol::CommentState::Sent);
+        assert!(!review.read_with(cx, |review, _| review.reply_is_open(root)));
+        assert!(focused(&button, cx), "focus did not go back to Reply");
+
+        click("comment-reply-open-3", cx);
+        cx.simulate_input("Again");
+        click("comment-reply-send-3", cx);
+        cx.run_until_parked();
+        redraw(cx);
+
+        assert_eq!(comments_of(&workspace, cx).len(), before + 2);
+        assert!(focused(&button, cx));
+    }
+
+    #[gpui::test]
+    fn a_reply_that_succeeds_leaves_focus_where_the_user_moved_it(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = thread_three(&workspace, cx);
+        let root = CommentId(3);
+        let button = review.update(cx, |review, cx| review.reply_button_focus(root, cx));
+        let elsewhere = review.read_with(cx, |review, _| review.body_focus().clone());
+
+        click("comment-reply-open-3", cx);
+        cx.simulate_input("Thanks");
+        review.update(cx, |review, cx| review.submit_reply(root, cx));
+        cx.update(|window, cx| window.focus(&elsewhere, cx));
+        cx.run_until_parked();
+        redraw(cx);
+
+        assert!(!review.read_with(cx, |review, _| review.reply_is_open(root)));
+        assert!(focused(&elsewhere, cx), "the answer took focus away");
+        assert!(!focused(&button, cx));
+    }
+
+    #[gpui::test]
+    fn cmd_enter_sends_the_reply_from_the_field(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = thread_three(&workspace, cx);
+        let before = comments_of(&workspace, cx).len();
+
+        click("comment-reply-open-3", cx);
+        cx.simulate_input("Thanks");
+        cx.simulate_keystrokes("cmd-enter");
+        cx.run_until_parked();
+        redraw(cx);
+
+        assert_eq!(comments_of(&workspace, cx).len(), before + 1);
+        assert!(!review.read_with(cx, |review, _| review.reply_is_open(CommentId(3))));
+    }
+
+    #[gpui::test]
+    fn a_failed_reply_keeps_its_field_open_with_the_text(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = thread_three(&workspace, cx);
+        let root = CommentId(3);
+        workspace.update(cx, |workspace, _| {
+            workspace.source = crate::workspace::DataSource::Connecting;
+        });
+
+        click("comment-reply-open-3", cx);
+        cx.simulate_input("Thanks");
+        cx.simulate_keystrokes("cmd-enter");
+        cx.run_until_parked();
+        redraw(cx);
+
+        assert!(review.read_with(cx, |review, _| review.reply_is_open(root)));
+        assert_eq!(
+            review
+                .update(cx, |review, cx| review.reply_input_for_test(root, cx))
+                .read_with(cx, |input, _| input.text()),
+            "Thanks"
+        );
+        assert!(!review.read_with(cx, |review, _| review.reply_sending(root)));
+    }
+
+    #[gpui::test]
+    fn resolve_folds_a_sent_thread_and_reopen_brings_it_back(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        thread_three(&workspace, cx);
+        let id = CommentId(3);
+        let resolve_there = cx.debug_bounds("comment-resolve-3").is_some();
+
+        click("comment-resolve-3", cx);
+        let resolved = comment_state(&workspace, id, cx);
+        let folded = cx.debug_bounds("comment-folded-3").is_some();
+        click("comment-folded-3", cx);
+        click("comment-resolve-3", cx);
+
+        assert!(resolve_there);
+        assert_eq!(resolved, swarm_protocol::CommentState::Resolved);
+        assert!(folded, "a resolved thread folds");
+        assert_eq!(
+            comment_state(&workspace, id, cx),
+            swarm_protocol::CommentState::Sent,
+            "Reopen sets the thread back to sent"
+        );
+    }
+
+    #[gpui::test]
+    fn only_a_pending_thread_offers_delete(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        thread_three(&workspace, cx);
+        let sent = (
+            cx.debug_bounds("comment-delete-3").is_some(),
+            cx.debug_bounds("comment-resolve-3").is_some(),
+        );
+
+        change_comment(
+            &workspace,
+            CommentId(3),
+            |comment| {
+                comment.state = swarm_protocol::CommentState::Pending;
+                comment.sent_at = None;
+                comment.delivered_at = None;
+            },
+            cx,
+        );
+        let pending = (
+            cx.debug_bounds("comment-delete-3").is_some(),
+            cx.debug_bounds("comment-resolve-3").is_some(),
+        );
+
+        assert_eq!(sent, (false, true));
+        assert_eq!(pending, (true, false));
+    }
+
+    #[gpui::test]
+    fn a_delivery_event_changes_the_thread_from_in_flight_to_delivered(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = thread_three(&workspace, cx);
+        let tag = |cx: &VisualTestContext| {
+            review.read_with(cx, |review, _| review.state_text_for_test(CommentId(3)))
+        };
+
+        change_comment(&workspace, CommentId(3), |c| c.delivered_at = None, cx);
+        let in_flight = tag(cx);
+        change_comment(
+            &workspace,
+            CommentId(3),
+            |c| c.delivered_at = c.sent_at.map(|at| at + 12_000),
+            cx,
+        );
+        let delivered = tag(cx);
+
+        assert_eq!(in_flight.as_deref(), Some("In flight"));
+        assert!(
+            delivered.is_some_and(|text| text.starts_with("Delivered ") && text.ends_with(" ago")),
+        );
+    }
+
     /// The accessibility name and state of an element.
     fn a11y_of(element: impl IntoElement) -> (Option<String>, Option<bool>) {
         use gpui::Element as _;
@@ -3499,6 +3804,31 @@ mod tests {
         element.write_a11y_info(&mut node);
 
         (node.label().map(str::to_owned), node.is_selected())
+    }
+
+    #[gpui::test]
+    fn the_reply_button_does_not_claim_to_be_a_toggle(cx: &mut TestAppContext) {
+        use gpui::{Element as _, RenderOnce as _};
+
+        let (workspace, cx) = setup(cx);
+        let review = thread_three(&workspace, cx);
+        let root = CommentId(3);
+        let handle = review.update(cx, |review, cx| review.reply_button_focus(root, cx));
+        click("comment-reply-open-3", cx);
+        assert!(review.read_with(cx, |review, _| review.reply_is_open(root)));
+
+        let (label, toggled) = cx.update(|window, cx| {
+            let button = comments::reply_open_button(root, &handle, &review);
+            let element = button.render(window, cx).into_element();
+            let mut node = gpui::accesskit::Node::new(Role::Unknown);
+
+            element.write_a11y_info(&mut node);
+
+            (node.label().map(str::to_owned), node.toggled())
+        });
+
+        assert_eq!(label.as_deref(), Some("Reply"));
+        assert_eq!(toggled, None);
     }
 
     #[gpui::test]

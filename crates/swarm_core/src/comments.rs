@@ -9,6 +9,7 @@
 use std::cell::OnceCell;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Condvar, Mutex, PoisonError};
@@ -542,8 +543,9 @@ fn post(store: &Store, mail: &Mail, entries: &[Entry], batch: bool) -> Result<Wr
         .collect();
 
     let mut messages = Vec::new();
-    for text in message_texts(&blocks, batch) {
-        messages.push(store.add_message(&NewMessage {
+    let mut comments = Vec::with_capacity(entries.len());
+    for (range, text) in message_texts(&blocks, batch) {
+        let message = store.add_message(&NewMessage {
             project: mail.project,
             task: Some(mail.task),
             from: None,
@@ -551,43 +553,44 @@ fn post(store: &Store, mail: &Mail, entries: &[Entry], batch: bool) -> Result<Wr
             kind: MessageKind::Comment,
             text: &text,
             delivered: false,
-        })?);
-    }
+        })?;
 
-    let comments = entries
-        .iter()
-        .map(|entry| store.mark_comment_sent(entry.comment.id, entry.to))
-        .collect::<Result<_, _>>()?;
+        for entry in &entries[range] {
+            comments.push(store.mark_comment_sent(entry.comment.id, entry.to, message.id)?);
+        }
+        messages.push(message);
+    }
 
     Ok(Written { messages, comments })
 }
 
 /// Packs the blocks, in order, into messages of at most [`MAX_MESSAGE_BYTES`]. A `batch`
 /// message starts with its count line, and with its place when there is more than one.
-fn message_texts(blocks: &[String], batch: bool) -> Vec<String> {
+/// Each text comes with the range of blocks it holds.
+fn message_texts(blocks: &[String], batch: bool) -> Vec<(Range<usize>, String)> {
     if !batch {
-        return vec![blocks.join("\n\n")];
+        return vec![(0..blocks.len(), blocks.join("\n\n"))];
     }
 
     let room = MAX_MESSAGE_BYTES - HEADER_ROOM;
-    let mut groups: Vec<Vec<&str>> = Vec::new();
+    let mut groups: Vec<Range<usize>> = Vec::new();
     let mut size = 0;
-    for block in blocks {
+    for (index, block) in blocks.iter().enumerate() {
         match groups.last_mut() {
             Some(group) if size + 2 + block.len() <= room => {
                 size += 2 + block.len();
-                group.push(block);
+                group.end = index + 1;
             }
             _ => {
                 size = block.len();
-                groups.push(vec![block]);
+                groups.push(index..index + 1);
             }
         }
     }
 
     let total = groups.len();
     groups
-        .iter()
+        .into_iter()
         .enumerate()
         .map(|(index, group)| {
             let count = group.len();
@@ -597,8 +600,12 @@ fn message_texts(blocks: &[String], batch: bool) -> Vec<String> {
             } else {
                 String::new()
             };
+            let text = format!(
+                "{count} {noun}{place}:\n\n{}",
+                blocks[group.clone()].join("\n\n")
+            );
 
-            format!("{count} {noun}{place}:\n\n{}", group.join("\n\n"))
+            (group, text)
         })
         .collect()
 }
@@ -986,6 +993,7 @@ mod tests {
             outdated: false,
             created_at: 0,
             sent_at: None,
+            delivered_at: None,
         }
     }
 
@@ -1014,7 +1022,8 @@ mod tests {
             "d".to_owned(),
         ];
 
-        let texts = message_texts(&blocks, true);
+        let packed = message_texts(&blocks, true);
+        let texts: Vec<&String> = packed.iter().map(|(_, text)| text).collect();
 
         assert_eq!(texts.len(), 3);
         assert!(texts[0].starts_with("1 comment (1 of 3):\n\na"));
@@ -1022,8 +1031,21 @@ mod tests {
         assert!(texts[2].ends_with(":\n\nc\n\nd"));
         assert!(texts[2].starts_with("2 comments (3 of 3):"));
         assert!(texts.iter().all(|text| text.len() <= MAX_MESSAGE_BYTES));
-        assert_eq!(message_texts(&blocks[2..], true), ["2 comments:\n\nc\n\nd"]);
-        assert_eq!(message_texts(&blocks[2..], false), ["c\n\nd"]);
+        assert_eq!(
+            packed
+                .iter()
+                .map(|(range, _)| range.clone())
+                .collect::<Vec<_>>(),
+            [0..1, 1..2, 2..4]
+        );
+        assert_eq!(
+            message_texts(&blocks[2..], true),
+            [(0..2, "2 comments:\n\nc\n\nd".to_owned())]
+        );
+        assert_eq!(
+            message_texts(&blocks[2..], false),
+            [(0..2, "c\n\nd".to_owned())]
+        );
     }
 
     #[test]

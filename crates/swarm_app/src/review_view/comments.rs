@@ -2,21 +2,24 @@
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use gpui::{AnyElement, Context, Entity, FontWeight, Role, SharedString, Subscription, div, px};
+use gpui::{
+    AnyElement, Context, Entity, FocusHandle, Focusable as _, FontWeight, Role, SharedString,
+    Subscription, div, px,
+};
 use swarm_protocol::{
     COMMENT_BYTES, CommentAnchor, CommentId, CommentState, DiffLineKind, DiffSide, NewComment,
     ReviewComment, ReviewSource,
 };
 use swarm_ui::prelude::*;
-use swarm_ui::{TextArea, TextFieldSize, ThemeColors};
+use swarm_ui::{TextArea, ThemeColors};
 
 use super::{
     AgentLabel, DiffStyle, FileKey, NUMBER_WIDTH, ReviewView, SIGN_WIDTH, hunk_line,
     update_workspace,
 };
-use crate::actions::COMPOSER_CONTEXT;
+use crate::actions::{COMPOSER_CONTEXT, CancelReply, REPLY_CONTEXT};
 use crate::markdown;
 use crate::model::TaskId;
 use crate::review_comments::CommentSlot;
@@ -27,6 +30,9 @@ use crate::review_model::{
 
 const TOO_LONG: &str = "Comment is too long";
 const FIRST_WORDS: usize = 8;
+
+/// How often the relative times of delivered comments are drawn again.
+const CLOCK_TICK: Duration = Duration::from_secs(5);
 
 /// The line cursor: a line of a file, kept by the file's key so it survives a new diff
 /// that leaves the file as it was.
@@ -127,10 +133,46 @@ impl Composer {
 
 /// The reply field of a thread.
 pub(super) struct ReplyBox {
-    input: Entity<TextInput>,
+    input: Entity<TextArea>,
+    /// The field shows under the thread.
+    open: bool,
     /// The reply is on its way to the daemon.
     sending: bool,
+    /// The Reply button, which gets focus back when the field closes.
+    button: FocusHandle,
+    /// The Send and Cancel buttons. Both are off while the reply is on its way, but
+    /// focus stays on the one the user used.
+    send: FocusHandle,
+    cancel: FocusHandle,
     _subscription: Subscription,
+}
+
+/// Where focus goes at the next frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReplyFocus {
+    Field(CommentId),
+    Button(CommentId),
+    /// The Reply button, unless focus has left the field since the reply was sent.
+    ButtonFromField(CommentId),
+}
+
+/// A thread's Reply button. It only opens the field, which has its own Cancel, so it
+/// is not a toggle.
+pub(super) fn reply_open_button(
+    id: CommentId,
+    focus: &FocusHandle,
+    view: &Entity<ReviewView>,
+) -> Button {
+    let numeric = usize::try_from(id.0).unwrap_or(usize::MAX);
+    let view = view.clone();
+
+    Button::new(("comment-reply-open", numeric), "Reply")
+        .variant(ButtonVariant::Ghost)
+        .debug_selector(|| format!("comment-reply-open-{numeric}"))
+        .track_focus(focus)
+        .on_click(move |_, _, cx| {
+            view.update(cx, |this, cx| this.open_reply(id, cx));
+        })
 }
 
 fn system_now() -> u64 {
@@ -172,29 +214,40 @@ fn route_text(comment: &ReviewComment, agents: &[AgentLabel]) -> String {
     }
 }
 
-fn state_word(state: CommentState) -> &'static str {
-    match state {
-        CommentState::Pending => "Pending",
-        CommentState::Sent => "Sent",
-        CommentState::Resolved => "Resolved",
+/// The state of a comment for a screen reader.
+fn state_word(comment: &ReviewComment) -> &'static str {
+    match (comment.state, comment.delivered_at) {
+        (CommentState::Pending, _) => "Pending",
+        (CommentState::Sent, None) => "In flight",
+        (CommentState::Sent, Some(_)) => "Delivered",
+        (CommentState::Resolved, _) => "Resolved",
+    }
+}
+
+/// The text and tone of a comment's state tag: Pending until Request changes, In flight
+/// until the orchestrator's terminal got it, then Delivered with its age.
+pub(super) fn state_label(comment: &ReviewComment, now: u64) -> (String, TagTone) {
+    match (comment.state, comment.delivered_at) {
+        (CommentState::Pending, _) => ("Pending".to_owned(), TagTone::Warn),
+        (CommentState::Sent, None) => ("In flight".to_owned(), TagTone::Accent),
+        (CommentState::Sent, Some(delivered)) => {
+            let when = ago(delivered, now);
+            let text = if when == "now" {
+                "Delivered now".to_owned()
+            } else {
+                format!("Delivered {when} ago")
+            };
+
+            (text, TagTone::Ok)
+        }
+        (CommentState::Resolved, _) => ("Resolved".to_owned(), TagTone::Neutral),
     }
 }
 
 fn state_tag(comment: &ReviewComment, now: u64) -> Tag {
-    match comment.state {
-        CommentState::Pending => Tag::new("Pending").tone(TagTone::Warn),
-        CommentState::Sent => {
-            let when = ago(comment.sent_at.unwrap_or(comment.created_at), now);
-            let text = if when == "now" {
-                "Sent now".to_owned()
-            } else {
-                format!("Sent {when} ago")
-            };
+    let (text, tone) = state_label(comment, now);
 
-            Tag::new(text).tone(TagTone::Accent)
-        }
-        CommentState::Resolved => Tag::new("Resolved"),
-    }
+    Tag::new(text).tone(tone)
 }
 
 impl ReviewView {
@@ -249,6 +302,31 @@ impl ReviewView {
         self.open_counts = counts.into();
         self.replies_of = Rc::new(replies);
         self.resolve_cursor();
+    }
+
+    /// Runs a clock while a delivered comment shows its age, so "Delivered 12s ago" moves
+    /// on. The sample has a fixed time and needs none.
+    pub(super) fn sync_clock(&mut self, cx: &mut Context<Self>) {
+        let ticking = self.input.as_ref().is_some_and(|input| {
+            input.fixed_now.is_none()
+                && input.comments.iter().any(|comment| {
+                    comment.state == CommentState::Sent && comment.delivered_at.is_some()
+                })
+        });
+
+        if !ticking {
+            self.clock = None;
+        } else if self.clock.is_none() {
+            self.clock = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(CLOCK_TICK).await;
+
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        return;
+                    }
+                }
+            }));
+        }
     }
 
     /// Keeps the cursor on its line when the file is as it was, else drops it.
@@ -311,6 +389,63 @@ impl ReviewView {
         self.submit_reply(root, cx);
     }
 
+    /// Opens a thread on screen for a snapshot: its file selected, the thread unfolded
+    /// and, with `reply`, its reply field open with that text.
+    #[cfg(feature = "snapshot")]
+    pub(crate) fn show_thread(
+        &mut self,
+        id: CommentId,
+        reply: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(file) = self.file_of_thread(id) {
+            self.select_file(file, cx);
+        }
+        self.unfolded.insert(id);
+
+        if let Some(text) = reply {
+            let input = self.reply_input(id, cx);
+
+            input.update(cx, |input, cx| input.set_text(text.to_owned(), cx));
+            self.open_reply(id, cx);
+        }
+
+        self.after_card_change();
+        cx.notify();
+    }
+
+    #[cfg(any(test, feature = "snapshot"))]
+    pub(crate) fn file_of_thread(&self, id: CommentId) -> Option<usize> {
+        let comments = &self.input.as_ref()?.comments;
+
+        self.threads
+            .iter()
+            .find(|thread| comments.get(thread.root).is_some_and(|root| root.id == id))
+            .map(|thread| thread.file)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn state_text_for_test(&self, id: CommentId) -> Option<String> {
+        let input = self.input.as_ref()?;
+        let comment = input.comments.iter().find(|comment| comment.id == id)?;
+
+        Some(state_label(comment, input.fixed_now.unwrap_or_else(system_now)).0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reply_is_open(&self, root: CommentId) -> bool {
+        self.reply_boxes.get(&root).is_some_and(|reply| reply.open)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reply_button_focus(
+        &mut self,
+        root: CommentId,
+        cx: &mut Context<Self>,
+    ) -> FocusHandle {
+        self.reply_box(root, cx).button.clone()
+    }
+
     #[cfg(test)]
     pub(crate) fn reply_sending(&self, root: CommentId) -> bool {
         self.reply_boxes
@@ -323,7 +458,7 @@ impl ReviewView {
         &mut self,
         root: CommentId,
         cx: &mut Context<Self>,
-    ) -> Entity<TextInput> {
+    ) -> Entity<TextArea> {
         self.reply_input(root, cx)
     }
 
@@ -782,20 +917,24 @@ impl ReviewView {
         }
     }
 
-    /// Applies an answer to a reply: the field clears on success and opens again on
-    /// failure.
+    /// Applies an answer to a reply: on success the field clears and closes, and focus
+    /// goes back to the Reply button if the field still holds it. On failure the field
+    /// stays open with its text.
     fn reply_answer(
         &mut self,
         root: CommentId,
         result: Result<(), SharedString>,
         cx: &mut Context<Self>,
     ) {
+        let sent = result.is_ok();
+
         if let Some(reply) = self.reply_boxes.get_mut(&root) {
             reply.sending = false;
+            reply.open = !sent;
             reply.input.update(cx, |input, cx| {
                 input.set_disabled(false, cx);
 
-                if result.is_ok() {
+                if sent {
                     input.set_text("", cx);
                 }
             });
@@ -804,11 +943,14 @@ impl ReviewView {
         match result {
             Ok(()) => {
                 self.card_errors.remove(&root);
+                self.focus_reply = Some(ReplyFocus::ButtonFromField(root));
             }
             Err(message) => {
                 self.card_errors.insert(root, message);
             }
         }
+
+        self.after_card_change();
     }
 
     /// Forgets the draft and the box of a task that closed.
@@ -828,15 +970,13 @@ impl ReviewView {
         }
     }
 
-    fn reply_input(&mut self, root: CommentId, cx: &mut Context<Self>) -> Entity<TextInput> {
-        let reply = self.reply_boxes.entry(root).or_insert_with(|| {
+    fn reply_box(&mut self, root: CommentId, cx: &mut Context<Self>) -> &mut ReplyBox {
+        self.reply_boxes.entry(root).or_insert_with(|| {
             let input = cx.new(|cx| {
-                let mut input = TextInput::new(cx);
-                input.set_label("Reply", cx);
-                input.set_placeholder("Reply", cx);
-                input.set_size(TextFieldSize::Small, cx);
-                input.set_bordered(false, cx);
-                input
+                let mut area = TextArea::new(cx);
+                area.set_label("Reply", cx);
+                area.set_rows(3, cx);
+                area
             });
             let subscription = cx.subscribe(&input, move |this, _, event, cx| {
                 if matches!(event, TextInputEvent::Submitted(_)) {
@@ -846,12 +986,77 @@ impl ReviewView {
 
             ReplyBox {
                 input,
+                open: false,
                 sending: false,
+                button: cx.focus_handle().tab_stop(true),
+                send: cx.focus_handle().tab_stop(true),
+                cancel: cx.focus_handle().tab_stop(true),
                 _subscription: subscription,
             }
-        });
+        })
+    }
 
-        reply.input.clone()
+    fn reply_input(&mut self, root: CommentId, cx: &mut Context<Self>) -> Entity<TextArea> {
+        self.reply_box(root, cx).input.clone()
+    }
+
+    /// Shows the reply field of a thread and moves focus into it.
+    pub(crate) fn open_reply(&mut self, root: CommentId, cx: &mut Context<Self>) {
+        self.reply_box(root, cx).open = true;
+        self.focus_reply = Some(ReplyFocus::Field(root));
+
+        self.after_card_change();
+        cx.notify();
+    }
+
+    /// Closes the reply field, drops its text and gives focus back to the Reply button.
+    /// A reply on its way keeps its field.
+    pub(crate) fn cancel_reply(&mut self, root: CommentId, cx: &mut Context<Self>) {
+        let Some(reply) = self.reply_boxes.get_mut(&root) else {
+            return;
+        };
+        if reply.sending || !reply.open {
+            return;
+        }
+
+        reply.open = false;
+        reply.input.update(cx, |input, cx| input.set_text("", cx));
+        self.card_errors.remove(&root);
+        self.focus_reply = Some(ReplyFocus::Button(root));
+
+        self.after_card_change();
+        cx.notify();
+    }
+
+    /// Moves focus where the last reply action asked for.
+    pub(super) fn apply_reply_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(focus) = self.focus_reply.take() else {
+            return;
+        };
+
+        match focus {
+            ReplyFocus::Field(root) => {
+                let handle = self.reply_input(root, cx).focus_handle(cx);
+
+                window.focus(&handle, cx);
+            }
+            ReplyFocus::Button(root) => {
+                let handle = self.reply_box(root, cx).button.clone();
+
+                window.focus(&handle, cx);
+            }
+            ReplyFocus::ButtonFromField(root) => {
+                let reply = self.reply_box(root, cx);
+                let (field, button) = (reply.input.focus_handle(cx), reply.button.clone());
+                let in_field = field.contains_focused(window, cx)
+                    || reply.send.is_focused(window)
+                    || reply.cancel.is_focused(window);
+
+                if in_field {
+                    window.focus(&button, cx);
+                }
+            }
+        }
     }
 
     /// Sends the text of a thread's reply field as a reply.
@@ -1037,7 +1242,22 @@ impl ReviewView {
         let numeric = usize::try_from(id.0).unwrap_or(usize::MAX);
         let resolved = root.state == CommentState::Resolved;
         let view = cx.entity();
-        let reply_input = self.reply_input(id, cx);
+        let (reply_input, reply_open, reply_sending, reply_button) = {
+            let reply = self.reply_box(id, cx);
+
+            (
+                reply.input.clone(),
+                reply.open,
+                reply.sending,
+                reply.button.clone(),
+            )
+        };
+        let (send_focus, cancel_focus) = {
+            let reply = self.reply_box(id, cx);
+
+            (reply.send.clone(), reply.cancel.clone())
+        };
+        let reply_empty = reply_input.read(cx).text().trim().is_empty();
         let replies: Vec<ReviewComment> = self
             .replies_of
             .get(&id)
@@ -1153,6 +1373,7 @@ impl ReviewView {
         let action = if root.state == CommentState::Pending {
             Button::new(("comment-delete", numeric), "Delete")
                 .variant(ButtonVariant::Secondary)
+                .debug_selector(|| format!("comment-delete-{numeric}"))
                 .on_click(move |_, _, cx| {
                     update_workspace(&workspace, cx, |workspace, cx| {
                         workspace.delete_review_comment(task, id, cx);
@@ -1164,6 +1385,8 @@ impl ReviewView {
                 if resolved { "Reopen" } else { "Resolve" },
             )
             .variant(ButtonVariant::Secondary)
+            .debug_selector(|| format!("comment-resolve-{numeric}"))
+            .when(!resolved, |button| button.icon(IconName::Check))
             .on_click(move |_, _, cx| {
                 update_workspace(&workspace, cx, |workspace, cx| {
                     workspace.resolve_review_comment(task, id, !resolved, cx);
@@ -1171,10 +1394,68 @@ impl ReviewView {
             })
         };
 
+        let send_label = if root.state == CommentState::Pending {
+            "Add reply"
+        } else {
+            "Send"
+        };
+        let editor = reply_open.then(|| {
+            let (cancel_view, send_view) = (view.clone(), view.clone());
+
+            v_flex()
+                .id(("comment-reply", numeric))
+                .debug_selector(|| format!("comment-reply-{numeric}"))
+                .key_context(REPLY_CONTEXT)
+                .on_action(cx.listener(move |this, _: &CancelReply, _, cx| {
+                    this.cancel_reply(id, cx);
+                }))
+                .role(Role::Group)
+                .aria_label("Reply")
+                .gap(px(8.))
+                .px(px(12.))
+                .py(px(8.))
+                .border_b_1()
+                .border_color(line)
+                .child(reply_input)
+                .child(
+                    h_flex()
+                        .gap(px(8.))
+                        .justify_end()
+                        .child(
+                            Button::new(("comment-reply-cancel", numeric), "Cancel")
+                                .variant(ButtonVariant::Ghost)
+                                .debug_selector(|| format!("comment-reply-cancel-{numeric}"))
+                                .track_focus(&cancel_focus)
+                                .disabled(reply_sending)
+                                .on_click(move |_, _, cx| {
+                                    cancel_view.update(cx, |this, cx| this.cancel_reply(id, cx));
+                                }),
+                        )
+                        .child(
+                            Button::new(("comment-reply-send", numeric), send_label)
+                                .variant(ButtonVariant::Primary)
+                                .debug_selector(|| format!("comment-reply-send-{numeric}"))
+                                .track_focus(&send_focus)
+                                .disabled(reply_empty || reply_sending)
+                                .on_click(move |_, _, cx| {
+                                    send_view.update(cx, |this, cx| this.submit_reply(id, cx));
+                                }),
+                        ),
+                )
+        });
+
+        let footer = h_flex()
+            .gap(px(8.))
+            .px(px(12.))
+            .py(px(6.))
+            .child(reply_open_button(id, &reply_button, &view))
+            .child(div().flex_1())
+            .child(action);
+
         let label = format!(
             "Comment by You on {name} line {}, {}{}",
             root.anchor.line,
-            state_word(root.state),
+            state_word(root),
             if root.outdated { ", outdated" } else { "" }
         );
 
@@ -1201,14 +1482,8 @@ impl ReviewView {
                     .children(body(root))
                     .children(reply_rows),
             )
-            .child(
-                h_flex()
-                    .gap(px(8.))
-                    .px(px(12.))
-                    .py(px(6.))
-                    .child(div().flex_1().min_w_0().child(reply_input))
-                    .child(action),
-            )
+            .children(editor)
+            .child(footer)
             .children(error.map(|message| {
                 div()
                     .id(("comment-error", numeric))
@@ -1332,7 +1607,76 @@ impl ReviewView {
 
 #[cfg(test)]
 mod tests {
-    use super::first_words;
+    use std::path::PathBuf;
+
+    use swarm_protocol::{CommentAnchor, DiffSide, TaskId};
+
+    use super::*;
+
+    fn comment(state: CommentState, delivered_at: Option<u64>) -> ReviewComment {
+        ReviewComment {
+            id: CommentId(1),
+            task: TaskId(1),
+            parent: None,
+            source: ReviewSource::Live,
+            anchor: CommentAnchor {
+                worktree: PathBuf::from("/wt"),
+                path: PathBuf::from("a.rs"),
+                side: DiffSide::New,
+                line: 1,
+                text: String::new(),
+                before: None,
+                after: None,
+            },
+            body: "Rename it".to_owned(),
+            state,
+            to: None,
+            outdated: false,
+            created_at: 0,
+            sent_at: (state != CommentState::Pending).then_some(1_000),
+            delivered_at,
+        }
+    }
+
+    #[test]
+    fn the_tag_follows_the_comment_from_pending_to_delivered() {
+        let now = 100_000;
+
+        assert_eq!(
+            state_label(&comment(CommentState::Pending, None), now),
+            ("Pending".to_owned(), TagTone::Warn)
+        );
+        assert_eq!(
+            state_label(&comment(CommentState::Sent, None), now),
+            ("In flight".to_owned(), TagTone::Accent)
+        );
+        assert_eq!(
+            state_label(&comment(CommentState::Sent, Some(88_000)), now),
+            ("Delivered 12s ago".to_owned(), TagTone::Ok)
+        );
+        assert_eq!(
+            state_label(&comment(CommentState::Sent, Some(98_000)), now).0,
+            "Delivered now"
+        );
+        assert_eq!(
+            state_label(&comment(CommentState::Resolved, Some(88_000)), now),
+            ("Resolved".to_owned(), TagTone::Neutral)
+        );
+    }
+
+    #[test]
+    fn a_screen_reader_hears_the_same_state() {
+        assert_eq!(state_word(&comment(CommentState::Pending, None)), "Pending");
+        assert_eq!(state_word(&comment(CommentState::Sent, None)), "In flight");
+        assert_eq!(
+            state_word(&comment(CommentState::Sent, Some(1))),
+            "Delivered"
+        );
+        assert_eq!(
+            state_word(&comment(CommentState::Resolved, None)),
+            "Resolved"
+        );
+    }
 
     #[test]
     fn a_folded_thread_shows_the_first_words() {

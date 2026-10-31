@@ -237,6 +237,7 @@ impl Workspace {
             outdated: false,
             created_at: 0,
             sent_at: None,
+            delivered_at: None,
         };
         let owner = self.comment_owner(&probe);
         let now = self.now_ms();
@@ -455,6 +456,7 @@ mod tests {
             outdated: false,
             created_at: 0,
             sent_at: None,
+            delivered_at: None,
         }
     }
 

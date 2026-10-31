@@ -38,7 +38,9 @@ actions!(
         /// Moves the line cursor down one commentable line.
         NextLine,
         /// Closes the comment box and drops its draft.
-        CancelComment
+        CancelComment,
+        /// Closes the reply field of a thread and drops its text.
+        CancelReply
     ]
 );
 
@@ -50,6 +52,9 @@ pub(crate) const REVIEW_BODY_CONTEXT: &str = "ReviewBody";
 
 /// Key context of the box for a new comment.
 pub(crate) const COMPOSER_CONTEXT: &str = "CommentComposer";
+
+/// Key context of the reply field of a thread.
+pub(crate) const REPLY_CONTEXT: &str = "CommentReply";
 
 /// Plain keys of Review never fire while a text field has focus.
 const REVIEW_KEYS: &str = "Review && !TextInput && !TextArea";
@@ -96,6 +101,7 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new("up", PreviousLine, body),
         KeyBinding::new("down", NextLine, body),
         KeyBinding::new("escape", CancelComment, Some(COMPOSER_CONTEXT)),
+        KeyBinding::new("escape", CancelReply, Some(REPLY_CONTEXT)),
     ]);
 
     cx.bind_keys(bindings);

@@ -280,6 +280,14 @@ impl Setup {
             .expect("messages")
     }
 
+    fn comments_in(&self, messages: &[swarm_protocol::MessageId]) -> Vec<ReviewComment> {
+        self.store
+            .lock()
+            .expect("lock")
+            .comments_in_messages(messages)
+            .expect("comments")
+    }
+
     fn states(&self) -> Vec<CommentState> {
         self.store
             .lock()
@@ -459,6 +467,9 @@ fn all_pending_comments_go_in_one_message() {
             .expect("pending")
             .is_empty()
     );
+
+    let carried = setup.comments_in(&[written.messages[0].id]);
+    assert_eq!(carried.len(), 3, "a batch shares one message");
 }
 
 #[test]
@@ -1033,6 +1044,18 @@ fn comments_over_one_message_are_split_between_comments() {
     assert_eq!(setup.states(), [CommentState::Sent; 5]);
     assert_eq!(setup.messages().len(), 2);
     assert_eq!(written.comments.len(), 5);
+
+    let first = setup.comments_in(&[written.messages[0].id]);
+    let second = setup.comments_in(&[written.messages[1].id]);
+    assert_eq!((first.len(), second.len()), (3, 2));
+    assert_eq!(
+        first
+            .iter()
+            .chain(&second)
+            .map(|c| c.id)
+            .collect::<Vec<_>>(),
+        written.comments.iter().map(|c| c.id).collect::<Vec<_>>()
+    );
 }
 
 #[test]

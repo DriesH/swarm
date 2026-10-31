@@ -182,6 +182,77 @@ fn open_review_live_comments(
     review_element(workspace, ReviewSource::Live, cx);
 }
 
+/// Changes a sample comment as a daemon event would.
+fn change_comment(
+    workspace: &mut Workspace,
+    id: swarm_protocol::CommentId,
+    change: impl FnOnce(&mut swarm_protocol::ReviewComment),
+    cx: &mut Context<Workspace>,
+) {
+    let found = workspace
+        .data
+        .task_comments(workspace.active_task)
+        .iter()
+        .find(|comment| comment.id == id)
+        .cloned();
+
+    if let Some(mut comment) = found {
+        change(&mut comment);
+        workspace.comment_event(
+            &swarm_protocol::CommentEvent::Changed(Box::new(comment)),
+            cx,
+        );
+    }
+}
+
+/// Opens Review on Live with the sample thread 3 on screen. `reply` opens its reply field.
+fn show_live_thread(
+    workspace: &mut Workspace,
+    id: swarm_protocol::CommentId,
+    reply: Option<&str>,
+    cx: &mut Context<Workspace>,
+) {
+    review_element(workspace, ReviewSource::Live, cx);
+    workspace
+        .review
+        .update(cx, |review, cx| review.show_thread(id, reply, cx));
+}
+
+/// The sent thread that the orchestrator has not got yet.
+fn open_review_thread_in_flight(
+    workspace: &mut Workspace,
+    _: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let id = swarm_protocol::CommentId(3);
+
+    change_comment(workspace, id, |comment| comment.delivered_at = None, cx);
+    show_live_thread(workspace, id, None, cx);
+}
+
+/// A delivered thread with its reply field open.
+fn open_review_thread_reply(
+    workspace: &mut Workspace,
+    _: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    show_live_thread(
+        workspace,
+        swarm_protocol::CommentId(3),
+        Some("Done in the next commit."),
+        cx,
+    );
+}
+
+/// A resolved thread, opened.
+fn open_review_thread_resolved(
+    workspace: &mut Workspace,
+    _: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    show_live_thread(workspace, swarm_protocol::CommentId(5), None, cx);
+}
+
 /// Approves the open task's Merged diff and drops the sample's pending comments.
 fn approve_sample(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
     let task = workspace.active_task;
@@ -555,6 +626,36 @@ pub(crate) fn run(directory: PathBuf, cx: &mut App) {
                 Appearance::Dark,
                 "workspace-review-live-comments-dark.png",
                 Some(open_review_live_comments),
+            ),
+            (
+                Appearance::Light,
+                "workspace-review-thread-in-flight-light.png",
+                Some(open_review_thread_in_flight),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-review-thread-in-flight-dark.png",
+                Some(open_review_thread_in_flight),
+            ),
+            (
+                Appearance::Light,
+                "workspace-review-thread-reply-light.png",
+                Some(open_review_thread_reply),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-review-thread-reply-dark.png",
+                Some(open_review_thread_reply),
+            ),
+            (
+                Appearance::Light,
+                "workspace-review-thread-resolved-light.png",
+                Some(open_review_thread_resolved),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-review-thread-resolved-dark.png",
+                Some(open_review_thread_resolved),
             ),
             (
                 Appearance::Light,

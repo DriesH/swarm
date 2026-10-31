@@ -1048,6 +1048,7 @@ pub(crate) fn fake_add(
         outdated: false,
         created_at: now,
         sent_at: (!waits).then_some(now),
+        delivered_at: (!waits).then_some(now),
     });
 }
 
@@ -1086,6 +1087,7 @@ pub(crate) fn fake_send(
             comment.to = owner(comment);
             comment.state = CommentState::Sent;
             comment.sent_at = Some(now);
+            comment.delivered_at = Some(now);
             sent = true;
         }
     }
@@ -1176,6 +1178,7 @@ pub(crate) fn sample_comments(
             outdated: false,
             created_at: now.saturating_sub(age),
             sent_at: sent.then(|| now.saturating_sub(age).saturating_add(1_000)),
+            delivered_at: sent.then(|| now.saturating_sub(age).saturating_add(3_000)),
         }
     };
 
@@ -1931,6 +1934,7 @@ mod tests {
             outdated: false,
             created_at: 1,
             sent_at: None,
+            delivered_at: None,
         }
     }
 
