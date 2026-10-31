@@ -1,17 +1,60 @@
 //! Messages between agents: stored in SQLite, announced to the app, and waited for.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use swarm_core::store::{NewMessage, Store};
 use swarm_protocol::agent::InboxMessage;
-use swarm_protocol::{AgentId, Event, MessageInfo};
+use swarm_protocol::{AgentId, Event, MessageId, MessageInfo};
 
 use crate::hub::Clients;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// How often a waiting call looks at its peer.
+const PEER_CHECK: Duration = Duration::from_secs(1);
+
+/// Unread messages that someone is about to deliver. They count as delivered only after
+/// [`Claim::commit`]; a claim that drops without it gives them back.
+pub(crate) struct Claim {
+    messages: Vec<InboxMessage>,
+    owner: Arc<Messages>,
+}
+
+impl Claim {
+    pub(crate) fn messages(&self) -> &[InboxMessage] {
+        &self.messages
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+
+    /// The messages reached the agent: mark them delivered.
+    pub(crate) fn commit(self) {
+        let ids = self.ids();
+
+        if let Err(error) = lock(&self.owner.store).mark_delivered(&ids) {
+            log::error!("cannot mark messages as delivered: {error}");
+        }
+    }
+
+    fn ids(&self) -> Vec<MessageId> {
+        self.messages.iter().map(|message| message.id).collect()
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        let mut claimed = lock(&self.owner.claimed);
+        for message in &self.messages {
+            claimed.remove(&message.id);
+        }
+    }
 }
 
 pub(crate) struct Messages {
@@ -21,6 +64,8 @@ pub(crate) struct Messages {
     /// check and the sleep.
     wake: Mutex<()>,
     arrived: Condvar,
+    /// Messages a [`Claim`] holds right now.
+    claimed: Mutex<HashSet<MessageId>>,
 }
 
 impl Messages {
@@ -30,6 +75,7 @@ impl Messages {
             clients,
             wake: Mutex::new(()),
             arrived: Condvar::new(),
+            claimed: Mutex::default(),
         })
     }
 
@@ -46,38 +92,54 @@ impl Messages {
         Ok(info)
     }
 
-    /// Takes the agent's unread messages and marks them delivered.
-    pub(crate) fn take(&self, agent: AgentId) -> Result<Vec<InboxMessage>> {
-        Ok(lock(&self.store).take_unread(agent)?)
-    }
+    /// Claims the agent's unread messages that nobody else holds.
+    pub(crate) fn claim(self: &Arc<Self>, agent: AgentId) -> Result<Claim> {
+        let unread = lock(&self.store).unread(agent)?;
 
-    pub(crate) fn has_unread(&self, agent: AgentId) -> bool {
-        lock(&self.store).has_unread(agent).unwrap_or_else(|error| {
-            log::error!("cannot check the messages of agent {}: {error}", agent.0);
+        let mut claimed = lock(&self.claimed);
+        let messages: Vec<InboxMessage> = unread
+            .into_iter()
+            .filter(|message| claimed.insert(message.id))
+            .collect();
 
-            false
+        Ok(Claim {
+            messages,
+            owner: Arc::clone(self),
         })
     }
 
-    /// Waits until the agent has an unread message or `timeout` passes, then takes them.
-    pub(crate) fn wait(&self, agent: AgentId, timeout: Duration) -> Result<Vec<InboxMessage>> {
+    /// Waits until the agent has an unread message, `timeout` passes or `gone` says the
+    /// caller hung up, then claims the messages. A caller that hung up gets none.
+    pub(crate) fn wait(
+        self: &Arc<Self>,
+        agent: AgentId,
+        timeout: Duration,
+        gone: &dyn Fn() -> bool,
+    ) -> Result<Claim> {
         let deadline = Instant::now() + timeout;
         let mut guard = lock(&self.wake);
 
         loop {
-            let messages = self.take(agent)?;
-            if !messages.is_empty() {
-                return Ok(messages);
+            if gone() {
+                return Ok(Claim {
+                    messages: Vec::new(),
+                    owner: Arc::clone(self),
+                });
+            }
+
+            let claim = self.claim(agent)?;
+            if !claim.is_empty() {
+                return Ok(claim);
             }
 
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Ok(messages);
+                return Ok(claim);
             }
 
             guard = self
                 .arrived
-                .wait_timeout(guard, remaining)
+                .wait_timeout(guard, remaining.min(PEER_CHECK))
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
         }
@@ -120,7 +182,7 @@ mod tests {
         let start = Instant::now();
 
         let taken = messages
-            .wait(AgentId(1), Duration::from_millis(80))
+            .wait(AgentId(1), Duration::from_millis(80), &|| false)
             .expect("wait");
 
         assert!(taken.is_empty());
@@ -133,11 +195,11 @@ mod tests {
         messages.post(&new_message(1, "ready")).expect("post");
 
         let taken = messages
-            .wait(AgentId(1), Duration::from_secs(30))
+            .wait(AgentId(1), Duration::from_secs(30), &|| false)
             .expect("wait");
 
-        assert_eq!(taken.len(), 1);
-        assert_eq!(taken[0].text, "ready");
+        assert_eq!(taken.messages().len(), 1);
+        assert_eq!(taken.messages()[0].text, "ready");
     }
 
     #[test]
@@ -151,11 +213,11 @@ mod tests {
         });
 
         let taken = messages
-            .wait(AgentId(1), Duration::from_secs(30))
+            .wait(AgentId(1), Duration::from_secs(30), &|| false)
             .expect("wait");
         poster.join().expect("join");
 
-        assert_eq!(taken[0].text, "late");
+        assert_eq!(taken.messages()[0].text, "late");
         assert!(start.elapsed() < Duration::from_secs(10));
     }
 
@@ -165,11 +227,75 @@ mod tests {
         messages.post(&new_message(2, "not yours")).expect("post");
 
         let taken = messages
-            .wait(AgentId(1), Duration::from_millis(50))
+            .wait(AgentId(1), Duration::from_millis(50), &|| false)
             .expect("wait");
 
         assert!(taken.is_empty());
-        assert!(messages.has_unread(AgentId(2)));
+        assert!(!messages.claim(AgentId(2)).expect("claim").is_empty());
+    }
+
+    #[test]
+    fn a_claim_that_is_dropped_gives_the_messages_back() {
+        let messages = messages();
+        messages.post(&new_message(1, "keep")).expect("post");
+
+        let claim = messages.claim(AgentId(1)).expect("claim");
+        assert_eq!(claim.messages().len(), 1);
+        assert!(messages.claim(AgentId(1)).expect("again").is_empty());
+        drop(claim);
+
+        assert_eq!(
+            messages.claim(AgentId(1)).expect("later").messages().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_committed_claim_is_delivered_for_good() {
+        let messages = messages();
+        messages.post(&new_message(1, "once")).expect("post");
+
+        messages.claim(AgentId(1)).expect("claim").commit();
+
+        assert!(messages.claim(AgentId(1)).expect("later").is_empty());
+    }
+
+    #[test]
+    fn a_wait_for_a_caller_that_hung_up_claims_nothing() {
+        let messages = messages();
+        messages.post(&new_message(1, "mine")).expect("post");
+
+        let taken = messages
+            .wait(AgentId(1), Duration::from_secs(30), &|| true)
+            .expect("wait");
+
+        assert!(taken.is_empty());
+        assert_eq!(
+            messages.claim(AgentId(1)).expect("claim").messages().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_wait_stops_when_the_caller_hangs_up() {
+        let messages = messages();
+        let hung_up = std::sync::atomic::AtomicBool::new(false);
+        let start = Instant::now();
+
+        let taken = thread::scope(|scope| {
+            scope.spawn(|| {
+                thread::park_timeout(Duration::from_millis(100));
+                hung_up.store(true, std::sync::atomic::Ordering::Release);
+            });
+
+            messages.wait(AgentId(1), Duration::from_secs(30), &|| {
+                hung_up.load(std::sync::atomic::Ordering::Acquire)
+            })
+        })
+        .expect("wait");
+
+        assert!(taken.is_empty());
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

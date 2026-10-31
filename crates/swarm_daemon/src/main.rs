@@ -6,6 +6,7 @@ mod calls;
 mod connection;
 mod hub;
 mod messages;
+mod processes;
 mod recovery;
 mod tasks;
 
@@ -30,6 +31,7 @@ use crate::agents::{AgentConfig, Agents};
 use crate::calls::Calls;
 use crate::hub::{Clients, Terminals};
 use crate::messages::Messages;
+use crate::processes::Processes;
 use crate::recovery::System;
 
 /// What every client connection works with.
@@ -39,6 +41,7 @@ pub(crate) struct Services {
     pub(crate) agents: Arc<Agents>,
     pub(crate) clients: Arc<Clients>,
     pub(crate) messages: Arc<Messages>,
+    pub(crate) processes: Arc<Processes>,
     pub(crate) store: Arc<Mutex<Store>>,
 }
 
@@ -64,6 +67,7 @@ fn main() -> ExitCode {
         log::error!("{error:#}");
         return ExitCode::FAILURE;
     }
+    raise_file_limit();
 
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -151,12 +155,21 @@ fn run() -> Result<()> {
         vec![paths.socket.clone(), agent_socket_path],
     )?;
 
+    let processes = Processes::new(
+        Arc::clone(&store),
+        Arc::clone(&terminals),
+        Arc::clone(&clients),
+        Arc::clone(&messages),
+        Arc::clone(&agents),
+    );
+
     let services = Arc::new(Services {
         terminals,
         projects,
         agents,
         clients,
         messages,
+        processes,
         store,
     });
 
@@ -233,6 +246,30 @@ fn unblock_signals() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Every agent connection and terminal holds a descriptor, and macOS starts a process
+/// with only 256.
+fn raise_file_limit() {
+    const WANTED: libc::rlim_t = 4096;
+
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid `rlimit` that the call fills in.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } != 0 {
+        return;
+    }
+
+    limit.rlim_cur = limit.rlim_cur.max(WANTED.min(limit.rlim_max));
+    // SAFETY: `limit` is a valid `rlimit` that the call reads.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) } != 0 {
+        log::warn!(
+            "cannot raise the file limit: {}",
+            std::io::Error::last_os_error()
+        );
+    }
 }
 
 fn ignore_hangup() -> Result<()> {

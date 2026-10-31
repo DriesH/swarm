@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -16,13 +17,17 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result};
 use swarm_protocol::agent::{AgentRequest, Reply};
 
-use crate::calls::Calls;
+use crate::calls::{After, Calls, Gone};
 
 /// Longest request line.
 const MAX_LINE: u64 = 4 << 20;
 
 /// Most connections served at once; the others are closed.
-const MAX_CONNECTIONS: usize = 64;
+const MAX_CONNECTIONS: usize = 256;
+
+/// Most connections that may wait at once (`wait`, `task_wait`, `terminal_wait`). The
+/// rest of the room is for short calls and hooks.
+pub(crate) const MAX_WAITS: usize = 192;
 
 /// A refusal is logged as a warning at most this often per agent.
 const WARN_INTERVAL: Duration = Duration::from_secs(60);
@@ -52,10 +57,10 @@ pub(crate) fn bind(path: &Path) -> Result<UnixListener> {
 }
 
 /// Counts the open connections; the count goes down when the guard drops.
-struct Slot(Arc<AtomicUsize>);
+pub(crate) struct Slot(Arc<AtomicUsize>);
 
 impl Slot {
-    fn take(open: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
+    pub(crate) fn take(open: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
         if open.fetch_add(1, Ordering::AcqRel) >= limit {
             open.fetch_sub(1, Ordering::AcqRel);
 
@@ -69,6 +74,28 @@ impl Slot {
 impl Drop for Slot {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Lets one warning through each [`WARN_INTERVAL`].
+#[derive(Default)]
+pub(crate) struct Throttle {
+    last: Mutex<Option<Instant>>,
+}
+
+impl Throttle {
+    /// Returns true when the caller should log a warning.
+    pub(crate) fn allow(&self, now: Instant) -> bool {
+        let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
+
+        match *last {
+            Some(before) if now.duration_since(before) < WARN_INTERVAL => false,
+            _ => {
+                *last = Some(now);
+
+                true
+            }
+        }
     }
 }
 
@@ -103,6 +130,7 @@ impl RefusalLog {
 pub(crate) fn serve(listener: &UnixListener, calls: &Arc<Calls>) {
     let open = Arc::new(AtomicUsize::new(0));
     let refusals = Arc::new(RefusalLog::default());
+    let full = Throttle::default();
 
     for stream in listener.incoming() {
         let stream = match stream {
@@ -115,7 +143,9 @@ pub(crate) fn serve(listener: &UnixListener, calls: &Arc<Calls>) {
         };
 
         let Some(slot) = Slot::take(&open, MAX_CONNECTIONS) else {
-            log::debug!("agent socket is full: connection closed");
+            if full.allow(Instant::now()) {
+                log::warn!("agent socket is full: {MAX_CONNECTIONS} connections are open");
+            }
             drop(stream);
             continue;
         };
@@ -143,8 +173,8 @@ fn connection(
     idle_timeout: Duration,
 ) -> Result<()> {
     stream.set_read_timeout(Some(idle_timeout))?;
-    let mut writer = stream.try_clone()?;
-    let mut reader = BufReader::new(stream);
+    let mut writer = &stream;
+    let mut reader = BufReader::new(&stream);
 
     loop {
         let mut line = String::new();
@@ -163,18 +193,64 @@ fn connection(
             return Ok(());
         }
 
-        writeln!(writer, "{}", encode(&answer(calls, refusals, line.trim())))?;
+        let (reply, after) = answer(calls, refusals, line.trim(), &|| peer_gone(&stream));
+        let written = writeln!(writer, "{}", encode(&reply)).is_ok();
+
+        if let Some(after) = after {
+            after(written);
+        }
+        if !written {
+            return Ok(());
+        }
     }
 }
 
-fn answer(calls: &Calls, refusals: &RefusalLog, line: &str) -> Reply {
+/// True when the other end closed the connection. A peer that sent its next request
+/// is still there.
+fn peer_gone(stream: &UnixStream) -> bool {
+    let descriptor = stream.as_raw_fd();
+    let mut poll = libc::pollfd {
+        fd: descriptor,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+
+    // SAFETY: `poll` is one valid `pollfd` and the count is 1.
+    let ready = unsafe { libc::poll(&raw mut poll, 1, 0) };
+    if ready <= 0 {
+        return false;
+    }
+    if poll.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+        return true;
+    }
+
+    let mut byte = 0_u8;
+    // SAFETY: the buffer is one valid byte, and a peek takes nothing off the socket.
+    let peeked = unsafe {
+        libc::recv(
+            descriptor,
+            (&raw mut byte).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+
+    peeked == 0
+}
+
+fn answer(
+    calls: &Calls,
+    refusals: &RefusalLog,
+    line: &str,
+    gone: Gone<'_>,
+) -> (Reply, Option<After>) {
     let Ok(request) = serde_json::from_str::<AgentRequest>(line) else {
-        return Reply::failure("the request is not valid");
+        return (Reply::failure("the request is not valid"), None);
     };
     let agent = request.agent;
 
-    if let Ok(reply) = calls.handle(request) {
-        return reply;
+    if let Ok(answer) = calls.handle(request, gone) {
+        return answer;
     }
 
     if refusals.should_warn(agent.0, Instant::now()) {
@@ -183,7 +259,7 @@ fn answer(calls: &Calls, refusals: &RefusalLog, line: &str) -> Reply {
         log::debug!("agent socket refused agent {}", agent.0);
     }
 
-    Reply::failure("refused")
+    (Reply::failure("refused"), None)
 }
 
 fn encode(reply: &Reply) -> String {
@@ -196,6 +272,10 @@ mod tests {
     use std::path::PathBuf;
 
     use serde_json::{Value, json};
+    use swarm_core::store::NewMessage;
+    use swarm_protocol::{AgentId, MessageKind, ProjectId};
+
+    use crate::messages::Messages;
 
     use super::*;
 
@@ -227,7 +307,7 @@ mod tests {
         assert!(log.should_warn(1, start + WARN_INTERVAL));
     }
     /// Everything the socket needs, with one registered orchestrator.
-    fn calls_with_an_agent() -> (Arc<Calls>, u64, String) {
+    fn calls_with_an_agent() -> (Arc<Calls>, u64, String, Arc<Messages>) {
         use std::sync::Mutex;
 
         use swarm_core::Projects;
@@ -238,6 +318,7 @@ mod tests {
         use crate::agents::{AgentConfig, Agents, Place};
         use crate::hub::{Clients, Terminals};
         use crate::messages::Messages;
+        use crate::processes::Processes;
 
         let store = Store::open_in_memory().expect("store");
         let project = store
@@ -278,15 +359,22 @@ mod tests {
         let token = agents.token_for_test(agent.id).expect("token");
 
         let services = Arc::new(Services {
+            processes: Processes::new(
+                Arc::clone(&store),
+                Arc::clone(&terminals),
+                Arc::clone(&clients),
+                Arc::clone(&messages),
+                Arc::clone(&agents),
+            ),
             terminals,
             projects: Arc::new(Projects::new(Arc::clone(&store))),
             agents,
             clients,
-            messages,
+            messages: Arc::clone(&messages),
             store,
         });
 
-        (Arc::new(Calls::new(services)), agent.id.0, token)
+        (Arc::new(Calls::new(services)), agent.id.0, token, messages)
     }
 
     fn ask(stream: &mut UnixStream, reader: &mut BufReader<UnixStream>, line: &str) -> Value {
@@ -299,7 +387,7 @@ mod tests {
 
     #[test]
     fn a_wait_longer_than_the_idle_time_is_not_cut_off() {
-        let (calls, agent, token) = calls_with_an_agent();
+        let (calls, agent, token, _) = calls_with_an_agent();
         let (server_end, mut client) = UnixStream::pair().expect("pair");
         let serving = thread::spawn(move || {
             connection(
@@ -329,12 +417,139 @@ mod tests {
     }
 
     #[test]
+    fn a_client_that_hangs_up_mid_wait_loses_no_message() {
+        let (calls, agent, token, messages) = calls_with_an_agent();
+        let (server_end, mut client) = UnixStream::pair().expect("pair");
+        let serving = thread::spawn(move || {
+            connection(
+                server_end,
+                &calls,
+                &RefusalLog::default(),
+                Duration::from_secs(30),
+            )
+        });
+        writeln!(
+            client,
+            r#"{{"agent":{agent},"token":"{token}","method":"wait","params":{{"timeout_secs":60}}}}"#
+        )
+        .expect("write");
+        thread::park_timeout(Duration::from_millis(300));
+
+        drop(client);
+        messages
+            .post(&NewMessage {
+                project: ProjectId(1),
+                task: None,
+                from: None,
+                to: AgentId(agent),
+                kind: MessageKind::Report,
+                text: "after the hang-up",
+                delivered: false,
+            })
+            .expect("post");
+        let start = Instant::now();
+        serving.join().expect("join").expect("a clean end");
+
+        assert!(start.elapsed() < Duration::from_secs(5), "the wait went on");
+        let kept = messages.claim(AgentId(agent)).expect("claim");
+        assert_eq!(kept.messages().len(), 1);
+        assert_eq!(kept.messages()[0].text, "after the hang-up");
+    }
+
+    #[test]
+    fn a_message_is_delivered_only_after_the_reply_was_written() {
+        let (calls, agent, token, messages) = calls_with_an_agent();
+        messages
+            .post(&NewMessage {
+                project: ProjectId(1),
+                task: None,
+                from: None,
+                to: AgentId(agent),
+                kind: MessageKind::Report,
+                text: "hello",
+                delivered: false,
+            })
+            .expect("post");
+        let request = format!(r#"{{"agent":{agent},"token":"{token}","method":"read"}}"#);
+
+        let (reply, after) = answer(&calls, &RefusalLog::default(), &request, &|| false);
+        assert!(reply.ok);
+        assert!(
+            messages.claim(AgentId(agent)).expect("claim").is_empty(),
+            "held until the write"
+        );
+
+        after.expect("work after the write")(false);
+        assert_eq!(
+            messages
+                .claim(AgentId(agent))
+                .expect("claim")
+                .messages()
+                .len(),
+            1
+        );
+
+        let (_, after) = answer(&calls, &RefusalLog::default(), &request, &|| false);
+        after.expect("work after the write")(true);
+        assert!(messages.claim(AgentId(agent)).expect("claim").is_empty());
+    }
+
+    #[test]
+    fn waits_beyond_the_cap_are_refused_but_short_calls_are_not() {
+        let (calls, agent, token, _) = calls_with_an_agent();
+        let held = calls.hold_waits_for_test(MAX_WAITS);
+        let wait = format!(
+            r#"{{"agent":{agent},"token":"{token}","method":"wait","params":{{"timeout_secs":1}}}}"#
+        );
+        let read = format!(r#"{{"agent":{agent},"token":"{token}","method":"read"}}"#);
+
+        let (waited, _) = answer(&calls, &RefusalLog::default(), &wait, &|| false);
+        let (short, _) = answer(&calls, &RefusalLog::default(), &read, &|| false);
+
+        assert_eq!(waited.error.as_deref(), Some("too many waits"));
+        assert!(short.ok);
+        drop(held);
+        let (again, _) = answer(&calls, &RefusalLog::default(), &wait, &|| false);
+        assert!(again.ok);
+    }
+
+    #[test]
+    fn the_full_warning_comes_once_a_minute() {
+        let throttle = Throttle::default();
+        let start = Instant::now();
+
+        assert!(throttle.allow(start));
+        assert!(!throttle.allow(start + Duration::from_secs(59)));
+        assert!(throttle.allow(start + WARN_INTERVAL));
+    }
+
+    #[test]
+    fn a_closed_peer_is_gone_and_an_open_one_is_not() {
+        let (server_end, mut client) = UnixStream::pair().expect("pair");
+        assert!(!peer_gone(&server_end));
+
+        writeln!(client, "next request").expect("write");
+        assert!(
+            !peer_gone(&server_end),
+            "a pending request is not a hang-up"
+        );
+
+        drop(client);
+        let mut sink = String::new();
+        BufReader::new(&server_end)
+            .read_line(&mut sink)
+            .expect("read");
+        assert!(peer_gone(&server_end));
+    }
+
+    #[test]
     fn a_request_with_a_wrong_token_is_refused() {
-        let (calls, agent, _token) = calls_with_an_agent();
-        let reply = answer(
+        let (calls, agent, _token, _) = calls_with_an_agent();
+        let (reply, _) = answer(
             &calls,
             &RefusalLog::default(),
             &format!(r#"{{"agent":{agent},"token":"wrong","method":"read"}}"#),
+            &|| false,
         );
 
         assert!(!reply.ok);
@@ -343,9 +558,9 @@ mod tests {
 
     #[test]
     fn a_garbled_request_is_not_valid() {
-        let (calls, _, _) = calls_with_an_agent();
+        let (calls, _, _, _) = calls_with_an_agent();
 
-        let reply = answer(&calls, &RefusalLog::default(), "{nope");
+        let (reply, _) = answer(&calls, &RefusalLog::default(), "{nope", &|| false);
 
         assert_eq!(reply.error.as_deref(), Some("the request is not valid"));
     }

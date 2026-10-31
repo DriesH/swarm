@@ -12,9 +12,10 @@ use anyhow::Result;
 use swarm_protocol::{
     CallId, Event, FrameError, Request, TaskInfo, TerminalId, VERSION, read, write,
 };
+use swarm_term::TerminalInput;
 
 use crate::Services;
-use crate::hub::{CREATE_HISTORY_LINES, ClientSink, Frame, QUEUE_FRAMES};
+use crate::hub::{CREATE_HISTORY_LINES, ClientSink, Frame, Hub, QUEUE_FRAMES};
 use crate::tasks;
 
 /// Longest parent chain the peer check follows.
@@ -138,11 +139,26 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
             }
         }
         Request::Input { id, input } => match terminals.get(id) {
-            Some(hub) if hub.send_input(input) => services.agents.app_input(id),
-            _ => send_missing(sink, id),
+            Some(hub) => forward_input(services, sink, &hub, id, input),
+            None => send_missing(sink, id),
         },
-        Request::StartOrchestrator { call, .. } => {
-            send_error(sink, call, &"not available yet");
+        Request::StartOrchestrator {
+            call,
+            project,
+            kind,
+        } => {
+            let services = Arc::clone(services);
+            run_slow(
+                sink,
+                "start-orchestrator",
+                call,
+                move |sink| match tasks::start_orchestrator(&services, project, kind) {
+                    Ok(agent) => {
+                        sink.send_event(&Event::AgentStarted { call, agent });
+                    }
+                    Err(error) => send_error(sink, call, &error),
+                },
+            );
         }
         Request::ListProjects { call } => match projects.list() {
             Ok(projects) => {
@@ -171,11 +187,35 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
                     });
                 };
 
-                if let Err(error) = tasks::create(&services, &task, reply) {
+                if let Err(error) = tasks::create(&services, &task, None, reply) {
                     send_error(sink, call, &error);
                 }
             });
         }
+    }
+}
+
+/// The app typed into, resized or killed a terminal.
+fn forward_input(
+    services: &Services,
+    sink: &ClientSink,
+    hub: &Hub,
+    id: TerminalId,
+    input: TerminalInput,
+) {
+    // An agent chose the size of its process terminal; the app keeps out of it.
+    if matches!(input, TerminalInput::Resize(_)) && hub.fixed_size().is_some() {
+        return;
+    }
+
+    let killed = matches!(input, TerminalInput::Kill);
+    services.agents.app_input(id, &input);
+    if killed {
+        services.processes.stopped_by_user(id);
+    }
+
+    if !hub.send_input(input) {
+        send_missing(sink, id);
     }
 }
 

@@ -8,7 +8,8 @@ use std::thread;
 use anyhow::{Context as _, Result};
 use swarm_core::{PreparedTask, PreparedWorker, Projects};
 use swarm_protocol::{
-    AgentRole, CreateTask, CreateTerminal, TaskId, TaskInfo, TerminalId, TerminalKind,
+    AgentId, AgentInfo, AgentKind, AgentRole, CreateTask, CreateTerminal, ProjectId, TaskId,
+    TaskInfo, TerminalId, TerminalKind,
 };
 use swarm_term::{ExitStatus, Palette, Rgb, Size};
 
@@ -49,6 +50,9 @@ pub(crate) const TERMINAL_PALETTE: Palette = Palette {
     ],
 };
 
+/// The name of a Start orchestrator.
+const START_NAME: &str = "start";
+
 /// How the setup script went, as the orchestrator needs to know it.
 enum Setup {
     None,
@@ -59,9 +63,11 @@ enum Setup {
 
 /// Makes the task and starts its setup script without waiting for it. `reply` gets
 /// the task first; the orchestrator starts after it, once the setup has ended.
+/// `created_by` is the Start orchestrator that asked for the task, if one did.
 pub(crate) fn create(
     services: &Services,
     request: &CreateTask,
+    created_by: Option<AgentId>,
     reply: impl FnOnce(&TaskInfo),
 ) -> Result<()> {
     let plan = request
@@ -73,26 +79,23 @@ pub(crate) fn create(
         mut task,
         setup,
         env,
-    } = services.projects.create_task(request)?;
+    } = services.projects.create_task_by(request, created_by)?;
 
-    let agent =
-        plan.and_then(
-            |plan| match services.agents.register(&Place::of_task(&task), plan) {
-                Ok(info) => {
-                    task.agents.push(info.clone());
+    let agent = match plan {
+        Some(plan) => match services.agents.register(&Place::of_task(&task), plan) {
+            Ok(info) => {
+                task.agents.push(info.clone());
 
-                    Some(info.id)
-                }
-                Err(error) => {
-                    log::error!(
-                        "cannot record the orchestrator of task {}: {error:#}",
-                        task.id.0
-                    );
+                Some(info.id)
+            }
+            Err(error) => {
+                services.projects.discard_task(&task);
 
-                    None
-                }
-            },
-        );
+                return Err(error.context("cannot record the orchestrator"));
+            }
+        },
+        None => None,
+    };
 
     let setup = match setup {
         None => Setup::None,
@@ -133,6 +136,51 @@ pub(crate) fn create(
     }
 
     Ok(())
+}
+
+/// Starts the project's Start orchestrator in the project root, or returns the one that
+/// runs. It has no setup script and no first message: the user speaks first.
+pub(crate) fn start_orchestrator(
+    services: &Services,
+    project: ProjectId,
+    kind: Option<AgentKind>,
+) -> Result<AgentInfo> {
+    let kind = match kind {
+        Some(kind) => kind,
+        None => services.agents.default_kind()?,
+    };
+    let plan = services.agents.plan(kind, AgentRole::StartOrchestrator)?;
+
+    let (agent, created) = services.projects.start_agent_or(project, |root, base| {
+        services
+            .agents
+            .register(
+                &Place {
+                    project,
+                    task: None,
+                    name: START_NAME,
+                    worktree: root,
+                    branch: base,
+                    ports: &[],
+                },
+                plan,
+            )
+            .map_err(|error| swarm_core::Error::Invalid(format!("{error:#}")))
+    })?;
+    if !created {
+        return Ok(services.agents.info(agent.id).unwrap_or(agent));
+    }
+
+    services.agents.announce(agent.id);
+    let start = Start {
+        agent: agent.id,
+        task_name: String::new(),
+        env: Vec::new(),
+        first_message: None,
+    };
+    start_agent(services, start, Setup::None);
+
+    Ok(services.agents.info(agent.id).unwrap_or(agent))
 }
 
 /// Runs the worker's setup script without waiting, then starts the worker with `brief`
@@ -261,6 +309,7 @@ fn start_setup(
             }
         })),
         on_output: None,
+        process: None,
     };
 
     let hub = terminals

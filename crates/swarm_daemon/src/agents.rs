@@ -17,17 +17,18 @@ use swarm_core::adapters::{self, LaunchSpec, Session};
 use swarm_core::agents::{StatusMerge, is_trust_prompt, new_session_id, new_token};
 use swarm_core::git;
 use swarm_core::prompts::{self, Harness, PromptFile};
-use swarm_core::store::{NewAgent, Store};
+use swarm_core::store::{NewAgent, NewMessage, Store};
 use swarm_protocol::agent::render_inbox;
 use swarm_protocol::{
     AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, CreateTerminal, Event,
-    ProjectId, TaskId, TaskInfo, TerminalId, TerminalKind,
+    MessageKind, ProjectId, TaskId, TaskInfo, TerminalId, TerminalKind,
 };
 use swarm_settings::Settings;
 use swarm_term::{ExitStatus, ProgramState, Row, TerminalInput, TerminalOutput};
 
 use crate::hub::{Clients, Extras, Hub, Terminals};
 use crate::messages::Messages;
+use crate::processes::exit_text;
 use crate::tasks::{TERMINAL_PALETTE, TERMINAL_SIZE};
 
 /// How long the first message waits for a ready signal before it looks at the agent.
@@ -35,6 +36,9 @@ const FIRST_MESSAGE_PATIENCE: Duration = Duration::from_secs(60);
 
 /// After `SessionStart`, how long to wait for an OSC 7501 report before going ahead.
 const SESSION_START_GRACE: Duration = Duration::from_secs(2);
+
+/// The orchestrator hears at most once in this time that the user typed into a worker.
+const USER_INPUT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Terminal UIs treat an Enter that follows text at once as part of a paste.
 const ENTER_DELAY: Duration = Duration::from_millis(150);
@@ -133,6 +137,52 @@ struct Live {
     ready: Option<flume::Sender<Ready>>,
     /// Unread messages may be pasted: the first message went in, or there is none.
     delivery_open: bool,
+    /// The agent asked to end its session: it stops for good instead of resuming.
+    stop_requested: bool,
+    typing: UserTyping,
+}
+
+/// Follows what the user types into a worker's terminal.
+#[derive(Default)]
+struct UserTyping {
+    typed: bool,
+    told_at: Option<Instant>,
+}
+
+impl UserTyping {
+    /// Returns true on the first Enter after typing, unless the orchestrator heard
+    /// less than [`USER_INPUT_INTERVAL`] ago.
+    fn observe(&mut self, input: &TerminalInput, now: Instant) -> bool {
+        let (typed, enter) = match input {
+            TerminalInput::Key(key) if matches!(key.name.as_str(), "enter" | "return") => {
+                (false, true)
+            }
+            TerminalInput::Key(key) => (
+                key.text.is_some() && !key.modifiers.control && !key.modifiers.command,
+                false,
+            ),
+            TerminalInput::Text(text) | TerminalInput::Paste(text) => (
+                !text.trim_end_matches(['\r', '\n']).is_empty(),
+                text.ends_with(['\r', '\n']),
+            ),
+            _ => return false,
+        };
+
+        self.typed |= typed;
+        if !enter || !std::mem::take(&mut self.typed) {
+            return false;
+        }
+
+        if self
+            .told_at
+            .is_some_and(|told| now.duration_since(told) < USER_INPUT_INTERVAL)
+        {
+            return false;
+        }
+        self.told_at = Some(now);
+
+        true
+    }
 }
 
 /// What tells the first message that the agent can take input.
@@ -189,7 +239,11 @@ pub(crate) struct Agents {
     live: Mutex<HashMap<AgentId, Live>>,
     /// One paste at a time, so two deliveries never interleave in a terminal.
     paste: Mutex<()>,
+    /// Told when an agent's process ended.
+    on_end: Mutex<Vec<EndObserver>>,
 }
+
+type EndObserver = Box<dyn Fn(AgentId) + Send + Sync>;
 
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -211,7 +265,13 @@ impl Agents {
             messages,
             live: Mutex::default(),
             paste: Mutex::new(()),
+            on_end: Mutex::default(),
         })
+    }
+
+    /// Calls `observer` with the ID of every agent whose process ends.
+    pub(crate) fn on_end(&self, observer: EndObserver) {
+        lock(&self.on_end).push(observer);
     }
 
     /// Reads the settings. Call it before anything is created, so a broken settings
@@ -222,13 +282,38 @@ impl Agents {
             None => Settings::default(),
         };
 
+        let command = settings.agents.cli(kind).command.clone();
+        Self::find_command(&command)?;
+
         Ok(Plan {
             kind,
             role,
             model: settings.agents.model(kind, role).to_owned(),
-            command: settings.agents.cli(kind).command.clone(),
+            command,
             skip_permissions: settings.agents.skip_permissions,
         })
+    }
+
+    /// Looks the CLI up as a shell would.
+    fn find_command(command: &str) -> Result<PathBuf, CommandNotFound> {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+
+        adapters::find_command(
+            command,
+            std::env::var_os("PATH").as_deref(),
+            home.as_deref(),
+        )
+        .ok_or_else(|| CommandNotFound(command.to_owned()))
+    }
+
+    /// The agent kind the settings pick for orchestrators.
+    pub(crate) fn default_kind(&self) -> Result<AgentKind> {
+        let settings = match &self.config.settings {
+            Some(path) => swarm_settings::load(path)?,
+            None => Settings::default(),
+        };
+
+        Ok(settings.agents.orchestrator.into())
     }
 
     /// Writes the agent's row and makes it known to the agent socket. Nothing runs yet.
@@ -264,10 +349,17 @@ impl Agents {
                 screen: Some(ScreenText::default()),
                 ready: None,
                 delivery_open: true,
+                stop_requested: false,
+                typing: UserTyping::default(),
             },
         );
 
         Ok(info)
+    }
+
+    /// Drops an agent that never ran, without telling anyone.
+    pub(crate) fn forget(&self, id: AgentId) {
+        lock(&self.live).remove(&id);
     }
 
     /// Tells every client about an agent that was just added.
@@ -300,15 +392,86 @@ impl Agents {
         self.update(id, |live| live.merge.notify(text));
     }
 
-    /// The app sent input to a terminal: a notice on the agent in it no longer applies.
-    pub(crate) fn app_input(&self, terminal: TerminalId) {
-        let agent = lock(&self.live)
+    /// The app sent input to a terminal: a notice on the agent in it no longer applies,
+    /// and the orchestrator hears when the user typed into a worker (ADR 0002).
+    pub(crate) fn app_input(self: &Arc<Self>, terminal: TerminalId, input: &TerminalInput) {
+        let typed_into = lock(&self.live)
             .values()
             .find(|agent| agent.info.terminal == Some(terminal))
-            .map(|agent| agent.info.id);
+            .map(|agent| (agent.info.id, agent.info.role));
+        let Some((id, role)) = typed_into else {
+            return;
+        };
 
-        if let Some(id) = agent {
-            self.update(id, |live| live.merge.app_input());
+        self.update(id, |live| live.merge.app_input());
+
+        if role != AgentRole::Worker {
+            return;
+        }
+        let told = lock(&self.live)
+            .get_mut(&id)
+            .is_some_and(|live| live.typing.observe(input, Instant::now()));
+        if told {
+            self.user_typed(id);
+        }
+    }
+
+    fn user_typed(self: &Arc<Self>, worker: AgentId) {
+        let Some(info) = self.info(worker) else {
+            return;
+        };
+        let Some(task) = info.task else {
+            return;
+        };
+
+        let orchestrator = lock(&self.store).list_agents(task).map(|agents| {
+            agents
+                .into_iter()
+                .find(|agent| agent.role == AgentRole::Orchestrator)
+        });
+        let orchestrator = match orchestrator {
+            Ok(Some(orchestrator)) => orchestrator,
+            Ok(None) => return,
+            Err(error) => {
+                log::error!("cannot find the orchestrator of task {}: {error}", task.0);
+
+                return;
+            }
+        };
+
+        let text = format!("The user typed into {}'s terminal.", info.name);
+        let posted = self.messages.post(&NewMessage {
+            project: info.project,
+            task: Some(task),
+            from: None,
+            to: orchestrator.id,
+            kind: MessageKind::UserInput,
+            text: &text,
+            delivered: false,
+        });
+        match posted {
+            Ok(_) => self.deliver_unread(orchestrator.id),
+            Err(error) => log::error!("cannot tell the orchestrator about the user: {error:#}"),
+        }
+    }
+
+    /// Ends the agent's process for good (`swarm exit`): the lifecycle becomes
+    /// `Stopped`, not `Resumable`.
+    pub(crate) fn exit(&self, id: AgentId) {
+        let terminal = {
+            let mut live = lock(&self.live);
+            let Some(agent) = live.get_mut(&id) else {
+                return;
+            };
+            agent.stop_requested = true;
+
+            agent.info.terminal
+        };
+
+        if let Some(hub) = terminal.and_then(|terminal| self.terminals.get(terminal))
+            && !hub.send_input(TerminalInput::Kill)
+        {
+            log::debug!("agent {} already ended", id.0);
         }
     }
 
@@ -326,13 +489,7 @@ impl Agents {
             )
         };
 
-        let home = std::env::var_os("HOME").map(PathBuf::from);
-        let command = adapters::find_command(
-            &plan.command,
-            std::env::var_os("PATH").as_deref(),
-            home.as_deref(),
-        )
-        .ok_or_else(|| CommandNotFound(plan.command.clone()))?;
+        let command = Self::find_command(&plan.command)?;
 
         let info = self.info(id).context("the agent is not registered")?;
         let project_root = lock(&self.store)
@@ -347,6 +504,8 @@ impl Agents {
                 task: info.task,
                 task_name: &start.task_name,
                 role: plan.role,
+                kind: plan.kind,
+                skip_permissions: plan.skip_permissions,
                 socket: &self.config.socket,
             },
             self.config.settings.as_deref().and_then(Path::parent),
@@ -403,6 +562,7 @@ impl Agents {
             on_output: Some(Box::new(move |program_output| {
                 output.output(id, program_output);
             })),
+            process: None,
         };
         let request = CreateTerminal {
             kind: TerminalKind::Agent,
@@ -410,7 +570,7 @@ impl Agents {
             cwd: Some(info.worktree.clone()),
             size: TERMINAL_SIZE,
             palette: TERMINAL_PALETTE,
-            task: info.task.map(TaskId::terminal_key),
+            task: Some(terminal_key(&info)),
         };
         let hub = self
             .terminals
@@ -462,7 +622,7 @@ impl Agents {
     }
 
     /// Ends an agent that never ran, or never will.
-    pub(crate) fn fail(&self, id: AgentId, message: &str) {
+    pub(crate) fn fail(self: &Arc<Self>, id: AgentId, message: &str) {
         let Some(mut agent) = lock(&self.live).remove(&id) else {
             return;
         };
@@ -470,6 +630,45 @@ impl Agents {
         agent.merge.fail(message);
         agent.info.lifecycle = AgentLifecycle::Stopped;
         self.publish(&mut agent);
+
+        self.tell_worker_stopped(&agent.info, &format!("failed: {message}"));
+    }
+
+    /// The orchestrator hears that one of its workers failed to start or ended.
+    fn tell_worker_stopped(self: &Arc<Self>, worker: &AgentInfo, what: &str) {
+        let (AgentRole::Worker, Some(task)) = (worker.role, worker.task) else {
+            return;
+        };
+
+        let orchestrator = lock(&self.store).list_agents(task).map(|agents| {
+            agents
+                .into_iter()
+                .find(|agent| agent.role == AgentRole::Orchestrator)
+        });
+        let orchestrator = match orchestrator {
+            Ok(Some(orchestrator)) => orchestrator,
+            Ok(None) => return,
+            Err(error) => {
+                log::error!("cannot find the orchestrator of task {}: {error}", task.0);
+
+                return;
+            }
+        };
+
+        let text = format!("worker {} {what}", worker.name);
+        let posted = self.messages.post(&NewMessage {
+            project: worker.project,
+            task: Some(task),
+            from: None,
+            to: orchestrator.id,
+            kind: MessageKind::WorkerStopped,
+            text: &text,
+            delivered: false,
+        });
+        match posted {
+            Ok(_) => self.deliver_unread(orchestrator.id),
+            Err(error) => log::error!("cannot tell the orchestrator about a worker: {error:#}"),
+        }
     }
 
     /// Applies a hook event from an agent that the socket has already identified.
@@ -585,7 +784,7 @@ impl Agents {
     }
 
     /// Pastes the agent's unread messages into its terminal when it is idle and its
-    /// first message went in. Marks them delivered.
+    /// first message went in. They count as delivered once the paste reached the terminal.
     pub(crate) fn deliver_unread(self: &Arc<Self>, id: AgentId) {
         let terminal = {
             let live = lock(&self.live);
@@ -603,12 +802,9 @@ impl Agents {
         let Some(hub) = terminal.and_then(|terminal| self.terminals.get(terminal)) else {
             return;
         };
-        if !self.messages.has_unread(id) {
-            return;
-        }
 
-        let messages = match self.messages.take(id) {
-            Ok(messages) if !messages.is_empty() => messages,
+        let claim = match self.messages.claim(id) {
+            Ok(claim) if !claim.is_empty() => claim,
             Ok(_) => return,
             Err(error) => {
                 log::error!("cannot take the messages of agent {}: {error:#}", id.0);
@@ -623,11 +819,14 @@ impl Agents {
             .spawn(move || {
                 let _one_paste = lock(&agents.paste);
 
-                let typed = hub.send_input(TerminalInput::Paste(render_inbox(&messages)));
+                let typed = hub.send_input(TerminalInput::Paste(render_inbox(claim.messages())));
                 sleep_for(ENTER_DELAY);
 
                 if !typed || !hub.send_input(TerminalInput::Text("\r".to_owned())) {
                     log::warn!("agent {} ended before its messages arrived", id.0);
+                }
+                if typed {
+                    claim.commit();
                 }
             });
 
@@ -636,19 +835,27 @@ impl Agents {
         }
     }
 
-    fn exited(&self, id: AgentId, exit: Option<&ExitStatus>) {
+    fn exited(self: &Arc<Self>, id: AgentId, exit: Option<&ExitStatus>) {
         let Some(mut agent) = lock(&self.live).remove(&id) else {
             return;
         };
 
         agent.merge.process_exited(exit);
         agent.info.terminal = None;
-        agent.info.lifecycle = if agent.session_id.is_some() && agent.session_confirmed {
-            AgentLifecycle::Resumable
-        } else {
-            AgentLifecycle::Stopped
-        };
+        agent.info.lifecycle =
+            if !agent.stop_requested && agent.session_id.is_some() && agent.session_confirmed {
+                AgentLifecycle::Resumable
+            } else {
+                AgentLifecycle::Stopped
+            };
         self.publish(&mut agent);
+
+        let how = exit.map_or_else(|| "no exit status".to_owned(), exit_text);
+        self.tell_worker_stopped(&agent.info, &format!("stopped, {how}"));
+
+        for observer in lock(&self.on_end).iter() {
+            observer(id);
+        }
     }
 
     /// Runs `change` on a live agent and publishes when it returns true.
@@ -828,7 +1035,20 @@ impl ScreenText {
     }
 }
 
-fn row_text(row: &Row) -> String {
+/// The key the app finds an agent's task by: the task, or the project's Start tab.
+pub(crate) fn terminal_key(info: &AgentInfo) -> String {
+    match info.task {
+        Some(task) => task.terminal_key(),
+        None => start_key(info.project),
+    }
+}
+
+/// Keeps in step with `start_key` in the app's model.
+pub(crate) fn start_key(project: ProjectId) -> String {
+    format!("project:{}/start", project.0)
+}
+
+pub(crate) fn row_text(row: &Row) -> String {
     let mut line = String::new();
     for span in &row.texts {
         while line.chars().count() < usize::from(span.col) {
@@ -963,6 +1183,66 @@ mod tests {
         assert_eq!(mode(&file.path), 0o600);
         assert_eq!(std::fs::read_to_string(&file.path).expect("read"), "secret");
         std::fs::remove_dir_all(&folder).expect("cleanup");
+    }
+
+    fn typed(text: &str) -> TerminalInput {
+        TerminalInput::Text(text.to_owned())
+    }
+
+    fn key(name: &str, text: Option<&str>) -> TerminalInput {
+        TerminalInput::Key(swarm_term::Key {
+            name: name.to_owned(),
+            modifiers: swarm_term::Modifiers::default(),
+            text: text.map(str::to_owned),
+            repeat: false,
+        })
+    }
+
+    #[test]
+    fn the_first_enter_after_typing_tells_the_orchestrator() {
+        let mut typing = UserTyping::default();
+        let now = Instant::now();
+
+        assert!(!typing.observe(&key("a", Some("a")), now));
+        assert!(!typing.observe(&typed("bc"), now));
+        assert!(typing.observe(&key("enter", None), now));
+    }
+
+    #[test]
+    fn an_enter_without_typing_is_not_news() {
+        let mut typing = UserTyping::default();
+
+        assert!(!typing.observe(&key("enter", None), Instant::now()));
+        assert!(!typing.observe(&typed("\r"), Instant::now()));
+    }
+
+    #[test]
+    fn text_or_a_paste_that_ends_in_a_line_break_counts_as_typing_and_enter() {
+        let now = Instant::now();
+
+        assert!(UserTyping::default().observe(&typed("ls\r"), now));
+        assert!(UserTyping::default().observe(&TerminalInput::Paste("a\nb\n".to_owned()), now));
+        assert!(!UserTyping::default().observe(&TerminalInput::Paste("no break".to_owned()), now));
+    }
+
+    #[test]
+    fn keys_that_type_nothing_do_not_count() {
+        let mut typing = UserTyping::default();
+        let now = Instant::now();
+
+        assert!(!typing.observe(&key("up", None), now));
+        assert!(!typing.observe(&TerminalInput::Focus(true), now));
+        assert!(!typing.observe(&key("enter", None), now));
+    }
+
+    #[test]
+    fn the_orchestrator_hears_at_most_once_in_thirty_seconds() {
+        let mut typing = UserTyping::default();
+        let start = Instant::now();
+
+        assert!(typing.observe(&typed("a\r"), start));
+        assert!(!typing.observe(&typed("b\r"), start + Duration::from_secs(29)));
+        assert!(typing.observe(&typed("c\r"), start + Duration::from_secs(30)));
     }
 
     #[test]
