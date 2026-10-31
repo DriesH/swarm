@@ -62,8 +62,16 @@ const MERGE_PR_TIMEOUT: Duration = Duration::from_secs(180 + 4 * GH_SECS + 30);
 const SPAWN_POLL: Duration = Duration::from_millis(50);
 
 /// The only variables the daemon inherits from the app.
-const DAEMON_ENV: [&str; 7] = [
-    "HOME", "USER", "LOGNAME", "PATH", "LANG", "TMPDIR", "RUST_LOG",
+/// `SSH_AUTH_SOCK` lets the daemon's `git push` use the user's ssh agent.
+const DAEMON_ENV: [&str; 8] = [
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "PATH",
+    "LANG",
+    "TMPDIR",
+    "RUST_LOG",
+    "SSH_AUTH_SOCK",
 ];
 
 #[derive(Debug, thiserror::Error)]
