@@ -49,6 +49,7 @@ pub struct IconButton {
     color: Color,
     toggle_state: Option<bool>,
     reveal_group: Option<SharedString>,
+    tab_stop: bool,
     disabled: bool,
     on_click: Option<ClickHandler>,
 }
@@ -63,6 +64,7 @@ impl IconButton {
             color: Color::Faint,
             toggle_state: None,
             reveal_group: None,
+            tab_stop: true,
             debug_selector: None,
             disabled: false,
             on_click: None,
@@ -89,6 +91,13 @@ impl IconButton {
     /// focus. It stays in the tab order.
     pub fn reveal_with_group(mut self, group: impl Into<SharedString>) -> Self {
         self.reveal_group = Some(group.into());
+        self
+    }
+
+    /// Takes the button out of the Tab order, for one of many repeated buttons that
+    /// has a keyboard route elsewhere.
+    pub fn skip_tab_stop(mut self) -> Self {
+        self.tab_stop = false;
         self
     }
 }
@@ -154,7 +163,7 @@ impl RenderOnce for IconButton {
                 } else {
                     button
                         .focusable()
-                        .tab_stop(true)
+                        .tab_stop(self.tab_stop)
                         .cursor_pointer()
                         .hover(|style| style.bg(active))
                         .when_some(self.reveal_group.clone(), |button, group| {

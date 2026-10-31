@@ -36,6 +36,7 @@ pub(crate) enum Command {
     NextFile,
     PreviousFile,
     ToggleViewed,
+    CommentOnLine,
     CloseTask,
     Task(TaskId),
     Agent(TerminalId),
@@ -131,6 +132,10 @@ fn task_status(status: TaskStatus) -> (AgentStatus, Option<&'static str>) {
 }
 
 /// The rows for the open project and task, in group order.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one flat list of rows reads best in one place"
+)]
 pub(crate) fn rows(data: &FakeData, project: ProjectId, task: TaskId, view: View) -> Vec<Row> {
     let stat = data.live_stat(task);
     let (additions, deletions) = (stat.additions, stat.deletions);
@@ -227,6 +232,13 @@ pub(crate) fn rows(data: &FakeData, project: ProjectId, task: TaskId, view: View
                 Command::ToggleViewed,
             )
             .keys(&["V"]),
+            Row::new(
+                Group::Swarm,
+                IconName::Plus,
+                "Comment on line",
+                Command::CommentOnLine,
+            )
+            .keys(&["C"]),
         ]);
     }
 
@@ -673,6 +685,7 @@ impl Workspace {
             Command::NextFile => self.review.update(cx, ReviewView::next_file),
             Command::PreviousFile => self.review.update(cx, ReviewView::previous_file),
             Command::ToggleViewed => self.review.update(cx, ReviewView::toggle_selected_viewed),
+            Command::CommentOnLine => self.review.update(cx, ReviewView::comment_on_line),
             Command::CloseTask => self.open_close_task(self.active_task, window, cx),
         }
     }
@@ -696,6 +709,19 @@ mod tests {
             .iter()
             .map(|index| rows[*index].label.to_string())
             .collect()
+    }
+
+    #[test]
+    fn comment_on_line_is_in_the_palette_only_while_review_is_open() {
+        let data = FakeData::sample();
+        let has = |view| {
+            rows(&data, ProjectId(0), TaskId(0), view)
+                .iter()
+                .any(|row| row.command == Command::CommentOnLine)
+        };
+
+        assert!(has(View::Review));
+        assert!(!has(View::Terminals));
     }
 
     #[test]

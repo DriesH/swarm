@@ -5,6 +5,7 @@
 
 pub mod adapters;
 pub mod agents;
+pub mod comments;
 pub mod config;
 pub mod git;
 pub mod prompts;
@@ -109,6 +110,8 @@ pub struct Projects {
     store: Arc<Mutex<Store>>,
     /// One task is made at a time, so two clients never pick the same name or ports.
     creating: Mutex<()>,
+    /// One comment change runs at a time in a task, so a comment is never sent twice.
+    comments: comments::TaskLocks,
 }
 
 impl Projects {
@@ -116,6 +119,7 @@ impl Projects {
         Self {
             store,
             creating: Mutex::new(()),
+            comments: comments::TaskLocks::default(),
         }
     }
 
@@ -671,13 +675,19 @@ impl Projects {
         })
     }
 
-    /// Stores the approval when the Merged diff still has this fingerprint.
+    /// Stores the approval when the Merged diff still has this fingerprint and no comment
+    /// of the task is pending.
     pub fn approve(&self, id: TaskId, fingerprint: u64) -> Result<TaskInfo, Error> {
         let current = self.task_diff(id, ReviewSource::Merged)?;
         if current.fingerprint != fingerprint {
             return Err(Error::Invalid(
                 "the changes changed since you reviewed them".to_owned(),
             ));
+        }
+
+        let _guard = self.comments.lock(id);
+        if !self.pending_comments(id)?.is_empty() {
+            return Err(Error::Invalid("comments are pending".to_owned()));
         }
 
         lock(&self.store).set_approved(id, fingerprint)?;

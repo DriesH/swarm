@@ -283,6 +283,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.daemon = Some(client.clone());
+        self.forget_comment_listing();
         Self::watch_events(&client, window, cx);
         self.drop_agent_terminals();
 
@@ -354,6 +355,14 @@ impl Workspace {
             cx,
             |workspace, event, _, cx| {
                 workspace.message_event(event, cx);
+            },
+        );
+        Self::forward(
+            client.comment_events(),
+            window,
+            cx,
+            |workspace, event, _, cx| {
+                workspace.comment_event(&event, cx);
             },
         );
     }
@@ -618,11 +627,12 @@ impl Workspace {
         }
 
         self.review_sources.remove(&task);
+        self.review
+            .update(cx, |review, cx| review.forget_task_comments(task, cx));
         self.swarm_selection.remove(&task);
         self.previous_tabs.retain(|_, other| *other != task);
-        if self.review_approving == Some(task) {
-            self.review_approving = None;
-        }
+        self.review_approving.remove(&task);
+        self.review_requesting.remove(&task);
 
         if was_open {
             let next = tabs
@@ -1717,6 +1727,10 @@ mod tests {
             Request::TaskDiff { call, .. } => Some(Event::TaskDiff {
                 call: *call,
                 diff: None,
+            }),
+            Request::ListComments { call, .. } => Some(Event::Comments {
+                call: *call,
+                comments: Vec::new(),
             }),
             _ => None,
         }
@@ -4116,6 +4130,382 @@ mod tests {
         assert!(sources);
         assert_eq!(inactive, (false, false));
         assert_eq!(back, (false, true));
+    }
+
+    type CommentRequests = flume::Receiver<Request>;
+
+    /// A daemon that lists no comments and accepts adds, and reports what it was asked.
+    fn comment_daemon() -> (PathBuf, CommentRequests) {
+        let (asked, requests) = flume::unbounded();
+        let socket = fake_daemon_replying(move |request| match request {
+            Request::TaskDiff {
+                call,
+                task,
+                source,
+                known,
+            } => {
+                let diff = known.is_none().then(|| diff_of(task.0, source, 9));
+
+                Some(Event::TaskDiff { call, diff })
+            }
+            Request::ListComments { call, .. } => {
+                asked.send(request).ok();
+
+                Some(Event::Comments {
+                    call,
+                    comments: Vec::new(),
+                })
+            }
+            Request::AddComment { call, .. } | Request::SendComments { call, .. } => {
+                asked.send(request).ok();
+
+                Some(Event::Done { call })
+            }
+            _ => None,
+        });
+
+        (socket, requests)
+    }
+
+    #[gpui::test]
+    fn comments_are_listed_when_review_opens_and_again_for_a_new_diff(cx: &mut TestAppContext) {
+        let (socket, requests) = comment_daemon();
+        let (workspace, cx, _client) = real_task_workspace(&socket, cx);
+        fast_polls(&workspace, cx);
+        cx.update(|window, _| window.activate_window());
+        redraw(cx);
+
+        let before_review = requests.try_iter().count();
+        workspace.update(cx, |workspace, cx| workspace.set_view(View::Review, cx));
+        redraw(cx);
+        let listed = wait_until(cx, |cx| {
+            redraw(cx);
+            requests
+                .try_iter()
+                .any(|request| matches!(request, Request::ListComments { .. }))
+        });
+        let settled = wait_until(cx, |cx| {
+            redraw(cx);
+            workspace.read_with(cx, |workspace, _| {
+                workspace
+                    .comments_listed
+                    .is_some_and(|(_, _, fingerprint)| fingerprint == Some(9))
+            })
+        });
+        // Drain whatever the diff arriving already asked.
+        requests.try_iter().for_each(drop);
+
+        workspace.update(cx, |workspace, cx| {
+            let source = workspace.review_source(workspace.active_task);
+            workspace.apply_diff(diff_of(7, source, 10), cx);
+        });
+        redraw(cx);
+        let again = wait_until(cx, |cx| {
+            redraw(cx);
+            requests
+                .try_iter()
+                .any(|request| matches!(request, Request::ListComments { .. }))
+        });
+
+        assert_eq!(before_review, 0, "nothing is listed before Review opens");
+        assert!(listed && settled && again);
+    }
+
+    #[gpui::test]
+    fn a_comment_goes_to_the_daemon_and_the_box_closes_when_it_answers(cx: &mut TestAppContext) {
+        let (socket, requests) = comment_daemon();
+        let (workspace, cx, _client) = real_task_workspace(&socket, cx);
+        workspace.update(cx, |workspace, cx| workspace.set_view(View::Review, cx));
+        let mut diff = diff_of(7, ReviewSource::Live, 9);
+        diff.files = vec![swarm_protocol::FileDiff {
+            worktree: PathBuf::from("/wt"),
+            path: PathBuf::from("a.rs"),
+            agent: None,
+            change: swarm_protocol::FileChange::Modified,
+            mode_change: None,
+            additions: 1,
+            deletions: 0,
+            binary: false,
+            hunks: vec![swarm_protocol::DiffHunk {
+                old_start: 1,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 1,
+                section: String::new(),
+                lines: vec![swarm_protocol::DiffLine {
+                    kind: swarm_protocol::DiffLineKind::Added,
+                    text: "let x = 1;".into(),
+                }],
+            }],
+            truncated: false,
+        }];
+        workspace.update(cx, |workspace, cx| {
+            workspace.data.store_diff(diff);
+            workspace.set_review_source(ReviewSource::Live, cx);
+        });
+        redraw(cx);
+        let review = workspace.read_with(cx, |workspace, _| workspace.review.clone());
+
+        cx.simulate_keystrokes("c");
+        redraw(cx);
+        cx.simulate_input("Rename x");
+        cx.simulate_keystrokes("cmd-enter");
+        let sent = wait_until(cx, |cx| {
+            redraw(cx);
+            requests.try_iter().any(|request| match request {
+                Request::AddComment { comment, .. } => {
+                    comment.body == "Rename x"
+                        && comment.anchor.line == 1
+                        && comment.anchor.text == "let x = 1;"
+                        && comment.source == ReviewSource::Live
+                }
+                _ => false,
+            })
+        });
+        let closed = wait_until(cx, |cx| {
+            redraw(cx);
+            !review.read_with(cx, |review, _| review.composer_is_open())
+        });
+
+        assert!(sent, "the daemon got the comment with its anchor");
+        assert!(closed, "the box closes when the daemon says done");
+    }
+
+    #[gpui::test]
+    fn comment_events_reach_the_comments_of_the_task(cx: &mut TestAppContext) {
+        let (socket, _requests) = comment_daemon();
+        let (workspace, cx, _client) = real_task_workspace(&socket, cx);
+        let comment = swarm_protocol::ReviewComment {
+            id: swarm_protocol::CommentId(4),
+            task: DaemonTaskId(7),
+            parent: None,
+            source: ReviewSource::Merged,
+            anchor: swarm_protocol::CommentAnchor {
+                worktree: PathBuf::from("/wt"),
+                path: PathBuf::from("a.rs"),
+                side: swarm_protocol::DiffSide::New,
+                line: 1,
+                text: String::new(),
+                before: None,
+                after: None,
+            },
+            body: "x".into(),
+            state: swarm_protocol::CommentState::Pending,
+            to: None,
+            outdated: false,
+            created_at: 0,
+            sent_at: None,
+        };
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.comment_event(
+                &swarm_protocol::CommentEvent::Changed(Box::new(comment)),
+                cx,
+            );
+        });
+
+        let kept = workspace.read_with(cx, |workspace, _| {
+            workspace.data.task_list(DaemonTaskId(7)).len()
+        });
+        assert_eq!(kept, 1);
+    }
+
+    fn pending_comment(id: u64, body: &str) -> swarm_protocol::ReviewComment {
+        swarm_protocol::ReviewComment {
+            id: swarm_protocol::CommentId(id),
+            task: DaemonTaskId(7),
+            parent: None,
+            source: ReviewSource::Merged,
+            anchor: swarm_protocol::CommentAnchor {
+                worktree: PathBuf::from("/wt"),
+                path: PathBuf::from("a.rs"),
+                side: swarm_protocol::DiffSide::New,
+                line: 1,
+                text: String::new(),
+                before: None,
+                after: None,
+            },
+            body: body.into(),
+            state: swarm_protocol::CommentState::Pending,
+            to: None,
+            outdated: false,
+            created_at: 0,
+            sent_at: None,
+        }
+    }
+
+    fn comment_ids(workspace: &Entity<Workspace>, cx: &VisualTestContext) -> Vec<(u64, String)> {
+        workspace.read_with(cx, |workspace, _| {
+            workspace
+                .data
+                .task_list(DaemonTaskId(7))
+                .iter()
+                .map(|comment| (comment.id.0, comment.body.clone()))
+                .collect()
+        })
+    }
+
+    #[gpui::test]
+    fn a_list_answer_started_before_an_event_keeps_what_the_event_changed(cx: &mut TestAppContext) {
+        let (release, gate) = flume::unbounded::<()>();
+        let socket = fake_daemon_replying(move |request| match request {
+            Request::ListComments { call, .. } => {
+                gate.recv().ok();
+
+                Some(Event::Comments {
+                    call,
+                    comments: vec![pending_comment(1, "older"), pending_comment(3, "deleted")],
+                })
+            }
+            _ => None,
+        });
+        let (workspace, cx, _client) = real_task_workspace(&socket, cx);
+
+        // The list is asked but the daemon has not answered: nothing ran yet.
+        workspace.update(cx, |workspace, cx| workspace.set_view(View::Review, cx));
+        workspace.update(cx, Workspace::sync_review);
+        let started = workspace.read_with(cx, |workspace, _| workspace.comment_sync.is_asking());
+        workspace.update(cx, |workspace, cx| {
+            let event = swarm_protocol::CommentEvent::Changed;
+
+            workspace.comment_event(&event(Box::new(pending_comment(1, "newer"))), cx);
+            workspace.comment_event(&event(Box::new(pending_comment(2, "added"))), cx);
+            workspace.comment_event(
+                &swarm_protocol::CommentEvent::Deleted {
+                    task: DaemonTaskId(7),
+                    id: swarm_protocol::CommentId(3),
+                },
+                cx,
+            );
+        });
+        release.send(()).ok();
+        drop(release);
+        let listed = wait_until(cx, |cx| {
+            redraw(cx);
+            workspace.read_with(cx, |workspace, _| workspace.comments_listed.is_some())
+        });
+
+        assert!(started && listed);
+        assert_eq!(
+            comment_ids(&workspace, cx),
+            [(1, "newer".to_owned()), (2, "added".to_owned())]
+        );
+    }
+
+    #[gpui::test]
+    fn a_failed_list_is_asked_again_for_a_new_diff_but_not_on_every_frame(cx: &mut TestAppContext) {
+        let (asked, requests) = flume::unbounded();
+        let socket = fake_daemon_replying(move |request| match request {
+            Request::ListComments { call, .. } => {
+                asked.send(()).ok();
+
+                Some(Event::Error {
+                    call: Some(call),
+                    id: None,
+                    message: "busy".into(),
+                })
+            }
+            _ => None,
+        });
+        let (workspace, cx, _client) = real_task_workspace(&socket, cx);
+
+        workspace.update(cx, |workspace, cx| workspace.set_view(View::Review, cx));
+        redraw(cx);
+        let first = wait_until(cx, |cx| {
+            redraw(cx);
+            workspace.read_with(cx, |workspace, _| workspace.comment_sync.has_failed())
+        });
+        for _ in 0..5 {
+            workspace.update(cx, |_, cx| cx.notify());
+            redraw(cx);
+        }
+        let after_frames = requests.try_iter().count();
+        let listed = workspace.read_with(cx, |workspace, _| workspace.comments_listed);
+
+        workspace.update(cx, |workspace, cx| {
+            let source = workspace.review_source(workspace.active_task);
+
+            workspace.apply_diff(diff_of(7, source, 10), cx);
+        });
+        redraw(cx);
+        let again = wait_until(cx, |cx| {
+            redraw(cx);
+            !requests.is_empty()
+        });
+
+        assert!(first && again);
+        assert_eq!(after_frames, 1, "a failed list was asked again at once");
+        assert_eq!(listed, None, "a failed list counted as listed");
+    }
+
+    #[gpui::test]
+    fn the_refusal_of_a_stopped_orchestrator_shows_in_the_daemons_words(cx: &mut TestAppContext) {
+        let socket = fake_daemon_replying(|request| match request {
+            Request::SendComments { call, .. } => Some(Event::Error {
+                call: Some(call),
+                id: None,
+                message: "the orchestrator is stopped".into(),
+            }),
+            _ => None,
+        });
+        let (workspace, cx, _client) = real_task_workspace(&socket, cx);
+
+        workspace.update(cx, |workspace, cx| {
+            workspace
+                .data
+                .set_comments(DaemonTaskId(7), vec![pending_comment(1, "Rename it")]);
+            workspace.request_review_changes(cx);
+        });
+        let shown = wait_until(cx, |cx| {
+            workspace.read_with(cx, |workspace, _| workspace.review_error.is_some())
+        });
+
+        let (error, active, requesting) = workspace.read_with(cx, |workspace, _| {
+            (
+                workspace.review_error.clone(),
+                workspace.active_task,
+                workspace.review_requesting.len(),
+            )
+        });
+        assert!(shown);
+        assert_eq!(
+            error,
+            Some((active, "the orchestrator is stopped".into())),
+            "the daemon's refusal, without a prefix"
+        );
+        assert_eq!(requesting, 0, "the request stayed in flight");
+    }
+
+    #[gpui::test]
+    fn the_refusal_of_an_approval_with_pending_comments_shows_in_the_daemons_words(
+        cx: &mut TestAppContext,
+    ) {
+        let socket = fake_daemon_replying(|request| match request {
+            Request::ApproveTask { call, .. } => Some(Event::Error {
+                call: Some(call),
+                id: None,
+                message: "2 comments are pending".into(),
+            }),
+            _ => None,
+        });
+        let (workspace, cx, _client) = real_task_workspace(&socket, cx);
+
+        workspace.update(cx, |workspace, cx| {
+            workspace
+                .data
+                .store_diff(diff_of(7, ReviewSource::Merged, 9));
+            workspace.set_review_source(ReviewSource::Merged, cx);
+            workspace.approve_review(cx);
+        });
+        let shown = wait_until(cx, |cx| {
+            workspace.read_with(cx, |workspace, _| workspace.review_error.is_some())
+        });
+
+        let (error, active) = workspace.read_with(cx, |workspace, _| {
+            (workspace.review_error.clone(), workspace.active_task)
+        });
+        assert!(shown);
+        assert_eq!(error, Some((active, "2 comments are pending".into())));
     }
 
     fn close_daemon(check: swarm_protocol::CloseCheck) -> (PathBuf, flume::Receiver<DaemonTaskId>) {

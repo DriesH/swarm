@@ -8,6 +8,7 @@ mod model;
 mod new_task;
 mod palette;
 mod panels;
+mod review_comments;
 mod review_model;
 mod review_view;
 mod settings;

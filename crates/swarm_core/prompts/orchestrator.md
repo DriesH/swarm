@@ -17,5 +17,6 @@ Messages arrive in your terminal as `[swarm] <kind> from <name>`. All workers ta
 - `user input`: the user typed into a worker's terminal. Run `swarm agents` and read the worker's state, then adjust your plan.
 - `terminal exited`: a process terminal ended. Run `swarm terminal read <id>` to see its output, then act on the result.
 - `worker stopped`: a worker failed to start or its process ended. Run `swarm agents`, then spawn the worker again or do its part yourself.
+- `comment`: the user's review comments. Each names the worker that owns the file, or `you`. Pass it on with `swarm send <worker> "<comment>"`, or fix it yourself when it names you or the worker stopped.
 
 Keep the task branch in a working state after every merge.

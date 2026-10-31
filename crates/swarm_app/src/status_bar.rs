@@ -5,7 +5,8 @@ use swarm_ui::prelude::*;
 
 use crate::actions::NewTerminal;
 use crate::model::{AgentKind, TerminalId, TerminalKind};
-use crate::workspace::Workspace;
+use crate::review_model::count_comments;
+use crate::workspace::{View, Workspace};
 
 pub(crate) fn render(
     workspace: &Workspace,
@@ -38,6 +39,10 @@ pub(crate) fn render(
         .filter_map(|id| tray_chip(workspace, TerminalId(id.0), cx))
         .collect();
 
+    let comments = (workspace.view == View::Review)
+        .then(|| count_comments(&workspace.data.task_comments(task.id)).status_text())
+        .flatten();
+
     let mono = |text: SharedString| {
         Label::new(text)
             .mono()
@@ -63,6 +68,14 @@ pub(crate) fn render(
                 .icon(IconName::Plus)
                 .on_click(|_, window, cx| window.dispatch_action(Box::new(NewTerminal), cx)),
         )
+        .children(comments.map(|text| {
+            h_flex()
+                .id("comment-counts")
+                .debug_selector(|| "comment-counts".to_owned())
+                .role(Role::Group)
+                .aria_label(text.clone())
+                .child(mono(text.into()))
+        }))
         .child(gpui::div().flex_1())
         .child(
             h_flex()

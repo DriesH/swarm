@@ -16,11 +16,18 @@ use std::time::{Duration, Instant};
 use swarm_term::{TerminalChannels, TerminalInput, TerminalOutput};
 
 use crate::{
-    AgentChange, AgentId, AgentInfo, AgentKind, CallId, CloseCheck, CreateTask, CreateTerminal,
-    Event, FrameError, MessageId, MessageInfo, Paths, ProjectId, ProjectInfo, Request,
-    ReviewSource, TaskDiff, TaskId, TaskInfo, TerminalId, TerminalInfo, VERSION, check_private_dir,
-    read, write,
+    AgentChange, AgentId, AgentInfo, AgentKind, CallId, CloseCheck, CommentId, CreateTask,
+    CreateTerminal, Event, FrameError, MessageId, MessageInfo, NewComment, Paths, ProjectId,
+    ProjectInfo, Request, ReviewComment, ReviewSource, TaskDiff, TaskId, TaskInfo, TerminalId,
+    TerminalInfo, VERSION, check_private_dir, read, write,
 };
+
+/// A review comment was added, changed or deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommentEvent {
+    Changed(Box<ReviewComment>),
+    Deleted { task: TaskId, id: CommentId },
+}
 
 /// A message was sent or delivered, in the order the daemon sent the events.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +104,7 @@ struct Shared {
     tasks: flume::Sender<TaskInfo>,
     terminals: flume::Sender<TerminalInfo>,
     messages: flume::Sender<MessageEvent>,
+    comments: flume::Sender<CommentEvent>,
     /// Terminals whose size an agent owns: their `Resize` input is dropped.
     size_locked: Mutex<HashSet<TerminalId>>,
 }
@@ -144,6 +152,7 @@ struct Inner {
     task_events: flume::Receiver<TaskInfo>,
     terminal_events: flume::Receiver<TerminalInfo>,
     message_events: flume::Receiver<MessageEvent>,
+    comment_events: flume::Receiver<CommentEvent>,
 }
 
 impl Drop for Inner {
@@ -235,6 +244,7 @@ impl Client {
         let (task_sender, task_receiver) = flume::unbounded();
         let (terminal_sender, terminal_receiver) = flume::unbounded();
         let (message_sender, message_receiver) = flume::unbounded();
+        let (comment_sender, comment_receiver) = flume::unbounded();
         let shared = Arc::new(Shared {
             routes: Mutex::new(HashMap::new()),
             waiters: Mutex::new(HashMap::new()),
@@ -246,6 +256,7 @@ impl Client {
             tasks: task_sender,
             terminals: terminal_sender,
             messages: message_sender,
+            comments: comment_sender,
             size_locked: Mutex::new(HashSet::new()),
         });
         let (request_sender, request_receiver) = flume::unbounded();
@@ -281,6 +292,7 @@ impl Client {
                 task_events: task_receiver,
                 terminal_events: terminal_receiver,
                 message_events: message_receiver,
+                comment_events: comment_receiver,
             }),
             reply_timeout: REPLY_TIMEOUT,
         })
@@ -323,6 +335,11 @@ impl Client {
     /// Every `MessageSent` and `MessagesDelivered` the daemon sends. Use one consumer.
     pub fn message_events(&self) -> flume::Receiver<MessageEvent> {
         self.inner.message_events.clone()
+    }
+
+    /// Every `CommentChanged` and `CommentDeleted` the daemon sends. Use one consumer.
+    pub fn comment_events(&self) -> flume::Receiver<CommentEvent> {
+        self.inner.comment_events.clone()
     }
 
     /// Changes how long calls wait (`create_task` waits at least 60 s) for the daemon.
@@ -466,6 +483,52 @@ impl Client {
         match reply {
             Event::Done { .. } => Ok(()),
             other => Err(unexpected("ApproveTask", &other)),
+        }
+    }
+
+    /// The task's comments, oldest first, with anchors checked against the files now.
+    pub fn list_comments(&self, task: TaskId) -> Result<Vec<ReviewComment>, ClientError> {
+        let timeout = self.reply_timeout.max(GIT_TIMEOUT);
+
+        match self.call_with_timeout(|call| Request::ListComments { call, task }, None, timeout)? {
+            Event::Comments { comments, .. } => Ok(comments),
+            other => Err(unexpected("ListComments", &other)),
+        }
+    }
+
+    /// Adds a comment; it arrives through [`Client::comment_events`].
+    pub fn add_comment(&self, comment: NewComment) -> Result<(), ClientError> {
+        let timeout = self.reply_timeout.max(GIT_TIMEOUT);
+
+        match self.call_with_timeout(|call| Request::AddComment { call, comment }, None, timeout)? {
+            Event::Done { .. } => Ok(()),
+            other => Err(unexpected("AddComment", &other)),
+        }
+    }
+
+    pub fn delete_comment(&self, id: CommentId) -> Result<(), ClientError> {
+        match self.call(|call| Request::DeleteComment { call, id }, None)? {
+            Event::Done { .. } => Ok(()),
+            other => Err(unexpected("DeleteComment", &other)),
+        }
+    }
+
+    pub fn resolve_comment(&self, id: CommentId, resolved: bool) -> Result<(), ClientError> {
+        let request = |call| Request::ResolveComment { call, id, resolved };
+
+        match self.call(request, None)? {
+            Event::Done { .. } => Ok(()),
+            other => Err(unexpected("ResolveComment", &other)),
+        }
+    }
+
+    /// Sends the task's pending comments to its orchestrator in one message.
+    pub fn request_changes(&self, task: TaskId) -> Result<(), ClientError> {
+        let timeout = self.reply_timeout.max(GIT_TIMEOUT);
+
+        match self.call_with_timeout(|call| Request::SendComments { call, task }, None, timeout)? {
+            Event::Done { .. } => Ok(()),
+            other => Err(unexpected("SendComments", &other)),
         }
     }
 
@@ -685,6 +748,10 @@ fn unexpected(request: &str, event: &Event) -> ClientError {
     ClientError::Daemon(format!("unexpected reply to {request}: {event:?}"))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one arm per event reads best in one match"
+)]
 fn read_events(
     reader: &mut BufReader<UnixStream>,
     buffer: &mut Vec<u8>,
@@ -796,6 +863,27 @@ fn read_events(
                 deliver(shared, call, Event::CloseCheck { call, check });
             }
             Event::Done { call } => deliver(shared, call, Event::Done { call }),
+            Event::Comments { call, comments } => {
+                deliver(shared, call, Event::Comments { call, comments });
+            }
+            Event::CommentChanged { comment } => {
+                if shared
+                    .comments
+                    .send(CommentEvent::Changed(Box::new(comment)))
+                    .is_err()
+                {
+                    log::debug!("comment event has no listener");
+                }
+            }
+            Event::CommentDeleted { task, id } => {
+                if shared
+                    .comments
+                    .send(CommentEvent::Deleted { task, id })
+                    .is_err()
+                {
+                    log::debug!("comment event has no listener");
+                }
+            }
         }
     }
 

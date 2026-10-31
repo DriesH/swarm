@@ -3,6 +3,7 @@
 mod agent_socket;
 mod agents;
 mod calls;
+mod comments;
 mod connection;
 mod hub;
 mod messages;

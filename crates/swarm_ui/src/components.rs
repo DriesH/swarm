@@ -17,6 +17,7 @@ mod status;
 mod switch;
 mod tab;
 mod tab_strip;
+mod tag;
 pub(crate) mod text_input;
 mod tile_frame;
 mod tooltip;
@@ -41,6 +42,7 @@ pub use status::*;
 pub use switch::*;
 pub use tab::*;
 pub use tab_strip::*;
+pub use tag::*;
 pub use text_input::*;
 pub use tile_frame::*;
 pub use tooltip::*;
@@ -68,6 +70,7 @@ pub fn all_components() -> Vec<ComponentEntry> {
         ComponentEntry::of::<PopoverMenu>(),
         ComponentEntry::of::<Dropdown>(),
         ComponentEntry::of::<StatusPill>(),
+        ComponentEntry::of::<Tag>(),
         ComponentEntry::of::<ListRow>(),
         ComponentEntry::of::<TrayChip>(),
         ComponentEntry::of::<Panel>(),

@@ -15,9 +15,9 @@ use swarm_protocol::{
 };
 use swarm_term::TerminalInput;
 
-use crate::Services;
 use crate::hub::{CREATE_HISTORY_LINES, ClientSink, Frame, Hub, QUEUE_FRAMES};
 use crate::tasks;
+use crate::{Services, comments};
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -193,6 +193,11 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
         | Request::ApproveTask { .. }
         | Request::CheckClose { .. }
         | Request::CloseTask { .. }) => handle_review(services, sink, request),
+        request @ (Request::ListComments { .. }
+        | Request::AddComment { .. }
+        | Request::DeleteComment { .. }
+        | Request::ResolveComment { .. }
+        | Request::SendComments { .. }) => handle_comments(services, sink, request),
         Request::ListProjects { call } => match projects.list() {
             Ok(projects) => {
                 sink.send_event(&Event::Projects { call, projects });
@@ -329,6 +334,54 @@ fn handle_review(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Requ
             });
         }
         _ => {}
+    }
+}
+
+/// Review comments: list, add, delete, resolve and send.
+fn handle_comments(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
+    let services = Arc::clone(services);
+
+    match request {
+        Request::ListComments { call, task } => {
+            run_slow(sink, "list-comments", call, move |sink| {
+                match services.projects.list_comments(task) {
+                    Ok(comments) => {
+                        sink.send_event(&Event::Comments { call, comments });
+                    }
+                    Err(error) => send_error(sink, call, &error),
+                }
+            });
+        }
+        Request::AddComment { call, comment } => {
+            run_slow(sink, "add-comment", call, move |sink| {
+                done_or_error(sink, call, comments::add(&services, &comment));
+            });
+        }
+        Request::DeleteComment { call, id } => {
+            run_slow(sink, "delete-comment", call, move |sink| {
+                done_or_error(sink, call, comments::delete(&services, id));
+            });
+        }
+        Request::ResolveComment { call, id, resolved } => {
+            run_slow(sink, "resolve-comment", call, move |sink| {
+                done_or_error(sink, call, comments::resolve(&services, id, resolved));
+            });
+        }
+        Request::SendComments { call, task } => {
+            run_slow(sink, "send-comments", call, move |sink| {
+                done_or_error(sink, call, comments::send_pending(&services, task));
+            });
+        }
+        _ => {}
+    }
+}
+
+fn done_or_error(sink: &ClientSink, call: CallId, result: Result<()>) {
+    match result {
+        Ok(()) => {
+            sink.send_event(&Event::Done { call });
+        }
+        Err(error) => send_error(sink, call, &error),
     }
 }
 
