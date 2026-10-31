@@ -577,6 +577,9 @@ pub(crate) struct FakeData {
     pub agent_changes: HashMap<AgentId, AgentChanges>,
     /// The latest diff of each task and source, see [`FakeData::diff_id`].
     pub diffs: HashMap<(swarm_protocol::TaskId, ReviewSource), Rc<TaskDiff>>,
+    /// The lines of folded files the user asked for. [`FakeData::store_diff`] puts them
+    /// back into every new diff.
+    pub loaded: crate::review_model::LoadedFiles,
     /// The review comments of each task, oldest first, under [`FakeData::diff_id`].
     pub comments: HashMap<swarm_protocol::TaskId, Rc<[ReviewComment]>>,
 }
@@ -1520,8 +1523,9 @@ impl FakeData {
             .unwrap_or_default()
     }
 
-    /// Keeps a diff the daemon sent. Returns false when it is the one already kept.
-    pub(crate) fn store_diff(&mut self, diff: TaskDiff) -> bool {
+    /// Keeps a diff the daemon sent, with the lines of the folded files the user loaded.
+    /// Returns false when it is the one already kept.
+    pub(crate) fn store_diff(&mut self, mut diff: TaskDiff) -> bool {
         let key = (diff.task, diff.source);
 
         if self
@@ -1532,9 +1536,50 @@ impl FakeData {
             return false;
         }
 
+        self.loaded.restore(&mut diff);
         self.diffs.insert(key, Rc::new(diff));
 
         true
+    }
+
+    /// Keeps the answer to a request for the lines of one folded file. A file the diff no
+    /// longer holds is dropped from it, with its share of the totals.
+    pub(crate) fn finish_load(
+        &mut self,
+        key: &crate::review_model::LoadKey,
+        answer: Result<Option<swarm_protocol::FileDiff>, SharedString>,
+    ) {
+        let diff = (key.0, key.1);
+
+        match answer {
+            Ok(Some(file)) => {
+                self.loaded.keep(key, &file);
+
+                if let Some(stored) = self.diffs.get_mut(&diff) {
+                    self.loaded.merge(key, Rc::make_mut(stored));
+                }
+            }
+            Ok(None) => {
+                self.loaded.forget(key);
+
+                let position = self.diffs.get(&diff).and_then(|stored| {
+                    stored
+                        .files
+                        .iter()
+                        .position(|file| file.worktree == key.2 && file.path == key.3)
+                });
+
+                if let (Some(position), Some(stored)) = (position, self.diffs.get_mut(&diff)) {
+                    let stored = Rc::make_mut(stored);
+                    let gone = stored.files.remove(position);
+
+                    stored.stat.files = stored.stat.files.saturating_sub(1);
+                    stored.stat.additions = stored.stat.additions.saturating_sub(gone.additions);
+                    stored.stat.deletions = stored.stat.deletions.saturating_sub(gone.deletions);
+                }
+            }
+            Err(message) => self.loaded.fail(key, message),
+        }
     }
 
     /// The fingerprint of the Merged diff the app has loaded for a tab.
@@ -1771,6 +1816,7 @@ impl FakeData {
     pub(crate) fn remove_task(&mut self, task: TaskId) -> Vec<TerminalId> {
         if let Some(id) = self.diff_id(task) {
             self.diffs.retain(|(other, _), _| *other != id);
+            self.loaded.forget_task(id);
             self.comments.remove(&id);
         }
 

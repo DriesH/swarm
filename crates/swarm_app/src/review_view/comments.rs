@@ -38,7 +38,7 @@ const CLOCK_TICK: Duration = Duration::from_secs(5);
 /// that leaves the file as it was.
 pub(super) struct Cursor {
     pub key: FileKey,
-    pub hash: u64,
+    pub digest: u64,
     pub pos: LinePos,
 }
 
@@ -263,7 +263,7 @@ impl ReviewView {
             return;
         };
         let comments = Rc::clone(&input.comments);
-        let threads = place_threads(diff, &comments);
+        let threads = place_threads(diff, &comments, &input.loads);
 
         let mut counts = vec![0_u32; diff.files.len()];
         for thread in &threads {
@@ -337,7 +337,7 @@ impl ReviewView {
         let found = self
             .infos
             .iter()
-            .position(|info| info.key == cursor.key && info.hash == cursor.hash);
+            .position(|info| info.key == cursor.key && info.digest == cursor.digest);
 
         self.cursor = found.map(|file| Cursor {
             pos: LinePos {
@@ -659,7 +659,7 @@ impl ReviewView {
 
         self.cursor = Some(Cursor {
             key: info.key.clone(),
-            hash: info.hash,
+            digest: info.digest,
             pos,
         });
         cx.notify();

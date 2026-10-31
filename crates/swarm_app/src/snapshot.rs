@@ -76,6 +76,22 @@ fn open_many_tabs_scrolled(workspace: &mut Workspace, _: &mut Window, cx: &mut C
     }
 }
 
+/// The Terminals view with the Changes panel: one folder closed and one file under the cursor.
+fn open_changes_tree(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
+    workspace.set_view(View::Terminals, cx);
+    workspace.right_panel = Some(RightPanel::Changes);
+    workspace.sync_changes_list(cx);
+    workspace
+        .changes_list
+        .update(cx, crate::panels::ChangesList::mark_for_snapshot);
+}
+
+/// The Terminals view with the Files panel.
+fn open_files_panel(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
+    workspace.set_view(View::Terminals, cx);
+    workspace.right_panel = Some(RightPanel::Files);
+}
+
 fn open_swarm(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
     workspace.set_view(View::Swarm, cx);
 }
@@ -143,6 +159,41 @@ fn review_element(
         .update(cx, |review, cx| review.select_file(index, cx));
 
     Some(index)
+}
+
+/// Opens Review on Merged, where the folded lock file is the first card.
+fn open_review_folded(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
+    workspace.set_view(View::Review, cx);
+    workspace.set_review_source(ReviewSource::Merged, cx);
+}
+
+/// Merged, with the large file loaded and on screen.
+fn open_review_loaded(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
+    workspace.set_view(View::Review, cx);
+    workspace.set_review_source(ReviewSource::Merged, cx);
+    workspace.sync_review(cx);
+
+    let Some(diff) = workspace
+        .data
+        .task_diff(workspace.active_task, ReviewSource::Merged)
+        .map(Rc::clone)
+    else {
+        return;
+    };
+    let Some((index, file)) = diff
+        .files
+        .iter()
+        .enumerate()
+        .find(|(_, file)| file.path.ends_with("glyphs.rs"))
+    else {
+        return;
+    };
+
+    workspace.show_file_diff(file.worktree.clone(), file.path.clone(), cx);
+    workspace.sync_review(cx);
+    workspace
+        .review
+        .update(cx, |review, cx| review.select_file(index, cx));
 }
 
 fn open_review_comment_box(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
@@ -218,15 +269,29 @@ fn show_live_thread(
         .update(cx, |review, cx| review.show_thread(id, reply, cx));
 }
 
-/// The sent thread that the orchestrator has not got yet.
+/// The sent thread that the orchestrator has not got yet. Its replies are in flight too.
 fn open_review_thread_in_flight(
     workspace: &mut Workspace,
     _: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
     let id = swarm_protocol::CommentId(3);
+    let thread: Vec<_> = workspace
+        .data
+        .task_comments(workspace.active_task)
+        .iter()
+        .filter(|comment| comment.id == id || comment.parent == Some(id))
+        .map(|comment| comment.id)
+        .collect();
 
-    change_comment(workspace, id, |comment| comment.delivered_at = None, cx);
+    for comment in thread {
+        change_comment(
+            workspace,
+            comment,
+            |comment| comment.delivered_at = None,
+            cx,
+        );
+    }
     show_live_thread(workspace, id, None, cx);
 }
 
@@ -489,6 +554,26 @@ pub(crate) fn run(directory: PathBuf, cx: &mut App) {
             ),
             (
                 Appearance::Light,
+                "workspace-changes-tree-light.png",
+                Some(open_changes_tree),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-changes-tree-dark.png",
+                Some(open_changes_tree),
+            ),
+            (
+                Appearance::Light,
+                "workspace-files-panel-light.png",
+                Some(open_files_panel),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-files-panel-dark.png",
+                Some(open_files_panel),
+            ),
+            (
+                Appearance::Light,
                 "workspace-island-light.png",
                 Some(open_island),
             ),
@@ -596,6 +681,26 @@ pub(crate) fn run(directory: PathBuf, cx: &mut App) {
                 Appearance::Dark,
                 "workspace-review-dark.png",
                 Some(open_review),
+            ),
+            (
+                Appearance::Light,
+                "workspace-review-folded-light.png",
+                Some(open_review_folded),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-review-folded-dark.png",
+                Some(open_review_folded),
+            ),
+            (
+                Appearance::Light,
+                "workspace-review-loaded-light.png",
+                Some(open_review_loaded),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-review-loaded-dark.png",
+                Some(open_review_loaded),
             ),
             (
                 Appearance::Light,

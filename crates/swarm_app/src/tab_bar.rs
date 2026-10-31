@@ -34,6 +34,7 @@ pub(crate) fn render(
     let stat = workspace.data.live_stat(task.id);
     let panel = workspace.visible_panel();
     let panels_disabled = workspace.view == View::Swarm;
+    let changes_disabled = workspace.view != View::Terminals;
     let pull_request = workspace.pull_request_toggle_label(task.id);
 
     h_flex()
@@ -71,7 +72,7 @@ pub(crate) fn render(
                                 "Changes",
                                 IconName::Branch,
                                 panel == Some(RightPanel::Changes),
-                                panels_disabled,
+                                changes_disabled,
                                 cx.listener(|workspace, _, _, cx| {
                                     workspace.toggle_panel(RightPanel::Changes, cx);
                                 }),
@@ -302,6 +303,23 @@ mod tests {
 
         let panel = workspace.read_with(cx, |workspace, _| workspace.right_panel);
         assert_eq!(panel, Some(RightPanel::Changes));
+    }
+
+    #[gpui::test]
+    fn in_review_the_changes_button_does_nothing_and_files_still_opens(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        workspace.update(cx, |workspace, cx| workspace.set_view(View::Review, cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        click("changes-button", cx);
+        let after_changes = workspace.read_with(cx, |workspace, _| workspace.right_panel);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        click("files-button", cx);
+        let after_files = workspace.read_with(cx, |workspace, _| workspace.visible_panel());
+
+        assert_eq!(after_changes, Some(RightPanel::Changes));
+        assert_eq!(after_files, Some(RightPanel::Files));
     }
 
     #[gpui::test]

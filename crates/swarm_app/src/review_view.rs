@@ -11,26 +11,28 @@ use gpui::{
     StyleRefinement, UniformListScrollHandle, WeakEntity, Window, div, list, px, uniform_list,
 };
 use swarm_protocol::{
-    CommentId, DiffLine, DiffLineKind, DiffSide, FileChange, FileDiff, ReviewComment, ReviewSource,
-    TaskDiff,
+    CommentId, DiffLine, DiffLineKind, DiffSide, FileChange, FileDiff, Fold, ReviewComment,
+    ReviewSource, TaskDiff,
 };
 use swarm_ui::fonts::MONO_FONT;
 use swarm_ui::prelude::*;
 use swarm_ui::styles::focus_ring;
-use swarm_ui::{StatusPill, ThemeColors};
+use swarm_ui::{StatusPill, TagTone, ThemeColors};
 
 use crate::actions::{
-    CancelComment, CommentOnLine, CreatePullRequest, NextFile, NextLine, PreviousFile,
-    PreviousLine, REVIEW_BODY_CONTEXT, REVIEW_CONTEXT, SetUpGithub, ToggleViewed,
+    CancelComment, CommentOnLine, CreatePullRequest, FILE_TREE_CONTEXT, NextFile, NextLine,
+    PreviousFile, PreviousLine, REVIEW_BODY_CONTEXT, REVIEW_CONTEXT, SetUpGithub, ToggleViewed,
+    TreeActivate, TreeCollapse, TreeExpand, TreeNext, TreePrevious,
 };
+use crate::file_tree::{self, Entry, EntryKind, Key, Mark, Move};
 use crate::markdown::Markdown;
 use crate::model::{AgentKind, TaskId};
 use crate::pull_request::PrOffer;
 use crate::review_comments::refusal;
 use crate::review_model::{
-    AgentLabel, BodyRows, DiffStyle, FileGroup, FileInfo, FileKey, GroupKind, Grouping, LinePos,
-    Marks, Note, Row, Side, Thread, build_rows, count_comments, file_infos, group_files, plural,
-    thousands, visible_files, worktree_count,
+    AgentLabel, BodyRows, DiffStyle, FileInfo, FileKey, FileLoad, FileLoads, LinePos, LoadKey,
+    Marks, Note, Row, Side, Thread, build_rows, count_comments, file_infos, is_folded, plural,
+    sample_lines, thousands, visible_files, worktree_count,
 };
 use crate::workspace::{View, Workspace};
 
@@ -39,7 +41,6 @@ mod comments;
 use comments::{Composer, ReplyBox, ReplyFocus};
 
 const NAV_WIDTH: f32 = 272.;
-const NAV_ROW: f32 = 30.;
 const HEADER_HEIGHT: f32 = 46.;
 const CARD_HEADER: f32 = 38.;
 const CARD_GAP: f32 = 14.;
@@ -51,7 +52,6 @@ const PLACE_SHRINK: f32 = 1_000.;
 const NO_NEWLINE: &str = "No newline at end of file";
 const SOURCES: [ReviewSource; 2] = [ReviewSource::Live, ReviewSource::Merged];
 const STYLES: [DiffStyle; 2] = [DiffStyle::Unified, DiffStyle::Split];
-const GROUPINGS: [Grouping; 2] = [Grouping::ByAgent, Grouping::ByFolder];
 
 /// A request to scroll to a file, from the Swarm view or the Changes panel.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,6 +82,8 @@ pub(crate) struct ReviewInput {
     pub jump: Option<Jump>,
     /// The comments of the task, oldest first.
     pub comments: Rc<[ReviewComment]>,
+    /// Which folded files of the diff the user asked for, and how that went.
+    pub loads: Rc<FileLoads>,
     /// Request changes is on its way.
     pub requesting: bool,
     /// The fixed clock of fake data, else the system clock.
@@ -97,19 +99,8 @@ impl ReviewInput {
             || self.diff != other.diff
             || self.filter != other.filter
             || self.agents != other.agents
+            || self.loads != other.loads
     }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-enum NavItem {
-    Group {
-        title: SharedString,
-        kind: GroupKind,
-        files: usize,
-    },
-    File {
-        file: usize,
-    },
 }
 
 /// Where the top of the body sits, so a new diff keeps the reader in place.
@@ -123,19 +114,25 @@ pub(crate) struct ReviewView {
     workspace: WeakEntity<Workspace>,
     input: Option<ReviewInput>,
     pub(crate) style: DiffStyle,
-    pub(crate) grouping: Grouping,
     selected: HashMap<TaskId, FileKey>,
-    /// The hash each viewed file had when it was marked.
+    /// The digest each viewed file had when it was marked.
     viewed: HashMap<TaskId, HashMap<FileKey, u64>>,
     collapsed: HashMap<TaskId, HashSet<FileKey>>,
     handled_jump: u64,
     infos: Rc<[FileInfo]>,
     shown: Rc<[usize]>,
     body: Rc<BodyRows>,
-    nav: Rc<[NavItem]>,
+    /// The visible rows of the file tree.
+    tree: Rc<[Entry]>,
+    /// The folders the user closed, by folder path.
+    closed: HashMap<TaskId, HashSet<String>>,
+    /// What the tree cursor stands on. Without one it stands on the selected file.
+    tree_cursor: HashMap<TaskId, Mark>,
     body_list: ListState,
     nav_scroll: UniformListScrollHandle,
     focus_handle: FocusHandle,
+    /// Focus of the file tree, which is one stop for Tab.
+    nav_focus: FocusHandle,
     /// Focus of the diff body, where the line cursor keys work.
     body_focus: FocusHandle,
     threads: Rc<[Thread]>,
@@ -216,7 +213,6 @@ impl ReviewView {
             workspace,
             input: None,
             style: DiffStyle::default(),
-            grouping: Grouping::default(),
             selected: HashMap::new(),
             viewed: HashMap::new(),
             collapsed: HashMap::new(),
@@ -224,10 +220,13 @@ impl ReviewView {
             infos: Rc::from([]),
             shown: Rc::from([]),
             body: Rc::default(),
-            nav: Rc::from([]),
+            tree: Rc::from([]),
+            closed: HashMap::new(),
+            tree_cursor: HashMap::new(),
             body_list: ListState::new(0, ListAlignment::Top, px(400.)),
             nav_scroll: UniformListScrollHandle::new(),
             focus_handle: cx.focus_handle(),
+            nav_focus: cx.focus_handle().tab_stop(true),
             body_focus: cx.focus_handle().tab_stop(true),
             threads: Rc::from([]),
             open_counts: Rc::from([]),
@@ -289,7 +288,7 @@ impl ReviewView {
         cx.notify();
     }
 
-    /// Forgets the viewed mark of every file present with other hunks, and opens its card.
+    /// Forgets the viewed mark of every file present with another digest, and opens its card.
     /// A file the diff does not hold keeps its mark.
     fn forget_changed_files(&mut self, input: &ReviewInput) {
         let Some(diff) = &input.diff else {
@@ -303,9 +302,9 @@ impl ReviewView {
             return;
         };
 
-        viewed.retain(|key, hash| {
-            let current = infos.iter().find(|info| info.key == *key).map(|i| i.hash);
-            let keep = current.is_none_or(|current| current == *hash);
+        viewed.retain(|key, digest| {
+            let current = infos.iter().find(|info| info.key == *key).map(|i| i.digest);
+            let keep = current.is_none_or(|current| current == *digest);
 
             if !keep {
                 collapsed.remove(key);
@@ -331,21 +330,11 @@ impl ReviewView {
         let anchor = keep_scroll.then(|| self.top_anchor()).flatten();
 
         let Some(input) = self.input.clone() else {
-            self.infos = Rc::from([]);
-            self.shown = Rc::from([]);
-            self.nav = Rc::from([]);
-            self.body = Rc::default();
-            self.threads = Rc::from([]);
-            self.body_list.reset(0);
+            self.clear_rows();
             return;
         };
         let Some(diff) = input.diff.as_ref() else {
-            self.infos = Rc::from([]);
-            self.shown = Rc::from([]);
-            self.nav = Rc::from([]);
-            self.body = Rc::default();
-            self.threads = Rc::from([]);
-            self.body_list.reset(0);
+            self.clear_rows();
             return;
         };
 
@@ -356,6 +345,15 @@ impl ReviewView {
         self.rebuild_rows(anchor);
     }
 
+    fn clear_rows(&mut self) {
+        self.infos = Rc::from([]);
+        self.shown = Rc::from([]);
+        self.tree = Rc::from([]);
+        self.body = Rc::default();
+        self.threads = Rc::from([]);
+        self.body_list.reset(0);
+    }
+
     fn rebuild_nav(&mut self) {
         let Some(input) = &self.input else {
             return;
@@ -363,21 +361,9 @@ impl ReviewView {
         let Some(diff) = &input.diff else {
             return;
         };
+        let closed = self.closed.get(&input.task).cloned().unwrap_or_default();
 
-        let groups: Vec<FileGroup> =
-            group_files(&diff.files, &self.shown, self.grouping, &input.agents);
-        let mut items = Vec::new();
-
-        for group in groups {
-            items.push(NavItem::Group {
-                title: group.title,
-                kind: group.kind,
-                files: group.files.len(),
-            });
-            items.extend(group.files.into_iter().map(|file| NavItem::File { file }));
-        }
-
-        self.nav = items.into();
+        self.tree = file_tree::build(&diff.files, &self.shown, &input.agents, &closed).into();
     }
 
     fn rebuild_rows(&mut self, anchor: Option<Anchor>) {
@@ -388,6 +374,7 @@ impl ReviewView {
             return;
         };
         let collapsed = self.collapsed.get(&input.task);
+        let loads = Rc::clone(&input.loads);
         let marks = Marks {
             threads: Rc::clone(&self.threads),
             composer: self.composer_at(),
@@ -397,11 +384,18 @@ impl ReviewView {
             diff,
             &self.infos,
             &self.shown,
-            |file| {
-                self.infos
-                    .get(file)
-                    .is_some_and(|info| collapsed.is_some_and(|set| set.contains(&info.key)))
-            },
+            (
+                |file| {
+                    self.infos
+                        .get(file)
+                        .is_some_and(|info| collapsed.is_some_and(|set| set.contains(&info.key)))
+                },
+                |file| {
+                    diff.files
+                        .get(file)
+                        .is_some_and(|data| is_folded(data, &loads))
+                },
+            ),
             self.style,
             &marks,
         ));
@@ -470,7 +464,27 @@ impl ReviewView {
             return;
         };
 
+        self.reveal(file);
         self.select(file);
+    }
+
+    /// Opens the closed folders above a file, so its row shows.
+    fn reveal(&mut self, file: usize) {
+        let (Some(task), Some(data)) = (self.task(), self.diff().and_then(|d| d.files.get(file)))
+        else {
+            return;
+        };
+        let path = data.path.clone();
+        let Some(closed) = self.closed.get_mut(&task) else {
+            return;
+        };
+        let before = closed.len();
+
+        closed.retain(|folder| !path.starts_with(folder));
+
+        if closed.len() != before {
+            self.rebuild_nav();
+        }
     }
 
     /// Selects the file and shows it at the top of the body.
@@ -480,6 +494,7 @@ impl ReviewView {
         };
 
         self.selected.insert(task, info.key.clone());
+        self.tree_cursor.insert(task, Mark::File(info.key.clone()));
         self.scroll_to_file(file);
     }
 
@@ -491,13 +506,85 @@ impl ReviewView {
             });
         }
 
-        let position = self
-            .nav
-            .iter()
-            .position(|item| *item == NavItem::File { file });
-        if let Some(position) = position {
-            self.nav_scroll
-                .scroll_to_item(position, ScrollStrategy::Nearest);
+        self.scroll_nav_to_cursor();
+    }
+
+    fn scroll_nav_to_cursor(&self) {
+        if let Some(row) = self.cursor_row() {
+            self.nav_scroll.scroll_to_item(row, ScrollStrategy::Nearest);
+        }
+    }
+
+    /// The row of the tree cursor: where the user moved it, else the selected file.
+    fn cursor_row(&self) -> Option<usize> {
+        let task = self.task()?;
+        let diff = self.diff()?;
+        let mark = self.tree_cursor.get(&task).cloned().or_else(|| {
+            let info = self.infos.get(self.selected_file()?)?;
+
+            Some(Mark::File(info.key.clone()))
+        })?;
+
+        file_tree::row_of(&self.tree, &diff.files, &mark)
+    }
+
+    /// Puts the tree cursor on a row.
+    fn put_cursor(&mut self, row: usize, cx: &mut Context<Self>) {
+        let (Some(task), Some(diff), Some(entry)) = (self.task(), self.diff(), self.tree.get(row))
+        else {
+            return;
+        };
+        let Some(mark) = file_tree::mark_of(entry, &diff.files) else {
+            return;
+        };
+
+        self.tree_cursor.insert(task, mark);
+        self.scroll_nav_to_cursor();
+        cx.notify();
+    }
+
+    /// Opens or closes the folder of a row. The cursor stays on it.
+    fn set_folder_open(&mut self, row: usize, open: bool, cx: &mut Context<Self>) {
+        let (Some(task), Some(entry)) = (self.task(), self.tree.get(row)) else {
+            return;
+        };
+        let folder = entry.folder.to_string();
+        let closed = self.closed.entry(task).or_default();
+
+        if open {
+            closed.remove(&folder);
+        } else {
+            closed.insert(folder.clone());
+        }
+
+        self.tree_cursor.insert(task, Mark::Folder(folder));
+        self.rebuild_nav();
+        self.scroll_nav_to_cursor();
+        cx.notify();
+    }
+
+    /// What an arrow key does in the tree.
+    fn move_tree(&mut self, key: Key, cx: &mut Context<Self>) {
+        match file_tree::step(&self.tree, self.cursor_row(), key) {
+            Move::Select(row) => self.put_cursor(row, cx),
+            Move::Open(row) => self.set_folder_open(row, true, cx),
+            Move::Close(row) => self.set_folder_open(row, false, cx),
+            Move::Stay => {}
+        }
+    }
+
+    /// Enter or Space: opens the file under the cursor in the diff, or toggles the folder.
+    fn activate_row(&mut self, row: usize, cx: &mut Context<Self>) {
+        match self.tree.get(row).map(|entry| entry.kind.clone()) {
+            Some(EntryKind::File { file }) => self.select_file(file, cx),
+            Some(EntryKind::Folder { open }) => self.set_folder_open(row, !open, cx),
+            None => {}
+        }
+    }
+
+    fn activate_cursor(&mut self, cx: &mut Context<Self>) {
+        if let Some(row) = self.cursor_row() {
+            self.activate_row(row, cx);
         }
     }
 
@@ -521,7 +608,7 @@ impl ReviewView {
         self.viewed
             .get(&task)
             .and_then(|viewed| viewed.get(&info.key))
-            .is_some_and(|hash| *hash == info.hash)
+            .is_some_and(|digest| *digest == info.digest)
     }
 
     pub(crate) fn viewed_count(&self) -> usize {
@@ -561,22 +648,34 @@ impl ReviewView {
         &self.shown
     }
 
+    /// How the lines of a folded file stand, for tests.
     #[cfg(test)]
-    pub(crate) fn group_titles(&self) -> Vec<SharedString> {
-        self.nav
-            .iter()
-            .filter_map(|item| match item {
-                NavItem::Group { title, .. } => Some(title.clone()),
-                NavItem::File { .. } => None,
-            })
-            .collect()
+    pub(crate) fn load_of(&self, file: usize) -> Option<FileLoad> {
+        let info = self.infos.get(file)?;
+
+        self.input.as_ref()?.loads.get(&info.key).cloned()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tree_rows(&self) -> &[Entry] {
+        &self.tree
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tree_cursor_row(&self) -> Option<usize> {
+        self.cursor_row()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tree_focus(&self) -> &FocusHandle {
+        &self.nav_focus
     }
 
     pub(crate) fn toggle_viewed(&mut self, file: usize, cx: &mut Context<Self>) {
         let (Some(task), Some(info)) = (self.task(), self.infos.get(file)) else {
             return;
         };
-        let (key, hash) = (info.key.clone(), info.hash);
+        let (key, digest) = (info.key.clone(), info.digest);
         let viewed = self.is_viewed(task, file);
 
         let marks = self.viewed.entry(task).or_default();
@@ -586,7 +685,7 @@ impl ReviewView {
             marks.remove(&key);
             collapsed.remove(&key);
         } else {
-            marks.insert(key.clone(), hash);
+            marks.insert(key.clone(), digest);
             collapsed.insert(key);
         }
 
@@ -661,16 +760,6 @@ impl ReviewView {
         self.after_card_change();
         cx.notify();
     }
-
-    pub(crate) fn set_grouping(&mut self, grouping: Grouping, cx: &mut Context<Self>) {
-        if self.grouping == grouping {
-            return;
-        }
-
-        self.grouping = grouping;
-        self.rebuild_nav();
-        cx.notify();
-    }
 }
 
 fn pill_label(count: usize) -> SharedString {
@@ -687,6 +776,15 @@ fn kind_icon(kind: AgentKind) -> IconName {
     match kind {
         AgentKind::ClaudeCode => IconName::ClaudeCode,
         AgentKind::Codex => IconName::Codex,
+    }
+}
+
+/// The tag text of a folded file.
+fn fold_label(fold: Fold) -> &'static str {
+    match fold {
+        Fold::Lock => "Lock file",
+        Fold::Generated => "Generated",
+        Fold::Large => "Large diff",
     }
 }
 
@@ -778,7 +876,6 @@ impl ReviewView {
             f32::from(u16::try_from(viewed).unwrap_or(u16::MAX))
                 / f32::from(u16::try_from(total).unwrap_or(u16::MAX))
         };
-        let view = cx.entity();
         let workspace = self.workspace.clone();
 
         let summary = h_flex()
@@ -803,6 +900,7 @@ impl ReviewView {
 
         let progress = div()
             .id("review-progress")
+            .debug_selector(|| "review-progress".to_owned())
             .role(Role::ProgressIndicator)
             .aria_label(format!("{viewed} of {total} files viewed"))
             .mx(px(8.))
@@ -861,30 +959,30 @@ impl ReviewView {
             )
         });
 
-        let grouping = div().mx(px(6.)).mb(px(8.)).child(
-            SegmentedControl::new("review-grouping", "Group files", ["By agent", "By folder"])
-                .selected(
-                    GROUPINGS
-                        .iter()
-                        .position(|grouping| *grouping == self.grouping)
-                        .unwrap_or(0),
-                )
-                .on_select(move |index, _, cx| {
-                    let Some(grouping) = GROUPINGS.get(index).copied() else {
-                        return;
-                    };
-
-                    view.update(cx, |this, cx| this.set_grouping(grouping, cx));
-                }),
-        );
-
         let items = uniform_list(
             "review-nav-list",
-            self.nav.len(),
-            cx.processor(|this, range: Range<usize>, _, cx| this.nav_items(range, cx)),
+            self.tree.len(),
+            cx.processor(|this, range: Range<usize>, window, cx| this.nav_items(range, window, cx)),
         )
         .track_scroll(&self.nav_scroll)
         .size_full();
+
+        let tree = div()
+            .id("review-tree")
+            .debug_selector(|| "review-tree".to_owned())
+            .role(Role::Tree)
+            .aria_label("File tree")
+            .key_context(FILE_TREE_CONTEXT)
+            .track_focus(&self.nav_focus)
+            .on_action(cx.listener(|this, _: &TreePrevious, _, cx| this.move_tree(Key::Up, cx)))
+            .on_action(cx.listener(|this, _: &TreeNext, _, cx| this.move_tree(Key::Down, cx)))
+            .on_action(cx.listener(|this, _: &TreeCollapse, _, cx| this.move_tree(Key::Left, cx)))
+            .on_action(cx.listener(|this, _: &TreeExpand, _, cx| this.move_tree(Key::Right, cx)))
+            .on_action(cx.listener(|this, _: &TreeActivate, _, cx| this.activate_cursor(cx)))
+            .flex_1()
+            .min_h_0()
+            .px(px(4.))
+            .child(items);
 
         v_flex()
             .id("review-nav")
@@ -895,68 +993,112 @@ impl ReviewView {
             .h_full()
             .pt(px(12.))
             .pb(px(10.))
-            .px(px(8.))
             .border_r_1()
             .border_color(colors.line)
-            .child(summary)
-            .child(progress)
-            .children(chip)
-            .child(grouping)
-            .child(div().flex_1().min_h_0().child(items))
+            .child(div().px(px(8.)).child(summary))
+            .child(div().px(px(8.)).child(progress))
+            .children(chip.map(|chip| div().px(px(8.)).child(chip)))
+            .child(div().h(px(4.)))
+            .child(tree)
             .into_any_element()
     }
 
-    fn nav_items(&mut self, range: Range<usize>, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn nav_items(
+        &mut self,
+        range: Range<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
         let colors = cx.theme().colors().clone();
         let Some(task) = self.task() else {
             return Vec::new();
         };
-        let selected = self.selected_file();
-        let nav = Rc::clone(&self.nav);
+        let cursor = self.cursor_row();
+        let ring = self.nav_focus.is_focused(window) && window.last_input_was_keyboard();
+        let tree = Rc::clone(&self.tree);
         let mut elements = Vec::new();
 
         for position in range {
-            let Some(item) = nav.get(position) else {
+            let Some(entry) = tree.get(position) else {
                 continue;
             };
+            let selected = (cursor == Some(position), ring);
+            let row = self.nav_row(position, entry, selected, task, &colors, cx);
 
-            let element = match item {
-                NavItem::Group { title, kind, files } => nav_group(position, title, *kind, *files),
-                NavItem::File { file } => {
-                    self.nav_file(position, *file, selected == Some(*file), task, &colors, cx)
-                }
-            };
-
-            elements.push(element);
+            elements
+                .push(row.map_or_else(|| div().into_any_element(), IntoElement::into_any_element));
         }
 
         elements
     }
 
-    fn nav_file(
+    fn nav_row(
         &self,
         position: usize,
-        file: usize,
-        selected: bool,
+        entry: &Entry,
+        selected: (bool, bool),
         task: TaskId,
         colors: &ThemeColors,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let (Some(diff), Some(info)) = (self.diff(), self.infos.get(file)) else {
-            return div().into_any_element();
-        };
-        let Some(data) = diff.files.get(file) else {
-            return div().into_any_element();
-        };
+    ) -> Option<TreeRow> {
+        match &entry.kind {
+            EntryKind::Folder { open } => {
+                Some(Self::nav_folder(position, entry, *open, selected, cx))
+            }
+            EntryKind::File { file } => {
+                self.nav_file(position, entry, *file, selected, task, colors, cx)
+            }
+        }
+    }
+
+    fn nav_folder(
+        position: usize,
+        entry: &Entry,
+        open: bool,
+        (selected, ring): (bool, bool),
+        cx: &mut Context<Self>,
+    ) -> TreeRow {
+        TreeRow::new(("review-nav-row", position), entry.name.clone())
+            .debug_selector(|| format!("review-nav-folder-{position}"))
+            .level(entry.level)
+            .folder(open)
+            .toggle_state(selected)
+            .ring(selected && ring)
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.nav_focus.focus(window, cx);
+                this.set_folder_open(position, !open, cx);
+            }))
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one row needs its place, its data and the theme"
+    )]
+    fn nav_file(
+        &self,
+        position: usize,
+        entry: &Entry,
+        file: usize,
+        (selected, ring): (bool, bool),
+        task: TaskId,
+        colors: &ThemeColors,
+        cx: &mut Context<Self>,
+    ) -> Option<TreeRow> {
+        let (diff, info) = (self.diff()?, self.infos.get(file)?);
+        let data = diff.files.get(file)?;
         let viewed = self.is_viewed(task, file);
-        let (active, raised, accent) = (colors.active, colors.raised, colors.accent);
+        let (warn, warn_bg) = (colors.warn, colors.warn_bg);
 
         let open = self.open_counts.get(file).copied().unwrap_or(0);
         let label = format!(
-            "{}, {}, {}{}{}",
+            "{}, {}, {}{}{}{}",
             info.path,
             plural(data.additions, "addition", "additions"),
             plural(data.deletions, "deletion", "deletions"),
+            entry
+                .agent
+                .as_ref()
+                .map_or_else(String::new, |agent| format!(", {agent}")),
             if open > 0 {
                 format!(", {}", plural(open, "open comment", "open comments"))
             } else {
@@ -964,37 +1106,16 @@ impl ReviewView {
             },
             if viewed { ", viewed" } else { "" }
         );
-        let (warn, warn_bg) = (colors.warn, colors.warn_bg);
 
-        h_flex()
-            .id(("review-nav-file", position))
-            .debug_selector(|| format!("review-nav-file-{file}"))
-            .role(Role::Button)
-            .aria_label(label)
-            .aria_selected(selected)
-            .focusable()
-            .tab_stop(true)
-            .cursor_pointer()
-            .h(px(NAV_ROW - 2.))
-            .mt(px(2.))
-            .pl(px(32.))
-            .pr(px(8.))
+        let end = h_flex()
+            .flex_none()
             .gap(px(8.))
-            .rounded(px(7.))
-            .when(selected, |row| row.bg(active))
-            .when(!selected, |row| row.hover(move |style| style.bg(raised)))
-            .focus_visible(move |style| focus_ring(style, accent))
-            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                this.select_file(file, cx);
+            .children(entry.agent.clone().map(|agent| {
+                Label::new(agent)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
+                    .truncate()
             }))
-            .child(
-                div().flex_1().min_w_0().flex().child(
-                    Label::new(info.name.clone())
-                        .size(LabelSize::Small)
-                        .color(if viewed { Color::Muted } else { Color::Default })
-                        .truncate(),
-                ),
-            )
             .child(counts(data.additions, data.deletions, LabelSize::XSmall))
             .when(open > 0, |row| {
                 row.child(
@@ -1020,8 +1141,22 @@ impl ReviewView {
                         .size(IconSize::Small)
                         .color(Color::Ok),
                 )
-            }))
-            .into_any_element()
+            }));
+
+        Some(
+            TreeRow::new(("review-nav-row", position), info.name.clone())
+                .debug_selector(|| format!("review-nav-file-{file}"))
+                .accessible_label(label)
+                .level(entry.level)
+                .label_color(if viewed { Color::Muted } else { Color::Default })
+                .toggle_state(selected)
+                .ring(selected && ring)
+                .end_slot(end)
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.nav_focus.focus(window, cx);
+                    this.select_file(file, cx);
+                })),
+        )
     }
 
     fn header_bar(
@@ -1292,6 +1427,10 @@ impl ReviewView {
         card_slot(first, last, content, &colors)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one flat element tree reads best in one place"
+    )]
     fn card_header(
         &self,
         file: usize,
@@ -1300,21 +1439,29 @@ impl ReviewView {
         colors: &ThemeColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (Some(task), Some(info), Some(data)) =
-            (self.task(), self.infos.get(file), diff.files.get(file))
-        else {
+        let (Some(task), Some(info), Some(data), Some(input)) = (
+            self.task(),
+            self.infos.get(file),
+            diff.files.get(file),
+            self.input.as_ref(),
+        ) else {
             return div().into_any_element();
         };
         let viewed = self.is_viewed(task, file);
         let agent = self.agent_of(data);
         let view = cx.entity();
         let toggle_view = view.clone();
+        let folded = is_folded(data, &input.loads);
+        let load = input.loads.get(&info.key);
+        let fold = data.fold.map(fold_label);
+        let comments = self.open_counts.get(file).copied().unwrap_or(0);
 
         let summary = format!(
-            "{}, {}, {}",
+            "{}, {}, {}{}",
             info.path,
             plural(data.additions, "addition", "additions"),
-            plural(data.deletions, "deletion", "deletions")
+            plural(data.deletions, "deletion", "deletions"),
+            fold.map_or_else(String::new, |fold| format!(", {fold}"))
         );
 
         let tag = match data.change {
@@ -1327,6 +1474,35 @@ impl ReviewView {
             .mode_change
             .map(|(old, new)| format!("{old:o} \u{2192} {new:o}"));
 
+        let loading = matches!(load, Some(FileLoad::Loading));
+        let error = match load {
+            Some(FileLoad::Failed(message)) => Some(message.clone()),
+            _ => None,
+        };
+        let show = folded.then(|| {
+            let workspace = self.workspace.clone();
+            let (worktree, path) = (data.worktree.clone(), data.path.clone());
+
+            Button::new(
+                ("review-show-diff", file),
+                if loading { "Loading" } else { "Show diff" },
+            )
+            .accessible_label(if loading {
+                format!("Loading, {}", info.name)
+            } else {
+                format!("Show diff, {}", info.name)
+            })
+            .debug_selector(|| format!("review-show-diff-{file}"))
+            .disabled(loading)
+            .on_click(move |_, _, cx| {
+                let (worktree, path) = (worktree.clone(), path.clone());
+
+                update_workspace(&workspace, cx, |workspace, cx| {
+                    workspace.show_file_diff(worktree, path, cx);
+                });
+            })
+        });
+
         h_flex()
             .id(("review-file", file))
             .role(Role::Group)
@@ -1335,7 +1511,9 @@ impl ReviewView {
             .gap(px(10.))
             .px(px(12.))
             .when(open, |header| header.border_b_1().border_color(colors.line))
-            .child(
+            .child(if folded {
+                div().w(px(24.)).flex_none().into_any_element()
+            } else {
                 IconButton::new(
                     ("review-toggle", file),
                     if open {
@@ -1352,8 +1530,9 @@ impl ReviewView {
                 .color(Color::Muted)
                 .on_click(move |_, _, cx| {
                     view.update(cx, |this, cx| this.toggle_collapsed(file, cx));
-                }),
-            )
+                })
+                .into_any_element()
+            })
             .child(
                 h_flex()
                     .min_w_0()
@@ -1371,6 +1550,12 @@ impl ReviewView {
                     ),
             )
             .child(counts(data.additions, data.deletions, LabelSize::XSmall))
+            .children(fold.map(|fold| {
+                div()
+                    .id(("review-fold", file))
+                    .debug_selector(|| format!("review-fold-{file}"))
+                    .child(Tag::new(fold))
+            }))
             .children(tag.map(|(text, color, background)| {
                 div()
                     .flex_none()
@@ -1403,7 +1588,33 @@ impl ReviewView {
                             .color(Color::Faint),
                     )
             }))
+            .when(folded && comments > 0, |header| {
+                header.child(
+                    div()
+                        .id(("review-folded-comments", file))
+                        .debug_selector(|| format!("review-folded-comments-{file}"))
+                        .child(
+                            Tag::new(plural(comments, "comment", "comments")).tone(TagTone::Warn),
+                        ),
+                )
+            })
             .child(div().flex_1())
+            .children(error.map(|message| {
+                div()
+                    .id(("review-load-error", file))
+                    .debug_selector(|| format!("review-load-error-{file}"))
+                    .role(Role::Alert)
+                    .aria_label(message.clone())
+                    .max_w(px(260.))
+                    .min_w_0()
+                    .child(
+                        Label::new(message)
+                            .size(LabelSize::Small)
+                            .color(Color::Del)
+                            .truncate(),
+                    )
+            }))
+            .children(show)
             .children(agent.map(|agent| {
                 h_flex()
                     .flex_none()
@@ -1432,45 +1643,6 @@ impl ReviewView {
 
         input.agents.iter().find(|agent| agent.id == id).cloned()
     }
-}
-
-fn nav_group(position: usize, title: &SharedString, kind: GroupKind, files: usize) -> AnyElement {
-    let count = u32::try_from(files).unwrap_or(u32::MAX);
-
-    h_flex()
-        .id(("review-nav-group", position))
-        .role(Role::Group)
-        .aria_label(format!("{title}, {}", plural(count, "file", "files")))
-        .h(px(NAV_ROW + 6.))
-        .pt(px(6.))
-        .px(px(8.))
-        .gap(px(8.))
-        .child(match kind {
-            GroupKind::Agent(kind) => Icon::new(kind_icon(kind))
-                .size(IconSize::Large)
-                .into_any_element(),
-            GroupKind::Folder | GroupKind::Other => div().into_any_element(),
-        })
-        .child({
-            let title = Label::new(title.clone())
-                .size(LabelSize::Small)
-                .weight(FontWeight::MEDIUM)
-                .truncate();
-            let title = if kind == GroupKind::Folder {
-                title.mono()
-            } else {
-                title
-            };
-
-            div().flex_1().min_w_0().flex().child(title)
-        })
-        .child(
-            Label::new(files.to_string())
-                .mono()
-                .size(LabelSize::XSmall)
-                .color(Color::Faint),
-        )
-        .into_any_element()
 }
 
 /// One row of a card: the card's border, and its rounded ends on the first and last row.
@@ -2047,6 +2219,7 @@ impl Workspace {
                 worktree: self.review_worktree.clone(),
             }),
             comments: self.data.task_comments(task),
+            loads: Rc::new(self.data.loaded.loads(id, source)),
             requesting: self.review_requesting.contains(&task),
             fixed_now: self.fixed_now,
         };
@@ -2115,6 +2288,106 @@ impl Workspace {
         .detach();
     }
 
+    /// Loads the lines of a folded file of the diff Review shows. The daemon sends them
+    /// once; a new diff with the same digest keeps them, see [`FakeData::store_diff`].
+    ///
+    /// [`FakeData::store_diff`]: crate::model::FakeData::store_diff
+    pub(crate) fn show_file_diff(
+        &mut self,
+        worktree: PathBuf,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let task = self.active_task;
+        let Some(id) = self.data.diff_id(task) else {
+            return;
+        };
+        let source = self.review_source(task);
+        let folded = self.data.diffs.get(&(id, source)).is_some_and(|diff| {
+            diff.files
+                .iter()
+                .any(|file| file.worktree == worktree && file.path == path && file.fold.is_some())
+        });
+        let key = (id, source, worktree, path);
+
+        if folded && self.data.loaded.begin(&key) {
+            self.request_file_lines(key, cx);
+            cx.notify();
+        }
+    }
+
+    /// Asks for the lines of a file, and keeps the answer when it comes. Marks the file as
+    /// loading first, see [`LoadedFiles::begin`].
+    ///
+    /// [`LoadedFiles::begin`]: crate::review_model::LoadedFiles::begin
+    pub(crate) fn request_file_lines(&mut self, key: LoadKey, cx: &mut Context<Self>) {
+        let Some(client) = self.daemon.clone() else {
+            let answer = if self.source == crate::workspace::DataSource::Sample {
+                Ok(self
+                    .data
+                    .diffs
+                    .get(&(key.0, key.1))
+                    .and_then(|diff| {
+                        diff.files
+                            .iter()
+                            .find(|file| file.worktree == key.2 && file.path == key.3)
+                    })
+                    .map(sample_lines))
+            } else {
+                Err("Not connected".into())
+            };
+
+            self.data.finish_load(&key, answer);
+
+            return;
+        };
+
+        let (task, source, worktree, path) = key.clone();
+        let asking =
+            cx.background_spawn(async move { client.file_hunks(task, source, worktree, path) });
+
+        cx.spawn(async move |this, cx| {
+            let answer = asking.await;
+
+            let updated = this.update(cx, |workspace, cx| {
+                let answer = answer.map_err(|error| {
+                    log::warn!("cannot load the lines of a file: {error}");
+
+                    refusal(&error)
+                });
+
+                workspace.data.finish_load(&key, answer);
+                cx.notify();
+            });
+
+            if let Err(error) = updated {
+                log::debug!("the window closed before the file arrived: {error}");
+            }
+        })
+        .detach();
+    }
+
+    /// Loads the files the user opened again when their digest changed.
+    pub(crate) fn reload_changed_files(
+        &mut self,
+        task: swarm_protocol::TaskId,
+        source: ReviewSource,
+        cx: &mut Context<Self>,
+    ) {
+        let stale = self
+            .data
+            .diffs
+            .get(&(task, source))
+            .map(|diff| self.data.loaded.stale(diff))
+            .unwrap_or_default();
+
+        for key in stale {
+            if self.data.loaded.begin(&key) {
+                self.request_file_lines(key, cx);
+            }
+        }
+    }
+
     /// Opens Review at a file of the Live diff, as the Changes panel does.
     pub(crate) fn open_changed_file(
         &mut self,
@@ -2155,7 +2428,7 @@ pub(crate) fn short(message: &str) -> SharedString {
 #[cfg(test)]
 mod tests {
     use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext};
-    use swarm_protocol::{DiffHunk, DiffLine};
+    use swarm_protocol::{DiffHunk, DiffLine, Fold};
 
     use super::*;
     use crate::actions;
@@ -2213,41 +2486,384 @@ mod tests {
         })
     }
 
-    #[gpui::test]
-    fn the_nav_groups_files_by_agent_then_by_folder(cx: &mut TestAppContext) {
-        let (workspace, cx) = setup(cx);
-        let review = open_review(&workspace, cx);
+    fn file_named(
+        workspace: &Entity<Workspace>,
+        source: ReviewSource,
+        name: &str,
+        cx: &VisualTestContext,
+    ) -> usize {
+        workspace.read_with(cx, |workspace, _| {
+            workspace
+                .data
+                .task_diff(TaskId(0), source)
+                .and_then(|diff| diff.files.iter().position(|file| file.path.ends_with(name)))
+                .unwrap_or(usize::MAX)
+        })
+    }
 
-        let by_agent = review.read_with(cx, |review, _| review.group_titles());
-        review.update(cx, |review, cx| review.set_grouping(Grouping::ByFolder, cx));
-        let by_folder = review.read_with(cx, |review, _| review.group_titles());
+    /// `level name` of each row of the tree, folders with a slash.
+    fn outline(review: &Entity<ReviewView>, cx: &VisualTestContext) -> Vec<String> {
+        review.read_with(cx, |review, _| {
+            review
+                .tree_rows()
+                .iter()
+                .map(|entry| {
+                    let slash = matches!(entry.kind, EntryKind::Folder { .. });
 
-        let names: Vec<_> = by_agent.iter().map(ToString::to_string).collect();
-        assert_eq!(names, ["term-render", "pty-io", "ui-tokens"]);
-        assert!(by_folder.iter().any(|title| title == "crates/swarm-ui/src"));
-        assert!(by_folder.iter().any(|title| title == "benches"));
+                    format!(
+                        "{} {}{}",
+                        entry.level,
+                        entry.name,
+                        if slash { "/" } else { "" }
+                    )
+                })
+                .collect()
+        })
+    }
+
+    fn focus_tree(review: &Entity<ReviewView>, cx: &mut VisualTestContext) {
+        let handle = review.read_with(cx, |review, _| review.tree_focus().clone());
+
+        cx.update(|window, cx| window.focus(&handle, cx));
+        redraw(cx);
+    }
+
+    fn put_cursor(review: &Entity<ReviewView>, row: usize, cx: &mut VisualTestContext) {
+        review.update(cx, |review, cx| review.put_cursor(row, cx));
+        redraw(cx);
+    }
+
+    fn cursor_row(review: &Entity<ReviewView>, cx: &VisualTestContext) -> Option<usize> {
+        review.read_with(cx, |review, _| review.tree_cursor_row())
+    }
+
+    fn row_named(review: &Entity<ReviewView>, name: &str, cx: &VisualTestContext) -> usize {
+        review.read_with(cx, |review, _| {
+            review
+                .tree_rows()
+                .iter()
+                .position(|entry| entry.name == name)
+                .unwrap_or(usize::MAX)
+        })
+    }
+
+    fn node_of(
+        row: Option<TreeRow>,
+        cx: &mut VisualTestContext,
+    ) -> (Option<Role>, gpui::accesskit::Node) {
+        use gpui::{Element as _, RenderOnce as _};
+
+        let Some(row) = row else {
+            return (None, gpui::accesskit::Node::new(Role::Unknown));
+        };
+
+        cx.update(|window, cx| {
+            let element = row.render(window, cx).into_element();
+            let mut node = gpui::accesskit::Node::new(Role::Unknown);
+
+            element.write_a11y_info(&mut node);
+
+            (element.a11y_role(), node)
+        })
     }
 
     #[gpui::test]
-    fn files_without_an_agent_go_to_other_changes(cx: &mut TestAppContext) {
+    fn the_file_list_is_a_folder_tree_without_a_grouping_control(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
-        workspace.update(cx, |workspace, _| {
-            for source in [ReviewSource::Live, ReviewSource::Merged] {
-                let key = (swarm_protocol::TaskId(0), source);
-                if let Some(diff) = workspace.data.diffs.get_mut(&key) {
-                    let mut changed = (**diff).clone();
-                    changed.files[0].agent = None;
-                    *diff = Rc::new(changed);
+        let review = open_review(&workspace, cx);
+
+        let rows = outline(&review, cx);
+
+        assert_eq!(rows[0], "0 benches/");
+        assert_eq!(rows[1], "1 grid.rs");
+        assert_eq!(rows[2], "0 crates/");
+        assert!(rows.contains(&"2 src/".to_owned()), "{rows:?}");
+        assert!(rows.contains(&"1 swarm-ui/src/".to_owned()), "{rows:?}");
+        assert_eq!(rows.last().map(String::as_str), Some("0 Cargo.lock"));
+        assert!(rows.iter().all(|row| !row.contains("Other changes")));
+        let progress = cx.debug_bounds("review-progress");
+        let tree = cx.debug_bounds("review-tree");
+
+        let gap = progress
+            .zip(tree)
+            .map(|(progress, tree)| tree.top() - progress.bottom());
+        assert!(
+            gap.is_some_and(|gap| gap < px(16.)),
+            "something sits between the progress bar and the tree: {gap:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn tree_rows_have_roles_levels_and_expanded_and_selected_states(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = open_review(&workspace, cx);
+        put_cursor(&review, 2, cx);
+
+        let rows = review.update(cx, |review, cx| {
+            let colors = cx.theme().colors().clone();
+            let cursor = review.tree_cursor_row();
+            let task = review.task().unwrap_or(TaskId(0));
+
+            review
+                .tree_rows()
+                .to_vec()
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| {
+                    let row = review.nav_row(
+                        index,
+                        entry,
+                        (cursor == Some(index), false),
+                        task,
+                        &colors,
+                        cx,
+                    );
+
+                    (entry.clone(), row)
+                })
+                .collect::<Vec<_>>()
+        });
+
+        assert!(rows.len() > 8);
+
+        for (index, (entry, row)) in rows.into_iter().enumerate() {
+            let (role, node) = node_of(row, cx);
+
+            assert_eq!(role, Some(Role::TreeItem), "row {index}");
+            assert_eq!(node.level(), Some(entry.level + 1), "row {index}");
+            assert_eq!(node.is_selected(), Some(index == 2), "row {index}");
+            match entry.kind {
+                EntryKind::Folder { open } => {
+                    assert_eq!(node.is_expanded(), Some(open), "row {index}");
+                    assert_eq!(node.label(), Some(&*entry.name), "row {index}");
+                }
+                EntryKind::File { .. } => {
+                    assert_eq!(node.is_expanded(), None, "row {index}");
+                    let label = node.label().unwrap_or_default();
+                    assert!(label.contains("addition"), "{label}");
                 }
             }
+        }
+    }
+
+    #[gpui::test]
+    fn the_up_and_down_arrows_move_the_cursor_and_stop_at_the_ends(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = open_review(&workspace, cx);
+        focus_tree(&review, cx);
+        let last = review.read_with(cx, |review, _| review.tree_rows().len() - 1);
+        put_cursor(&review, 0, cx);
+
+        cx.simulate_keystrokes("down");
+        let down = cursor_row(&review, cx);
+        cx.simulate_keystrokes("up");
+        let up = cursor_row(&review, cx);
+        cx.simulate_keystrokes("up");
+        let top = cursor_row(&review, cx);
+        put_cursor(&review, last, cx);
+        cx.simulate_keystrokes("down");
+        let bottom = cursor_row(&review, cx);
+
+        assert_eq!(
+            (down, up, top, bottom),
+            (Some(1), Some(0), Some(0), Some(last))
+        );
+        let selected = review.read_with(cx, |review, _| review.selected_file());
+        assert_eq!(
+            selected,
+            Some(file_named(&workspace, ReviewSource::Live, "lib.rs", cx))
+        );
+    }
+
+    #[gpui::test]
+    fn the_left_and_right_arrows_close_open_and_step_through_folders(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = open_review(&workspace, cx);
+        focus_tree(&review, cx);
+        let rows = outline(&review, cx);
+        put_cursor(&review, 0, cx);
+
+        cx.simulate_keystrokes("left");
+        let closed = outline(&review, cx);
+        cx.simulate_keystrokes("right");
+        let reopened = outline(&review, cx);
+        cx.simulate_keystrokes("right");
+        let first_child = cursor_row(&review, cx);
+        cx.simulate_keystrokes("right");
+        let on_a_file = cursor_row(&review, cx);
+        cx.simulate_keystrokes("left");
+        let parent = cursor_row(&review, cx);
+
+        assert_eq!(rows[..2], ["0 benches/", "1 grid.rs"]);
+        assert_eq!(closed[..2], ["0 benches/", "0 crates/"]);
+        assert_eq!(reopened, rows);
+        assert_eq!(
+            (first_child, on_a_file, parent),
+            (Some(1), Some(1), Some(0))
+        );
+    }
+
+    #[gpui::test]
+    fn enter_and_space_open_a_file_in_the_diff_and_toggle_a_folder(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = open_review(&workspace, cx);
+        focus_tree(&review, cx);
+        let glyphs = file_named(&workspace, ReviewSource::Live, "glyphs.rs", cx);
+        let grid = file_named(&workspace, ReviewSource::Live, "benches/grid.rs", cx);
+
+        put_cursor(&review, row_named(&review, "glyphs.rs", cx), cx);
+        let before = review.read_with(cx, |review, _| review.selected_file());
+        cx.simulate_keystrokes("enter");
+        let by_enter = review.read_with(cx, |review, _| review.selected_file());
+
+        put_cursor(&review, row_named(&review, "grid.rs", cx), cx);
+        cx.simulate_keystrokes("space");
+        let by_space = review.read_with(cx, |review, _| review.selected_file());
+
+        put_cursor(&review, 0, cx);
+        cx.simulate_keystrokes("enter");
+        let folded = outline(&review, cx).len();
+        cx.simulate_keystrokes("space");
+        let unfolded = outline(&review, cx).len();
+
+        assert_ne!(before, Some(glyphs));
+        assert_eq!(by_enter, Some(glyphs));
+        assert_eq!(by_space, Some(grid));
+        assert!(folded < unfolded);
+    }
+
+    #[gpui::test]
+    fn moving_the_cursor_does_not_open_a_file_and_clicking_does(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = open_review(&workspace, cx);
+        focus_tree(&review, cx);
+        let before = review.read_with(cx, |review, _| review.selected_file());
+
+        cx.simulate_keystrokes("down down down");
+        let after_arrows = review.read_with(cx, |review, _| review.selected_file());
+        let glyphs = file_named(&workspace, ReviewSource::Live, "glyphs.rs", cx);
+        click(
+            Box::leak(format!("review-nav-file-{glyphs}").into_boxed_str()),
+            cx,
+        );
+        let after_click = review.read_with(cx, |review, _| review.selected_file());
+
+        assert_eq!(before, after_arrows);
+        assert_eq!(after_click, Some(glyphs));
+    }
+
+    #[gpui::test]
+    fn j_and_k_still_work_while_the_tree_has_focus(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = open_review(&workspace, cx);
+        focus_tree(&review, cx);
+        let first = review.read_with(cx, |review, _| review.selected_file());
+
+        cx.simulate_keystrokes("j");
+        let second = review.read_with(cx, |review, _| review.selected_file());
+        cx.simulate_keystrokes("v");
+        let viewed = review.read_with(cx, |review, _| review.viewed_count());
+        cx.simulate_keystrokes("k");
+        let back = review.read_with(cx, |review, _| review.selected_file());
+
+        assert_ne!(first, second);
+        assert_eq!(first, back);
+        assert_eq!(viewed, 1);
+    }
+
+    #[gpui::test]
+    fn the_tree_is_one_stop_for_tab(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = open_review(&workspace, cx);
+        focus_tree(&review, cx);
+        let handle = review.read_with(cx, |review, _| review.tree_focus().clone());
+        let inside = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| handle.contains_focused(window, cx))
+        };
+
+        let start = inside(cx);
+        cx.simulate_keystrokes("tab");
+        let after_tab = inside(cx);
+        cx.simulate_keystrokes("shift-tab");
+        let after_back = (inside(cx), cx.update(|window, _| handle.is_focused(window)));
+
+        assert!(start);
+        assert!(!after_tab, "Tab stayed inside the tree");
+        assert_eq!(after_back, (true, true));
+    }
+
+    #[gpui::test]
+    fn closed_folders_stay_closed_across_a_diff_refresh(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = open_review(&workspace, cx);
+        let open = outline(&review, cx);
+
+        click("review-nav-folder-0", cx);
+        let closed = outline(&review, cx);
+        change_first_file(&workspace, cx);
+        let refreshed = outline(&review, cx);
+
+        assert_eq!(closed[0], "0 benches/");
+        assert_eq!(closed.len(), open.len() - 1);
+        assert_eq!(refreshed, closed, "a refresh opened the folder again");
+    }
+
+    #[gpui::test]
+    fn the_same_path_in_two_worktrees_shows_its_agent_on_each_row(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        workspace.update(cx, |workspace, _| {
+            let key = (swarm_protocol::TaskId(0), ReviewSource::Live);
+            let Some(diff) = workspace.data.diffs.get_mut(&key) else {
+                return;
+            };
+            let mut changed = (**diff).clone();
+            let pty_io = changed
+                .files
+                .iter()
+                .find(|file| file.path.ends_with("pty.rs"))
+                .map(|file| (file.worktree.clone(), file.agent));
+            let mut copy = changed.files[0].clone();
+
+            if let Some((worktree, agent)) = pty_io {
+                copy.worktree = worktree;
+                copy.agent = agent;
+                copy.digest += 1;
+            }
+            changed.files.push(copy);
+            changed.fingerprint += 1;
+            *diff = Rc::new(changed);
         });
         let review = open_review(&workspace, cx);
 
-        let titles = review.read_with(cx, |review, _| review.group_titles());
+        let (rows, labels) = review.update(cx, |review, cx| {
+            let colors = cx.theme().colors().clone();
+            let task = review.task().unwrap_or(TaskId(0));
+            let rows = review.tree_rows().to_vec();
+            let labels: Vec<_> = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| entry.agent.is_some())
+                .filter_map(|(index, entry)| {
+                    review.nav_row(index, entry, (false, false), task, &colors, cx)
+                })
+                .collect();
 
-        assert_eq!(
-            titles.last().map(ToString::to_string).as_deref(),
-            Some("Other changes")
+            (rows, labels.len())
+        });
+        let repeated: Vec<_> = rows
+            .iter()
+            .filter(|entry| entry.name == "lib.rs")
+            .map(|entry| entry.agent.as_ref().map(ToString::to_string))
+            .collect();
+
+        assert_eq!(repeated.len(), 2);
+        assert!(repeated.iter().all(Option::is_some));
+        assert_ne!(repeated[0], repeated[1]);
+        assert_eq!(labels, 2);
+        assert!(
+            rows.iter()
+                .filter(|entry| entry.name != "lib.rs")
+                .all(|entry| entry.agent.is_none())
         );
     }
 
@@ -2348,6 +2964,7 @@ mod tests {
             if let Some(diff) = workspace.data.diffs.get_mut(&key) {
                 let mut changed = (**diff).clone();
                 changed.fingerprint += 1;
+                changed.files[0].digest += 1;
                 changed.files[0].hunks = vec![DiffHunk {
                     old_start: 1,
                     old_lines: 1,
@@ -2434,7 +3051,7 @@ mod tests {
         redraw(cx);
 
         let review = workspace.read_with(cx, |workspace, _| workspace.review.clone());
-        let (shown, selected, titles) = review.read_with(cx, |review, _| {
+        let (shown, selected, rows) = review.read_with(cx, |review, _| {
             let selected = review.selected_file().and_then(|file| {
                 review
                     .diff()
@@ -2442,20 +3059,24 @@ mod tests {
                     .map(|file| file.path.clone())
             });
 
-            (review.shown_files().len(), selected, review.group_titles())
+            (
+                review.shown_files().len(),
+                selected,
+                review.tree_rows().len(),
+            )
         });
 
-        assert_eq!(shown, 2);
+        assert_eq!(shown, 3);
         assert_eq!(
             selected,
             Some(PathBuf::from("crates/swarm-term/src/pty.rs"))
         );
-        assert_eq!(titles.len(), 1);
+        assert_eq!(rows, 5, "Cargo.lock and one folder with two files");
         assert!(cx.debug_bounds("review-filter").is_some());
 
         click("review-filter", cx);
         let shown = review.read_with(cx, |review, _| review.shown_files().len());
-        assert_eq!(shown, 9);
+        assert_eq!(shown, 11);
     }
 
     #[gpui::test]
@@ -2519,18 +3140,360 @@ mod tests {
     }
 
     #[gpui::test]
-    fn the_changes_panel_lists_the_live_diff_by_agent(cx: &mut TestAppContext) {
+    fn the_changes_panel_lists_the_live_diff_as_a_tree(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
         redraw(cx);
 
         let list = workspace.read_with(cx, |workspace, _| workspace.changes_list.clone());
-        let (titles, files) =
-            list.read_with(cx, |list, _| (list.group_titles(), list.file_count()));
+        let (rows, files) =
+            list.read_with(cx, |list, _| (list.tree_rows().to_vec(), list.file_count()));
         let stat = workspace.read_with(cx, |workspace, _| workspace.data.live_stat(TaskId(0)));
 
-        assert_eq!(titles.len(), 3);
-        assert_eq!(files, 9);
-        assert_eq!((stat.additions, stat.deletions), (321, 41));
+        assert_eq!(files, 11);
+        assert!(
+            rows.iter()
+                .any(|row| row.name == "swarm-ui/src" && row.level == 1)
+        );
+        assert!(rows.iter().any(|row| row.name == "src" && row.level == 2));
+        assert_eq!(rows[0].level, 0);
+        assert_eq!((stat.additions, stat.deletions), (2_623, 394));
+    }
+
+    fn changes_outline(
+        list: &Entity<crate::panels::ChangesList>,
+        cx: &VisualTestContext,
+    ) -> Vec<String> {
+        list.read_with(cx, |list, _| {
+            list.tree_rows()
+                .iter()
+                .map(|entry| format!("{} {}", entry.level, entry.name))
+                .collect()
+        })
+    }
+
+    #[gpui::test]
+    fn the_changes_panel_rows_are_tree_items_with_levels_and_expanded_states(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = setup(cx);
+        redraw(cx);
+        let list = workspace.read_with(cx, |workspace, _| workspace.changes_list.clone());
+        list.update(cx, |list, cx| list.put_cursor_for_test(1, cx));
+
+        let rows = list.update(cx, |list, cx| {
+            (0..list.tree_rows().len())
+                .map(|index| (list.tree_rows()[index].clone(), list.tree_row(index, cx)))
+                .collect::<Vec<_>>()
+        });
+
+        assert!(rows.len() > 8);
+        for (index, (entry, row)) in rows.into_iter().enumerate() {
+            let (role, node) = node_of(row, cx);
+
+            assert_eq!(role, Some(Role::TreeItem));
+            assert_eq!(node.level(), Some(entry.level + 1));
+            assert_eq!(node.is_selected(), Some(index == 1));
+            assert_eq!(
+                node.is_expanded(),
+                match entry.kind {
+                    EntryKind::Folder { open } => Some(open),
+                    EntryKind::File { .. } => None,
+                }
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn a_click_on_a_file_of_the_changes_panel_opens_review_at_it(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        redraw(cx);
+        let theme = file_named(&workspace, ReviewSource::Live, "theme.rs", cx);
+
+        click(
+            Box::leak(format!("change-file-{theme}").into_boxed_str()),
+            cx,
+        );
+
+        let view = workspace.read_with(cx, |workspace, _| workspace.view);
+        let review = workspace.read_with(cx, |workspace, _| workspace.review.clone());
+        let selected = review.read_with(cx, |review, _| review.selected_file());
+        assert_eq!(view, View::Review);
+        assert_eq!(selected, Some(theme));
+    }
+
+    #[gpui::test]
+    fn the_changes_panel_tree_takes_arrow_keys_and_enter_opens_review(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        redraw(cx);
+        let list = workspace.read_with(cx, |workspace, _| workspace.changes_list.clone());
+        let handle = list.read_with(cx, |list, _| list.tree_focus().clone());
+        cx.update(|window, cx| window.focus(&handle, cx));
+        redraw(cx);
+        let open = changes_outline(&list, cx);
+
+        cx.simulate_keystrokes("down");
+        let first = list.read_with(cx, |list, _| list.cursor_at());
+        cx.simulate_keystrokes("left");
+        let closed = changes_outline(&list, cx);
+        cx.simulate_keystrokes("right");
+        let reopened = changes_outline(&list, cx);
+        cx.simulate_keystrokes("down");
+        cx.simulate_keystrokes("enter");
+
+        let view = workspace.read_with(cx, |workspace, _| workspace.view);
+        let review = workspace.read_with(cx, |workspace, _| workspace.review.clone());
+        let selected = review
+            .read_with(cx, |review, _| review.selected_file())
+            .and_then(|file| {
+                workspace.read_with(cx, |workspace, _| {
+                    workspace
+                        .data
+                        .task_diff(TaskId(0), ReviewSource::Live)
+                        .and_then(|diff| diff.files.get(file).map(|file| file.path.clone()))
+                })
+            });
+        assert_eq!(first, Some(0));
+        assert!(closed.len() < open.len());
+        assert_eq!(reopened, open);
+        assert_eq!(view, View::Review);
+        assert_eq!(selected, Some(PathBuf::from("benches/grid.rs")));
+    }
+
+    #[gpui::test]
+    fn the_changes_panel_keeps_its_closed_folders_across_a_diff_refresh(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        redraw(cx);
+        let list = workspace.read_with(cx, |workspace, _| workspace.changes_list.clone());
+
+        click("change-folder-0", cx);
+        let closed = changes_outline(&list, cx);
+        change_first_file(&workspace, cx);
+        let refreshed = changes_outline(&list, cx);
+
+        assert_eq!(closed[0], "0 benches");
+        assert_eq!(closed[1], "0 crates");
+        assert_eq!(refreshed, closed);
+    }
+
+    fn selector(text: String) -> &'static str {
+        Box::leak(text.into_boxed_str())
+    }
+
+    /// Opens Review on Merged, where the folded lock file is file 0.
+    fn open_merged(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> Entity<ReviewView> {
+        use_source(workspace, ReviewSource::Merged, cx);
+
+        let review = open_review(workspace, cx);
+
+        assert_eq!(
+            file_named(workspace, ReviewSource::Merged, "Cargo.lock", cx),
+            0
+        );
+
+        review
+    }
+
+    /// The rows of one file card.
+    fn card_rows(review: &Entity<ReviewView>, file: usize, cx: &VisualTestContext) -> Vec<Row> {
+        review.read_with(cx, |review, _| {
+            review
+                .rows()
+                .iter()
+                .copied()
+                .filter(|row| row.file() == Some(file))
+                .collect()
+        })
+    }
+
+    #[gpui::test]
+    fn a_folded_file_is_one_header_row_with_its_tag_and_a_show_diff_button(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = setup(cx);
+        let review = open_merged(&workspace, cx);
+        let large = file_named(&workspace, ReviewSource::Merged, "glyphs.rs", cx);
+
+        for file in [0, large] {
+            assert_eq!(
+                card_rows(&review, file, cx),
+                [Row::Header {
+                    file: u32::try_from(file).unwrap_or(0)
+                }],
+                "file {file} is more than a header"
+            );
+        }
+        redraw(cx);
+
+        assert!(cx.debug_bounds("review-fold-0").is_some(), "the tag");
+        assert!(
+            cx.debug_bounds("review-show-diff-0").is_some(),
+            "the button"
+        );
+        assert!(cx.debug_bounds("review-toggle-0").is_none());
+        let normal = file_named(&workspace, ReviewSource::Merged, "benches/grid.rs", cx);
+        assert!(card_rows(&review, normal, cx).len() > 3);
+        assert!(
+            cx.debug_bounds(selector(format!("review-show-diff-{normal}")))
+                .is_none()
+        );
+    }
+
+    #[gpui::test]
+    fn show_diff_fills_in_the_sample_lines_at_once_and_the_tag_stays(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = open_merged(&workspace, cx);
+        redraw(cx);
+
+        click("review-show-diff-0", cx);
+
+        let rows = card_rows(&review, 0, cx);
+        let (unfolded, counts) = workspace.read_with(cx, |workspace, _| {
+            let file = workspace
+                .data
+                .task_diff(TaskId(0), ReviewSource::Merged)
+                .and_then(|diff| diff.files.first().cloned());
+
+            (
+                file.as_ref()
+                    .map(|file| (file.fold, !file.hunks.is_empty())),
+                file.map(|file| (file.additions, file.deletions)),
+            )
+        });
+        assert!(rows.len() > 100, "{} rows", rows.len());
+        assert_eq!(unfolded, Some((Some(Fold::Lock), true)));
+        assert_eq!(counts, Some((1_690, 312)));
+        assert!(cx.debug_bounds("review-fold-0").is_some(), "the tag went");
+        assert!(
+            cx.debug_bounds("review-show-diff-0").is_none(),
+            "the button stayed"
+        );
+    }
+
+    #[gpui::test]
+    fn j_and_k_step_over_folded_files_and_v_marks_them_viewed(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = open_merged(&workspace, cx);
+        let first = review.read_with(cx, |review, _| review.selected_file());
+
+        cx.simulate_keystrokes("j");
+        let second = review.read_with(cx, |review, _| review.selected_file());
+        cx.simulate_keystrokes("k");
+        let back = review.read_with(cx, |review, _| review.selected_file());
+        cx.simulate_keystrokes("v");
+        let viewed = review.read_with(cx, |review, _| review.is_file_viewed(0));
+
+        assert_eq!((first, second, back), (Some(0), Some(1), Some(0)));
+        assert!(viewed, "v did not mark the folded file");
+    }
+
+    #[gpui::test]
+    fn loading_the_lines_does_not_reset_viewed(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = open_merged(&workspace, cx);
+        review.update(cx, |review, cx| review.toggle_viewed(0, cx));
+        redraw(cx);
+        let before = review.read_with(cx, |review, _| review.is_file_viewed(0));
+
+        click("review-show-diff-0", cx);
+
+        let after = review.read_with(cx, |review, _| review.is_file_viewed(0));
+        let digest = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .data
+                .task_diff(TaskId(0), ReviewSource::Merged)
+                .and_then(|diff| diff.files.first().map(|file| file.digest))
+        });
+        assert!(before && after, "viewed was lost");
+        assert_ne!(digest, Some(0));
+    }
+
+    fn comment_on_the_lock_file(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> usize {
+        let comment = workspace.update(cx, |workspace, _| {
+            let diff = workspace
+                .data
+                .task_diff(TaskId(0), ReviewSource::Merged)
+                .cloned()
+                .expect("the Merged diff");
+            let file = sample_lines(&diff.files[0]);
+            let at = first_changed_line(&file, 0).expect("a changed line");
+            let anchor =
+                crate::review_model::anchor_for(&file, at.hunk as usize, at.line as usize, at.side)
+                    .expect("an anchor");
+            let comment = ReviewComment {
+                id: CommentId(90),
+                task: swarm_protocol::TaskId(0),
+                parent: None,
+                source: ReviewSource::Merged,
+                anchor,
+                body: "Is this bump needed?".to_owned(),
+                state: swarm_protocol::CommentState::Sent,
+                to: None,
+                outdated: false,
+                created_at: 1,
+                sent_at: Some(2),
+                delivered_at: Some(3),
+            };
+            let mut list = workspace.data.task_comments(TaskId(0)).to_vec();
+
+            list.push(comment.clone());
+            workspace.data.set_comments(swarm_protocol::TaskId(0), list);
+
+            comment
+        });
+        workspace.update(cx, |_, cx| cx.notify());
+        redraw(cx);
+
+        comments_of(workspace, cx)
+            .iter()
+            .position(|other| other.id == comment.id)
+            .expect("the comment is listed")
+    }
+
+    #[gpui::test]
+    fn threads_on_a_folded_file_are_counted_but_not_placed_or_outdated_until_it_loads(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = setup(cx);
+        let review = open_merged(&workspace, cx);
+        let root = comment_on_the_lock_file(&workspace, cx);
+        redraw(cx);
+
+        let place_of = |review: &Entity<ReviewView>, cx: &VisualTestContext| {
+            review.read_with(cx, |review, _| {
+                review
+                    .thread_places()
+                    .into_iter()
+                    .find(|(index, ..)| *index == root)
+                    .map(|(_, place, _)| place)
+            })
+        };
+        let before = place_of(&review, cx);
+        let counted = review.read_with(cx, |review, _| review.open_count(0));
+        let thread_rows = card_rows(&review, 0, cx)
+            .iter()
+            .filter(|row| matches!(row, Row::Thread { .. }))
+            .count();
+        let header_count = cx.debug_bounds("review-folded-comments-0").is_some();
+
+        click("review-show-diff-0", cx);
+        let after = place_of(&review, cx);
+        let placed_rows = card_rows(&review, 0, cx)
+            .iter()
+            .filter(|row| matches!(row, Row::Thread { .. }))
+            .count();
+
+        assert_eq!(before, Some(Place::Folded));
+        assert_eq!(counted, 1, "the badge lost the thread");
+        assert_eq!(thread_rows, 0);
+        assert!(header_count, "the header lost the count");
+        assert!(matches!(after, Some(Place::Line { .. })), "{after:?}");
+        assert_eq!(placed_rows, 1);
     }
 
     #[gpui::test]
@@ -2600,7 +3563,7 @@ mod tests {
             "the counts sit away from the place: {follows:?}"
         );
 
-        for width in [1650., 1600.] {
+        for width in [1330., 1280.] {
             cx.simulate_resize(gpui::size(px(width), px(800.)));
             redraw(cx);
             let place = cx.debug_bounds("review-place");
@@ -2794,7 +3757,7 @@ mod tests {
         let review = open_review(&workspace, cx);
 
         let counts: Vec<u32> = review.read_with(cx, |review, _| {
-            (0..9).map(|file| review.open_count(file)).collect()
+            (0..11).map(|file| review.open_count(file)).collect()
         });
 
         assert_eq!(
@@ -2989,6 +3952,7 @@ mod tests {
         open_review(&workspace, cx);
         let before = count_comments(&comments_of(&workspace, cx)).pending;
 
+        cx.simulate_keystrokes("j");
         cx.simulate_keystrokes("c");
         redraw(cx);
         cx.simulate_input("Why");
@@ -3246,6 +4210,7 @@ mod tests {
         let (workspace, cx) = setup(cx);
         let review = open_review(&workspace, cx);
         use_source(&workspace, ReviewSource::Merged, cx);
+        review.update(cx, ReviewView::next_file);
         let first = review.read_with(cx, |review, _| review.selected_file());
         let pos = workspace.read_with(cx, |workspace, _| {
             workspace
