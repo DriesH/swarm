@@ -16,7 +16,7 @@ const MID_ANIMATION: Duration = Duration::from_millis(40);
 
 /// Extra shots after key presses, to check focus rings and keyboard use:
 /// (page, keys, file suffix, wait for animations to finish).
-const KEYBOARD_SHOTS: [(&str, &[&str], &str, bool); 7] = [
+const KEYBOARD_SHOTS: [(&str, &[&str], &str, bool); 9] = [
     ("Label", &["down"], "list-row", true),
     ("Button", &["tab"], "segment", true),
     ("Button", &["tab", "tab", "tab", "tab"], "button", true),
@@ -27,9 +27,16 @@ const KEYBOARD_SHOTS: [(&str, &[&str], &str, bool); 7] = [
         "icon-button",
         true,
     ),
+    ("Tab", &TO_IDLE_TAB, "tab-close-tab", true),
+    ("Tab", &TO_IDLE_CLOSE, "tab-close-button", true),
     ("SegmentedControl", &SELECT_SWARM, "glide-mid", false),
     ("SegmentedControl", &SELECT_SWARM, "glide-end", true),
 ];
+
+/// Tabs through the Tab page: the theme control, four tabs, the selected closable tab and its
+/// button, then the idle closable tab (8) and its button (9).
+const TO_IDLE_TAB: [&str; 8] = ["tab"; 8];
+const TO_IDLE_CLOSE: [&str; 9] = ["tab"; 9];
 
 /// Tabs past the theme control to "Swarm" in the view switch, then presses Space.
 const SELECT_SWARM: [&str; 6] = ["tab", "tab", "tab", "tab", "tab", "space"];

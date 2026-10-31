@@ -1,8 +1,8 @@
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, App, BoxShadow, ElementId, Entity, FocusHandle, Hsla, Pixels, Role, SharedString,
-    Toggled, Window, black, div, point, px,
+    AnyElement, App, BoxShadow, ElementId, Entity, FocusHandle, Hsla, Pixels, Role, ScrollHandle,
+    SharedString, Toggled, Window, black, div, point, px,
 };
 
 use crate::component::{Component, example, example_group};
@@ -11,12 +11,17 @@ use crate::{Confirm, Dismiss, MENU_CONTEXT, SelectNext, SelectPrevious};
 
 type Handler = Rc<dyn Fn(&mut Window, &mut App) + 'static>;
 
+const ITEM_HEIGHT: Pixels = px(34.);
+const SEPARATOR_HEIGHT: Pixels = px(9.);
+const MENU_PADDING: Pixels = px(5.);
+
 /// One row of a [`Menu`].
 #[must_use]
 pub struct MenuItem {
     id: ElementId,
     label: SharedString,
     icon: Option<IconName>,
+    status: Option<AgentStatus>,
     checked: Option<bool>,
     disabled: bool,
     on_select: Option<Handler>,
@@ -28,6 +33,7 @@ impl MenuItem {
             id: id.into(),
             label: label.into(),
             icon: None,
+            status: None,
             checked: None,
             disabled: false,
             on_select: None,
@@ -36,6 +42,12 @@ impl MenuItem {
 
     pub fn icon(mut self, icon: IconName) -> Self {
         self.icon = Some(icon);
+        self
+    }
+
+    /// Shows a status ring before the label, in place of an icon.
+    pub fn status(mut self, status: AgentStatus) -> Self {
+        self.status = Some(status);
         self
     }
 
@@ -71,6 +83,7 @@ pub struct Menu {
     label: SharedString,
     entries: Vec<MenuEntry>,
     width: Pixels,
+    max_height: Option<Pixels>,
     on_dismiss: Option<Handler>,
     focus: Option<FocusHandle>,
 }
@@ -83,6 +96,7 @@ impl Menu {
             label: label.into(),
             entries: Vec::new(),
             width: px(236.),
+            max_height: None,
             on_dismiss: None,
             focus: None,
         }
@@ -100,6 +114,12 @@ impl Menu {
 
     pub fn width(mut self, width: Pixels) -> Self {
         self.width = width;
+        self
+    }
+
+    /// Caps the height. A longer list scrolls, and the arrow keys keep the highlight in view.
+    pub fn max_height(mut self, height: Pixels) -> Self {
+        self.max_height = Some(height);
         self
     }
 
@@ -146,12 +166,29 @@ fn move_highlight(
     highlight: &Entity<Option<usize>>,
     enabled: &[bool],
     forward: bool,
+    scroll: &ScrollHandle,
     cx: &mut App,
 ) {
     highlight.update(cx, |current, cx| {
         *current = step(enabled, *current, forward).or(*current);
+
+        if let Some(index) = *current {
+            scroll.scroll_to_item(index);
+        }
+
         cx.notify();
     });
+}
+
+/// How far a scrolling menu must scroll for the entry to show, worked out from the
+/// fixed row heights because the menu has not been laid out yet.
+fn reveal_offset(heights: &[Pixels], index: usize, max_height: Pixels) -> Pixels {
+    let above: Pixels = heights.iter().take(index).copied().sum();
+    let bottom = MENU_PADDING + above + heights.get(index).copied().unwrap_or_default();
+    // The border takes 1px on each side of the viewport.
+    let viewport = max_height - px(2.);
+
+    (bottom + MENU_PADDING - viewport).max(Pixels::ZERO)
 }
 
 fn render_item(
@@ -185,9 +222,10 @@ fn render_item(
         })
         .flex()
         .flex_row()
+        .flex_none()
         .items_center()
         .gap(px(10.))
-        .h(px(34.))
+        .h(ITEM_HEIGHT)
         .px(px(10.))
         .rounded(px(7.))
         .whitespace_nowrap()
@@ -221,6 +259,16 @@ fn render_item(
                     .color(Color::Muted),
             )
         })
+        .when_some(item.status, |row, status| {
+            row.child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .justify_center()
+                    .w(px(15.))
+                    .child(StatusRing::new(status)),
+            )
+        })
         .child(
             div()
                 .flex_1()
@@ -233,6 +281,48 @@ fn render_item(
         .into_any_element()
 }
 
+/// The menu's scroll handle and highlight, in keyed window state. A new menu highlights its
+/// checked item, or else its first, and a scrolling menu starts with that item in view.
+fn menu_state(
+    id: &ElementId,
+    entries: &[MenuEntry],
+    enabled: &[bool],
+    max_height: Option<Pixels>,
+    window: &mut Window,
+    cx: &mut App,
+) -> (ScrollHandle, Entity<Option<usize>>) {
+    let checked = entries.iter().position(
+        |entry| matches!(entry, MenuEntry::Item(item) if !item.disabled && item.checked == Some(true)),
+    );
+    let first = checked.or_else(|| step(enabled, None, true));
+
+    let scroll = window
+        .use_keyed_state((id.clone(), "scroll"), cx, |_, _| ScrollHandle::new())
+        .read(cx)
+        .clone();
+    let heights: Vec<Pixels> = entries
+        .iter()
+        .map(|entry| match entry {
+            MenuEntry::Item(_) => ITEM_HEIGHT,
+            MenuEntry::Separator => SEPARATOR_HEIGHT,
+        })
+        .collect();
+
+    let highlight = window.use_keyed_state((id.clone(), "highlight"), cx, {
+        let scroll = scroll.clone();
+
+        move |_, _| {
+            if let (Some(max_height), Some(index)) = (max_height, first) {
+                scroll.set_offset(point(px(0.), -reveal_offset(&heights, index, max_height)));
+            }
+
+            first
+        }
+    });
+
+    (scroll, highlight)
+}
+
 impl RenderOnce for Menu {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let colors = cx.theme().colors();
@@ -243,9 +333,14 @@ impl RenderOnce for Menu {
             .iter()
             .map(|entry| matches!(entry, MenuEntry::Item(item) if !item.disabled))
             .collect();
-        let first = step(&enabled, None, true);
-        let highlight =
-            window.use_keyed_state((self.id.clone(), "highlight"), cx, move |_, _| first);
+        let (scroll, highlight) = menu_state(
+            &self.id,
+            &self.entries,
+            &enabled,
+            self.max_height,
+            window,
+            cx,
+        );
         let highlighted = *highlight.read(cx);
 
         let selects: Rc<[Option<Handler>]> = self
@@ -263,7 +358,12 @@ impl RenderOnce for Menu {
             .into_iter()
             .enumerate()
             .map(|(index, entry)| match entry {
-                MenuEntry::Separator => div().h(px(1.)).my(px(4.)).bg(line).into_any_element(),
+                MenuEntry::Separator => div()
+                    .h(px(1.))
+                    .flex_none()
+                    .my(px(4.))
+                    .bg(line)
+                    .into_any_element(),
                 MenuEntry::Item(item) => {
                     let is_highlighted = highlighted == Some(index) && !item.disabled;
 
@@ -290,7 +390,7 @@ impl RenderOnce for Menu {
             .when_some(self.focus.as_ref(), InteractiveElement::track_focus)
             .occlude()
             .w(self.width)
-            .p(px(5.))
+            .p(MENU_PADDING)
             .rounded(px(10.))
             .border_1()
             .border_color(line)
@@ -310,13 +410,23 @@ impl RenderOnce for Menu {
                     }
                 }
             })
-            .on_action({
-                let (highlight, enabled) = (highlight.clone(), Rc::clone(&enabled));
-                move |_: &SelectPrevious, _, cx| move_highlight(&highlight, &enabled, false, cx)
+            .when_some(self.max_height, |menu, max_height| {
+                menu.max_h(max_height)
+                    .overflow_y_scroll()
+                    .track_scroll(&scroll)
             })
             .on_action({
                 let (highlight, enabled) = (highlight.clone(), Rc::clone(&enabled));
-                move |_: &SelectNext, _, cx| move_highlight(&highlight, &enabled, true, cx)
+                let scroll = scroll.clone();
+                move |_: &SelectPrevious, _, cx| {
+                    move_highlight(&highlight, &enabled, false, &scroll, cx);
+                }
+            })
+            .on_action({
+                let (highlight, enabled) = (highlight.clone(), Rc::clone(&enabled));
+                move |_: &SelectNext, _, cx| {
+                    move_highlight(&highlight, &enabled, true, &scroll, cx);
+                }
             })
             .on_action(move |_: &Confirm, window, cx| {
                 let Some(index) = *highlight.read(cx) else {
@@ -344,8 +454,41 @@ impl Component for Menu {
                 "Default",
                 [example("Default", demo_menu("menu-demo"))],
             ))
+            .child(example_group(
+                "Status rings, scrolling",
+                [example("Taller than 260 px", task_menu("menu-demo-tasks"))],
+            ))
             .into_any_element()
     }
+}
+
+/// A long menu of tasks with status rings, for the `Menu` preview.
+fn task_menu(id: &'static str) -> Menu {
+    let tasks = [
+        ("terminal-renderer", AgentStatus::Working),
+        ("menu-bar-usage", AgentStatus::Blocked),
+        ("worktree-scripts", AgentStatus::Idle),
+        ("ui-tokens", AgentStatus::Working),
+        ("daemon-restart", AgentStatus::Done),
+        ("review-comments", AgentStatus::Blocked),
+        ("swarm-graph", AgentStatus::Idle),
+        ("palette-search", AgentStatus::Working),
+        ("settings-pages", AgentStatus::Error),
+        ("diff-split-view", AgentStatus::Idle),
+    ];
+
+    tasks.into_iter().enumerate().fold(
+        Menu::new(id, "All tasks")
+            .width(px(280.))
+            .max_height(px(260.)),
+        |menu, (index, (name, status))| {
+            menu.item(
+                MenuItem::new(("task", index), name)
+                    .status(status)
+                    .checked(index == 3),
+            )
+        },
+    )
 }
 
 /// The menu shown by the `Menu` and `PopoverMenu` previews.
@@ -359,7 +502,26 @@ pub(crate) fn demo_menu(id: &'static str) -> Menu {
 
 #[cfg(test)]
 mod tests {
-    use super::step;
+    use gpui::{Pixels, px};
+
+    use super::{ITEM_HEIGHT, reveal_offset, step};
+
+    fn rows(count: usize) -> Vec<Pixels> {
+        vec![ITEM_HEIGHT; count]
+    }
+
+    #[test]
+    fn reveal_offset_keeps_the_top_rows_in_place() {
+        assert_eq!(reveal_offset(&rows(20), 0, px(360.)), px(0.));
+        assert_eq!(reveal_offset(&rows(20), 5, px(360.)), px(0.));
+    }
+
+    #[test]
+    fn reveal_offset_scrolls_a_row_below_the_view_into_it() {
+        // Row 10 ends at 5 + 11 * 34 = 379; the view shows 358 px; 5 px of padding stay below.
+        assert_eq!(reveal_offset(&rows(20), 10, px(360.)), px(26.));
+        assert_eq!(reveal_offset(&rows(20), 19, px(360.)), px(332.));
+    }
 
     #[test]
     fn step_forward_skips_disabled_entries() {

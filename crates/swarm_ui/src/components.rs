@@ -16,6 +16,7 @@ mod segmented_control;
 mod status;
 mod switch;
 mod tab;
+mod tab_bar;
 mod tab_strip;
 mod tag;
 pub(crate) mod text_input;
@@ -41,6 +42,7 @@ pub use segmented_control::*;
 pub use status::*;
 pub use switch::*;
 pub use tab::*;
+pub use tab_bar::*;
 pub use tab_strip::*;
 pub use tag::*;
 pub use text_input::*;
@@ -64,6 +66,7 @@ pub fn all_components() -> Vec<ComponentEntry> {
         ComponentEntry::of::<Checkbox>(),
         ComponentEntry::of::<SegmentedControl>(),
         ComponentEntry::of::<Tab>(),
+        ComponentEntry::of::<TabBar>(),
         ComponentEntry::of::<TabStrip>(),
         ComponentEntry::of::<ResizeHandle>(),
         ComponentEntry::of::<Menu>(),

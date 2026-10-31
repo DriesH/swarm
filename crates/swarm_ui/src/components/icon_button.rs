@@ -7,25 +7,25 @@ use crate::traits::ClickHandler;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum IconButtonSize {
-    /// 22px square, 12px icon: tile header actions.
+    /// 24px square, 14px icon: tile header actions.
     #[default]
     Small,
-    /// 28px square, 14px icon: toolbars.
+    /// 30px square, 16px icon: toolbars.
     Medium,
 }
 
 impl IconButtonSize {
-    fn square(self) -> Pixels {
+    pub(crate) fn square(self) -> Pixels {
         match self {
-            Self::Small => px(22.),
-            Self::Medium => px(28.),
+            Self::Small => px(24.),
+            Self::Medium => px(30.),
         }
     }
 
     fn icon(self) -> IconSize {
         match self {
-            Self::Small => IconSize::Small,
-            Self::Medium => IconSize::Medium,
+            Self::Small => IconSize::Medium,
+            Self::Medium => IconSize::Large,
         }
     }
 
@@ -242,5 +242,50 @@ impl Component for IconButton {
                 )],
             ))
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::{Context, Render, TestAppContext, size};
+
+    use super::*;
+
+    struct Buttons;
+
+    impl Render for Buttons {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            h_flex()
+                .gap(px(8.))
+                .child(
+                    IconButton::new("small", IconName::Plus, "Small")
+                        .debug_selector(|| "small".to_owned()),
+                )
+                .child(
+                    IconButton::new("medium", IconName::Plus, "Medium")
+                        .size(IconButtonSize::Medium)
+                        .debug_selector(|| "medium".to_owned()),
+                )
+        }
+    }
+
+    #[test]
+    fn buttons_are_24_and_30_pixels_square() {
+        let mut app = TestAppContext::single();
+        app.update(crate::theme::init);
+        let (_, cx) = app.add_window_view(|_, _| Buttons);
+        cx.run_until_parked();
+
+        let small = cx.debug_bounds("small").map(|bounds| bounds.size);
+        let medium = cx.debug_bounds("medium").map(|bounds| bounds.size);
+
+        assert_eq!(small, Some(size(px(24.), px(24.))));
+        assert_eq!(medium, Some(size(px(30.), px(30.))));
+    }
+
+    #[test]
+    fn icons_are_14_and_16_pixels() {
+        assert_eq!(IconButtonSize::Small.icon().pixels(), px(14.));
+        assert_eq!(IconButtonSize::Medium.icon().pixels(), px(16.));
     }
 }
