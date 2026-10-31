@@ -20,7 +20,7 @@ mod client;
 pub use client::{Client, ClientError, MessageEvent};
 
 /// Bumped on every incompatible change; the daemon refuses other versions.
-pub const VERSION: u32 = 6;
+pub const VERSION: u32 = 7;
 
 /// The most messages [`Request::ListMessages`] returns.
 pub const MESSAGES_LISTED: usize = 500;
