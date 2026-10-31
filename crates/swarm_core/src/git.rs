@@ -1,13 +1,13 @@
 //! Runs the `git` binary. User text only ever travels as an argument, never through a shell.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
-use swarm_protocol::DiffStat;
+use swarm_protocol::{DiffStat, FILES_LISTED, FileStat};
 
 use crate::Error;
 
@@ -145,6 +145,12 @@ pub fn merge_base(worktree: &Path, revision: &str) -> Result<String, Error> {
 /// work, plus untracked files. A binary or huge untracked file counts as a file with no
 /// lines.
 pub fn diff_stat(worktree: &Path, base: &str) -> Result<DiffStat, Error> {
+    diff_files(worktree, base).map(|(stat, _)| stat)
+}
+
+/// The totals of [`diff_stat`] and the changed files, most changed lines first. The list
+/// stops at [`FILES_LISTED`] files; the totals count all of them.
+pub fn diff_files(worktree: &Path, base: &str) -> Result<(DiffStat, Vec<FileStat>), Error> {
     // `diff-index` never writes the index, so it cannot block the agent's own git.
     let (arguments, output) = execute(
         worktree,
@@ -162,7 +168,7 @@ pub fn diff_stat(worktree: &Path, base: &str) -> Result<DiffStat, Error> {
         return Err(failure(&arguments, &output));
     }
 
-    let mut files: HashSet<String> = HashSet::new();
+    let mut files: HashMap<String, (u32, u32)> = HashMap::new();
     let (mut additions, mut deletions) = (0_u32, 0_u32);
 
     for entry in output
@@ -177,9 +183,12 @@ pub fn diff_stat(worktree: &Path, base: &str) -> Result<DiffStat, Error> {
             continue;
         };
 
-        additions = additions.saturating_add(added.parse().unwrap_or(0));
-        deletions = deletions.saturating_add(removed.parse().unwrap_or(0));
-        files.insert(path.to_owned());
+        let (added, removed): (u32, u32) =
+            (added.parse().unwrap_or(0), removed.parse().unwrap_or(0));
+
+        additions = additions.saturating_add(added);
+        deletions = deletions.saturating_add(removed);
+        files.insert(path.to_owned(), (added, removed));
     }
 
     let (arguments, output) = execute(
@@ -199,17 +208,45 @@ pub fn diff_stat(worktree: &Path, base: &str) -> Result<DiffStat, Error> {
         .enumerate()
     {
         let path = String::from_utf8_lossy(path).into_owned();
+        let mut lines = 0;
         if index < MAX_COUNTED_FILES {
-            additions = additions.saturating_add(count_lines(&worktree.join(&path), &mut budget));
+            lines = count_lines(&worktree.join(&path), &mut budget);
         }
-        files.insert(path);
+
+        additions = additions.saturating_add(lines);
+        files.insert(path, (lines, 0));
     }
 
-    Ok(DiffStat {
+    let stat = DiffStat {
         files: u32::try_from(files.len()).unwrap_or(u32::MAX),
         additions,
         deletions,
-    })
+    };
+
+    Ok((stat, listed_files(files)))
+}
+
+/// Most changed lines first, ties by path so the order is stable.
+fn listed_files(files: HashMap<String, (u32, u32)>) -> Vec<FileStat> {
+    let mut listed: Vec<FileStat> = files
+        .into_iter()
+        .map(|(path, (additions, deletions))| FileStat {
+            path: PathBuf::from(path),
+            additions,
+            deletions,
+        })
+        .collect();
+
+    listed.sort_by(|one, other| {
+        let changed = |file: &FileStat| u64::from(file.additions) + u64::from(file.deletions);
+
+        changed(other)
+            .cmp(&changed(one))
+            .then_with(|| one.path.cmp(&other.path))
+    });
+    listed.truncate(FILES_LISTED);
+
+    listed
 }
 
 /// Lines in a text file. A symlink is one line, like git sees it. Anything that is not a

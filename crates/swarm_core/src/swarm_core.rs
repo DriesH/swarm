@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use swarm_protocol::{
-    AgentId, AgentInfo, AgentRole, CreateTask, DiffStat, ProjectId, ProjectInfo, TaskId, TaskInfo,
-    TerminalId,
+    AgentChange, AgentId, AgentInfo, AgentRole, CreateTask, ProjectId, ProjectInfo, TaskId,
+    TaskInfo, TerminalId,
 };
 use swarm_term::ExitStatus;
 
@@ -380,11 +380,11 @@ impl Projects {
     /// What each agent changed in its worktree since it branched off. An agent whose
     /// changes cannot be read is left out: a Start orchestrator, an unknown agent, a
     /// missing worktree or a git failure.
-    pub fn agent_changes(&self, agents: &[AgentId]) -> Vec<(AgentId, DiffStat)> {
+    pub fn agent_changes(&self, agents: &[AgentId]) -> Vec<AgentChange> {
         agents
             .iter()
             .filter_map(|id| match self.agent_change(*id) {
-                Ok(stat) => stat.map(|stat| (*id, stat)),
+                Ok(change) => change,
                 Err(error) => {
                     log::debug!("cannot read the changes of agent {}: {error}", id.0);
 
@@ -394,7 +394,7 @@ impl Projects {
             .collect()
     }
 
-    fn agent_change(&self, id: AgentId) -> Result<Option<DiffStat>, Error> {
+    fn agent_change(&self, id: AgentId) -> Result<Option<AgentChange>, Error> {
         // The store lock is gone before git runs.
         let (agent, worker_base, task_base, task_branch) = {
             let store = lock(&self.store);
@@ -433,7 +433,13 @@ impl Projects {
             return Ok(None);
         };
 
-        git::diff_stat(&agent.worktree, &base).map(Some)
+        let (stat, files) = git::diff_files(&agent.worktree, &base)?;
+
+        Ok(Some(AgentChange {
+            agent: id,
+            stat,
+            files,
+        }))
     }
 
     /// Ports no task of any project uses, so two projects never share a port.

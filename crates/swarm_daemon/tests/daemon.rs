@@ -14,9 +14,10 @@ use std::time::{Duration, Instant};
 
 use swarm_core::store::Store;
 use swarm_protocol::{
-    AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, CallId, CreateTask,
-    CreateTerminal, DiffStat, Event, MessageInfo, MessageKind, ProjectId, ProjectInfo, Request,
-    TaskId, TaskInfo, TerminalId, TerminalInfo, TerminalKind, VERSION, read, write,
+    AgentChange, AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, CallId,
+    CreateTask, CreateTerminal, DiffStat, Event, FileStat, MessageInfo, MessageKind, ProjectId,
+    ProjectInfo, Request, TaskId, TaskInfo, TerminalId, TerminalInfo, TerminalKind, VERSION, read,
+    write,
 };
 use swarm_term::{
     BlockedKind, ExitStatus, Palette, ProgramState, Rgb, Row, Size, TerminalInput, TerminalOutput,
@@ -3208,13 +3209,25 @@ esac"#,
 
     assert_eq!(
         changes,
-        vec![(
-            worker.id,
-            DiffStat {
+        vec![AgentChange {
+            agent: worker.id,
+            stat: DiffStat {
                 files: 2,
                 additions: 3,
                 deletions: 0,
-            }
-        )]
+            },
+            files: vec![
+                FileStat {
+                    path: "loose.txt".into(),
+                    additions: 2,
+                    deletions: 0,
+                },
+                FileStat {
+                    path: "api.txt".into(),
+                    additions: 1,
+                    deletions: 0,
+                },
+            ],
+        }]
     );
 }

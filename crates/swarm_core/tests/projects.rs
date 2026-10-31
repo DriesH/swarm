@@ -11,7 +11,8 @@ use swarm_core::git;
 use swarm_core::store::{NewAgent, Store};
 use swarm_core::{Error, Projects, WorkerCheckout};
 use swarm_protocol::{
-    AgentId, AgentInfo, AgentKind, AgentRole, CreateTask, DiffStat, ProjectId, TaskInfo,
+    AgentChange, AgentId, AgentInfo, AgentKind, AgentRole, CreateTask, DiffStat, FileStat,
+    ProjectId, TaskInfo,
 };
 
 static NEXT_FOLDER: AtomicU32 = AtomicU32::new(0);
@@ -909,6 +910,65 @@ fn the_diff_stat_counts_commits_edits_untracked_and_binary_files() {
     );
 }
 
+fn file_stat(path: &str, additions: u32) -> FileStat {
+    FileStat {
+        path: path.into(),
+        additions,
+        deletions: 0,
+    }
+}
+
+#[test]
+fn the_file_list_puts_the_most_changed_files_first() {
+    let repo = ignoring_setup_files();
+    let base = repo.git(&["rev-parse", "HEAD"]);
+
+    std::fs::write(repo.root.join("README.md"), "hello\nworld\n").expect("edit");
+    std::fs::write(repo.root.join("big.txt"), "1\n2\n3\n4\n5\n").expect("untracked");
+    std::fs::write(repo.root.join("small.txt"), "1\n").expect("untracked");
+    std::fs::write(repo.root.join("blob.bin"), [0_u8, 1]).expect("binary");
+
+    let (stat, files) = git::diff_files(&repo.root, &base).expect("files");
+    let listed: Vec<(String, u32, u32)> = files
+        .iter()
+        .map(|file| {
+            (
+                file.path.display().to_string(),
+                file.additions,
+                file.deletions,
+            )
+        })
+        .collect();
+
+    assert_eq!(stat.files, 4);
+    assert_eq!(
+        listed,
+        [
+            ("big.txt".to_owned(), 5, 0),
+            ("README.md".to_owned(), 2, 1),
+            ("small.txt".to_owned(), 1, 0),
+            ("blob.bin".to_owned(), 0, 0),
+        ]
+    );
+}
+
+#[test]
+fn the_file_list_stops_at_the_cap_but_the_totals_count_every_file() {
+    let repo = ignoring_setup_files();
+    let base = repo.git(&["rev-parse", "HEAD"]);
+
+    for index in 0..(swarm_protocol::FILES_LISTED + 20) {
+        std::fs::write(repo.root.join(format!("file-{index:04}.txt")), "x\n").expect("file");
+    }
+    std::fs::write(repo.root.join("large.txt"), "x\ny\nz\n").expect("file");
+
+    let (stat, files) = git::diff_files(&repo.root, &base).expect("files");
+
+    assert_eq!(files.len(), swarm_protocol::FILES_LISTED);
+    assert_eq!(stat.files as usize, swarm_protocol::FILES_LISTED + 21);
+    assert_eq!(files[0].path.display().to_string(), "large.txt");
+}
+
 #[test]
 fn a_tracked_binary_counts_as_a_file_without_lines() {
     let repo = ignoring_setup_files();
@@ -964,14 +1024,15 @@ fn a_worker_is_measured_from_where_it_branched() {
     assert_eq!(recorded.expect("base").as_deref(), Some(branched.as_str()));
     assert_eq!(
         changes,
-        vec![(
-            worker.id,
-            DiffStat {
+        vec![AgentChange {
+            agent: worker.id,
+            stat: DiffStat {
                 files: 2,
                 additions: 3,
                 deletions: 0,
-            }
-        )]
+            },
+            files: vec![file_stat("work.txt", 2), file_stat("loose.txt", 1)],
+        }]
     );
 }
 
@@ -1186,13 +1247,14 @@ fn a_worker_without_a_base_commit_is_measured_from_the_task_branch() {
 
     assert_eq!(
         changes,
-        vec![(
-            worker.id,
-            DiffStat {
+        vec![AgentChange {
+            agent: worker.id,
+            stat: DiffStat {
                 files: 1,
                 additions: 2,
                 deletions: 0,
-            }
-        )]
+            },
+            files: vec![file_stat("work.txt", 2)],
+        }]
     );
 }
