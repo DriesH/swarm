@@ -1,13 +1,14 @@
 //! The main window's root view.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use gpui::{
-    Bounds, Context, Entity, FocusHandle, Focusable, Pixels, ScrollHandle, SharedString, Size,
-    Subscription, Window, div, px,
+    Bounds, Context, Entity, FocusHandle, Focusable, ListAlignment, ListState, Pixels,
+    SharedString, Size, Subscription, Window, div, px,
 };
-use swarm_protocol::Client;
+use swarm_protocol::{Client, MessageId};
 use swarm_ui::fonts::UI_FONT;
 use swarm_ui::prelude::*;
 
@@ -102,9 +103,13 @@ pub(crate) struct Workspace {
     pub(crate) swarm_zoom: f32,
     /// The agent Review shows, set by View diff.
     pub(crate) review_agent: Option<AgentId>,
-    pub(crate) messages_scroll: ScrollHandle,
-    pub(crate) messages_scroll_key: Option<(AgentId, usize)>,
+    pub(crate) messages_list: ListState,
+    /// The agent and newest message the thread was last scrolled for.
+    pub(crate) messages_scroll_key: Cell<Option<(AgentId, Option<MessageId>)>>,
     pub(crate) changes_poll: Option<gpui::Task<()>>,
+    /// The task the running poll asks about.
+    pub(crate) polled_task: Option<TaskId>,
+    _activation_subscription: Subscription,
     pub(crate) swarm_clock: Option<gpui::Task<()>>,
 }
 
@@ -147,6 +152,9 @@ impl Workspace {
         window.focus(&focus_handle, cx);
 
         let (orchestrator_input, orchestrator_subscription) = views::orchestrator_input(cx);
+        let activation_subscription = cx.observe_window_activation(window, |this, window, cx| {
+            this.sync_swarm_tasks(window.is_window_active(), cx);
+        });
 
         Self {
             data,
@@ -186,9 +194,11 @@ impl Workspace {
             swarm_focus: HashMap::new(),
             swarm_zoom: 1.,
             review_agent: None,
-            messages_scroll: ScrollHandle::new(),
-            messages_scroll_key: None,
+            messages_list: ListState::new(0, ListAlignment::Top, px(200.)),
+            messages_scroll_key: Cell::new(None),
             changes_poll: None,
+            polled_task: None,
+            _activation_subscription: activation_subscription,
             swarm_clock: None,
         }
     }
@@ -266,8 +276,10 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Opening a view this way clears the agent filter of Review. Only View diff sets it.
     pub(crate) fn set_view(&mut self, view: View, cx: &mut Context<Self>) {
         self.view = view;
+        self.review_agent = None;
         cx.notify();
     }
 
@@ -422,11 +434,14 @@ impl Render for Workspace {
         let (ground, panel, line, fg) = (colors.ground, colors.panel, colors.line, colors.fg);
 
         self.start_orchestrator_if_needed(window, cx);
-        self.sync_swarm_tasks(cx);
+        self.sync_swarm_tasks(window.is_window_active(), cx);
         self.apply_pending_focus(window, cx);
         self.ensure_focus_handles(cx);
-        self.ensure_swarm_handles(cx);
-        self.sync_messages_scroll();
+
+        if self.view == View::Swarm {
+            self.ensure_swarm_handles(cx);
+        }
+
         self.layout = views::compute_layout(self);
 
         let sidebar = sidebar::render(self, window, cx);

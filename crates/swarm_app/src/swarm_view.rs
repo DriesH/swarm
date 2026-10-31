@@ -1,18 +1,20 @@
 //! The Swarm view: the task's agents as a graph, a timeline below and the inspector.
 
+use std::collections::HashMap;
+use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    AnyElement, Bounds, ClickEvent, Context, FontWeight, Hsla, KeyDownEvent, Pixels, Role,
-    SharedString, Window, canvas, div, fill, point, px, relative, size,
+    AnyElement, Bounds, ClickEvent, Context, FollowMode, FontWeight, Hsla, KeyDownEvent, Pixels,
+    Role, SharedString, Window, canvas, div, fill, list, point, px, relative, size,
 };
-use swarm_protocol::{AgentId as DaemonAgentId, MessageInfo, MessageKind};
+use swarm_protocol::{AgentId as DaemonAgentId, MessageId, MessageKind};
 use swarm_ui::fonts::MONO_FONT;
 use swarm_ui::prelude::*;
 use swarm_ui::styles::focus_ring;
 use swarm_ui::{ButtonVariant, ThemeColors};
 
-use crate::model::{Agent, AgentId, AgentKind};
+use crate::model::{Agent, AgentId, AgentKind, Message};
 use crate::workspace::{View, Workspace};
 
 const ORCHESTRATOR_SIZE: (f32, f32) = (210., 80.);
@@ -88,16 +90,12 @@ fn edge_color(kind: Option<MessageKind>, colors: &ThemeColors) -> Hsla {
     }
 }
 
-fn between(message: &MessageInfo, a: DaemonAgentId, b: DaemonAgentId) -> bool {
+fn between(message: &Message, a: DaemonAgentId, b: DaemonAgentId) -> bool {
     (message.from == Some(a) && message.to == b) || (message.from == Some(b) && message.to == a)
 }
 
 /// The kind of the newest message between two agents, in either direction.
-fn newest_kind(
-    messages: &[&MessageInfo],
-    a: DaemonAgentId,
-    b: DaemonAgentId,
-) -> Option<MessageKind> {
+fn newest_kind(messages: &[&Message], a: DaemonAgentId, b: DaemonAgentId) -> Option<MessageKind> {
     messages
         .iter()
         .filter(|message| between(message, a, b))
@@ -108,7 +106,7 @@ fn newest_kind(
 /// Where the messages in flight between the orchestrator and a worker sit on the curve.
 /// The orchestrator's start at 0.35 and move toward the worker, the worker's start at 0.65.
 fn flight_dots(
-    messages: &[&MessageInfo],
+    messages: &[&Message],
     orchestrator: DaemonAgentId,
     worker: DaemonAgentId,
 ) -> Vec<(f32, MessageKind)> {
@@ -137,12 +135,12 @@ fn flight_dots(
 }
 
 /// "45s", "4m" or "2h 5m". `None` while the start is unknown.
-pub(crate) fn running_time(created_at: u64, ended_at: Option<u64>, now: u64) -> Option<String> {
-    if created_at == 0 {
+pub(crate) fn running_time(since: u64, ended_at: Option<u64>, now: u64) -> Option<String> {
+    if since == 0 {
         return None;
     }
 
-    let seconds = ended_at.unwrap_or(now).saturating_sub(created_at) / 1_000;
+    let seconds = ended_at.unwrap_or(now).saturating_sub(since) / 1_000;
     let (minutes, hours) = (seconds / 60 % 60, seconds / 3_600);
 
     Some(if seconds < 60 {
@@ -171,9 +169,9 @@ fn relative_time(sent_at: u64, now: u64) -> String {
 
 /// The messages on an agent's lane: the ones it sent, and the ones Swarm sent to it.
 fn lane_marks<'a>(
-    messages: &'a [&'a MessageInfo],
+    messages: &'a [&'a Message],
     agent: DaemonAgentId,
-) -> impl Iterator<Item = &'a MessageInfo> {
+) -> impl Iterator<Item = &'a Message> {
     messages.iter().copied().filter(move |message| {
         message.from == Some(agent) || (message.from.is_none() && message.to == agent)
     })
@@ -197,6 +195,25 @@ fn step_zoom(zoom: f32, steps: i8) -> f32 {
     let next = zoom + ZOOM_STEP * f32::from(steps);
 
     ((next * 10.).round() / 10.).clamp(MIN_ZOOM, MAX_ZOOM)
+}
+
+/// "pty-io, Codex, Blocked, 1 message in flight".
+fn card_label(agent: &Agent, in_flight: u32) -> String {
+    let label = format!(
+        "{}, {}, {}",
+        agent.name,
+        agent.kind.label(),
+        agent.status.label()
+    );
+
+    if in_flight == 0 {
+        label
+    } else {
+        format!(
+            "{label}, {} in flight",
+            plural(in_flight, "message", "messages")
+        )
+    }
 }
 
 fn plural(count: u32, one: &str, many: &str) -> String {
@@ -255,17 +272,38 @@ impl Workspace {
         }
     }
 
-    /// Scrolls the message thread to the newest message when the agent or the thread changed.
-    pub(crate) fn sync_messages_scroll(&mut self) {
-        let Some(agent) = self.selected_agent() else {
-            return;
-        };
+    /// Fits the thread's list to the messages. The list follows the newest message when the
+    /// agent changed, or when it was already at the bottom, so reading older ones is safe.
+    fn sync_messages_list(&self, agent: AgentId, thread: &[Message]) {
+        let key = scroll_key(agent, thread);
+        let previous = self.messages_scroll_key.get();
+        let known = self.messages_list.item_count();
 
-        let count = self.thread_of(agent).len();
-        if self.messages_scroll_key != Some((agent, count)) {
-            self.messages_scroll_key = Some((agent, count));
-            self.messages_scroll.scroll_to_bottom();
+        if previous == Some(key) && known == thread.len() {
+            return;
         }
+
+        let same_agent = previous.is_some_and(|(previous_agent, _)| previous_agent == agent);
+        let following = !same_agent || self.messages_list.is_following_tail();
+        let appended = same_agent
+            && thread.len() > known
+            && (known == 0
+                || previous.is_some_and(|(_, newest)| {
+                    thread.get(known - 1).map(|message| message.id) == newest
+                }));
+
+        if appended {
+            self.messages_list
+                .splice(known..known, thread.len() - known);
+        } else {
+            self.messages_list.reset(thread.len());
+        }
+
+        if following {
+            self.messages_list.set_follow_mode(FollowMode::Tail);
+        }
+
+        self.messages_scroll_key.set(Some(key));
     }
 
     pub(crate) fn zoom_swarm(&mut self, steps: i8, cx: &mut Context<Self>) {
@@ -285,8 +323,8 @@ impl Workspace {
 
     /// Switches to Review, filtered to the agent.
     pub(crate) fn view_agent_diff(&mut self, agent: AgentId, cx: &mut Context<Self>) {
-        self.review_agent = Some(agent);
         self.set_view(View::Review, cx);
+        self.review_agent = Some(agent);
     }
 
     /// Moves the selection and the keyboard focus with an arrow key. Enter focuses the tile.
@@ -319,7 +357,7 @@ impl Workspace {
     }
 
     /// Messages where the agent is the sender or the recipient, oldest first.
-    fn thread_of(&self, agent: AgentId) -> Vec<&MessageInfo> {
+    fn thread_of(&self, agent: AgentId) -> Vec<Message> {
         let Some(id) = self.data.agent(agent).map(Agent::protocol_id) else {
             return Vec::new();
         };
@@ -327,18 +365,8 @@ impl Workspace {
         self.data
             .task_messages(self.active_task)
             .filter(|message| message.from == Some(id) || message.to == id)
+            .cloned()
             .collect()
-    }
-
-    fn agent_name(&self, id: Option<DaemonAgentId>) -> SharedString {
-        let Some(id) = id else {
-            return "swarm".into();
-        };
-
-        self.data
-            .agents_of(self.active_task)
-            .find(|agent| agent.protocol_id() == id)
-            .map_or_else(|| "agent".into(), |agent| agent.name.clone())
     }
 
     /// The agent's worktree relative to the project root.
@@ -432,7 +460,9 @@ struct Preview {
 /// Everything the view shows, read once per frame.
 struct SwarmData<'a> {
     agents: Vec<&'a Agent>,
-    messages: Vec<&'a MessageInfo>,
+    messages: Vec<&'a Message>,
+    names: Rc<HashMap<DaemonAgentId, SharedString>>,
+    in_flight: HashMap<DaemonAgentId, u32>,
     now: u64,
     selected: Option<AgentId>,
 }
@@ -443,14 +473,33 @@ pub(crate) fn render(
     cx: &mut Context<Workspace>,
 ) -> AnyElement {
     let task = workspace.active_task();
+    let agents: Vec<&Agent> = task
+        .orchestrator
+        .into_iter()
+        .chain(task.workers.iter().copied())
+        .filter_map(|id| workspace.data.agent(id))
+        .collect();
+    let messages: Vec<&Message> = workspace.data.task_messages(task.id).collect();
+
+    let names = agents
+        .iter()
+        .map(|agent| (agent.protocol_id(), agent.name.clone()))
+        .collect();
+    let mut in_flight: HashMap<DaemonAgentId, u32> = HashMap::new();
+    for message in messages
+        .iter()
+        .filter(|message| message.delivered_at.is_none())
+    {
+        for agent in message.from.into_iter().chain([message.to]) {
+            *in_flight.entry(agent).or_default() += 1;
+        }
+    }
+
     let data = SwarmData {
-        agents: task
-            .orchestrator
-            .into_iter()
-            .chain(task.workers.iter().copied())
-            .filter_map(|id| workspace.data.agent(id))
-            .collect(),
-        messages: workspace.data.task_messages(task.id).collect(),
+        agents,
+        messages,
+        names: Rc::new(names),
+        in_flight,
         now: workspace.now_ms(),
         selected: workspace.selected_agent(),
     };
@@ -813,8 +862,14 @@ fn card(
     let zoom = workspace.swarm_zoom;
     let id = agent.id;
     let selected = data.selected == Some(id);
+    let in_flight = data
+        .in_flight
+        .get(&agent.protocol_id())
+        .copied()
+        .unwrap_or(0);
+    let label = card_label(agent, in_flight);
 
-    let time = running_time(agent.created_at, agent.ended_at, data.now);
+    let time = running_time(agent.running_since(), agent.ended_at, data.now);
     let time_text = time.unwrap_or_else(|| "\u{2014}".to_owned());
     let second_line = if is_orchestrator {
         h_flex().child(mono(
@@ -836,12 +891,8 @@ fn card(
     let mut card = div()
         .id(("agent-card", id.0 as usize))
         .role(Role::Button)
-        .aria_label(format!(
-            "{}, {}, {}",
-            agent.name,
-            agent.kind.label(),
-            agent.status.label()
-        ))
+        .aria_label(label)
+        .aria_selected(selected)
         .absolute()
         .left(px(left * zoom))
         .top(px(top * zoom))
@@ -899,8 +950,8 @@ fn timeline(data: &SwarmData, cx: &mut Context<Workspace>) -> AnyElement {
     let start = data
         .agents
         .iter()
-        .map(|agent| agent.created_at)
-        .filter(|created| *created > 0)
+        .map(|agent| agent.running_since())
+        .filter(|since| *since > 0)
         .min()
         .unwrap_or(data.now);
     let minutes = data.now.saturating_sub(start) / MINUTE;
@@ -959,9 +1010,9 @@ fn timeline(data: &SwarmData, cx: &mut Context<Workspace>) -> AnyElement {
 
 fn lane(agent: &Agent, data: &SwarmData, start: u64, cx: &mut Context<Workspace>) -> AnyElement {
     let colors = cx.theme().colors().clone();
-    let marks: Vec<&MessageInfo> = lane_marks(&data.messages, agent.protocol_id()).collect();
+    let marks: Vec<&Message> = lane_marks(&data.messages, agent.protocol_id()).collect();
 
-    let from = timeline_fraction(agent.created_at, start, data.now);
+    let from = timeline_fraction(agent.running_since(), start, data.now);
     let to = timeline_fraction(agent.ended_at.unwrap_or(data.now), start, data.now);
 
     let rings: Vec<AnyElement> = marks
@@ -1013,7 +1064,7 @@ fn lane(agent: &Agent, data: &SwarmData, start: u64, cx: &mut Context<Workspace>
                 .flex_1()
                 .relative()
                 .h(px(14.))
-                .when(agent.created_at > 0, |track| {
+                .when(agent.running_since() > 0, |track| {
                     track.child(
                         div()
                             .absolute()
@@ -1111,7 +1162,7 @@ fn inspector_body(
             .into_any_element(),
         None => div().child("\u{2014}").into_any_element(),
     };
-    let running = running_time(agent.created_at, agent.ended_at, data.now)
+    let running = running_time(agent.running_since(), agent.ended_at, data.now)
         .unwrap_or_else(|| "\u{2014}".to_owned());
 
     let header = h_flex()
@@ -1154,16 +1205,24 @@ fn inspector_body(
         .child(definition("Running", running, &colors))
         .child(definition("Changes", changes, &colors));
 
-    let thread: Vec<AnyElement> = workspace
-        .thread_of(id)
-        .into_iter()
-        .map(|message| message_row(workspace, message, data.now, &colors))
-        .collect();
+    let thread = workspace.thread_of(id);
+    workspace.sync_messages_list(id, &thread);
+
+    let names = Rc::clone(&data.names);
+    let (now, row_colors) = (data.now, colors.clone());
+    let rows = list(workspace.messages_list.clone(), move |index, _, _| {
+        thread.get(index).map_or_else(
+            || div().into_any_element(),
+            |message| message_row(index, message, now, &names, &row_colors),
+        )
+    })
+    .size_full();
+
     let messages = v_flex()
         .flex_1()
         .min_h_0()
         .px(px(14.))
-        .py(px(12.))
+        .pt(px(12.))
         .gap(px(12.))
         .child(
             Label::new("Messages")
@@ -1171,16 +1230,13 @@ fn inspector_body(
                 .color(Color::Faint),
         )
         .child(
-            v_flex()
+            div()
                 .id("message-thread")
                 .role(Role::List)
                 .aria_label("Messages")
                 .flex_1()
                 .min_h_0()
-                .gap(px(12.))
-                .overflow_y_scroll()
-                .track_scroll(&workspace.messages_scroll)
-                .children(thread),
+                .child(rows),
         );
 
     let preview = workspace.terminal_preview(agent, cx);
@@ -1282,10 +1338,25 @@ fn inspector_body(
         .into_any_element()
 }
 
+fn agent_name(
+    names: &HashMap<DaemonAgentId, SharedString>,
+    id: Option<DaemonAgentId>,
+) -> SharedString {
+    let Some(id) = id else {
+        return "swarm".into();
+    };
+
+    names
+        .get(&id)
+        .cloned()
+        .unwrap_or_else(|| SharedString::new_static("agent"))
+}
+
 fn message_row(
-    workspace: &Workspace,
-    message: &MessageInfo,
+    index: usize,
+    message: &Message,
     now: u64,
+    names: &HashMap<DaemonAgentId, SharedString>,
     colors: &ThemeColors,
 ) -> AnyElement {
     let when = if message.delivered_at.is_none() {
@@ -1295,43 +1366,47 @@ fn message_row(
     };
 
     v_flex()
-        .flex_none()
-        .gap(px(4.))
+        .id(("message", index))
+        .role(Role::ListItem)
+        .pb(px(12.))
         .child(
-            h_flex()
-                .gap(px(6.))
+            v_flex()
+                .gap(px(4.))
                 .child(
-                    mono(workspace.agent_name(message.from), 11., colors.fg)
-                        .font_weight(FontWeight::MEDIUM),
+                    h_flex()
+                        .gap(px(6.))
+                        .child(
+                            mono(agent_name(names, message.from), 11., colors.fg)
+                                .font_weight(FontWeight::MEDIUM),
+                        )
+                        .child(mono("\u{2192}", 11., colors.faint))
+                        .child(mono(agent_name(names, Some(message.to)), 11., colors.faint))
+                        .child(div().flex_1())
+                        .child(mono(when, 11., colors.faint)),
                 )
-                .child(mono("\u{2192}", 11., colors.faint))
-                .child(mono(
-                    workspace.agent_name(Some(message.to)),
-                    11.,
-                    colors.faint,
-                ))
-                .child(div().flex_1())
-                .child(mono(when, 11., colors.faint)),
-        )
-        .child(
-            div()
-                .text_size(px(12.5))
-                .line_height(px(18.75))
-                .text_color(colors.muted)
-                .child(SharedString::from(message.text.clone())),
+                .child(
+                    div()
+                        .text_size(px(12.5))
+                        .line_height(px(18.75))
+                        .text_color(colors.muted)
+                        .child(message.text.clone()),
+                ),
         )
         .into_any_element()
 }
 
+/// What the thread was last scrolled for: the agent and its newest message.
+fn scroll_key(agent: AgentId, thread: &[Message]) -> (AgentId, Option<MessageId>) {
+    (agent, thread.last().map(|message| message.id))
+}
+
 #[cfg(test)]
 mod tests {
-    use gpui::{TestAppContext, VisualTestContext};
-    use swarm_protocol::MessageId;
-
     use super::*;
     use crate::actions;
     use crate::model::{SAMPLE_NOW, TaskId, TerminalId};
     use crate::workspace::RightPanel;
+    use gpui::{TestAppContext, VisualTestContext};
 
     fn setup(cx: &mut TestAppContext) -> (gpui::Entity<Workspace>, &mut VisualTestContext) {
         cx.update(|cx| {
@@ -1374,7 +1449,7 @@ mod tests {
         let (workspace, cx) = setup(cx);
 
         let kinds = workspace.read_with(cx, |workspace, _| {
-            let messages: Vec<&MessageInfo> = workspace
+            let messages: Vec<&Message> = workspace
                 .data
                 .task_messages(workspace.active_task)
                 .collect();
@@ -1400,7 +1475,7 @@ mod tests {
         let (workspace, cx) = setup(cx);
 
         let (down, up, none) = workspace.read_with(cx, |workspace, _| {
-            let messages: Vec<&MessageInfo> = workspace
+            let messages: Vec<&Message> = workspace
                 .data
                 .task_messages(workspace.active_task)
                 .collect();
@@ -1418,20 +1493,18 @@ mod tests {
     #[test]
     fn dots_are_capped_and_spread_along_the_curve() {
         let (orchestrator, worker) = (DaemonAgentId(1), DaemonAgentId(2));
-        let messages: Vec<MessageInfo> = (0..6)
-            .map(|id| MessageInfo {
+        let messages: Vec<Message> = (0..6)
+            .map(|id| Message {
                 id: MessageId(id),
-                project: swarm_protocol::ProjectId(1),
-                task: None,
                 from: Some(orchestrator),
                 to: worker,
                 kind: MessageKind::Task,
-                text: String::new(),
+                text: SharedString::default(),
                 sent_at: id,
                 delivered_at: None,
             })
             .collect();
-        let refs: Vec<&MessageInfo> = messages.iter().collect();
+        let refs: Vec<&Message> = messages.iter().collect();
 
         let dots = flight_dots(&refs, orchestrator, worker);
 
@@ -1477,7 +1550,7 @@ mod tests {
         let (workspace, cx) = setup(cx);
 
         let (orchestrator, pty_io, mark) = workspace.read_with(cx, |workspace, _| {
-            let messages: Vec<&MessageInfo> = workspace
+            let messages: Vec<&Message> = workspace
                 .data
                 .task_messages(workspace.active_task)
                 .collect();
@@ -1595,7 +1668,7 @@ mod tests {
         let (workspace, cx) = setup(cx);
         let in_flight = |cx: &mut VisualTestContext| {
             workspace.read_with(cx, |workspace, _| {
-                let messages: Vec<&MessageInfo> = workspace
+                let messages: Vec<&Message> = workspace
                     .data
                     .task_messages(workspace.active_task)
                     .collect();
@@ -1633,6 +1706,136 @@ mod tests {
         assert_eq!(panel, None);
         assert_eq!(choice, Some(RightPanel::Changes));
         assert_eq!(back, Some(RightPanel::Changes));
+    }
+
+    #[gpui::test]
+    fn a_card_label_counts_the_messages_in_flight(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+
+        let (plain, one, two) = workspace.read_with(cx, |workspace, _| {
+            let worker = workspace.active_task().workers[1];
+            let agent = workspace.data.agent(worker).expect("a worker");
+
+            (
+                card_label(agent, 0),
+                card_label(agent, 1),
+                card_label(agent, 2),
+            )
+        });
+
+        assert_eq!(plain, "pty-io, Codex, Blocked");
+        assert_eq!(one, "pty-io, Codex, Blocked, 1 message in flight");
+        assert_eq!(two, "pty-io, Codex, Blocked, 2 messages in flight");
+    }
+
+    #[test]
+    fn the_scroll_key_follows_the_newest_message_not_the_count() {
+        let message = |id: u64| Message {
+            id: MessageId(id),
+            from: None,
+            to: DaemonAgentId(1),
+            kind: MessageKind::Task,
+            text: SharedString::default(),
+            sent_at: id,
+            delivered_at: None,
+        };
+        let agent = AgentId(1);
+        let before = [message(1), message(2)];
+        let after = [message(2), message(3)];
+
+        assert_eq!(before.len(), after.len());
+        assert_ne!(scroll_key(agent, &before), scroll_key(agent, &after));
+        assert_eq!(scroll_key(agent, &[]), (agent, None));
+    }
+
+    fn add_thread_messages(
+        workspace: &gpui::Entity<Workspace>,
+        range: std::ops::Range<u64>,
+        cx: &mut VisualTestContext,
+    ) {
+        workspace.update(cx, |workspace, _| {
+            let orchestrator = id_of(workspace, "orchestrator");
+            let Some((project, task)) = workspace.data.message_key(workspace.active_task) else {
+                return;
+            };
+
+            for id in range {
+                workspace.data.record_message(&swarm_protocol::MessageInfo {
+                    id: MessageId(id),
+                    project,
+                    task,
+                    from: Some(orchestrator),
+                    to: id_of(workspace, "bench"),
+                    kind: MessageKind::Task,
+                    text: format!("a long enough message to take some room {id}"),
+                    sent_at: SAMPLE_NOW,
+                    delivered_at: Some(SAMPLE_NOW),
+                });
+            }
+        });
+    }
+
+    fn following(workspace: &gpui::Entity<Workspace>, cx: &mut VisualTestContext) -> bool {
+        workspace.read_with(cx, |workspace, _| {
+            workspace.messages_list.is_following_tail()
+        })
+    }
+
+    fn scroll_position(
+        workspace: &gpui::Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> gpui::ListOffset {
+        workspace.read_with(cx, |workspace, _| {
+            workspace.messages_list.logical_scroll_top()
+        })
+    }
+
+    #[gpui::test]
+    fn a_new_message_scrolls_only_a_thread_that_was_at_the_bottom(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        add_thread_messages(&workspace, 100..140, cx);
+        redraw(cx);
+        redraw(cx);
+        assert!(following(&workspace, cx));
+
+        add_thread_messages(&workspace, 140..141, cx);
+        redraw(cx);
+        redraw(cx);
+        assert!(following(&workspace, cx));
+
+        workspace.read_with(cx, |workspace, _| {
+            workspace.messages_list.scroll_by(px(-600.));
+        });
+        redraw(cx);
+        let reading = scroll_position(&workspace, cx);
+        assert!(!following(&workspace, cx));
+
+        add_thread_messages(&workspace, 141..142, cx);
+        redraw(cx);
+        redraw(cx);
+        assert!(!following(&workspace, cx));
+        assert_eq!(scroll_position(&workspace, cx).item_ix, reading.item_ix);
+    }
+
+    #[gpui::test]
+    fn only_view_diff_filters_review_to_an_agent(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let worker = workspace.read_with(cx, |workspace, _| workspace.active_task().workers[0]);
+        let filter = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| workspace.review_agent)
+        };
+
+        workspace.update(cx, |workspace, cx| workspace.view_agent_diff(worker, cx));
+        assert_eq!(filter(cx), Some(worker));
+
+        workspace.update_in(cx, |_, window, cx| {
+            window.dispatch_action(Box::new(actions::ShowReview), cx);
+        });
+        assert_eq!(filter(cx), None);
+
+        workspace.update(cx, |workspace, cx| workspace.view_agent_diff(worker, cx));
+        workspace.update(cx, |workspace, cx| workspace.set_view(View::Review, cx));
+        assert_eq!(filter(cx), None);
     }
 
     #[gpui::test]

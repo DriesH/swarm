@@ -60,6 +60,36 @@ pub(crate) struct Project {
 /// The newest messages kept for each task.
 pub(crate) const MESSAGES_PER_TASK: usize = 500;
 
+/// How many delivery times are kept for messages that have not been listed yet.
+const EARLY_DELIVERIES: usize = 1_000;
+
+/// A message as the app keeps it: the text is cheap to clone for rendering.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Message {
+    pub id: MessageId,
+    pub from: Option<DaemonAgentId>,
+    pub to: DaemonAgentId,
+    pub kind: MessageKind,
+    pub text: SharedString,
+    pub sent_at: u64,
+    /// `None` while the message is in flight.
+    pub delivered_at: Option<u64>,
+}
+
+impl From<&MessageInfo> for Message {
+    fn from(info: &MessageInfo) -> Self {
+        Self {
+            id: info.id,
+            from: info.from,
+            to: info.to,
+            kind: info.kind,
+            text: SharedString::from(info.text.clone()),
+            sent_at: info.sent_at,
+            delivered_at: info.delivered_at,
+        }
+    }
+}
+
 /// What links a task to the daemon.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DaemonTask {
@@ -183,6 +213,8 @@ pub(crate) struct Agent {
     pub terminal: TerminalId,
     /// Milliseconds since the Unix epoch; 0 when unknown.
     pub created_at: u64,
+    /// When its process last started, if it did.
+    pub started_at: Option<u64>,
     /// When its process last ended, if it did.
     pub ended_at: Option<u64>,
     /// What a fake agent says it does, where a real one shows the program's status text.
@@ -192,6 +224,11 @@ pub(crate) struct Agent {
 }
 
 impl Agent {
+    /// When the running time starts: the last process start, else the creation.
+    pub(crate) fn running_since(&self) -> u64 {
+        self.started_at.unwrap_or(self.created_at)
+    }
+
     /// The id messages use: the daemon's, or one made from the fake id.
     pub(crate) fn protocol_id(&self) -> DaemonAgentId {
         self.daemon
@@ -425,7 +462,9 @@ pub(crate) struct FakeData {
     /// The last [`MESSAGES_PER_TASK`] messages of each task, oldest first. A Start
     /// orchestrator's messages sit under its project with no task.
     pub messages:
-        HashMap<(swarm_protocol::ProjectId, Option<swarm_protocol::TaskId>), VecDeque<MessageInfo>>,
+        HashMap<(swarm_protocol::ProjectId, Option<swarm_protocol::TaskId>), VecDeque<Message>>,
+    /// Delivery times that came before their message, newest last.
+    pub early_deliveries: VecDeque<(MessageId, u64)>,
     /// The latest changes of each agent's worktree. Missing while unknown.
     pub diff_stats: HashMap<AgentId, DiffStat>,
 }
@@ -555,6 +594,7 @@ impl Builder {
             status: spec.status,
             terminal,
             created_at: 0,
+            started_at: None,
             ended_at: None,
             note: None,
             daemon: None,
@@ -1006,14 +1046,12 @@ impl FakeData {
 
         let log = self.messages.entry(key).or_default();
         for ((id, from, to, kind, seconds, delivered), text) in sample.into_iter().zip(texts) {
-            log.push_back(MessageInfo {
+            log.push_back(Message {
                 id: MessageId(id),
-                project: key.0,
-                task: key.1,
                 from: Some(id_of(from)),
                 to: id_of(to),
                 kind,
-                text: text.to_owned(),
+                text: SharedString::new(text),
                 sent_at: ago(seconds),
                 delivered_at: delivered.then(|| ago(seconds) + SECOND),
             });
@@ -1191,6 +1229,7 @@ impl FakeData {
             agent.model = SharedString::new(&info.model);
             agent.status = ui_status(info.status);
             agent.created_at = info.created_at;
+            agent.started_at = info.started_at;
             agent.ended_at = info.ended_at;
             agent.daemon = Some(daemon);
 
@@ -1245,6 +1284,7 @@ impl FakeData {
             status: ui_status(info.status),
             terminal,
             created_at: info.created_at,
+            started_at: info.started_at,
             ended_at: info.ended_at,
             note: None,
             daemon: Some(daemon),
@@ -1429,22 +1469,25 @@ impl FakeData {
 
     /// Keeps a message, up to the last [`MESSAGES_PER_TASK`] of its task, in id order.
     /// A copy of a kept message only fills in `delivered_at`.
-    pub(crate) fn record_message(&mut self, message: &MessageInfo) {
-        let log = self
-            .messages
-            .entry((message.project, message.task))
-            .or_default();
+    pub(crate) fn record_message(&mut self, info: &MessageInfo) {
+        let early = self.take_early_delivery(info.id);
+        let delivered_at = info.delivered_at.or(early);
 
-        if let Some(known) = log.iter_mut().find(|known| known.id == message.id) {
+        let log = self.messages.entry((info.project, info.task)).or_default();
+
+        if let Some(known) = log.iter_mut().find(|known| known.id == info.id) {
             if known.delivered_at.is_none() {
-                known.delivered_at = message.delivered_at;
+                known.delivered_at = delivered_at;
             }
 
             return;
         }
 
+        let mut message = Message::from(info);
+        message.delivered_at = delivered_at;
+
         let at = log.partition_point(|known| known.id < message.id);
-        log.insert(at, message.clone());
+        log.insert(at, message);
 
         while log.len() > MESSAGES_PER_TASK {
             log.pop_front();
@@ -1458,13 +1501,38 @@ impl FakeData {
         }
     }
 
-    /// Sets `delivered_at` on the kept messages with these ids.
+    /// Sets `delivered_at` on the kept messages with these ids. Ids not kept yet are
+    /// remembered, so a message that arrives later is not left in flight.
     pub(crate) fn mark_delivered(&mut self, ids: &[MessageId], delivered_at: u64) {
+        let mut missing: Vec<MessageId> = ids.to_vec();
+
         for message in self.messages.values_mut().flatten() {
-            if message.delivered_at.is_none() && ids.contains(&message.id) {
+            if !ids.contains(&message.id) {
+                continue;
+            }
+
+            missing.retain(|id| *id != message.id);
+
+            if message.delivered_at.is_none() {
                 message.delivered_at = Some(delivered_at);
             }
         }
+
+        for id in missing {
+            self.early_deliveries.push_back((id, delivered_at));
+        }
+        while self.early_deliveries.len() > EARLY_DELIVERIES {
+            self.early_deliveries.pop_front();
+        }
+    }
+
+    fn take_early_delivery(&mut self, id: MessageId) -> Option<u64> {
+        let at = self
+            .early_deliveries
+            .iter()
+            .position(|(early, _)| *early == id)?;
+
+        self.early_deliveries.remove(at).map(|(_, time)| time)
     }
 
     /// The kept messages of a task, oldest first. `None` is a Start orchestrator's.
@@ -1472,7 +1540,7 @@ impl FakeData {
         &self,
         project: swarm_protocol::ProjectId,
         task: Option<swarm_protocol::TaskId>,
-    ) -> impl Iterator<Item = &MessageInfo> {
+    ) -> impl Iterator<Item = &Message> {
         self.messages.get(&(project, task)).into_iter().flatten()
     }
 
@@ -1499,7 +1567,7 @@ impl FakeData {
     }
 
     /// The messages of a tab, oldest first.
-    pub(crate) fn task_messages(&self, task: TaskId) -> impl Iterator<Item = &MessageInfo> {
+    pub(crate) fn task_messages(&self, task: TaskId) -> impl Iterator<Item = &Message> {
         let (project, task) = self.message_key(task).unzip();
 
         project
@@ -1847,6 +1915,7 @@ impl FakeData {
             status: AgentStatus::Working,
             terminal,
             created_at: 0,
+            started_at: None,
             ended_at: None,
             note: None,
             daemon: None,
@@ -2089,6 +2158,7 @@ mod tests {
             lifecycle: AgentLifecycle::Running,
             revision,
             created_at: 0,
+            started_at: None,
             ended_at: None,
         }
     }
@@ -2293,6 +2363,74 @@ mod tests {
             .map(|message| (message.id.0, message.delivered_at))
             .collect();
         assert_eq!(kept, [(1, None), (2, Some(9)), (3, None)]);
+    }
+
+    fn delivery_times(data: &FakeData) -> Vec<(u64, Option<u64>)> {
+        data.messages_of(
+            swarm_protocol::ProjectId(1),
+            Some(swarm_protocol::TaskId(7)),
+        )
+        .map(|message| (message.id.0, message.delivered_at))
+        .collect()
+    }
+
+    #[test]
+    fn a_delivery_that_comes_before_its_message_is_applied_when_it_arrives() {
+        let mut data = FakeData::live();
+
+        data.mark_delivered(&[MessageId(2)], 9);
+        data.merge_messages(&[message(1), message(2)]);
+
+        assert_eq!(delivery_times(&data), [(1, None), (2, Some(9))]);
+        assert!(data.early_deliveries.is_empty());
+    }
+
+    #[test]
+    fn early_deliveries_are_bounded() {
+        let mut data = FakeData::live();
+        let ids: Vec<MessageId> = (0..1_500).map(MessageId).collect();
+
+        data.mark_delivered(&ids, 9);
+
+        assert_eq!(data.early_deliveries.len(), EARLY_DELIVERIES);
+        assert_eq!(data.early_deliveries.front(), Some(&(MessageId(500), 9)));
+    }
+
+    #[test]
+    fn a_delivered_copy_wins_over_a_kept_one_in_flight_and_never_the_reverse() {
+        let mut data = FakeData::live();
+        let delivered = MessageInfo {
+            delivered_at: Some(9),
+            ..message(1)
+        };
+
+        data.record_message(&message(1));
+        data.record_message(&delivered);
+        assert_eq!(delivery_times(&data), [(1, Some(9))]);
+
+        data.record_message(&message(1));
+        assert_eq!(delivery_times(&data), [(1, Some(9))]);
+    }
+
+    #[test]
+    fn a_resumed_agent_runs_since_its_last_start() {
+        let mut data = FakeData::live();
+        let info = |started_at| AgentInfo {
+            created_at: 100,
+            started_at,
+            ..agent_with(DaemonAgentStatus::Working, 1)
+        };
+
+        live_task(&mut data, vec![info(None)]);
+        let never_started = data.agents.last().map(Agent::running_since);
+
+        data.sync_agent(&AgentInfo {
+            revision: 2,
+            ..info(Some(500))
+        });
+        let resumed = data.agents.last().map(Agent::running_since);
+
+        assert_eq!((never_started, resumed), (Some(100), Some(500)));
     }
 
     #[test]

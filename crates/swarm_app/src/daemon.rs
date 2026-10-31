@@ -668,17 +668,24 @@ impl Workspace {
         .detach();
     }
 
-    /// Keeps the Swarm view's background work running only while the view is shown:
-    /// the poll for changes and the clock for running times.
-    pub(crate) fn sync_swarm_tasks(&mut self, cx: &mut Context<Self>) {
-        if self.view != View::Swarm || self.has_no_projects() {
+    /// Keeps the Swarm view's background work running only while the view is shown in an
+    /// active window: the poll for changes and the clock for running times. The poll
+    /// restarts, and so asks at once, when the open task changes.
+    pub(crate) fn sync_swarm_tasks(&mut self, window_active: bool, cx: &mut Context<Self>) {
+        if self.view != View::Swarm || self.has_no_projects() || !window_active {
             self.changes_poll = None;
+            self.polled_task = None;
             self.swarm_clock = None;
             return;
         }
 
+        if self.polled_task != Some(self.active_task) {
+            self.changes_poll = None;
+        }
+
         if self.changes_poll.is_none() && self.daemon.is_some() {
             self.changes_poll = Some(Self::poll_changes(cx));
+            self.polled_task = Some(self.active_task);
         }
 
         if self.swarm_clock.is_none() && self.fixed_now.is_none() {
@@ -703,6 +710,7 @@ impl Workspace {
                 };
 
                 if let Some((client, agents)) = request {
+                    let asked = agents.clone();
                     let asking = cx
                         .background_executor()
                         .spawn(async move { client.agent_changes(agents) });
@@ -710,7 +718,7 @@ impl Workspace {
                     match asking.await {
                         Ok(changes) => {
                             let applied = this.update(cx, |workspace, cx| {
-                                workspace.apply_changes(&changes, cx);
+                                workspace.apply_changes(&asked, &changes, cx);
                             });
 
                             if applied.is_err() {
@@ -738,12 +746,26 @@ impl Workspace {
         (!agents.is_empty()).then_some((client, agents))
     }
 
+    /// Keeps the changes of the asked agents. An asked agent missing from the reply loses
+    /// its stats, so a worktree that can no longer be read does not show old numbers.
     pub(crate) fn apply_changes(
         &mut self,
+        asked: &[DaemonAgentId],
         changes: &[(DaemonAgentId, DiffStat)],
         cx: &mut Context<Self>,
     ) {
         let mut updated = false;
+
+        for id in asked {
+            if changes.iter().any(|(answered, _)| answered == id) {
+                continue;
+            }
+            let Some(agent) = self.data.agent_with_daemon_id(*id).map(|agent| agent.id) else {
+                continue;
+            };
+
+            updated |= self.data.diff_stats.remove(&agent).is_some();
+        }
 
         for (id, stat) in changes {
             let Some(agent) = self.data.agent_with_daemon_id(*id).map(|agent| agent.id) else {
@@ -2118,6 +2140,7 @@ mod tests {
             lifecycle: AgentLifecycle::Running,
             revision: NEXT_REVISION.fetch_add(1, Ordering::Relaxed),
             created_at: 0,
+            started_at: None,
             ended_at: None,
         }
     }
@@ -3289,6 +3312,7 @@ mod tests {
             _ => None,
         });
         let (workspace, cx, _client) = real_task_workspace(&socket, cx);
+        cx.update(|window, _| window.activate_window());
         change_agent(
             &workspace,
             &agent_info(1, 7, DaemonAgentStatus::Working),
@@ -3317,6 +3341,118 @@ mod tests {
             requests.try_iter().next(),
             Some(vec![swarm_protocol::AgentId(1)])
         );
+    }
+
+    #[gpui::test]
+    fn a_delivered_event_before_its_message_is_not_lost(cx: &mut TestAppContext) {
+        let (workspace, cx, _client) = real_task_workspace(&fake_daemon(), cx);
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.message_event(
+                MessageEvent::Delivered {
+                    ids: vec![swarm_protocol::MessageId(1)],
+                    delivered_at: 9,
+                },
+                cx,
+            );
+            workspace.message_event(MessageEvent::Sent(history_message(1, None)), cx);
+        });
+
+        let delivered = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .data
+                .messages_of(DaemonProjectId(5), Some(DaemonTaskId(7)))
+                .map(|message| message.delivered_at)
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(delivered, [Some(9)]);
+    }
+
+    fn polling(workspace: &Entity<Workspace>, cx: &VisualTestContext) -> (bool, bool) {
+        workspace.read_with(cx, |workspace, _| {
+            (
+                workspace.changes_poll.is_some(),
+                workspace.swarm_clock.is_some(),
+            )
+        })
+    }
+
+    #[gpui::test]
+    fn polling_stops_after_leaving_the_swarm_view_or_when_the_window_is_inactive(
+        cx: &mut TestAppContext,
+    ) {
+        let socket = fake_daemon_replying(|_| None);
+        let (workspace, cx, _client) = real_task_workspace(&socket, cx);
+        workspace.update(cx, |workspace, _| workspace.fixed_now = None);
+        change_agent(
+            &workspace,
+            &agent_info(1, 7, DaemonAgentStatus::Working),
+            cx,
+        );
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        assert_eq!(polling(&workspace, cx), (false, false));
+
+        workspace.update(cx, |workspace, cx| workspace.set_view(View::Swarm, cx));
+        redraw(cx);
+        assert_eq!(polling(&workspace, cx), (true, true));
+
+        cx.deactivate_window();
+        cx.run_until_parked();
+        assert_eq!(polling(&workspace, cx), (false, false));
+
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        assert_eq!(polling(&workspace, cx), (true, true));
+
+        workspace.update(cx, |workspace, cx| workspace.set_view(View::Terminals, cx));
+        redraw(cx);
+        assert_eq!(polling(&workspace, cx), (false, false));
+    }
+
+    #[gpui::test]
+    fn the_poll_restarts_when_the_open_task_changes(cx: &mut TestAppContext) {
+        let socket = fake_daemon_replying(|_| None);
+        let (workspace, cx, _client) = real_task_workspace(&socket, cx);
+        cx.update(|window, _| window.activate_window());
+        workspace.update(cx, |workspace, cx| workspace.set_view(View::Swarm, cx));
+        redraw(cx);
+
+        let polled = workspace.read_with(cx, |workspace, _| workspace.polled_task);
+        workspace.update(cx, |workspace, cx| {
+            workspace.polled_task = Some(TaskId(u32::MAX - 1));
+            cx.notify();
+        });
+        redraw(cx);
+
+        let after = workspace.read_with(cx, |workspace, _| workspace.polled_task);
+        assert!(polled.is_some());
+        assert_eq!(after, polled);
+    }
+
+    #[gpui::test]
+    fn an_agent_missing_from_the_changes_loses_its_stats(cx: &mut TestAppContext) {
+        let (workspace, cx, _client) = real_task_workspace(&fake_daemon(), cx);
+        change_agent(
+            &workspace,
+            &agent_info(1, 7, DaemonAgentStatus::Working),
+            cx,
+        );
+        let ask = [swarm_protocol::AgentId(1)];
+        let stat = DiffStat {
+            files: 1,
+            additions: 2,
+            deletions: 3,
+        };
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.apply_changes(&ask, &[(ask[0], stat)], cx);
+        });
+        let known = workspace.read_with(cx, |workspace, _| workspace.data.diff_stats.len());
+        workspace.update(cx, |workspace, cx| workspace.apply_changes(&ask, &[], cx));
+        let left = workspace.read_with(cx, |workspace, _| workspace.data.diff_stats.len());
+
+        assert_eq!((known, left), (1, 0));
     }
 
     type StartRequests = flume::Receiver<(DaemonProjectId, Option<swarm_protocol::AgentKind>)>;
