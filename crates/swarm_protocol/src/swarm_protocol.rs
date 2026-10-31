@@ -28,8 +28,9 @@ pub const MESSAGES_LISTED: usize = 500;
 /// The most files one [`AgentChange`] lists.
 pub const FILES_LISTED: usize = 500;
 
-/// The longest comment body, in bytes, like a message.
-pub const COMMENT_BYTES: usize = 64 << 10;
+/// The longest comment body, in bytes. A quarter of a message, so the orchestrator can
+/// pass a comment on with its header and quoted line.
+pub const COMMENT_BYTES: usize = 16 << 10;
 
 /// The most files one [`TaskDiff`] lists. Its totals still count every file.
 pub const DIFF_FILES: usize = 1_000;
@@ -569,7 +570,7 @@ pub enum Request {
         known: Option<u64>,
     },
     /// Approves the Merged diff with this fingerprint. Refused when the Merged diff
-    /// changed since. Answered with [`Event::TaskChanged`] to every client, then
+    /// changed since, or while comments of the task are pending. Answered with [`Event::TaskChanged`] to every client, then
     /// [`Event::Done`].
     ApproveTask {
         call: CallId,
@@ -608,8 +609,9 @@ pub enum Request {
         id: CommentId,
         resolved: bool,
     },
-    /// Sends every `Pending` comment of the task to its orchestrator in one `Comment`
-    /// message. Refused when none waits. Answered with a [`Event::CommentChanged`] per
+    /// Sends every `Pending` comment of the task to its orchestrator in `Comment`
+    /// messages of at most 64 KiB each. Refused when none waits, when the orchestrator
+    /// is stopped, or when the task has no orchestrator. Answered with a [`Event::CommentChanged`] per
     /// comment to every client, then [`Event::Done`].
     SendComments {
         call: CallId,
