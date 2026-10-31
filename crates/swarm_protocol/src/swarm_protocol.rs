@@ -45,6 +45,12 @@ pub const DIFF_LINES: usize = 50_000;
 /// Longer lines are cut to this many bytes, on a character boundary.
 pub const DIFF_LINE_BYTES: usize = 1_000;
 
+/// The longest a push may run in the daemon, pre-push hooks included.
+pub const PUSH_SECS: u64 = 600;
+
+/// The longest one `gh` call may run in the daemon.
+pub const GH_SECS: u64 = 60;
+
 /// Guards against a corrupt length prefix allocating gigabytes.
 const MAX_FRAME: usize = 256 << 20;
 
@@ -209,6 +215,9 @@ pub struct TaskInfo {
     /// The task was closed: its agents stopped and its worktrees are gone. Sent once in
     /// a `TaskChanged`; closed tasks are never listed.
     pub closed: bool,
+    /// The branch the pull request merges into: the branch the task started from when
+    /// `origin` has it, else the project's base branch.
+    pub pr_base: String,
     /// The pull request made from the task branch, once it exists.
     pub pull_request: Option<PrLink>,
     /// Close the task (as [`Request::CloseTask`] does) once its pull request is merged.
@@ -408,6 +417,8 @@ pub struct TaskDiff {
     /// A hash of every changed line, file mode and blob, also of lines left out by
     /// the caps. Equal fingerprints mean equal changes. Stable across daemon restarts.
     pub fingerprint: u64,
+    /// The commit at HEAD of the task worktree when the diff was read.
+    pub head: String,
     /// Totals over every changed file, also files past [`DIFF_FILES`].
     pub stat: DiffStat,
     /// Up to [`DIFF_FILES`] files, sorted by worktree, then path.
@@ -508,6 +519,8 @@ pub enum CheckState {
     Running,
     Passed,
     Failed,
+    /// Not run, because an earlier check failed.
+    Skipped,
     /// Its terminal was closed or the run was replaced before it ended.
     Stopped,
 }
@@ -531,6 +544,10 @@ pub struct ChecksRun {
     /// HEAD of the task worktree when the run started. A newer commit makes the result
     /// stale.
     pub commit: String,
+    /// The task worktree had no uncommitted changes and the same HEAD when the run
+    /// started and when it ended, so the checks tested exactly `commit`. Only a clean
+    /// run can let a pull request through.
+    pub clean: bool,
     /// `[checks] required`: a pull request needs every check passed on its commit.
     pub required: bool,
     pub checks: Vec<LocalCheck>,
@@ -550,6 +567,23 @@ pub struct PrDraft {
 pub struct PrLink {
     pub number: u64,
     pub url: String,
+    /// The commit Swarm last pushed to it. Merging only merges this commit.
+    pub head: String,
+}
+
+/// What the pull request panel needs from the daemon for one task.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PrPanel {
+    /// `[checks] before_pr` as configured now. Empty means no local checks.
+    pub commands: Vec<String>,
+    /// `[checks] required`.
+    pub required: bool,
+    /// The pre-push hook git runs on push, as in [`ChecksRun::pre_push_hook`].
+    pub pre_push_hook: Option<String>,
+    /// The latest run, if any. It does not survive a daemon restart.
+    pub run: Option<ChecksRun>,
+    /// The latest draft from the orchestrator, if any.
+    pub draft: Option<PrDraft>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -776,8 +810,9 @@ pub enum Request {
         call: CallId,
         task: TaskId,
     },
-    /// The task's latest run. Answered with [`Event::Checks`].
-    ListChecks {
+    /// The configured checks, the latest run and the latest draft. Answered with
+    /// [`Event::PrPanel`].
+    PrPanel {
         call: CallId,
         task: TaskId,
     },
@@ -788,17 +823,28 @@ pub enum Request {
         call: CallId,
         task: TaskId,
     },
-    /// Pushes the task branch and opens the pull request with `gh`. Refused unless the
-    /// Merged diff is approved as it is now, no comment is pending, and the local checks
-    /// passed on the current commit (when `[checks] required` is false, `skip_checks`
-    /// allows failed or missing checks). An error carries the push or `gh` output.
-    /// Answered with a `TaskChanged` to every client, then [`Event::Done`].
+    /// Reads HEAD of the task worktree once, then pushes exactly that commit to the task
+    /// branch and opens the pull request into [`TaskInfo::pr_base`] with `gh`. Refused
+    /// unless HEAD is the task branch, the Merged diff at that commit is approved, no
+    /// comment is pending, and a clean checks run passed on that commit (when
+    /// `[checks] required` is false, `skip_checks` allows failed or missing checks). An
+    /// open pull request from the branch that Swarm did not record is taken over
+    /// instead. An error carries the push or `gh` output. Answered with a `TaskChanged`
+    /// to every client, then [`Event::Done`].
     CreatePr {
         call: CallId,
         task: TaskId,
         draft: PrDraft,
         as_draft: bool,
         close_after_merge: bool,
+        skip_checks: bool,
+    },
+    /// Pushes new commits to the task's open pull request, under the same rules as
+    /// [`Request::CreatePr`]. Answered with a `TaskChanged` to every client, then
+    /// [`Event::Done`].
+    UpdatePr {
+        call: CallId,
+        task: TaskId,
         skip_checks: bool,
     },
     /// Answered with [`Event::PrStatus`].
@@ -817,9 +863,12 @@ pub enum Request {
         task: TaskId,
         logins: Vec<String>,
     },
-    /// Merges the pull request on GitHub and deletes its remote branch. With
-    /// `close_after_merge`, the task then closes unless closing would lose uncommitted
-    /// work. Answered with a `TaskChanged` to every client, then [`Event::Done`].
+    /// Merges the pull request on GitHub, but only when its head is still
+    /// [`PrLink::head`], confirms the merge, and deletes the remote branch. With
+    /// `close_after_merge`, the task then closes only when nothing would be lost: no
+    /// uncommitted work and no local commit that is not in the pull request. A merge
+    /// queue leaves the pull request open. Answered with a `TaskChanged` to every
+    /// client, then [`Event::Done`].
     MergePr {
         call: CallId,
         task: TaskId,
@@ -954,10 +1003,9 @@ pub enum Event {
         call: CallId,
         branches: Vec<String>,
     },
-    /// `None` when the task never ran its checks.
-    Checks {
+    PrPanel {
         call: CallId,
-        run: Option<ChecksRun>,
+        panel: PrPanel,
     },
     /// Sent to every client whenever a check of a run starts or ends.
     ChecksChanged {

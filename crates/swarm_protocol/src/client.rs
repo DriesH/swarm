@@ -17,10 +17,10 @@ use swarm_term::{TerminalChannels, TerminalInput, TerminalOutput};
 
 use crate::{
     AgentChange, AgentId, AgentInfo, AgentKind, CallId, ChecksRun, CloseCheck, CommentId,
-    CreateTask, CreateTerminal, Event, FrameError, GithubStatus, MergeMethod, MessageId,
-    MessageInfo, NewComment, Paths, PrDraft, ProjectId, ProjectInfo, PullRequest, Request,
-    ReviewComment, ReviewSource, TaskDiff, TaskId, TaskInfo, TerminalId, TerminalInfo, VERSION,
-    check_private_dir, read, write,
+    CreateTask, CreateTerminal, Event, FrameError, GH_SECS, GithubStatus, MergeMethod, MessageId,
+    MessageInfo, NewComment, PUSH_SECS, Paths, PrDraft, PrPanel, ProjectId, ProjectInfo,
+    PullRequest, Request, ReviewComment, ReviewSource, TaskDiff, TaskId, TaskInfo, TerminalId,
+    TerminalInfo, VERSION, check_private_dir, read, write,
 };
 
 /// Local checks moved on, or the orchestrator sent a pull request draft.
@@ -55,8 +55,10 @@ const SPAWN_TIMEOUT: Duration = Duration::from_secs(3);
 const GIT_TIMEOUT: Duration = Duration::from_secs(60);
 /// Closing waits for agents to stop, then runs the teardown script (60 s at most).
 const CLOSE_TASK_TIMEOUT: Duration = Duration::from_secs(180);
-/// Creating a pull request pushes first, and a pre-push hook may run the test suite.
-const CREATE_PR_TIMEOUT: Duration = Duration::from_secs(600);
+/// Creating or updating a pull request pushes first, then calls `gh` a few times.
+const CREATE_PR_TIMEOUT: Duration = Duration::from_secs(PUSH_SECS + 4 * GH_SECS + 30);
+/// Merging calls `gh` a few times and may then close the task.
+const MERGE_PR_TIMEOUT: Duration = Duration::from_secs(180 + 4 * GH_SECS + 30);
 const SPAWN_POLL: Duration = Duration::from_millis(50);
 
 /// The only variables the daemon inherits from the app.
@@ -584,11 +586,13 @@ impl Client {
         )
     }
 
-    /// The task's latest checks run, if it ever ran them.
-    pub fn list_checks(&self, task: TaskId) -> Result<Option<ChecksRun>, ClientError> {
-        match self.call(|call| Request::ListChecks { call, task }, None)? {
-            Event::Checks { run, .. } => Ok(run),
-            other => Err(unexpected("ListChecks", &other)),
+    /// The configured checks, the latest run and the latest draft of a task.
+    pub fn pr_panel(&self, task: TaskId) -> Result<PrPanel, ClientError> {
+        let timeout = self.reply_timeout.max(GIT_TIMEOUT);
+
+        match self.call_with_timeout(|call| Request::PrPanel { call, task }, None, timeout)? {
+            Event::PrPanel { panel, .. } => Ok(panel),
+            other => Err(unexpected("PrPanel", &other)),
         }
     }
 
@@ -624,6 +628,18 @@ impl Client {
         self.done(request, "CreatePr", timeout)
     }
 
+    /// Pushes new commits to the task's open pull request.
+    pub fn update_pr(&self, task: TaskId, skip_checks: bool) -> Result<(), ClientError> {
+        let timeout = self.reply_timeout.max(CREATE_PR_TIMEOUT);
+        let request = |call| Request::UpdatePr {
+            call,
+            task,
+            skip_checks,
+        };
+
+        self.done(request, "UpdatePr", timeout)
+    }
+
     pub fn pr_status(&self, task: TaskId) -> Result<PullRequest, ClientError> {
         let timeout = self.reply_timeout.max(GIT_TIMEOUT);
 
@@ -652,7 +668,7 @@ impl Client {
 
     /// Merges the pull request; with close after merge, the task may close too.
     pub fn merge_pr(&self, task: TaskId, method: MergeMethod) -> Result<(), ClientError> {
-        let timeout = self.reply_timeout.max(CLOSE_TASK_TIMEOUT);
+        let timeout = self.reply_timeout.max(MERGE_PR_TIMEOUT);
         let request = |call| Request::MergePr { call, task, method };
 
         self.done(request, "MergePr", timeout)
@@ -1025,7 +1041,7 @@ fn read_events(
             Event::Branches { call, branches } => {
                 deliver(shared, call, Event::Branches { call, branches });
             }
-            Event::Checks { call, run } => deliver(shared, call, Event::Checks { call, run }),
+            Event::PrPanel { call, panel } => deliver(shared, call, Event::PrPanel { call, panel }),
             Event::PrStatus { call, pull_request } => {
                 deliver(shared, call, Event::PrStatus { call, pull_request });
             }

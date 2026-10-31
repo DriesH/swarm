@@ -489,6 +489,7 @@ fn task_info() -> TaskInfo {
         briefed: false,
         approved: None,
         closed: false,
+        pr_base: "main".into(),
         pull_request: None,
         close_after_merge: false,
     }
