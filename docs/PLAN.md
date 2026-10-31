@@ -144,7 +144,7 @@ Four kinds:
 | Call | Who | What |
 |---|---|---|
 | `terminal.spawn {cmd, cwd?, size?, name?}` | any agent | Starts a process terminal. `size` is `{cols, rows}` or `small` / `medium` / `large`. Returns an ID. |
-| `terminal.resize {id, size}` | owner agent | Asks for a new size. The layout grants the closest size that fits and returns it. |
+| `terminal.resize {id, size}` | owner agent | Asks for a new size. The daemon clamps it to 20–300 columns and 5–100 rows and returns the size it granted. The layout fits the tile around that size. |
 | `terminal.read {id, lines?}` | owner agent, orchestrator | Reads the screen or the last lines of output. |
 | `terminal.wait {id, until: exit\|output-match, pattern?}` | owner agent, orchestrator | Waits for exit or for a line such as `ready in`. |
 | `terminal.kill {id, signal?}` | owner agent, orchestrator | Stops the process; the terminal closes. |
@@ -323,6 +323,7 @@ Reports in `docs/spikes/`. Code in `spikes/` (throwaway).
 - Claude Code: pick the session ID up front with `--session-id`; resume with `--resume <id>`. Hooks via `--settings <file>`, never by editing the user's settings.
 - Codex: `--dangerously-bypass-approvals-and-sandbox` to skip approvals; `-c developer_instructions=…` adds to AGENTS.md; `codex resume <id>` (pass `-m` again for `codex exec resume`); the session ID only arrives at the first prompt; hooks passed with `-c` need their trust hash passed too.
 - Start Codex with `-c check_for_update_on_startup=false`. Never type into an agent before it reports `idle`: startup prompts swallow input (a spike accepted a Codex update this way).
+- Codex's `workspace-write` sandbox blocks unix sockets and makes `.git` read-only. Codex agents use the `swarm` MCP tools (MCP servers run outside the sandbox, and Codex passes them only the env names listed in `env_vars`), and get the main repository's `.git` and their own `.git/worktrees/<name>` as writable roots so they can commit.
 - Both CLIs ask once per project whether to trust the folder; they key trust on the main repository root, so worktrees share the answer. Swarm never pre-trusts. While the dialog shows, the agent is blocked with "Trust this folder".
 
 **Usage and menu bar**
