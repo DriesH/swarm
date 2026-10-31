@@ -109,7 +109,7 @@ fn task_tab(
 
     Tab::new(
         ("task", id.0 as usize),
-        task.name.clone(),
+        workspace.data.tab_label(task),
         ring_status(task.status),
     )
     .debug_selector(move || format!("tab-{}", id.0))

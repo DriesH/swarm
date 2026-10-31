@@ -11,9 +11,12 @@ use swarm_ui::prelude::*;
 use swarm_ui::styles::focus_ring;
 use swarm_ui::{FocusStyle, TextFieldSize, TileRing};
 
+use crate::daemon::{CHROME_HEIGHT, CHROME_WIDTH};
 use crate::model::{Agent, AgentKind, FakeLine, Terminal, TerminalId, TerminalKind};
 use crate::workspace::{DataSource, View, Workspace};
 
+/// The padding a terminal view leaves around its grid.
+const VIEW_PADDING: f32 = 8.;
 const CHAR_WIDTH: f32 = 7.2;
 const ROW_HEIGHT: f32 = 17.;
 const HEADER_HEIGHT: f32 = 34.;
@@ -123,6 +126,17 @@ fn process_size(columns: u16, rows: u16) -> swarm_layout::Size {
     )
 }
 
+/// Size of a tile for a process terminal that an agent fixed at `columns` × `rows`,
+/// from the terminal view's cell size when it is known.
+fn fixed_size(cell: Option<(f32, f32)>, columns: u16, rows: u16) -> swarm_layout::Size {
+    let (cell_width, cell_height) = cell.unwrap_or((CHAR_WIDTH, ROW_HEIGHT));
+
+    swarm_layout::Size::new(
+        f32::from(columns) * cell_width + 2. * VIEW_PADDING + CHROME_WIDTH,
+        f32::from(rows) * cell_height + 2. * VIEW_PADDING + CHROME_HEIGHT,
+    )
+}
+
 /// Cells that fit in a tile of this size.
 fn cells(size: Size<Pixels>) -> (u32, u32) {
     let columns = (f32::from(size.width) / CHAR_WIDTH).floor().max(0.);
@@ -162,6 +176,10 @@ fn tile_spec(workspace: &Workspace, terminal: &Terminal, activity: Activity) -> 
     spec.requested = terminal
         .requested_size
         .map(|(columns, rows)| process_size(columns, rows));
+
+    if let Some((columns, rows)) = terminal.fixed_size {
+        spec.fixed = Some(fixed_size(workspace.cell_size, columns, rows));
+    }
 
     if terminal.kind == TerminalKind::User {
         spec.fixed = workspace
@@ -213,9 +231,7 @@ pub(crate) fn tile_specs(workspace: &Workspace) -> Vec<TileSpec> {
 }
 
 pub(crate) fn compute_layout(workspace: &Workspace) -> Layout {
-    let area = workspace
-        .terminal_area
-        .map_or(FIRST_FRAME_AREA, |bounds| bounds.size);
+    let area = workspace.terminal_area_size().unwrap_or(FIRST_FRAME_AREA);
 
     let specs = tile_specs(workspace);
 
@@ -261,6 +277,7 @@ impl Workspace {
 
         if let Some(live) = self.live_terminals.remove(&terminal) {
             live.kill_if_running(cx);
+            self.dismissed_terminals.insert(live.daemon_id());
         }
 
         self.data.stop_process(task, terminal);
@@ -282,10 +299,12 @@ impl Workspace {
 
     /// The size a new user terminal tile starts with.
     pub(crate) fn planned_user_size(&self) -> Size<Pixels> {
-        let size = self.terminal_area.map_or(DEFAULT_USER_SIZE, |bounds| Size {
-            width: DEFAULT_USER_SIZE.width.min(bounds.size.width - px(350.)),
-            height: DEFAULT_USER_SIZE.height.min(bounds.size.height - px(20.)),
-        });
+        let size = self
+            .terminal_area_size()
+            .map_or(DEFAULT_USER_SIZE, |area| Size {
+                width: DEFAULT_USER_SIZE.width.min(area.width - px(350.)),
+                height: DEFAULT_USER_SIZE.height.min(area.height - px(20.)),
+            });
 
         size.max(&MIN_TILE)
     }
@@ -355,10 +374,12 @@ impl Workspace {
         size: Size<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        let largest = self.terminal_area.map_or(FIRST_FRAME_AREA, |bounds| Size {
-            width: bounds.size.width - px(20.),
-            height: bounds.size.height - px(20.),
-        });
+        let largest = self
+            .terminal_area_size()
+            .map_or(FIRST_FRAME_AREA, |area| Size {
+                width: area.width - px(20.),
+                height: area.height - px(20.),
+            });
         let size = size.min(&largest).max(&MIN_TILE);
 
         if self.user_sizes.get(&terminal) != Some(&size) {
@@ -393,12 +414,19 @@ impl Workspace {
         cx.notify();
     }
 
-    fn set_terminal_area(&mut self, bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
-        let resized = self.terminal_area.map(|area| area.size) != Some(bounds.size);
+    fn set_terminal_area(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let resized = self.terminal_area_size() != Some(bounds.size);
         self.terminal_area = Some(bounds);
+        self.terminal_area_had_panel = self.visible_panel().is_some();
 
+        // A notify during prepaint can wait for the next input; this draws right away.
         if resized {
-            cx.notify();
+            cx.on_next_frame(window, |_, _, cx| cx.notify());
         }
     }
 
@@ -467,9 +495,11 @@ fn terminals(workspace: &Workspace, cx: &mut Context<Workspace>) -> impl IntoEle
         .collect();
 
     div()
-        .on_children_prepainted(move |bounds, _, cx| {
+        .on_children_prepainted(move |bounds, window, cx| {
             if let Some(first) = bounds.first() {
-                area.update(cx, |workspace, cx| workspace.set_terminal_area(*first, cx));
+                area.update(cx, |workspace, cx| {
+                    workspace.set_terminal_area(*first, window, cx);
+                });
             }
         })
         .id("terminals")
@@ -840,8 +870,8 @@ mod tests {
     use gpui::{TestAppContext, VisualTestContext};
 
     use super::*;
-    use crate::actions::{self, NewTerminal};
-    use crate::model::AgentId;
+    use crate::actions::{self, NewTerminal, PlanWithOrchestrator};
+    use crate::model::{AgentId, TaskId};
 
     fn setup(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
         cx.update(|cx| {
@@ -938,6 +968,23 @@ mod tests {
         let area = workspace.read_with(cx, |workspace, _| workspace.terminal_area);
 
         assert!(area.is_some());
+    }
+
+    #[gpui::test]
+    fn a_tab_switch_that_shows_the_panel_lays_out_for_the_new_area(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        cx.dispatch_action(PlanWithOrchestrator);
+        redraw(cx);
+
+        let before_measure = workspace.update(cx, |workspace, cx| {
+            workspace.select_task(TaskId(1), cx);
+            compute_layout(workspace)
+        });
+        redraw(cx);
+        let measured = workspace.read_with(cx, |workspace, _| workspace.layout.clone());
+
+        assert!(!measured.placed.is_empty());
+        assert_eq!(before_measure.placed, measured.placed);
     }
 
     #[gpui::test]

@@ -8,9 +8,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use swarm_core::git;
-use swarm_core::store::Store;
-use swarm_core::{Error, Projects};
-use swarm_protocol::{CreateTask, ProjectId};
+use swarm_core::store::{NewAgent, Store};
+use swarm_core::{Error, Projects, WorkerCheckout};
+use swarm_protocol::{AgentInfo, AgentKind, AgentRole, CreateTask, ProjectId, TaskInfo};
 
 static NEXT_FOLDER: AtomicU32 = AtomicU32::new(0);
 
@@ -544,4 +544,332 @@ fn a_name_without_letters_is_an_error() {
     let result = projects.create_task(&request(project.id, "???"));
 
     assert!(matches!(result, Err(Error::Invalid(_))));
+}
+
+fn shared_projects() -> (Projects, Arc<Mutex<Store>>) {
+    let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+
+    (Projects::new(Arc::clone(&store)), store)
+}
+
+fn register_worker(
+    store: &Arc<Mutex<Store>>,
+    checkout: &WorkerCheckout,
+) -> Result<AgentInfo, Error> {
+    store.lock().expect("lock").add_agent(&NewAgent {
+        project: checkout.project,
+        task: Some(checkout.task),
+        role: AgentRole::Worker,
+        kind: AgentKind::ClaudeCode,
+        model: "sonnet",
+        session_id: None,
+        name: &checkout.name,
+        worktree: &checkout.worktree,
+        branch: &checkout.branch,
+        ports: &checkout.ports,
+    })
+}
+
+fn task_with_a_commit(projects: &Projects, repo: &Repo) -> TaskInfo {
+    let project = projects.add(&repo.root).expect("add");
+    let task = projects
+        .create_task(&request(project.id, "Login"))
+        .expect("task")
+        .task;
+    std::fs::write(task.worktree.join("task-file"), "from the task").expect("file");
+    git_in(&task.worktree, &["add", "task-file"]);
+    git_in(&task.worktree, &["commit", "-q", "-m", "task commit"]);
+
+    task
+}
+
+fn git_in(folder: &Path, arguments: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(folder)
+        .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+        .args(arguments)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {arguments:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+#[test]
+fn a_worker_gets_a_branch_from_the_task_branch_and_its_own_worktree() {
+    let repo = Repo::new(CONFIG);
+    let (projects, store) = shared_projects();
+    let task = task_with_a_commit(&projects, &repo);
+
+    let prepared = projects
+        .create_worker(&task, "API Layer", |checkout| {
+            register_worker(&store, checkout)
+        })
+        .expect("worker");
+
+    assert_eq!(prepared.agent.name, "api-layer");
+    assert_eq!(prepared.agent.branch, "swarm/login--api-layer");
+    assert_eq!(
+        prepared.agent.worktree,
+        repo.root.join(".worktrees/login--api-layer")
+    );
+    assert_eq!(prepared.agent.role, AgentRole::Worker);
+    assert!(
+        repo.branches()
+            .contains(&"swarm/login--api-layer".to_owned())
+    );
+    assert!(prepared.agent.worktree.join("task-file").is_file());
+    assert_eq!(
+        std::fs::read_to_string(prepared.agent.worktree.join(".env")).expect("copied"),
+        "SECRET=1"
+    );
+    assert_eq!(prepared.setup.as_deref(), Some("echo ready > setup-ran"));
+}
+
+#[test]
+fn worker_ports_do_not_overlap_the_task_or_other_workers() {
+    let repo = Repo::new("[worktrees]\nports = { range = \"5170-5179\", per_worktree = 3 }\n");
+    let (projects, store) = shared_projects();
+    let task = task_with_a_commit(&projects, &repo);
+    assert_eq!(task.ports, [5170, 5171, 5172]);
+
+    let first = projects
+        .create_worker(&task, "one", |checkout| register_worker(&store, checkout))
+        .expect("first");
+    let second = projects
+        .create_worker(&task, "two", |checkout| register_worker(&store, checkout))
+        .expect("second");
+
+    let ports = |env: &[(String, String)]| {
+        env.iter()
+            .find(|(name, _)| name == "SWARM_PORTS")
+            .map(|(_, value)| value.clone())
+    };
+    assert_eq!(ports(&first.env).as_deref(), Some("5173,5174,5175"));
+    assert_eq!(ports(&second.env).as_deref(), Some("5176,5177,5178"));
+}
+
+#[test]
+fn a_worker_name_is_unique_within_its_task() {
+    let repo = Repo::new("");
+    let (projects, store) = shared_projects();
+    let task = task_with_a_commit(&projects, &repo);
+    projects
+        .create_worker(&task, "api", |checkout| register_worker(&store, checkout))
+        .expect("first");
+
+    let result =
+        projects.create_worker(&task, "API!", |checkout| register_worker(&store, checkout));
+
+    assert!(
+        matches!(&result, Err(Error::Invalid(message)) if message.contains("already")),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn a_worker_name_without_letters_is_refused() {
+    let repo = Repo::new("");
+    let (projects, store) = shared_projects();
+    let task = task_with_a_commit(&projects, &repo);
+
+    let result = projects.create_worker(&task, "!!!", |checkout| register_worker(&store, checkout));
+
+    assert!(
+        matches!(&result, Err(Error::Invalid(message)) if message.contains("worker name")),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn a_failed_registration_leaves_no_worker_behind() {
+    let repo = Repo::new(CONFIG);
+    let (projects, _store) = shared_projects();
+    let task = task_with_a_commit(&projects, &repo);
+
+    let result = projects.create_worker(&task, "api", |_| {
+        Err(Error::Invalid("cannot record".to_owned()))
+    });
+
+    assert!(result.is_err());
+    assert!(!repo.branches().contains(&"swarm/login--api".to_owned()));
+    assert!(!repo.root.join(".worktrees/login--api").exists());
+}
+
+#[test]
+fn merging_a_worker_branch_makes_a_merge_commit() {
+    let repo = Repo::new("");
+    let (projects, store) = shared_projects();
+    let task = task_with_a_commit(&projects, &repo);
+    let worker = projects
+        .create_worker(&task, "api", |checkout| register_worker(&store, checkout))
+        .expect("worker")
+        .agent;
+    std::fs::write(worker.worktree.join("api.rs"), "fn api() {}").expect("file");
+    git_in(&worker.worktree, &["add", "api.rs"]);
+    git_in(&worker.worktree, &["commit", "-q", "-m", "api"]);
+
+    let outcome = git::merge_branch(&task.worktree, &worker.branch).expect("merge");
+
+    assert!(outcome.merged, "{outcome:?}");
+    assert!(outcome.conflicts.is_empty());
+    assert!(task.worktree.join("api.rs").is_file());
+    let parents = git_in(&task.worktree, &["log", "-1", "--format=%p"]);
+    assert_eq!(
+        parents.split(' ').count(),
+        2,
+        "a merge commit has two parents"
+    );
+}
+
+#[test]
+fn a_conflicting_merge_is_an_outcome_and_stays_open() {
+    let repo = Repo::new("");
+    let (projects, store) = shared_projects();
+    let task = task_with_a_commit(&projects, &repo);
+    let worker = projects
+        .create_worker(&task, "api", |checkout| register_worker(&store, checkout))
+        .expect("worker")
+        .agent;
+    std::fs::write(worker.worktree.join("README.md"), "worker text").expect("file");
+    git_in(&worker.worktree, &["commit", "-q", "-am", "worker change"]);
+    std::fs::write(task.worktree.join("README.md"), "task text").expect("file");
+    git_in(&task.worktree, &["commit", "-q", "-am", "task change"]);
+
+    let outcome = git::merge_branch(&task.worktree, &worker.branch).expect("merge");
+
+    assert!(!outcome.merged);
+    assert_eq!(outcome.conflicts, [PathBuf::from("README.md")]);
+    assert!(outcome.output.contains("CONFLICT"), "{}", outcome.output);
+    assert!(task.worktree.join("README.md").is_file());
+    let status = git_in(&task.worktree, &["status", "--porcelain"]);
+    assert!(status.contains("UU README.md"), "{status}");
+}
+
+#[test]
+fn a_merge_of_a_missing_branch_is_an_error() {
+    let repo = Repo::new("");
+    let (projects, _store) = shared_projects();
+    let task = task_with_a_commit(&projects, &repo);
+
+    let result = git::merge_branch(&task.worktree, "swarm/nothing");
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn a_branch_that_looks_like_an_option_is_not_read_as_one() {
+    let repo = Repo::new("");
+    let (projects, _store) = shared_projects();
+    let task = task_with_a_commit(&projects, &repo);
+
+    let result = git::merge_branch(&task.worktree, "--abort");
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn a_linked_worktree_lists_only_the_git_folders_a_commit_writes() {
+    let repo = Repo::new("");
+    let (projects, store) = shared_projects();
+    let task = task_with_a_commit(&projects, &repo);
+    let worker = projects
+        .create_worker(&task, "api", |checkout| register_worker(&store, checkout))
+        .expect("worker")
+        .agent;
+
+    let folders = git::writable_git_dirs(&worker.worktree).expect("folders");
+
+    assert_eq!(
+        folders,
+        [
+            repo.root.join(".git/objects"),
+            repo.root.join(".git/refs"),
+            repo.root.join(".git/logs"),
+            repo.root.join(".git/worktrees/login--api")
+        ]
+    );
+    assert!(git::writable_git_dirs(&repo.root).expect("root").is_empty());
+}
+
+#[test]
+fn a_discarded_worker_leaves_no_branch_folder_or_ports() {
+    let repo = Repo::new(CONFIG);
+    let (projects, store) = shared_projects();
+    let task = task_with_a_commit(&projects, &repo);
+    let worker = projects
+        .create_worker(&task, "api", |checkout| register_worker(&store, checkout))
+        .expect("worker")
+        .agent;
+
+    projects.discard_worker(&worker);
+
+    assert!(!repo.branches().contains(&"swarm/login--api".to_owned()));
+    assert!(!worker.worktree.exists());
+    assert!(
+        store
+            .lock()
+            .expect("store")
+            .agent(worker.id)
+            .expect("read")
+            .is_none()
+    );
+    let again = projects
+        .create_worker(&task, "api", |checkout| register_worker(&store, checkout))
+        .expect("the name and ports are free again")
+        .agent;
+    assert_eq!(again.worktree, worker.worktree);
+}
+
+#[test]
+fn a_discarded_task_leaves_no_branch_folder_or_row() {
+    let repo = Repo::new(CONFIG);
+    let (projects, store) = shared_projects();
+    let project = projects.add(&repo.root).expect("add");
+    let task = projects
+        .create_task(&request(project.id, "login"))
+        .expect("task")
+        .task;
+
+    projects.discard_task(&task);
+
+    assert!(!repo.branches().contains(&task.branch));
+    assert!(!task.worktree.exists());
+    assert!(
+        store
+            .lock()
+            .expect("store")
+            .task(task.id)
+            .expect("read")
+            .is_none()
+    );
+}
+
+#[test]
+fn a_task_made_by_an_agent_records_it() {
+    let repo = Repo::new("");
+    let (projects, store) = shared_projects();
+    let project = projects.add(&repo.root).expect("add");
+
+    let task = projects
+        .create_task_by(
+            &request(project.id, "login"),
+            Some(swarm_protocol::AgentId(9)),
+        )
+        .expect("task")
+        .task;
+
+    assert_eq!(task.created_by, Some(swarm_protocol::AgentId(9)));
+    let stored = store
+        .lock()
+        .expect("store")
+        .task(task.id)
+        .expect("read")
+        .expect("task");
+    assert_eq!(stored.created_by, Some(swarm_protocol::AgentId(9)));
 }

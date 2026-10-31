@@ -12,9 +12,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
-use swarm_core::store::Store;
-use swarm_protocol::{CreateTerminal, Event, TerminalId, TerminalInfo, TerminalKind, encode};
-use swarm_term::{ExitStatus, TerminalInput, TerminalOutput, channels};
+use swarm_core::store::{ProcessMeta, Store};
+use swarm_protocol::{
+    CreateTerminal, Event, GridSize, TerminalId, TerminalInfo, TerminalKind, encode,
+};
+use swarm_term::{ExitStatus, Size, TerminalInput, TerminalOutput, channels};
 use swarm_term_vt::{DEFAULT_SCROLLBACK_BYTES, LocalTerminal, SpawnOptions};
 
 use crate::recovery::process_info;
@@ -42,10 +44,22 @@ pub(crate) struct Extras {
     pub(crate) on_exit: Option<Box<dyn FnOnce(Option<ExitStatus>) + Send>>,
     /// Sees every output on the hub thread before clients get it.
     pub(crate) on_output: Option<OutputObserver>,
+    /// Set for a process terminal an agent started.
+    pub(crate) process: Option<ProcessMeta>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A grid size as the PTY wants it. The cell size only matters for pixel reports.
+pub(crate) fn cell_size(grid: GridSize) -> Size {
+    Size {
+        cols: grid.cols,
+        rows: grid.rows,
+        cell_width: 8,
+        cell_height: 16,
+    }
 }
 
 pub(crate) fn encode_event(event: &Event) -> Option<Frame> {
@@ -140,6 +154,7 @@ struct Subscriber {
 
 #[derive(Default)]
 struct HubState {
+    process: Option<ProcessMeta>,
     title: Option<String>,
     cwd: Option<PathBuf>,
     exit: Option<ExitStatus>,
@@ -243,6 +258,7 @@ pub(crate) struct Hub {
     id: TerminalId,
     kind: TerminalKind,
     task: Option<String>,
+    pid: Option<u32>,
     input: flume::Sender<TerminalInput>,
     state: Mutex<HubState>,
 }
@@ -259,6 +275,12 @@ impl Hub {
             id: self.id,
             kind: self.kind,
             task: self.task.clone(),
+            owner: state.process.as_ref().map(|process| process.owner),
+            name: state
+                .process
+                .as_ref()
+                .and_then(|process| process.name.clone()),
+            fixed_size: state.process.as_ref().map(|process| process.size),
             title: state.title.clone(),
             cwd: state.cwd.clone(),
             exit: state.exit.clone(),
@@ -281,6 +303,38 @@ impl Hub {
 
     pub(crate) fn send_input(&self, input: TerminalInput) -> bool {
         self.input.send(input).is_ok()
+    }
+
+    /// The size an agent chose for its process terminal; the app must not change it.
+    pub(crate) fn fixed_size(&self) -> Option<GridSize> {
+        lock(&self.state)
+            .process
+            .as_ref()
+            .map(|process| process.size)
+    }
+
+    /// Resizes the PTY and remembers the size as the fixed one. Returns false when the
+    /// terminal is gone.
+    pub(crate) fn resize_fixed(&self, size: GridSize) -> bool {
+        if let Some(process) = &mut lock(&self.state).process {
+            process.size = size;
+        }
+
+        self.send_input(TerminalInput::Resize(cell_size(size)))
+    }
+
+    /// Sends the signal to the process group. Returns false when the terminal is gone
+    /// or the signal cannot be sent.
+    pub(crate) fn signal(&self, signal: libc::c_int) -> bool {
+        if lock(&self.state).closed {
+            return false;
+        }
+        let Some(group) = self.pid.and_then(|pid| libc::pid_t::try_from(pid).ok()) else {
+            return false;
+        };
+
+        // SAFETY: killpg takes plain integers and has no memory effects.
+        unsafe { libc::killpg(group, signal) == 0 }
     }
 
     /// Reads the terminal's output until it exits, then ends the hub.
@@ -400,6 +454,11 @@ impl Terminals {
         extras: Extras,
     ) -> Result<Arc<Hub>> {
         let id = lock(&self.store).insert_starting(&request)?;
+        if let Some(process) = &extras.process
+            && let Err(error) = lock(&self.store).set_process(id, process)
+        {
+            log::error!("cannot record the owner of terminal {}: {error}", id.0);
+        }
 
         let (terminal_channels, emulator_channels) = channels();
         let options = SpawnOptions {
@@ -438,7 +497,9 @@ impl Terminals {
             kind: request.kind,
             task: request.task,
             input: terminal_channels.input,
+            pid,
             state: Mutex::new(HubState {
+                process: extras.process,
                 cwd: request.cwd,
                 ..HubState::default()
             }),

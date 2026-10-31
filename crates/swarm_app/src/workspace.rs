@@ -21,6 +21,8 @@ use crate::palette::Overlay;
 use crate::views::Resizing;
 use crate::{panels, sidebar, status_bar, tab_bar, views};
 
+pub(crate) const RIGHT_PANEL_WIDTH: Pixels = px(320.);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum View {
     Terminals,
@@ -60,6 +62,8 @@ pub(crate) struct Workspace {
     pub(crate) terminal_focus: HashMap<TerminalId, FocusHandle>,
     pub(crate) overlay: Option<Overlay>,
     pub(crate) terminal_area: Option<Bounds<Pixels>>,
+    /// True when the right panel was shown as `terminal_area` was measured.
+    pub(crate) terminal_area_had_panel: bool,
     pub(crate) layout: swarm_layout::Layout,
     pub(crate) user_sizes: HashMap<TerminalId, Size<Pixels>>,
     pub(crate) resizing: Option<Resizing>,
@@ -73,6 +77,14 @@ pub(crate) struct Workspace {
     pub(crate) settings_path: Option<PathBuf>,
     /// Tasks whose setup exit was already handled.
     pub(crate) setup_exits_shown: HashSet<swarm_protocol::TaskId>,
+    /// Process terminals the user closed. They never get a tile again.
+    pub(crate) dismissed_terminals: HashSet<swarm_protocol::TerminalId>,
+    /// Projects whose Start orchestrator was asked for. Only Plan with orchestrator asks again.
+    pub(crate) start_requested: HashSet<ProjectId>,
+    /// The tab used before the open one, for each project.
+    pub(crate) previous_tabs: HashMap<ProjectId, TaskId>,
+    /// Width and height of one cell of the terminal font, once measured.
+    pub(crate) cell_size: Option<(f32, f32)>,
     pub(crate) daemon_launch: Option<DaemonLaunch>,
     pub(crate) reconnecting: bool,
     pub(crate) source: DataSource,
@@ -132,6 +144,7 @@ impl Workspace {
             terminal_focus: HashMap::new(),
             overlay: None,
             terminal_area: None,
+            terminal_area_had_panel: false,
             layout: swarm_layout::Layout::default(),
             user_sizes: HashMap::new(),
             resizing: None,
@@ -141,6 +154,10 @@ impl Workspace {
             pending_agents: HashMap::new(),
             settings_path: None,
             setup_exits_shown: HashSet::new(),
+            dismissed_terminals: HashSet::new(),
+            start_requested: HashSet::new(),
+            previous_tabs: HashMap::new(),
+            cell_size: None,
             daemon_launch: None,
             reconnecting: false,
             source,
@@ -188,7 +205,12 @@ impl Workspace {
             return;
         }
 
-        let task = self.data.ensure_start_task(self.active_project);
+        let project = self.active_project;
+        let task = self.data.ensure_start_task(project);
+
+        if !self.data.start_runs(project) {
+            self.start_requested.remove(&project);
+        }
 
         self.overlay = None;
         self.select_task(task, cx);
@@ -198,6 +220,15 @@ impl Workspace {
         let Some(entry) = self.data.task(task) else {
             return;
         };
+
+        let before = self.active_task;
+        let same_project = self
+            .data
+            .task(before)
+            .is_some_and(|old| old.project == entry.project);
+        if before != task && same_project {
+            self.previous_tabs.insert(entry.project, before);
+        }
 
         self.active_project = entry.project;
         self.active_task = task;
@@ -305,6 +336,19 @@ impl Workspace {
         }
     }
 
+    /// The terminal area for the panel shown now. A tab switch can show or hide the
+    /// panel before the area is measured again.
+    pub(crate) fn terminal_area_size(&self) -> Option<Size<Pixels>> {
+        let mut size = self.terminal_area?.size;
+        match (self.terminal_area_had_panel, self.visible_panel().is_some()) {
+            (true, false) => size.width += RIGHT_PANEL_WIDTH,
+            (false, true) => size.width -= RIGHT_PANEL_WIDTH,
+            _ => {}
+        }
+
+        Some(size)
+    }
+
     /// The right panel to show. A Start or Plan task has none, but the choice is kept.
     pub(crate) fn visible_panel(&self) -> Option<RightPanel> {
         if self.has_no_projects() || self.active_task().is_start {
@@ -342,6 +386,7 @@ impl Render for Workspace {
         let colors = cx.theme().colors();
         let (ground, panel, line, fg) = (colors.ground, colors.panel, colors.line, colors.fg);
 
+        self.start_orchestrator_if_needed(window, cx);
         self.apply_pending_focus(window, cx);
         self.ensure_focus_handles(cx);
         self.layout = views::compute_layout(self);
@@ -361,7 +406,7 @@ impl Render for Workspace {
             .child(div().flex_1().min_w_0().h_full().child(views))
             .children(right_panel.map(|panel_element| {
                 div()
-                    .w(px(320.))
+                    .w(RIGHT_PANEL_WIDTH)
                     .flex_none()
                     .h_full()
                     .border_l_1()

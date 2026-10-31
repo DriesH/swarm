@@ -927,3 +927,89 @@ fn random_cases_place_some_tiles() {
     // Guards against a generator that only makes empty or trivial cases.
     assert!(placed > 2000 && attention_dropped > 0);
 }
+
+// Fixed process terminals.
+
+fn fixed_process(id: u32, fixed: Size) -> TileSpec {
+    TileSpec {
+        fixed: Some(fixed),
+        ..tile(id, TileKind::Process, Activity::Running)
+    }
+}
+
+#[test]
+fn fixed_process_that_fits_gets_its_exact_size() {
+    let tiles = [
+        worker(0, Activity::Working),
+        fixed_process(1, terminal_size(80, 12)),
+    ];
+
+    let layout = layout(area(1220.0, 800.0), &tiles, &LayoutStyle::default());
+
+    assert_rect(&layout, 1, Rect::new(634.0, 10.0, 576.0, 238.0));
+}
+
+#[test]
+fn fixed_process_wider_than_the_area_is_clamped_to_it() {
+    let tiles = [fixed_process(0, Size::new(2000.0, 300.0))];
+
+    let layout = layout(area(800.0, 600.0), &tiles, &LayoutStyle::default());
+
+    assert_rect(&layout, 0, Rect::new(10.0, 10.0, 780.0, 300.0));
+}
+
+#[test]
+fn fixed_process_taller_than_the_area_is_clamped_to_it() {
+    let tiles = [fixed_process(0, Size::new(400.0, 2000.0))];
+
+    let layout = layout(area(800.0, 600.0), &tiles, &LayoutStyle::default());
+
+    assert_rect(&layout, 0, Rect::new(390.0, 10.0, 400.0, 580.0));
+}
+
+#[test]
+fn fixed_process_leaves_room_for_the_orchestrator_column() {
+    let tiles = [orchestrator(0), fixed_process(1, Size::new(2000.0, 300.0))];
+
+    let layout = layout(area(1000.0, 600.0), &tiles, &LayoutStyle::default());
+
+    assert_rect(&layout, 0, Rect::new(10.0, 10.0, 320.0, 580.0));
+    assert_rect(&layout, 1, Rect::new(340.0, 10.0, 650.0, 300.0));
+}
+
+#[test]
+fn fixed_process_never_goes_below_the_minimum_tile_size() {
+    let tiles = [fixed_process(0, Size::new(50.0, 50.0))];
+
+    let layout = layout(area(800.0, 600.0), &tiles, &LayoutStyle::default());
+
+    assert_rect(&layout, 0, Rect::new(530.0, 10.0, 260.0, 160.0));
+}
+
+#[test]
+fn other_tiles_reflow_around_a_fixed_process() {
+    let tiles = [
+        worker(0, Activity::Working),
+        worker(1, Activity::Working),
+        fixed_process(2, Size::new(500.0, 300.0)),
+    ];
+
+    let layout = layout(area(1220.0, 800.0), &tiles, &LayoutStyle::default());
+
+    assert_rect(&layout, 2, Rect::new(710.0, 10.0, 500.0, 300.0));
+    assert_rect(&layout, 0, Rect::new(10.0, 320.0, 595.0, 470.0));
+    assert_rect(&layout, 1, Rect::new(615.0, 320.0, 595.0, 470.0));
+}
+
+#[test]
+fn user_terminal_is_packed_before_a_fixed_process() {
+    let tiles = [
+        fixed_process(0, Size::new(400.0, 300.0)),
+        user(1, Size::new(300.0, 200.0)),
+    ];
+
+    let layout = layout(area(1220.0, 800.0), &tiles, &LayoutStyle::default());
+
+    assert_rect(&layout, 1, Rect::new(910.0, 10.0, 300.0, 200.0));
+    assert_rect(&layout, 0, Rect::new(500.0, 10.0, 400.0, 300.0));
+}

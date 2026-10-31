@@ -7,15 +7,17 @@
 use std::io;
 use std::path::Path;
 
-use swarm_protocol::{AgentId, AgentRole, TaskId};
+use swarm_protocol::{AgentId, AgentKind, AgentRole, TaskId};
 
 const ORCHESTRATOR: &str = include_str!("../prompts/orchestrator.md");
 const WORKER: &str = include_str!("../prompts/worker.md");
+const START: &str = include_str!("../prompts/start.md");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptFile {
     Orchestrator,
     Worker,
+    Start,
 }
 
 impl PromptFile {
@@ -23,6 +25,7 @@ impl PromptFile {
         match role {
             AgentRole::Orchestrator => Self::Orchestrator,
             AgentRole::Worker => Self::Worker,
+            AgentRole::StartOrchestrator => Self::Start,
         }
     }
 
@@ -30,6 +33,7 @@ impl PromptFile {
         match self {
             Self::Orchestrator => "orchestrator.md",
             Self::Worker => "worker.md",
+            Self::Start => "start.md",
         }
     }
 
@@ -37,6 +41,7 @@ impl PromptFile {
         match self {
             Self::Orchestrator => ORCHESTRATOR,
             Self::Worker => WORKER,
+            Self::Start => START,
         }
     }
 }
@@ -45,29 +50,97 @@ impl PromptFile {
 #[derive(Debug, Clone, Copy)]
 pub struct Harness<'a> {
     pub agent: AgentId,
-    pub task: TaskId,
+    /// `None` for a Start orchestrator.
+    pub task: Option<TaskId>,
     pub task_name: &'a str,
     pub role: AgentRole,
+    pub kind: AgentKind,
+    pub skip_permissions: bool,
     pub socket: &'a Path,
 }
 
+/// One line per command: the command, then what it does.
+const ORCHESTRATOR_COMMANDS: &[&str] = &[
+    "`swarm spawn <name> [--kind claude|codex] [--model M] [--brief TEXT]`: start a worker (the brief comes from stdin without `--brief`)",
+    "`swarm send <worker> <text>`: send a message to one of your workers",
+    "`swarm read`: take your unread messages",
+    "`swarm wait [--timeout SECS]`: wait for a message (default 100, at most 600)",
+    "`swarm merge <worker>`: merge a worker's branch into the task branch",
+    "`swarm agents`: list your workers",
+    "`swarm notify <text>`: ask the user for attention",
+    "`swarm confirm`: say that you understood your brief",
+];
+
+/// Every role can run process terminals (dev servers, tests) in its worktree.
+const TERMINAL_COMMANDS: &[&str] = &[
+    "`swarm terminal spawn [--name N] [--size small|medium|large|COLSxROWS] [--cwd DIR] -- <command>...`: run a command in a process terminal; no shell is added, so pass `sh -c` yourself when you need one",
+    "`swarm terminal list`: list the process terminals of your task",
+    "`swarm terminal read <id> [--lines N]`: read the screen or the last lines of output (at most 2000)",
+    "`swarm terminal wait <id> (--exit | --output TEXT) [--timeout SECS]`: wait for the process to exit or for a line that contains TEXT",
+    "`swarm terminal resize <id> <size>`: resize a terminal you started",
+    "`swarm terminal kill <id> [--signal TERM|INT|KILL|HUP]`: stop a process (the terminal's owner or your orchestrator)",
+];
+
+const WORKER_COMMANDS: &[&str] = &[
+    "`swarm ask <text>`: ask your orchestrator a question; the answer arrives as a message",
+    "`swarm report <text>`: send your orchestrator a progress or final report",
+    "`swarm read`: take your unread messages",
+    "`swarm wait [--timeout SECS]`: wait for a message (default 100, at most 600)",
+];
+
+const START_COMMANDS: &[&str] = &[
+    "`swarm task create <name> [--from BRANCH] [--kind claude|codex] [--brief TEXT]`: make a task and start its orchestrator with the brief (the brief comes from stdin without `--brief`)",
+    "`swarm task list`: list the tasks of the project",
+    "`swarm task wait <id>... --until briefed|done [--timeout SECS]`: wait until the task orchestrators confirmed their brief or finished (default 100, at most 600)",
+    "`swarm exit`: end your own session",
+    "`swarm read`: take your unread messages",
+    "`swarm wait [--timeout SECS]`: wait for a message (default 100, at most 600)",
+];
+
+/// Claude Code's Bash tool stops a command after 120 s unless told otherwise.
+const WAIT_NOTE: &str = "The waiting commands (`swarm wait`, `swarm task wait`, `swarm terminal wait`) \
+     end after `--timeout` seconds. When you wait longer than 100 seconds in a shell, give the \
+     Bash tool a timeout longer than `--timeout`.";
+
 impl Harness<'_> {
     fn block(&self) -> String {
-        let role = match self.role {
-            AgentRole::Orchestrator => "orchestrator",
-            AgentRole::Worker => "worker",
+        let (role, commands) = match self.role {
+            AgentRole::Orchestrator => ("orchestrator", ORCHESTRATOR_COMMANDS),
+            AgentRole::Worker => ("worker", WORKER_COMMANDS),
+            AgentRole::StartOrchestrator => ("start orchestrator", START_COMMANDS),
+        };
+        let task = self.task.map_or_else(
+            || "none".to_owned(),
+            |task| format!("{} ({})", task.0, self.task_name),
+        );
+        let commands = commands
+            .iter()
+            .chain(TERMINAL_COMMANDS)
+            .map(|command| format!("- {command}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let access = if self.kind == AgentKind::Codex && !self.skip_permissions {
+            "Your shell cannot reach Swarm inside the Codex sandbox. Use the tools of the `swarm` \
+             MCP server. A tool is named like its command, with `_` between the words: \
+             `swarm terminal spawn` is `terminal_spawn`, and `swarm exit` is `agent_exit`."
+        } else {
+            "Run these commands in your shell, or call the tools of the `swarm` MCP server. A tool \
+             is named like its command, with `_` between the words: `swarm terminal spawn` is \
+             `terminal_spawn`, and `swarm exit` is `agent_exit`."
         };
 
         format!(
             "# Swarm harness\n\n\
              - Agent: {agent}\n\
-             - Task: {task} ({name})\n\
+             - Task: {task}\n\
              - Role: {role}\n\
              - SWARM_SOCKET: {socket}\n\n\
-             Run `swarm --help` for the commands that talk to Swarm.",
+             {access}\n\n\
+             {commands}\n\n\
+             {WAIT_NOTE}\n\n\
+             Run `swarm --help` for the details of each command.",
             agent = self.agent.0,
-            task = self.task.0,
-            name = self.task_name,
             socket = self.socket.display(),
         )
     }
@@ -143,9 +216,11 @@ mod tests {
     fn harness(socket: &Path) -> Harness<'_> {
         Harness {
             agent: AgentId(7),
-            task: TaskId(3),
+            task: Some(TaskId(3)),
             task_name: "Fix it",
             role: AgentRole::Orchestrator,
+            kind: AgentKind::ClaudeCode,
+            skip_permissions: false,
             socket,
         }
     }
@@ -263,5 +338,128 @@ mod tests {
         );
 
         assert!(prompt.starts_with("# Swarm harness"));
+    }
+    #[test]
+    fn each_role_lists_only_its_commands() {
+        let block = |role| {
+            Harness {
+                role,
+                ..harness(Path::new("/s"))
+            }
+            .block()
+        };
+
+        let orchestrator = block(AgentRole::Orchestrator);
+        let worker = block(AgentRole::Worker);
+        let start = Harness {
+            role: AgentRole::StartOrchestrator,
+            task: None,
+            ..harness(Path::new("/s"))
+        }
+        .block();
+
+        assert!(orchestrator.contains("- `swarm spawn "));
+        assert!(orchestrator.contains("- `swarm merge <worker>`"));
+        assert!(!orchestrator.contains("swarm ask"));
+        assert!(worker.contains("- `swarm ask <text>`"));
+        assert!(worker.contains("- `swarm report <text>`"));
+        assert!(!worker.contains("swarm spawn"));
+        assert!(!worker.contains("swarm send"));
+        assert!(start.contains("- `swarm wait "));
+        assert!(!start.contains("swarm spawn"));
+        assert!(start.contains("Task: none"));
+    }
+
+    #[test]
+    fn the_start_orchestrator_gets_the_task_commands_and_the_others_do_not() {
+        let block = |role| {
+            Harness {
+                role,
+                ..harness(Path::new("/s"))
+            }
+            .block()
+        };
+
+        let start = block(AgentRole::StartOrchestrator);
+
+        assert!(start.contains("- `swarm task create "));
+        assert!(start.contains("- `swarm task wait "));
+        assert!(start.contains("- `swarm task list`"));
+        assert!(start.contains("- `swarm exit`"));
+        assert!(!block(AgentRole::Orchestrator).contains("swarm task create"));
+        assert!(!block(AgentRole::Worker).contains("swarm task create"));
+    }
+
+    #[test]
+    fn every_role_is_told_to_give_the_bash_tool_a_longer_timeout() {
+        for role in [
+            AgentRole::Orchestrator,
+            AgentRole::Worker,
+            AgentRole::StartOrchestrator,
+        ] {
+            let block = Harness {
+                role,
+                ..harness(Path::new("/s"))
+            }
+            .block();
+
+            assert!(
+                block.contains("timeout longer than `--timeout`"),
+                "{role:?}"
+            );
+            assert!(block.contains("(default 100, at most 600)"), "{role:?}");
+        }
+    }
+
+    #[test]
+    fn the_start_orchestrator_waits_again_after_a_timeout() {
+        assert!(START.contains("`timed out`"));
+        assert!(START.contains("run it again"));
+    }
+
+    #[test]
+    fn the_orchestrator_knows_what_to_do_with_every_swarm_message() {
+        for kind in ["user input", "terminal exited", "worker stopped"] {
+            assert!(ORCHESTRATOR.contains(&format!("`{kind}`")), "{kind}");
+        }
+    }
+
+    #[test]
+    fn every_role_gets_the_terminal_commands() {
+        for role in [
+            AgentRole::Orchestrator,
+            AgentRole::Worker,
+            AgentRole::StartOrchestrator,
+        ] {
+            let block = Harness {
+                role,
+                ..harness(Path::new("/s"))
+            }
+            .block();
+
+            assert!(block.contains("- `swarm terminal spawn "), "{role:?}");
+            assert!(block.contains("- `swarm terminal kill "), "{role:?}");
+            assert!(block.contains("- `swarm terminal list`"), "{role:?}");
+        }
+    }
+
+    #[test]
+    fn a_sandboxed_codex_agent_is_told_to_use_the_mcp_tools() {
+        let block = |kind, skip_permissions| {
+            Harness {
+                kind,
+                skip_permissions,
+                ..harness(Path::new("/s"))
+            }
+            .block()
+        };
+
+        let sandboxed = block(AgentKind::Codex, false);
+        let skipping = block(AgentKind::Codex, true);
+        let claude = block(AgentKind::ClaudeCode, false);
+
+        assert!(sandboxed.contains("cannot reach Swarm"));
+        assert!(skipping.contains("Run these commands in your shell"));
+        assert!(claude.contains("Run these commands in your shell"));
     }
 }

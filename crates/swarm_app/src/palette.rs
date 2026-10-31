@@ -166,7 +166,7 @@ pub(crate) fn rows(data: &FakeData, project: ProjectId, task: TaskId) -> Vec<Row
         Row::new(
             Group::Tasks,
             IconName::Tab,
-            entry.name.clone(),
+            data.tab_label(entry),
             Command::Task(entry.id),
         )
         .detail(Detail::Status(status, label))

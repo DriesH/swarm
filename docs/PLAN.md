@@ -41,10 +41,12 @@ Crate names use snake_case, like Zed. Key decisions live in [`docs/adr/`](adr/).
 
 ### Agent harness
 
-Every agent terminal gets `SWARM_SOCKET`, `SWARM_AGENT_ID` and `SWARM_TASK`.
+Every agent terminal gets `SWARM_SOCKET`, `SWARM_AGENT_ID`, `SWARM_TASK` and its own `SWARM_TOKEN`, and finds `swarm` on its `PATH`.
 
-- Orchestrator: `swarm spawn`, `swarm send`, `swarm read`, `swarm wait`, `swarm merge`, `swarm notify` (asks the user for attention), `swarm pr draft` (only after the user approved the review).
-- Workers: `swarm ask orchestrator`, `swarm report`.
+- Orchestrator: `swarm spawn`, `swarm send`, `swarm agents`, `swarm merge`, `swarm notify` (asks the user for attention), `swarm confirm` (the brief is understood), `swarm pr draft` (phase 6, only after the user approved the review).
+- Workers: `swarm ask`, `swarm report`.
+- Every agent: `swarm read` and `swarm wait` take the caller's unread messages. A message the agent has not read is pasted into its terminal the next time it is idle.
+- The daemon checks the caller's role on every call; a worker cannot message another worker.
 - The same calls are exposed as MCP tools. Task calls (`task.*`) and terminal calls (`terminal.*`) are listed below.
 - If the user types into a worker terminal, Swarm tells the orchestrator (ADR 0002).
 
@@ -142,7 +144,7 @@ Four kinds:
 | Call | Who | What |
 |---|---|---|
 | `terminal.spawn {cmd, cwd?, size?, name?}` | any agent | Starts a process terminal. `size` is `{cols, rows}` or `small` / `medium` / `large`. Returns an ID. |
-| `terminal.resize {id, size}` | owner agent | Asks for a new size. The layout grants the closest size that fits and returns it. |
+| `terminal.resize {id, size}` | owner agent | Asks for a new size. The daemon clamps it to 20–300 columns and 5–100 rows and returns the size it granted. The layout fits the tile around that size. |
 | `terminal.read {id, lines?}` | owner agent, orchestrator | Reads the screen or the last lines of output. |
 | `terminal.wait {id, until: exit\|output-match, pattern?}` | owner agent, orchestrator | Waits for exit or for a line such as `ready in`. |
 | `terminal.kill {id, signal?}` | owner agent, orchestrator | Stops the process; the terminal closes. |
@@ -321,6 +323,7 @@ Reports in `docs/spikes/`. Code in `spikes/` (throwaway).
 - Claude Code: pick the session ID up front with `--session-id`; resume with `--resume <id>`. Hooks via `--settings <file>`, never by editing the user's settings.
 - Codex: `--dangerously-bypass-approvals-and-sandbox` to skip approvals; `-c developer_instructions=…` adds to AGENTS.md; `codex resume <id>` (pass `-m` again for `codex exec resume`); the session ID only arrives at the first prompt; hooks passed with `-c` need their trust hash passed too.
 - Start Codex with `-c check_for_update_on_startup=false`. Never type into an agent before it reports `idle`: startup prompts swallow input (a spike accepted a Codex update this way).
+- Codex's `workspace-write` sandbox blocks unix sockets and makes `.git` read-only. Codex agents use the `swarm` MCP tools (MCP servers run outside the sandbox, and Codex passes them only the env names listed in `env_vars`), and get the main repository's `.git` and their own `.git/worktrees/<name>` as writable roots so they can commit.
 - Both CLIs ask once per project whether to trust the folder; they key trust on the main repository root, so worktrees share the answer. Swarm never pre-trusts. While the dialog shows, the agent is blocked with "Trust this folder".
 
 **Usage and menu bar**

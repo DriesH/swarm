@@ -1,16 +1,20 @@
-//! Starting a task: the work in `swarm_core`, then the setup script as a terminal,
-//! then the orchestrator.
+//! Starting a task or a worker: the work in `swarm_core`, then the setup script as a
+//! terminal, then the agent.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::thread;
 
 use anyhow::{Context as _, Result};
-use swarm_core::{PreparedTask, Projects};
-use swarm_protocol::{AgentRole, CreateTask, CreateTerminal, TaskInfo, TerminalId, TerminalKind};
+use swarm_core::{PreparedTask, PreparedWorker, Projects};
+use swarm_protocol::{
+    AgentId, AgentInfo, AgentKind, AgentRole, CreateTask, CreateTerminal, ProjectId, TaskId,
+    TaskInfo, TerminalId, TerminalKind,
+};
 use swarm_term::{ExitStatus, Palette, Rgb, Size};
 
 use crate::Services;
-use crate::agents::{CommandNotFound, Start};
+use crate::agents::{CommandNotFound, Place, Start};
 use crate::hub::{Extras, Terminals};
 
 /// Default size and colors of a setup or agent terminal; the app resizes it when it
@@ -46,6 +50,9 @@ pub(crate) const TERMINAL_PALETTE: Palette = Palette {
     ],
 };
 
+/// The name of a Start orchestrator.
+const START_NAME: &str = "start";
+
 /// How the setup script went, as the orchestrator needs to know it.
 enum Setup {
     None,
@@ -56,9 +63,11 @@ enum Setup {
 
 /// Makes the task and starts its setup script without waiting for it. `reply` gets
 /// the task first; the orchestrator starts after it, once the setup has ended.
+/// `created_by` is the Start orchestrator that asked for the task, if one did.
 pub(crate) fn create(
     services: &Services,
     request: &CreateTask,
+    created_by: Option<AgentId>,
     reply: impl FnOnce(&TaskInfo),
 ) -> Result<()> {
     let plan = request
@@ -70,30 +79,34 @@ pub(crate) fn create(
         mut task,
         setup,
         env,
-    } = services.projects.create_task(request)?;
+    } = services.projects.create_task_by(request, created_by)?;
 
-    let agent = plan.and_then(|plan| match services.agents.register(&task, plan) {
-        Ok(info) => {
-            task.agents.push(info.clone());
+    let agent = match plan {
+        Some(plan) => match services.agents.register(&Place::of_task(&task), plan) {
+            Ok(info) => {
+                task.agents.push(info.clone());
 
-            Some(info.id)
-        }
-        Err(error) => {
-            log::error!(
-                "cannot record the orchestrator of task {}: {error:#}",
-                task.id.0
-            );
+                Some(info.id)
+            }
+            Err(error) => {
+                services.projects.discard_task(&task);
 
-            None
-        }
-    });
+                return Err(error.context("cannot record the orchestrator"));
+            }
+        },
+        None => None,
+    };
 
     let setup = match setup {
         None => Setup::None,
         Some(script) => match start_setup(
             &services.terminals,
             &services.projects,
-            &task,
+            &SetupSite {
+                task: task.id,
+                cwd: &task.worktree,
+                record: true,
+            },
             script,
             env.clone(),
         ) {
@@ -115,18 +128,104 @@ pub(crate) fn create(
     if let Some(agent) = agent {
         let start = Start {
             agent,
-            task,
+            task_name: task.name.clone(),
             env,
             first_message: request.first_message.clone(),
         };
-        start_orchestrator(services, start, setup);
+        start_agent(services, start, setup);
     }
 
     Ok(())
 }
 
-/// Waits for the setup on its own thread, then starts the orchestrator or marks it failed.
-fn start_orchestrator(services: &Services, start: Start, setup: Setup) {
+/// Starts the project's Start orchestrator in the project root, or returns the one that
+/// runs. It has no setup script and no first message: the user speaks first.
+pub(crate) fn start_orchestrator(
+    services: &Services,
+    project: ProjectId,
+    kind: Option<AgentKind>,
+) -> Result<AgentInfo> {
+    let kind = match kind {
+        Some(kind) => kind,
+        None => services.agents.default_kind()?,
+    };
+    let plan = services.agents.plan(kind, AgentRole::StartOrchestrator)?;
+
+    let (agent, created) = services.projects.start_agent_or(project, |root, base| {
+        services
+            .agents
+            .register(
+                &Place {
+                    project,
+                    task: None,
+                    name: START_NAME,
+                    worktree: root,
+                    branch: base,
+                    ports: &[],
+                },
+                plan,
+            )
+            .map_err(|error| swarm_core::Error::Invalid(format!("{error:#}")))
+    })?;
+    if !created {
+        return Ok(services.agents.info(agent.id).unwrap_or(agent));
+    }
+
+    services.agents.announce(agent.id);
+    let start = Start {
+        agent: agent.id,
+        task_name: String::new(),
+        env: Vec::new(),
+        first_message: None,
+    };
+    start_agent(services, start, Setup::None);
+
+    Ok(services.agents.info(agent.id).unwrap_or(agent))
+}
+
+/// Runs the worker's setup script without waiting, then starts the worker with `brief`
+/// as its first message. The caller has the worker already; a failure shows as its status.
+pub(crate) fn start_worker(
+    services: &Services,
+    prepared: PreparedWorker,
+    task: &TaskInfo,
+    brief: String,
+) {
+    let agent = prepared.agent.id;
+
+    let setup = match prepared.setup {
+        None => Setup::None,
+        Some(script) => match start_setup(
+            &services.terminals,
+            &services.projects,
+            &SetupSite {
+                task: task.id,
+                cwd: &prepared.agent.worktree,
+                record: false,
+            },
+            script,
+            prepared.env.clone(),
+        ) {
+            Ok((_, done)) => Setup::Running(done),
+            Err(error) => {
+                log::error!("cannot start the setup of worker {}: {error:#}", agent.0);
+
+                Setup::Failed
+            }
+        },
+    };
+
+    let start = Start {
+        agent,
+        task_name: task.name.clone(),
+        env: prepared.env,
+        first_message: Some(brief),
+    };
+    start_agent(services, start, setup);
+}
+
+/// Waits for the setup on its own thread, then starts the agent or marks it failed.
+fn start_agent(services: &Services, start: Start, setup: Setup) {
     let agents = Arc::clone(&services.agents);
     let agent = start.agent;
 
@@ -167,34 +266,42 @@ fn start_failure(error: &anyhow::Error) -> &'static str {
     }
 }
 
+/// Where a setup script runs and whether the task row keeps its terminal and exit.
+struct SetupSite<'a> {
+    task: TaskId,
+    cwd: &'a Path,
+    /// True for a task's own setup; a worker's setup leaves the task row alone.
+    record: bool,
+}
+
 fn start_setup(
     terminals: &Arc<Terminals>,
     projects: &Arc<Projects>,
-    task: &TaskInfo,
+    site: &SetupSite<'_>,
     script: String,
     env: Vec<(String, String)>,
 ) -> Result<(TerminalId, flume::Receiver<Option<ExitStatus>>)> {
     let request = CreateTerminal {
         kind: TerminalKind::Process,
         command: Some(vec!["/bin/sh".to_owned(), "-lc".to_owned(), script]),
-        cwd: Some(task.worktree.clone()),
+        cwd: Some(site.cwd.to_owned()),
         size: TERMINAL_SIZE,
         palette: TERMINAL_PALETTE,
-        task: Some(task.id.terminal_key()),
+        task: Some(site.task.terminal_key()),
     };
 
     let (started, finished) = (Arc::clone(projects), Arc::clone(projects));
     let (done, ended) = flume::bounded(1);
-    let task_id = task.id;
+    let (task_id, record) = (site.task, site.record);
     let extras = Extras {
         env,
         on_started: Some(Box::new(move |terminal| {
-            if let Err(error) = started.set_setup_terminal(task_id, Some(terminal)) {
+            if record && let Err(error) = started.set_setup_terminal(task_id, Some(terminal)) {
                 log::error!("cannot record the setup terminal: {error}");
             }
         })),
         on_exit: Some(Box::new(move |exit| {
-            if let Err(error) = finished.finish_setup(task_id, exit.as_ref()) {
+            if record && let Err(error) = finished.finish_setup(task_id, exit.as_ref()) {
                 log::error!("cannot record the end of the setup: {error}");
             }
             if done.send(exit).is_err() {
@@ -202,6 +309,7 @@ fn start_setup(
             }
         })),
         on_output: None,
+        process: None,
     };
 
     let hub = terminals

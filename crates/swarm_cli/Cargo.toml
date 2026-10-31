@@ -12,4 +12,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+clap.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+swarm_protocol.workspace = true

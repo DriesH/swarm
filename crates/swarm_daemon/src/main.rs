@@ -2,8 +2,11 @@
 
 mod agent_socket;
 mod agents;
+mod calls;
 mod connection;
 mod hub;
+mod messages;
+mod processes;
 mod recovery;
 mod tasks;
 
@@ -25,7 +28,10 @@ use swarm_core::store::Store;
 use swarm_protocol::{Paths, check_private_dir};
 
 use crate::agents::{AgentConfig, Agents};
+use crate::calls::Calls;
 use crate::hub::{Clients, Terminals};
+use crate::messages::Messages;
+use crate::processes::Processes;
 use crate::recovery::System;
 
 /// What every client connection works with.
@@ -34,6 +40,9 @@ pub(crate) struct Services {
     pub(crate) projects: Arc<Projects>,
     pub(crate) agents: Arc<Agents>,
     pub(crate) clients: Arc<Clients>,
+    pub(crate) messages: Arc<Messages>,
+    pub(crate) processes: Arc<Processes>,
+    pub(crate) store: Arc<Mutex<Store>>,
 }
 
 /// Where the daemon is told to keep its files and read its settings.
@@ -58,6 +67,7 @@ fn main() -> ExitCode {
         log::error!("{error:#}");
         return ExitCode::FAILURE;
     }
+    raise_file_limit();
 
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -126,6 +136,7 @@ fn run() -> Result<()> {
     let projects = Arc::new(Projects::new(Arc::clone(&store)));
     let terminals = Terminals::new(Arc::clone(&store));
     let clients = Arc::new(Clients::default());
+    let messages = Messages::new(Arc::clone(&store), Arc::clone(&clients));
     let agents = Agents::new(
         AgentConfig {
             data_dir: paths.data.clone(),
@@ -133,27 +144,40 @@ fn run() -> Result<()> {
             settings: arguments.settings.or_else(swarm_settings::default_path),
             swarm,
         },
-        store,
+        Arc::clone(&store),
         Arc::clone(&terminals),
         Arc::clone(&clients),
+        Arc::clone(&messages),
     );
-
-    let agent_server = Arc::clone(&agents);
-    thread::Builder::new()
-        .name("agent-socket".into())
-        .spawn(move || agent_socket::serve(&agent_listener, &agent_server))?;
 
     watch_signals(
         Arc::clone(&terminals),
         vec![paths.socket.clone(), agent_socket_path],
     )?;
 
+    let processes = Processes::new(
+        Arc::clone(&store),
+        Arc::clone(&terminals),
+        Arc::clone(&clients),
+        Arc::clone(&messages),
+        Arc::clone(&agents),
+    );
+
     let services = Arc::new(Services {
         terminals,
         projects,
         agents,
         clients,
+        messages,
+        processes,
+        store,
     });
+
+    let calls = Arc::new(Calls::new(Arc::clone(&services)));
+    thread::Builder::new()
+        .name("agent-socket".into())
+        .spawn(move || agent_socket::serve(&agent_listener, &calls))?;
+
     serve(&listener, &services);
 
     Ok(())
@@ -222,6 +246,30 @@ fn unblock_signals() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Every agent connection and terminal holds a descriptor, and macOS starts a process
+/// with only 256.
+fn raise_file_limit() {
+    const WANTED: libc::rlim_t = 4096;
+
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid `rlimit` that the call fills in.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } != 0 {
+        return;
+    }
+
+    limit.rlim_cur = limit.rlim_cur.max(WANTED.min(limit.rlim_max));
+    // SAFETY: `limit` is a valid `rlimit` that the call reads.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) } != 0 {
+        log::warn!(
+            "cannot raise the file limit: {}",
+            std::io::Error::last_os_error()
+        );
+    }
 }
 
 fn ignore_hangup() -> Result<()> {

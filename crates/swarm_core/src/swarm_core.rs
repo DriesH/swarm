@@ -11,10 +11,12 @@ pub mod prompts;
 pub mod store;
 pub mod task;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use swarm_protocol::{CreateTask, ProjectInfo, TaskId, TaskInfo, TerminalId};
+use swarm_protocol::{
+    AgentId, AgentInfo, AgentRole, CreateTask, ProjectId, ProjectInfo, TaskId, TaskInfo, TerminalId,
+};
 use swarm_term::ExitStatus;
 
 use crate::config::{LoadedConfig, ProjectConfig};
@@ -57,6 +59,28 @@ fn git_message(command: &str, stderr: &str) -> String {
 pub struct PreparedTask {
     pub task: TaskInfo,
     /// The script text, when the caller asked for it and the config has one.
+    pub setup: Option<String>,
+    /// `SWARM_TASK`, `SWARM_PORT` and `SWARM_PORTS`.
+    pub env: Vec<(String, String)>,
+}
+
+/// Where a worker works, as [`Projects::create_worker`] made it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerCheckout {
+    pub project: ProjectId,
+    pub task: TaskId,
+    /// The unique worker slug.
+    pub name: String,
+    pub branch: String,
+    pub worktree: PathBuf,
+    pub ports: Vec<u16>,
+}
+
+/// What the daemon needs to run a worker's setup script and start it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedWorker {
+    pub agent: AgentInfo,
+    /// The project's setup script, when it has one.
     pub setup: Option<String>,
     /// `SWARM_TASK`, `SWARM_PORT` and `SWARM_PORTS`.
     pub env: Vec<(String, String)>,
@@ -112,9 +136,96 @@ impl Projects {
         lock(&self.store).finish_setup(task, exit)
     }
 
+    /// Undoes [`Projects::create_task`] for a task that never started: removes its
+    /// worktree, branch and row, which frees its ports.
+    pub fn discard_task(&self, task: &TaskInfo) {
+        let _creating = lock(&self.creating);
+
+        if let Some(root) = self.project_root(task.project) {
+            remove_task_leftovers(&root, &task.branch, &task.worktree);
+        }
+        if let Err(error) = lock(&self.store).delete_task(task.id) {
+            log::error!("cannot delete task {}: {error}", task.id.0);
+        }
+    }
+
+    /// Undoes [`Projects::create_worker`] for a worker that never started: removes its
+    /// worktree, branch and row, which frees its ports.
+    pub fn discard_worker(&self, worker: &AgentInfo) {
+        let _creating = lock(&self.creating);
+
+        if let Some(root) = self.project_root(worker.project) {
+            remove_task_leftovers(&root, &worker.branch, &worker.worktree);
+        }
+        if let Err(error) = lock(&self.store).delete_agent(worker.id) {
+            log::error!("cannot delete agent {}: {error}", worker.id.0);
+        }
+    }
+
+    fn project_root(&self, project: ProjectId) -> Option<PathBuf> {
+        match lock(&self.store).project(project) {
+            Ok(project) => project.map(|project| project.path),
+            Err(error) => {
+                log::error!("cannot find project {}: {error}", project.0);
+
+                None
+            }
+        }
+    }
+
+    /// The ports a worker or orchestrator reserved, as `SWARM_PORT`.
+    pub fn agent_env(&self, agent: &AgentInfo) -> Result<Vec<(String, String)>, Error> {
+        let store = lock(&self.store);
+
+        let ports = match agent.task {
+            Some(task) if agent.role == AgentRole::Orchestrator => {
+                store.task(task)?.map(|task| task.ports).unwrap_or_default()
+            }
+            _ => store.agent_ports(agent.id)?,
+        };
+
+        Ok(match agent.task {
+            Some(task) => ports_env(task, &ports),
+            None => Vec::new(),
+        })
+    }
+
+    /// The project's running Start orchestrator, or the one `register` makes in the
+    /// project root on the base branch. The flag is true for a new one. Only one runs
+    /// per project, even when two callers ask at once.
+    pub fn start_agent_or(
+        &self,
+        project: ProjectId,
+        register: impl FnOnce(&Path, &str) -> Result<AgentInfo, Error>,
+    ) -> Result<(AgentInfo, bool), Error> {
+        let _creating = lock(&self.creating);
+
+        let stored = lock(&self.store)
+            .project(project)?
+            .ok_or(Error::UnknownProject(project.0))?;
+        if let Some(agent) = lock(&self.store).start_agent(project)? {
+            return Ok((agent, false));
+        }
+
+        let LoadedConfig { config, .. } = config::load(&stored.path);
+        let base = git::default_base_branch(&stored.path, config.worktrees.base_branch.as_deref());
+
+        Ok((register(&stored.path, &base)?, true))
+    }
+
     /// Makes the task branch and task worktree, copies files, reserves ports and
     /// records the task. Nothing is left behind when a step fails.
     pub fn create_task(&self, request: &CreateTask) -> Result<PreparedTask, Error> {
+        self.create_task_by(request, None)
+    }
+
+    /// Like [`Projects::create_task`]; the row records `created_by`, the Start
+    /// orchestrator that asked for the task.
+    pub fn create_task_by(
+        &self,
+        request: &CreateTask,
+        created_by: Option<AgentId>,
+    ) -> Result<PreparedTask, Error> {
         let _creating = lock(&self.creating);
 
         let project = lock(&self.store)
@@ -156,7 +267,7 @@ impl Projects {
         git::worktree_add(&root, &branch, &worktree, &base)?;
 
         let recorded = self.record(
-            &root, &config, request, name, &branch, &base, &worktree, &ports,
+            &root, &config, request, name, &branch, &base, &worktree, &ports, created_by,
         );
         let task = match recorded {
             Ok(task) => task,
@@ -172,6 +283,89 @@ impl Projects {
         let env = task_env(&task);
 
         Ok(PreparedTask { task, setup, env })
+    }
+
+    /// Makes a worker's branch (from the task branch) and worktree, copies files and
+    /// reserves ports. `register` records the worker's agent row while ports are still
+    /// held; nothing is left behind when a step or `register` fails.
+    pub fn create_worker(
+        &self,
+        task: &TaskInfo,
+        name: &str,
+        register: impl FnOnce(&WorkerCheckout) -> Result<AgentInfo, Error>,
+    ) -> Result<PreparedWorker, Error> {
+        let _creating = lock(&self.creating);
+
+        let project = lock(&self.store)
+            .project(task.project)?
+            .ok_or(Error::UnknownProject(task.project.0))?;
+        let root = project.path;
+
+        let LoadedConfig { config, error } = config::load(&root);
+        if let Some(error) = error {
+            return Err(Error::Invalid(format!(
+                "the project config has a problem: {error}"
+            )));
+        }
+
+        let worker_slug = task::slug(name).map_err(|_| {
+            Error::Invalid(format!("the worker name {name:?} has no letters or digits"))
+        })?;
+        let taken = lock(&self.store)
+            .list_agents(task.id)?
+            .iter()
+            .any(|agent| agent.role == AgentRole::Worker && agent.name == worker_slug);
+        if taken {
+            return Err(Error::Invalid(format!(
+                "this task already has a worker named {worker_slug}"
+            )));
+        }
+
+        let task_slug = task
+            .worktree
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .ok_or_else(|| Error::Invalid("the task worktree has no name".to_owned()))?;
+        let folder = root.join(&config.worktrees.folder);
+        task::create_folder_inside(&root, &folder)?;
+
+        let branch = format!("{}--{worker_slug}", task.branch);
+        let worktree = folder.join(format!("{task_slug}--{worker_slug}"));
+        if worktree.symlink_metadata().is_ok() || git::branch_exists(&root, &branch)? {
+            return Err(Error::Invalid(format!(
+                "the branch or folder for worker {worker_slug} exists already"
+            )));
+        }
+        git::verify_start_point(&root, &task.branch)?;
+
+        let ports = self.reserve_ports(&config)?;
+
+        git::worktree_add(&root, &branch, &worktree, &task.branch)?;
+
+        let checkout = WorkerCheckout {
+            project: task.project,
+            task: task.id,
+            name: worker_slug,
+            branch,
+            worktree,
+            ports,
+        };
+        let recorded = task::copy_files(&root, &checkout.worktree, &config.worktrees.copy)
+            .and_then(|()| register(&checkout));
+        let agent = match recorded {
+            Ok(agent) => agent,
+            Err(error) => {
+                remove_task_leftovers(&root, &checkout.branch, &checkout.worktree);
+
+                return Err(error);
+            }
+        };
+
+        let setup =
+            (!config.worktrees.setup.trim().is_empty()).then(|| config.worktrees.setup.clone());
+        let env = ports_env(task.id, &checkout.ports);
+
+        Ok(PreparedWorker { agent, setup, env })
     }
 
     /// Ports no task of any project uses, so two projects never share a port.
@@ -200,17 +394,21 @@ impl Projects {
         base: &str,
         worktree: &Path,
         ports: &[u16],
+        created_by: Option<AgentId>,
     ) -> Result<TaskInfo, Error> {
         task::copy_files(root, worktree, &config.worktrees.copy)?;
 
-        lock(&self.store).add_task(&NewTask {
-            project: request.project,
-            name,
-            branch,
-            base,
-            worktree,
-            ports,
-        })
+        lock(&self.store).add_task_by(
+            &NewTask {
+                project: request.project,
+                name,
+                branch,
+                base,
+                worktree,
+                ports,
+            },
+            created_by,
+        )
     }
 
     fn info(&self, project: StoredProject) -> Result<ProjectInfo, Error> {
@@ -226,6 +424,7 @@ impl Projects {
             base_branch,
             config_error: error,
             tasks,
+            start: lock(&self.store).start_agent(project.id)?,
         })
     }
 }
@@ -244,10 +443,14 @@ fn remove_task_leftovers(root: &Path, branch: &str, worktree: &Path) {
 }
 
 fn task_env(task: &TaskInfo) -> Vec<(String, String)> {
-    let mut env = vec![("SWARM_TASK".to_owned(), task.id.0.to_string())];
+    ports_env(task.id, &task.ports)
+}
 
-    if let Some(first) = task.ports.first() {
-        let list: Vec<String> = task.ports.iter().map(u16::to_string).collect();
+fn ports_env(task: TaskId, ports: &[u16]) -> Vec<(String, String)> {
+    let mut env = vec![("SWARM_TASK".to_owned(), task.0.to_string())];
+
+    if let Some(first) = ports.first() {
+        let list: Vec<String> = ports.iter().map(u16::to_string).collect();
 
         env.push(("SWARM_PORT".to_owned(), first.to_string()));
         env.push(("SWARM_PORTS".to_owned(), list.join(",")));

@@ -32,6 +32,7 @@ swarm_term_vt = { path = "crates/swarm_term_vt" }
 swarm_ui = { path = "crates/swarm_ui" }
 
 anyhow = "1"
+clap = { version = "4.6", features = ["derive"] }
 env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
 flume = "0.12"
 image = { version = "0.25", default-features = false, features = ["png"] }

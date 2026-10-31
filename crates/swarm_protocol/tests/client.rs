@@ -12,8 +12,9 @@ use std::time::{Duration, Instant};
 
 use swarm_protocol::{
     AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, Client, ClientError,
-    CreateTask, CreateTerminal, Event, ProjectId, ProjectInfo, Request, TaskId, TaskInfo,
-    TerminalId, TerminalInfo, TerminalKind, VERSION, read, write,
+    CreateTask, CreateTerminal, Event, GridSize, MessageId, MessageInfo, MessageKind, ProjectId,
+    ProjectInfo, Request, TaskId, TaskInfo, TerminalId, TerminalInfo, TerminalKind, VERSION, read,
+    write,
 };
 use swarm_term::{Palette, Rgb, Size, TerminalInput, TerminalOutput};
 
@@ -175,6 +176,9 @@ fn list_returns_what_the_daemon_sends() {
         id: TerminalId(3),
         kind: TerminalKind::User,
         task: Some("swarm/terminal-renderer".into()),
+        owner: None,
+        name: None,
+        fixed_size: None,
         title: Some("zsh".into()),
         cwd: None,
         exit: None,
@@ -378,6 +382,9 @@ fn info(id: u64) -> TerminalInfo {
         id: TerminalId(id),
         kind: TerminalKind::User,
         task: None,
+        owner: None,
+        name: None,
+        fixed_size: None,
         title: None,
         cwd: None,
         exit: None,
@@ -478,6 +485,8 @@ fn task_info() -> TaskInfo {
         setup_terminal: Some(TerminalId(9)),
         setup_exit: None,
         agents: Vec::new(),
+        created_by: None,
+        briefed: false,
     }
 }
 
@@ -489,6 +498,7 @@ fn project_info() -> ProjectInfo {
         base_branch: "main".into(),
         config_error: None,
         tasks: vec![task_info()],
+        start: None,
     }
 }
 
@@ -617,10 +627,14 @@ fn create_task_reports_a_daemon_error() {
 fn agent_info(status: AgentStatus) -> AgentInfo {
     AgentInfo {
         id: AgentId(1),
-        task: TaskId(4),
+        project: ProjectId(2),
+        task: Some(TaskId(4)),
         role: AgentRole::Orchestrator,
         kind: AgentKind::ClaudeCode,
         model: "opus".into(),
+        name: "orchestrator".into(),
+        worktree: PathBuf::from("/tmp/wt"),
+        branch: "swarm/login".into(),
         terminal: Some(TerminalId(7)),
         status,
         message: None,
@@ -650,5 +664,154 @@ fn agent_changes_reach_the_agent_events() {
     assert_eq!(
         (first.status, second.status),
         (AgentStatus::Working, AgentStatus::Done)
+    );
+}
+
+#[test]
+fn start_orchestrator_sends_the_request_and_returns_the_agent() {
+    let socket = serve(|fake| {
+        fake.handshake(VERSION);
+        let Some(Request::StartOrchestrator {
+            call,
+            project,
+            kind,
+        }) = fake.request()
+        else {
+            panic!("expected a StartOrchestrator request");
+        };
+        assert_eq!((project, kind), (ProjectId(2), Some(AgentKind::Codex)));
+        fake.send(&Event::AgentStarted {
+            call,
+            agent: agent_info(AgentStatus::Unknown),
+        });
+        fake.drain();
+    });
+    let client = Client::connect(&socket).expect("connect");
+
+    let agent = client
+        .start_orchestrator(ProjectId(2), Some(AgentKind::Codex))
+        .expect("start orchestrator");
+
+    assert_eq!(agent, agent_info(AgentStatus::Unknown));
+}
+
+#[test]
+fn start_orchestrator_reports_a_daemon_error() {
+    let socket = serve(|fake| {
+        fake.handshake(VERSION);
+        let Some(Request::StartOrchestrator { call, .. }) = fake.request() else {
+            panic!("expected a StartOrchestrator request");
+        };
+        fake.send(&Event::Error {
+            call: Some(call),
+            id: None,
+            message: "no such project".into(),
+        });
+        fake.drain();
+    });
+    let client = Client::connect(&socket).expect("connect");
+
+    let result = client.start_orchestrator(ProjectId(9), None);
+
+    assert!(matches!(result, Err(ClientError::Daemon(message)) if message == "no such project"));
+}
+
+#[test]
+fn task_terminal_and_message_broadcasts_reach_their_listeners() {
+    let socket = serve(|fake| {
+        fake.handshake(VERSION);
+        fake.send(&Event::TaskChanged { task: task_info() });
+        fake.send(&Event::TerminalChanged {
+            terminal: TerminalInfo {
+                kind: TerminalKind::Process,
+                fixed_size: Some(GridSize { cols: 80, rows: 12 }),
+                ..info(5)
+            },
+        });
+        fake.send(&Event::MessageSent {
+            message: MessageInfo {
+                id: MessageId(1),
+                project: ProjectId(2),
+                task: Some(TaskId(4)),
+                from: None,
+                to: AgentId(1),
+                kind: MessageKind::Brief,
+                text: "go".into(),
+                sent_at: 0,
+            },
+        });
+        fake.drain();
+    });
+    let client = Client::connect(&socket).expect("connect");
+
+    let task = client.task_events().recv_timeout(WAIT).expect("task");
+    let terminal = client
+        .terminal_events()
+        .recv_timeout(WAIT)
+        .expect("terminal");
+    let message = client.message_events().recv_timeout(WAIT).expect("message");
+
+    assert_eq!(task, task_info());
+    assert_eq!(terminal.fixed_size, Some(GridSize { cols: 80, rows: 12 }));
+    assert_eq!(message.text, "go");
+}
+
+#[test]
+fn a_locked_terminal_drops_resize_input() {
+    let (seen_sender, seen) = flume::unbounded();
+    let socket = serve(move |fake| {
+        fake.handshake(VERSION);
+        while let Some(request) = fake.request() {
+            seen_sender.send(request).expect("test is listening");
+        }
+    });
+    let client = Client::connect(&socket).expect("connect");
+    let channels = client.attach(TerminalId(4), 10).expect("attach");
+    let size = Size {
+        cols: 80,
+        rows: 12,
+        cell_width: 7,
+        cell_height: 17,
+    };
+
+    client.set_size_locked(TerminalId(4), true);
+    channels
+        .input
+        .send(TerminalInput::Resize(size))
+        .expect("send resize");
+    channels
+        .input
+        .send(TerminalInput::Focus(true))
+        .expect("send focus");
+
+    let mut requests = Vec::new();
+    while requests.last()
+        != Some(&Request::Input {
+            id: TerminalId(4),
+            input: TerminalInput::Focus(true),
+        })
+    {
+        requests.push(seen.recv_timeout(WAIT).expect("a request"));
+    }
+
+    client.set_size_locked(TerminalId(4), false);
+    channels
+        .input
+        .send(TerminalInput::Resize(size))
+        .expect("send resize");
+    requests.push(seen.recv_timeout(WAIT).expect("the resize"));
+
+    assert_eq!(
+        requests[1..],
+        [
+            Request::Input {
+                id: TerminalId(4),
+                input: TerminalInput::Focus(true)
+            },
+            Request::Input {
+                id: TerminalId(4),
+                input: TerminalInput::Resize(size)
+            },
+        ]
     );
 }

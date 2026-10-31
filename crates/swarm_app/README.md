@@ -22,6 +22,10 @@ Both binaries land in `target/debug`. The app starts `swarm-daemon` from its own
 - **Quit the app:** user terminals keep running. Open the app again and they come back.
 - **Stop the daemon:** `pkill -x swarm-daemon`. This ends every terminal.
 - **Task key:** real tasks use `task:<id>` as the terminal key. Fake sample tasks use `<project name>/<task name>`.
+- **Workers:** every agent of a task gets a live tile after the orchestrator. A stopped agent keeps its tile without a terminal.
+- **Process terminals:** a process terminal an agent starts gets a tile named by its `name`, else its title. When an agent fixes its size, the tile is sized to those rows and the app never sends `Resize` for it. A successful exit closes the tile after 3 s; a failed exit stays until you close it.
+- **Start and Plan tab:** a project with no tasks opens on its Start tab and the app asks the daemon for the Start orchestrator once. The tab reads "Plan" when a task did not come from that orchestrator. It closes when the orchestrator exits. **+ › Plan with orchestrator** opens it again.
+- **Tasks and messages:** a task an agent makes gets a tab without taking focus. The model keeps the last 500 messages per task for the Swarm view.
 - **Add project:** the `+` next to Projects opens a folder picker. Errors show in the sidebar until dismissed.
 - Snapshot and frame-stats runs never connect.
 

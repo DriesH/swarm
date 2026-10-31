@@ -21,6 +21,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const EOF_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// How long to wait for the reader to hand over the last output after an exit.
 const EXIT_DRAIN: Duration = Duration::from_millis(50);
+/// How long history requests are still answered after the last update of an ended
+/// process, so a reader can fetch lines that scrolled past in that update.
+const EXIT_HISTORY: Duration = Duration::from_millis(100);
 /// Scrollback lines in the first snapshot.
 const SNAPSHOT_HISTORY_LINES: u32 = 1000;
 
@@ -169,7 +172,25 @@ impl TerminalLoop {
         }
 
         self.take_output();
-        self.flush()
+        let changed = self.dirty;
+        self.flush()?;
+
+        if changed {
+            self.answer_history(commands);
+        }
+
+        Ok(())
+    }
+
+    fn answer_history(&mut self, commands: &flume::Receiver<Command>) {
+        let deadline = Instant::now() + EXIT_HISTORY;
+        while let Ok(command) = commands.recv_deadline(deadline) {
+            if let Command::Input(input @ TerminalInput::FetchHistory { .. }) = command
+                && let Err(error) = self.handle_input(input)
+            {
+                log::warn!("history after exit failed: {error:#}");
+            }
+        }
     }
 
     fn handle(&mut self, command: Command) {
