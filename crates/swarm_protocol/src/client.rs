@@ -16,9 +16,10 @@ use std::time::{Duration, Instant};
 use swarm_term::{TerminalChannels, TerminalInput, TerminalOutput};
 
 use crate::{
-    AgentChange, AgentId, AgentInfo, AgentKind, CallId, CreateTask, CreateTerminal, Event,
-    FrameError, MessageId, MessageInfo, Paths, ProjectId, ProjectInfo, Request, TaskId, TaskInfo,
-    TerminalId, TerminalInfo, VERSION, check_private_dir, read, write,
+    AgentChange, AgentId, AgentInfo, AgentKind, CallId, CloseCheck, CreateTask, CreateTerminal,
+    Event, FrameError, MessageId, MessageInfo, Paths, ProjectId, ProjectInfo, Request,
+    ReviewSource, TaskDiff, TaskId, TaskInfo, TerminalId, TerminalInfo, VERSION,
+    check_private_dir, read, write,
 };
 
 /// A message was sent or delivered, in the order the daemon sent the events.
@@ -418,6 +419,64 @@ impl Client {
         }
     }
 
+    /// The changes of a task. Returns `None` when the diff still has the `known`
+    /// fingerprint.
+    pub fn task_diff(
+        &self,
+        task: TaskId,
+        source: ReviewSource,
+        known: Option<u64>,
+    ) -> Result<Option<TaskDiff>, ClientError> {
+        let reply = self.call(
+            |call| Request::TaskDiff {
+                call,
+                task,
+                source,
+                known,
+            },
+            None,
+        )?;
+
+        match reply {
+            Event::TaskDiff { diff, .. } => Ok(diff),
+            other => Err(unexpected("TaskDiff", &other)),
+        }
+    }
+
+    /// Approves the Merged diff with this fingerprint. The new task arrives through
+    /// [`Client::task_events`].
+    pub fn approve_task(&self, task: TaskId, fingerprint: u64) -> Result<(), ClientError> {
+        let reply = self.call(
+            |call| Request::ApproveTask {
+                call,
+                task,
+                fingerprint,
+            },
+            None,
+        )?;
+
+        match reply {
+            Event::Done { .. } => Ok(()),
+            other => Err(unexpected("ApproveTask", &other)),
+        }
+    }
+
+    /// What closing the task would throw away.
+    pub fn check_close(&self, task: TaskId) -> Result<CloseCheck, ClientError> {
+        match self.call(|call| Request::CheckClose { call, task }, None)? {
+            Event::CloseCheck { check, .. } => Ok(check),
+            other => Err(unexpected("CheckClose", &other)),
+        }
+    }
+
+    /// Closes the task. The closed task arrives through [`Client::task_events`].
+    pub fn close_task(&self, task: TaskId) -> Result<(), ClientError> {
+        match self.call(|call| Request::CloseTask { call, task }, None)? {
+            Event::Done { .. } => Ok(()),
+            other => Err(unexpected("CloseTask", &other)),
+        }
+    }
+
     /// Creates a terminal and attaches to it.
     pub fn create(
         &self,
@@ -712,6 +771,13 @@ fn read_events(
             Event::AgentChanges { call, changes } => {
                 deliver(shared, call, Event::AgentChanges { call, changes });
             }
+            Event::TaskDiff { call, diff } => {
+                deliver(shared, call, Event::TaskDiff { call, diff });
+            }
+            Event::CloseCheck { call, check } => {
+                deliver(shared, call, Event::CloseCheck { call, check });
+            }
+            Event::Done { call } => deliver(shared, call, Event::Done { call }),
         }
     }
 
