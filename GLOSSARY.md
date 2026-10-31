@@ -77,7 +77,7 @@ The Review source that shows the work in progress: the task worktree and each wo
 _Avoid_: Current, working copy
 
 **Merged**:
-The Review source that shows only the task worktree against the base branch: what the pull request would hold.
+The Review source that shows only the commits of the task branch: what the pull request would hold.
 _Avoid_: Final, combined
 
 **Approve**:

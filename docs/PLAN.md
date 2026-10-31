@@ -167,7 +167,7 @@ The harness block is always added first and is not editable.
 
 Every agent belongs to a task. The daemon tracks every agent in SQLite (ADR 0005), so none are lost; the goal is that none are forgotten.
 
-- **Close task**: from the tab's close button or ⌘K. A dialog shows what closing stops and deletes: running agents, uncommitted files, workers with their own worktree that are not merged. Then the agents and process terminals stop, the teardown script runs, and the task worktree and workers' own worktrees are removed. Every branch stays, so only uncommitted work is lost. A closed task is never listed again and its ports are free.
+- **Close task**: from the tab's close button or ⌘K. A dialog shows what closing stops and deletes: running agents, user terminals, uncommitted files, workers with their own worktree that are not merged. Then the agents and all terminals of the task stop, the teardown script runs, and the task worktree and workers' own worktrees are removed. Every branch stays, so only uncommitted work (and ignored files) is lost. After the agents stop, the daemon checks again and refuses when more would be lost than the dialog showed. A close interrupted by a crash finishes on the next daemon start. A closed task is never listed again and its ports are free.
 - **Quit**: with running agents, ask once: keep running or stop all. Option to remember the choice.
 - **Idle stop**: a done or idle agent stops after 30 minutes (setting). Its session ID is kept, so it resumes with `claude --resume <id>` or `codex resume <id>`.
 - **Menu bar**: shows the running agent count and **Stop all**, also when the app is closed.
@@ -189,14 +189,14 @@ A third view next to Terminals and Swarm in the header switch (**Terminals | Swa
 Two sources:
 
 - **Live** (default while workers run): each worker's worktree diff, committed and uncommitted, refreshed as agents edit. For workers that share the task worktree, only their `swarm commit` commits are attributed to them; uncommitted work is not. Files being edited get an "Editing" pill. A comment is sent right away through the orchestrator to the worker that owns the file. Approve is disabled.
-- **Merged** (default when all workers are done): task branch against the base branch. Comments are batched and sent with **Request changes**.
+- **Merged** (default when all workers are done): the commits of the task branch since it left the base branch, so exactly what the pull request holds. Uncommitted work shows only in Live. Comments are batched and sent with **Request changes**.
 
 Live comments are anchored to the code text, not line numbers. If the agent rewrites those lines, the comment is marked outdated.
 
 - Layout: the file list on the left (272 px) with "N files", "N / N viewed" and **By agent | By folder**; files no agent commit touched are in "Other changes". On the right a header with the agents' status, **Live | Merged**, **Unified | Split** and **Approve**, then one card per file.
 - **Viewed** is per file and resets when the file's diff changes. A viewed file folds. Keys: `j` / `k` next or previous file, `v` viewed.
 - The source starts as Live while a worker of the task works, else Merged; the user's pick then stays for that task.
-- **Approve** works only on Merged. The daemon stores a fingerprint of the Merged diff (a hash of every changed line). When the diff changes, the approval no longer counts and Review shows **Approve** again.
+- **Approve** works only on Merged. The daemon stores a fingerprint of the Merged diff (a hash of every changed line, file mode and blob). When the diff changes, the approval no longer counts and Review shows **Approve** again.
 - Large diffs: at most 1,000 files, 5,000 lines per file and 50,000 lines in total are sent; the totals still count everything. The list is virtualized.
 
 ### Pull requests
