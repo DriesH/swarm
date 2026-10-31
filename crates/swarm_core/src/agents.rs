@@ -72,7 +72,7 @@ impl StatusMerge {
         before != self.visible()
     }
 
-    /// The app sent input to the agent's terminal: a notice no longer applies.
+    /// The user typed or pasted into the agent's terminal: a notice no longer applies.
     pub fn app_input(&mut self) -> bool {
         let before = self.visible();
         self.notice = None;

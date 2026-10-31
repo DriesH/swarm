@@ -463,9 +463,17 @@ impl Agents {
         self.update(id, |live| live.merge.notify(text));
     }
 
-    /// The app sent input to a terminal: a notice on the agent in it no longer applies,
-    /// and the orchestrator hears when the user typed into a worker (ADR 0002).
+    /// The user typed or pasted into a terminal: a notice on the agent in it no longer
+    /// applies, and the orchestrator hears when the user typed into a worker (ADR 0002).
+    /// Resizes, focus and scrollback requests only show the terminal; they change nothing.
     pub(crate) fn app_input(self: &Arc<Self>, terminal: TerminalId, input: &TerminalInput) {
+        if !matches!(
+            input,
+            TerminalInput::Key(_) | TerminalInput::Text(_) | TerminalInput::Paste(_)
+        ) {
+            return;
+        }
+
         let typed_into = lock(&self.live)
             .values()
             .find(|agent| agent.info.terminal == Some(terminal))
