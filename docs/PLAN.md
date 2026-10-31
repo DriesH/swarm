@@ -75,7 +75,7 @@ Every agent terminal gets `SWARM_SOCKET`, `SWARM_AGENT_ID`, `SWARM_TASK` and its
 
 **Starting new work later.** The **+** in the tab bar opens a menu with two choices:
 
-- **New task**: a sheet with name, branch from (default: base branch; option: current tab's branch), orchestrator agent, optional first message, run setup script. Swarm creates the worktree and tab and starts one orchestrator.
+- **New task**: a sheet with name, branch from (default: base branch; any local branch, so a kept branch of a closed task can be picked up again), orchestrator agent, optional first message, run setup script. Swarm creates the worktree and tab and starts one orchestrator.
 - **Plan with orchestrator**: opens a Plan tab for a bigger request that should be split into several tasks. It is the Start tab under another name, because the project already has tasks. Only one Start or Plan tab can be open per project.
 
 Harness calls for the Start orchestrator:
@@ -167,7 +167,7 @@ The harness block is always added first and is not editable.
 
 Every agent belongs to a task. The daemon tracks every agent in SQLite (ADR 0005), so none are lost; the goal is that none are forgotten.
 
-- **Close task**: from the tab's close button or ⌘K. A dialog shows what closing stops and deletes: running agents, user terminals, uncommitted files, workers with their own worktree that are not merged. Then the agents and all terminals of the task stop, the teardown script runs, and the task worktree and workers' own worktrees are removed. Every branch stays, so only uncommitted work (and ignored files) is lost. After the agents stop, the daemon checks again and refuses when more would be lost than the dialog showed. A close interrupted by a crash finishes on the next daemon start. A closed task is never listed again and its ports are free.
+- **Close task**: from the tab's close button or ⌘K. A dialog shows what closing stops and deletes: running agents, user terminals, uncommitted files, workers with their own worktree that are not merged. Then the agents and all terminals of the task stop, the teardown script runs, and the task worktree and workers' own worktrees are removed. A branch already merged into the base branch is deleted; every other branch stays, so only uncommitted work (and ignored files) is lost. Branches merged by squash on GitHub do not count as merged and stay. After the agents stop, the daemon checks again and refuses when more would be lost than the dialog showed. A close interrupted by a crash finishes on the next daemon start. A closed task is never listed again and its ports are free.
 - **Quit**: with running agents, ask once: keep running or stop all. Option to remember the choice.
 - **Idle stop**: a done or idle agent stops after 30 minutes (setting). Its session ID is kept, so it resumes with `claude --resume <id>` or `codex resume <id>`.
 - **Menu bar**: shows the running agent count and **Stop all**, also when the app is closed.

@@ -85,7 +85,7 @@ The user's sign-off on the Merged changes of a task. It holds only while those c
 _Avoid_: Accept, sign off, LGTM
 
 **Close task**:
-Ending a task: its agents stop and its worktrees are removed. Its branch stays.
+Ending a task: its agents stop and its worktrees are removed. Its branch stays unless it is already merged into the base branch.
 _Avoid_: Delete task, archive, kill
 
 **Task worktree**:
