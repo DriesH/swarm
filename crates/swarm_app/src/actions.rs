@@ -28,12 +28,30 @@ actions!(
         /// Selects the previous changed file.
         PreviousFile,
         /// Marks the selected file viewed, or not viewed.
-        ToggleViewed
+        ToggleViewed,
+        /// Opens the comment box on the line cursor.
+        CommentOnLine,
+        /// Moves the line cursor up one commentable line.
+        PreviousLine,
+        /// Moves the line cursor down one commentable line.
+        NextLine,
+        /// Closes the comment box and drops its draft.
+        CancelComment
     ]
 );
 
 /// Key context of the Review view.
 pub(crate) const REVIEW_CONTEXT: &str = "Review";
+
+/// Key context of the diff body, where the line cursor lives.
+pub(crate) const REVIEW_BODY_CONTEXT: &str = "ReviewBody";
+
+/// Key context of the box for a new comment.
+pub(crate) const COMPOSER_CONTEXT: &str = "CommentComposer";
+
+/// Plain keys of Review never fire while a text field has focus.
+const REVIEW_KEYS: &str = "Review && !TextInput && !TextArea";
+const BODY_KEYS: &str = "ReviewBody && !TextInput && !TextArea";
 
 /// Focuses the agent at `index` in the open task (the orchestrator is 0).
 #[derive(Clone, PartialEq, Action)]
@@ -66,11 +84,16 @@ pub(crate) fn bind_keys(cx: &mut App) {
             .map(|(index, key)| KeyBinding::new(key, FocusAgent { index }, root)),
     );
 
-    let review = Some(REVIEW_CONTEXT);
+    let review = Some(REVIEW_KEYS);
+    let body = Some(BODY_KEYS);
     bindings.extend([
         KeyBinding::new("j", NextFile, review),
         KeyBinding::new("k", PreviousFile, review),
         KeyBinding::new("v", ToggleViewed, review),
+        KeyBinding::new("c", CommentOnLine, review),
+        KeyBinding::new("up", PreviousLine, body),
+        KeyBinding::new("down", NextLine, body),
+        KeyBinding::new("escape", CancelComment, Some(COMPOSER_CONTEXT)),
     ]);
 
     cx.bind_keys(bindings);

@@ -140,6 +140,10 @@ pub(crate) struct Workspace {
     /// The task whose approval is on its way to the daemon.
     pub(crate) review_approving: Option<TaskId>,
     pub(crate) review_error: Option<(TaskId, SharedString)>,
+    /// The task whose Request changes is on its way to the daemon.
+    pub(crate) review_requesting: Option<TaskId>,
+    /// The comments listing the daemon last answered, so a list is asked once per diff.
+    pub(crate) comments_listed: Option<crate::review_comments::Listed>,
     /// Moves keyboard focus into Review at the next frame.
     pub(crate) pending_review_focus: bool,
     pub(crate) review_poll: Option<DiffPoll>,
@@ -263,6 +267,8 @@ impl Workspace {
             review_worktree: None,
             review_approving: None,
             review_error: None,
+            review_requesting: None,
+            comments_listed: None,
             pending_review_focus: false,
             review_poll: None,
             live_poll: None,
@@ -350,6 +356,9 @@ impl Workspace {
     /// Opening a view this way clears the agent filter of Review. Only View diff sets it.
     pub(crate) fn set_view(&mut self, view: View, cx: &mut Context<Self>) {
         self.view = view;
+        if view != View::Review {
+            self.comments_listed = None;
+        }
         self.review_agent = None;
         self.review_file = None;
         self.pending_review_focus = view == View::Review;
@@ -443,7 +452,7 @@ impl Workspace {
             return;
         }
 
-        let handle = self.review.read(cx).focus_handle().clone();
+        let handle = self.review.read(cx).body_focus().clone();
 
         window.focus(&handle, cx);
     }

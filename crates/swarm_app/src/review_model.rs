@@ -1,13 +1,15 @@
 //! Review: the data behind the diff view. Plain data, no gpui entities.
 
-use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use gpui::SharedString;
 use swarm_protocol::{
-    AgentId as DaemonAgentId, DiffHunk, DiffLine, DiffLineKind, DiffStat, FileChange, FileDiff,
+    AgentId as DaemonAgentId, CommentAnchor, CommentEvent, CommentId, CommentState, DiffHunk,
+    DiffLine, DiffLineKind, DiffSide, DiffStat, FileChange, FileDiff, NewComment, ReviewComment,
     ReviewSource, TaskDiff, TaskId,
 };
 
@@ -299,6 +301,15 @@ pub(crate) enum Row {
         file: u32,
         note: Note,
     },
+    /// A comment thread: an index into [`Marks::threads`].
+    Thread {
+        file: u32,
+        thread: u32,
+    },
+    /// The box for a new comment, under the line of [`Marks::composer`].
+    Composer {
+        file: u32,
+    },
     /// The space under the last card.
     End,
 }
@@ -310,7 +321,9 @@ impl Row {
             | Self::Hunk { file, .. }
             | Self::Line { file, .. }
             | Self::Pair { file, .. }
-            | Self::Note { file, .. } => file,
+            | Self::Note { file, .. }
+            | Self::Thread { file, .. }
+            | Self::Composer { file } => file,
             Self::End => return None,
         };
 
@@ -357,7 +370,9 @@ pub(crate) fn build_rows(
     shown: &[usize],
     collapsed: impl Fn(usize) -> bool,
     style: DiffStyle,
+    marks: &Marks,
 ) -> BodyRows {
+    let lookup = Lookup::new(marks);
     let mut body = BodyRows {
         rows: Vec::new(),
         headers: vec![None; diff.files.len()],
@@ -376,6 +391,13 @@ pub(crate) fn build_rows(
 
         if collapsed(*index) {
             continue;
+        }
+
+        for thread in lookup.tops(*index) {
+            body.rows.push(Row::Thread {
+                file: at,
+                thread: *thread,
+            });
         }
 
         if file.binary {
@@ -409,9 +431,15 @@ pub(crate) fn build_rows(
                 hunk: hunk_at,
             });
 
+            let start = body.rows.len();
+
             match style {
                 DiffStyle::Unified => unified_rows(&mut body.rows, at, hunk_at, hunk),
                 DiffStyle::Split => split_rows(&mut body.rows, at, hunk_at, hunk),
+            }
+
+            if !lookup.is_empty() {
+                lookup.add_after_lines(&mut body.rows, start);
             }
         }
 
@@ -561,6 +589,614 @@ fn split_rows(rows: &mut Vec<Row>, file: u32, hunk: u32, data: &DiffHunk) {
         old += row_index(deleted.len());
         new += row_index(added.len());
     }
+}
+
+/// A line of a file diff that a comment can sit on: indexes into the diff, with the
+/// line's index inside its hunk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct LinePos {
+    pub file: u32,
+    pub hunk: u32,
+    pub line: u32,
+    pub side: DiffSide,
+}
+
+/// The side a line of this kind can be commented on. `NoNewline` has none.
+pub(crate) fn side_of(kind: DiffLineKind) -> Option<DiffSide> {
+    match kind {
+        DiffLineKind::Deleted => Some(DiffSide::Old),
+        DiffLineKind::Added | DiffLineKind::Context => Some(DiffSide::New),
+        DiffLineKind::NoNewline => None,
+    }
+}
+
+fn on_side(kind: DiffLineKind, side: DiffSide) -> bool {
+    match side {
+        DiffSide::Old => matches!(kind, DiffLineKind::Context | DiffLineKind::Deleted),
+        DiffSide::New => matches!(kind, DiffLineKind::Context | DiffLineKind::Added),
+    }
+}
+
+/// The numbers of a hunk's lines as `(old, new)`, 0 where a line has none.
+pub(crate) fn hunk_numbers(hunk: &DiffHunk) -> Vec<(u32, u32)> {
+    let (mut old, mut new) = (hunk.old_start, hunk.new_start);
+
+    hunk.lines
+        .iter()
+        .map(|line| {
+            let numbers = match line.kind {
+                DiffLineKind::Context => (old, new),
+                DiffLineKind::Deleted => (old, 0),
+                DiffLineKind::Added => (0, new),
+                DiffLineKind::NoNewline => (0, 0),
+            };
+
+            if matches!(line.kind, DiffLineKind::Context | DiffLineKind::Deleted) {
+                old += 1;
+            }
+            if matches!(line.kind, DiffLineKind::Context | DiffLineKind::Added) {
+                new += 1;
+            }
+
+            numbers
+        })
+        .collect()
+}
+
+/// The comment anchor of a line: its number and text on `side`, and the texts of the
+/// lines just before and after on that side, `None` at the hunk's edges.
+pub(crate) fn anchor_for(
+    file: &FileDiff,
+    hunk: usize,
+    line: usize,
+    side: DiffSide,
+) -> Option<CommentAnchor> {
+    let data = file.hunks.get(hunk)?;
+    let current = data.lines.get(line)?;
+
+    if !on_side(current.kind, side) {
+        return None;
+    }
+
+    let numbers = hunk_numbers(data);
+    let (old, new) = *numbers.get(line)?;
+    let number = match side {
+        DiffSide::Old => old,
+        DiffSide::New => new,
+    };
+
+    let same_side: Vec<&DiffLine> = data
+        .lines
+        .iter()
+        .filter(|other| on_side(other.kind, side))
+        .collect();
+    let position = same_side
+        .iter()
+        .position(|other| std::ptr::eq(*other, current))?;
+
+    Some(CommentAnchor {
+        worktree: file.worktree.clone(),
+        path: file.path.clone(),
+        side,
+        line: number,
+        text: current.text.clone(),
+        before: position
+            .checked_sub(1)
+            .and_then(|before| same_side.get(before))
+            .map(|line| line.text.clone()),
+        after: same_side.get(position + 1).map(|line| line.text.clone()),
+    })
+}
+
+/// The hunk and line index of the line numbered `number` on `side`.
+pub(crate) fn find_line(file: &FileDiff, side: DiffSide, number: u32) -> Option<(u32, u32)> {
+    for (hunk_index, hunk) in file.hunks.iter().enumerate() {
+        for (line_index, (old, new)) in hunk_numbers(hunk).into_iter().enumerate() {
+            let here = match side {
+                DiffSide::Old => old,
+                DiffSide::New => new,
+            };
+            let kind_fits = hunk
+                .lines
+                .get(line_index)
+                .is_some_and(|line| on_side(line.kind, side));
+
+            if here == number && kind_fits {
+                return Some((row_index(hunk_index), row_index(line_index)));
+            }
+        }
+    }
+
+    None
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Place {
+    /// Under a line, as hunk and line index.
+    Line { hunk: u32, line: u32 },
+    /// At the top of the file card: outdated, or on a line no hunk holds.
+    Top,
+}
+
+/// A top-level comment placed on a file of the diff.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Thread {
+    /// Index into the comments slice that was placed.
+    pub root: usize,
+    pub file: usize,
+    pub side: DiffSide,
+    pub place: Place,
+}
+
+/// Places the top-level comments made on the diff's source on its files. Comments of
+/// other sources, and of files the diff does not hold, are left out. The result is
+/// ordered by file, then top before lines, then position, then age.
+pub(crate) fn place_threads(diff: &TaskDiff, comments: &[ReviewComment]) -> Vec<Thread> {
+    let files: HashMap<FileKey, usize> = diff
+        .files
+        .iter()
+        .enumerate()
+        .map(|(index, file)| ((file.worktree.clone(), file.path.clone()), index))
+        .collect();
+    let mut threads = Vec::new();
+
+    for (root, comment) in comments.iter().enumerate() {
+        if comment.parent.is_some() || comment.source != diff.source {
+            continue;
+        }
+
+        let key = (comment.anchor.worktree.clone(), comment.anchor.path.clone());
+        let Some(file) = files.get(&key).copied() else {
+            continue;
+        };
+        let found = if comment.outdated {
+            None
+        } else {
+            diff.files
+                .get(file)
+                .and_then(|data| find_line(data, comment.anchor.side, comment.anchor.line))
+        };
+
+        threads.push(Thread {
+            root,
+            file,
+            side: comment.anchor.side,
+            place: found.map_or(Place::Top, |(hunk, line)| Place::Line { hunk, line }),
+        });
+    }
+
+    threads.sort_by_key(|thread| {
+        let order = match thread.place {
+            Place::Top => (0, 0, 0),
+            Place::Line { hunk, line } => (1, hunk, line),
+        };
+
+        (thread.file, order, thread.root)
+    });
+
+    threads
+}
+
+/// What the rows need besides the diff: the placed threads and the open composer.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Marks {
+    pub threads: Rc<[Thread]>,
+    pub composer: Option<LinePos>,
+}
+
+/// Finds the threads of a line quickly while rows are built.
+struct Lookup<'a> {
+    marks: &'a Marks,
+    tops: HashMap<usize, Vec<u32>>,
+    lines: HashMap<(usize, u32, u32), Vec<u32>>,
+}
+
+impl<'a> Lookup<'a> {
+    fn new(marks: &'a Marks) -> Self {
+        let mut tops: HashMap<usize, Vec<u32>> = HashMap::new();
+        let mut lines: HashMap<(usize, u32, u32), Vec<u32>> = HashMap::new();
+
+        for (index, thread) in marks.threads.iter().enumerate() {
+            let index = row_index(index);
+
+            match thread.place {
+                Place::Top => tops.entry(thread.file).or_default().push(index),
+                Place::Line { hunk, line } => lines
+                    .entry((thread.file, hunk, line))
+                    .or_default()
+                    .push(index),
+            }
+        }
+
+        Self { marks, tops, lines }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.lines.is_empty() && self.marks.composer.is_none()
+    }
+
+    fn tops(&self, file: usize) -> &[u32] {
+        self.tops.get(&file).map_or(&[], Vec::as_slice)
+    }
+
+    /// Adds the thread and composer rows under the lines among `rows[start..]`.
+    fn add_after_lines(&self, rows: &mut Vec<Row>, start: usize) {
+        let generated = rows.split_off(start);
+
+        for row in generated {
+            rows.push(row);
+
+            match row {
+                Row::Line {
+                    file, hunk, line, ..
+                } => self.push_under(rows, file, hunk, line, None),
+                Row::Pair {
+                    file,
+                    hunk,
+                    left,
+                    right,
+                } => {
+                    if let Some(side) = left {
+                        self.push_under(rows, file, hunk, side.line, Some(DiffSide::Old));
+                    }
+                    if let Some(side) = right {
+                        self.push_under(rows, file, hunk, side.line, Some(DiffSide::New));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn push_under(
+        &self,
+        rows: &mut Vec<Row>,
+        file: u32,
+        hunk: u32,
+        line: u32,
+        side: Option<DiffSide>,
+    ) {
+        let fits = |other: DiffSide| side.is_none_or(|side| side == other);
+
+        if let Some(threads) = self.lines.get(&(file as usize, hunk, line)) {
+            for thread in threads {
+                let placed = self.marks.threads.get(*thread as usize);
+
+                if placed.is_some_and(|placed| fits(placed.side)) {
+                    rows.push(Row::Thread {
+                        file,
+                        thread: *thread,
+                    });
+                }
+            }
+        }
+
+        let composer = self
+            .marks
+            .composer
+            .filter(|at| at.file == file && at.hunk == hunk && at.line == line && fits(at.side));
+
+        if composer.is_some() {
+            rows.push(Row::Composer { file });
+        }
+    }
+}
+
+/// How many comments of each state a task has.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CommentCounts {
+    pub pending: u32,
+    pub sent: u32,
+    pub resolved: u32,
+}
+
+pub(crate) fn count_comments(comments: &[ReviewComment]) -> CommentCounts {
+    let mut counts = CommentCounts::default();
+
+    for comment in comments {
+        match comment.state {
+            CommentState::Pending => counts.pending += 1,
+            CommentState::Sent => counts.sent += 1,
+            CommentState::Resolved => counts.resolved += 1,
+        }
+    }
+
+    counts
+}
+
+impl CommentCounts {
+    /// "2 pending comments", or "3 sent · 1 pending" when more than one state shows.
+    pub(crate) fn status_text(self) -> Option<String> {
+        let parts: Vec<(u32, &str)> = [
+            (self.sent, "sent"),
+            (self.pending, "pending"),
+            (self.resolved, "resolved"),
+        ]
+        .into_iter()
+        .filter(|(count, _)| *count > 0)
+        .collect();
+
+        match parts.as_slice() {
+            [] => None,
+            [(count, word)] => Some(format!(
+                "{count} {word} {}",
+                if *count == 1 { "comment" } else { "comments" }
+            )),
+            many => Some(
+                many.iter()
+                    .map(|(count, word)| format!("{count} {word}"))
+                    .collect::<Vec<_>>()
+                    .join(" \u{b7} "),
+            ),
+        }
+    }
+}
+
+/// Applies a daemon event to a task's comments, kept oldest first.
+pub(crate) fn apply_comment_event(comments: &mut Vec<ReviewComment>, event: &CommentEvent) {
+    match event {
+        CommentEvent::Changed(comment) => {
+            if let Some(slot) = comments.iter_mut().find(|other| other.id == comment.id) {
+                *slot = (**comment).clone();
+            } else {
+                comments.push((**comment).clone());
+                comments.sort_by_key(|other| other.id);
+            }
+        }
+        CommentEvent::Deleted { id, .. } => {
+            comments.retain(|other| other.id != *id && other.parent != Some(*id));
+        }
+    }
+}
+
+/// The comment the sample (no daemon) makes of a new one: Live goes at once, Merged
+/// waits, and a reply follows its parent.
+pub(crate) fn fake_add(
+    list: &mut Vec<ReviewComment>,
+    new: NewComment,
+    owner: Option<DaemonAgentId>,
+    now: u64,
+) {
+    let id = CommentId(list.iter().map(|comment| comment.id.0).max().unwrap_or(0) + 1);
+    let waits = match new.parent {
+        Some(parent) => list
+            .iter()
+            .find(|comment| comment.id == parent)
+            .is_some_and(|comment| comment.state == CommentState::Pending),
+        None => new.source == ReviewSource::Merged,
+    };
+
+    list.push(ReviewComment {
+        id,
+        task: new.task,
+        parent: new.parent,
+        source: new.source,
+        anchor: new.anchor,
+        body: new.body,
+        state: if waits {
+            CommentState::Pending
+        } else {
+            CommentState::Sent
+        },
+        to: if waits { None } else { owner },
+        outdated: false,
+        created_at: now,
+        sent_at: (!waits).then_some(now),
+    });
+}
+
+/// Marks a thread resolved, or sent again.
+pub(crate) fn fake_resolve(list: &mut [ReviewComment], id: CommentId, resolved: bool) {
+    if let Some(comment) = list.iter_mut().find(|comment| comment.id == id) {
+        comment.state = if resolved {
+            CommentState::Resolved
+        } else {
+            CommentState::Sent
+        };
+    }
+}
+
+/// Deletes a pending comment and its replies.
+pub(crate) fn fake_delete(list: &mut Vec<ReviewComment>, id: CommentId) {
+    let pending = list
+        .iter()
+        .any(|comment| comment.id == id && comment.state == CommentState::Pending);
+
+    if pending {
+        list.retain(|comment| comment.id != id && comment.parent != Some(id));
+    }
+}
+
+/// Sends every pending comment. Returns false when none waited.
+pub(crate) fn fake_send(
+    list: &mut [ReviewComment],
+    owner: impl Fn(&ReviewComment) -> Option<DaemonAgentId>,
+    now: u64,
+) -> bool {
+    let mut sent = false;
+
+    for comment in list.iter_mut() {
+        if comment.state == CommentState::Pending {
+            comment.to = owner(comment);
+            comment.state = CommentState::Sent;
+            comment.sent_at = Some(now);
+            sent = true;
+        }
+    }
+
+    sent
+}
+
+/// How long ago, as "40s", "6m", "2h" or "3d". Under 5 seconds is "now".
+pub(crate) fn ago(then: u64, now: u64) -> String {
+    let seconds = now.saturating_sub(then) / 1_000;
+
+    if seconds < 5 {
+        "now".to_owned()
+    } else if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h", seconds / 3_600)
+    } else {
+        format!("{}d", seconds / 86_400)
+    }
+}
+
+/// The first added or deleted line of a file, as a position.
+pub(crate) fn first_changed_line(file: &FileDiff, index: usize) -> Option<LinePos> {
+    for (hunk_index, hunk) in file.hunks.iter().enumerate() {
+        for (line_index, line) in hunk.lines.iter().enumerate() {
+            let side = match line.kind {
+                DiffLineKind::Added => DiffSide::New,
+                DiffLineKind::Deleted => DiffSide::Old,
+                DiffLineKind::Context | DiffLineKind::NoNewline => continue,
+            };
+
+            return Some(LinePos {
+                file: row_index(index),
+                hunk: row_index(hunk_index),
+                line: row_index(line_index),
+                side,
+            });
+        }
+    }
+
+    None
+}
+
+fn find_file<'a>(diff: &'a TaskDiff, name: &str) -> Option<(usize, &'a FileDiff)> {
+    diff.files
+        .iter()
+        .enumerate()
+        .find(|(_, file)| file.path.ends_with(name))
+}
+
+/// Sample comments for the sample task: a pending one and a deleted-side one on Merged;
+/// a sent thread with a reply, a resolved thread and an outdated comment on Live.
+pub(crate) fn sample_comments(
+    live: &TaskDiff,
+    merged: &TaskDiff,
+    agents: [DaemonAgentId; 3],
+    now: u64,
+) -> Vec<ReviewComment> {
+    let task = merged.task;
+    let find = find_file;
+    let first = |diff: &TaskDiff, name: &str| {
+        let (index, file) = find(diff, name)?;
+        let at = first_changed_line(file, index)?;
+
+        anchor_for(file, at.hunk as usize, at.line as usize, at.side)
+    };
+    let made = |id: u64,
+                parent: Option<u64>,
+                source: ReviewSource,
+                anchor: CommentAnchor,
+                body: &str,
+                state: CommentState,
+                age: u64| {
+        let sent = state != CommentState::Pending;
+
+        ReviewComment {
+            id: CommentId(id),
+            task,
+            parent: parent.map(CommentId),
+            source,
+            anchor,
+            body: body.to_owned(),
+            state,
+            to: sent.then_some(agents[0]),
+            outdated: false,
+            created_at: now.saturating_sub(age),
+            sent_at: sent.then(|| now.saturating_sub(age).saturating_add(1_000)),
+        }
+    };
+
+    let mut comments = Vec::new();
+
+    if let Some(anchor) = first(merged, "element.rs") {
+        comments.push(made(
+            1,
+            None,
+            ReviewSource::Merged,
+            anchor,
+            "Cache shaped lines per row and only reshape dirty rows. A full reshape every frame will hurt at `200\u{d7}60`.",
+            CommentState::Pending,
+            300_000,
+        ));
+    }
+
+    if let Some(anchor) = first(merged, "grid.rs") {
+        comments.push(made(
+            2,
+            None,
+            ReviewSource::Merged,
+            anchor,
+            "Why not a ring buffer here?",
+            CommentState::Pending,
+            120_000,
+        ));
+    }
+
+    if let Some(anchor) = first(live, "element.rs") {
+        comments.push(made(
+            3,
+            None,
+            ReviewSource::Live,
+            anchor.clone(),
+            "Cache shaped lines per row and only reshape dirty rows. A full reshape every frame will hurt at `200\u{d7}60`.",
+            CommentState::Sent,
+            41_000,
+        ));
+        comments.push(made(
+            4,
+            Some(3),
+            ReviewSource::Live,
+            anchor,
+            "Also check `dirty.contains` after a resize.",
+            CommentState::Sent,
+            20_000,
+        ));
+    }
+
+    if let Some(anchor) = first(live, "grid.rs") {
+        comments.push(made(
+            5,
+            None,
+            ReviewSource::Live,
+            anchor,
+            "Rename `cell_0` to something that says what it holds.",
+            CommentState::Resolved,
+            900_000,
+        ));
+    }
+
+    if let Some((_, file)) = find(live, "pty.rs") {
+        let anchor = CommentAnchor {
+            worktree: file.worktree.clone(),
+            path: file.path.clone(),
+            side: DiffSide::New,
+            line: 60,
+            text: "        let stale = old_buffer.take();".to_owned(),
+            before: None,
+            after: None,
+        };
+        let mut outdated = made(
+            6,
+            None,
+            ReviewSource::Live,
+            anchor,
+            "Drop the `take` here, the buffer is reused.",
+            CommentState::Sent,
+            600_000,
+        );
+
+        outdated.outdated = true;
+        comments.push(outdated);
+    }
+
+    comments
 }
 
 /// `1204` as `1,204`.
@@ -878,7 +1514,7 @@ mod tests {
         let infos = file_infos(diff);
         let shown: Vec<usize> = (0..diff.files.len()).collect();
 
-        build_rows(diff, &infos, &shown, |_| false, style).rows
+        build_rows(diff, &infos, &shown, |_| false, style, &Marks::default()).rows
     }
 
     #[test]
@@ -1027,6 +1663,7 @@ mod tests {
             &[0, 1],
             |index| index == 0,
             DiffStyle::Unified,
+            &Marks::default(),
         );
 
         assert_eq!(body.headers, [Some(0), Some(1)]);
@@ -1203,5 +1840,338 @@ mod tests {
             assert_eq!(counted(DiffLineKind::Added), file.additions as usize);
             assert_eq!(counted(DiffLineKind::Deleted), file.deletions as usize);
         }
+    }
+
+    fn comment(id: u64, side: DiffSide, line: u32, state: CommentState) -> ReviewComment {
+        ReviewComment {
+            id: CommentId(id),
+            task: TaskId(1),
+            parent: None,
+            source: ReviewSource::Merged,
+            anchor: CommentAnchor {
+                worktree: PathBuf::from("/wt"),
+                path: PathBuf::from("a.rs"),
+                side,
+                line,
+                text: String::new(),
+                before: None,
+                after: None,
+            },
+            body: format!("comment {id}"),
+            state,
+            to: None,
+            outdated: false,
+            created_at: 1,
+            sent_at: None,
+        }
+    }
+
+    /// Lines: ctx a (10, 20), del b (11), add B (21), ctx c (12, 22).
+    fn commented_diff() -> TaskDiff {
+        diff(vec![file(
+            "a.rs",
+            None,
+            vec![
+                line(DiffLineKind::Context, "a"),
+                line(DiffLineKind::Deleted, "b"),
+                line(DiffLineKind::Added, "B"),
+                line(DiffLineKind::Context, "c"),
+            ],
+        )])
+    }
+
+    fn rows_with(diff: &TaskDiff, comments: &[ReviewComment], style: DiffStyle) -> Vec<Row> {
+        let infos = file_infos(diff);
+        let marks = Marks {
+            threads: place_threads(diff, comments).into(),
+            composer: None,
+        };
+
+        build_rows(diff, &infos, &[0], |_| false, style, &marks).rows
+    }
+
+    fn thread_rows(rows: &[Row]) -> Vec<usize> {
+        rows.iter()
+            .enumerate()
+            .filter(|(_, row)| matches!(row, Row::Thread { .. }))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    #[test]
+    fn an_anchor_holds_the_line_and_its_neighbors_on_its_side() {
+        let diff = commented_diff();
+        let file = &diff.files[0];
+
+        let added = anchor_for(file, 0, 2, DiffSide::New);
+        let deleted = anchor_for(file, 0, 1, DiffSide::Old);
+
+        let added = added.expect("the added line takes a new-side anchor");
+        assert_eq!((added.line, added.text.as_str()), (21, "B"));
+        assert_eq!(added.before.as_deref(), Some("a"));
+        assert_eq!(added.after.as_deref(), Some("c"));
+        assert_eq!(added.worktree, PathBuf::from("/wt"));
+        assert_eq!(added.path, PathBuf::from("a.rs"));
+
+        let deleted = deleted.expect("the deleted line takes an old-side anchor");
+        assert_eq!((deleted.line, deleted.text.as_str()), (11, "b"));
+        assert_eq!(deleted.before.as_deref(), Some("a"));
+        assert_eq!(deleted.after.as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn an_anchor_has_no_neighbor_past_the_edge_of_its_hunk() {
+        let diff = commented_diff();
+        let file = &diff.files[0];
+
+        let first = anchor_for(file, 0, 0, DiffSide::New).expect("context line");
+        let last = anchor_for(file, 0, 3, DiffSide::Old).expect("context line, old side");
+
+        assert_eq!(
+            (first.line, first.before, first.after.as_deref()),
+            (20, None, Some("B"))
+        );
+        assert_eq!(
+            (last.line, last.before.as_deref(), last.after),
+            (12, Some("b"), None)
+        );
+    }
+
+    #[test]
+    fn a_line_has_no_anchor_on_a_side_it_is_not_on() {
+        let mut diff = commented_diff();
+        diff.files[0].hunks[0]
+            .lines
+            .push(line(DiffLineKind::NoNewline, ""));
+        let file = &diff.files[0];
+
+        assert!(anchor_for(file, 0, 2, DiffSide::Old).is_none());
+        assert!(anchor_for(file, 0, 1, DiffSide::New).is_none());
+        assert!(anchor_for(file, 0, 4, DiffSide::New).is_none());
+        assert!(anchor_for(file, 3, 0, DiffSide::New).is_none());
+    }
+
+    #[test]
+    fn a_comment_sits_under_its_line_in_unified() {
+        let diff = commented_diff();
+        let comments = [comment(1, DiffSide::New, 21, CommentState::Pending)];
+
+        let rows = rows_with(&diff, &comments, DiffStyle::Unified);
+
+        // Header, hunk, a, b, B, thread, c, end.
+        assert_eq!(thread_rows(&rows), [5]);
+        assert!(matches!(rows[4], Row::Line { line: 2, .. }));
+    }
+
+    #[test]
+    fn an_old_side_comment_sits_under_the_row_with_that_old_number() {
+        let diff = commented_diff();
+        let comments = [comment(1, DiffSide::Old, 11, CommentState::Pending)];
+
+        let rows = rows_with(&diff, &comments, DiffStyle::Unified);
+
+        assert_eq!(thread_rows(&rows), [4]);
+        assert!(matches!(rows[3], Row::Line { line: 1, .. }));
+    }
+
+    #[test]
+    fn a_comment_sits_under_its_pair_in_split() {
+        let diff = commented_diff();
+        let comments = [
+            comment(1, DiffSide::New, 21, CommentState::Pending),
+            comment(2, DiffSide::Old, 12, CommentState::Pending),
+        ];
+
+        let rows = rows_with(&diff, &comments, DiffStyle::Split);
+
+        // Header, hunk, a|a, b|B, thread (new 21), c|c, thread (old 12), end.
+        assert_eq!(thread_rows(&rows), [4, 6]);
+        assert!(matches!(rows[3], Row::Pair { .. }));
+        assert!(matches!(rows[5], Row::Pair { .. }));
+    }
+
+    #[test]
+    fn an_outdated_comment_and_one_outside_every_hunk_go_to_the_top_of_the_file() {
+        let diff = commented_diff();
+        let mut outdated = comment(1, DiffSide::New, 21, CommentState::Sent);
+        outdated.outdated = true;
+        let outside = comment(2, DiffSide::New, 900, CommentState::Pending);
+
+        let comments = [outdated, outside];
+
+        let threads = place_threads(&diff, &comments);
+        let rows = rows_with(&diff, &comments, DiffStyle::Unified);
+
+        assert!(threads.iter().all(|thread| thread.place == Place::Top));
+        assert_eq!(thread_rows(&rows), [1, 2]);
+        assert!(matches!(rows[0], Row::Header { .. }));
+        assert!(matches!(rows[3], Row::Hunk { .. }));
+    }
+
+    #[test]
+    fn comments_of_another_source_or_file_and_replies_are_not_placed() {
+        let diff = commented_diff();
+        let mut live = comment(1, DiffSide::New, 21, CommentState::Sent);
+        live.source = ReviewSource::Live;
+        let mut elsewhere = comment(2, DiffSide::New, 21, CommentState::Sent);
+        elsewhere.anchor.path = PathBuf::from("other.rs");
+        let mut reply = comment(3, DiffSide::New, 21, CommentState::Sent);
+        reply.parent = Some(CommentId(9));
+
+        let threads = place_threads(&diff, &[live, elsewhere, reply]);
+
+        assert!(threads.is_empty());
+    }
+
+    #[test]
+    fn the_comment_box_sits_under_the_threads_of_its_line() {
+        let diff = commented_diff();
+        let infos = file_infos(&diff);
+        let comments = [comment(1, DiffSide::New, 21, CommentState::Pending)];
+        let marks = Marks {
+            threads: place_threads(&diff, &comments).into(),
+            composer: Some(LinePos {
+                file: 0,
+                hunk: 0,
+                line: 2,
+                side: DiffSide::New,
+            }),
+        };
+
+        let rows = build_rows(&diff, &infos, &[0], |_| false, DiffStyle::Unified, &marks).rows;
+
+        assert!(matches!(rows[5], Row::Thread { .. }));
+        assert!(matches!(rows[6], Row::Composer { .. }));
+    }
+
+    #[test]
+    fn comment_counts_read_as_a_status() {
+        let pending = comment(1, DiffSide::New, 1, CommentState::Pending);
+        let sent = comment(2, DiffSide::New, 1, CommentState::Sent);
+        let resolved = comment(3, DiffSide::New, 1, CommentState::Resolved);
+        let text = |list: &[ReviewComment]| count_comments(list).status_text();
+
+        assert_eq!(text(&[]), None);
+        assert_eq!(
+            text(&[pending.clone(), pending.clone()]).as_deref(),
+            Some("2 pending comments")
+        );
+        assert_eq!(
+            text(std::slice::from_ref(&pending)).as_deref(),
+            Some("1 pending comment")
+        );
+        assert_eq!(
+            text(&[sent.clone(), sent.clone(), sent.clone(), pending]).as_deref(),
+            Some("3 sent \u{b7} 1 pending")
+        );
+        assert_eq!(
+            text(&[sent, resolved]).as_deref(),
+            Some("1 sent \u{b7} 1 resolved")
+        );
+    }
+
+    #[test]
+    fn events_add_change_and_delete_comments() {
+        let mut list = vec![comment(1, DiffSide::New, 1, CommentState::Pending)];
+        let mut reply = comment(2, DiffSide::New, 1, CommentState::Pending);
+        reply.parent = Some(CommentId(1));
+        let mut sent = list[0].clone();
+        sent.state = CommentState::Sent;
+
+        apply_comment_event(&mut list, &CommentEvent::Changed(Box::new(reply)));
+        apply_comment_event(&mut list, &CommentEvent::Changed(Box::new(sent)));
+        let changed: Vec<_> = list.iter().map(|c| (c.id.0, c.state)).collect();
+        apply_comment_event(
+            &mut list,
+            &CommentEvent::Deleted {
+                task: TaskId(1),
+                id: CommentId(1),
+            },
+        );
+
+        assert_eq!(
+            changed,
+            [(1, CommentState::Sent), (2, CommentState::Pending)]
+        );
+        assert!(list.is_empty(), "a delete takes the replies with it");
+    }
+
+    #[test]
+    fn the_sample_daemon_follows_the_rules_of_the_real_one() {
+        let anchor = comment(1, DiffSide::New, 21, CommentState::Pending).anchor;
+        let new = |parent, source| NewComment {
+            task: TaskId(1),
+            parent,
+            source,
+            anchor: anchor.clone(),
+            body: "x".into(),
+        };
+        let mut list = Vec::new();
+
+        fake_add(&mut list, new(None, ReviewSource::Merged), None, 5);
+        fake_add(
+            &mut list,
+            new(Some(CommentId(1)), ReviewSource::Merged),
+            None,
+            6,
+        );
+        fake_add(
+            &mut list,
+            new(None, ReviewSource::Live),
+            Some(DaemonAgentId(4)),
+            7,
+        );
+        let added: Vec<_> = list.iter().map(|c| (c.state, c.to)).collect();
+        fake_delete(&mut list, CommentId(3));
+        let after_refused = list.len();
+        let sent = fake_send(&mut list, |_| Some(DaemonAgentId(9)), 8);
+        let again = fake_send(&mut list, |_| None, 9);
+        fake_resolve(&mut list, CommentId(1), true);
+
+        assert_eq!(
+            added,
+            [
+                (CommentState::Pending, None),
+                (CommentState::Pending, None),
+                (CommentState::Sent, Some(DaemonAgentId(4))),
+            ]
+        );
+        assert_eq!(after_refused, 3, "only a pending comment can be deleted");
+        assert!(sent && !again);
+        assert_eq!(list[0].state, CommentState::Resolved);
+        assert_eq!(list[1].to, Some(DaemonAgentId(9)));
+    }
+
+    #[test]
+    fn times_read_as_short_ago_words() {
+        assert_eq!(ago(10_000, 12_000), "now");
+        assert_eq!(ago(0, 40_000), "40s");
+        assert_eq!(ago(0, 6 * 60_000), "6m");
+        assert_eq!(ago(0, 2 * 3_600_000), "2h");
+        assert_eq!(ago(0, 3 * 86_400_000), "3d");
+    }
+
+    #[test]
+    fn the_sample_comments_anchor_to_real_lines() {
+        let agents = [DaemonAgentId(1), DaemonAgentId(2), DaemonAgentId(3)];
+        let live = sample_diff(TaskId(0), ReviewSource::Live, agents);
+        let merged = sample_diff(TaskId(0), ReviewSource::Merged, agents);
+
+        let comments = sample_comments(&live, &merged, agents, 1_000_000);
+
+        for diff in [&live, &merged] {
+            let placed = place_threads(diff, &comments);
+            let tops = placed.iter().filter(|t| t.place == Place::Top).count();
+
+            assert!(!placed.is_empty());
+            assert!(tops <= 1, "only the outdated sample is not on a line");
+        }
+        assert_eq!(
+            comments
+                .iter()
+                .filter(|c| c.state == CommentState::Pending)
+                .count(),
+            2
+        );
     }
 }
