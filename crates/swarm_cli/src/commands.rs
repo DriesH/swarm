@@ -6,8 +6,8 @@ use std::io::Read as _;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use swarm_protocol::agent::{
-    AgentSummary, Call, InboxMessage, Merged, Sent, TaskSummary, TaskUntil, TerminalSize,
-    TerminalSummary, TerminalText, TerminalUntil, TerminalWaited, render_inbox,
+    AgentSummary, Call, Committed, InboxMessage, Merged, Sent, TaskSummary, TaskUntil,
+    TerminalSize, TerminalSummary, TerminalText, TerminalUntil, TerminalWaited, render_inbox,
 };
 use swarm_protocol::{AgentId, AgentKind, AgentLifecycle, GridSize, TaskId, TerminalId};
 
@@ -23,6 +23,12 @@ pub(crate) enum Command {
         kind: Option<AgentKind>,
         model: Option<String>,
         brief: String,
+        /// The reason the worker needs its own worktree; `None` shares the task worktree.
+        own_worktree: Option<String>,
+    },
+    Commit {
+        message: String,
+        paths: Vec<std::path::PathBuf>,
     },
     /// `to` is an agent ID or a worker name.
     Send {
@@ -104,12 +110,14 @@ impl Command {
                 kind,
                 model,
                 brief,
+                own_worktree,
             } => {
                 let result = session.call(Call::Spawn {
                     name,
                     kind,
                     model,
                     brief,
+                    own_worktree,
                 })?;
                 let worker: AgentSummary = decode(&result)?;
                 let text = format!(
@@ -121,6 +129,12 @@ impl Command {
                 );
 
                 Ok(output(result, text))
+            }
+            Self::Commit { message, paths } => {
+                let result = session.call(Call::Commit { message, paths })?;
+                let committed: Committed = decode(&result)?;
+
+                Ok(output(result, format!("committed {}", committed.commit)))
             }
             Self::Send { to, text } => {
                 let to = resolve(session, &to)?;

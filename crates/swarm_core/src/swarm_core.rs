@@ -152,14 +152,33 @@ impl Projects {
 
     /// Undoes [`Projects::create_worker`] for a worker that never started: removes its
     /// worktree, branch and row, which frees its ports.
+    /// A worker in the task worktree only loses its row.
     pub fn discard_worker(&self, worker: &AgentInfo) {
         let _creating = lock(&self.creating);
 
-        if let Some(root) = self.project_root(worker.project) {
+        if !self.shares_task_worktree(worker)
+            && let Some(root) = self.project_root(worker.project)
+        {
             remove_task_leftovers(&root, &worker.branch, &worker.worktree);
         }
         if let Err(error) = lock(&self.store).delete_agent(worker.id) {
             log::error!("cannot delete agent {}: {error}", worker.id.0);
+        }
+    }
+
+    /// True for a worker that works in its task's worktree.
+    fn shares_task_worktree(&self, worker: &AgentInfo) -> bool {
+        let Some(task) = worker.task else {
+            return false;
+        };
+
+        match lock(&self.store).task(task) {
+            Ok(task) => task.is_some_and(|task| task.worktree == worker.worktree),
+            Err(error) => {
+                log::error!("cannot find task {}: {error}", task.0);
+
+                true
+            }
         }
     }
 
@@ -286,6 +305,61 @@ impl Projects {
         Ok(PreparedTask { task, setup, env })
     }
 
+    /// Adds a worker that works in the task worktree on the task branch. Nothing is
+    /// made on disk and no setup script runs: the task worktree ran it already.
+    /// `register` records the worker's agent row.
+    pub fn create_shared_worker(
+        &self,
+        task: &TaskInfo,
+        name: &str,
+        register: impl FnOnce(&WorkerCheckout) -> Result<AgentInfo, Error>,
+    ) -> Result<PreparedWorker, Error> {
+        let _creating = lock(&self.creating);
+
+        let worker_slug = self.free_worker_slug(task, name)?;
+        let base_commit = git::commit_of(&task.worktree, &task.branch)?;
+
+        let checkout = WorkerCheckout {
+            project: task.project,
+            task: task.id,
+            name: worker_slug,
+            branch: task.branch.clone(),
+            worktree: task.worktree.clone(),
+            ports: task.ports.clone(),
+        };
+        let agent = register(&checkout)?;
+
+        if let Err(error) = lock(&self.store).set_base_commit(agent.id, &base_commit) {
+            log::warn!("cannot record where worker {} started: {error}", agent.id.0);
+        }
+
+        let env = ports_env(task.id, &checkout.ports);
+
+        Ok(PreparedWorker {
+            agent,
+            setup: None,
+            env,
+        })
+    }
+
+    /// The slug of `name`, when no worker of the task has it yet.
+    fn free_worker_slug(&self, task: &TaskInfo, name: &str) -> Result<String, Error> {
+        let worker_slug = task::slug(name).map_err(|_| {
+            Error::Invalid(format!("the worker name {name:?} has no letters or digits"))
+        })?;
+        let taken = lock(&self.store)
+            .list_agents(task.id)?
+            .iter()
+            .any(|agent| agent.role == AgentRole::Worker && agent.name == worker_slug);
+        if taken {
+            return Err(Error::Invalid(format!(
+                "this task already has a worker named {worker_slug}"
+            )));
+        }
+
+        Ok(worker_slug)
+    }
+
     /// Makes a worker's branch (from the task branch) and worktree, copies files and
     /// reserves ports. `register` records the worker's agent row while ports are still
     /// held; nothing is left behind when a step or `register` fails.
@@ -309,18 +383,7 @@ impl Projects {
             )));
         }
 
-        let worker_slug = task::slug(name).map_err(|_| {
-            Error::Invalid(format!("the worker name {name:?} has no letters or digits"))
-        })?;
-        let taken = lock(&self.store)
-            .list_agents(task.id)?
-            .iter()
-            .any(|agent| agent.role == AgentRole::Worker && agent.name == worker_slug);
-        if taken {
-            return Err(Error::Invalid(format!(
-                "this task already has a worker named {worker_slug}"
-            )));
-        }
+        let worker_slug = self.free_worker_slug(task, name)?;
 
         let task_slug = task
             .worktree
@@ -396,7 +459,7 @@ impl Projects {
 
     fn agent_change(&self, id: AgentId) -> Result<Option<AgentChange>, Error> {
         // The store lock is gone before git runs.
-        let (agent, worker_base, task_base, task_branch) = {
+        let (agent, worker_base, task_base, task_branch, task_worktree) = {
             let store = lock(&self.store);
             let Some(agent) = store.agent(id)?.map(|stored| stored.info) else {
                 return Ok(None);
@@ -407,13 +470,31 @@ impl Projects {
                 None => None,
             };
             let task_base = task.as_ref().map(|task| task.base.clone());
+            let task_worktree = task.as_ref().map(|task| task.worktree.clone());
             let task_branch = task.map(|task| task.branch);
 
-            (agent, worker_base, task_base, task_branch)
+            (agent, worker_base, task_base, task_branch, task_worktree)
         };
 
         if !agent.worktree.is_dir() {
             return Ok(None);
+        }
+
+        let shared = agent.role == AgentRole::Worker
+            && task_worktree.as_deref() == Some(agent.worktree.as_path());
+        if shared {
+            // The worktree holds other agents' work too, so only its commits count.
+            let Some(base) = worker_base else {
+                return Ok(None);
+            };
+
+            let (stat, files) = git::trailer_stat(&agent.worktree, &base, &agent.name)?;
+
+            return Ok(Some(AgentChange {
+                agent: id,
+                stat,
+                files,
+            }));
         }
 
         let base = match agent.role {

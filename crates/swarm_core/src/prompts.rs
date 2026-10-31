@@ -61,11 +61,12 @@ pub struct Harness<'a> {
 
 /// One line per command: the command, then what it does.
 const ORCHESTRATOR_COMMANDS: &[&str] = &[
-    "`swarm spawn <name> [--kind claude|codex] [--model M] [--brief TEXT]`: start a worker (the brief comes from stdin without `--brief`)",
+    "`swarm spawn <name> [--kind claude|codex] [--model M] [--own-worktree REASON] [--brief TEXT]`: start a worker in the task worktree, or in its own worktree when you give a reason (the brief comes from stdin without `--brief`)",
     "`swarm send <worker> <text>`: send a message to one of your workers",
+    "`swarm commit -m <message> <path>...`: commit only the named files in your worktree",
     "`swarm read`: take your unread messages",
     "`swarm wait [--timeout SECS]`: wait for a message (default 100, at most 600)",
-    "`swarm merge <worker>`: merge a worker's branch into the task branch",
+    "`swarm merge <worker>`: merge the branch of a worker that has its own worktree into the task branch",
     "`swarm agents`: list your workers",
     "`swarm notify <text>`: ask the user for attention",
     "`swarm confirm`: say that you understood your brief",
@@ -84,6 +85,7 @@ const TERMINAL_COMMANDS: &[&str] = &[
 const WORKER_COMMANDS: &[&str] = &[
     "`swarm ask <text>`: ask your orchestrator a question; the answer arrives as a message",
     "`swarm report <text>`: send your orchestrator a progress or final report",
+    "`swarm commit -m <message> <path>...`: commit only the named files in your worktree, as yourself",
     "`swarm read`: take your unread messages",
     "`swarm wait [--timeout SECS]`: wait for a message (default 100, at most 600)",
 ];
@@ -360,13 +362,17 @@ mod tests {
 
         assert!(orchestrator.contains("- `swarm spawn "));
         assert!(orchestrator.contains("- `swarm merge <worker>`"));
+        assert!(orchestrator.contains("[--own-worktree REASON]"));
+        assert!(orchestrator.contains("- `swarm commit -m <message> <path>...`"));
         assert!(!orchestrator.contains("swarm ask"));
         assert!(worker.contains("- `swarm ask <text>`"));
         assert!(worker.contains("- `swarm report <text>`"));
+        assert!(worker.contains("- `swarm commit -m <message> <path>...`"));
         assert!(!worker.contains("swarm spawn"));
         assert!(!worker.contains("swarm send"));
         assert!(start.contains("- `swarm wait "));
         assert!(!start.contains("swarm spawn"));
+        assert!(!start.contains("swarm commit"));
         assert!(start.contains("Task: none"));
     }
 
@@ -408,6 +414,37 @@ mod tests {
                 "{role:?}"
             );
             assert!(block.contains("(default 100, at most 600)"), "{role:?}");
+        }
+    }
+
+    #[test]
+    fn the_start_orchestrator_agrees_the_features_with_the_user_first() {
+        assert!(START.contains("Count the features"));
+        assert!(START.contains("ask the user to confirm"));
+        assert!(START.contains("exactly one task for each agreed feature"));
+        assert!(START.contains("never split one feature over tasks"));
+    }
+
+    #[test]
+    fn the_orchestrator_shares_the_task_worktree_unless_it_has_a_reason() {
+        assert!(ORCHESTRATOR.contains("share the task worktree"));
+        assert!(ORCHESTRATOR.contains("--own-worktree \"<reason>\""));
+        assert!(ORCHESTRATOR.contains("only for a worker that has its own worktree"));
+    }
+
+    #[test]
+    fn the_worker_commits_only_its_own_files() {
+        assert!(WORKER.contains("swarm commit -m"));
+        assert!(WORKER.contains("`commit` MCP tool"));
+        for forbidden in [
+            "git add -A",
+            "git commit -a",
+            "git reset",
+            "git checkout",
+            "git stash",
+            "git clean",
+        ] {
+            assert!(WORKER.contains(forbidden), "{forbidden}");
         }
     }
 

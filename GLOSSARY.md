@@ -9,7 +9,7 @@ A git repository opened in Swarm.
 _Avoid_: Workspace, space, repo
 
 **Task**:
-One piece of work inside a project, with its own branch and its own swarm.
+One feature inside a project, with its own branch and its own swarm.
 _Avoid_: Job, session, thread
 
 **Swarm**:
@@ -49,7 +49,7 @@ The first message a worker or a task's orchestrator starts with: what to do and 
 _Avoid_: Prompt, instructions, ticket
 
 **Worktree**:
-A separate checkout of the project where one worker makes its changes.
+A separate checkout of the project. Each task has a task worktree; a worker gets its own worktree only when the orchestrator has a reason.
 _Avoid_: Sandbox, copy, clone
 
 **Task branch**:

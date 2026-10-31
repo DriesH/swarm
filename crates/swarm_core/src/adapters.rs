@@ -735,8 +735,26 @@ mod tests {
             .collect();
         assert!(allowed.contains(&"Bash(swarm task create *)"));
         assert!(allowed.contains(&"Bash(swarm terminal read *)"));
+        assert!(allowed.contains(&"Bash(swarm commit *)"));
+        assert!(allowed.contains(&"mcp__swarm__commit"));
         assert!(allowed.contains(&"mcp__swarm__terminal_read"));
         assert!(allowed.contains(&"mcp__swarm__agent_exit"));
+    }
+
+    #[test]
+    fn codex_approves_the_commit_tool_without_asking() {
+        let env = harness_env();
+        let launch = build(&LaunchSpec {
+            harness_env: &env,
+            ..spec(AgentKind::Codex)
+        });
+
+        let config = codex_config(&launch);
+        let tools = config["mcp_servers"]["swarm"]["tools"]
+            .as_table()
+            .expect("tools");
+
+        assert_eq!(tools["commit"]["approval_mode"].as_str(), Some("approve"));
     }
 
     #[test]

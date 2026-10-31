@@ -392,8 +392,8 @@ fn help_lists_every_command() {
 
     let text = String::from_utf8_lossy(&output.stdout);
     for command in [
-        "spawn", "send", "ask", "report", "notify", "read", "wait", "merge", "agents", "confirm",
-        "mcp", "hook",
+        "spawn", "send", "ask", "report", "commit", "notify", "read", "wait", "merge", "agents",
+        "confirm", "mcp", "hook",
     ] {
         assert!(text.contains(command), "{command} is missing:\n{text}");
     }
@@ -447,6 +447,7 @@ fn the_mcp_server_lists_the_tools_of_the_role_over_stdio() {
         [
             "ask",
             "report",
+            "commit",
             "read",
             "wait",
             "terminal_spawn",
@@ -481,6 +482,110 @@ fn an_mcp_tool_call_reaches_the_daemon_and_returns_text() {
         replies[0]["result"]["content"][0]["text"],
         "sent (message 5)"
     );
+}
+
+#[test]
+fn commit_sends_the_message_and_paths_and_prints_the_commit() {
+    let (socket, daemon) = fake_daemon(
+        "commit",
+        vec![serde_json::json!({ "ok": true, "result": { "commit": "abc123" } })],
+    );
+    let mut command = agent_command(&socket);
+    command.args(["commit", "-m", "feat: api", "src/api.rs"]);
+
+    let output = run(command, "");
+    let requests = daemon.join().expect("daemon");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "committed abc123"
+    );
+    assert_eq!(requests[0]["method"], "commit");
+    assert_eq!(requests[0]["params"]["message"], "feat: api");
+    assert_eq!(
+        requests[0]["params"]["paths"],
+        serde_json::json!(["src/api.rs"])
+    );
+}
+
+#[test]
+fn spawn_sends_the_reason_for_its_own_worktree() {
+    let worker = serde_json::json!({
+        "id": 4, "name": "api", "role": "Worker", "kind": "ClaudeCode", "model": "sonnet",
+        "status": "unknown", "message": null, "lifecycle": "Starting",
+        "branch": "swarm/login--api", "worktree": "/repo/.worktrees/login--api",
+    });
+    let (socket, daemon) = fake_daemon(
+        "spawn-own",
+        vec![serde_json::json!({ "ok": true, "result": worker })],
+    );
+    let mut command = agent_command(&socket);
+    command.args([
+        "spawn",
+        "api",
+        "--brief",
+        "go",
+        "--own-worktree",
+        "same files",
+    ]);
+
+    let output = run(command, "");
+    let requests = daemon.join().expect("daemon");
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(requests[0]["method"], "spawn");
+    assert_eq!(requests[0]["params"]["own_worktree"], "same files");
+}
+
+#[test]
+fn an_mcp_commit_sends_the_paths_to_the_daemon() {
+    let (socket, daemon) = fake_daemon(
+        "mcp-commit",
+        vec![serde_json::json!({ "ok": true, "result": { "commit": "abc123" } })],
+    );
+    let lines = [
+        serde_json::json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+        "params": { "name": "commit", "arguments": {
+            "message": "feat: api", "paths": ["src/api.rs", "src/lib.rs"] } } }),
+    ];
+
+    let replies = mcp_session(&socket, "worker", &lines);
+    let requests = daemon.join().expect("daemon");
+
+    assert_eq!(requests[0]["method"], "commit");
+    assert_eq!(
+        requests[0]["params"]["paths"],
+        serde_json::json!(["src/api.rs", "src/lib.rs"])
+    );
+    assert_eq!(replies[0]["result"]["isError"], false);
+    assert_eq!(
+        replies[0]["result"]["content"][0]["text"],
+        "committed abc123"
+    );
+}
+
+#[test]
+fn an_mcp_spawn_passes_own_worktree_on() {
+    let worker = serde_json::json!({
+        "id": 4, "name": "api", "role": "Worker", "kind": "ClaudeCode", "model": "sonnet",
+        "status": "unknown", "message": null, "lifecycle": "Starting",
+        "branch": "swarm/login--api", "worktree": "/repo/.worktrees/login--api",
+    });
+    let (socket, daemon) = fake_daemon(
+        "mcp-spawn-own",
+        vec![serde_json::json!({ "ok": true, "result": worker })],
+    );
+    let lines = [
+        serde_json::json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+        "params": { "name": "spawn", "arguments": {
+            "name": "api", "brief": "go", "own_worktree": "an experiment" } } }),
+    ];
+
+    mcp_session(&socket, "orchestrator", &lines);
+    let requests = daemon.join().expect("daemon");
+
+    assert_eq!(requests[0]["params"]["own_worktree"], "an experiment");
 }
 
 #[test]

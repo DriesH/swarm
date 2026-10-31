@@ -4,9 +4,9 @@ use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io::{Read as _, Write as _};
 use std::os::unix::ffi::OsStrExt as _;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use swarm_protocol::{DiffStat, FILES_LISTED, FileStat};
 
@@ -55,6 +55,18 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    execute_with(directory, arguments, &[])
+}
+
+fn execute_with<I, S>(
+    directory: &Path,
+    arguments: I,
+    environment: &[(&str, &str)],
+) -> Result<(Vec<OsString>, Output), Error>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let arguments: Vec<OsString> = arguments
         .into_iter()
         .map(|argument| argument.as_ref().to_owned())
@@ -66,6 +78,7 @@ where
         .args(&arguments)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
+        .envs(environment.iter().copied())
         .stdin(std::process::Stdio::null())
         .output()
         .map_err(|source| Error::Io {
@@ -173,23 +186,7 @@ pub fn diff_files(worktree: &Path, base: &str) -> Result<(DiffStat, Vec<FileStat
     let mut files: HashMap<Vec<u8>, (u32, u32)> = HashMap::new();
     let (mut additions, mut deletions) = (0_u32, 0_u32);
 
-    for entry in output
-        .raw
-        .split(|byte| *byte == 0)
-        .filter(|entry| !entry.is_empty())
-    {
-        let mut parts = entry.splitn(3, |byte| *byte == b'\t');
-        let (Some(added), Some(removed), Some(path)) = (parts.next(), parts.next(), parts.next())
-        else {
-            continue;
-        };
-
-        let (added, removed) = (parse_count(added), parse_count(removed));
-
-        additions = additions.saturating_add(added);
-        deletions = deletions.saturating_add(removed);
-        files.insert(path.to_vec(), (added, removed));
-    }
+    add_numstat(&output.raw, &mut files, &mut additions, &mut deletions);
 
     let (arguments, output) = execute(
         worktree,
@@ -258,6 +255,88 @@ fn listed_files(files: HashMap<Vec<u8>, (u32, u32)>) -> Vec<FileStat> {
             deletions,
         })
         .collect()
+}
+
+/// Adds the entries of `numstat -z` output to the totals and to each file. A file can
+/// appear once per commit, so its counts add up.
+fn add_numstat(
+    raw: &[u8],
+    files: &mut HashMap<Vec<u8>, (u32, u32)>,
+    additions: &mut u32,
+    deletions: &mut u32,
+) {
+    for entry in raw
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let mut parts = entry.splitn(3, |byte| *byte == b'\t');
+        let (Some(added), Some(removed), Some(path)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+
+        let (added, removed) = (parse_count(added), parse_count(removed));
+
+        *additions = additions.saturating_add(added);
+        *deletions = deletions.saturating_add(removed);
+
+        let file = files.entry(path.to_vec()).or_default();
+        file.0 = file.0.saturating_add(added);
+        file.1 = file.1.saturating_add(removed);
+    }
+}
+
+/// What the commits since `base` that carry `Swarm-Agent: <agent>` changed. Work that
+/// is not committed yet, and commits of other agents, do not count.
+pub fn trailer_stat(
+    worktree: &Path,
+    base: &str,
+    agent: &str,
+) -> Result<(DiffStat, Vec<FileStat>), Error> {
+    let pattern = format!("--grep=^Swarm-Agent: {}$", regex_escape(agent));
+    let range = format!("{base}..HEAD");
+
+    let (arguments, output) = execute(
+        worktree,
+        [
+            "log",
+            "--numstat",
+            "-z",
+            "--format=",
+            "--no-renames",
+            &pattern,
+            "--end-of-options",
+            &range,
+        ],
+    )?;
+    if !output.success {
+        return Err(failure(&arguments, &output));
+    }
+
+    let mut files: HashMap<Vec<u8>, (u32, u32)> = HashMap::new();
+    let (mut additions, mut deletions) = (0_u32, 0_u32);
+    add_numstat(&output.raw, &mut files, &mut additions, &mut deletions);
+
+    let stat = DiffStat {
+        files: u32::try_from(files.len()).unwrap_or(u32::MAX),
+        additions,
+        deletions,
+    };
+
+    Ok((stat, listed_files(files)))
+}
+
+fn regex_escape(text: &str) -> String {
+    let mut escaped = String::new();
+
+    for character in text.chars() {
+        if "\\.[]*^$".contains(character) {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+
+    escaped
 }
 
 /// Lines in a text file. A symlink is one line, like git sees it. Anything that is not a
@@ -479,6 +558,142 @@ pub fn merge_branch(worktree: &Path, branch: &str) -> Result<MergeOutcome, Error
         conflicts,
         output: printed,
     })
+}
+
+/// One commit at a time per worktree, so two agents never race on `index.lock`.
+fn commit_lock(worktree: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+
+    let mut locks = LOCKS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+
+    Arc::clone(locks.entry(worktree.to_path_buf()).or_default())
+}
+
+/// Checks that every path is a plain relative path inside `worktree` and not in `.git`.
+fn check_commit_paths(worktree: &Path, paths: &[PathBuf]) -> Result<(), Error> {
+    if paths.is_empty() {
+        return Err(Error::Invalid(
+            "name the files to commit; committing everything is not allowed".to_owned(),
+        ));
+    }
+
+    let real_worktree = worktree.canonicalize().map_err(|source| Error::Io {
+        action: format!("read the worktree {}", worktree.display()),
+        source,
+    })?;
+
+    for path in paths {
+        let shown = path.display();
+
+        if path.as_os_str().is_empty() || path.is_absolute() {
+            return Err(Error::Invalid(format!(
+                "{shown:?} must be a path relative to your worktree"
+            )));
+        }
+
+        for component in path.components() {
+            match component {
+                Component::Normal(name) if name.eq_ignore_ascii_case(".git") => {
+                    return Err(Error::Invalid(format!("{shown:?} is inside .git")));
+                }
+                Component::Normal(_) | Component::CurDir => {}
+                _ => {
+                    return Err(Error::Invalid(format!(
+                        "{shown:?} must stay inside your worktree (no \"..\")"
+                    )));
+                }
+            }
+        }
+
+        let parent = worktree.join(path.parent().unwrap_or(Path::new("")));
+        if let Ok(real_parent) = parent.canonicalize()
+            && !real_parent.starts_with(&real_worktree)
+        {
+            return Err(Error::Invalid(format!(
+                "{shown:?} leads outside your worktree"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Commits `paths` and nothing else in `worktree`. The author is `<agent> (Swarm)`, and
+/// a `Swarm-Agent` trailer names the agent. Returns the new commit.
+pub fn commit_paths(
+    worktree: &Path,
+    agent: &str,
+    message: &str,
+    paths: &[PathBuf],
+) -> Result<String, Error> {
+    if message.trim().is_empty() {
+        return Err(Error::Invalid("the commit message is empty".to_owned()));
+    }
+    check_commit_paths(worktree, paths)?;
+
+    let key = worktree.canonicalize().map_err(|source| Error::Io {
+        action: format!("read the worktree {}", worktree.display()),
+        source,
+    })?;
+    let lock = commit_lock(&key);
+    let _held = lock.lock().unwrap_or_else(PoisonError::into_inner);
+
+    let author = format!("{agent} (Swarm)");
+    let email = run(worktree, ["config", "user.email"])
+        .ok()
+        .filter(|email| !email.is_empty());
+    let mut environment = vec![
+        ("GIT_LITERAL_PATHSPECS", "1"),
+        ("GIT_AUTHOR_NAME", author.as_str()),
+    ];
+    if let Some(email) = &email {
+        environment.push(("GIT_AUTHOR_EMAIL", email.as_str()));
+    }
+
+    let mut add: Vec<&OsStr> = vec![OsStr::new("add"), OsStr::new("--end-of-options")];
+    add.extend(paths.iter().map(|path| path.as_os_str()));
+    git_step(worktree, &add, &environment)?;
+
+    let trailer = format!("Swarm-Agent: {agent}");
+    let mut commit: Vec<&OsStr> = vec![
+        OsStr::new("commit"),
+        OsStr::new("-m"),
+        OsStr::new(message),
+        OsStr::new("--trailer"),
+        OsStr::new(&trailer),
+        OsStr::new("--"),
+    ];
+    commit.extend(paths.iter().map(|path| path.as_os_str()));
+    git_step(worktree, &commit, &environment)?;
+
+    run(worktree, ["rev-parse", "--verify", "HEAD"])
+}
+
+/// Runs one git step; a failure becomes the text git printed, for the agent to act on.
+fn git_step(
+    worktree: &Path,
+    arguments: &[&OsStr],
+    environment: &[(&str, &str)],
+) -> Result<(), Error> {
+    let (arguments, output) = execute_with(worktree, arguments, environment)?;
+    if output.success {
+        return Ok(());
+    }
+
+    let printed = [output.stderr.as_str(), output.stdout.as_str()]
+        .iter()
+        .filter(|part| !part.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let command = arguments
+        .first()
+        .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+
+    Err(Error::Invalid(format!("git {command} failed: {printed}")))
 }
 
 pub fn branch_delete(root: &Path, branch: &str) -> Result<(), Error> {

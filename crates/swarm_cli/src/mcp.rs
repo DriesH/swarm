@@ -79,7 +79,7 @@ struct Tool {
 const TOOLS: &[Tool] = &[
     Tool {
         name: "spawn",
-        description: "Start a worker in its own worktree and branch. The brief is its first message: say what to do and what done means.",
+        description: "Start a worker. It works in the task worktree unless you give own_worktree. The brief is its first message: say what to do, which files it owns and what done means.",
         audience: Audience::Only(&[Role::Orchestrator]),
         schema: || {
             schema(
@@ -100,6 +100,11 @@ const TOOLS: &[Tool] = &[
                         "string",
                         "The model. Defaults to the worker model from the settings.",
                     ),
+                    (
+                        "own_worktree",
+                        "string",
+                        "The reason the worker needs its own worktree and branch. Leave it out to share the task worktree.",
+                    ),
                 ],
                 &["name", "brief"],
             )
@@ -112,6 +117,7 @@ const TOOLS: &[Tool] = &[
                     .transpose()?,
                 model: optional(arguments, "model")?,
                 brief: required(arguments, "brief")?,
+                own_worktree: optional(arguments, "own_worktree")?,
             })
         },
     },
@@ -154,6 +160,33 @@ const TOOLS: &[Tool] = &[
         build: |arguments| {
             Ok(Command::Report {
                 text: required(arguments, "text")?,
+            })
+        },
+    },
+    Tool {
+        name: "commit",
+        description: "Commit the named files, and nothing else, in your worktree. The commit is yours: your name is the author. Use it instead of git commit.",
+        audience: Audience::Only(&[Role::Orchestrator, Role::Worker]),
+        schema: || {
+            schema(
+                &[
+                    ("message", "string", "The commit message."),
+                    (
+                        "paths",
+                        "strings",
+                        "The files to commit, relative to your worktree.",
+                    ),
+                ],
+                &["message", "paths"],
+            )
+        },
+        build: |arguments| {
+            Ok(Command::Commit {
+                message: required(arguments, "message")?,
+                paths: string_list(arguments, "paths")?
+                    .into_iter()
+                    .map(std::path::PathBuf::from)
+                    .collect(),
             })
         },
     },
@@ -1027,7 +1060,7 @@ mod tests {
         assert_eq!(
             tool_names(Role::Orchestrator),
             [
-                "spawn", "send", "read", "wait", "merge", "notify", "agents", "confirm"
+                "spawn", "send", "commit", "read", "wait", "merge", "notify", "agents", "confirm"
             ]
             .into_iter()
             .chain(TERMINAL_TOOLS)
@@ -1039,7 +1072,7 @@ mod tests {
     fn a_worker_lists_only_its_tools() {
         assert_eq!(
             tool_names(Role::Worker),
-            ["ask", "report", "read", "wait"]
+            ["ask", "report", "commit", "read", "wait"]
                 .into_iter()
                 .chain(TERMINAL_TOOLS)
                 .collect::<Vec<_>>()
@@ -1114,6 +1147,61 @@ mod tests {
     }
 
     #[test]
+    fn the_start_orchestrator_cannot_commit() {
+        let reply = server(Role::StartOrchestrator)
+            .handle(&request(
+                "tools/call",
+                json!({ "name": "commit", "arguments": {} }),
+            ))
+            .expect("reply");
+
+        assert_eq!(reply["error"]["code"], INVALID_PARAMS);
+    }
+
+    #[test]
+    fn the_commit_tool_takes_a_message_and_a_list_of_paths() {
+        let reply = server(Role::Worker)
+            .handle(&request("tools/list", json!({})))
+            .expect("reply");
+        let tools = reply["result"]["tools"].as_array().expect("tools");
+        let commit = tools
+            .iter()
+            .find(|tool| tool["name"] == "commit")
+            .expect("commit tool");
+
+        assert_eq!(
+            commit["inputSchema"]["required"],
+            json!(["message", "paths"])
+        );
+        assert_eq!(
+            commit["inputSchema"]["properties"]["paths"]["type"],
+            "array"
+        );
+        assert_eq!(
+            commit["inputSchema"]["properties"]["paths"]["items"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn the_spawn_tool_offers_own_worktree_but_does_not_require_it() {
+        let reply = server(Role::Orchestrator)
+            .handle(&request("tools/list", json!({})))
+            .expect("reply");
+        let tools = reply["result"]["tools"].as_array().expect("tools");
+        let spawn = tools
+            .iter()
+            .find(|tool| tool["name"] == "spawn")
+            .expect("spawn tool");
+
+        assert_eq!(
+            spawn["inputSchema"]["properties"]["own_worktree"]["type"],
+            "string"
+        );
+        assert_eq!(spawn["inputSchema"]["required"], json!(["name", "brief"]));
+    }
+
+    #[test]
     fn bad_arguments_are_a_tool_error_with_is_error() {
         let reply = server(Role::Orchestrator)
             .handle(&request(
@@ -1155,7 +1243,7 @@ mod tests {
         assert_eq!(reply["result"]["resultType"], "complete");
         assert_eq!(
             reply["result"]["tools"].as_array().expect("tools").len(),
-            10
+            11
         );
     }
 

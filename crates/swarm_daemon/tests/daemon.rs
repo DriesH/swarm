@@ -1670,7 +1670,7 @@ orchestrator)
   printf '%s\n' "$line" > "$OUT/orchestrator-first"
   working
   swarm confirm > "$OUT/confirm.out" 2>&1
-  swarm spawn api --brief "build the api" > "$OUT/spawn.out" 2>&1
+  swarm spawn api --own-worktree "same files" --brief "build the api" > "$OUT/spawn.out" 2>&1
   swarm wait --timeout 60 > "$OUT/question.out" 2>&1
   swarm send api "use port 5173" > "$OUT/send.out" 2>&1
   swarm wait --timeout 60 > "$OUT/report.out" 2>&1
@@ -1799,7 +1799,7 @@ orchestrator)
   idle
   IFS= read -r line
   working
-  swarm spawn api --brief "change the readme" > "$OUT/spawn.out" 2>&1
+  swarm spawn api --own-worktree "same files" --brief "change the readme" > "$OUT/spawn.out" 2>&1
   swarm wait --timeout 60 > "$OUT/report.out" 2>&1
   echo "task text" > README.md
   git add README.md
@@ -2099,6 +2099,7 @@ sleep 30"#,
         [
             "spawn",
             "send",
+            "commit",
             "read",
             "wait",
             "merge",
@@ -2967,7 +2968,7 @@ fn the_orchestrator_hears_that_a_worker_failed_to_start() {
         r#"idle
 IFS= read -r line
 working
-swarm spawn api --brief "never starts" > "$OUT/spawn.out" 2>&1
+swarm spawn api --own-worktree "same files" --brief "never starts" > "$OUT/spawn.out" 2>&1
 swarm wait --timeout 30 > "$OUT/failed.out" 2>&1
 sleep 30"#,
     );
@@ -3211,7 +3212,7 @@ orchestrator)
   idle
   IFS= read -r line
   working
-  swarm spawn api --brief "write files" > "$OUT/spawn.out" 2>&1
+  swarm spawn api --own-worktree "same files" --brief "write files" > "$OUT/spawn.out" 2>&1
   sleep 30
   ;;
 worker)
@@ -3268,4 +3269,98 @@ esac"#,
             ],
         }]
     );
+}
+
+#[test]
+fn workers_share_the_task_worktree_and_commit_their_own_files() {
+    let fixture = fixture_with_helpers(
+        r#"case "$SWARM_ROLE" in
+orchestrator)
+  idle
+  IFS= read -r line
+  working
+  swarm spawn api --brief "write api.txt" > "$OUT/spawn-api.out" 2>&1
+  swarm spawn ui --brief "write ui.txt" > "$OUT/spawn-ui.out" 2>&1
+  swarm spawn lonely --own-worktree "  " --brief "x" > "$OUT/spawn-blank.out" 2>&1
+  swarm wait --timeout 60 > "$OUT/report-1.out" 2>&1
+  swarm wait --timeout 60 > "$OUT/report-2.out" 2>&1
+  swarm merge api > "$OUT/merge.out" 2>&1
+  echo $? > "$OUT/merge.code"
+  swarm agents > "$OUT/agents.out" 2>&1
+  echo done > "$OUT/orchestrator-done"
+  sleep 30
+  ;;
+worker)
+  idle
+  IFS= read -r line
+  working
+  pwd -P > "$OUT/pwd-$SWARM_AGENT_ID"
+  case "$line" in
+  "write api.txt")
+    echo api > api.txt
+    swarm commit -m "feat: api" api.txt > "$OUT/commit-api.out" 2>&1
+    swarm commit -m "bad" /etc/passwd > "$OUT/absolute.out" 2>&1
+    swarm commit -m "bad" ../escape > "$OUT/dotdot.out" 2>&1
+    swarm commit -m "bad" .git/config > "$OUT/dotgit.out" 2>&1
+    ;;
+  *)
+    echo ui > ui.txt
+    swarm commit -m "feat: ui" ui.txt > "$OUT/commit-ui.out" 2>&1
+    ;;
+  esac
+  swarm report "done" > "$OUT/report-sent-$SWARM_AGENT_ID.out" 2>&1
+  idle
+  sleep 30
+  ;;
+esac"#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (_client, task) = start_task(&daemon, &repo);
+    fixture.read_when_written("orchestrator-done");
+
+    let said = |name: &str| fixture.read_when_written(name);
+    assert!(said("spawn-api.out").contains(&format!("worktree: {}", task.worktree.display())));
+    assert!(said("spawn-api.out").contains(&format!("branch: {}", task.branch)));
+    assert!(said("spawn-blank.out").contains("state a reason for --own-worktree"));
+    assert!(said("commit-api.out").starts_with("committed "));
+    assert!(said("commit-ui.out").starts_with("committed "));
+    assert!(said("absolute.out").contains("relative"));
+    assert!(said("dotdot.out").contains("inside your worktree"));
+    assert!(said("dotgit.out").contains(".git"));
+    assert_eq!(said("merge.code").trim(), "1");
+    assert!(said("merge.out").contains("works in the task worktree; nothing to merge"));
+
+    let real_worktree = task.worktree.canonicalize().expect("real path");
+    let working_in: Vec<PathBuf> = std::fs::read_dir(&fixture.out)
+        .expect("out folder")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("pwd-"))
+        .map(|entry| PathBuf::from(std::fs::read_to_string(entry.path()).expect("pwd").trim()))
+        .collect();
+    assert_eq!(working_in, [real_worktree.clone(), real_worktree]);
+    assert!(!task.worktree.with_file_name("agent-task--api").exists());
+
+    let mut commits: Vec<String> = git_output(
+        &task.worktree,
+        &[
+            "log",
+            "-2",
+            "--format=%s|%an|%ae|%(trailers:key=Swarm-Agent,valueonly)",
+        ],
+    )
+    .lines()
+    .filter(|line| !line.is_empty())
+    .map(str::to_owned)
+    .collect();
+    commits.sort();
+    assert_eq!(
+        commits,
+        [
+            "feat: api|api (Swarm)|test@example.com|api",
+            "feat: ui|ui (Swarm)|test@example.com|ui",
+        ]
+    );
+    assert!(task.worktree.join("api.txt").is_file());
+    assert!(task.worktree.join("ui.txt").is_file());
 }

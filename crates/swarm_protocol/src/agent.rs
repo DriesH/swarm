@@ -31,8 +31,9 @@ pub enum Call {
     /// Any agent: a Claude Code or Codex hook event, forwarded as it came.
     Hook { event: Value },
 
-    /// Orchestrator: makes a worker worktree from the task branch and starts a worker
-    /// with `brief` as its first message. Returns [`AgentSummary`].
+    /// Orchestrator: starts a worker with `brief` as its first message. The worker
+    /// works in the task worktree, or in a worktree of its own made from the task
+    /// branch when `own_worktree` gives the reason. Returns [`AgentSummary`].
     Spawn {
         name: String,
         /// `None` uses the orchestrator's own kind.
@@ -40,6 +41,9 @@ pub enum Call {
         /// `None` uses the worker default from the settings.
         model: Option<String>,
         brief: String,
+        /// Why the worker needs its own worktree; `None` shares the task worktree.
+        #[serde(default)]
+        own_worktree: Option<String>,
     },
     /// Orchestrator: a message to one of its workers. Returns [`Sent`].
     Send { to: AgentId, text: String },
@@ -53,6 +57,12 @@ pub enum Call {
     /// Any agent: waits until the caller has an unread message, then takes them all.
     /// Returns `Vec<`[`InboxMessage`]`>`, empty after the timeout.
     Wait { timeout_secs: Option<u32> },
+    /// Worker or task orchestrator: commits `paths` (and nothing else) in the caller's
+    /// worktree, as the caller. Returns [`Committed`].
+    Commit {
+        message: String,
+        paths: Vec<PathBuf>,
+    },
     /// Orchestrator: merges a worker's branch into the task branch in the task
     /// worktree. Returns [`Merged`].
     Merge { worker: AgentId },
@@ -124,6 +134,7 @@ pub const HARNESS_CALLS: &[(&str, &str)] = &[
     ("report", "report"),
     ("read", "read"),
     ("wait", "wait"),
+    ("commit", "commit"),
     ("merge", "merge"),
     ("notify", "notify"),
     ("agents", "agents"),
@@ -292,6 +303,12 @@ pub struct Merged {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Committed {
+    /// The new commit.
+    pub commit: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct TaskSummary {
     pub id: TaskId,
     pub name: String,
@@ -357,6 +374,44 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<AgentRequest>(value).expect("decode"),
             request
+        );
+    }
+
+    #[test]
+    fn a_spawn_without_own_worktree_still_parses() {
+        let request: AgentRequest = serde_json::from_value(json!({
+            "agent": 1, "token": "t", "method": "spawn",
+            "params": { "name": "api", "kind": null, "model": null, "brief": "go" },
+        }))
+        .expect("decode");
+
+        assert_eq!(
+            request.call,
+            Call::Spawn {
+                name: "api".to_owned(),
+                kind: None,
+                model: None,
+                brief: "go".to_owned(),
+                own_worktree: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_commit_carries_a_message_and_paths() {
+        let call = Call::Commit {
+            message: "feat: api".to_owned(),
+            paths: vec![PathBuf::from("src/api.rs")],
+        };
+
+        let value = serde_json::to_value(&call).expect("encode");
+
+        assert_eq!(
+            value,
+            json!({
+                "method": "commit",
+                "params": { "message": "feat: api", "paths": ["src/api.rs"] },
+            })
         );
     }
 
