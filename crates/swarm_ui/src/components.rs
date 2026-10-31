@@ -1,4 +1,5 @@
 mod button;
+mod check_row;
 mod checkbox;
 mod dialog;
 mod dropdown;
@@ -8,6 +9,7 @@ mod kbd;
 mod label;
 mod list_row;
 mod menu;
+mod output_block;
 mod panel;
 mod popover_menu;
 mod project_tile;
@@ -25,6 +27,7 @@ mod tooltip;
 mod tray_chip;
 
 pub use button::*;
+pub use check_row::*;
 pub use checkbox::*;
 pub use dialog::*;
 pub use dropdown::*;
@@ -34,6 +37,7 @@ pub use kbd::*;
 pub use label::*;
 pub use list_row::*;
 pub use menu::*;
+pub use output_block::*;
 pub use panel::*;
 pub use popover_menu::*;
 pub use project_tile::*;
@@ -74,6 +78,8 @@ pub fn all_components() -> Vec<ComponentEntry> {
         ComponentEntry::of::<Dropdown>(),
         ComponentEntry::of::<StatusPill>(),
         ComponentEntry::of::<Tag>(),
+        ComponentEntry::of::<CheckRow>(),
+        ComponentEntry::of::<OutputBlock>(),
         ComponentEntry::of::<ListRow>(),
         ComponentEntry::of::<TrayChip>(),
         ComponentEntry::of::<TrayMore>(),

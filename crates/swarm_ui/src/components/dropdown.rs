@@ -8,6 +8,9 @@ use crate::components::popover_menu::popover_state;
 use crate::prelude::*;
 use crate::styles::focus_ring;
 
+/// A longer list of options scrolls.
+const MENU_HEIGHT: gpui::Pixels = px(272.);
+
 type ChangeHandler = Rc<dyn Fn(usize, &mut Window, &mut App) + 'static>;
 
 /// A select: a trigger showing the chosen option, and a menu of all options.
@@ -141,7 +144,7 @@ impl RenderOnce for Dropdown {
 
         PopoverMenu::new(self.id, trigger, move |_, _| {
             options.iter().enumerate().fold(
-                Menu::new((menu_id.clone(), "menu"), label.clone()),
+                Menu::new((menu_id.clone(), "menu"), label.clone()).max_height(MENU_HEIGHT),
                 |menu, (index, option)| {
                     let on_change = on_change.clone();
 

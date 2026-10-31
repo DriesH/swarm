@@ -38,6 +38,8 @@ Focus an element when the window opens. With nothing focused, GPUI sends Tab now
 | `TrayMore` | `Button`, "4 more tiles" |
 | `Panel`, `PanelRow` | `Group` with `.accessible(id, label)` |
 | `TileFrame` | `Group`, "name terminal" |
+| `CheckRow`, `CheckStatus` | `ListItem`, "name, status, value" |
+| `OutputBlock` | `Log` with the text as its value |
 
 Every interactive component is focusable, works with Enter and Space (GPUI turns them into a click), and shows a 2px accent focus ring when focused from the keyboard.
 
