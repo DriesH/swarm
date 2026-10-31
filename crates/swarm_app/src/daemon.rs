@@ -13,15 +13,15 @@ use gpui::{
 };
 use swarm_protocol::{
     AgentId as DaemonAgentId, AgentInfo, AgentLifecycle, Client, ClientError, CreateTerminal,
-    MessageInfo, Paths, ProjectInfo, TaskInfo, TerminalId as DaemonTerminalId, TerminalInfo,
-    TerminalKind as DaemonKind,
+    DiffStat, MessageEvent, Paths, ProjectInfo, TaskInfo, TerminalId as DaemonTerminalId,
+    TerminalInfo, TerminalKind as DaemonKind,
 };
 use swarm_term::{ExitStatus, TerminalChannels, TerminalInput};
 use swarm_term_view::{TerminalEvent, TerminalView, palette_for};
 use swarm_ui::ActiveTheme as _;
 
 use crate::model::{FakeData, ProjectId, TaskId, TerminalId};
-use crate::workspace::{DataSource, Workspace};
+use crate::workspace::{DataSource, View, Workspace};
 
 /// Scrollback lines requested when attaching.
 const ATTACH_HISTORY: u32 = 1_000;
@@ -44,6 +44,8 @@ const RECONNECT_STEPS: [Duration; 3] = [
     Duration::from_secs(2),
 ];
 const RECONNECT_LONG: Duration = Duration::from_secs(5);
+/// How often the Swarm view asks for the changes of the open task's agents.
+const CHANGES_INTERVAL: Duration = Duration::from_secs(5);
 /// How long an exited process terminal stays, so its exit code can be read.
 pub(crate) const PROCESS_LINGER: Duration = Duration::from_secs(3);
 
@@ -306,6 +308,7 @@ impl Workspace {
 
         self.attach_new_terminals(&client, terminals, window, cx);
         self.attach_agents(window, cx);
+        self.load_message_history(client, cx);
 
         cx.notify();
     }
@@ -338,8 +341,8 @@ impl Workspace {
             client.message_events(),
             window,
             cx,
-            |workspace, message, _, cx| {
-                workspace.message_sent(&message, cx);
+            |workspace, event, _, cx| {
+                workspace.message_event(event, cx);
             },
         );
     }
@@ -609,9 +612,150 @@ impl Workspace {
         cx.notify();
     }
 
-    pub(crate) fn message_sent(&mut self, message: &MessageInfo, cx: &mut Context<Self>) {
-        self.data.record_message(message);
+    pub(crate) fn message_event(&mut self, event: MessageEvent, cx: &mut Context<Self>) {
+        match event {
+            MessageEvent::Sent(message) => self.data.record_message(&message),
+            MessageEvent::Delivered { ids, delivered_at } => {
+                self.data.mark_delivered(&ids, delivered_at);
+            }
+        }
+
         cx.notify();
+    }
+
+    /// Fetches the kept messages of every task and Start orchestrator, off the main thread.
+    fn load_message_history(&self, client: Client, cx: &mut Context<Self>) {
+        let mut scopes = Vec::new();
+
+        for project in &self.data.projects {
+            let Some(daemon) = project.daemon else {
+                continue;
+            };
+
+            scopes.push((daemon, None));
+            scopes.extend(
+                self.data
+                    .tasks_of(project.id)
+                    .filter_map(|task| task.daemon.as_ref())
+                    .map(|task| (daemon, Some(task.id))),
+            );
+        }
+
+        cx.spawn(async move |this, cx| {
+            let listing = cx.background_executor().spawn(async move {
+                let mut messages = Vec::new();
+
+                for (project, task) in scopes {
+                    match client.list_messages(project, task) {
+                        Ok(listed) => messages.extend(listed),
+                        Err(error) => log::warn!("cannot list messages: {error}"),
+                    }
+                }
+
+                messages
+            });
+            let messages = listing.await;
+
+            let merged = this.update(cx, |workspace, cx| {
+                workspace.data.merge_messages(&messages);
+                cx.notify();
+            });
+
+            if let Err(error) = merged {
+                log::debug!("the window closed before the messages came: {error}");
+            }
+        })
+        .detach();
+    }
+
+    /// Keeps the Swarm view's background work running only while the view is shown:
+    /// the poll for changes and the clock for running times.
+    pub(crate) fn sync_swarm_tasks(&mut self, cx: &mut Context<Self>) {
+        if self.view != View::Swarm || self.has_no_projects() {
+            self.changes_poll = None;
+            self.swarm_clock = None;
+            return;
+        }
+
+        if self.changes_poll.is_none() && self.daemon.is_some() {
+            self.changes_poll = Some(Self::poll_changes(cx));
+        }
+
+        if self.swarm_clock.is_none() && self.fixed_now.is_none() {
+            self.swarm_clock = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(Duration::from_secs(1)).await;
+
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        return;
+                    }
+                }
+            }));
+        }
+    }
+
+    fn poll_changes(cx: &mut Context<Self>) -> gpui::Task<()> {
+        cx.spawn(async move |this, cx| {
+            loop {
+                let Ok(request) = this.update(cx, |workspace, _| workspace.changes_request())
+                else {
+                    return;
+                };
+
+                if let Some((client, agents)) = request {
+                    let asking = cx
+                        .background_executor()
+                        .spawn(async move { client.agent_changes(agents) });
+
+                    match asking.await {
+                        Ok(changes) => {
+                            let applied = this.update(cx, |workspace, cx| {
+                                workspace.apply_changes(&changes, cx);
+                            });
+
+                            if applied.is_err() {
+                                return;
+                            }
+                        }
+                        Err(error) => log::debug!("cannot read agent changes: {error}"),
+                    }
+                }
+
+                cx.background_executor().timer(CHANGES_INTERVAL).await;
+            }
+        })
+    }
+
+    /// The client and the daemon ids of the open task's agents, while the daemon answers.
+    fn changes_request(&self) -> Option<(Client, Vec<DaemonAgentId>)> {
+        let client = self.daemon.clone().filter(Client::is_connected)?;
+        let agents: Vec<DaemonAgentId> = self
+            .data
+            .agents_of(self.active_task)
+            .filter_map(|agent| agent.daemon.as_ref().map(|daemon| daemon.id))
+            .collect();
+
+        (!agents.is_empty()).then_some((client, agents))
+    }
+
+    pub(crate) fn apply_changes(
+        &mut self,
+        changes: &[(DaemonAgentId, DiffStat)],
+        cx: &mut Context<Self>,
+    ) {
+        let mut updated = false;
+
+        for (id, stat) in changes {
+            let Some(agent) = self.data.agent_with_daemon_id(*id).map(|agent| agent.id) else {
+                continue;
+            };
+
+            updated |= self.data.diff_stats.insert(agent, *stat) != Some(*stat);
+        }
+
+        if updated {
+            cx.notify();
+        }
     }
 
     /// Forgets a tile's live view and everything that points at it.
@@ -1309,7 +1453,8 @@ mod tests {
     use gpui::{TestAppContext, VisualTestContext};
     use swarm_protocol::AgentStatus as DaemonAgentStatus;
     use swarm_protocol::{
-        Event, ProjectId as DaemonProjectId, Request, TaskId as DaemonTaskId, VERSION, read, write,
+        Event, MessageInfo, ProjectId as DaemonProjectId, Request, TaskId as DaemonTaskId, VERSION,
+        read, write,
     };
     use swarm_term_view::TerminalEvent;
     use swarm_ui::AgentStatus;
@@ -1345,6 +1490,14 @@ mod tests {
             Request::List { call } => Some(Event::Terminals {
                 call: *call,
                 terminals: Vec::new(),
+            }),
+            Request::ListMessages { call, .. } => Some(Event::Messages {
+                call: *call,
+                messages: Vec::new(),
+            }),
+            Request::AgentChanges { call, .. } => Some(Event::AgentChanges {
+                call: *call,
+                changes: Vec::new(),
             }),
             _ => None,
         }
@@ -1964,6 +2117,8 @@ mod tests {
             message: None,
             lifecycle: AgentLifecycle::Running,
             revision: NEXT_REVISION.fetch_add(1, Ordering::Relaxed),
+            created_at: 0,
+            ended_at: None,
         }
     }
 
@@ -3001,9 +3156,12 @@ mod tests {
             kind: swarm_protocol::MessageKind::Brief,
             text: "go".into(),
             sent_at: 0,
+            delivered_at: None,
         };
 
-        workspace.update(cx, |workspace, cx| workspace.message_sent(&message, cx));
+        workspace.update(cx, |workspace, cx| {
+            workspace.message_event(MessageEvent::Sent(message), cx);
+        });
 
         let kept = workspace.read_with(cx, |workspace, _| {
             workspace
@@ -3012,6 +3170,153 @@ mod tests {
                 .count()
         });
         assert_eq!(kept, 1);
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the fake daemon answers on its own thread"
+    )]
+    fn wait_a_little() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    fn wait_until(
+        cx: &mut VisualTestContext,
+        done: impl Fn(&mut VisualTestContext) -> bool,
+    ) -> bool {
+        for _ in 0..100 {
+            cx.executor().allow_parking();
+            cx.run_until_parked();
+
+            if done(cx) {
+                return true;
+            }
+
+            wait_a_little();
+        }
+
+        false
+    }
+
+    fn history_message(id: u64, delivered_at: Option<u64>) -> MessageInfo {
+        MessageInfo {
+            id: swarm_protocol::MessageId(id),
+            project: DaemonProjectId(5),
+            task: Some(DaemonTaskId(7)),
+            from: None,
+            to: swarm_protocol::AgentId(1),
+            kind: swarm_protocol::MessageKind::Task,
+            text: "go".into(),
+            sent_at: id,
+            delivered_at,
+        }
+    }
+
+    #[gpui::test]
+    fn the_message_history_is_loaded_once_the_daemon_is_used(cx: &mut TestAppContext) {
+        let socket = fake_daemon_replying(|request| match request {
+            Request::ListMessages { call, task, .. } if task.is_some() => Some(Event::Messages {
+                call,
+                messages: vec![history_message(1, Some(5)), history_message(2, None)],
+            }),
+            _ => None,
+        });
+        let (workspace, cx, _client) = real_task_workspace(&socket, cx);
+
+        let loaded = wait_until(cx, |cx| {
+            workspace.read_with(cx, |workspace, _| {
+                workspace
+                    .data
+                    .messages_of(DaemonProjectId(5), Some(DaemonTaskId(7)))
+                    .count()
+                    == 2
+            })
+        });
+
+        assert!(loaded);
+    }
+
+    #[gpui::test]
+    fn a_delivered_event_clears_a_message_in_flight(cx: &mut TestAppContext) {
+        let (workspace, cx, _client) = real_task_workspace(&fake_daemon(), cx);
+        let message = history_message(1, None);
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.message_event(MessageEvent::Sent(message), cx);
+            workspace.message_event(
+                MessageEvent::Delivered {
+                    ids: vec![swarm_protocol::MessageId(1)],
+                    delivered_at: 9,
+                },
+                cx,
+            );
+        });
+
+        let delivered = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .data
+                .messages_of(DaemonProjectId(5), Some(DaemonTaskId(7)))
+                .map(|message| message.delivered_at)
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(delivered, [Some(9)]);
+    }
+
+    #[gpui::test]
+    fn changes_are_polled_only_while_the_swarm_view_shows(cx: &mut TestAppContext) {
+        let (asked, requests) = flume::unbounded();
+        let socket = fake_daemon_replying(move |request| match request {
+            Request::AgentChanges { call, agents } => {
+                asked.send(agents.clone()).ok();
+
+                Some(Event::AgentChanges {
+                    call,
+                    changes: agents
+                        .into_iter()
+                        .map(|agent| {
+                            (
+                                agent,
+                                DiffStat {
+                                    files: 2,
+                                    additions: 5,
+                                    deletions: 1,
+                                },
+                            )
+                        })
+                        .collect(),
+                })
+            }
+            _ => None,
+        });
+        let (workspace, cx, _client) = real_task_workspace(&socket, cx);
+        change_agent(
+            &workspace,
+            &agent_info(1, 7, DaemonAgentStatus::Working),
+            cx,
+        );
+
+        redraw(cx);
+        for _ in 0..5 {
+            wait_a_little();
+            redraw(cx);
+        }
+        let before = requests.try_iter().count();
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_view(View::Swarm, cx);
+        });
+        redraw(cx);
+
+        let polled = wait_until(cx, |cx| {
+            workspace.read_with(cx, |workspace, _| !workspace.data.diff_stats.is_empty())
+        });
+
+        assert_eq!(before, 0);
+        assert!(polled);
+        assert_eq!(
+            requests.try_iter().next(),
+            Some(vec![swarm_protocol::AgentId(1)])
+        );
     }
 
     type StartRequests = flume::Receiver<(DaemonProjectId, Option<swarm_protocol::AgentKind>)>;

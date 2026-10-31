@@ -12,7 +12,7 @@ use gpui::{AnyWindowHandle, App, AsyncApp, Context, Window};
 use swarm_ui::theme::{self, Appearance};
 
 use crate::model::ProjectId;
-use crate::workspace::Workspace;
+use crate::workspace::{View, Workspace};
 
 type OpenOverlay = fn(&mut Workspace, &mut Window, &mut Context<Workspace>);
 
@@ -26,6 +26,10 @@ fn open_start(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Worksp
 
 fn open_start_empty(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
     workspace.select_project(ProjectId(3), cx);
+}
+
+fn open_swarm(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
+    workspace.set_view(View::Swarm, cx);
 }
 
 fn show_empty(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
@@ -62,6 +66,16 @@ pub(crate) fn run(directory: PathBuf, cx: &mut App) {
                 Appearance::Dark,
                 "workspace-island-dark.png",
                 Some(open_island),
+            ),
+            (
+                Appearance::Light,
+                "workspace-swarm-light.png",
+                Some(open_swarm),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-swarm-dark.png",
+                Some(open_swarm),
             ),
             (
                 Appearance::Light,

@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use gpui::{
-    Bounds, Context, Entity, FocusHandle, Focusable, Pixels, SharedString, Size, Subscription,
-    Window, div, px,
+    Bounds, Context, Entity, FocusHandle, Focusable, Pixels, ScrollHandle, SharedString, Size,
+    Subscription, Window, div, px,
 };
 use swarm_protocol::Client;
 use swarm_ui::fonts::UI_FONT;
@@ -16,7 +16,9 @@ use crate::actions::{
     ShowTerminals, ToggleChanges, ToggleCommandPalette, ToggleFiles,
 };
 use crate::daemon::{DaemonLaunch, LiveTerminal};
-use crate::model::{FakeData, ProjectId, Task, TaskId, TaskStatus, TerminalId, TerminalKind};
+use crate::model::{
+    AgentId, FakeData, ProjectId, SAMPLE_NOW, Task, TaskId, TaskStatus, TerminalId, TerminalKind,
+};
 use crate::palette::Overlay;
 use crate::views::Resizing;
 use crate::{panels, sidebar, status_bar, tab_bar, views};
@@ -92,6 +94,18 @@ pub(crate) struct Workspace {
     pub(crate) sidebar_error: Option<SharedString>,
     pub(crate) orchestrator_input: Entity<TextInput>,
     _orchestrator_subscription: Subscription,
+    /// Replaces the system clock, so snapshots and tests show the same times.
+    pub(crate) fixed_now: Option<u64>,
+    /// The agent selected in the Swarm view, for each task.
+    pub(crate) swarm_selection: HashMap<TaskId, AgentId>,
+    pub(crate) swarm_focus: HashMap<AgentId, FocusHandle>,
+    pub(crate) swarm_zoom: f32,
+    /// The agent Review shows, set by View diff.
+    pub(crate) review_agent: Option<AgentId>,
+    pub(crate) messages_scroll: ScrollHandle,
+    pub(crate) messages_scroll_key: Option<(AgentId, usize)>,
+    pub(crate) changes_poll: Option<gpui::Task<()>>,
+    pub(crate) swarm_clock: Option<gpui::Task<()>>,
 }
 
 impl Workspace {
@@ -102,7 +116,10 @@ impl Workspace {
 
     /// Fake projects, tasks and agents for snapshots and tests.
     pub(crate) fn with_sample(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self::with_data(DataSource::Sample, FakeData::sample(), window, cx)
+        let mut workspace = Self::with_data(DataSource::Sample, FakeData::sample(), window, cx);
+        workspace.fixed_now = Some(SAMPLE_NOW);
+
+        workspace
     }
 
     fn with_data(
@@ -164,6 +181,15 @@ impl Workspace {
             sidebar_error: None,
             orchestrator_input,
             _orchestrator_subscription: orchestrator_subscription,
+            fixed_now: None,
+            swarm_selection: HashMap::new(),
+            swarm_focus: HashMap::new(),
+            swarm_zoom: 1.,
+            review_agent: None,
+            messages_scroll: ScrollHandle::new(),
+            messages_scroll_key: None,
+            changes_poll: None,
+            swarm_clock: None,
         }
     }
 
@@ -340,7 +366,11 @@ impl Workspace {
     /// panel before the area is measured again.
     pub(crate) fn terminal_area_size(&self) -> Option<Size<Pixels>> {
         let mut size = self.terminal_area?.size;
-        match (self.terminal_area_had_panel, self.visible_panel().is_some()) {
+        // The layout stays what the Terminals view shows, also while the Swarm view hides the panel.
+        match (
+            self.terminal_area_had_panel,
+            self.panel_in(View::Terminals).is_some(),
+        ) {
             (true, false) => size.width += RIGHT_PANEL_WIDTH,
             (false, true) => size.width -= RIGHT_PANEL_WIDTH,
             _ => {}
@@ -349,9 +379,14 @@ impl Workspace {
         Some(size)
     }
 
-    /// The right panel to show. A Start or Plan task has none, but the choice is kept.
+    /// The right panel to show. A Start or Plan task and the Swarm view have none, but the
+    /// choice is kept.
     pub(crate) fn visible_panel(&self) -> Option<RightPanel> {
-        if self.has_no_projects() || self.active_task().is_start {
+        self.panel_in(self.view)
+    }
+
+    fn panel_in(&self, view: View) -> Option<RightPanel> {
+        if self.has_no_projects() || self.active_task().is_start || view == View::Swarm {
             None
         } else {
             self.right_panel
@@ -387,8 +422,11 @@ impl Render for Workspace {
         let (ground, panel, line, fg) = (colors.ground, colors.panel, colors.line, colors.fg);
 
         self.start_orchestrator_if_needed(window, cx);
+        self.sync_swarm_tasks(cx);
         self.apply_pending_focus(window, cx);
         self.ensure_focus_handles(cx);
+        self.ensure_swarm_handles(cx);
+        self.sync_messages_scroll();
         self.layout = views::compute_layout(self);
 
         let sidebar = sidebar::render(self, window, cx);

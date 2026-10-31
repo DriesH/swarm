@@ -6,12 +6,15 @@ use std::path::PathBuf;
 use gpui::{Hsla, SharedString, rgb};
 use swarm_protocol::{
     AgentId as DaemonAgentId, AgentInfo, AgentLifecycle, AgentRole,
-    AgentStatus as DaemonAgentStatus, MessageInfo, ProjectInfo, TaskInfo,
-    TerminalId as DaemonTerminalId, TerminalInfo,
+    AgentStatus as DaemonAgentStatus, DiffStat, MessageId, MessageInfo, MessageKind, ProjectInfo,
+    TaskInfo, TerminalId as DaemonTerminalId, TerminalInfo,
 };
 use swarm_term::{BlockedKind, ExitStatus};
 use swarm_ui::AgentStatus;
 use swarm_ui::prelude::Color;
+
+/// The clock of fake data: snapshots and tests show times relative to it.
+pub(crate) const SAMPLE_NOW: u64 = 1_800_000_000_000;
 
 pub(crate) const START_TASK: &str = "Start";
 pub(crate) const PLAN_TASK: &str = "Plan";
@@ -144,6 +147,8 @@ pub(crate) struct DaemonAgent {
     pub lifecycle: AgentLifecycle,
     /// Of the daemon's last report. An older report is dropped.
     pub revision: u64,
+    pub worktree: PathBuf,
+    pub branch: SharedString,
 }
 
 /// The sidebar and tile visuals for a daemon status.
@@ -176,11 +181,24 @@ pub(crate) struct Agent {
     pub model: SharedString,
     pub status: AgentStatus,
     pub terminal: TerminalId,
+    /// Milliseconds since the Unix epoch; 0 when unknown.
+    pub created_at: u64,
+    /// When its process last ended, if it did.
+    pub ended_at: Option<u64>,
+    /// What a fake agent says it does, where a real one shows the program's status text.
+    pub note: Option<SharedString>,
     /// Set for an agent the daemon runs.
     pub daemon: Option<DaemonAgent>,
 }
 
 impl Agent {
+    /// The id messages use: the daemon's, or one made from the fake id.
+    pub(crate) fn protocol_id(&self) -> DaemonAgentId {
+        self.daemon
+            .as_ref()
+            .map_or(DaemonAgentId(u64::from(self.id.0)), |daemon| daemon.id)
+    }
+
     /// What a real agent shows next to its name: kind, model, then why it is blocked
     /// or has stopped. A fake agent shows its model only.
     pub(crate) fn meta(&self) -> SharedString {
@@ -408,6 +426,8 @@ pub(crate) struct FakeData {
     /// orchestrator's messages sit under its project with no task.
     pub messages:
         HashMap<(swarm_protocol::ProjectId, Option<swarm_protocol::TaskId>), VecDeque<MessageInfo>>,
+    /// The latest changes of each agent's worktree. Missing while unknown.
+    pub diff_stats: HashMap<AgentId, DiffStat>,
 }
 
 fn sample_usage() -> Vec<(SharedString, f32)> {
@@ -432,6 +452,15 @@ struct Builder {
     next_agent: u32,
     next_terminal: u32,
     next_task: u32,
+}
+
+struct SampleSwarm {
+    task: TaskId,
+    orchestrator: AgentId,
+    term_render: AgentId,
+    pty_io: AgentId,
+    ui_tokens: AgentId,
+    bench: AgentId,
 }
 
 struct AgentSpec<'a> {
@@ -525,6 +554,9 @@ impl Builder {
             model: SharedString::new(spec.model),
             status: spec.status,
             terminal,
+            created_at: 0,
+            ended_at: None,
+            note: None,
             daemon: None,
         });
 
@@ -732,7 +764,7 @@ impl FakeData {
                 ]),
             },
         );
-        builder.worker(
+        let bench = builder.worker(
             renderer,
             AgentSpec {
                 name: "bench",
@@ -852,7 +884,22 @@ impl FakeData {
             minimal_orchestrator("opus 5.5"),
         );
 
+        let orchestrator = builder
+            .data
+            .task(renderer)
+            .and_then(|task| task.orchestrator)
+            .unwrap_or(AgentId(0));
+        let team = SampleSwarm {
+            task: renderer,
+            orchestrator,
+            term_render,
+            pty_io,
+            ui_tokens,
+            bench,
+        };
+
         let mut data = builder.data;
+        data.add_sample_swarm(&team);
         data.file_tree = sample_file_tree();
         data.usage = sample_usage();
 
@@ -862,6 +909,115 @@ impl FakeData {
         }
 
         data
+    }
+
+    /// Times, status notes, changes and messages for the Swarm view of the sample task.
+    fn add_sample_swarm(&mut self, team: &SampleSwarm) {
+        const SECOND: u64 = 1_000;
+
+        let ago = |seconds: u64| SAMPLE_NOW - seconds * SECOND;
+        let times = [
+            (team.orchestrator, 840, None, "Answering pty-io"),
+            (team.ui_tokens, 790, Some(ago(70)), "Done · ready to merge"),
+            (team.term_render, 780, None, "Running cargo bench"),
+            (team.pty_io, 400, None, "Asked a question"),
+            (team.bench, 750, None, "Waiting for a task"),
+        ];
+
+        for (id, started, ended, note) in times {
+            if let Some(agent) = self.agents.iter_mut().find(|agent| agent.id == id) {
+                agent.created_at = ago(started);
+                agent.ended_at = ended;
+                agent.note = Some(SharedString::new(note));
+            }
+        }
+
+        let stat = |files, additions, deletions| DiffStat {
+            files,
+            additions,
+            deletions,
+        };
+        self.diff_stats.insert(team.ui_tokens, stat(3, 186, 12));
+        self.diff_stats.insert(team.term_render, stat(4, 94, 21));
+        self.diff_stats.insert(team.pty_io, stat(2, 41, 8));
+
+        let Some(key) = self.message_key(team.task) else {
+            return;
+        };
+        let id_of = |agent: AgentId| DaemonAgentId(u64::from(agent.0));
+        let sample = [
+            (
+                1,
+                team.orchestrator,
+                team.ui_tokens,
+                MessageKind::Brief,
+                785,
+                true,
+            ),
+            (
+                2,
+                team.orchestrator,
+                team.term_render,
+                MessageKind::Brief,
+                775,
+                true,
+            ),
+            (
+                4,
+                team.orchestrator,
+                team.pty_io,
+                MessageKind::Brief,
+                395,
+                true,
+            ),
+            (
+                5,
+                team.ui_tokens,
+                team.orchestrator,
+                MessageKind::Report,
+                70,
+                true,
+            ),
+            (
+                6,
+                team.pty_io,
+                team.orchestrator,
+                MessageKind::Question,
+                20,
+                false,
+            ),
+            (
+                7,
+                team.orchestrator,
+                team.term_render,
+                MessageKind::Task,
+                8,
+                false,
+            ),
+        ];
+        let texts = [
+            "Build the color tokens for the terminal. Report when the theme compiles.",
+            "Render the terminal grid with shaped lines. Report the frame time.",
+            "Wire PTY read/write on a background thread. Report the API back to me.",
+            "Tokens done: 38 tokens, light and dark. Ready to merge.",
+            "portable-pty or raw openpty? portable-pty adds 4 dependencies.",
+            "Run cargo bench on the grid and report the numbers.",
+        ];
+
+        let log = self.messages.entry(key).or_default();
+        for ((id, from, to, kind, seconds, delivered), text) in sample.into_iter().zip(texts) {
+            log.push_back(MessageInfo {
+                id: MessageId(id),
+                project: key.0,
+                task: key.1,
+                from: Some(id_of(from)),
+                to: id_of(to),
+                kind,
+                text: text.to_owned(),
+                sent_at: ago(seconds),
+                delivered_at: delivered.then(|| ago(seconds) + SECOND),
+            });
+        }
     }
 
     /// No projects yet. Usage and the file tree stay empty until they are real.
@@ -1012,6 +1168,8 @@ impl FakeData {
             message: info.message.as_deref().map(SharedString::new),
             lifecycle: info.lifecycle,
             revision: info.revision,
+            worktree: info.worktree.clone(),
+            branch: SharedString::new(&info.branch),
         };
 
         let existing = self.agents.iter_mut().find(|agent| {
@@ -1032,6 +1190,8 @@ impl FakeData {
 
             agent.model = SharedString::new(&info.model);
             agent.status = ui_status(info.status);
+            agent.created_at = info.created_at;
+            agent.ended_at = info.ended_at;
             agent.daemon = Some(daemon);
 
             (agent.id, agent.terminal)
@@ -1084,6 +1244,9 @@ impl FakeData {
             model: SharedString::new(&info.model),
             status: ui_status(info.status),
             terminal,
+            created_at: info.created_at,
+            ended_at: info.ended_at,
+            note: None,
             daemon: Some(daemon),
         });
 
@@ -1264,35 +1427,84 @@ impl FakeData {
         gone
     }
 
-    /// Keeps a message, up to the last [`MESSAGES_PER_TASK`] of its task.
+    /// Keeps a message, up to the last [`MESSAGES_PER_TASK`] of its task, in id order.
+    /// A copy of a kept message only fills in `delivered_at`.
     pub(crate) fn record_message(&mut self, message: &MessageInfo) {
         let log = self
             .messages
             .entry((message.project, message.task))
             .or_default();
 
-        if log.iter().any(|known| known.id == message.id) {
+        if let Some(known) = log.iter_mut().find(|known| known.id == message.id) {
+            if known.delivered_at.is_none() {
+                known.delivered_at = message.delivered_at;
+            }
+
             return;
         }
 
-        log.push_back(message.clone());
+        let at = log.partition_point(|known| known.id < message.id);
+        log.insert(at, message.clone());
 
         while log.len() > MESSAGES_PER_TASK {
             log.pop_front();
         }
     }
 
+    /// Keeps the messages a listing returned.
+    pub(crate) fn merge_messages(&mut self, messages: &[MessageInfo]) {
+        for message in messages {
+            self.record_message(message);
+        }
+    }
+
+    /// Sets `delivered_at` on the kept messages with these ids.
+    pub(crate) fn mark_delivered(&mut self, ids: &[MessageId], delivered_at: u64) {
+        for message in self.messages.values_mut().flatten() {
+            if message.delivered_at.is_none() && ids.contains(&message.id) {
+                message.delivered_at = Some(delivered_at);
+            }
+        }
+    }
+
     /// The kept messages of a task, oldest first. `None` is a Start orchestrator's.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the Swarm view reads them in phase 5")
-    )]
     pub(crate) fn messages_of(
         &self,
         project: swarm_protocol::ProjectId,
         task: Option<swarm_protocol::TaskId>,
     ) -> impl Iterator<Item = &MessageInfo> {
         self.messages.get(&(project, task)).into_iter().flatten()
+    }
+
+    /// Where the messages of a tab are kept. Fake tabs use ids made from their own.
+    pub(crate) fn message_key(
+        &self,
+        task: TaskId,
+    ) -> Option<(swarm_protocol::ProjectId, Option<swarm_protocol::TaskId>)> {
+        let task = self.task(task)?;
+        let project = self.project(task.project)?;
+
+        let project_key = project
+            .daemon
+            .unwrap_or(swarm_protocol::ProjectId(u64::from(project.id.0)));
+        let task_key = (!task.is_start).then(|| {
+            task.daemon
+                .as_ref()
+                .map_or(swarm_protocol::TaskId(u64::from(task.id.0)), |daemon| {
+                    daemon.id
+                })
+        });
+
+        Some((project_key, task_key))
+    }
+
+    /// The messages of a tab, oldest first.
+    pub(crate) fn task_messages(&self, task: TaskId) -> impl Iterator<Item = &MessageInfo> {
+        let (project, task) = self.message_key(task).unzip();
+
+        project
+            .into_iter()
+            .flat_map(move |project| self.messages_of(project, task.flatten()))
     }
 
     /// Applies what the daemon says about a process terminal an agent started.
@@ -1634,6 +1846,9 @@ impl FakeData {
             model: model.into(),
             status: AgentStatus::Working,
             terminal,
+            created_at: 0,
+            ended_at: None,
+            note: None,
             daemon: None,
         });
         self.tasks.push(Task {
@@ -1873,6 +2088,8 @@ mod tests {
             message: None,
             lifecycle: AgentLifecycle::Running,
             revision,
+            created_at: 0,
+            ended_at: None,
         }
     }
 
@@ -2044,15 +2261,38 @@ mod tests {
 
     fn message(id: u64) -> MessageInfo {
         MessageInfo {
-            id: swarm_protocol::MessageId(id),
+            id: MessageId(id),
             project: swarm_protocol::ProjectId(1),
             task: Some(swarm_protocol::TaskId(7)),
             from: None,
             to: DaemonAgentId(1),
-            kind: swarm_protocol::MessageKind::Task,
+            kind: MessageKind::Task,
             text: format!("message {id}"),
             sent_at: id,
+            delivered_at: None,
         }
+    }
+
+    #[test]
+    fn merging_a_history_drops_known_messages_and_keeps_the_order() {
+        let mut data = FakeData::live();
+        let delivered = MessageInfo {
+            delivered_at: Some(9),
+            ..message(2)
+        };
+
+        data.record_message(&message(3));
+        data.record_message(&message(2));
+        data.merge_messages(&[message(1), delivered, message(3)]);
+
+        let kept: Vec<(u64, Option<u64>)> = data
+            .messages_of(
+                swarm_protocol::ProjectId(1),
+                Some(swarm_protocol::TaskId(7)),
+            )
+            .map(|message| (message.id.0, message.delivered_at))
+            .collect();
+        assert_eq!(kept, [(1, None), (2, Some(9)), (3, None)]);
     }
 
     #[test]

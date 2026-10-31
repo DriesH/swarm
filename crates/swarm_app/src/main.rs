@@ -9,6 +9,7 @@ mod panels;
 mod settings;
 mod sidebar;
 mod status_bar;
+mod swarm_view;
 mod tab_bar;
 mod views;
 mod window_drag;
