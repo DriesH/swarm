@@ -21,6 +21,8 @@ const CHAR_WIDTH: f32 = 7.2;
 const ROW_HEIGHT: f32 = 17.;
 const HEADER_HEIGHT: f32 = 34.;
 const HANDLE_HEIGHT: f32 = 6.;
+/// The rows of the terminal a small tile shows.
+const SMALL_TILE_ROWS: u16 = 12;
 const KEY_STEP: f32 = 20.;
 const MIN_TILE: Size<Pixels> = Size {
     width: px(260.),
@@ -121,15 +123,31 @@ fn process_size(columns: u16, rows: u16) -> swarm_layout::Size {
     )
 }
 
+/// Height of a tile that shows `rows` rows of the terminal font: the rows, the padding of
+/// the terminal view and the tile's header and border.
+fn rows_height(cell: Option<(f32, f32)>, rows: u16) -> f32 {
+    let (_, cell_height) = cell.unwrap_or((CHAR_WIDTH, ROW_HEIGHT));
+
+    f32::from(rows) * cell_height + 2. * VIEW_PADDING + CHROME_HEIGHT
+}
+
 /// Size of a tile for a process terminal that an agent fixed at `columns` × `rows`,
 /// from the terminal view's cell size when it is known.
 fn fixed_size(cell: Option<(f32, f32)>, columns: u16, rows: u16) -> swarm_layout::Size {
-    let (cell_width, cell_height) = cell.unwrap_or((CHAR_WIDTH, ROW_HEIGHT));
+    let (cell_width, _) = cell.unwrap_or((CHAR_WIDTH, ROW_HEIGHT));
 
     swarm_layout::Size::new(
         f32::from(columns) * cell_width + 2. * VIEW_PADDING + CHROME_WIDTH,
-        f32::from(rows) * cell_height + 2. * VIEW_PADDING + CHROME_HEIGHT,
+        rows_height(cell, rows),
     )
+}
+
+/// The layout style with a small tile that shows [`SMALL_TILE_ROWS`] rows.
+fn layout_style(workspace: &Workspace) -> LayoutStyle {
+    LayoutStyle {
+        small_tile_height: rows_height(workspace.cell_size, SMALL_TILE_ROWS),
+        ..LayoutStyle::default()
+    }
 }
 
 /// Cells that fit in a tile of this size.
@@ -234,7 +252,7 @@ pub(crate) fn compute_layout(workspace: &Workspace) -> Layout {
         return start_layout(area, &specs);
     }
 
-    swarm_layout::layout(to_rect(area), &specs, &LayoutStyle::default())
+    swarm_layout::layout(to_rect(area), &specs, &layout_style(workspace))
 }
 
 /// One centered tile, at most 880px wide and as tall as the area allows.
@@ -932,6 +950,114 @@ mod tests {
         };
 
         assert_eq!(cells(size), (90, 14));
+    }
+
+    #[test]
+    fn a_small_tile_shows_twelve_rows_of_the_terminal_font() {
+        assert!((rows_height(Some((7.2, 17.)), SMALL_TILE_ROWS) - 286.).abs() < 0.01);
+        assert!((rows_height(Some((8., 20.)), SMALL_TILE_ROWS) - 322.).abs() < 0.01);
+        assert!((rows_height(None, SMALL_TILE_ROWS) - 286.).abs() < 0.01);
+    }
+
+    #[gpui::test]
+    fn the_layout_style_takes_the_small_tile_from_the_measured_cell_size(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+
+        let measured = workspace.read_with(cx, |workspace, _| {
+            (
+                workspace.cell_size,
+                layout_style(workspace).small_tile_height,
+            )
+        });
+        workspace.update(cx, |workspace, _| workspace.cell_size = Some((9., 22.)));
+        let larger =
+            workspace.read_with(cx, |workspace, _| layout_style(workspace).small_tile_height);
+
+        let (cell, height) = measured;
+        assert_eq!(cell.map(|(_, height)| height), Some(17.));
+        assert!((height - 286.).abs() < 0.01);
+        assert!((larger - 346.).abs() < 0.01);
+    }
+
+    fn rect_of(workspace: &Workspace, terminal: TerminalId) -> Rect {
+        workspace
+            .layout
+            .rect(TileId(terminal.0))
+            .unwrap_or_default()
+    }
+
+    #[gpui::test]
+    fn the_orchestrator_takes_most_of_the_width_and_workers_are_small_boxes(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = setup(cx);
+        redraw(cx);
+
+        workspace.read_with(cx, |workspace, _| {
+            let area = workspace
+                .terminal_area_size()
+                .expect("the area is measured");
+            let content = f32::from(area.width) - 20.;
+            let small = layout_style(workspace).small_tile_height;
+            let orchestrator = workspace
+                .active_task()
+                .orchestrator
+                .and_then(|id| workspace.data.agent(id))
+                .map(|agent| rect_of(workspace, agent.terminal))
+                .expect("the sample has an orchestrator");
+
+            assert!((orchestrator.size.width - 0.65 * content).abs() < 1.);
+            assert!((orchestrator.size.height - (f32::from(area.height) - 20.)).abs() < 1.);
+
+            let working = workspace
+                .active_task()
+                .workers
+                .iter()
+                .filter_map(|id| workspace.data.agent(*id))
+                .find(|agent| agent.status == AgentStatus::Working)
+                .map(|agent| rect_of(workspace, agent.terminal))
+                .expect("the sample has a working worker");
+            assert!((working.size.height - small).abs() < 0.5);
+            assert!(working.origin.x >= orchestrator.right());
+            assert!(working.size.height < f32::from(area.height) / 2.);
+        });
+    }
+
+    #[gpui::test]
+    fn a_blocked_worker_grows_and_shrinks_back_when_it_works_again(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let blocked = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .data
+                .agents
+                .iter()
+                .find(|agent| agent.status == AgentStatus::Blocked)
+                .map(|agent| (agent.id, agent.terminal))
+        });
+        let (agent, terminal) = blocked.expect("the sample has a blocked worker");
+        redraw(cx);
+        let height = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| rect_of(workspace, terminal).size.height)
+        };
+
+        let grown = height(cx);
+        workspace.update(cx, |workspace, cx| {
+            if let Some(entry) = workspace
+                .data
+                .agents
+                .iter_mut()
+                .find(|entry| entry.id == agent)
+            {
+                entry.status = AgentStatus::Working;
+            }
+            cx.notify();
+        });
+        redraw(cx);
+        let small =
+            workspace.read_with(cx, |workspace, _| layout_style(workspace).small_tile_height);
+
+        assert!(grown > small + 50.);
+        assert!((height(cx) - small).abs() < 0.5);
     }
 
     #[gpui::test]

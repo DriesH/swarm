@@ -21,7 +21,7 @@ use swarm_term::{ExitStatus, TerminalChannels, TerminalInput};
 use swarm_term_view::{TerminalEvent, TerminalView, palette_for};
 use swarm_ui::ActiveTheme as _;
 
-use crate::model::{AgentChanges, FakeData, ProjectId, TaskId, TerminalId};
+use crate::model::{AgentChanges, FakeData, ProjectId, TaskId, TerminalId, TerminalKind};
 use crate::workspace::{DataSource, View, Workspace};
 
 /// Scrollback lines requested when attaching.
@@ -1187,7 +1187,7 @@ impl Workspace {
     }
 
     /// Reads the cell size of the terminal font once, to size tiles in cells.
-    fn measure_cells(&mut self, window: &mut Window, cx: &Context<Self>) {
+    pub(crate) fn measure_cells(&mut self, window: &mut Window, cx: &Context<Self>) {
         if self.cell_size.is_some() {
             return;
         }
@@ -1471,6 +1471,18 @@ impl Workspace {
     ) -> LiveTerminal {
         let input = channels.input.clone();
         let view = cx.new(|cx| TerminalView::new(channels, accessible_name, window, cx));
+
+        // Both the tile and the Swarm view's Terminal tab show this view, so this is the
+        // only place that decides who may type.
+        let is_worker = self
+            .data
+            .terminal(terminal)
+            .is_some_and(|entry| entry.kind == TerminalKind::Worker);
+        if is_worker {
+            view.update(cx, |view, _| {
+                view.set_typing_gate(crate::settings::allow_worker_typing);
+            });
+        }
 
         let subscription =
             cx.subscribe_in(&view, window, move |workspace, _, event, window, cx| {

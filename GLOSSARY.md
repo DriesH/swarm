@@ -61,7 +61,7 @@ The view that shows a task's swarm as a graph of agents and the messages between
 _Avoid_: Graph view, map
 
 **Inspector**:
-The panel in the Swarm view that shows the selected agent: its details, messages, changes and terminals.
+The panel in the Swarm view that shows the selected agent: its details, messages, changes and its live terminal.
 _Avoid_: Details pane, sidebar
 
 **In flight**:

@@ -18,6 +18,7 @@ use swarm_protocol::{MessageId, MessageInfo, MessageKind};
 use swarm_ui::theme::{self, Appearance};
 
 use crate::model::Agent;
+use crate::swarm_view::InspectorTab;
 use crate::workspace::{RightPanel, View, Workspace};
 
 const ROUNDS: usize = 20;
@@ -304,7 +305,45 @@ async fn swarm_steps(recorder: &mut Recorder, cx: &mut AsyncApp) -> anyhow::Resu
         workspace.set_view(View::Swarm, cx);
     };
     recorder.step_after("swarm idle", show, SETTLE, cx).await?;
+    resize_and_scroll(recorder, "swarm resize", "swarm scroll", cx).await?;
 
+    // The same again with the Terminal tab open on a live terminal.
+    let open_terminal =
+        |workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>| {
+            crate::demo::attach_terminal(workspace, window, cx);
+            workspace.select_inspector_tab(InspectorTab::Terminal, cx);
+        };
+    recorder
+        .step_after("swarm idle", open_terminal, SETTLE, cx)
+        .await?;
+    resize_and_scroll(
+        recorder,
+        "swarm terminal resize",
+        "swarm terminal scroll",
+        cx,
+    )
+    .await?;
+
+    recorder
+        .step_after(
+            "swarm idle",
+            |workspace, _, cx| {
+                workspace.select_inspector_tab(InspectorTab::Messages, cx);
+                workspace.set_view(View::Terminals, cx);
+            },
+            STEP_WAIT,
+            cx,
+        )
+        .await
+}
+
+/// Resizes the window step by step, then scrolls over the inspector.
+async fn resize_and_scroll(
+    recorder: &mut Recorder,
+    resize_label: &'static str,
+    scroll_label: &'static str,
+    cx: &mut AsyncApp,
+) -> anyhow::Result<()> {
     for index in 0..SWARM_RESIZES {
         #[expect(clippy::cast_precision_loss, reason = "a small step count")]
         let width = 1100. + 25. * ((index % 20) as f32 + 1.);
@@ -312,7 +351,7 @@ async fn swarm_steps(recorder: &mut Recorder, cx: &mut AsyncApp) -> anyhow::Resu
             window.resize(size(px(width), px(800. + (width - 1100.) / 2.)));
         };
         recorder
-            .step_after("swarm resize", apply, SWARM_STEP_WAIT, cx)
+            .step_after(resize_label, apply, SWARM_STEP_WAIT, cx)
             .await?;
     }
 
@@ -337,17 +376,10 @@ async fn swarm_steps(recorder: &mut Recorder, cx: &mut AsyncApp) -> anyhow::Resu
             );
         })?;
         cx.background_executor().timer(SWARM_STEP_WAIT).await;
-        recorder.record("swarm scroll", cx)?;
+        recorder.record(scroll_label, cx)?;
     }
 
-    recorder
-        .step_after(
-            "swarm idle",
-            |workspace, _, cx| workspace.set_view(View::Terminals, cx),
-            STEP_WAIT,
-            cx,
-        )
-        .await
+    Ok(())
 }
 
 /// Gives the open task a diff of about 48,000 lines in both sources.

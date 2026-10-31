@@ -20,6 +20,8 @@ mod views;
 mod window_drag;
 mod workspace;
 
+#[cfg(any(feature = "snapshot", feature = "frame-stats"))]
+mod demo;
 #[cfg(feature = "frame-stats")]
 mod frame_stats;
 #[cfg(feature = "snapshot")]

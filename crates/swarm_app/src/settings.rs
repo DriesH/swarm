@@ -888,6 +888,19 @@ fn bind_keys(cx: &mut App) {
     ]);
 }
 
+/// Whether the user may type into worker terminals. It stays on until the settings turn it off.
+pub(crate) fn allow_worker_typing(cx: &App) -> bool {
+    cx.try_global::<Registry>()
+        .is_none_or(|registry| registry.state.read(cx).allow_worker_typing)
+}
+
+#[cfg(test)]
+pub(crate) fn set_allow_worker_typing(allowed: bool, cx: &mut App) {
+    let state = shared_state(None, cx);
+
+    state.update(cx, |state, _| state.allow_worker_typing = allowed);
+}
+
 fn shared_state(path: Option<PathBuf>, cx: &mut App) -> Entity<SettingsState> {
     if let Some(registry) = cx.try_global::<Registry>() {
         return registry.state.clone();
