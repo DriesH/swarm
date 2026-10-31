@@ -119,7 +119,9 @@ Three parts: 1. Review view, Approve, Changes panel and Close task. 2. Comments.
 
 **Goal:** know what the swarm is doing without opening the window.
 
-**Scope:** `swarm_usage` (status item, GPUI popover, Claude usage from status line data with the endpoint as fallback, Codex usage through `codex app-server`), running agent count and **Stop all**, system notifications with actions, dock bounce, notification settings.
+**Scope:** `swarm_usage` (Claude usage from status line data with the endpoint as fallback, Codex usage through `codex app-server`), menu bar status item with a GPUI popover, running agent count and **Stop all**, system notifications with actions, dock bounce, notification settings.
+
+Three parts: 1. Usage in the daemon and the sidebar card. 2. Menu bar and popover. 3. Notifications.
 
 **Done when:**
 

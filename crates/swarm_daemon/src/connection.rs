@@ -190,6 +190,12 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
                 sink.send_event(&Event::AgentChanges { call, changes });
             });
         }
+        Request::Usage { call } => {
+            sink.send_event(&Event::Usage {
+                call,
+                usage: swarm_protocol::Usage::default(),
+            });
+        }
         request @ (Request::TaskDiff { .. }
         | Request::FileHunks { .. }
         | Request::ApproveTask { .. }

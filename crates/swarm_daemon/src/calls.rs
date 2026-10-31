@@ -239,7 +239,7 @@ impl Calls {
                 self.task_wait(caller, &ids, until, timeout_secs, gone)
             }
             // `handle` answers it before it gets here.
-            Call::AgentExit => Ok(Value::Null),
+            Call::AgentExit | Call::RateLimits { .. } => Ok(Value::Null),
 
             // The size is accepted and ignored: a process terminal follows its tile.
             Call::TerminalSpawn {

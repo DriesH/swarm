@@ -35,7 +35,7 @@ Cargo workspace:
 | `swarm_settings` | User settings in `~/.config/swarm/settings.toml` (agents, default models, terminal typing), shared by app and daemon |
 | `swarm_cli` | The `swarm` CLI agents use (hooks now; spawn, send, ask and MCP next) over the daemon's agent socket (ADR 0008) |
 | `swarm_app` | Window, sidebar, tabs, Terminals / Swarm / Review views, panels, settings |
-| `swarm_usage` | Menu bar icon, popover and usage polling |
+| `swarm_usage` | Reads Claude and Codex subscription usage. No GPUI: the daemon polls, the app's menu bar shows it |
 
 Crate names use snake_case, like Zed. Key decisions live in [`docs/adr/`](adr/). Terms live in [`GLOSSARY.md`](../GLOSSARY.md).
 
@@ -370,6 +370,9 @@ Reports in `docs/spikes/`. Code in `spikes/` (throwaway).
 **Usage and menu bar**
 
 - Claude usage: read `rate_limits` from the Claude Code status line data of agents Swarm runs. Fall back to `/api/oauth/usage` at most every 5 minutes, honor `Retry-After` and store it on disk. The endpoint shares a budget with the user's own sessions and returns 429 often.
+- The daemon polls usage, not the app: it outlives the app and keeps one schedule. It polls only while an app is connected, keeps the last good numbers on disk, and broadcasts each change.
+- Swarm sets the status line of its Claude agents to `swarm statusline`. It sends `rate_limits` to the daemon, then runs the user's own status line command from `~/.claude/settings.json` with the same input and prints its output, so the user keeps their status line.
+- The fallback request goes through `/usr/bin/curl` with the token in a config on stdin, never in arguments: no TLS stack in the daemon, HTTPS only, no redirects.
 - Claude token (fallback only): Keychain item `Claude Code-credentials`, read through `/usr/bin/security`; never logged or stored.
 - Codex usage: `codex app-server` → `account/rateLimits/read`. Codex keeps its own token.
 - Menu bar popover is a GPUI window under an `NSStatusItem`. Compute its position before opening it.

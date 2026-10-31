@@ -20,7 +20,7 @@ mod client;
 pub use client::{Client, ClientError, CommentEvent, MessageEvent, PrEvent};
 
 /// Bumped on every incompatible change; the daemon refuses other versions.
-pub const VERSION: u32 = 12;
+pub const VERSION: u32 = 13;
 
 /// The most messages [`Request::ListMessages`] returns.
 pub const MESSAGES_LISTED: usize = 500;
@@ -673,6 +673,50 @@ pub struct PullRequest {
     pub read_at: u64,
 }
 
+/// One limit of a subscription, like Claude's 5-hour window.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct UsageWindow {
+    /// Short, like `5h`, `7d` or `30d`.
+    pub label: String,
+    /// 0 to 100, rounded.
+    pub used_percent: u8,
+    /// Unix seconds.
+    pub resets_at: Option<u64>,
+}
+
+/// Why the last usage read failed.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum UsageProblem {
+    /// The CLI is not installed.
+    NotInstalled,
+    NotLoggedIn,
+    /// The account refused the stored login.
+    Unauthorized,
+    /// Asked again too soon; the next read is at `retry_at` (Unix seconds).
+    RateLimited {
+        retry_at: u64,
+    },
+    Failed(String),
+}
+
+/// The usage of one CLI's subscription. A failed read keeps the last good windows.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct ProviderUsage {
+    /// Shortest window first.
+    pub windows: Vec<UsageWindow>,
+    /// The plan name the provider reports, like `max` or `plus`.
+    pub plan: Option<String>,
+    /// When `windows` was read, in Unix seconds. `None` before the first read.
+    pub read_at: Option<u64>,
+    pub problem: Option<UsageProblem>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct Usage {
+    pub claude: ProviderUsage,
+    pub codex: ProviderUsage,
+}
+
 /// What closing a task would throw away, so the app can ask first.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct CloseCheck {
@@ -788,6 +832,10 @@ pub enum Request {
     CheckClose {
         call: CallId,
         task: TaskId,
+    },
+    /// The last known subscription usage. Answered with [`Event::Usage`].
+    Usage {
+        call: CallId,
     },
     /// The task's comments, oldest first, with each anchor checked against the files
     /// as they are now. Answered with [`Event::Comments`].
@@ -1031,6 +1079,14 @@ pub enum Event {
     CommentDeleted {
         task: TaskId,
         id: CommentId,
+    },
+    Usage {
+        call: CallId,
+        usage: Usage,
+    },
+    /// Sent to every client when the usage of a subscription changed.
+    UsageChanged {
+        usage: Usage,
     },
     GithubStatus {
         call: CallId,
