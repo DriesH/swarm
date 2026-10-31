@@ -1,21 +1,26 @@
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, App, ElementId, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent,
-    Orientation, Role, SharedString, Window, div, px,
+    AnyElement, App, Context, Div, ElementId, Empty, FocusHandle, KeyDownEvent, MouseButton,
+    Orientation, Render, Role, SharedString, Stateful, Window, div, px,
 };
 
 use crate::component::{Component, example, example_group};
 use crate::prelude::*;
 
-type DragHandler = Rc<dyn Fn(&MouseDownEvent, &mut Window, &mut App) + 'static>;
+type DragHook = Box<dyn FnOnce(Stateful<Div>) -> Stateful<Div>>;
+type ResetHandler = Rc<dyn Fn(&mut Window, &mut App) + 'static>;
 type NudgeHandler = Rc<dyn Fn(Nudge, &mut Window, &mut App) + 'static>;
 
-/// Which way an arrow key moves the border.
+/// How a key moves the border: an arrow key a step, Home and End to the limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Nudge {
     Left,
     Right,
+    /// Home: the smallest size.
+    Smallest,
+    /// End: the largest size.
+    Largest,
 }
 
 /// A vertical drag handle on the left border of a panel. Its parent must be positioned
@@ -29,7 +34,8 @@ pub struct ResizeHandle {
     value: f32,
     range: (f32, f32),
     dragging: bool,
-    on_drag_start: Option<DragHandler>,
+    drag: Option<DragHook>,
+    on_reset: Option<ResetHandler>,
     on_nudge: Option<NudgeHandler>,
 }
 
@@ -46,7 +52,8 @@ impl ResizeHandle {
             value: 0.,
             range: (0., 0.),
             dragging: false,
-            on_drag_start: None,
+            drag: None,
+            on_reset: None,
             on_nudge: None,
         }
     }
@@ -63,18 +70,39 @@ impl ResizeHandle {
         self
     }
 
-    pub fn on_drag_start(
-        mut self,
-        handler: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
-    ) -> Self {
-        self.on_drag_start = Some(Rc::new(handler));
+    /// Makes the handle draggable. `payload` is what `DragMoveEvent<T>` listeners of an
+    /// ancestor get while the drag lasts, wherever the pointer is in the window.
+    pub fn on_drag<T: Clone + 'static>(mut self, payload: T) -> Self {
+        self.drag = Some(Box::new(move |handle| {
+            handle
+                .on_drag(payload, |_, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.new(|_| NoGhost)
+                })
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        }));
         self
     }
 
-    /// Called when Left or Right is pressed on the focused handle.
+    /// Called when the border is double-clicked.
+    pub fn on_reset(mut self, handler: impl Fn(&mut Window, &mut App) + 'static) -> Self {
+        self.on_reset = Some(Rc::new(handler));
+        self
+    }
+
+    /// Called when an arrow key, Home or End is pressed on the focused handle.
     pub fn on_nudge(mut self, handler: impl Fn(Nudge, &mut Window, &mut App) + 'static) -> Self {
         self.on_nudge = Some(Rc::new(handler));
         self
+    }
+}
+
+/// The drag shows nothing next to the pointer.
+struct NoGhost;
+
+impl Render for NoGhost {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        Empty
     }
 }
 
@@ -112,17 +140,26 @@ impl RenderOnce for ResizeHandle {
                     .bg(if thick { accent } else { line })
                     .group_hover(group, move |style| style.ml(px(3.)).w(px(3.)).bg(accent)),
             )
-            .when_some(self.on_drag_start, |handle, handler| {
-                handle.on_mouse_down(MouseButton::Left, move |event, window, cx| {
-                    cx.stop_propagation();
-                    handler(event, window, cx);
+            .when_some(self.drag, |handle, apply| apply(handle))
+            .when_some(self.on_reset, |handle, handler| {
+                handle.on_mouse_up(MouseButton::Left, move |event, window, cx| {
+                    if event.click_count == 2 {
+                        cx.stop_propagation();
+                        handler(window, cx);
+                    }
                 })
             })
             .when_some(self.on_nudge, |handle, handler| {
                 handle.on_key_down(move |event: &KeyDownEvent, window, cx| {
+                    if event.keystroke.modifiers.modified() {
+                        return;
+                    }
+
                     let nudge = match event.keystroke.key.as_str() {
                         "left" => Nudge::Left,
                         "right" => Nudge::Right,
+                        "home" => Nudge::Smallest,
+                        "end" => Nudge::Largest,
                         _ => return,
                     };
 

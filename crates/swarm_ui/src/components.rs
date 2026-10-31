@@ -19,6 +19,7 @@ mod tab;
 mod tab_strip;
 pub(crate) mod text_input;
 mod tile_frame;
+mod tooltip;
 mod tray_chip;
 
 pub use button::*;
@@ -42,6 +43,7 @@ pub use tab::*;
 pub use tab_strip::*;
 pub use text_input::*;
 pub use tile_frame::*;
+pub use tooltip::*;
 pub use tray_chip::*;
 
 use crate::component::ComponentEntry;
@@ -72,5 +74,6 @@ pub fn all_components() -> Vec<ComponentEntry> {
         ComponentEntry::of::<ProjectTile>(),
         ComponentEntry::of::<TileFrame>(),
         ComponentEntry::of::<Dialog>(),
+        ComponentEntry::of::<Tooltip>(),
     ]
 }

@@ -1,8 +1,8 @@
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, App, Context, ElementId, FocusHandle, FontWeight, KeyDownEvent, Role, SharedString,
-    Window, div, px,
+    AnyElement, App, Context, Div, ElementId, FocusHandle, FontWeight, Hsla, KeyDownEvent, Role,
+    SharedString, Stateful, Window, div, px,
 };
 
 use crate::component::{Component, example, example_group};
@@ -17,7 +17,8 @@ struct StripTab {
     count: Option<SharedString>,
 }
 
-/// Text tabs with an underline on the selected one. Left and Right move between tabs.
+/// Text tabs with an underline on the selected one. Left and Right move between tabs,
+/// Home and End jump to the first and the last.
 #[derive(IntoElement)]
 #[must_use]
 pub struct TabStrip {
@@ -107,6 +108,64 @@ impl Focus {
     }
 }
 
+/// One tab. `position` is its index and the number of tabs; `colors` are the text and
+/// the focus ring.
+fn strip_tab(
+    tab: StripTab,
+    position: (usize, usize),
+    is_selected: bool,
+    handle: &FocusHandle,
+    colors: (Hsla, Hsla),
+) -> Stateful<Div> {
+    let ((index, count), (fg, accent)) = (position, colors);
+    let accessible_label = match &tab.count {
+        Some(tab_count) => SharedString::from(format!("{}, {tab_count}", tab.label)),
+        None => tab.label.clone(),
+    };
+
+    div()
+        .id(("strip-tab", index))
+        .role(Role::Tab)
+        .aria_label(accessible_label)
+        .aria_selected(is_selected)
+        .aria_position_in_set(index + 1)
+        .aria_size_of_set(count)
+        .track_focus(handle)
+        .cursor_pointer()
+        .flex()
+        .items_center()
+        .gap(px(5.))
+        .pb(px(9.))
+        .mb(px(-1.))
+        .border_b_2()
+        .border_color(if is_selected {
+            fg
+        } else {
+            gpui::transparent_black()
+        })
+        .focus_visible(move |style| focus_ring(style, accent))
+        .child(
+            Label::new(tab.label)
+                .size(LabelSize::Small)
+                .weight(if is_selected {
+                    FontWeight::MEDIUM
+                } else {
+                    FontWeight::NORMAL
+                })
+                .color(if is_selected {
+                    Color::Default
+                } else {
+                    Color::Muted
+                }),
+        )
+        .children(tab.count.map(|tab_count| {
+            Label::new(tab_count)
+                .mono()
+                .size(LabelSize::XSmall)
+                .color(Color::Faint)
+        }))
+}
+
 impl RenderOnce for TabStrip {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let colors = cx.theme().colors();
@@ -128,57 +187,12 @@ impl RenderOnce for TabStrip {
             .zip(&handles)
             .enumerate()
             .map(|(index, (tab, handle))| {
-                let is_selected = index == selected;
-                let accessible_label = match &tab.count {
-                    Some(tab_count) => SharedString::from(format!("{}, {tab_count}", tab.label)),
-                    None => tab.label.clone(),
-                };
                 let on_select = on_select.clone();
 
-                div()
-                    .id(("strip-tab", index))
+                strip_tab(tab, (index, count), index == selected, handle, (fg, accent))
                     .when_some(debug_selector.clone(), |element, prefix| {
                         element.debug_selector(move || format!("{prefix}-{index}"))
                     })
-                    .role(Role::Tab)
-                    .aria_label(accessible_label)
-                    .aria_selected(is_selected)
-                    .aria_position_in_set(index + 1)
-                    .aria_size_of_set(count)
-                    .track_focus(handle)
-                    .cursor_pointer()
-                    .flex()
-                    .items_center()
-                    .gap(px(5.))
-                    .pb(px(9.))
-                    .mb(px(-1.))
-                    .border_b_2()
-                    .border_color(if is_selected {
-                        fg
-                    } else {
-                        gpui::transparent_black()
-                    })
-                    .focus_visible(move |style| focus_ring(style, accent))
-                    .child(
-                        Label::new(tab.label)
-                            .size(LabelSize::Small)
-                            .weight(if is_selected {
-                                FontWeight::MEDIUM
-                            } else {
-                                FontWeight::NORMAL
-                            })
-                            .color(if is_selected {
-                                Color::Default
-                            } else {
-                                Color::Muted
-                            }),
-                    )
-                    .children(tab.count.map(|tab_count| {
-                        Label::new(tab_count)
-                            .mono()
-                            .size(LabelSize::XSmall)
-                            .color(Color::Faint)
-                    }))
                     .when_some(on_select, |element, handler| {
                         element.on_click(move |_, window, cx| handler(index, window, cx))
                     })
@@ -190,10 +204,14 @@ impl RenderOnce for TabStrip {
                 if event.keystroke.modifiers.modified() {
                     return;
                 }
-                if !matches!(event.keystroke.key.as_str(), "left" | "right") {
-                    return;
-                }
-                let Some(next) = neighbor(&event.keystroke.key, selected, count) else {
+                let key = event.keystroke.key.as_str();
+                let next = match key {
+                    "home" => Some(0),
+                    "end" => count.checked_sub(1),
+                    "left" | "right" => neighbor(key, selected, count),
+                    _ => None,
+                };
+                let Some(next) = next else {
                     return;
                 };
 
@@ -255,12 +273,18 @@ impl Component for TabStrip {
 
 #[cfg(test)]
 mod tests {
-    use gpui::{Render, TestAppContext};
+    use gpui::accesskit::Node;
+    use gpui::{Element as _, Render, TestAppContext};
 
     use super::*;
 
+    /// Role, label, selected and position of one tab.
+    type TabInfo = (Option<Role>, Option<String>, Option<bool>, Option<usize>);
+
     struct Probe {
         tab_stops: Vec<bool>,
+        strip: Option<(Option<Role>, Option<String>)>,
+        tabs: Vec<TabInfo>,
     }
 
     impl Render for Probe {
@@ -271,20 +295,118 @@ mod tests {
             let handles = focus.update(cx, |focus, cx| focus.sync(3, 1, cx));
             self.tab_stops = handles.iter().map(|handle| handle.tab_stop).collect();
 
+            let strip = TabStrip::new("strip", "Inspector")
+                .tab_with_count("Messages", "3")
+                .tab("Changes")
+                .tab("Terminal")
+                .render(window, cx)
+                .into_element();
+            let mut node = Node::new(strip.a11y_role().unwrap_or(Role::Unknown));
+            strip.write_a11y_info(&mut node);
+            self.strip = Some((strip.a11y_role(), node.label().map(str::to_owned)));
+
+            self.tabs = handles
+                .iter()
+                .zip([
+                    StripTab {
+                        label: "Messages".into(),
+                        count: Some("3".into()),
+                    },
+                    StripTab {
+                        label: "Changes".into(),
+                        count: None,
+                    },
+                    StripTab {
+                        label: "Terminal".into(),
+                        count: None,
+                    },
+                ])
+                .enumerate()
+                .map(|(index, (handle, tab))| {
+                    let element = strip_tab(
+                        tab,
+                        (index, 3),
+                        index == 1,
+                        handle,
+                        (Hsla::default(), Hsla::default()),
+                    );
+                    let mut node = Node::new(element.a11y_role().unwrap_or(Role::Unknown));
+                    element.write_a11y_info(&mut node);
+
+                    (
+                        element.a11y_role(),
+                        node.label().map(str::to_owned),
+                        node.is_selected(),
+                        node.position_in_set(),
+                    )
+                })
+                .collect();
+
             div()
         }
+    }
+
+    fn probe(app: &mut TestAppContext) -> gpui::WindowHandle<Probe> {
+        app.update(crate::theme::init);
+        let window = app.add_window(|_, _| Probe {
+            tab_stops: Vec::new(),
+            strip: None,
+            tabs: Vec::new(),
+        });
+        app.run_until_parked();
+
+        window
     }
 
     #[test]
     fn only_the_selected_tab_is_a_tab_stop() {
         let mut app = TestAppContext::single();
-        let window = app.add_window(|_, _| Probe {
-            tab_stops: Vec::new(),
-        });
-        app.run_until_parked();
+        let window = probe(&mut app);
 
         let tab_stops = app.update(|cx| window.read(cx).map(|probe| probe.tab_stops.clone()));
 
         assert_eq!(tab_stops.ok(), Some(vec![false, true, false]));
+    }
+
+    #[test]
+    fn tab_strip_is_a_labelled_tab_list() {
+        let mut app = TestAppContext::single();
+        let window = probe(&mut app);
+
+        let (strip, tabs) = app
+            .update(|cx| {
+                window
+                    .read(cx)
+                    .map(|probe| (probe.strip.clone(), probe.tabs.clone()))
+            })
+            .expect("the probe");
+
+        assert_eq!(
+            strip,
+            Some((Some(Role::TabList), Some("Inspector".to_owned())))
+        );
+        assert_eq!(
+            tabs,
+            [
+                (
+                    Some(Role::Tab),
+                    Some("Messages, 3".to_owned()),
+                    Some(false),
+                    Some(1)
+                ),
+                (
+                    Some(Role::Tab),
+                    Some("Changes".to_owned()),
+                    Some(true),
+                    Some(2)
+                ),
+                (
+                    Some(Role::Tab),
+                    Some("Terminal".to_owned()),
+                    Some(false),
+                    Some(3)
+                ),
+            ]
+        );
     }
 }

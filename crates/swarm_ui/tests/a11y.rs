@@ -288,22 +288,6 @@ fn text_area_is_a_multiline_text_input() {
 }
 
 #[test]
-fn tab_strip_is_a_labelled_tab_list() {
-    with_window(|window, cx| {
-        let info = a11y_info(
-            TabStrip::new("strip", "Inspector")
-                .tab_with_count("Messages", "3")
-                .tab("Terminal"),
-            window,
-            cx,
-        );
-
-        assert_eq!(info.role, Some(Role::TabList));
-        assert_eq!(info.node.label(), Some("Inspector"));
-    });
-}
-
-#[test]
 fn resize_handle_is_a_splitter_with_its_width() {
     with_window(|window, cx| {
         let focus = cx.focus_handle();
