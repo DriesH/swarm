@@ -641,6 +641,7 @@ fn agent_info(status: AgentStatus) -> AgentInfo {
         lifecycle: AgentLifecycle::Running,
         revision: 1,
         created_at: 1_000,
+        started_at: Some(2_000),
         ended_at: None,
     }
 }

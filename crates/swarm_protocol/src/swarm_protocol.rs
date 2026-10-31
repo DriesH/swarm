@@ -154,6 +154,9 @@ pub struct AgentInfo {
     pub revision: u64,
     /// Milliseconds since the Unix epoch.
     pub created_at: u64,
+    /// When its process last started, in milliseconds since the Unix epoch. `None`
+    /// before the first start.
+    pub started_at: Option<u64>,
     /// When its process last ended, in milliseconds since the Unix epoch. `None` while
     /// it runs or before it starts.
     pub ended_at: Option<u64>,
