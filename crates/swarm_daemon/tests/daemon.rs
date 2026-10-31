@@ -1970,6 +1970,44 @@ esac"#,
 }
 
 #[test]
+fn the_daemon_refuses_a_message_over_64_kib() {
+    let fixture = fixture_with_helpers(
+        r#"BIG=$(head -c 70000 /dev/zero | tr '\0' x)
+case "$SWARM_ROLE" in
+orchestrator)
+  idle
+  IFS= read -r line
+  working
+  swarm spawn big --brief "$BIG" > "$OUT/big-brief.out" 2>&1
+  swarm spawn a --brief "report big" > "$OUT/spawn-a.out" 2>&1
+  swarm send a "$BIG" > "$OUT/big-send.out" 2>&1
+  echo done > "$OUT/orchestrator-done"
+  sleep 30
+  ;;
+worker)
+  idle
+  IFS= read -r line
+  working
+  swarm ask "$BIG" > "$OUT/big-ask.out" 2>&1
+  swarm report "$BIG" > "$OUT/big-report.out" 2>&1
+  sleep 30
+  ;;
+esac"#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (_client, _task) = start_task(&daemon, &repo);
+    fixture.read_when_written("orchestrator-done");
+
+    let said = |name: &str| fixture.read_when_written(name);
+    let refusal = "swarm: message is 69 KiB; the limit is 64 KiB: shorten it or write it to a file and send the path";
+    assert_eq!(said("big-brief.out").trim(), refusal);
+    assert_eq!(said("big-send.out").trim(), refusal);
+    assert_eq!(said("big-ask.out").trim(), refusal);
+    assert_eq!(said("big-report.out").trim(), refusal);
+}
+
+#[test]
 fn a_notice_blocks_the_agent_until_it_works_again() {
     let fixture = fixture_with_helpers(
         r#"idle

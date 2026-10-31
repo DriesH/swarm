@@ -34,6 +34,9 @@ const DEFAULT_WAIT_SECS: u32 = 100;
 /// The longest `wait`.
 const MAX_WAIT_SECS: u32 = 600;
 
+/// The most bytes of text one message, brief or report may hold.
+const MAX_MESSAGE_BYTES: usize = 64 << 10;
+
 /// How often `task_wait` looks at the tasks again.
 const TASK_POLL: Duration = Duration::from_millis(100);
 
@@ -51,6 +54,18 @@ fn refuse<T>(message: impl Into<String>) -> Result<T, Failure> {
 }
 
 type Outcome = Result<Value, Failure>;
+
+fn check_size(text: &str) -> Result<(), Failure> {
+    if text.len() <= MAX_MESSAGE_BYTES {
+        return Ok(());
+    }
+
+    refuse(format!(
+        "message is {} KiB; the limit is {} KiB: shorten it or write it to a file and send the path",
+        text.len().div_ceil(1024),
+        MAX_MESSAGE_BYTES >> 10,
+    ))
+}
 
 fn reply_with(result: impl Serialize) -> Outcome {
     Ok(serde_json::to_value(result)?)
@@ -301,6 +316,7 @@ impl Calls {
         if brief.trim().is_empty() {
             return refuse("a worker needs a brief");
         }
+        check_size(&brief)?;
         let model = model.map(|model| model.trim().to_owned());
         if model
             .as_deref()
@@ -364,6 +380,7 @@ impl Calls {
         if text.trim().is_empty() {
             return refuse("the message is empty");
         }
+        check_size(text)?;
 
         let worker = self.worker_of(caller, to)?;
 
@@ -377,6 +394,7 @@ impl Calls {
         if text.trim().is_empty() {
             return refuse("the message is empty");
         }
+        check_size(text)?;
 
         let orchestrator = lock(&self.services.store)
             .list_agents(task)?
@@ -457,6 +475,7 @@ impl Calls {
         if brief.trim().is_empty() {
             return refuse("a task needs a brief");
         }
+        check_size(&brief)?;
 
         let kind = match kind {
             Some(kind) => kind,
@@ -725,6 +744,21 @@ mod tests {
             created_by: None,
             briefed: true,
         }
+    }
+
+    #[test]
+    fn a_message_over_64_kib_is_refused_with_a_way_out() {
+        let at_limit = "x".repeat(MAX_MESSAGE_BYTES);
+        let over = "x".repeat(MAX_MESSAGE_BYTES + 1);
+
+        assert!(check_size(&at_limit).is_ok());
+        let Err(Failure(message)) = check_size(&over) else {
+            panic!("a message over the limit was accepted");
+        };
+        assert_eq!(
+            message,
+            "message is 65 KiB; the limit is 64 KiB: shorten it or write it to a file and send the path"
+        );
     }
 
     #[test]

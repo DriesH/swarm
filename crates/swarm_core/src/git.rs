@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io::{Read as _, Write as _};
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -168,7 +169,8 @@ pub fn diff_files(worktree: &Path, base: &str) -> Result<(DiffStat, Vec<FileStat
         return Err(failure(&arguments, &output));
     }
 
-    let mut files: HashMap<String, (u32, u32)> = HashMap::new();
+    // Keyed by the raw bytes, so names that are not UTF-8 never collide.
+    let mut files: HashMap<Vec<u8>, (u32, u32)> = HashMap::new();
     let (mut additions, mut deletions) = (0_u32, 0_u32);
 
     for entry in output
@@ -176,19 +178,17 @@ pub fn diff_files(worktree: &Path, base: &str) -> Result<(DiffStat, Vec<FileStat
         .split(|byte| *byte == 0)
         .filter(|entry| !entry.is_empty())
     {
-        let entry = String::from_utf8_lossy(entry);
-        let mut parts = entry.splitn(3, '\t');
+        let mut parts = entry.splitn(3, |byte| *byte == b'\t');
         let (Some(added), Some(removed), Some(path)) = (parts.next(), parts.next(), parts.next())
         else {
             continue;
         };
 
-        let (added, removed): (u32, u32) =
-            (added.parse().unwrap_or(0), removed.parse().unwrap_or(0));
+        let (added, removed) = (parse_count(added), parse_count(removed));
 
         additions = additions.saturating_add(added);
         deletions = deletions.saturating_add(removed);
-        files.insert(path.to_owned(), (added, removed));
+        files.insert(path.to_vec(), (added, removed));
     }
 
     let (arguments, output) = execute(
@@ -207,14 +207,16 @@ pub fn diff_files(worktree: &Path, base: &str) -> Result<(DiffStat, Vec<FileStat
         .take(MAX_UNTRACKED_FILES)
         .enumerate()
     {
-        let path = String::from_utf8_lossy(path).into_owned();
         let mut lines = 0;
         if index < MAX_COUNTED_FILES {
-            lines = count_lines(&worktree.join(&path), &mut budget);
+            lines = count_lines(&worktree.join(OsStr::from_bytes(path)), &mut budget);
         }
 
         additions = additions.saturating_add(lines);
-        files.insert(path, (lines, 0));
+
+        // A path deleted from the index but still on disk is in both lists.
+        let entry = files.entry(path.to_vec()).or_default();
+        entry.0 = entry.0.saturating_add(lines);
     }
 
     let stat = DiffStat {
@@ -226,27 +228,36 @@ pub fn diff_files(worktree: &Path, base: &str) -> Result<(DiffStat, Vec<FileStat
     Ok((stat, listed_files(files)))
 }
 
-/// Most changed lines first, ties by path so the order is stable.
-fn listed_files(files: HashMap<String, (u32, u32)>) -> Vec<FileStat> {
-    let mut listed: Vec<FileStat> = files
-        .into_iter()
-        .map(|(path, (additions, deletions))| FileStat {
-            path: PathBuf::from(path),
-            additions,
-            deletions,
-        })
-        .collect();
+/// A numstat count; binary files print `-`.
+fn parse_count(count: &[u8]) -> u32 {
+    std::str::from_utf8(count)
+        .ok()
+        .and_then(|count| count.parse().ok())
+        .unwrap_or(0)
+}
 
-    listed.sort_by(|one, other| {
-        let changed = |file: &FileStat| u64::from(file.additions) + u64::from(file.deletions);
+/// Most changed lines first, ties by path so the order is stable. A name that is not
+/// UTF-8 is listed with replacement characters, because the wire format needs UTF-8.
+fn listed_files(files: HashMap<Vec<u8>, (u32, u32)>) -> Vec<FileStat> {
+    let mut sorted: Vec<(Vec<u8>, (u32, u32))> = files.into_iter().collect();
+
+    sorted.sort_by(|(one_path, one), (other_path, other)| {
+        let changed = |(added, removed): &(u32, u32)| u64::from(*added) + u64::from(*removed);
 
         changed(other)
             .cmp(&changed(one))
-            .then_with(|| one.path.cmp(&other.path))
+            .then_with(|| one_path.cmp(other_path))
     });
-    listed.truncate(FILES_LISTED);
+    sorted.truncate(FILES_LISTED);
 
-    listed
+    sorted
+        .into_iter()
+        .map(|(path, (additions, deletions))| FileStat {
+            path: PathBuf::from(String::from_utf8_lossy(&path).into_owned()),
+            additions,
+            deletions,
+        })
+        .collect()
 }
 
 /// Lines in a text file. A symlink is one line, like git sees it. Anything that is not a
@@ -517,4 +528,23 @@ pub fn add_exclude_line(root: &Path, line: &str) -> Result<(), Error> {
     writeln!(file, "{separator}{line}").map_err(io_error("write"))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_that_are_not_utf8_stay_separate_entries() {
+        let mut files = HashMap::new();
+        files.insert(vec![b'a', 0xff], (1, 0));
+        files.insert(vec![b'a', 0xfe], (2, 0));
+        files.insert(b"a.txt".to_vec(), (3, 0));
+
+        let listed = listed_files(files);
+
+        assert_eq!(listed.len(), 3);
+        assert_eq!(listed[0].path, PathBuf::from("a.txt"));
+        assert_eq!(listed[1].path, PathBuf::from("a\u{fffd}"));
+    }
 }

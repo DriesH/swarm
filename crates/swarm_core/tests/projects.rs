@@ -953,6 +953,27 @@ fn the_file_list_puts_the_most_changed_files_first() {
 }
 
 #[test]
+fn a_file_removed_from_the_index_but_kept_on_disk_is_one_entry_that_matches_the_totals() {
+    let repo = ignoring_setup_files();
+
+    std::fs::write(repo.root.join("README.md"), "a\nb\nc\n").expect("edit");
+    git_in(&repo.root, &["add", "README.md"]);
+    git_in(&repo.root, &["commit", "-q", "-m", "edit"]);
+    let base_after_edit = repo.git(&["rev-parse", "HEAD"]);
+    git_in(&repo.root, &["rm", "-q", "--cached", "README.md"]);
+
+    let (stat, files) = git::diff_files(&repo.root, &base_after_edit).expect("files");
+    let listed_additions: u32 = files.iter().map(|file| file.additions).sum();
+    let listed_deletions: u32 = files.iter().map(|file| file.deletions).sum();
+
+    assert_eq!(files.len(), 1, "{files:?}");
+    assert_eq!(stat.files, 1);
+    assert_eq!(listed_additions, stat.additions);
+    assert_eq!(listed_deletions, stat.deletions);
+    assert_eq!((stat.additions, stat.deletions), (3, 3));
+}
+
+#[test]
 fn the_file_list_stops_at_the_cap_but_the_totals_count_every_file() {
     let repo = ignoring_setup_files();
     let base = repo.git(&["rev-parse", "HEAD"]);
