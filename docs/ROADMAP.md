@@ -131,13 +131,14 @@ Three parts: 1. Review view, Approve, Changes panel and Close task. 2. Comments.
 
 **Goal:** a signed app that someone else can install.
 
-**Scope:** welcome screen and system check, remaining settings pages (Terminals with the font size, Prompts), `tile.grow` / `tile.shrink` (the tile sizes themselves came early, after phase 5), file-type icons in the style of vscode-icons for files and folders (Changes tab, Changes and Files panels, Review), easter eggs, full VoiceOver and keyboard audit, performance pass, app bundle signing and notarization, updates, docs website and product website.
+**Scope:** welcome screen and system check, remaining settings pages (Terminals with the font size, Prompts, and Projects, which edits each repository's `.swarm/config.toml`), `tile.grow` / `tile.shrink` (the tile sizes themselves came early, after phase 5), file-type icons in the style of vscode-icons for files and folders (Changes tab, Changes and Files panels, Review), easter eggs, full VoiceOver and keyboard audit, performance pass, app bundle signing and notarization, updates, docs website and product website.
 
 **Done when:**
 
 - [ ] First launch guides through the system check
 - [ ] `tile.grow` / `tile.shrink` change a worker's tile, and a user-sized tile ignores them
 - [ ] Changing the terminal font size in Settings resizes every terminal at once
+- [ ] Settings › Projects edits `.swarm/config.toml` and keeps the file's comments and the keys it does not show
 - [ ] Files and folders show file-type icons; the icon set's license terms are met (vscode-icons: CC BY-SA 4.0 for the icons, attribution in About, branded icons excluded)
 - [ ] VoiceOver audit passes on every screen (checklist in `crates/swarm_ui/README.md`)
 - [ ] Reduce Motion reaches GPUI and stops spinners and easter-egg animations
