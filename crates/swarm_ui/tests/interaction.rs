@@ -120,6 +120,41 @@ fn clicking_the_trigger_opens_the_menu_and_focuses_it(cx: &mut TestAppContext) {
     assert!(cx.update(|window, cx| window.focused(cx).is_some()));
 }
 
+struct BottomHarness;
+
+impl Render for BottomHarness {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex().size_full().justify_end().child(
+            PopoverMenu::new(
+                "popover",
+                gpui::div()
+                    .id("trigger")
+                    .size(px(40.))
+                    .debug_selector(|| "trigger".to_owned()),
+                |_, _| Menu::new("menu", "Test menu").item(MenuItem::new("a", "a")),
+            )
+            .opens_upward(),
+        )
+    }
+}
+
+#[gpui::test]
+fn an_upward_menu_opens_above_its_trigger(cx: &mut TestAppContext) {
+    cx.update(swarm_ui::theme::init);
+    let (_, cx) = cx.add_window_view(|_, _| BottomHarness);
+    cx.run_until_parked();
+    let trigger = cx
+        .debug_bounds("trigger")
+        .expect("the trigger is on screen");
+
+    cx.simulate_click(trigger.center(), Modifiers::none());
+    cx.run_until_parked();
+
+    let menu = cx.debug_bounds("menu").expect("the menu is open");
+    assert!(menu.bottom() <= trigger.top());
+    assert!(menu.top() >= px(0.));
+}
+
 #[gpui::test]
 fn down_skips_a_disabled_item(cx: &mut TestAppContext) {
     let (log, _, cx) = setup(cx, false);

@@ -221,7 +221,12 @@ fn render_item(
                     .color(Color::Muted),
             )
         })
-        .child(div().flex_1().child(Label::new(item.label)))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(Label::new(item.label).truncate()),
+        )
         .when(item.checked == Some(true), |row| {
             row.child(Icon::new(IconName::Check).size(IconSize::Small))
         })

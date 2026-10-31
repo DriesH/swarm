@@ -35,6 +35,7 @@ Focus an element when the window opens. With nothing focused, GPUI sends Tab now
 | `StatusPill`, `StatusRing`, `StatusDot` | none: status goes into the parent's label |
 | `ListRow` | `ListItem` with selected state |
 | `TrayChip` | `Button`, "Show name, status" |
+| `TrayMore` | `Button`, "4 more tiles" |
 | `Panel`, `PanelRow` | `Group` with `.accessible(id, label)` |
 | `TileFrame` | `Group`, "name terminal" |
 
@@ -91,7 +92,7 @@ Run `cargo run -p gallery`, turn on VoiceOver (Cmd-F5) and check:
 
 - Each sidebar row reads its name and "selected"; Up and Down move between rows.
 - The theme control reads as a radio group "Theme" with three options.
-- Buttons, icon buttons and tray chips read their label; Enter and Space press them.
+- Buttons, icon buttons, tray chips and the "+N" tray chip read their label; Enter and Space press them.
 - Switches read "on" or "off" and change with Space.
 - Tabs read "name, status" and "selected".
 - Tiles read "name terminal" as a group.

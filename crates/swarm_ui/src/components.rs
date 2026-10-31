@@ -73,6 +73,7 @@ pub fn all_components() -> Vec<ComponentEntry> {
         ComponentEntry::of::<Tag>(),
         ComponentEntry::of::<ListRow>(),
         ComponentEntry::of::<TrayChip>(),
+        ComponentEntry::of::<TrayMore>(),
         ComponentEntry::of::<Panel>(),
         ComponentEntry::of::<ProjectTile>(),
         ComponentEntry::of::<TileFrame>(),

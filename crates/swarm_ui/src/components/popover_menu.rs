@@ -18,6 +18,7 @@ pub struct PopoverMenu {
     id: ElementId,
     trigger: AnyElement,
     menu: MenuBuilder,
+    upward: bool,
 }
 
 impl PopoverMenu {
@@ -32,7 +33,14 @@ impl PopoverMenu {
             id: id.into(),
             trigger: trigger.into_any_element(),
             menu: Rc::new(menu),
+            upward: false,
         }
+    }
+
+    /// Opens the menu above the trigger, for a trigger at the bottom of the window.
+    pub fn opens_upward(mut self) -> Self {
+        self.upward = true;
+        self
     }
 }
 
@@ -104,12 +112,21 @@ impl RenderOnce for PopoverMenu {
                 move |window, cx| close(&state, window, cx)
             });
 
-            let position =
-                trigger_bounds.map(|bounds| point(bounds.left(), bounds.bottom() + px(4.)));
+            let (anchor, position) = if self.upward {
+                (
+                    Anchor::BottomLeft,
+                    trigger_bounds.map(|bounds| point(bounds.left(), bounds.top() - px(4.))),
+                )
+            } else {
+                (
+                    Anchor::TopLeft,
+                    trigger_bounds.map(|bounds| point(bounds.left(), bounds.bottom() + px(4.))),
+                )
+            };
 
             deferred(
                 anchored()
-                    .anchor(Anchor::TopLeft)
+                    .anchor(anchor)
                     .when_some(position, gpui::Anchored::position)
                     .snap_to_window_with_margin(px(8.))
                     .child(
@@ -181,14 +198,25 @@ impl Component for PopoverMenu {
             .gap_6()
             .child(example_group(
                 "Default",
-                [example(
-                    "Opens below the trigger",
-                    PopoverMenu::new(
-                        "popover-demo",
-                        IconButton::new("new-tab", IconName::Plus, "New tab"),
-                        |_, _| demo_menu("popover-demo-menu"),
+                [
+                    example(
+                        "Opens below the trigger",
+                        PopoverMenu::new(
+                            "popover-demo",
+                            IconButton::new("new-tab", IconName::Plus, "New tab"),
+                            |_, _| demo_menu("popover-demo-menu"),
+                        ),
                     ),
-                )],
+                    example(
+                        "Opens above the trigger",
+                        PopoverMenu::new(
+                            "popover-demo-up",
+                            IconButton::new("new-tab-up", IconName::Plus, "New tab"),
+                            |_, _| demo_menu("popover-demo-up-menu"),
+                        )
+                        .opens_upward(),
+                    ),
+                ],
             ))
             .into_any_element()
     }

@@ -1,4 +1,4 @@
-//! Accessibility checks for Button, Kbd, Dropdown and `PopoverMenu`.
+//! Accessibility checks for Button, Kbd, Dropdown, `PopoverMenu` and the tray chips.
 
 use gpui::accesskit::{Node, Role, Toggled};
 use gpui::{
@@ -88,6 +88,30 @@ fn kbd_is_a_label_with_a_spoken_name() {
 
         assert_eq!(info.role, Some(Role::Label));
         assert_eq!(info.node.label(), Some("Command Shift R"));
+    });
+}
+
+#[test]
+fn tray_more_chip_says_how_many_tiles_it_stands_for() {
+    with_window(|window, cx| {
+        let one = a11y_info(TrayMore::new("one", 1), window, cx);
+        let four = a11y_info(TrayMore::new("four", 4), window, cx);
+
+        assert_eq!(four.role, Some(Role::Button));
+        assert_eq!(four.node.label(), Some("4 more tiles"));
+        assert_eq!(one.node.label(), Some("1 more tile"));
+    });
+}
+
+#[test]
+fn a_long_name_stops_widening_a_tray_chip_at_its_cap() {
+    with_window(|window, _| {
+        let short = TrayChip::width("a", window);
+        let long = TrayChip::width(&"w".repeat(200), window);
+        let longer = TrayChip::width(&"w".repeat(400), window);
+
+        assert!(short < long);
+        assert_eq!(long, longer);
     });
 }
 
