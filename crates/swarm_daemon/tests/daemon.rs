@@ -1722,7 +1722,7 @@ orchestrator)
   printf '%s\n' "$line" > "$OUT/orchestrator-first"
   working
   swarm confirm > "$OUT/confirm.out" 2>&1
-  swarm spawn api --own-worktree "same files" --brief "build the api" > "$OUT/spawn.out" 2>&1
+  swarm spawn api --kind codex --own-worktree "same files" --brief "build the api" > "$OUT/spawn.out" 2>&1
   swarm wait --timeout 60 > "$OUT/question.out" 2>&1
   swarm send api "use port 5173" > "$OUT/send.out" 2>&1
   swarm wait --timeout 60 > "$OUT/report.out" 2>&1
@@ -1751,7 +1751,7 @@ esac"#,
     );
     let repo = repo_for_merges();
     let daemon = Daemon::start_with_settings(&fixture.settings());
-    let (mut client, task) = start_task(&daemon, &repo);
+    let (mut client, task) = start_task_of(&daemon, &repo, AgentKind::Codex);
 
     let mut kinds = Vec::new();
     let mut briefed = false;
@@ -1786,8 +1786,8 @@ esac"#,
     assert_eq!(worker.task, Some(task.id));
     assert_eq!(worker.project, task.project);
     assert!(worker.worktree.ends_with(".worktrees/agent-task--api"));
-    assert_eq!(worker.kind, AgentKind::ClaudeCode);
-    assert_eq!(worker.model, "sonnet");
+    assert_eq!(worker.kind, AgentKind::Codex);
+    assert_eq!(worker.model, "gpt-6-luna");
 
     assert_eq!(
         fixture.read_when_written("orchestrator-first").trim(),
@@ -1851,7 +1851,7 @@ orchestrator)
   idle
   IFS= read -r line
   working
-  swarm spawn api --own-worktree "same files" --brief "change the readme" > "$OUT/spawn.out" 2>&1
+  swarm spawn api --kind codex --own-worktree "same files" --brief "change the readme" > "$OUT/spawn.out" 2>&1
   swarm wait --timeout 60 > "$OUT/report.out" 2>&1
   echo "task text" > README.md
   git add README.md
@@ -1875,7 +1875,7 @@ esac"#,
     );
     let repo = repo_for_merges();
     let daemon = Daemon::start_with_settings(&fixture.settings());
-    let (_client, _task) = start_task(&daemon, &repo);
+    let (_client, _task) = start_task_of(&daemon, &repo, AgentKind::Codex);
 
     assert_eq!(fixture.read_when_written("merge.code").trim(), "1");
     let merge = fixture.read_when_written("merge.out");
@@ -1891,21 +1891,20 @@ esac"#,
     );
 }
 
-#[test]
-fn a_message_is_pasted_when_the_agent_becomes_idle() {
-    let fixture = fixture_with_helpers(
+/// An orchestrator that starts a worker and waits until the worker reported. `before`
+/// runs in its shell before the worker starts, `after` once the worker reported. `after`
+/// writes `$OUT/pasted` and maybe `$OUT/early`.
+fn report_fixture(before: &str, after: &str) -> Fixture {
+    fixture_with_helpers(&format!(
         r#"case "$SWARM_ROLE" in
 orchestrator)
   idle
   IFS= read -r line
   working
-  swarm spawn api --brief "report at once" > "$OUT/spawn.out" 2>&1
+{before}
+  swarm spawn api --kind codex --brief "report at once" > "$OUT/spawn.out" 2>&1
   while [ ! -f "$OUT/reported" ]; do sleep 0.1; done
-  if IFS= read -r -t 1 early; then printf '%s\n' "$early" > "$OUT/early"; fi
-  idle
-  IFS= read -r header
-  IFS= read -r body
-  printf '%s\n%s\n' "$header" "$body" > "$OUT/pasted"
+{after}
   sleep 30
   ;;
 worker)
@@ -1916,13 +1915,27 @@ worker)
   echo yes > "$OUT/reported"
   sleep 30
   ;;
-esac"#,
-    );
-    let repo = repo_for_merges();
-    let daemon = Daemon::start_with_settings(&fixture.settings());
-    let (_client, _task) = start_task(&daemon, &repo);
+esac"#
+    ))
+}
 
-    let pasted = fixture.read_when_written("pasted");
+/// The task of a harness test, with an orchestrator of the given kind. A fake agent that
+/// reads its messages with `swarm wait` while it reports `working` is a Codex agent: a
+/// Claude Code agent gets messages pasted while it works, so the wait would race the paste.
+fn start_task_of(daemon: &Daemon, repo: &Repo, kind: AgentKind) -> (Client, TaskInfo) {
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+
+    let mut request = orchestrator_task(project.id, false);
+    request.orchestrator = Some(kind);
+    request.first_message = Some("lead the task".to_owned());
+    let task = client.create_task(request);
+
+    (client, task)
+}
+
+fn assert_pasted_report(pasted: &str) {
     let mut lines = pasted.lines();
 
     assert!(
@@ -1933,10 +1946,251 @@ esac"#,
         "{pasted}"
     );
     assert_eq!(lines.next(), Some("all green"));
+}
+
+#[test]
+fn a_claude_code_agent_gets_a_message_while_it_works() {
+    let fixture = report_fixture(
+        "",
+        r#"  IFS= read -r -t 10 header
+  IFS= read -r body
+  printf '%s\n%s\n' "$header" "$body" > "$OUT/pasted""#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (_client, _task) = start_task_of(&daemon, &repo, AgentKind::ClaudeCode);
+
+    assert_pasted_report(&fixture.read_when_written("pasted"));
+}
+
+#[test]
+fn a_codex_agent_gets_a_message_only_when_it_is_idle() {
+    let fixture = report_fixture(
+        "",
+        r#"  if IFS= read -r -t 2 early; then printf '%s\n' "$early" > "$OUT/early"; fi
+  idle
+  IFS= read -r header
+  IFS= read -r body
+  printf '%s\n%s\n' "$header" "$body" > "$OUT/pasted""#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (_client, _task) = start_task_of(&daemon, &repo, AgentKind::Codex);
+
+    assert_pasted_report(&fixture.read_when_written("pasted"));
     assert!(
         !fixture.out.join("early").exists(),
         "the message was pasted before the agent was idle"
     );
+}
+
+#[test]
+fn a_blocked_agent_gets_a_message_when_it_works_again() {
+    let fixture = report_fixture(
+        r"  printf '\033]7501;state=blocked:kind=permission\007'
+  sleep 0.3",
+        r#"  if IFS= read -r -t 2 early; then printf '%s\n' "$early" > "$OUT/early"; fi
+  working
+  IFS= read -r header
+  IFS= read -r body
+  printf '%s\n%s\n' "$header" "$body" > "$OUT/pasted""#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (_client, _task) = start_task_of(&daemon, &repo, AgentKind::ClaudeCode);
+
+    assert_pasted_report(&fixture.read_when_written("pasted"));
+    assert!(
+        !fixture.out.join("early").exists(),
+        "the message was pasted into a prompt"
+    );
+}
+
+/// A Claude Code orchestrator that runs `swarm wait` around the paste of a worker's
+/// report, then a second `swarm wait` that it ends itself after a second. `in_the_gap`
+/// starts the first wait before the paste's Enter arrives.
+fn queued_paste_fixture(in_the_gap: bool) -> Fixture {
+    let read_enter = r#"  IFS= read -r text
+  printf '%s\n%s\n' "$header" "$text" > "$OUT/pasted""#;
+    let first_wait = r#"  SECONDS=0
+  swarm wait --timeout 60 > "$OUT/first.out" 2>&1
+  echo "$? $SECONDS" > "$OUT/first.done""#;
+    let (before, after) = if in_the_gap {
+        (first_wait, read_enter)
+    } else {
+        (read_enter, first_wait)
+    };
+
+    report_fixture(
+        "",
+        &format!(
+            r#"  IFS= read -r header
+{before}
+{after}
+  swarm wait --timeout 60 > "$OUT/second.out" 2>&1 &
+  second=$!
+  sleep 1
+  if kill -0 "$second" 2>/dev/null; then echo running > "$OUT/second.state"; kill "$second"; else echo returned > "$OUT/second.state"; fi"#
+        ),
+    )
+}
+
+/// The first wait must end at once, the second must block as it always did.
+fn assert_waits_end_once(fixture: &Fixture) {
+    let first = fixture.read_when_written("first.done");
+    let mut words = first.split_whitespace();
+    let code = words.next().expect("exit code");
+    let seconds: u32 = words.next().expect("seconds").parse().expect("number");
+
+    assert_eq!(code, "0", "{first}");
+    assert!(seconds < 5, "the wait lasted {seconds} s");
+    assert_eq!(
+        fixture.read_when_written("first.out").trim(),
+        "no new messages"
+    );
+    assert_pasted_report(&fixture.read_when_written("pasted"));
+    assert_eq!(
+        fixture.read_when_written("second.state").trim(),
+        "running",
+        "the second wait ended too, so the early end is not one-shot"
+    );
+}
+
+#[test]
+fn a_wait_right_after_a_paste_into_a_working_agent_ends_at_once() {
+    let fixture = queued_paste_fixture(false);
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (_client, _task) = start_task_of(&daemon, &repo, AgentKind::ClaudeCode);
+
+    assert_waits_end_once(&fixture);
+}
+
+#[test]
+fn a_wait_between_the_paste_and_its_enter_ends_at_once() {
+    let fixture = queued_paste_fixture(true);
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (_client, _task) = start_task_of(&daemon, &repo, AgentKind::ClaudeCode);
+
+    assert_waits_end_once(&fixture);
+}
+
+#[test]
+fn a_paste_that_meets_a_prompt_waits_for_it_and_is_not_pasted_twice() {
+    let fixture = report_fixture(
+        "",
+        r#"  IFS= read -r header
+  printf '\033]7501;state=blocked:kind=permission\007'
+  if IFS= read -r -t 2 early; then printf '%s\n' "$early" > "$OUT/early"; fi
+  working
+  IFS= read -r -t 10 body
+  printf '%s\n%s\n' "$header" "$body" > "$OUT/pasted"
+  if IFS= read -r -t 2 again; then printf '%s\n' "$again" > "$OUT/again"; fi
+  echo done > "$OUT/done""#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, task) = start_task_of(&daemon, &repo, AgentKind::ClaudeCode);
+
+    let report = client.wait_for_message(|message| message.kind == MessageKind::Report);
+    fixture.read_when_written("done");
+
+    assert_pasted_report(&fixture.read_when_written("pasted"));
+    assert!(
+        !fixture.out.join("early").exists(),
+        "the Enter went into the prompt"
+    );
+    assert!(
+        !fixture.out.join("again").exists(),
+        "the messages were pasted a second time"
+    );
+    let delivered: Vec<_> = client
+        .list_messages(task.project, Some(task.id))
+        .into_iter()
+        .filter(|message| message.id == report.id)
+        .map(|message| message.delivered_at.is_some())
+        .collect();
+    assert_eq!(delivered, [true]);
+}
+
+/// A Claude Code orchestrator that works while the user writes a line into its
+/// terminal. `$OUT/ready` shows it works; the worker starts once `$OUT/typed` exists.
+fn draft_fixture() -> Fixture {
+    fixture_with_helpers(
+        r#"case "$SWARM_ROLE" in
+orchestrator)
+  idle
+  IFS= read -r line
+  working
+  echo ok > "$OUT/ready"
+  while [ ! -f "$OUT/typed" ]; do sleep 0.1; done
+  swarm spawn api --kind codex --brief "report at once" > "$OUT/spawn.out" 2>&1
+  IFS= read -r draft
+  IFS= read -r header
+  IFS= read -r body
+  printf '%s\n%s\n%s\n' "$draft" "$header" "$body" > "$OUT/lines"
+  sleep 30
+  ;;
+worker)
+  idle
+  IFS= read -r line
+  working
+  swarm report "all green" > "$OUT/report.out" 2>&1
+  sleep 30
+  ;;
+esac"#,
+    )
+}
+
+#[test]
+fn a_message_waits_until_the_user_sends_the_line_they_are_writing() {
+    let fixture = draft_fixture();
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, task) = start_task_of(&daemon, &repo, AgentKind::ClaudeCode);
+    let orchestrator = client
+        .wait_for_agent(|agent| agent.role == AgentRole::Orchestrator && agent.terminal.is_some());
+    let terminal = orchestrator.terminal.expect("terminal");
+    fixture.read_when_written("ready");
+
+    client.send(&Request::Input {
+        id: terminal,
+        input: TerminalInput::Text("half-written".to_owned()),
+    });
+    // The daemon handles a connection's requests in order: its answer shows the input
+    // was seen.
+    client.list_messages(task.project, Some(task.id));
+    std::fs::write(fixture.out.join("typed"), "x").expect("typed");
+
+    let report = client.wait_for_message(|message| message.kind == MessageKind::Report);
+    thread::park_timeout(Duration::from_millis(1500));
+    let held = client.list_messages(task.project, Some(task.id));
+    assert!(
+        held.iter()
+            .all(|message| message.id != report.id || message.delivered_at.is_none()),
+        "the message was pasted into the line"
+    );
+    assert!(!fixture.out.join("lines").exists());
+
+    client.send(&Request::Input {
+        id: terminal,
+        input: TerminalInput::Text("\r".to_owned()),
+    });
+
+    let lines = fixture.read_when_written("lines");
+    let mut lines = lines.lines();
+    assert_eq!(lines.next(), Some("half-written"));
+    assert!(
+        lines
+            .next()
+            .is_some_and(|header| header.starts_with("[swarm] report from api (agent ")),
+    );
+    assert_eq!(lines.next(), Some("all green"));
+    client.wait_for(|event| match event {
+        Event::MessagesDelivered { ids, .. } if ids.contains(&report.id) => Some(()),
+        _ => None,
+    });
 }
 
 #[test]
@@ -1947,8 +2201,8 @@ orchestrator)
   idle
   IFS= read -r line
   working
-  swarm spawn a --brief "wait for go" > "$OUT/spawn-a.out" 2>&1
-  swarm spawn b --brief "stay idle" > "$OUT/spawn-b.out" 2>&1
+  swarm spawn a --kind codex --brief "wait for go" > "$OUT/spawn-a.out" 2>&1
+  swarm spawn b --kind codex --brief "stay idle" > "$OUT/spawn-b.out" 2>&1
   swarm send a go > "$OUT/send-go.out" 2>&1
   swarm wait --timeout 60 > "$OUT/wait.out" 2>&1
   swarm ask "q" > "$OUT/orch-ask.out" 2>&1
@@ -1980,7 +2234,7 @@ esac"#,
     );
     let repo = repo_for_merges();
     let daemon = Daemon::start_with_settings(&fixture.settings());
-    let (_client, _task) = start_task(&daemon, &repo);
+    let (_client, _task) = start_task_of(&daemon, &repo, AgentKind::Codex);
     fixture.read_when_written("orchestrator-done");
 
     let said = |name: &str| fixture.read_when_written(name);
@@ -2364,8 +2618,7 @@ fn sized_terminal_repo() -> Repo {
 }
 
 #[test]
-#[expect(clippy::too_many_lines, reason = "one scripted scenario")]
-fn an_agent_runs_a_command_in_a_sized_terminal_and_stops_it() {
+fn an_agent_runs_a_command_in_a_process_terminal_and_stops_it() {
     let fixture = fixture_with_helpers(&format!(
         r#"idle
 IFS= read -r line
@@ -2389,7 +2642,7 @@ sleep 30"#
     ));
     let repo = sized_terminal_repo();
     let daemon = Daemon::start_with_settings(&fixture.settings());
-    let (mut client, task) = start_task(&daemon, &repo);
+    let (mut client, task) = start_task_of(&daemon, &repo, AgentKind::Codex);
     let owner = task.agents[0].id;
 
     let ids = fixture.read_when_written("ids");
@@ -2402,7 +2655,8 @@ sleep 30"#
     assert!(
         fixture
             .read_when_written("spawn.out")
-            .contains("size: 100x30")
+            .contains("size: 80x12"),
+        "the requested size is ignored"
     );
     assert_eq!(
         fixture.read_when_written("wait.out").trim(),
@@ -2412,14 +2666,14 @@ sleep 30"#
     let list = fixture.read_when_written("list.out");
     assert!(
         list.contains(&format!(
-            "{dev}  dev server  100x30  running  agent {}",
+            "{dev}  dev server  80x12  running  agent {}",
             owner.0
         )),
         "{list}"
     );
     assert_eq!(
         fixture.read_when_written("resize.out").trim(),
-        format!("terminal {dev} is now 120x40")
+        format!("terminal {dev} is 80x12; its tile sets the size")
     );
     assert_eq!(
         fixture.read_when_written("short.out").trim(),
@@ -2477,10 +2731,7 @@ sleep 30"#
         .expect("the spawn was announced");
     assert_eq!(first.kind, TerminalKind::Process);
     assert_eq!(first.owner, Some(owner));
-    assert_eq!(
-        first.fixed_size.map(|size| (size.cols, size.rows)),
-        Some((100, 30))
-    );
+    assert_eq!(first.fixed_size, None);
     assert_eq!(first.task.as_deref(), Some(task.id.terminal_key().as_str()));
     assert!(
         exited
@@ -2494,7 +2745,6 @@ sleep 30"#
         .expect("the owner is stored");
     assert_eq!(stored.owner, owner);
     assert_eq!(stored.name.as_deref(), Some("dev server"));
-    assert_eq!((stored.size.cols, stored.size.rows), (120, 40));
 }
 
 #[test]
@@ -2526,7 +2776,7 @@ orchestrator)
   idle
   IFS= read -r line
   working
-  swarm spawn api --brief "run the server" > "$OUT/spawn.out" 2>&1
+  swarm spawn api --kind codex --brief "run the server" > "$OUT/spawn.out" 2>&1
   until swarm terminal list 2>&1 | grep -q running; do sleep 0.2; done
   ID=$(swarm terminal list | awk '{print $1}')
   swarm terminal read "$ID" > "$OUT/orchestrator-read.out" 2>&1
@@ -2546,7 +2796,7 @@ esac"#,
     );
     let repo = sized_terminal_repo();
     let daemon = Daemon::start_with_settings(&fixture.settings());
-    let (mut client, _task) = start_task(&daemon, &repo);
+    let (mut client, _task) = start_task_of(&daemon, &repo, AgentKind::Codex);
 
     let id = fixture.read_when_written("id");
     let id = TerminalId(id.trim().parse().expect("terminal id"));
@@ -2568,7 +2818,7 @@ esac"#,
 }
 
 #[test]
-fn the_app_cannot_resize_a_terminal_an_agent_sized() {
+fn the_app_resizes_a_process_terminal_to_its_tile() {
     let fixture = fixture_with_helpers(
         r#"idle
 IFS= read -r line
@@ -2578,6 +2828,7 @@ sed -n 's/^started terminal \([0-9]*\).*/\1/p' "$OUT/spawn.out" > "$OUT/id"
 until swarm terminal read "$(cat "$OUT/id")" --lines 100 | grep -q typed-after-resize; do sleep 0.2; done
 sleep 1
 swarm terminal read "$(cat "$OUT/id")" --lines 100 > "$OUT/read.out" 2>&1
+swarm terminal list > "$OUT/list.out" 2>&1
 sleep 30"#,
     );
     let repo = sized_terminal_repo();
@@ -2601,8 +2852,53 @@ sleep 30"#,
     });
 
     let read = fixture.read_when_written("read.out");
-    assert!(read.contains("30 100"), "{read}");
-    assert!(!read.contains("10 50"), "{read}");
+    assert!(read.contains("10 50"), "{read}");
+    assert!(!read.contains("30 100"), "{read}");
+    let list = fixture.read_when_written("list.out");
+    assert!(list.contains("50x10"), "{list}");
+}
+
+#[test]
+fn terminal_resize_returns_the_current_size_and_changes_nothing() {
+    let fixture = fixture_with_helpers(
+        r#"idle
+IFS= read -r line
+working
+swarm terminal spawn --size 100x30 -- sh -c 'while true; do stty size; sleep 0.2; done' > "$OUT/spawn.out" 2>&1
+ID=$(sed -n 's/^started terminal \([0-9]*\).*/\1/p' "$OUT/spawn.out")
+until swarm terminal read "$ID" --lines 100 | grep -q "12 80"; do sleep 0.2; done
+swarm terminal resize "$ID" large > "$OUT/resize.out" 2>&1
+sleep 1
+swarm terminal read "$ID" --lines 100 > "$OUT/read.out" 2>&1
+swarm terminal list > "$OUT/list.out" 2>&1
+sleep 30"#,
+    );
+    let repo = sized_terminal_repo();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, _task) = start_task(&daemon, &repo);
+
+    let resized = fixture.read_when_written("resize.out");
+    let read = fixture.read_when_written("read.out");
+    let list = fixture.read_when_written("list.out");
+
+    assert!(resized.contains("is 80x12;"), "{resized}");
+    assert!(read.contains("12 80"), "{read}");
+    assert!(!read.contains("40 140"), "{read}");
+    assert!(!read.contains("30 100"), "{read}");
+    assert!(list.contains("80x12"), "{list}");
+
+    let announced = client.wait_for(|event| match event {
+        Event::TerminalChanged { terminal } if terminal.kind == TerminalKind::Process => {
+            Some(terminal.clone())
+        }
+        _ => None,
+    });
+    assert_eq!(announced.fixed_size, None);
+    let stored = database(&daemon)
+        .process(announced.id)
+        .expect("read")
+        .expect("the owner is stored");
+    assert_eq!(Some(stored.owner), announced.owner);
 }
 
 #[test]
@@ -2971,7 +3267,7 @@ esac"#,
     );
     let repo = sized_terminal_repo();
     let daemon = Daemon::start_with_settings(&fixture.settings());
-    let (mut client, _task) = start_task(&daemon, &repo);
+    let (mut client, _task) = start_task_of(&daemon, &repo, AgentKind::Codex);
 
     let orchestrator = client
         .wait_for_agent(|agent| agent.role == AgentRole::Orchestrator && agent.terminal.is_some());
@@ -3053,9 +3349,9 @@ orchestrator)
   idle
   IFS= read -r line
   working
-  swarm spawn first --brief "end at once" > "$OUT/spawn-1.out" 2>&1
+  swarm spawn first --kind codex --brief "end at once" > "$OUT/spawn-1.out" 2>&1
   swarm wait --timeout 30 > "$OUT/ended.out" 2>&1
-  swarm spawn second --brief "end at once" > "$OUT/spawn-2.out" 2>&1
+  swarm spawn second --kind codex --brief "end at once" > "$OUT/spawn-2.out" 2>&1
   sleep 30
   ;;
 worker)
@@ -3065,7 +3361,7 @@ esac"#,
     );
     let repo = ported_repo("5170-5175", "");
     let daemon = Daemon::start_with_settings(&fixture.settings());
-    let (_client, _task) = start_task(&daemon, &repo);
+    let (_client, _task) = start_task_of(&daemon, &repo, AgentKind::Codex);
 
     let ended = fixture.read_when_written("ended.out");
     let second = fixture.read_when_written("spawn-2.out");
@@ -3083,13 +3379,13 @@ fn the_orchestrator_hears_that_a_worker_failed_to_start() {
         r#"idle
 IFS= read -r line
 working
-swarm spawn api --own-worktree "same files" --brief "never starts" > "$OUT/spawn.out" 2>&1
+swarm spawn api --kind codex --own-worktree "same files" --brief "never starts" > "$OUT/spawn.out" 2>&1
 swarm wait --timeout 30 > "$OUT/failed.out" 2>&1
 sleep 30"#,
     );
     let repo = ported_repo("5170-5199", "setup = \"exit 3\"\n");
     let daemon = Daemon::start_with_settings(&fixture.settings());
-    let (_client, _task) = start_task(&daemon, &repo);
+    let (_client, _task) = start_task_of(&daemon, &repo, AgentKind::Codex);
 
     let failed = fixture.read_when_written("failed.out");
 
@@ -3107,7 +3403,7 @@ orchestrator)
   idle
   IFS= read -r line
   working
-  swarm spawn api --brief "start a server and end" > "$OUT/spawn.out" 2>&1
+  swarm spawn api --kind codex --brief "start a server and end" > "$OUT/spawn.out" 2>&1
   swarm wait --timeout 30 > "$OUT/message-1.out" 2>&1
   swarm wait --timeout 30 > "$OUT/message-2.out" 2>&1
   kill -0 "$(cat "$OUT/pid")" 2>/dev/null
@@ -3126,7 +3422,7 @@ esac"#,
     );
     let repo = ported_repo("5170-5199", "");
     let daemon = Daemon::start_with_settings(&fixture.settings());
-    let (_client, _task) = start_task(&daemon, &repo);
+    let (_client, _task) = start_task_of(&daemon, &repo, AgentKind::Codex);
 
     let alive = fixture.read_when_written("alive");
     let messages = format!(
@@ -3149,7 +3445,7 @@ orchestrator)
   idle
   IFS= read -r line
   working
-  swarm spawn api --brief "start a server and stop it" > "$OUT/spawn.out" 2>&1
+  swarm spawn api --kind codex --brief "start a server and stop it" > "$OUT/spawn.out" 2>&1
   swarm wait --timeout 30 > "$OUT/message.out" 2>&1
   sleep 30
   ;;
@@ -3166,7 +3462,7 @@ esac"#,
     );
     let repo = ported_repo("5170-5199", "");
     let daemon = Daemon::start_with_settings(&fixture.settings());
-    let (_client, _task) = start_task(&daemon, &repo);
+    let (_client, _task) = start_task_of(&daemon, &repo, AgentKind::Codex);
 
     let message = fixture.read_when_written("message.out");
 
@@ -3394,9 +3690,9 @@ orchestrator)
   idle
   IFS= read -r line
   working
-  swarm spawn api --brief "write api.txt" > "$OUT/spawn-api.out" 2>&1
-  swarm spawn ui --brief "write ui.txt" > "$OUT/spawn-ui.out" 2>&1
-  swarm spawn lonely --own-worktree "  " --brief "x" > "$OUT/spawn-blank.out" 2>&1
+  swarm spawn api --kind codex --brief "write api.txt" > "$OUT/spawn-api.out" 2>&1
+  swarm spawn ui --kind codex --brief "write ui.txt" > "$OUT/spawn-ui.out" 2>&1
+  swarm spawn lonely --kind codex --own-worktree "  " --brief "x" > "$OUT/spawn-blank.out" 2>&1
   swarm wait --timeout 60 > "$OUT/report-1.out" 2>&1
   swarm wait --timeout 60 > "$OUT/report-2.out" 2>&1
   swarm merge api > "$OUT/merge.out" 2>&1
@@ -3431,7 +3727,7 @@ esac"#,
     );
     let repo = repo_for_merges();
     let daemon = Daemon::start_with_settings(&fixture.settings());
-    let (_client, task) = start_task(&daemon, &repo);
+    let (_client, task) = start_task_of(&daemon, &repo, AgentKind::Codex);
     fixture.read_when_written("orchestrator-done");
 
     let said = |name: &str| fixture.read_when_written(name);
@@ -4249,19 +4545,107 @@ fn a_live_comment_reaches_the_orchestrator_and_names_the_worker() {
     assert_eq!(sent[0].to, Some(worker));
     assert!(sent[0].sent_at.is_some());
 
-    let delivered = events.iter().any(|event| {
-        matches!(event, Event::MessagesDelivered { ids, .. } if ids.contains(&messages[0].id))
-    });
-    if !delivered {
-        client.wait_for(|event| match event {
-            Event::MessagesDelivered { ids, .. } if ids.contains(&messages[0].id) => Some(()),
-            _ => None,
-        });
-    }
+    assert_eq!(sent[0].delivered_at, None, "it waits for the paste");
+
+    let delivered = comments_delivered(&mut client, &events, &[id], messages[0].id);
+    assert_eq!(delivered[0].state, CommentState::Sent);
     let inbox = fixture.read_when("inbox", |text| text.contains("Cache it."));
     assert!(inbox.contains("Cache it."), "{inbox}");
 
-    assert_eq!(client.list_comments(task.id)[0].id, id);
+    let listed = client.list_comments(task.id);
+    assert_eq!(listed[0].id, id);
+    assert_eq!(listed[0].delivered_at, delivered[0].delivered_at);
+}
+
+/// The delivered versions of the comments `ids`, from `events` and what comes next. The
+/// message `message` must be announced as delivered first.
+fn comments_delivered(
+    client: &mut Client,
+    events: &[Event],
+    ids: &[CommentId],
+    message: swarm_protocol::MessageId,
+) -> Vec<swarm_protocol::ReviewComment> {
+    let mut announced = false;
+    let mut found = Vec::new();
+    let mut observe = |event: &Event| {
+        match event {
+            Event::MessagesDelivered { ids, .. } if ids.contains(&message) => announced = true,
+            Event::CommentChanged { comment }
+                if ids.contains(&comment.id) && comment.delivered_at.is_some() =>
+            {
+                assert!(announced, "a comment was delivered before its message");
+                found.push(comment.clone());
+            }
+            _ => {}
+        }
+
+        found.len()
+    };
+
+    let mut count = 0;
+    for event in events {
+        count = observe(event);
+    }
+    while count < ids.len() {
+        count = observe(&client.next());
+    }
+
+    found
+}
+
+#[test]
+fn comments_sent_together_are_delivered_together_and_stay_delivered_after_a_restart() {
+    let fixture = Fixture::new(COMMENT_ORCHESTRATOR);
+    let repo = repo_for_merges();
+    let mut daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, task) = start_task(&daemon, &repo);
+    client.wait_for_message(|message| message.kind == MessageKind::Report);
+    fixture.read_when_written("report.out");
+    let first = changed(
+        &client
+            .add_comment(comment_at(&task, ReviewSource::Merged, 1, "one", "A"))
+            .expect("first"),
+    )[0]
+    .clone();
+    let second = changed(
+        &client
+            .add_comment(comment_at(&task, ReviewSource::Merged, 2, "two", "B"))
+            .expect("second"),
+    )[0]
+    .clone();
+    assert_eq!(first.delivered_at, None);
+    assert_eq!(first.state, CommentState::Pending);
+
+    let events = client
+        .until_done(&Request::SendComments {
+            call: CALL,
+            task: task.id,
+        })
+        .expect("sent");
+
+    let messages = comment_messages(&events);
+    assert_eq!(messages.len(), 1, "one batch, one message");
+    assert!(
+        changed(&events)
+            .iter()
+            .all(|comment| comment.delivered_at.is_none() && comment.state == CommentState::Sent)
+    );
+    let delivered =
+        comments_delivered(&mut client, &events, &[first.id, second.id], messages[0].id);
+    assert_eq!(delivered[0].delivered_at, delivered[1].delivered_at);
+    let time = delivered[0].delivered_at;
+    assert!(time.is_some());
+    fixture.read_when("inbox", |text| text.contains('B'));
+
+    drop(client);
+    daemon.crash();
+    let restarted = Daemon::start_in(daemon.home.clone());
+    let mut client = restarted.connect();
+    client.hello();
+
+    let listed = client.list_comments(task.id);
+    assert_eq!(listed.len(), 2);
+    assert!(listed.iter().all(|comment| comment.delivered_at == time));
 }
 
 #[test]

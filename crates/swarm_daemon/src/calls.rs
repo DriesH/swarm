@@ -454,6 +454,12 @@ impl Calls {
             gone,
         )?;
 
+        // A message that came in while the wait was open was left for it; give it to the
+        // terminal now.
+        if taken.is_empty() {
+            self.services.agents.deliver_unread(caller.id);
+        }
+
         inbox(taken, claim)
     }
 
