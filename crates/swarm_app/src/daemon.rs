@@ -309,7 +309,6 @@ impl Workspace {
                     let live = self.live_terminal(terminal, daemon_id, name, channels, window, cx);
                     self.live_terminals.insert(terminal, live);
                     self.disconnected.remove(&terminal);
-                    self.lock_fixed_size(&client, terminal, daemon_id);
                 }
                 Err(error) => log::warn!("cannot reattach terminal {}: {error}", daemon_id.0),
             }
@@ -1174,8 +1173,8 @@ impl Workspace {
         }
     }
 
-    /// Takes a process terminal's title, owner and fixed size, and holds back the
-    /// view's resizes while an agent fixed the size.
+    /// Takes a process terminal's title and owner. Its size follows its tile, so the
+    /// protocol's `fixed_size` is not used.
     fn apply_process_info(&mut self, terminal: TerminalId, info: &TerminalInfo) {
         let task = self
             .data
@@ -1189,20 +1188,6 @@ impl Workspace {
 
         let title = self.process_title(task, info);
         self.data.update_process(terminal, &title, info);
-
-        if let Some(client) = &self.daemon {
-            client.set_size_locked(info.id, info.fixed_size.is_some());
-        }
-    }
-
-    /// Holds back resizes of a reattached terminal whose size an agent fixed.
-    fn lock_fixed_size(&self, client: &Client, terminal: TerminalId, daemon_id: DaemonTerminalId) {
-        let fixed = self
-            .data
-            .terminal(terminal)
-            .is_some_and(|entry| entry.fixed_size.is_some());
-
-        client.set_size_locked(daemon_id, fixed);
     }
 
     /// Reads the cell size of the terminal font once, to size tiles in cells.
@@ -1548,6 +1533,7 @@ impl Workspace {
 
         self.data
             .set_terminal_meta(terminal, Some(exit_text(status).into()));
+        self.data.set_terminal_exit(terminal, status.clone());
         cx.notify();
 
         if !exit_failed(status) {
@@ -1594,6 +1580,7 @@ impl Workspace {
         let terminal =
             self.data
                 .add_live_process(task, SETUP_TITLE, Some(exit_text(&status).into()));
+        self.data.set_terminal_exit(terminal, status.clone());
 
         if !exit_failed(&status) {
             Self::close_after_linger(terminal, cx);
@@ -1656,6 +1643,7 @@ impl Workspace {
         if let Some(status) = status {
             self.data
                 .set_terminal_meta(terminal, Some(exit_text(&status).into()));
+            self.data.set_terminal_exit(terminal, status);
             cx.notify();
         }
 
@@ -1712,7 +1700,7 @@ fn exit_text(status: &ExitStatus) -> String {
     }
 }
 
-fn exit_failed(status: &ExitStatus) -> bool {
+pub(crate) fn exit_failed(status: &ExitStatus) -> bool {
     !matches!(status, ExitStatus::Code(0))
 }
 
@@ -3079,10 +3067,32 @@ pub(crate) mod tests {
         assert!(closed.is_empty());
     }
 
-    fn ended_process_state(
+    #[gpui::test]
+    fn a_failed_setup_that_ended_early_needs_attention(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        cx.executor().allow_parking();
+        let client = Client::connect(&fake_daemon()).expect("connect to the fake daemon");
+        use_projects(&workspace, &[project_info(5, "demo", Vec::new())], cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.use_daemon(client, &[], window, cx);
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let created = finished_setup(8, ExitStatus::Code(3));
+            workspace.task_created(&created, &[], window, cx);
+        });
+
+        assert_eq!(
+            process_activities(&workspace, cx),
+            [swarm_layout::Activity::Attention]
+        );
+    }
+
+    /// A process tile that lost its stream after its setup script ended with `status`.
+    fn ended_process_workspace(
         status: ExitStatus,
         cx: &mut TestAppContext,
-    ) -> (Vec<String>, Vec<String>) {
+    ) -> (Entity<Workspace>, &mut VisualTestContext) {
         let (workspace, cx) = setup(cx);
         let task = finished_setup(7, status);
         let socket = fake_daemon_replying(move |request| match request {
@@ -3114,12 +3124,54 @@ pub(crate) mod tests {
         });
         cx.executor().allow_parking();
         cx.run_until_parked();
+
+        (workspace, cx)
+    }
+
+    fn ended_process_state(
+        status: ExitStatus,
+        cx: &mut TestAppContext,
+    ) -> (Vec<String>, Vec<String>) {
+        let (workspace, cx) = ended_process_workspace(status, cx);
         let shown = setup_tile_state(&workspace, cx);
         cx.executor()
             .advance_clock(PROCESS_LINGER + Duration::from_millis(100));
         cx.run_until_parked();
 
         (shown, setup_tile_state(&workspace, cx))
+    }
+
+    fn process_activities(
+        workspace: &Entity<Workspace>,
+        cx: &VisualTestContext,
+    ) -> Vec<swarm_layout::Activity> {
+        workspace.read_with(cx, |workspace, _| {
+            crate::views::tile_specs(workspace)
+                .iter()
+                .filter(|spec| spec.kind == swarm_layout::TileKind::Process)
+                .map(|spec| spec.activity)
+                .collect()
+        })
+    }
+
+    #[gpui::test]
+    fn a_failed_setup_in_a_live_tile_needs_attention(cx: &mut TestAppContext) {
+        let (workspace, cx) = ended_process_workspace(ExitStatus::Code(3), cx);
+
+        assert_eq!(
+            process_activities(&workspace, cx),
+            [swarm_layout::Activity::Attention]
+        );
+    }
+
+    #[gpui::test]
+    fn a_setup_that_ended_well_in_a_live_tile_stays_running(cx: &mut TestAppContext) {
+        let (workspace, cx) = ended_process_workspace(ExitStatus::Code(0), cx);
+
+        assert_eq!(
+            process_activities(&workspace, cx),
+            [swarm_layout::Activity::Running]
+        );
     }
 
     #[gpui::test]
@@ -3280,60 +3332,52 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
-    fn a_fixed_size_sizes_the_tile_and_a_later_change_frees_it(cx: &mut TestAppContext) {
+    fn a_process_with_a_size_an_agent_asked_for_still_gets_the_process_tile(
+        cx: &mut TestAppContext,
+    ) {
         let (workspace, cx, _client) = real_task_workspace(&fake_daemon(), cx);
-        let fixed = TerminalInfo {
-            fixed_size: Some(swarm_protocol::GridSize { cols: 80, rows: 12 }),
+        let asked = TerminalInfo {
+            fixed_size: Some(swarm_protocol::GridSize {
+                cols: 140,
+                rows: 40,
+            }),
             ..process_info(30, Some("dev server"), "zsh")
         };
-        let requested = |workspace: &Entity<Workspace>, cx: &VisualTestContext| {
-            workspace.read_with(cx, |workspace, _| {
-                let specs = crate::views::tile_specs(workspace);
 
-                (
-                    specs.last().and_then(|spec| spec.fixed),
-                    workspace.cell_size,
-                )
-            })
-        };
+        change_terminal(&workspace, &asked, cx);
 
-        change_terminal(&workspace, &fixed, cx);
-        let (size, cell) = requested(&workspace, cx);
-        change_terminal(&workspace, &process_info(30, Some("dev server"), "zsh"), cx);
-        let (freed, _) = requested(&workspace, cx);
+        let (spec, height, process_height) = workspace.read_with(cx, |workspace, _| {
+            let specs = crate::views::tile_specs(workspace);
+            let spec = specs.last().copied().expect("a process spec");
+            let layout = crate::views::compute_layout(workspace);
 
-        let cell_height = cell.expect("the cell size was measured").1;
-        let size = size.expect("a fixed size");
-        let cell_width = cell.expect("the cell size was measured").0;
-        let expected = (
-            80. * cell_width + 16. + CHROME_WIDTH,
-            12. * cell_height + 16. + CHROME_HEIGHT,
-        );
-        assert!(
-            (size.width - expected.0).abs() < 0.01,
-            "{size:?} vs {expected:?}"
-        );
-        assert!(
-            (size.height - expected.1).abs() < 0.01,
-            "{size:?} vs {expected:?}"
-        );
-        assert_eq!(freed, None);
-        assert_eq!(process_tiles(&workspace, cx).len(), 1);
+            (
+                spec,
+                layout.rect(spec.id).map(|rect| rect.size.height),
+                crate::views::layout_style(workspace).process_tile_height,
+            )
+        });
+        assert_eq!(spec.kind, swarm_layout::TileKind::Process);
+        assert_eq!(spec.fixed, None);
+        let height = height.expect("the process tile is placed");
+        assert!((height - process_height).abs() < 0.01, "{height}");
     }
 
     #[gpui::test]
-    fn the_app_never_sends_resize_for_a_fixed_size_terminal(cx: &mut TestAppContext) {
+    fn the_app_resizes_a_process_terminal_to_its_tile_whatever_size_an_agent_asked_for(
+        cx: &mut TestAppContext,
+    ) {
         let (seen, requests) = flume::unbounded();
         let socket = fake_daemon_replying(move |request| {
             seen.send(request).ok();
             None
         });
         let (workspace, cx, _client) = real_task_workspace(&socket, cx);
-        let fixed = TerminalInfo {
+        let asked = TerminalInfo {
             fixed_size: Some(swarm_protocol::GridSize { cols: 80, rows: 12 }),
             ..process_info(30, Some("dev server"), "zsh")
         };
-        change_terminal(&workspace, &fixed, cx);
+        change_terminal(&workspace, &asked, cx);
 
         let input = workspace.read_with(cx, |workspace, _| {
             workspace
@@ -3374,12 +3418,12 @@ pub(crate) mod tests {
             matches!(
                 request,
                 Request::Input {
-                    input: TerminalInput::Resize(_),
+                    input: TerminalInput::Resize(resized),
                     ..
-                }
+                } if *resized == size
             )
         });
-        assert!(!resized, "{seen:?}");
+        assert!(resized, "{seen:?}");
     }
 
     fn process_tile_after_exit(code: u32, cx: &mut TestAppContext) -> (usize, usize) {
@@ -3402,6 +3446,47 @@ pub(crate) mod tests {
         cx.run_until_parked();
 
         (before, process_tiles(&workspace, cx).len())
+    }
+
+    fn process_height_after_exit(code: u32, cx: &mut TestAppContext) -> (f32, f32) {
+        let (workspace, cx, _client) = real_task_workspace(&fake_daemon(), cx);
+        change_terminal(&workspace, &process_info(30, Some("tests"), "zsh"), cx);
+        let tile = workspace
+            .read_with(cx, |workspace, _| {
+                workspace.live_terminals.keys().next().copied()
+            })
+            .expect("a process tile");
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let exited = TerminalEvent::Exited(ExitStatus::Code(code));
+            workspace.on_terminal_event(tile, &exited, window, cx);
+        });
+
+        workspace.read_with(cx, |workspace, _| {
+            let layout = crate::views::compute_layout(workspace);
+            let height = layout
+                .rect(swarm_layout::TileId(tile.0))
+                .map(|rect| rect.size.height);
+
+            (
+                height.expect("the process tile is placed"),
+                crate::views::layout_style(workspace).process_tile_height,
+            )
+        })
+    }
+
+    #[gpui::test]
+    fn an_agent_process_that_fails_gets_a_grown_tile(cx: &mut TestAppContext) {
+        let (height, small) = process_height_after_exit(1, cx);
+
+        assert!(height > small + 1., "{height} is not above {small}");
+    }
+
+    #[gpui::test]
+    fn an_agent_process_that_exits_well_keeps_its_small_tile(cx: &mut TestAppContext) {
+        let (height, small) = process_height_after_exit(0, cx);
+
+        assert!((height - small).abs() < 0.01, "{height} is not {small}");
     }
 
     #[gpui::test]
@@ -4387,6 +4472,7 @@ pub(crate) mod tests {
             outdated: false,
             created_at: 0,
             sent_at: None,
+            delivered_at: None,
         };
 
         workspace.update(cx, |workspace, cx| {
@@ -4423,6 +4509,7 @@ pub(crate) mod tests {
             outdated: false,
             created_at: 0,
             sent_at: None,
+            delivered_at: None,
         }
     }
 

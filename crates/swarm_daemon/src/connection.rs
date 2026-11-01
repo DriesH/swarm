@@ -559,19 +559,21 @@ fn forward_input(
     id: TerminalId,
     input: TerminalInput,
 ) {
-    // An agent chose the size of its process terminal; the app keeps out of it.
-    if matches!(input, TerminalInput::Resize(_)) && hub.fixed_size().is_some() {
-        return;
-    }
-
     let killed = matches!(input, TerminalInput::Kill);
-    services.agents.app_input(id, &input);
+    let sent_line = services.agents.app_input(id, &input);
     if killed {
         services.processes.stopped_by_user(id);
         services.checks.user_closed(id);
     }
 
-    if !hub.send_input(input) {
+    let reached = hub.send_input(input);
+
+    // After the input, so a message never lands before the line the user just sent.
+    if let Some(agent) = sent_line {
+        services.agents.deliver_unread(agent);
+    }
+
+    if !reached {
         send_missing(sink, id);
     }
 }

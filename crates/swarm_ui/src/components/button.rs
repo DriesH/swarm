@@ -1,6 +1,6 @@
 use gpui::{
-    AnyElement, App, ClickEvent, ElementId, FontWeight, Hsla, Pixels, Role, SharedString, Toggled,
-    Window, div, px,
+    AnyElement, App, ClickEvent, ElementId, FocusHandle, FontWeight, Hsla, Pixels, Role,
+    SharedString, Toggled, Window, div, px,
 };
 
 use crate::component::{Component, example, example_group};
@@ -125,6 +125,7 @@ pub struct Button {
     toggle_state: Option<bool>,
     full_width: bool,
     debug_selector: Option<String>,
+    focus_handle: Option<FocusHandle>,
     disabled: bool,
     on_click: Option<ClickHandler>,
 }
@@ -141,6 +142,7 @@ impl Button {
             toggle_state: None,
             full_width: false,
             debug_selector: None,
+            focus_handle: None,
             disabled: false,
             on_click: None,
         }
@@ -177,6 +179,13 @@ impl Button {
     /// Name for `VisualTestContext::debug_bounds`. Only recorded in test builds.
     pub fn debug_selector(mut self, selector: impl FnOnce() -> String) -> Self {
         self.debug_selector = Some(selector());
+        self
+    }
+
+    /// Uses `handle` as the button's focus, so the owner can move focus to it. Create
+    /// the handle with `tab_stop(true)` to keep the button in the Tab order.
+    pub fn track_focus(mut self, handle: &FocusHandle) -> Self {
+        self.focus_handle = Some(handle.clone());
         self
     }
 }
@@ -280,8 +289,10 @@ impl RenderOnce for Button {
                     button.opacity(0.5).cursor_default()
                 } else {
                     button
-                        .focusable()
-                        .tab_stop(true)
+                        .map(|button| match &self.focus_handle {
+                            Some(handle) => button.track_focus(handle),
+                            None => button.focusable().tab_stop(true),
+                        })
                         .cursor_pointer()
                         .hover(|style| {
                             style

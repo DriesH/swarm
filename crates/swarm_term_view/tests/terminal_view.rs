@@ -340,6 +340,140 @@ fn scrolling_moves_the_scrollback_position(cx: &mut TestAppContext) {
     assert_eq!((scrolled, back), (3, 0));
 }
 
+fn alternate_snapshot(rows: &[&str]) -> TerminalOutput {
+    let TerminalOutput::Snapshot(mut snapshot) = snapshot(rows, History::default()) else {
+        unreachable!("snapshot returns a snapshot");
+    };
+    snapshot.screen.alternate = true;
+
+    TerminalOutput::Snapshot(snapshot)
+}
+
+fn scrolls(setup: &Setup<'_>) -> Vec<(i32, u16, u16, bool)> {
+    setup
+        .inputs()
+        .into_iter()
+        .filter_map(|input| match input {
+            TerminalInput::Scroll {
+                lines,
+                column,
+                row,
+                keys,
+            } => Some((lines, column, row, keys)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn scroll_at(setup: &mut Setup<'_>, lines: f32, x: f32, y: f32) {
+    setup.cx.simulate_event(ScrollEvent {
+        position: point(px(x), px(y)),
+        delta: ScrollDelta::Lines(point(0., lines)),
+        modifiers: Modifiers::default(),
+        touch_phase: TouchPhase::Moved,
+        source: ScrollSource::Pointer,
+    });
+}
+
+#[gpui::test]
+fn the_wheel_on_the_alternate_screen_goes_to_the_program(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    setup.send(alternate_snapshot(&["a", "b", "c"]));
+    setup.inputs();
+
+    scroll_at(&mut setup, 3., 9., 9.);
+    scroll_at(&mut setup, -2., 9., 9.);
+
+    assert_eq!(scrolls(&setup), [(3, 0, 0, true), (-2, 0, 0, true)]);
+    let scrolled = setup
+        .terminal
+        .read_with(setup.cx, |view, _| view.scrolled_back());
+    assert_eq!(scrolled, 0);
+}
+
+#[gpui::test]
+fn the_wheel_names_the_cell_under_the_pointer(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    setup.send(alternate_snapshot(&["a", "b", "c"]));
+    setup.inputs();
+    let cell = setup
+        .cx
+        .update(|window, cx| TerminalView::cell_size(window, cx));
+
+    // The grid starts 8 px in from the corner. Aim at the middle of column 3, row 4.
+    let x = 8. + 3.5 * f32::from(cell.width);
+    let y = 8. + 4.5 * f32::from(cell.height);
+    scroll_at(&mut setup, 1., x, y);
+
+    assert_eq!(scrolls(&setup), [(1, 3, 4, true)]);
+}
+
+#[gpui::test]
+fn small_wheel_turns_on_the_alternate_screen_add_up(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    setup.send(alternate_snapshot(&["a"]));
+    setup.inputs();
+
+    scroll_at(&mut setup, 0.5, 9., 9.);
+    let first = scrolls(&setup);
+    scroll_at(&mut setup, 0.5, 9., 9.);
+    let second = scrolls(&setup);
+
+    assert!(first.is_empty());
+    assert_eq!(second, [(1, 0, 0, true)]);
+}
+
+#[gpui::test]
+fn a_closed_typing_gate_still_sends_the_wheel_to_the_program(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    setup.send(alternate_snapshot(&["a"]));
+    gate(&mut setup, &Rc::new(Cell::new(false)));
+    setup.inputs();
+
+    scroll_at(&mut setup, 2., 9., 9.);
+
+    assert_eq!(scrolls(&setup), [(2, 0, 0, false)]);
+}
+
+#[gpui::test]
+fn the_wheel_may_send_arrow_keys_only_while_typing_is_allowed(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    setup.send(alternate_snapshot(&["a"]));
+    let open = Rc::new(Cell::new(true));
+    gate(&mut setup, &open);
+    setup.inputs();
+
+    scroll_at(&mut setup, 1., 9., 9.);
+    let allowed = scrolls(&setup);
+    open.set(false);
+    scroll_at(&mut setup, 1., 9., 9.);
+    let denied = scrolls(&setup);
+
+    assert_eq!(allowed, [(1, 0, 0, true)]);
+    assert_eq!(denied, [(1, 0, 0, false)]);
+}
+
+#[gpui::test]
+fn the_wheel_on_the_main_screen_scrolls_history_and_sends_nothing(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    setup.send(snapshot(
+        &["a", "b", "c"],
+        History {
+            start: 0,
+            len: 1_000,
+        },
+    ));
+    setup.inputs();
+
+    scroll_up(&mut setup, 3.);
+
+    let scrolled = setup
+        .terminal
+        .read_with(setup.cx, |view, _| view.scrolled_back());
+    assert_eq!(scrolled, 3);
+    assert!(scrolls(&setup).is_empty());
+}
+
 fn gate(setup: &mut Setup<'_>, open: &Rc<Cell<bool>>) {
     let open = Rc::clone(open);
 

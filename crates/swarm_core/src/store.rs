@@ -11,8 +11,8 @@ use serde::de::DeserializeOwned;
 use swarm_protocol::agent::InboxMessage;
 use swarm_protocol::{
     AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, CommentAnchor,
-    CommentId, CommentState, CreateTerminal, GridSize, MessageId, MessageInfo, MessageKind,
-    NewComment, PrLink, ProjectId, ReviewComment, TaskId, TaskInfo, TerminalId, TerminalKind,
+    CommentId, CommentState, CreateTerminal, MessageId, MessageInfo, MessageKind, NewComment,
+    PrLink, ProjectId, ReviewComment, TaskId, TaskInfo, TerminalId, TerminalKind,
 };
 use swarm_term::ExitStatus;
 
@@ -150,6 +150,15 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE tasks ADD COLUMN close_after_merge INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE tasks ADD COLUMN pr_head TEXT;
     ALTER TABLE tasks ADD COLUMN pr_base TEXT",
+    // Known limit: the old `post` wrote all messages of a batch first, so a batch split
+    // over 64 KiB links every comment to its last message.
+    "ALTER TABLE comments ADD COLUMN message INTEGER;
+    UPDATE comments SET message = (
+        SELECT messages.id FROM messages
+        WHERE messages.task = comments.task AND messages.kind = '\"Comment\"'
+            AND messages.sent_at <= comments.sent_at
+        ORDER BY messages.sent_at DESC, messages.id DESC LIMIT 1
+    ) WHERE sent_at IS NOT NULL",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,7 +196,6 @@ pub struct Leftover {
 pub struct ProcessMeta {
     pub owner: AgentId,
     pub name: Option<String>,
-    pub size: GridSize,
 }
 
 /// A project row.
@@ -331,27 +339,11 @@ impl Store {
         Ok(TerminalId(from_row(self.connection.last_insert_rowid())?))
     }
 
-    /// Records who started a process terminal, what they called it and its fixed size.
+    /// Records who started a process terminal and what they called it.
     pub fn set_process(&self, id: TerminalId, meta: &ProcessMeta) -> Result<(), Error> {
         self.connection.execute(
-            "UPDATE terminals SET owner = ?1, name = ?2, fixed_cols = ?3, fixed_rows = ?4
-             WHERE id = ?5",
-            params![
-                to_row(meta.owner.0)?,
-                meta.name,
-                meta.size.cols,
-                meta.size.rows,
-                to_row(id.0)?
-            ],
-        )?;
-
-        Ok(())
-    }
-
-    pub fn set_process_size(&self, id: TerminalId, size: GridSize) -> Result<(), Error> {
-        self.connection.execute(
-            "UPDATE terminals SET fixed_cols = ?1, fixed_rows = ?2 WHERE id = ?3",
-            params![size.cols, size.rows, to_row(id.0)?],
+            "UPDATE terminals SET owner = ?1, name = ?2 WHERE id = ?3",
+            params![to_row(meta.owner.0)?, meta.name, to_row(id.0)?],
         )?;
 
         Ok(())
@@ -362,24 +354,21 @@ impl Store {
         let row = self
             .connection
             .query_row(
-                "SELECT owner, name, fixed_cols, fixed_rows FROM terminals WHERE id = ?1",
+                "SELECT owner, name FROM terminals WHERE id = ?1",
                 params![to_row(id.0)?],
                 |row| {
                     Ok((
                         row.get::<_, Option<i64>>(0)?,
                         row.get::<_, Option<String>>(1)?,
-                        row.get::<_, Option<u16>>(2)?,
-                        row.get::<_, Option<u16>>(3)?,
                     ))
                 },
             )
             .optional()?;
 
         Ok(match row {
-            Some((Some(owner), name, Some(cols), Some(rows))) => Some(ProcessMeta {
+            Some((Some(owner), name)) => Some(ProcessMeta {
                 owner: AgentId(owner.unsigned_abs()),
                 name,
-                size: GridSize { cols, rows },
             }),
             _ => None,
         })
@@ -1088,7 +1077,7 @@ impl Store {
         Ok(self
             .connection
             .query_row(
-                &format!("{COMMENT_COLUMNS} WHERE id = ?1"),
+                &format!("{COMMENT_COLUMNS} WHERE comments.id = ?1"),
                 params![to_row(id.0)?],
                 comment_from_row,
             )
@@ -1098,13 +1087,36 @@ impl Store {
     /// The comments of an open task, oldest first. A closed task has none.
     pub fn task_comments(&self, task: TaskId) -> Result<Vec<ReviewComment>, Error> {
         let mut statement = self.connection.prepare(&format!(
-            "{COMMENT_COLUMNS} WHERE task = ?1
+            "{COMMENT_COLUMNS} WHERE comments.task = ?1
              AND EXISTS (SELECT 1 FROM tasks WHERE tasks.id = comments.task AND closed_at IS NULL)
-             ORDER BY id"
+             ORDER BY comments.id"
         ))?;
         let rows = statement.query_map(params![to_row(task.0)?], comment_from_row)?;
 
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The comments that the messages carry, message by message. Comments of a closed
+    /// task are left out.
+    pub fn comments_in_messages(
+        &self,
+        messages: &[MessageId],
+    ) -> Result<Vec<ReviewComment>, Error> {
+        let mut statement = self.connection.prepare(&format!(
+            "{COMMENT_COLUMNS} WHERE comments.message = ?1
+             AND EXISTS (SELECT 1 FROM tasks WHERE tasks.id = comments.task AND closed_at IS NULL)
+             ORDER BY comments.id"
+        ))?;
+
+        let mut comments = Vec::new();
+        for message in messages {
+            let rows = statement.query_map(params![to_row(message.0)?], comment_from_row)?;
+            for row in rows {
+                comments.push(row?);
+            }
+        }
+
+        Ok(comments)
     }
 
     /// Where the anchored line is now, and whether it is gone.
@@ -1122,18 +1134,21 @@ impl Store {
         Ok(())
     }
 
-    /// Marks a pending comment as sent, to the worker that owned its file.
+    /// Marks a pending comment as sent in `message`, about the worker that owned its file.
     pub fn mark_comment_sent(
         &self,
         id: CommentId,
         to: Option<AgentId>,
+        message: MessageId,
     ) -> Result<ReviewComment, Error> {
         self.connection.execute(
-            "UPDATE comments SET state = ?1, to_agent = ?2, sent_at = ?3 WHERE id = ?4",
+            "UPDATE comments SET state = ?1, to_agent = ?2, sent_at = ?3, message = ?4
+             WHERE id = ?5",
             params![
                 to_json(&CommentState::Sent)?,
                 to.map(|agent| to_row(agent.0)).transpose()?,
                 now_millis(),
+                to_row(message.0)?,
                 to_row(id.0)?,
             ],
         )?;
@@ -1409,9 +1424,13 @@ fn to_json<T: Serialize>(value: &T) -> Result<String, Error> {
     Ok(serde_json::to_string(value)?)
 }
 
-const COMMENT_COLUMNS: &str = "SELECT id, task, parent, source, worktree, path, side, line,
-    anchor_text, before_text, after_text, body, state, to_agent, outdated, created_at, sent_at
-    FROM comments";
+/// `delivered_at` comes from the message that carried the comment.
+const COMMENT_COLUMNS: &str = "SELECT comments.id, comments.task, comments.parent,
+    comments.source, comments.worktree, comments.path, comments.side, comments.line,
+    comments.anchor_text, comments.before_text, comments.after_text, comments.body,
+    comments.state, comments.to_agent, comments.outdated, comments.created_at,
+    comments.sent_at, messages.delivered_at
+    FROM comments LEFT JOIN messages ON messages.id = comments.message";
 
 fn comment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewComment> {
     let id: i64 = row.get(0)?;
@@ -1422,6 +1441,7 @@ fn comment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewComment> 
     let to: Option<i64> = row.get(13)?;
     let created_at: i64 = row.get(15)?;
     let sent_at: Option<i64> = row.get(16)?;
+    let delivered_at: Option<i64> = row.get(17)?;
 
     Ok(ReviewComment {
         id: CommentId(id.unsigned_abs()),
@@ -1443,6 +1463,7 @@ fn comment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewComment> 
         outdated: row.get(14)?,
         created_at: created_at.unsigned_abs(),
         sent_at: sent_at.map(i64::unsigned_abs),
+        delivered_at: delivered_at.map(i64::unsigned_abs),
     })
 }
 
@@ -2056,10 +2077,13 @@ mod tests {
         assert_eq!(info.pull_request, None);
     }
 
+    /// The migration that adds `pr_number` is the fourteenth.
+    const PULL_REQUEST_MIGRATION: usize = 13;
+
     #[test]
     fn a_database_from_before_pull_requests_keeps_its_tasks() {
         let connection = Connection::open_in_memory().expect("connection");
-        let before = MIGRATIONS.len() - 2;
+        let before = PULL_REQUEST_MIGRATION;
         for migration in &MIGRATIONS[..before] {
             connection.execute_batch(migration).expect("old schema");
         }
@@ -2092,7 +2116,7 @@ mod tests {
     #[test]
     fn a_pull_request_from_before_the_pushed_commit_was_kept_has_an_empty_head() {
         let connection = Connection::open_in_memory().expect("connection");
-        let before = MIGRATIONS.len() - 1;
+        let before = PULL_REQUEST_MIGRATION + 1;
         for migration in &MIGRATIONS[..before] {
             connection.execute_batch(migration).expect("old schema");
         }
@@ -2190,33 +2214,17 @@ mod tests {
     }
 
     #[test]
-    fn a_process_terminal_keeps_its_owner_name_and_size() {
+    fn a_process_terminal_keeps_its_owner_and_name() {
         let store = Store::open_in_memory().expect("store");
         let id = store.insert_starting(&request(None)).expect("terminal");
         let meta = ProcessMeta {
             owner: AgentId(4),
             name: Some("dev server".to_owned()),
-            size: GridSize {
-                cols: 100,
-                rows: 30,
-            },
         };
 
         store.set_process(id, &meta).expect("set");
-        assert_eq!(store.process(id).expect("get"), Some(meta));
 
-        store
-            .set_process_size(
-                id,
-                GridSize {
-                    cols: 120,
-                    rows: 40,
-                },
-            )
-            .expect("resize");
-        let resized = store.process(id).expect("get").expect("row");
-        assert_eq!((resized.size.cols, resized.size.rows), (120, 40));
-        assert_eq!(resized.owner, AgentId(4));
+        assert_eq!(store.process(id).expect("get"), Some(meta));
     }
 
     #[test]
@@ -2539,6 +2547,102 @@ mod tests {
         assert!(again.ids.is_empty());
         assert_eq!(listed[0].delivered_at, Some(delivery.delivered_at));
         assert_eq!(listed[1].delivered_at, Some(delivery.delivered_at));
+    }
+
+    fn new_comment(task: TaskId) -> NewComment {
+        NewComment {
+            task,
+            parent: None,
+            source: swarm_protocol::ReviewSource::Live,
+            anchor: CommentAnchor {
+                worktree: PathBuf::from("/repo/.worktrees/fix-it"),
+                path: PathBuf::from("api.txt"),
+                side: swarm_protocol::DiffSide::New,
+                line: 1,
+                text: "one".to_owned(),
+                before: None,
+                after: None,
+            },
+            body: "Cache it.".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_comment_takes_the_delivery_time_of_the_message_that_carried_it() {
+        let (store, task) = store_with_task();
+        let agent = store.add_agent(&new_agent(task)).expect("agent");
+        let pending = store
+            .add_comment(&new_comment(task), CommentState::Pending)
+            .expect("pending");
+        let sent = store
+            .add_comment(&new_comment(task), CommentState::Pending)
+            .expect("sent");
+        let message = store
+            .add_message(&message(None, agent.id, "2 comments"))
+            .expect("message");
+
+        let waiting = store
+            .mark_comment_sent(sent.id, None, message.id)
+            .expect("mark");
+        assert_eq!(waiting.delivered_at, None);
+        assert_eq!(
+            store.comments_in_messages(&[message.id]).expect("carried"),
+            [waiting]
+        );
+
+        let delivery = store.mark_delivered(&[message.id]).expect("deliver");
+
+        let carried = store.comments_in_messages(&[message.id]).expect("carried");
+        assert_eq!(carried.len(), 1);
+        assert_eq!(carried[0].delivered_at, Some(delivery.delivered_at));
+        assert_eq!(
+            store.comment(sent.id).expect("read").expect("row"),
+            carried[0]
+        );
+        assert_eq!(store.task_comments(task).expect("list")[1], carried[0]);
+        assert_eq!(
+            store
+                .comment(pending.id)
+                .expect("read")
+                .expect("row")
+                .delivered_at,
+            None
+        );
+    }
+
+    #[test]
+    fn a_database_from_before_comment_messages_links_sent_comments_to_their_message() {
+        let connection = Connection::open_in_memory().expect("connection");
+        let before = MIGRATIONS.len() - 1;
+        for migration in &MIGRATIONS[..before] {
+            connection.execute_batch(migration).expect("old schema");
+        }
+        connection
+            .pragma_update(None, "user_version", i64::try_from(before).expect("count"))
+            .expect("version");
+        connection
+            .execute_batch(
+                "INSERT INTO projects (path, name, added_at) VALUES ('/repo', 'repo', 1);
+                 INSERT INTO tasks (project, name, branch, base, worktree, ports, created_at)
+                     VALUES (1, 'old', 'swarm/old', 'main', '/repo/.worktrees/old', '', 1);
+                 INSERT INTO messages (project, task, to_agent, kind, text, sent_at, delivered_at)
+                     VALUES (1, 1, 1, '\"Report\"', 'noise', 9, 9);
+                 INSERT INTO messages (project, task, to_agent, kind, text, sent_at, delivered_at)
+                     VALUES (1, 1, 1, '\"Comment\"', 'c', 10, 20);
+                 INSERT INTO comments (task, source, worktree, path, side, line, anchor_text,
+                         body, state, created_at, sent_at)
+                     VALUES (1, '\"Live\"', x'2f', x'61', '\"New\"', 1, 'one', 'A',
+                         '\"Sent\"', 5, 11),
+                         (1, '\"Merged\"', x'2f', x'61', '\"New\"', 1, 'one', 'B',
+                         '\"Pending\"', 6, NULL)",
+            )
+            .expect("old rows");
+
+        let store = Store::migrated(connection).expect("migrated");
+
+        let comments = store.task_comments(TaskId(1)).expect("comments");
+        assert_eq!(comments[0].delivered_at, Some(20));
+        assert_eq!(comments[1].delivered_at, None);
     }
 
     #[test]

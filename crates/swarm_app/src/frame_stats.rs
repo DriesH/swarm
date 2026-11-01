@@ -458,6 +458,7 @@ fn big_comments(
                 outdated: false,
                 created_at: 0,
                 sent_at: None,
+                delivered_at: None,
             })
         })
         .collect()

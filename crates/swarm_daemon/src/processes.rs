@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, bail};
 use swarm_core::store::{NewMessage, ProcessMeta, Store};
 use swarm_protocol::agent::TerminalWaited;
-use swarm_protocol::agent::{TerminalSize, TerminalSummary, TerminalText, TerminalUntil};
+use swarm_protocol::agent::{TerminalSummary, TerminalText, TerminalUntil};
 use swarm_protocol::{
     AgentId, AgentInfo, AgentRole, CreateTerminal, Event, GridSize, MessageKind, ProjectId, TaskId,
     TerminalId, TerminalKind,
@@ -42,10 +42,8 @@ const OWNER_ENDED_GRACE: Duration = Duration::from_secs(5);
 
 const MAX_NAME_CHARS: usize = 60;
 
-const MIN_COLS: u16 = 20;
-const MAX_COLS: u16 = 300;
-const MIN_ROWS: u16 = 5;
-const MAX_ROWS: u16 = 100;
+/// The size a process terminal starts with, until the app fits it to its tile.
+const START_SIZE: GridSize = GridSize { cols: 80, rows: 12 };
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -183,6 +181,7 @@ impl Transcript {
 
 struct State {
     id: TerminalId,
+    /// What the emulator reports, so it follows the tile.
     size: GridSize,
     text: Transcript,
     exit: Option<ExitStatus>,
@@ -252,7 +251,6 @@ pub(crate) fn exit_text(exit: &ExitStatus) -> String {
 pub(crate) struct Spawn {
     pub(crate) command: Vec<String>,
     pub(crate) cwd: Option<PathBuf>,
-    pub(crate) size: Option<TerminalSize>,
     pub(crate) name: Option<String>,
     /// The task env (`SWARM_TASK`, `SWARM_PORT`); never the caller's token.
     pub(crate) env: Vec<(String, String)>,
@@ -322,8 +320,6 @@ impl Processes {
         }
 
         let cwd = inside_worktree(caller, request.cwd)?;
-        let size = clamp(request.size.unwrap_or(TerminalSize::Medium).grid());
-
         let entry = Arc::new(Entry {
             owner: caller.id,
             project: caller.project,
@@ -332,7 +328,7 @@ impl Processes {
             command: request.command.clone(),
             state: Mutex::new(State {
                 id: TerminalId(0),
-                size,
+                size: START_SIZE,
                 text: Transcript::default(),
                 exit: None,
                 ended: false,
@@ -354,6 +350,10 @@ impl Processes {
                     let mut state = lock(&watched.state);
                     state.text.apply(output);
 
+                    if let Some(size) = screen_size(output) {
+                        state.size = size;
+                    }
+
                     (state.id, state.text.wants_history())
                 };
                 if wanted {
@@ -364,14 +364,13 @@ impl Processes {
             process: Some(ProcessMeta {
                 owner: caller.id,
                 name,
-                size,
             }),
         };
         let terminal = CreateTerminal {
             kind: TerminalKind::Process,
             command: Some(request.command),
             cwd: Some(cwd),
-            size: cell_size(size),
+            size: cell_size(START_SIZE),
             palette: TERMINAL_PALETTE,
             task: Some(terminal_key(caller)),
         };
@@ -409,12 +408,9 @@ impl Processes {
             .collect()
     }
 
-    pub(crate) fn resize(
-        &self,
-        caller: &AgentInfo,
-        id: TerminalId,
-        size: TerminalSize,
-    ) -> Result<TerminalSummary> {
+    /// The layout decides the size of a process terminal, so a request changes nothing:
+    /// the answer is the current size.
+    pub(crate) fn resize(&self, caller: &AgentInfo, id: TerminalId) -> Result<TerminalSummary> {
         let entry = self.visible(caller, id)?;
         if entry.owner != caller.id {
             bail!(
@@ -423,25 +419,7 @@ impl Processes {
             );
         }
 
-        let grid = clamp(size.grid());
-        let hub = self
-            .terminals
-            .get(id)
-            .filter(|_| !lock(&entry.state).ended)
-            .with_context(|| format!("terminal {} has ended", id.0))?;
-        if !hub.resize_fixed(grid) {
-            bail!("terminal {} has ended", id.0);
-        }
-
-        if let Err(error) = lock(&self.store).set_process_size(id, grid) {
-            log::error!("cannot record the size of terminal {}: {error}", id.0);
-        }
-        self.clients.broadcast(&Event::TerminalChanged {
-            terminal: hub.info(),
-        });
-
-        let mut state = lock(&entry.state);
-        state.size = grid;
+        let state = lock(&entry.state);
 
         Ok(entry.summary(&state))
     }
@@ -748,11 +726,18 @@ fn forget_oldest_ended(entries: &mut HashMap<TerminalId, Arc<Entry>>) {
     }
 }
 
-fn clamp(size: GridSize) -> GridSize {
-    GridSize {
-        cols: size.cols.clamp(MIN_COLS, MAX_COLS),
-        rows: size.rows.clamp(MIN_ROWS, MAX_ROWS),
-    }
+/// The grid of the screen an emulator output carries.
+fn screen_size(output: &TerminalOutput) -> Option<GridSize> {
+    let screen = match output {
+        TerminalOutput::Snapshot(snapshot) => &snapshot.screen,
+        TerminalOutput::Update(update) => &update.screen,
+        _ => return None,
+    };
+
+    Some(GridSize {
+        cols: screen.cols,
+        rows: screen.rows,
+    })
 }
 
 /// The folder to run in: the worktree, or a folder inside it. A link that leads out
@@ -954,24 +939,12 @@ mod tests {
     }
 
     #[test]
-    fn sizes_are_clamped() {
-        let size = clamp(GridSize { cols: 5, rows: 500 });
+    fn the_size_follows_the_screen_of_the_last_output() {
+        let grid = |output: &TerminalOutput| screen_size(output).map(|size| (size.cols, size.rows));
 
-        assert_eq!(
-            size,
-            GridSize {
-                cols: 20,
-                rows: 100
-            }
-        );
-        assert_eq!(
-            clamp(GridSize { cols: 900, rows: 1 }),
-            GridSize { cols: 300, rows: 5 }
-        );
-        assert_eq!(
-            clamp(TerminalSize::Small.grid()),
-            TerminalSize::Small.grid()
-        );
+        assert_eq!(grid(&snapshot(&["a", "b"], &[])), Some((80, 2)));
+        assert_eq!(grid(&update(9, 0, &[])), Some((80, 9)));
+        assert_eq!(grid(&TerminalOutput::Bell), None);
     }
 
     #[test]

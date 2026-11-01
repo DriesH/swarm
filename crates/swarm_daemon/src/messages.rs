@@ -1,6 +1,6 @@
 //! Messages between agents: stored in SQLite, announced to the app, and waited for.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -34,6 +34,15 @@ impl Claim {
         self.messages.is_empty()
     }
 
+    /// Gives the messages back and wakes the `wait` calls that could not take them while
+    /// the claim held them.
+    pub(crate) fn release(self) {
+        let owner = Arc::clone(&self.owner);
+        drop(self);
+
+        owner.wake();
+    }
+
     /// The messages reached the agent: mark them delivered.
     pub(crate) fn commit(self) {
         let ids = self.ids();
@@ -42,10 +51,23 @@ impl Claim {
         let store = lock(&self.owner.store);
         match store.mark_delivered(&ids) {
             Ok(delivery) if !delivery.ids.is_empty() => {
+                let comments = store.comments_in_messages(&delivery.ids);
+
                 self.owner.clients.broadcast(&Event::MessagesDelivered {
                     ids: delivery.ids,
                     delivered_at: delivery.delivered_at,
                 });
+
+                match comments {
+                    Ok(comments) => {
+                        for comment in comments {
+                            self.owner
+                                .clients
+                                .broadcast(&Event::CommentChanged { comment });
+                        }
+                    }
+                    Err(error) => log::error!("cannot read the delivered comments: {error}"),
+                }
             }
             Ok(_) => {}
             Err(error) => log::error!("cannot mark messages as delivered: {error}"),
@@ -75,6 +97,35 @@ pub(crate) struct Messages {
     arrived: Condvar,
     /// Messages a [`Claim`] holds right now.
     claimed: Mutex<HashSet<MessageId>>,
+    waits: Mutex<Waits>,
+}
+
+/// What the `wait` calls and the pastes of each agent need to agree on, behind one lock.
+#[derive(Default)]
+struct Waits {
+    /// How many `wait` calls each agent has open.
+    open: HashMap<AgentId, usize>,
+    /// Agents with a paste in their input queue that the next `wait` must not outlast.
+    queued: HashSet<AgentId>,
+}
+
+/// Counts an open `wait` call until it drops.
+struct Waiter<'a> {
+    owner: &'a Messages,
+    agent: AgentId,
+}
+
+impl Drop for Waiter<'_> {
+    fn drop(&mut self) {
+        let mut waits = lock(&self.owner.waits);
+
+        if let Some(count) = waits.open.get_mut(&self.agent) {
+            *count -= 1;
+            if *count == 0 {
+                waits.open.remove(&self.agent);
+            }
+        }
+    }
 }
 
 impl Messages {
@@ -85,7 +136,39 @@ impl Messages {
             wake: Mutex::new(()),
             arrived: Condvar::new(),
             claimed: Mutex::default(),
+            waits: Mutex::default(),
         })
+    }
+
+    /// The agent sits in a `wait` call, which takes its next message the moment it
+    /// arrives.
+    pub(crate) fn is_waiting(&self, agent: AgentId) -> bool {
+        lock(&self.waits).open.contains_key(&agent)
+    }
+
+    /// A paste for the agent is about to go out. False when the agent sits in a `wait`:
+    /// the wait takes the messages itself.
+    ///
+    /// With `queued`, the paste lands in the input queue of a working agent. The agent
+    /// only reads it after its current tool call ends, so its next `wait` ends at once
+    /// (see [`Self::wait`]). This and the start of a `wait` share one lock: either the
+    /// wait starts first and takes the messages, or it sees the mark.
+    pub(crate) fn begin_paste(&self, agent: AgentId, queued: bool) -> bool {
+        let mut waits = lock(&self.waits);
+        if waits.open.contains_key(&agent) {
+            return false;
+        }
+
+        if queued {
+            waits.queued.insert(agent);
+        }
+
+        true
+    }
+
+    /// The agent reads its input again: nothing waits in its queue anymore.
+    pub(crate) fn clear_queued(&self, agent: AgentId) {
+        lock(&self.waits).queued.remove(&agent);
     }
 
     /// Stores the message, tells the app and wakes the recipient if it waits.
@@ -126,14 +209,29 @@ impl Messages {
         })
     }
 
+    /// Counts a new `wait` call of the agent. The flag is true when a paste waits in the
+    /// agent's input queue; it is taken.
+    fn open_wait(&self, agent: AgentId) -> (Waiter<'_>, bool) {
+        let mut waits = lock(&self.waits);
+        *waits.open.entry(agent).or_default() += 1;
+        let queued = waits.queued.remove(&agent);
+
+        (Waiter { owner: self, agent }, queued)
+    }
+
     /// Waits until the agent has an unread message, `timeout` passes or `gone` says the
     /// caller hung up, then claims the messages. A caller that hung up gets none.
+    ///
+    /// A paste in the agent's input queue (see [`Self::begin_paste`]) ends the first wait
+    /// after it at once, once: the agent reads the paste when this call ends.
     pub(crate) fn wait(
         self: &Arc<Self>,
         agent: AgentId,
         timeout: Duration,
         gone: &dyn Fn() -> bool,
     ) -> Result<Claim> {
+        let (_waiter, queued) = self.open_wait(agent);
+
         let deadline = Instant::now() + timeout;
         let mut guard = lock(&self.wake);
 
@@ -146,7 +244,7 @@ impl Messages {
             }
 
             let claim = self.claim(agent)?;
-            if !claim.is_empty() {
+            if !claim.is_empty() || queued {
                 return Ok(claim);
             }
 
@@ -218,6 +316,157 @@ mod tests {
 
         assert_eq!(taken.messages().len(), 1);
         assert_eq!(taken.messages()[0].text, "ready");
+    }
+
+    #[test]
+    fn an_agent_in_a_wait_is_waiting_until_the_wait_ends() {
+        let messages = messages();
+        let peer = Arc::clone(&messages);
+        let ended_empty = thread::spawn(move || {
+            peer.wait(AgentId(1), Duration::from_millis(400), &|| false)
+                .expect("wait")
+                .is_empty()
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !messages.is_waiting(AgentId(1)) {
+            assert!(Instant::now() < deadline, "the wait never started");
+            thread::park_timeout(Duration::from_millis(10));
+        }
+        assert!(!messages.is_waiting(AgentId(2)));
+
+        assert!(ended_empty.join().expect("join"));
+        assert!(!messages.is_waiting(AgentId(1)));
+    }
+
+    #[test]
+    fn a_paste_in_the_queue_ends_the_next_wait_at_once_and_only_that_one() {
+        let messages = messages();
+        assert!(messages.begin_paste(AgentId(1), true));
+
+        let start = Instant::now();
+        let first = messages
+            .wait(AgentId(1), Duration::from_secs(30), &|| false)
+            .expect("wait");
+        assert!(first.is_empty());
+        assert!(start.elapsed() < Duration::from_secs(5));
+
+        let start = Instant::now();
+        messages
+            .wait(AgentId(1), Duration::from_millis(80), &|| false)
+            .expect("wait");
+        assert!(start.elapsed() >= Duration::from_millis(80));
+    }
+
+    #[test]
+    fn a_queue_mark_belongs_to_its_agent() {
+        let messages = messages();
+        assert!(messages.begin_paste(AgentId(2), true));
+
+        let start = Instant::now();
+        messages
+            .wait(AgentId(1), Duration::from_millis(80), &|| false)
+            .expect("wait");
+
+        assert!(start.elapsed() >= Duration::from_millis(80));
+    }
+
+    #[test]
+    fn a_paste_that_is_not_queued_leaves_the_wait_alone() {
+        let messages = messages();
+        assert!(messages.begin_paste(AgentId(1), false));
+
+        let start = Instant::now();
+        messages
+            .wait(AgentId(1), Duration::from_millis(80), &|| false)
+            .expect("wait");
+
+        assert!(start.elapsed() >= Duration::from_millis(80));
+    }
+
+    #[test]
+    fn a_cleared_queue_mark_does_not_end_a_wait() {
+        let messages = messages();
+        assert!(messages.begin_paste(AgentId(1), true));
+        messages.clear_queued(AgentId(1));
+
+        let start = Instant::now();
+        messages
+            .wait(AgentId(1), Duration::from_millis(80), &|| false)
+            .expect("wait");
+
+        assert!(start.elapsed() >= Duration::from_millis(80));
+    }
+
+    #[test]
+    fn a_wait_that_ends_at_once_still_returns_unread_messages() {
+        let messages = messages();
+        messages.post(&new_message(1, "unread")).expect("post");
+        assert!(messages.begin_paste(AgentId(1), true));
+
+        let taken = messages
+            .wait(AgentId(1), Duration::from_secs(30), &|| false)
+            .expect("wait");
+
+        assert_eq!(taken.messages().len(), 1);
+    }
+
+    #[test]
+    fn no_paste_goes_out_while_the_agent_sits_in_a_wait() {
+        let messages = messages();
+        let peer = Arc::clone(&messages);
+        let waiting = thread::spawn(move || {
+            peer.wait(AgentId(1), Duration::from_millis(400), &|| false)
+                .expect("wait")
+                .is_empty()
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !messages.is_waiting(AgentId(1)) {
+            assert!(Instant::now() < deadline, "the wait never started");
+            thread::park_timeout(Duration::from_millis(10));
+        }
+
+        assert!(!messages.begin_paste(AgentId(1), true));
+        assert!(!messages.begin_paste(AgentId(1), false));
+        assert!(messages.begin_paste(AgentId(2), true));
+        assert!(waiting.join().expect("join"));
+
+        let start = Instant::now();
+        messages
+            .wait(AgentId(1), Duration::from_millis(80), &|| false)
+            .expect("wait");
+        assert!(
+            start.elapsed() >= Duration::from_millis(80),
+            "a refused paste left a mark"
+        );
+    }
+
+    #[test]
+    fn a_released_claim_wakes_the_wait_that_could_not_take_it() {
+        let messages = messages();
+        messages.post(&new_message(1, "held")).expect("post");
+        let claim = messages.claim(AgentId(1)).expect("claim");
+
+        let peer = Arc::clone(&messages);
+        let start = Instant::now();
+        let waiting = thread::spawn(move || {
+            peer.wait(AgentId(1), Duration::from_secs(30), &|| false)
+                .expect("wait")
+                .messages()
+                .len()
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !messages.is_waiting(AgentId(1)) {
+            assert!(Instant::now() < deadline, "the wait never started");
+            thread::park_timeout(Duration::from_millis(10));
+        }
+        thread::park_timeout(Duration::from_millis(100));
+
+        claim.release();
+
+        assert_eq!(waiting.join().expect("join"), 1);
+        assert!(start.elapsed() < PEER_CHECK, "the wait slept on");
     }
 
     #[test]

@@ -199,6 +199,18 @@ pub enum TerminalInput {
     },
     /// Reported to the program when it asked for focus events (mode 1004).
     Focus(bool),
+    /// A mouse wheel turn over the program's screen, for the alternate screen where
+    /// the view has no scrollback to move. `lines` is positive towards older content
+    /// (wheel up). The emulator sends it as mouse wheel events when the program asked
+    /// for mouse reporting, else as arrow keys, the way terminals do on the alternate
+    /// screen.
+    Scroll {
+        lines: i32,
+        column: u16,
+        row: u16,
+        /// May fall back to arrow keys; false while typing is off.
+        keys: bool,
+    },
     /// Asks for a fresh [`TerminalOutput::Snapshot`] with up to `history` scrollback
     /// lines, for a view that attaches late. Pending changes go out first as an update.
     Snapshot {

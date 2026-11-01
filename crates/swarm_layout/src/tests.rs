@@ -15,11 +15,8 @@ fn orchestrator(id: u32) -> TileSpec {
     tile(id, TileKind::Orchestrator, Activity::Working)
 }
 
-fn process(id: u32, activity: Activity, requested: Size) -> TileSpec {
-    TileSpec {
-        requested: Some(requested),
-        ..tile(id, TileKind::Process, activity)
-    }
+fn process(id: u32, activity: Activity) -> TileSpec {
+    tile(id, TileKind::Process, activity)
 }
 
 fn user(id: u32, fixed: Size) -> TileSpec {
@@ -27,11 +24,6 @@ fn user(id: u32, fixed: Size) -> TileSpec {
         fixed: Some(fixed),
         ..tile(id, TileKind::User, Activity::Running)
     }
-}
-
-/// A terminal of `columns` × `rows` cells in Geist Mono, plus the 34 px header.
-fn terminal_size(columns: u16, rows: u16) -> Size {
-    Size::new(f32::from(columns) * 7.2, f32::from(rows) * 17.0 + 34.0)
 }
 
 fn area(width: f32, height: f32) -> Rect {
@@ -63,6 +55,7 @@ const COLUMN_WIDTH: f32 = 656.5;
 const RIGHT_X: f32 = 676.5;
 const RIGHT_WIDTH: f32 = 343.5;
 const SMALL: f32 = 286.0;
+const PROCESS: f32 = 218.0;
 const GAP: f32 = 10.0;
 const TALL: f32 = 2.0 * SMALL + GAP;
 const TOP: f32 = 10.0;
@@ -457,15 +450,24 @@ fn a_worker_that_needs_attention_keeps_its_place_in_the_stack() {
 }
 
 #[test]
-fn a_process_with_a_requested_height_does_not_grow() {
-    let tiles = [
-        orchestrator(0),
-        process(1, Activity::Attention, terminal_size(80, 10)),
-    ];
+fn a_process_that_needs_attention_grows_like_a_blocked_worker() {
+    let tiles = [orchestrator(0), process(1, Activity::Attention)];
 
     let layout = default_layout(&tiles);
 
-    assert_rect(&layout, 1, box_at(TOP, 204.0));
+    assert_rect(&layout, 1, box_at(TOP, TALL));
+}
+
+#[test]
+fn a_process_that_needs_attention_shrinks_back_when_it_runs_again() {
+    let failed = [orchestrator(0), process(1, Activity::Attention)];
+    let running = [orchestrator(0), process(1, Activity::Running)];
+
+    let failed = default_layout(&failed);
+    let running = default_layout(&running);
+
+    assert_rect(&failed, 1, box_at(TOP, TALL));
+    assert_rect(&running, 1, box_at(TOP, PROCESS));
 }
 
 #[test]
@@ -473,13 +475,13 @@ fn a_running_process_stacks_below_a_tall_attention_box() {
     let tiles = [
         orchestrator(0),
         worker(1, Activity::Attention),
-        process(2, Activity::Running, terminal_size(80, 10)),
+        process(2, Activity::Running),
     ];
 
     let layout = layout(area(1030.0, 1000.0), &tiles, &LayoutStyle::default());
 
     assert_rect(&layout, 1, box_at(TOP, TALL));
-    assert_rect(&layout, 2, box_at(602.0, 204.0));
+    assert_rect(&layout, 2, box_at(602.0, PROCESS));
     assert!(layout.tray.is_empty());
 }
 
@@ -488,7 +490,7 @@ fn a_running_process_that_does_not_fit_below_a_tall_attention_box_goes_to_the_tr
     let tiles = [
         orchestrator(0),
         worker(1, Activity::Attention),
-        process(2, Activity::Running, terminal_size(80, 10)),
+        process(2, Activity::Running),
     ];
 
     let layout = default_layout(&tiles);
@@ -520,8 +522,8 @@ fn workspace_tiles() -> Vec<TileSpec> {
         orchestrator(0),
         worker(1, Activity::Working),
         worker(2, Activity::Attention),
-        process(3, Activity::Running, terminal_size(90, 14)),
-        process(4, Activity::Running, terminal_size(80, 10)),
+        process(3, Activity::Running),
+        process(4, Activity::Running),
         worker(5, Activity::Done),
         worker(6, Activity::Idle),
     ]
@@ -551,8 +553,8 @@ fn workspace_mockup_in_a_tall_area_stacks_the_processes_below_the_tall_box() {
 
     assert_rect(&layout, 1, box_at(TOP, SMALL));
     assert_rect(&layout, 2, box_at(306.0, TALL));
-    assert_rect(&layout, 3, box_at(898.0, 272.0));
-    assert_rect(&layout, 4, box_at(1180.0, 204.0));
+    assert_rect(&layout, 3, box_at(898.0, PROCESS));
+    assert_rect(&layout, 4, box_at(1126.0, PROCESS));
     assert_eq!(layout.tray, tray(&[5, 6]));
 }
 
@@ -562,16 +564,16 @@ fn processes_stack_under_the_workers_when_none_needs_attention() {
         orchestrator(0),
         worker(1, Activity::Working),
         worker(2, Activity::Working),
-        process(3, Activity::Running, terminal_size(90, 14)),
-        process(4, Activity::Running, terminal_size(80, 10)),
+        process(3, Activity::Running),
+        process(4, Activity::Running),
     ];
 
     let layout = layout(area(1030.0, 1400.0), &tiles, &LayoutStyle::default());
 
     assert_rect(&layout, 1, box_at(TOP, SMALL));
     assert_rect(&layout, 2, box_at(306.0, SMALL));
-    assert_rect(&layout, 3, box_at(602.0, 272.0));
-    assert_rect(&layout, 4, box_at(884.0, 204.0));
+    assert_rect(&layout, 3, box_at(602.0, PROCESS));
+    assert_rect(&layout, 4, box_at(830.0, PROCESS));
     assert!(layout.tray.is_empty());
 }
 
@@ -582,7 +584,7 @@ fn island_layout() -> Layout {
         orchestrator(0),
         user(1, Size::new(650.0, 470.0)),
         worker(2, Activity::Working),
-        process(3, Activity::Working, terminal_size(90, 14)),
+        process(3, Activity::Working),
         worker(4, Activity::Working),
         worker(5, Activity::Done),
         worker(6, Activity::Idle),
@@ -606,7 +608,7 @@ fn island_mockup_puts_other_tiles_below_the_user_terminal() {
     let layout = island_layout();
 
     assert_rect(&layout, 2, Rect::new(400.0, 490.0, 320.0, SMALL));
-    assert_rect(&layout, 3, Rect::new(730.0, 490.0, 320.0, 272.0));
+    assert_rect(&layout, 3, Rect::new(730.0, 490.0, 320.0, PROCESS));
 }
 
 #[test]
@@ -714,7 +716,7 @@ fn tiny_area_keeps_only_orchestrator_and_user_terminal() {
         user(1, Size::new(600.0, 480.0)),
         worker(2, Activity::Attention),
         worker(3, Activity::Working),
-        process(4, Activity::Running, terminal_size(80, 10)),
+        process(4, Activity::Running),
     ];
 
     let layout = layout(area(1000.0, 500.0), &tiles, &LayoutStyle::default());
@@ -836,10 +838,7 @@ fn attention_worker_pushes_an_idle_worker_to_the_tray_when_there_is_no_room() {
 
 #[test]
 fn working_worker_beats_running_process() {
-    let tiles = [
-        process(0, Activity::Running, terminal_size(80, 10)),
-        worker(1, Activity::Working),
-    ];
+    let tiles = [process(0, Activity::Running), worker(1, Activity::Working)];
 
     let layout = layout(area(300.0, 200.0), &tiles, &LayoutStyle::default());
 
@@ -889,7 +888,7 @@ fn a_crowded_right_side_sends_idle_then_running_then_working_to_the_tray() {
         worker(1, Activity::Idle),
         worker(2, Activity::Working),
         worker(3, Activity::Attention),
-        process(4, Activity::Running, terminal_size(80, 10)),
+        process(4, Activity::Running),
         worker(5, Activity::Working),
         worker(6, Activity::Done),
     ];
@@ -930,7 +929,7 @@ fn tiles_keep_their_place_when_their_activity_changes() {
 #[test]
 fn processes_go_after_agents() {
     let tiles = [
-        process(0, Activity::Attention, terminal_size(80, 10)),
+        process(0, Activity::Attention),
         worker(1, Activity::Idle),
         worker(2, Activity::Working),
     ];
@@ -938,68 +937,119 @@ fn processes_go_after_agents() {
     let layout = layout(area(350.0, 790.0), &tiles, &LayoutStyle::default());
 
     assert_rect(&layout, 2, Rect::new(10.0, 10.0, 330.0, SMALL));
-    assert_rect(&layout, 0, Rect::new(10.0, 306.0, 330.0, 204.0));
+    assert_rect(&layout, 0, Rect::new(10.0, 306.0, 330.0, PROCESS));
     assert_eq!(layout.tray, tray(&[1]));
 }
 
-// Process heights.
+// Process terminals.
 
 #[test]
-fn process_with_a_requested_height_gets_it() {
-    let tiles = [
-        orchestrator(0),
-        process(1, Activity::Running, terminal_size(90, 14)),
-    ];
+fn a_process_is_the_smallest_box() {
+    let tiles = [orchestrator(0), process(1, Activity::Running)];
 
     let layout = default_layout(&tiles);
 
-    assert_rect(&layout, 1, box_at(TOP, 272.0));
+    assert_rect(&layout, 1, box_at(TOP, PROCESS));
 }
 
 #[test]
-fn process_without_a_requested_size_is_a_small_box() {
-    let tiles = [
-        orchestrator(0),
-        tile(1, TileKind::Process, Activity::Running),
-    ];
+fn a_process_shorter_than_the_minimum_gets_the_minimum_height() {
+    let style = LayoutStyle {
+        process_tile_height: 100.0,
+        ..LayoutStyle::default()
+    };
+    let tiles = [orchestrator(0), process(1, Activity::Running)];
 
-    let layout = default_layout(&tiles);
-
-    assert_rect(&layout, 1, box_at(TOP, SMALL));
-}
-
-#[test]
-fn process_shorter_than_the_minimum_gets_the_minimum_height() {
-    let tiles = [
-        orchestrator(0),
-        process(1, Activity::Running, Size::new(600.0, 60.0)),
-    ];
-
-    let layout = default_layout(&tiles);
+    let layout = layout(area(1030.0, 790.0), &tiles, &style);
 
     assert_rect(&layout, 1, box_at(TOP, 160.0));
 }
 
 #[test]
-fn process_taller_than_the_area_is_cut_to_it_when_it_is_first_in_its_column() {
-    let tiles = [process(0, Activity::Running, Size::new(600.0, 900.0))];
+fn a_process_taller_than_the_lane_is_cut_to_it_when_it_is_first_in_its_column() {
+    let tiles = [process(0, Activity::Running)];
 
-    let layout = layout(area(300.0, 400.0), &tiles, &LayoutStyle::default());
+    let layout = layout(area(300.0, 220.0), &tiles, &LayoutStyle::default());
 
-    assert_rect(&layout, 0, Rect::new(10.0, 10.0, 280.0, 380.0));
+    assert_rect(&layout, 0, Rect::new(10.0, 10.0, 280.0, 200.0));
 }
 
 #[test]
-fn process_that_does_not_fit_below_the_others_goes_to_the_next_column_or_the_tray() {
+fn a_process_stacks_below_the_workers() {
     let tiles = [
         orchestrator(0),
-        worker(1, Activity::Working),
-        process(2, Activity::Running, Size::new(600.0, 600.0)),
+        process(1, Activity::Running),
+        worker(2, Activity::Working),
     ];
 
     let layout = default_layout(&tiles);
 
-    assert_eq!(layout.tray, tray(&[2]));
+    assert_rect(&layout, 2, box_at(TOP, SMALL));
+    assert_rect(&layout, 1, box_at(306.0, PROCESS));
+}
+
+#[test]
+fn a_process_never_takes_width_from_the_orchestrator() {
+    let without = [orchestrator(0), worker(1, Activity::Working)];
+    let with = [
+        orchestrator(0),
+        worker(1, Activity::Working),
+        process(2, Activity::Running),
+    ];
+
+    let before = default_layout(&without).rect(TileId(0));
+    let after = default_layout(&with).rect(TileId(0));
+
+    assert_eq!(before, after);
+    assert_rect(
+        &default_layout(&with),
+        0,
+        Rect::new(10.0, 10.0, COLUMN_WIDTH, 770.0),
+    );
+}
+
+#[test]
+fn a_process_with_a_fixed_size_is_still_a_small_box_and_not_an_island() {
+    let tiles = [
+        orchestrator(0),
+        TileSpec {
+            fixed: Some(Size::new(700.0, 400.0)),
+            ..process(1, Activity::Running)
+        },
+    ];
+
+    let layout = default_layout(&tiles);
+
+    assert_rect(&layout, 0, Rect::new(10.0, 10.0, COLUMN_WIDTH, 770.0));
+    assert_rect(&layout, 1, box_at(TOP, PROCESS));
+}
+
+#[test]
+fn a_process_that_does_not_fit_below_two_workers_goes_to_the_tray() {
+    let tiles = [
+        orchestrator(0),
+        worker(1, Activity::Working),
+        worker(2, Activity::Working),
+        process(3, Activity::Running),
+    ];
+
+    let layout = default_layout(&tiles);
+
+    assert_eq!(layout.tray, tray(&[3]));
+}
+
+#[test]
+fn a_process_beside_a_user_terminal_island_flows_below_it_like_a_worker() {
+    let tiles = [
+        orchestrator(0),
+        user(1, Size::new(650.0, 470.0)),
+        process(2, Activity::Running),
+    ];
+
+    let layout = layout(area(1060.0, 790.0), &tiles, &LayoutStyle::default());
+
+    assert_rect(&layout, 1, Rect::new(400.0, 10.0, 650.0, 470.0));
+    assert_rect(&layout, 2, Rect::new(400.0, 490.0, 320.0, PROCESS));
 }
 
 // Properties over many random inputs.
@@ -1090,22 +1140,13 @@ fn random_tile(random: &mut Random, id: u32) -> TileSpec {
         Activity::Done,
         Activity::Idle,
     ]);
-    let requested = (kind == TileKind::Process && random.chance(70))
-        .then(|| Size::new(random.pixels(100, 900), random.pixels(40, 900)));
-    let fixed_chance = match kind {
-        TileKind::User => 70,
-        TileKind::Process => 35,
-        _ => 0,
-    };
-    let fixed = random
-        .chance(fixed_chance)
+    let fixed = (kind == TileKind::User && random.chance(70))
         .then(|| Size::new(random.pixels(80, 1200), random.pixels(60, 900)));
 
     TileSpec {
         id: TileId(id),
         kind,
         activity,
-        requested,
         fixed,
         pinned: random.chance(15),
         minimized: random.chance(10),
@@ -1117,13 +1158,16 @@ fn random_style(random: &mut Random) -> LayoutStyle {
         return LayoutStyle::default();
     }
 
+    let small_tile_height = 40 + random.below(461);
+
     LayoutStyle {
         gap: random.pixels(0, 24),
         padding: random.pixels(0, 24),
         orchestrator_share: f32::from(random.below(101)) / 100.0,
         min_tile: random.size(60, 400),
         min_orchestrator: random.size(100, 500),
-        small_tile_height: random.pixels(40, 500),
+        small_tile_height: f32::from(small_tile_height),
+        process_tile_height: random.pixels(40, small_tile_height),
     }
 }
 
@@ -1164,8 +1208,10 @@ fn app_case(seed: u64) -> Case {
         random.pixels(min_width, 2400),
         random.pixels(min_height, 1500),
     );
+    let small_tile_height = random.pixels(200, 400);
     let style = LayoutStyle {
-        small_tile_height: random.pixels(200, 400),
+        small_tile_height,
+        process_tile_height: (small_tile_height * 0.75).round(),
         ..LayoutStyle::default()
     };
     let tiles = random_tiles(&mut random);
@@ -1444,10 +1490,7 @@ fn boxes_without_a_size_of_their_own_are_never_taller_than_a_small_box() {
             .max(case.style.min_tile.height.max(1.0));
 
         for tile in case.tiles.iter().filter(|tile| {
-            tile.fixed.is_none()
-                && tile.requested.is_none()
-                && tile.activity != Activity::Attention
-                && Some(tile.id) != column
+            tile.fixed.is_none() && tile.activity != Activity::Attention && Some(tile.id) != column
         }) {
             let Some(rect) = layout.rect(tile.id) else {
                 continue;
@@ -1576,98 +1619,53 @@ fn random_cases_place_some_tiles() {
     assert!(placed > 2000 && attention_dropped > 0);
 }
 
-// Fixed process terminals.
+#[test]
+fn a_process_is_never_taller_than_its_box_unless_it_needs_attention() {
+    for case in cases() {
+        let layout = case.layout();
+        let wanted = case
+            .style
+            .process_tile_height
+            .max(case.style.min_tile.height.max(1.0));
 
-fn fixed_process(id: u32, fixed: Size) -> TileSpec {
-    TileSpec {
-        fixed: Some(fixed),
-        ..tile(id, TileKind::Process, Activity::Running)
+        for tile in case
+            .tiles
+            .iter()
+            .filter(|tile| tile.kind == TileKind::Process && tile.activity != Activity::Attention)
+        {
+            let Some(rect) = layout.rect(tile.id) else {
+                continue;
+            };
+
+            assert!(
+                rect.size.height <= wanted + FLOAT_TOLERANCE,
+                "{:?} is {:?} high, a process box is {wanted}",
+                tile.id,
+                rect.size.height
+            );
+        }
     }
 }
 
 #[test]
-fn fixed_process_that_fits_gets_its_exact_size() {
-    let tiles = [
-        worker(0, Activity::Working),
-        fixed_process(1, terminal_size(80, 12)),
-    ];
+fn a_process_ignores_a_fixed_size() {
+    for case in cases() {
+        let fixed = Some(Size::new(700.0, 400.0));
+        let sized = Case {
+            tiles: case
+                .tiles
+                .iter()
+                .map(|tile| TileSpec {
+                    fixed: fixed
+                        .filter(|_| tile.kind == TileKind::Process)
+                        .or(tile.fixed),
+                    ..*tile
+                })
+                .collect(),
+            area: case.area,
+            style: case.style,
+        };
 
-    let layout = layout(area(1220.0, 800.0), &tiles, &LayoutStyle::default());
-
-    assert_rect(&layout, 1, Rect::new(634.0, 10.0, 576.0, 238.0));
-}
-
-#[test]
-fn fixed_process_wider_than_the_area_is_clamped_to_it() {
-    let tiles = [fixed_process(0, Size::new(2000.0, 300.0))];
-
-    let layout = layout(area(800.0, 600.0), &tiles, &LayoutStyle::default());
-
-    assert_rect(&layout, 0, Rect::new(10.0, 10.0, 780.0, 300.0));
-}
-
-#[test]
-fn fixed_process_taller_than_the_area_is_clamped_to_it() {
-    let tiles = [fixed_process(0, Size::new(400.0, 2000.0))];
-
-    let layout = layout(area(800.0, 600.0), &tiles, &LayoutStyle::default());
-
-    assert_rect(&layout, 0, Rect::new(390.0, 10.0, 400.0, 580.0));
-}
-
-#[test]
-fn fixed_process_leaves_room_for_the_orchestrator_column() {
-    let tiles = [orchestrator(0), fixed_process(1, Size::new(2000.0, 300.0))];
-
-    let layout = layout(area(1000.0, 600.0), &tiles, &LayoutStyle::default());
-
-    assert_rect(&layout, 0, Rect::new(10.0, 10.0, 320.0, 580.0));
-    assert_rect(&layout, 1, Rect::new(340.0, 10.0, 650.0, 300.0));
-}
-
-#[test]
-fn fixed_process_never_goes_below_the_minimum_tile_size() {
-    let tiles = [fixed_process(0, Size::new(50.0, 50.0))];
-
-    let layout = layout(area(800.0, 600.0), &tiles, &LayoutStyle::default());
-
-    assert_rect(&layout, 0, Rect::new(530.0, 10.0, 260.0, 160.0));
-}
-
-#[test]
-fn fixed_process_that_would_be_squeezed_below_the_minimum_goes_to_the_tray() {
-    let tiles = [orchestrator(0), fixed_process(1, Size::new(578.0, 822.0))];
-
-    let layout = layout(area(536.0, 1218.0), &tiles, &LayoutStyle::default());
-
-    assert_rect(&layout, 0, Rect::new(10.0, 10.0, 516.0, 1198.0));
-    assert_eq!(layout.tray, tray(&[1]));
-}
-
-#[test]
-fn other_tiles_reflow_around_a_fixed_process() {
-    let tiles = [
-        worker(0, Activity::Working),
-        worker(1, Activity::Working),
-        fixed_process(2, Size::new(500.0, 300.0)),
-    ];
-
-    let layout = layout(area(1220.0, 800.0), &tiles, &LayoutStyle::default());
-
-    assert_rect(&layout, 2, Rect::new(710.0, 10.0, 500.0, 300.0));
-    assert_rect(&layout, 0, Rect::new(10.0, 10.0, 340.0, SMALL));
-    assert_rect(&layout, 1, Rect::new(360.0, 10.0, 340.0, SMALL));
-}
-
-#[test]
-fn user_terminal_is_packed_before_a_fixed_process() {
-    let tiles = [
-        fixed_process(0, Size::new(400.0, 300.0)),
-        user(1, Size::new(300.0, 200.0)),
-    ];
-
-    let layout = layout(area(1220.0, 800.0), &tiles, &LayoutStyle::default());
-
-    assert_rect(&layout, 1, Rect::new(910.0, 10.0, 300.0, 200.0));
-    assert_rect(&layout, 0, Rect::new(500.0, 10.0, 400.0, 300.0));
+        assert_eq!(sized.layout(), case.layout());
+    }
 }

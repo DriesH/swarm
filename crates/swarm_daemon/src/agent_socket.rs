@@ -197,7 +197,7 @@ fn connection(
         let written = writeln!(writer, "{}", encode(&reply)).is_ok();
 
         if let Some(after) = after {
-            after(written);
+            after(written, &|| peer_gone(&stream));
         }
         if !written {
             return Ok(());
@@ -493,7 +493,7 @@ mod tests {
             "held until the write"
         );
 
-        after.expect("work after the write")(false);
+        after.expect("work after the write")(false, &|| false);
         assert_eq!(
             messages
                 .claim(AgentId(agent))
@@ -504,7 +504,7 @@ mod tests {
         );
 
         let (_, after) = answer(&calls, &RefusalLog::default(), &request, &|| false);
-        after.expect("work after the write")(true);
+        after.expect("work after the write")(true, &|| false);
         assert!(messages.claim(AgentId(agent)).expect("claim").is_empty());
     }
 

@@ -349,10 +349,6 @@ pub(crate) struct Terminal {
     /// knows that agent.
     pub daemon_owner: Option<DaemonAgentId>,
     pub link: Option<SharedString>,
-    /// Columns and rows.
-    pub requested_size: Option<(u16, u16)>,
-    /// Columns and rows an agent fixed. The app never resizes such a terminal.
-    pub fixed_size: Option<(u16, u16)>,
     /// How a process ended. `None` while it runs. A live terminal's view knows it too.
     pub exit: Option<ExitStatus>,
     pub lines: Vec<FakeLine>,
@@ -704,9 +700,7 @@ impl Builder {
             meta,
             owner: None,
             link: None,
-            requested_size: None,
             daemon_owner: None,
-            fixed_size: None,
             exit: None,
             lines: spec.lines,
         });
@@ -743,7 +737,6 @@ impl Builder {
         task: TaskId,
         owner: AgentId,
         title: &str,
-        size: (u16, u16),
         link: Option<&str>,
         output: Vec<FakeLine>,
     ) {
@@ -761,15 +754,10 @@ impl Builder {
             id,
             kind: TerminalKind::Process,
             title: SharedString::new(title),
-            meta: Some(SharedString::from(format!(
-                "{owner_name} · {}×{}",
-                size.0, size.1
-            ))),
+            meta: Some(SharedString::from(owner_name)),
             owner: Some(owner),
             link: link.map(SharedString::new),
-            requested_size: Some(size),
             daemon_owner: None,
-            fixed_size: None,
             exit: None,
             lines: output,
         });
@@ -862,8 +850,8 @@ impl FakeData {
                     ("● pty-io asks: portable-pty or openpty?", Color::Default),
                     ("  portable-pty. Replying now.", Color::Muted),
                     ("● swarm send pty-io \"Use portable-pty.\"", Color::Default),
-                    ("◆ term-render started cargo test · 90×12", Color::Muted),
-                    ("◆ ui-tokens started pnpm dev · 80×10", Color::Muted),
+                    ("◆ term-render started cargo test", Color::Muted),
+                    ("◆ ui-tokens started pnpm dev", Color::Muted),
                     (
                         "✻ Orchestrating… (2m 14s · esc to interrupt)",
                         Color::Claude,
@@ -884,7 +872,7 @@ impl FakeData {
                     ("  88 + shape_line(row, &font, cx)", Color::Add),
                     ("  88 - paint_cell(cell, cx)", Color::Del),
                     ("● swarm terminal spawn", Color::Default),
-                    ("  \"cargo test -p swarm-term\" 90x14", Color::Muted),
+                    ("  \"cargo test -p swarm-term\"", Color::Muted),
                     ("● swarm terminal wait --exit", Color::Default),
                     ("✻ Working… 4m 02s", Color::Claude),
                 ]),
@@ -934,7 +922,6 @@ impl FakeData {
             renderer,
             term_render,
             "cargo test",
-            (90, 12),
             None,
             lines(&[
                 ("running 22 tests", Color::Default),
@@ -949,7 +936,6 @@ impl FakeData {
             renderer,
             ui_tokens,
             "pnpm dev",
-            (80, 10),
             Some("localhost:5173"),
             lines(&[
                 ("  VITE  ready in 412 ms", Color::Ok),
@@ -964,7 +950,6 @@ impl FakeData {
             renderer,
             pty_io,
             "cargo test -p swarm-term --watch",
-            (90, 12),
             None,
             lines(&[
                 ("running 14 tests", Color::Default),
@@ -976,7 +961,6 @@ impl FakeData {
             renderer,
             pty_io,
             "cargo build -p swarm-term",
-            (80, 12),
             None,
             lines(&[
                 ("   Compiling swarm-term v0.1.0", Color::Muted),
@@ -1443,9 +1427,7 @@ impl FakeData {
             meta: None,
             owner: None,
             link: None,
-            requested_size: None,
             daemon_owner: None,
-            fixed_size: None,
             exit: None,
             lines: Vec::new(),
         });
@@ -1938,7 +1920,6 @@ impl FakeData {
             entry.title = SharedString::new(title);
             entry.daemon_owner = info.owner;
             entry.owner = owner;
-            entry.fixed_size = info.fixed_size.map(|size| (size.cols, size.rows));
             entry.exit.clone_from(&info.exit);
         }
     }
@@ -2035,9 +2016,7 @@ impl FakeData {
             meta,
             owner: None,
             link: None,
-            requested_size: None,
             daemon_owner: None,
-            fixed_size: None,
             exit: None,
             lines: Vec::new(),
         });
@@ -2075,9 +2054,7 @@ impl FakeData {
             meta,
             owner: None,
             link: None,
-            requested_size: None,
             daemon_owner: None,
-            fixed_size: None,
             exit: None,
             lines,
         });
@@ -2092,6 +2069,12 @@ impl FakeData {
     pub(crate) fn set_terminal_meta(&mut self, terminal: TerminalId, meta: Option<SharedString>) {
         if let Some(entry) = self.terminals.iter_mut().find(|entry| entry.id == terminal) {
             entry.meta = meta;
+        }
+    }
+
+    pub(crate) fn set_terminal_exit(&mut self, terminal: TerminalId, exit: ExitStatus) {
+        if let Some(entry) = self.terminals.iter_mut().find(|entry| entry.id == terminal) {
+            entry.exit = Some(exit);
         }
     }
 
@@ -2252,9 +2235,7 @@ impl FakeData {
             meta: None,
             owner: None,
             link: None,
-            requested_size: None,
             daemon_owner: None,
-            fixed_size: None,
             exit: None,
             lines: terminal_lines,
         });
@@ -2871,7 +2852,7 @@ mod tests {
             task: Some("task:7".into()),
             owner: Some(DaemonAgentId(1)),
             name: Some("dev server".into()),
-            fixed_size: Some(swarm_protocol::GridSize { cols: 80, rows: 12 }),
+            fixed_size: None,
             title: None,
             cwd: None,
             exit: None,
@@ -2883,6 +2864,5 @@ mod tests {
         let orchestrator = data.task(task).and_then(|task| task.orchestrator);
         assert_eq!(entry.title.as_ref(), "dev server");
         assert_eq!(entry.owner, orchestrator);
-        assert_eq!(entry.fixed_size, Some((80, 12)));
     }
 }

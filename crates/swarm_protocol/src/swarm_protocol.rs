@@ -20,7 +20,7 @@ mod client;
 pub use client::{Client, ClientError, CommentEvent, MessageEvent, PrEvent};
 
 /// Bumped on every incompatible change; the daemon refuses other versions.
-pub const VERSION: u32 = 10;
+pub const VERSION: u32 = 11;
 
 /// The most messages [`Request::ListMessages`] returns.
 pub const MESSAGES_LISTED: usize = 500;
@@ -246,7 +246,7 @@ pub struct TerminalInfo {
     pub owner: Option<AgentId>,
     /// A label the owner gave, such as "dev server".
     pub name: Option<String>,
-    /// Set by the owner agent; the app never resizes such a terminal.
+    /// Unused: a process terminal follows its tile. The daemon sends `None`.
     pub fixed_size: Option<GridSize>,
     pub title: Option<String>,
     pub cwd: Option<PathBuf>,
@@ -482,6 +482,9 @@ pub struct ReviewComment {
     /// Milliseconds since the Unix epoch.
     pub created_at: u64,
     pub sent_at: Option<u64>,
+    /// When the message carrying it reached the orchestrator's terminal. `None` while
+    /// it waits.
+    pub delivered_at: Option<u64>,
 }
 
 /// A new comment. `parent` makes it a reply, which takes the parent's anchor.

@@ -44,6 +44,13 @@ const USER_INPUT_INTERVAL: Duration = Duration::from_secs(30);
 /// Terminal UIs treat an Enter that follows text at once as part of a paste.
 const ENTER_DELAY: Duration = Duration::from_millis(150);
 
+/// How often a paste that waits for a prompt to go away looks at the agent.
+const BLOCKED_POLL: Duration = Duration::from_millis(200);
+
+/// A line the user began holds messages back until they send it or this long after the
+/// last key.
+const DRAFT_PATIENCE: Duration = Duration::from_secs(60);
+
 pub(crate) struct AgentConfig {
     /// `<data>/agents/<id>/` holds each agent's files.
     pub(crate) data_dir: PathBuf,
@@ -143,16 +150,78 @@ struct Live {
     /// The agent asked to end its session: it stops for good instead of resuming.
     stop_requested: bool,
     typing: UserTyping,
+    /// One paste at a time, so two deliveries never interleave in the terminal.
+    paste: Arc<Mutex<()>>,
 }
 
-/// Follows what the user types into a worker's terminal.
+/// Follows what the user types into an agent's terminal.
 #[derive(Default)]
 struct UserTyping {
+    /// Workers only: the user typed since the orchestrator last heard.
     typed: bool,
     told_at: Option<Instant>,
+    /// When the user last typed into a line they have not sent yet.
+    draft_at: Option<Instant>,
+    /// A thread waits for the draft to end and then delivers again.
+    retry_pending: bool,
+}
+
+fn types_text(key: &swarm_term::Key) -> bool {
+    key.text.is_some() && !key.modifiers.control && !key.modifiers.command
 }
 
 impl UserTyping {
+    /// Follows the line the user writes. Returns true when this input sent a line
+    /// they had begun.
+    fn track_draft(&mut self, input: &TerminalInput, now: Instant) -> bool {
+        const BREAKS: [char; 2] = ['\r', '\n'];
+
+        let (written, sent) = match input {
+            // Shift or Alt with Enter adds a line to the draft.
+            TerminalInput::Key(key)
+                if matches!(key.name.as_str(), "enter" | "return")
+                    && !key.modifiers.shift
+                    && !key.modifiers.alt =>
+            {
+                (false, true)
+            }
+            TerminalInput::Key(key) => (types_text(key), false),
+            TerminalInput::Text(text) | TerminalInput::Paste(text) => (
+                text.rsplit(BREAKS)
+                    .next()
+                    .is_some_and(|last| !last.is_empty()),
+                text.contains(BREAKS),
+            ),
+            _ => return false,
+        };
+
+        if written {
+            self.draft_at = Some(now);
+
+            return false;
+        }
+
+        sent && self.draft_at.take().is_some()
+    }
+
+    /// How long the draft still holds messages back.
+    fn draft_remaining(&self, now: Instant) -> Option<Duration> {
+        let age = now.saturating_duration_since(self.draft_at?);
+
+        DRAFT_PATIENCE
+            .checked_sub(age)
+            .filter(|left| !left.is_zero())
+    }
+
+    fn drafting(&self, now: Instant) -> bool {
+        self.draft_remaining(now).is_some()
+    }
+
+    /// True once per wait: the caller starts the thread that retries.
+    fn begin_retry(&mut self) -> bool {
+        !std::mem::replace(&mut self.retry_pending, true)
+    }
+
     /// Returns true on the first Enter after typing, unless the orchestrator heard
     /// less than [`USER_INPUT_INTERVAL`] ago.
     fn observe(&mut self, input: &TerminalInput, now: Instant) -> bool {
@@ -160,10 +229,7 @@ impl UserTyping {
             TerminalInput::Key(key) if matches!(key.name.as_str(), "enter" | "return") => {
                 (false, true)
             }
-            TerminalInput::Key(key) => (
-                key.text.is_some() && !key.modifiers.control && !key.modifiers.command,
-                false,
-            ),
+            TerminalInput::Key(key) => (types_text(key), false),
             TerminalInput::Text(text) | TerminalInput::Paste(text) => (
                 !text.trim_end_matches(['\r', '\n']).is_empty(),
                 text.ends_with(['\r', '\n']),
@@ -208,6 +274,26 @@ enum Waiting {
 }
 
 impl Live {
+    /// Whether unread messages may be typed into the agent now: its state allows it and
+    /// the user is not in the middle of a line.
+    fn takes_messages(&self, now: Instant) -> bool {
+        self.accepts_messages() && !self.typing.drafting(now)
+    }
+
+    /// Claude Code queues what is typed during a turn. Codex is not known to, so it
+    /// waits for idle. A blocked agent never gets text: its prompt would take it.
+    fn accepts_messages(&self) -> bool {
+        if !self.delivery_open {
+            return false;
+        }
+
+        match self.merge.status() {
+            AgentStatus::Idle | AgentStatus::Done => true,
+            AgentStatus::Working => self.info.kind == AgentKind::ClaudeCode,
+            AgentStatus::Unknown | AgentStatus::Blocked(_) | AgentStatus::Error => false,
+        }
+    }
+
     fn signal_ready(&self, ready: Ready) {
         if let Some(sender) = &self.ready
             && sender.send(ready).is_err()
@@ -240,8 +326,6 @@ pub(crate) struct Agents {
     clients: Arc<Clients>,
     messages: Arc<Messages>,
     live: Mutex<HashMap<AgentId, Live>>,
-    /// One paste at a time, so two deliveries never interleave in a terminal.
-    paste: Mutex<()>,
     /// Told when an agent's process ended.
     on_end: Mutex<Vec<EndObserver>>,
     /// Tasks being closed: nothing new starts in them, and their agents end quietly.
@@ -269,7 +353,6 @@ impl Agents {
             clients,
             messages,
             live: Mutex::default(),
-            paste: Mutex::new(()),
             on_end: Mutex::default(),
             closing: Mutex::default(),
         })
@@ -425,6 +508,7 @@ impl Agents {
                 delivery_open: true,
                 stop_requested: false,
                 typing: UserTyping::default(),
+                paste: Arc::default(),
             },
         );
 
@@ -469,33 +553,44 @@ impl Agents {
     /// The user typed or pasted into a terminal: a notice on the agent in it no longer
     /// applies, and the orchestrator hears when the user typed into a worker (ADR 0002).
     /// Resizes, focus and scrollback requests only show the terminal; they change nothing.
-    pub(crate) fn app_input(self: &Arc<Self>, terminal: TerminalId, input: &TerminalInput) {
+    ///
+    /// Returns the agent whose unsent line this input sent. Call
+    /// [`Self::deliver_unread`] for it once the input reached the terminal, so the
+    /// messages come after the line.
+    pub(crate) fn app_input(
+        self: &Arc<Self>,
+        terminal: TerminalId,
+        input: &TerminalInput,
+    ) -> Option<AgentId> {
         if !matches!(
             input,
             TerminalInput::Key(_) | TerminalInput::Text(_) | TerminalInput::Paste(_)
         ) {
-            return;
+            return None;
         }
 
-        let typed_into = lock(&self.live)
+        let (id, role) = lock(&self.live)
             .values()
             .find(|agent| agent.info.terminal == Some(terminal))
-            .map(|agent| (agent.info.id, agent.info.role));
-        let Some((id, role)) = typed_into else {
-            return;
-        };
+            .map(|agent| (agent.info.id, agent.info.role))?;
 
         self.update(id, |live| live.merge.app_input());
 
-        if role != AgentRole::Worker {
-            return;
-        }
-        let told = lock(&self.live)
-            .get_mut(&id)
-            .is_some_and(|live| live.typing.observe(input, Instant::now()));
+        let (told, sent) = {
+            let mut live = lock(&self.live);
+            let agent = live.get_mut(&id)?;
+            let now = Instant::now();
+
+            let sent = agent.typing.track_draft(input, now);
+            let told = role == AgentRole::Worker && agent.typing.observe(input, now);
+
+            (told, sent)
+        };
         if told {
             self.user_typed(id);
         }
+
+        sent.then_some(id)
     }
 
     fn user_typed(self: &Arc<Self>, worker: AgentId) {
@@ -740,6 +835,8 @@ impl Agents {
             return;
         };
 
+        self.messages.clear_queued(id);
+
         agent.merge.fail(message);
         agent.info.lifecycle = AgentLifecycle::Stopped;
         agent.info.ended_at = Some(unix_millis());
@@ -796,6 +893,7 @@ impl Agents {
 
         let outcome = agent.merge.hook(event);
         agent.screen = None;
+        self.end_queue_if_stopped(agent);
 
         if let Some(session_id) = outcome.session_id {
             if agent.session_id.as_deref() != Some(session_id.as_str()) {
@@ -820,7 +918,7 @@ impl Agents {
         }
         drop(live);
 
-        if outcome.stopped {
+        if outcome.stopped || outcome.changed {
             self.deliver_unread(id);
         }
     }
@@ -893,27 +991,41 @@ impl Agents {
             _ => false,
         });
 
-        if matches!(output, TerminalOutput::ProgramStatus(report) if report.state == ProgramState::Idle)
-        {
+        if matches!(
+            output,
+            TerminalOutput::ProgramStatus(report)
+                if matches!(report.state, ProgramState::Idle | ProgramState::Working)
+        ) {
             self.deliver_unread(id);
         }
     }
 
-    /// Pastes the agent's unread messages into its terminal when it is idle and its
-    /// first message went in. They count as delivered once the paste reached the terminal.
+    /// Pastes the agent's unread messages into its terminal when it can take them (see
+    /// [`Live::takes_messages`]). They count as delivered once the paste reached the
+    /// terminal.
     pub(crate) fn deliver_unread(self: &Arc<Self>, id: AgentId) {
-        let terminal = {
-            let live = lock(&self.live);
-            let Some(agent) = live.get(&id) else {
+        let (terminal, paste) = {
+            let mut live = lock(&self.live);
+            let Some(agent) = live.get_mut(&id) else {
                 return;
             };
 
-            let idle = matches!(agent.merge.status(), AgentStatus::Idle | AgentStatus::Done);
-            if !agent.delivery_open || !idle {
+            if !agent.accepts_messages() || self.messages.is_waiting(id) {
                 return;
             }
 
-            agent.info.terminal
+            if agent.typing.drafting(Instant::now()) {
+                let retry = agent.typing.begin_retry();
+                drop(live);
+
+                if retry {
+                    self.retry_after_draft(id);
+                }
+
+                return;
+            }
+
+            (agent.info.terminal, Arc::clone(&agent.paste))
         };
         let Some(hub) = terminal.and_then(|terminal| self.terminals.get(terminal)) else {
             return;
@@ -933,10 +1045,30 @@ impl Agents {
         let spawned = thread::Builder::new()
             .name(format!("deliver-{}", id.0))
             .spawn(move || {
-                let _one_paste = lock(&agents.paste);
+                let _one_paste = lock(&paste);
+
+                // Waiting for the paste lock took time: the agent may be blocked by now, the
+                // user may have begun a line, or a `wait` may take the messages.
+                if !agents.begin_paste(id) {
+                    claim.release();
+                    // A line the user began meanwhile needs its retry timer.
+                    agents.deliver_unread(id);
+
+                    return;
+                }
 
                 let typed = hub.send_input(TerminalInput::Paste(render_inbox(claim.messages())));
                 sleep_for(ENTER_DELAY);
+
+                // A prompt that opened since the paste would take this Enter as its answer.
+                // The text stays in the input box: keep the claim and press Enter once the
+                // prompt is gone, so the messages are not pasted a second time.
+                if typed && !wait_out_block(|| agents.waiting(id), BLOCKED_POLL) {
+                    log::warn!("agent {} ended before its messages were sent", id.0);
+                    claim.release();
+
+                    return;
+                }
 
                 if !typed || !hub.send_input(TerminalInput::Text("\r".to_owned())) {
                     log::warn!("agent {} ended before its messages arrived", id.0);
@@ -951,10 +1083,75 @@ impl Agents {
         }
     }
 
+    /// Run with the paste lock held. False when the agent no longer takes messages or
+    /// sits in a `wait`. A paste into a working agent lands in its input queue; the
+    /// agent's next `wait` then ends at once (see [`Messages::begin_paste`]).
+    fn begin_paste(&self, id: AgentId) -> bool {
+        let live = lock(&self.live);
+        let Some(agent) = live.get(&id) else {
+            return false;
+        };
+
+        if !agent.takes_messages(Instant::now()) {
+            return false;
+        }
+
+        let working = agent.merge.status() == AgentStatus::Working;
+
+        self.messages.begin_paste(id, working)
+    }
+
+    /// Delivers again once the user's line no longer holds messages back. One thread
+    /// per agent: later calls while it runs do nothing.
+    fn retry_after_draft(self: &Arc<Self>, id: AgentId) {
+        let agents = Arc::clone(self);
+        let spawned = thread::Builder::new()
+            .name(format!("draft-{}", id.0))
+            .spawn(move || {
+                while let Some(left) = agents.draft_remaining(id) {
+                    sleep_for(left);
+                }
+
+                agents.deliver_unread(id);
+            });
+
+        if let Err(error) = spawned {
+            log::error!("cannot start the draft thread: {error}");
+            self.update(id, |live| {
+                live.typing.retry_pending = false;
+
+                false
+            });
+        }
+    }
+
+    /// How long the agent's draft still holds messages back. When there is none, the
+    /// retry thread is done.
+    fn draft_remaining(&self, id: AgentId) -> Option<Duration> {
+        let mut live = lock(&self.live);
+        let agent = live.get_mut(&id)?;
+
+        let left = agent.typing.draft_remaining(Instant::now());
+        if left.is_none() {
+            agent.typing.retry_pending = false;
+        }
+
+        left
+    }
+
+    /// The paste queue of an agent that reads its input again is empty.
+    fn end_queue_if_stopped(&self, agent: &Live) {
+        if matches!(agent.merge.status(), AgentStatus::Idle | AgentStatus::Done) {
+            self.messages.clear_queued(agent.info.id);
+        }
+    }
+
     fn exited(self: &Arc<Self>, id: AgentId, exit: Option<&ExitStatus>) {
         let Some(mut agent) = lock(&self.live).remove(&id) else {
             return;
         };
+
+        self.messages.clear_queued(id);
 
         agent.merge.process_exited(exit);
         agent.info.terminal = None;
@@ -987,6 +1184,8 @@ impl Agents {
         if change(agent) {
             self.publish(agent);
         }
+
+        self.end_queue_if_stopped(agent);
     }
 
     fn publish(&self, agent: &mut Live) {
@@ -1023,6 +1222,18 @@ fn wait_until_ready(
                 Waiting::Other => return true,
             },
             Err(flume::RecvTimeoutError::Disconnected) => return false,
+        }
+    }
+}
+
+/// Waits while the agent is blocked, looking every `poll`. Returns false when the agent
+/// ended first. There is no time limit: a permission prompt can wait for the user.
+fn wait_out_block(waiting: impl Fn() -> Waiting, poll: Duration) -> bool {
+    loop {
+        match waiting() {
+            Waiting::Gone => return false,
+            Waiting::Blocked => sleep_for(poll),
+            Waiting::Other => return true,
         }
     }
 }
@@ -1270,6 +1481,125 @@ mod tests {
         ));
     }
 
+    fn live(kind: AgentKind, state: ProgramState) -> Live {
+        let mut merge = StatusMerge::default();
+        merge.program_status(&swarm_term::ProgramStatus {
+            state,
+            message: None,
+        });
+
+        Live {
+            info: AgentInfo {
+                id: AgentId(1),
+                project: ProjectId(1),
+                task: Some(TaskId(1)),
+                role: AgentRole::Orchestrator,
+                kind,
+                model: "model".to_owned(),
+                name: "orchestrator".to_owned(),
+                worktree: PathBuf::from("/repo"),
+                branch: "main".to_owned(),
+                terminal: Some(TerminalId(1)),
+                status: AgentStatus::Unknown,
+                message: None,
+                lifecycle: AgentLifecycle::Running,
+                revision: 0,
+                created_at: 0,
+                started_at: None,
+                ended_at: None,
+            },
+            plan: Plan {
+                kind,
+                role: AgentRole::Orchestrator,
+                model: "model".to_owned(),
+                command: "agent".to_owned(),
+                skip_permissions: false,
+            },
+            token: String::new(),
+            merge,
+            session_id: None,
+            session_confirmed: false,
+            screen: None,
+            ready: None,
+            delivery_open: true,
+            stop_requested: false,
+            typing: UserTyping::default(),
+            paste: Arc::default(),
+        }
+    }
+
+    #[test]
+    fn claude_code_takes_messages_while_idle_done_or_working() {
+        for state in [
+            ProgramState::Idle,
+            ProgramState::Done,
+            ProgramState::Working,
+        ] {
+            assert!(
+                live(AgentKind::ClaudeCode, state).takes_messages(Instant::now()),
+                "{state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_takes_messages_only_while_idle_or_done() {
+        let now = Instant::now();
+
+        assert!(live(AgentKind::Codex, ProgramState::Idle).takes_messages(now));
+        assert!(live(AgentKind::Codex, ProgramState::Done).takes_messages(now));
+        assert!(!live(AgentKind::Codex, ProgramState::Working).takes_messages(now));
+    }
+
+    #[test]
+    fn no_agent_takes_messages_while_blocked_in_error_or_unknown() {
+        let blocked = [
+            ProgramState::Blocked(swarm_term::BlockedKind::Permission),
+            ProgramState::Blocked(swarm_term::BlockedKind::Question),
+            ProgramState::Blocked(swarm_term::BlockedKind::Auth),
+            ProgramState::Blocked(swarm_term::BlockedKind::Other),
+            ProgramState::Error,
+            ProgramState::Clear,
+        ];
+
+        for kind in [AgentKind::ClaudeCode, AgentKind::Codex] {
+            for state in blocked {
+                assert!(
+                    !live(kind, state).takes_messages(Instant::now()),
+                    "{kind:?} {state:?}"
+                );
+            }
+
+            let mut silent = live(kind, ProgramState::Idle);
+            silent.merge = StatusMerge::default();
+            assert!(
+                !silent.takes_messages(Instant::now()),
+                "{kind:?} before any report"
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_is_typed_before_the_first_message_went_in() {
+        let mut agent = live(AgentKind::ClaudeCode, ProgramState::Idle);
+        agent.delivery_open = false;
+
+        assert!(!agent.takes_messages(Instant::now()));
+    }
+
+    #[test]
+    fn a_notice_blocks_delivery_until_the_agent_works_again() {
+        let mut agent = live(AgentKind::ClaudeCode, ProgramState::Working);
+        agent.merge.notify("look here");
+        assert!(!agent.takes_messages(Instant::now()));
+
+        agent.merge.program_status(&swarm_term::ProgramStatus {
+            state: ProgramState::Working,
+            message: None,
+        });
+        assert!(agent.takes_messages(Instant::now()));
+    }
+
     #[test]
     fn sleep_for_waits_the_whole_time() {
         let start = Instant::now();
@@ -1362,6 +1692,163 @@ mod tests {
         assert!(typing.observe(&typed("a\r"), start));
         assert!(!typing.observe(&typed("b\r"), start + Duration::from_secs(29)));
         assert!(typing.observe(&typed("c\r"), start + Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn typing_starts_a_draft_and_enter_ends_it() {
+        let mut typing = UserTyping::default();
+        let now = Instant::now();
+
+        assert!(!typing.track_draft(&key("a", Some("a")), now));
+        assert!(typing.drafting(now));
+
+        assert!(typing.track_draft(&key("enter", None), now));
+        assert!(!typing.drafting(now));
+    }
+
+    #[test]
+    fn an_enter_without_a_draft_sends_nothing() {
+        let mut typing = UserTyping::default();
+
+        assert!(!typing.track_draft(&key("enter", None), Instant::now()));
+        assert!(!typing.track_draft(&typed("\r"), Instant::now()));
+    }
+
+    #[test]
+    fn a_line_break_in_text_ends_the_draft_unless_more_text_follows() {
+        let now = Instant::now();
+
+        for (text, ends) in [("ls\r", true), ("a\nb\n", true), ("a\nb", false)] {
+            let mut typing = UserTyping::default();
+            typing.track_draft(&typed("half"), now);
+
+            assert_eq!(typing.track_draft(&typed(text), now), ends, "{text:?}");
+            assert_eq!(typing.drafting(now), !ends, "{text:?}");
+        }
+
+        let mut typing = UserTyping::default();
+        typing.track_draft(&TerminalInput::Paste("first\nsecond".to_owned()), now);
+        assert!(typing.drafting(now));
+    }
+
+    #[test]
+    fn shift_or_alt_with_enter_keeps_the_draft() {
+        let now = Instant::now();
+
+        for (shift, alt) in [(true, false), (false, true)] {
+            let mut typing = UserTyping::default();
+            typing.track_draft(&typed("half"), now);
+
+            let enter = TerminalInput::Key(swarm_term::Key {
+                name: "enter".to_owned(),
+                modifiers: swarm_term::Modifiers {
+                    shift,
+                    alt,
+                    ..swarm_term::Modifiers::default()
+                },
+                text: None,
+                repeat: false,
+            });
+
+            assert!(!typing.track_draft(&enter, now), "{shift} {alt}");
+            assert!(typing.drafting(now), "{shift} {alt}");
+        }
+    }
+
+    #[test]
+    fn keys_that_type_nothing_do_not_start_a_draft() {
+        let mut typing = UserTyping::default();
+        let now = Instant::now();
+
+        typing.track_draft(&key("up", None), now);
+        typing.track_draft(&TerminalInput::Focus(true), now);
+
+        assert!(!typing.drafting(now));
+    }
+
+    #[test]
+    fn a_draft_holds_messages_back_for_sixty_seconds_after_the_last_key() {
+        let mut typing = UserTyping::default();
+        let start = Instant::now();
+
+        typing.track_draft(&typed("a"), start);
+        typing.track_draft(&typed("b"), start + Duration::from_secs(30));
+
+        assert!(typing.drafting(start + Duration::from_secs(89)));
+        assert!(!typing.drafting(start + Duration::from_secs(90)));
+        assert_eq!(
+            typing.draft_remaining(start + Duration::from_secs(80)),
+            Some(Duration::from_secs(10))
+        );
+    }
+
+    #[test]
+    fn nothing_is_typed_into_a_line_the_user_is_writing() {
+        let mut agent = live(AgentKind::ClaudeCode, ProgramState::Idle);
+        let start = Instant::now();
+        agent.typing.track_draft(&typed("half"), start);
+
+        assert!(!agent.takes_messages(start + Duration::from_secs(59)));
+        assert!(agent.takes_messages(start + DRAFT_PATIENCE));
+
+        agent.typing.track_draft(&key("enter", None), start);
+        assert!(agent.takes_messages(start + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn the_draft_retry_starts_once() {
+        let mut typing = UserTyping::default();
+
+        assert!(typing.begin_retry());
+        assert!(!typing.begin_retry());
+
+        typing.retry_pending = false;
+        assert!(typing.begin_retry());
+    }
+
+    #[test]
+    fn a_blocked_agent_is_waited_out_without_a_time_limit() {
+        let polls = std::sync::atomic::AtomicU32::new(0);
+
+        let ended = wait_out_block(
+            || {
+                if polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
+                    Waiting::Blocked
+                } else {
+                    Waiting::Other
+                }
+            },
+            Duration::from_millis(1),
+        );
+
+        assert!(ended);
+        assert_eq!(polls.load(std::sync::atomic::Ordering::Relaxed), 6);
+    }
+
+    #[test]
+    fn an_agent_that_ends_while_blocked_ends_the_wait_with_false() {
+        let polls = std::sync::atomic::AtomicU32::new(0);
+
+        let ended = wait_out_block(
+            || {
+                if polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2 {
+                    Waiting::Blocked
+                } else {
+                    Waiting::Gone
+                }
+            },
+            Duration::from_millis(1),
+        );
+
+        assert!(!ended);
+    }
+
+    #[test]
+    fn an_agent_that_is_not_blocked_is_not_waited_for() {
+        let start = Instant::now();
+
+        assert!(wait_out_block(|| Waiting::Other, Duration::from_secs(5)));
+        assert!(start.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

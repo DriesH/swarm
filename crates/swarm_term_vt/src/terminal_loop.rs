@@ -264,6 +264,18 @@ impl TerminalLoop {
                 self.send(TerminalOutput::History { from, rows });
                 self.dirty = true;
             }
+            TerminalInput::Scroll {
+                lines,
+                column,
+                row,
+                keys,
+            } => {
+                let bytes = self.emulator.encode_scroll(lines, column, row, keys)?;
+
+                if !bytes.is_empty() {
+                    self.pty.write(bytes);
+                }
+            }
             TerminalInput::Focus(focused) => {
                 if let Some(bytes) = self.emulator.focus_report(focused)? {
                     self.pty.write(bytes);
