@@ -528,3 +528,58 @@ fn escape_dismisses_a_toast_only_while_focus_is_in_it(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("tab escape");
     assert_eq!(entries(&log), ["dismiss"]);
 }
+
+struct OverlapHarness {
+    log: Log,
+}
+
+impl Render for OverlapHarness {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let tile = Rc::clone(&self.log);
+
+        gpui::div()
+            .id("overlap-root")
+            .relative()
+            .size_full()
+            .child(
+                gpui::div()
+                    .id("tile")
+                    .w(px(700.))
+                    .h(px(300.))
+                    .debug_selector(|| "tile".to_owned())
+                    .on_click(move |_, _, _| tile.borrow_mut().push("tile".to_owned())),
+            )
+            .child(
+                gpui::div().absolute().top_0().left_0().child(
+                    Toast::new("toast", "terminal-renderer", "Ready for review")
+                        .debug_selector(|| "toast".to_owned()),
+                ),
+            )
+    }
+}
+
+#[gpui::test]
+fn a_click_on_the_toast_does_not_reach_the_tile_under_it(cx: &mut TestAppContext) {
+    cx.update(swarm_ui::init);
+
+    let log = Log::default();
+    let shared = Rc::clone(&log);
+    let (_, cx) = cx.add_window_view(move |_, _| OverlapHarness { log: shared });
+    cx.run_until_parked();
+
+    let toast = cx.debug_bounds("toast").expect("the toast is on screen");
+    let on_the_toast = toast.origin + point(px(4.), px(4.));
+    let beside_the_toast = point(toast.right() + px(40.), toast.top() + px(4.));
+
+    cx.simulate_click(on_the_toast, Modifiers::none());
+    cx.run_until_parked();
+    assert!(entries(&log).is_empty(), "the click went through the toast");
+
+    cx.simulate_click(beside_the_toast, Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        entries(&log),
+        ["tile"],
+        "the tile takes clicks beside the toast"
+    );
+}

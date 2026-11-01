@@ -285,9 +285,9 @@ mod tests {
     fn a_drawn_icon_is_kept_for_the_next_frame() {
         let app = TestAppContext::single();
         app.update(|cx| {
-            let first = drawn_icon(FileIconName::Toml, ThemeKind::Dark, px(16.), 2., cx);
-            let again = drawn_icon(FileIconName::Toml, ThemeKind::Dark, px(16.), 2., cx);
-            let other_size = drawn_icon(FileIconName::Toml, ThemeKind::Dark, px(14.), 2., cx);
+            let first = drawn_icon(FileIconName::Json, ThemeKind::Dark, px(16.), 2., cx);
+            let again = drawn_icon(FileIconName::Json, ThemeKind::Dark, px(16.), 2., cx);
+            let other_size = drawn_icon(FileIconName::Json, ThemeKind::Dark, px(14.), 2., cx);
 
             assert!(matches!((&first, &again), (Some(a), Some(b)) if Arc::ptr_eq(a, b)));
             assert!(matches!((&first, &other_size), (Some(a), Some(b)) if !Arc::ptr_eq(a, b)));

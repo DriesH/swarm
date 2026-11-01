@@ -1,8 +1,8 @@
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, App, BoxShadow, ClickEvent, ElementId, FontWeight, Role, SharedString, Window,
-    black, point, px,
+    AnyElement, App, BoxShadow, ClickEvent, ElementId, FocusHandle, FontWeight, Role, SharedString,
+    Window, black, point, px,
 };
 
 use crate::component::{Component, example, example_group};
@@ -11,12 +11,14 @@ use crate::traits::ClickHandler;
 use crate::{Dismiss, TOAST_CONTEXT};
 
 type DismissHandler = Rc<dyn Fn(&mut Window, &mut App) + 'static>;
+type HoverHandler = Box<dyn Fn(bool, &mut Window, &mut App) + 'static>;
 
 /// A short message that appears over the window: a title, one line of status, an optional
 /// action and a dismiss button.
 ///
 /// It is a status region named "title, message". The action and the dismiss button are
-/// ordinary buttons in the tab order, and Escape dismisses it while focus is inside.
+/// ordinary buttons in the tab order, and Escape dismisses it while focus is inside. It
+/// blocks the mouse, so a click on it never reaches what is under it.
 #[derive(IntoElement)]
 #[must_use]
 pub struct Toast {
@@ -27,6 +29,8 @@ pub struct Toast {
     leading: Option<AnyElement>,
     action: Option<(SharedString, ClickHandler)>,
     on_dismiss: Option<DismissHandler>,
+    on_hover: Option<HoverHandler>,
+    focus_handle: Option<FocusHandle>,
     debug_selector: Option<String>,
 }
 
@@ -47,6 +51,8 @@ impl Toast {
             leading: None,
             action: None,
             on_dismiss: None,
+            on_hover: None,
+            focus_handle: None,
             debug_selector: None,
         }
     }
@@ -76,6 +82,19 @@ impl Toast {
     /// Called by the dismiss button and by Escape while focus is in the toast.
     pub fn on_dismiss(mut self, handler: impl Fn(&mut Window, &mut App) + 'static) -> Self {
         self.on_dismiss = Some(Rc::new(handler));
+        self
+    }
+
+    /// Called when the pointer enters or leaves the toast.
+    pub fn on_hover(mut self, handler: impl Fn(bool, &mut Window, &mut App) + 'static) -> Self {
+        self.on_hover = Some(Box::new(handler));
+        self
+    }
+
+    /// Tracks focus for the whole toast: `handle.contains_focused` is true while focus is on
+    /// the toast or in it.
+    pub fn track_focus(mut self, handle: &FocusHandle) -> Self {
+        self.focus_handle = Some(handle.clone());
         self
     }
 
@@ -151,6 +170,13 @@ impl RenderOnce for Toast {
                     .key_context(TOAST_CONTEXT)
                     .on_action(move |_: &Dismiss, window, cx| handler(window, cx))
             })
+            .when_some(self.focus_handle, |toast, handle| {
+                toast.track_focus(&handle)
+            })
+            .when_some(self.on_hover, |toast, handler| {
+                toast.on_hover(move |hovered, window, cx| handler(*hovered, window, cx))
+            })
+            .occlude()
             .w(px(TOAST_WIDTH))
             .gap(px(12.))
             .p(px(12.))

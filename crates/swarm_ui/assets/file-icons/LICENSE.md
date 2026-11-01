@@ -11,7 +11,7 @@ The SVG files in this folder are icons from vscode-icons.
 
 - **The files:** nothing. Each SVG is a byte-for-byte copy of the file with the same name in the `icons` folder of the repository.
 - **How Swarm draws them:** it rasterizes each SVG to the size of the row on screen. The SVG files are not edited.
-- **Which icons:** Swarm uses a small subset, chosen by hand.
+- **Which icons:** Swarm uses a small subset, chosen by hand. The TOML and dotenv icons are not included: they are project logos.
 
 ## License of these files
 
@@ -21,7 +21,7 @@ These files stay under CC BY-SA 4.0. The license of the Swarm source code does n
 
 Only generic glyphs: no product, company or project logo. A file that vscode-icons shows with a logo, such as a Rust, TypeScript, Python or Docker file, gets the default file icon in Swarm. A folder that has only a logo icon, such as `crates`, `node_modules` or `.github`, gets the default folder icon.
 
-Left out although it is a generic format: `pdf` (it shows the Adobe Acrobat mark). There is no generic lock-file icon in vscode-icons, so lock files get the default file icon.
+Left out although it is a generic format: `pdf` (it shows the Adobe Acrobat mark), `toml` (it shows the TOML project logo) and `env` (it shows the dotenv project logo). Those files get the generic config icon (the gear). There is no generic lock-file icon in vscode-icons, so lock files get the default file icon.
 
 ## Files and why they are not logos
 
@@ -39,7 +39,6 @@ Dark-theme files are used in the dark theme, and `light` files in the light them
 - `file_type_db.svg`: a stack of disks, the generic database symbol.
 - `file_type_light_db.svg`: the same stack, drawn for light themes.
 - `file_type_diff.svg`: a red minus above a green plus.
-- `file_type_dotenv.svg`: the text ".ENV" on a yellow square.
 - `file_type_font.svg`: the letters "Aa".
 - `file_type_light_font.svg`: the letters "Aa", drawn for light themes.
 - `file_type_image.svg`: a picture with a mountain and a sun.
@@ -56,8 +55,6 @@ Dark-theme files are used in the dark theme, and `light` files in the light them
 - `file_type_shell.svg`: a terminal window with a prompt.
 - `file_type_sql.svg`: a stack of yellow disks, the generic database symbol.
 - `file_type_text.svg`: a page with lines of text.
-- `file_type_toml.svg`: the letter "T" in square brackets.
-- `file_type_light_toml.svg`: the same, drawn for light themes.
 - `file_type_video.svg`: a film strip with a play triangle.
 - `file_type_xml.svg`: orange angle brackets and a slash.
 - `file_type_yaml.svg`: the word "YAML" in yellow letters, the name of the format.

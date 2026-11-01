@@ -66,7 +66,6 @@ file_icons! {
     Csv => "file_type_csv";
     Db => "file_type_db", "file_type_light_db";
     Diff => "file_type_diff";
-    Dotenv => "file_type_dotenv";
     Font => "file_type_font", "file_type_light_font";
     Image => "file_type_image";
     Ini => "file_type_ini", "file_type_light_ini";
@@ -80,7 +79,6 @@ file_icons! {
     Shell => "file_type_shell";
     Sql => "file_type_sql";
     Text => "file_type_text";
-    Toml => "file_type_toml", "file_type_light_toml";
     Video => "file_type_video";
     Xml => "file_type_xml";
     Yaml => "file_type_yaml", "file_type_light_yaml";
@@ -200,11 +198,10 @@ fn by_extension(extension: &str) -> Option<FileIconName> {
         | "scptd" | "so" => FileIconName::Binary,
         "cer" | "crl" | "crt" | "csr" | "der" | "p12" | "p7b" | "p7r" | "pfx" | "src" | "sst"
         | "stl" => FileIconName::Cert,
-        "plist" | "properties" => FileIconName::Config,
+        "env" | "plist" | "properties" | "toml" => FileIconName::Config,
         "csv" | "tsv" => FileIconName::Csv,
         "db" => FileIconName::Db,
         "diff" => FileIconName::Diff,
-        "env" => FileIconName::Dotenv,
         "eot" | "otf" | "pfa" | "pfb" | "sfd" | "ttf" | "woff" | "woff2" => FileIconName::Font,
         "bmp" | "gif" | "heic" | "icns" | "ico" | "jpeg" | "jpg" | "png" | "tiff" | "webp" => {
             FileIconName::Image
@@ -219,7 +216,6 @@ fn by_extension(extension: &str) -> Option<FileIconName> {
         "bash" | "fish" | "ksh" | "sh" | "zsh" => FileIconName::Shell,
         "sql" => FileIconName::Sql,
         "txt" => FileIconName::Text,
-        "toml" => FileIconName::Toml,
         "3g2" | "3gp" | "amv" | "asf" | "avi" | "divx" | "f4a" | "f4b" | "f4p" | "f4v" | "flv"
         | "m2v" | "m4v" | "mk3d" | "mkv" | "mov" | "mp2" | "mp4" | "mpe" | "mpeg" | "mpeg2"
         | "mpg" | "mpv" | "nsv" | "ogv" | "qt" | "rm" | "rmvb" | "svi" | "vob" | "webm" | "wmv" => {
@@ -318,7 +314,7 @@ mod tests {
     fn extensions_pick_the_icon() {
         for (name, icon) in [
             ("settings.json", Json),
-            ("Cargo.toml", Toml),
+            ("Cargo.toml", Config),
             ("ci.yml", Yaml),
             ("ci.yaml", Yaml),
             ("data.csv", Csv),
@@ -337,7 +333,7 @@ mod tests {
             ("app.ini", Ini),
             ("change.patch", Patch),
             ("change.diff", Diff),
-            (".env", Dotenv),
+            (".env", Config),
             ("data.db", Db),
         ] {
             assert_eq!(FileIconName::for_file(name), icon, "{name}");
@@ -384,8 +380,33 @@ mod tests {
     #[test]
     fn a_logo_file_name_uses_the_icon_of_its_extension() {
         assert_eq!(FileIconName::for_file("package.json"), Json);
-        assert_eq!(FileIconName::for_file("Cargo.toml"), Toml);
+        assert_eq!(FileIconName::for_file("Cargo.toml"), Config);
         assert_eq!(FileIconName::for_file("docker-compose.yml"), Yaml);
+    }
+
+    #[test]
+    fn toml_and_env_files_get_the_generic_config_icon() {
+        for name in [
+            "Cargo.toml",
+            "pyproject.TOML",
+            ".env",
+            ".ENV",
+            "prod.env",
+            ".config/settings.toml",
+        ] {
+            assert_eq!(FileIconName::for_file(name), Config, "{name}");
+        }
+    }
+
+    #[test]
+    fn no_logo_file_is_in_the_assets() {
+        for logo in [
+            "file_type_toml.svg",
+            "file_type_light_toml.svg",
+            "file_type_dotenv.svg",
+        ] {
+            assert!(!assets().join(logo).exists(), "{logo} is a logo");
+        }
     }
 
     #[test]

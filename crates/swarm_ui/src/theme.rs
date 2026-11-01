@@ -23,7 +23,7 @@ impl Appearance {
     }
 }
 
-/// The accent color: working status, links and the focus ring.
+/// The accent color: links, selection and the focus ring. Status colors do not follow it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Accent {
     #[default]
@@ -92,9 +92,12 @@ pub struct ThemeColors {
     pub muted: Hsla,
     /// Tertiary text: meta, counts, section titles.
     pub faint: Hsla,
-    /// Working status, links, focus ring.
+    /// Links and the focus ring. Follows the accent the user picked.
     pub accent: Hsla,
     pub accent_bg: Hsla,
+    /// Working status. Always blue, so it never matches `warn` (Blocked).
+    pub working: Hsla,
+    pub working_bg: Hsla,
     /// Selected text in a text field.
     pub selection: Hsla,
     /// Done status and success.
@@ -154,6 +157,8 @@ impl ThemeColors {
             faint,
             accent,
             accent_bg,
+            working,
+            working_bg,
             selection,
             ok,
             ok_bg,
@@ -191,6 +196,8 @@ impl ThemeColors {
             ("faint", *faint),
             ("accent", *accent),
             ("accent_bg", *accent_bg),
+            ("working", *working),
+            ("working_bg", *working_bg),
             ("selection", *selection),
             ("ok", *ok),
             ("ok_bg", *ok_bg),
@@ -250,6 +257,8 @@ impl Theme {
                 faint: rgb(0x878790).into(),
                 accent: rgb(0x6e9bff).into(),
                 accent_bg: rgba(0x6e9bff21).into(),
+                working: rgb(0x6e9bff).into(),
+                working_bg: rgba(0x6e9bff21).into(),
                 selection: rgba(0x6e9bff59).into(),
                 ok: rgb(0x4ac26b).into(),
                 ok_bg: rgba(0x4ac26b1f).into(),
@@ -312,6 +321,8 @@ impl Theme {
                 faint: rgb(0x696971).into(),  // #6b6b74
                 accent: rgb(0x285acb).into(), // #2f6bf0
                 accent_bg: rgba(0x2f6bf017).into(),
+                working: rgb(0x285acb).into(),
+                working_bg: rgba(0x2f6bf017).into(),
                 selection: rgba(0x285acb40).into(),
                 ok: rgb(0x176f30).into(), // #1a7f36
                 ok_bg: rgba(0x1a7f361a).into(),
@@ -360,6 +371,7 @@ impl Theme {
 
     /// The theme with the accent's tokens. Blue is the base; Honey is amber, dark enough
     /// in light mode for text to pass WCAG AA on every surface and on its own tint.
+    /// Status tokens (`working`, `warn`, `ok`, `del`) stay as they are.
     #[must_use]
     pub fn with_accent(mut self, accent: Accent) -> Self {
         if accent == Accent::Blue {
@@ -627,6 +639,7 @@ mod tests {
                 ("muted", colors.muted),
                 ("faint", colors.faint),
                 ("accent", colors.accent),
+                ("working", colors.working),
                 ("ok", colors.ok),
                 ("warn", colors.warn),
                 ("add", colors.add),
@@ -638,6 +651,10 @@ mod tests {
             // Status pills and diff counts sit on a tint over a surface.
             for (text, tint) in [
                 (("accent", colors.accent), ("accent_bg", colors.accent_bg)),
+                (
+                    ("working", colors.working),
+                    ("working_bg", colors.working_bg),
+                ),
                 (("warn", colors.warn), ("warn_bg", colors.warn_bg)),
                 (("ok", colors.ok), ("ok_bg", colors.ok_bg)),
                 (("add", colors.add), ("add_bg", colors.add_bg)),
@@ -787,6 +804,7 @@ mod tests {
                 ("muted", colors.muted),
                 ("faint", colors.faint),
                 ("accent", colors.accent),
+                ("working", colors.working),
                 ("ok", colors.ok),
                 ("warn", colors.warn),
             ] {
