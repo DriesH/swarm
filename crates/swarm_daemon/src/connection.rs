@@ -191,6 +191,7 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
             });
         }
         request @ (Request::TaskDiff { .. }
+        | Request::FileHunks { .. }
         | Request::ApproveTask { .. }
         | Request::CheckClose { .. }
         | Request::CloseTask { .. }) => handle_review(services, sink, request),
@@ -310,6 +311,24 @@ fn handle_review(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Requ
                         let diff = send.then_some(diff);
 
                         sink.send_event(&Event::TaskDiff { call, diff });
+                    }
+                    Err(error) => send_error(sink, call, &error),
+                }
+            });
+        }
+        Request::FileHunks {
+            call,
+            task,
+            source,
+            worktree,
+            path,
+        } => {
+            // Not behind `begin_diff`: loading a file never waits for a diff refresh.
+            let projects = Arc::clone(projects);
+            run_slow(sink, "file-hunks", call, move |sink| {
+                match projects.file_hunks(task, source, &worktree, &path) {
+                    Ok(file) => {
+                        sink.send_event(&Event::FileHunks { call, file });
                     }
                     Err(error) => send_error(sink, call, &error),
                 }

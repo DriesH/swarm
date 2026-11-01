@@ -44,6 +44,25 @@ actions!(
     ]
 );
 
+actions!(
+    file_tree,
+    [
+        /// Moves the cursor of a file tree to the row above.
+        TreePrevious,
+        /// Moves the cursor of a file tree to the row below.
+        TreeNext,
+        /// Closes the folder under the cursor, or moves to its parent.
+        TreeCollapse,
+        /// Opens the folder under the cursor, or moves to its first row.
+        TreeExpand,
+        /// Opens the file under the cursor in the diff, or opens or closes the folder.
+        TreeActivate
+    ]
+);
+
+/// Key context of a file tree, which is one stop for Tab and moves a cursor with the arrows.
+pub(crate) const FILE_TREE_CONTEXT: &str = "FileTree";
+
 /// Key context of the Review view.
 pub(crate) const REVIEW_CONTEXT: &str = "Review";
 
@@ -93,6 +112,7 @@ pub(crate) fn bind_keys(cx: &mut App) {
 
     let review = Some(REVIEW_KEYS);
     let body = Some(BODY_KEYS);
+    let tree = Some(FILE_TREE_CONTEXT);
     bindings.extend([
         KeyBinding::new("j", NextFile, review),
         KeyBinding::new("k", PreviousFile, review),
@@ -100,6 +120,12 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new("c", CommentOnLine, review),
         KeyBinding::new("up", PreviousLine, body),
         KeyBinding::new("down", NextLine, body),
+        KeyBinding::new("up", TreePrevious, tree),
+        KeyBinding::new("down", TreeNext, tree),
+        KeyBinding::new("left", TreeCollapse, tree),
+        KeyBinding::new("right", TreeExpand, tree),
+        KeyBinding::new("enter", TreeActivate, tree),
+        KeyBinding::new("space", TreeActivate, tree),
         KeyBinding::new("escape", CancelComment, Some(COMPOSER_CONTEXT)),
         KeyBinding::new("escape", CancelReply, Some(REPLY_CONTEXT)),
     ]);

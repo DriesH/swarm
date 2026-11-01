@@ -905,9 +905,39 @@ impl Workspace {
 
     /// Keeps a diff the daemon sent, and redraws when it differs from the one known.
     pub(crate) fn apply_diff(&mut self, diff: TaskDiff, cx: &mut Context<Self>) {
+        let (task, source) = (diff.task, diff.source);
+
         if self.data.store_diff(diff) {
+            self.reload_changed_files(task, source, cx);
             cx.notify();
         }
+    }
+
+    /// Asks the daemon for a diff without saying which one the app has, so its answer
+    /// decides: it replaces the stored diff when it differs.
+    pub(crate) fn refresh_diff(
+        &mut self,
+        task: swarm_protocol::TaskId,
+        source: ReviewSource,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.daemon.clone().filter(Client::is_connected) else {
+            return;
+        };
+        let asking = cx.background_spawn(async move { client.task_diff(task, source, None) });
+
+        cx.spawn(async move |this, cx| match asking.await {
+            Ok(Some(diff)) => {
+                let applied = this.update(cx, |workspace, cx| workspace.apply_diff(diff, cx));
+
+                if let Err(error) = applied {
+                    log::debug!("the window closed before the diff arrived: {error}");
+                }
+            }
+            Ok(None) => {}
+            Err(error) => log::debug!("cannot read the task diff: {error}"),
+        })
+        .detach();
     }
 
     fn poll_changes(cx: &mut Context<Self>) -> gpui::Task<()> {
@@ -1772,6 +1802,10 @@ pub(crate) mod tests {
             Request::TaskDiff { call, .. } => Some(Event::TaskDiff {
                 call: *call,
                 diff: None,
+            }),
+            Request::FileHunks { call, .. } => Some(Event::FileHunks {
+                call: *call,
+                file: None,
             }),
             Request::ListComments { call, .. } => Some(Event::Comments {
                 call: *call,
@@ -4415,6 +4449,8 @@ pub(crate) mod tests {
                 }],
             }],
             truncated: false,
+            digest: 0,
+            fold: None,
         }];
         workspace.update(cx, |workspace, cx| {
             workspace.data.store_diff(diff);
@@ -5071,5 +5107,531 @@ pub(crate) mod tests {
         assert!(opened);
         assert!(!lines.is_empty());
         assert!(rows.iter().all(|row| row.label() != "Close task"));
+    }
+    /// What the daemon answers when it is asked for the lines of a file.
+    enum Answer {
+        File(Box<swarm_protocol::FileDiff>),
+        Gone,
+        Fail(&'static str),
+    }
+
+    type FileRequests = flume::Receiver<(ReviewSource, PathBuf, PathBuf)>;
+
+    /// The `known` fingerprint of each request for the task diff.
+    type DiffAsked = flume::Receiver<Option<u64>>;
+
+    /// A daemon that answers each request for a file's lines with the next `Answer` it is
+    /// handed, and reports what it was asked.
+    fn file_daemon() -> (PathBuf, FileRequests, flume::Sender<Answer>) {
+        let (socket, requests, answer, ..) = file_daemon_with_diffs();
+
+        (socket, requests, answer)
+    }
+
+    /// Like `file_daemon`, and answers a request for the task diff with the next diff it is
+    /// handed, else with none.
+    fn file_daemon_with_diffs() -> (
+        PathBuf,
+        FileRequests,
+        flume::Sender<Answer>,
+        DiffAsked,
+        flume::Sender<TaskDiff>,
+    ) {
+        let (asked, requests) = flume::unbounded();
+        let (answer, answers) = flume::unbounded::<Answer>();
+        let (diff_asked, diff_requests) = flume::unbounded();
+        let (fresh, fresh_diffs) = flume::unbounded::<TaskDiff>();
+        let socket = fake_daemon_replying(move |request| match request {
+            Request::FileHunks {
+                call,
+                source,
+                worktree,
+                path,
+                ..
+            } => {
+                asked.send((source, worktree, path)).ok();
+
+                Some(match answers.recv() {
+                    Ok(Answer::File(file)) => Event::FileHunks {
+                        call,
+                        file: Some(*file),
+                    },
+                    Ok(Answer::Fail(message)) => Event::Error {
+                        call: Some(call),
+                        id: None,
+                        message: message.into(),
+                    },
+                    Ok(Answer::Gone) | Err(_) => Event::FileHunks { call, file: None },
+                })
+            }
+            Request::TaskDiff { call, known, .. } => {
+                diff_asked.send(known).ok();
+
+                Some(Event::TaskDiff {
+                    call,
+                    diff: fresh_diffs.try_recv().ok(),
+                })
+            }
+            _ => None,
+        });
+
+        (socket, requests, answer, diff_requests, fresh)
+    }
+
+    fn lock_file(digest: u64, text: Option<&str>) -> swarm_protocol::FileDiff {
+        let lines = text.map(|text| swarm_protocol::DiffHunk {
+            old_start: 1,
+            old_lines: 0,
+            new_start: 1,
+            new_lines: 1,
+            section: String::new(),
+            lines: vec![swarm_protocol::DiffLine {
+                kind: swarm_protocol::DiffLineKind::Added,
+                text: text.into(),
+            }],
+        });
+
+        swarm_protocol::FileDiff {
+            worktree: PathBuf::from("/wt"),
+            path: PathBuf::from("Cargo.lock"),
+            agent: None,
+            change: swarm_protocol::FileChange::Modified,
+            mode_change: None,
+            additions: 600,
+            deletions: 12,
+            binary: false,
+            hunks: lines.into_iter().collect(),
+            truncated: false,
+            digest,
+            fold: Some(swarm_protocol::Fold::Lock),
+        }
+    }
+
+    fn folded_diff(fingerprint: u64, digest: u64) -> TaskDiff {
+        let mut diff = diff_of(7, ReviewSource::Live, fingerprint);
+
+        diff.files = vec![lock_file(digest, None)];
+        diff.stat.files = 1;
+
+        diff
+    }
+
+    /// Review on a Live diff with one folded file, behind a daemon that answers with `Answer`.
+    fn folded_review<'a>(
+        socket: &std::path::Path,
+        cx: &'a mut TestAppContext,
+    ) -> (
+        Entity<Workspace>,
+        Entity<crate::review_view::ReviewView>,
+        &'a mut VisualTestContext,
+        Client,
+    ) {
+        let (workspace, cx, client) = real_task_workspace(socket, cx);
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.data.store_diff(folded_diff(1, 5));
+            workspace.set_view(View::Review, cx);
+            workspace.set_review_source(ReviewSource::Live, cx);
+        });
+        redraw(cx);
+        let review = workspace.read_with(cx, |workspace, _| workspace.review.clone());
+
+        (workspace, review, cx, client)
+    }
+
+    fn lines_of_the_file(workspace: &Entity<Workspace>, cx: &VisualTestContext) -> Vec<String> {
+        workspace.read_with(cx, |workspace, _| {
+            workspace
+                .data
+                .diffs
+                .get(&(DaemonTaskId(7), ReviewSource::Live))
+                .and_then(|diff| diff.files.first())
+                .map(|file| {
+                    file.hunks
+                        .iter()
+                        .flat_map(|hunk| hunk.lines.iter().map(|line| line.text.clone()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+    }
+
+    fn rows_of_the_file(
+        review: &Entity<crate::review_view::ReviewView>,
+        cx: &VisualTestContext,
+    ) -> usize {
+        review.read_with(cx, |review, _| {
+            review
+                .rows()
+                .iter()
+                .filter(|row| row.file() == Some(0))
+                .count()
+        })
+    }
+
+    fn load_of(
+        review: &Entity<crate::review_view::ReviewView>,
+        cx: &VisualTestContext,
+    ) -> Option<crate::review_model::FileLoad> {
+        review.read_with(cx, |review, _| review.load_of(0))
+    }
+
+    /// Draws without running the tasks that wait on the daemon, which would wait for the test.
+    fn draw_only(cx: &mut VisualTestContext) {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+
+    fn show_the_file(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) {
+        workspace.update(cx, |workspace, cx| {
+            workspace.show_file_diff(PathBuf::from("/wt"), PathBuf::from("Cargo.lock"), cx);
+        });
+    }
+
+    #[gpui::test]
+    fn show_diff_asks_the_daemon_once_reads_loading_and_then_shows_the_lines(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::review_model::FileLoad;
+
+        let (socket, requests, answer) = file_daemon();
+        let (workspace, review, cx, _client) = folded_review(&socket, cx);
+        let before = (rows_of_the_file(&review, cx), load_of(&review, cx));
+
+        show_the_file(&workspace, cx);
+        show_the_file(&workspace, cx);
+        draw_only(cx);
+        let waiting = (rows_of_the_file(&review, cx), load_of(&review, cx));
+
+        answer
+            .send(Answer::File(Box::new(lock_file(5, Some("lock = 1")))))
+            .ok();
+        let shown = wait_until(cx, |cx| {
+            redraw(cx);
+            load_of(&review, cx) == Some(FileLoad::Loaded)
+        });
+
+        assert_eq!(before, (1, None));
+        assert_eq!(waiting, (1, Some(FileLoad::Loading)));
+        assert!(shown, "the lines never arrived");
+        assert_eq!(requests.try_iter().count(), 1, "more than one request");
+        assert!(rows_of_the_file(&review, cx) > 1);
+        assert_eq!(lines_of_the_file(&workspace, cx), ["lock = 1"]);
+        assert!(cx.debug_bounds("review-fold-0").is_some(), "the tag went");
+        assert!(cx.debug_bounds("review-show-diff-0").is_none());
+    }
+
+    #[gpui::test]
+    fn a_refresh_with_the_same_digest_keeps_the_lines_without_a_new_request(
+        cx: &mut TestAppContext,
+    ) {
+        let (socket, requests, answer) = file_daemon();
+        let (workspace, review, cx, _client) = folded_review(&socket, cx);
+        answer
+            .send(Answer::File(Box::new(lock_file(5, Some("lock = 1")))))
+            .ok();
+        click_selector("review-show-diff-0", cx);
+        let loaded = wait_until(cx, |cx| {
+            redraw(cx);
+            !lines_of_the_file(&workspace, cx).is_empty()
+        });
+        requests.try_iter().for_each(drop);
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.apply_diff(folded_diff(2, 5), cx);
+        });
+        redraw(cx);
+        let settled = wait_until(cx, |cx| {
+            redraw(cx);
+            workspace.read_with(cx, |workspace, _| {
+                workspace
+                    .data
+                    .diffs
+                    .get(&(DaemonTaskId(7), ReviewSource::Live))
+                    .is_some_and(|diff| diff.fingerprint == 2)
+            })
+        });
+        wait_a_little();
+        redraw(cx);
+
+        assert!(loaded && settled);
+        assert_eq!(lines_of_the_file(&workspace, cx), ["lock = 1"]);
+        assert!(rows_of_the_file(&review, cx) > 1);
+        assert_eq!(requests.try_iter().count(), 0, "a new request went out");
+    }
+
+    #[gpui::test]
+    fn a_changed_digest_shows_loading_until_the_new_lines_arrive(cx: &mut TestAppContext) {
+        use crate::review_model::FileLoad;
+
+        let (socket, requests, answer) = file_daemon();
+        let (workspace, review, cx, _client) = folded_review(&socket, cx);
+        answer
+            .send(Answer::File(Box::new(lock_file(5, Some("old")))))
+            .ok();
+        click_selector("review-show-diff-0", cx);
+        wait_until(cx, |cx| {
+            redraw(cx);
+            !lines_of_the_file(&workspace, cx).is_empty()
+        });
+        requests.try_iter().for_each(drop);
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.apply_diff(folded_diff(2, 6), cx);
+        });
+        draw_only(cx);
+        let while_loading = (
+            lines_of_the_file(&workspace, cx),
+            rows_of_the_file(&review, cx),
+            load_of(&review, cx),
+        );
+
+        answer
+            .send(Answer::File(Box::new(lock_file(6, Some("new")))))
+            .ok();
+        let again = wait_until(cx, |cx| {
+            redraw(cx);
+            lines_of_the_file(&workspace, cx) == ["new"]
+        });
+
+        assert!(
+            while_loading.0.is_empty(),
+            "the old lines stayed in the card"
+        );
+        assert_eq!(while_loading.1, 1);
+        assert_eq!(while_loading.2, Some(FileLoad::Loading));
+        assert!(again, "the new lines never arrived");
+        assert_eq!(requests.try_iter().count(), 1, "one new request per change");
+        assert_eq!(load_of(&review, cx), Some(FileLoad::Loaded));
+        assert!(rows_of_the_file(&review, cx) > 1);
+    }
+
+    #[gpui::test]
+    fn a_failed_reload_shows_the_error_and_the_button_instead_of_the_old_lines(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::review_model::FileLoad;
+
+        let (socket, requests, answer) = file_daemon();
+        let (workspace, review, cx, _client) = folded_review(&socket, cx);
+        answer
+            .send(Answer::File(Box::new(lock_file(5, Some("old")))))
+            .ok();
+        click_selector("review-show-diff-0", cx);
+        wait_until(cx, |cx| {
+            redraw(cx);
+            !lines_of_the_file(&workspace, cx).is_empty()
+        });
+        answer.send(Answer::Fail("the file is locked")).ok();
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.apply_diff(folded_diff(2, 6), cx);
+        });
+        let failed = wait_until(cx, |cx| {
+            redraw(cx);
+            matches!(load_of(&review, cx), Some(FileLoad::Failed(_)))
+        });
+
+        assert!(failed, "the reload never failed");
+        assert_eq!(
+            load_of(&review, cx),
+            Some(FileLoad::Failed("the file is locked".into()))
+        );
+        assert!(lines_of_the_file(&workspace, cx).is_empty());
+        assert_eq!(rows_of_the_file(&review, cx), 1);
+        assert!(cx.debug_bounds("review-load-error-0").is_some(), "no error");
+        assert!(cx.debug_bounds("review-show-diff-0").is_some(), "no button");
+
+        answer
+            .send(Answer::File(Box::new(lock_file(6, Some("new")))))
+            .ok();
+        click_selector("review-show-diff-0", cx);
+        let loaded = wait_until(cx, |cx| {
+            redraw(cx);
+            load_of(&review, cx) == Some(FileLoad::Loaded)
+        });
+
+        assert!(loaded);
+        assert_eq!(requests.try_iter().count(), 3);
+        assert_eq!(lines_of_the_file(&workspace, cx), ["new"]);
+    }
+
+    #[gpui::test]
+    fn an_answer_for_an_older_digest_is_dropped_and_the_file_loads_again(cx: &mut TestAppContext) {
+        use crate::review_model::FileLoad;
+
+        let (socket, requests, answer) = file_daemon();
+        let (workspace, review, cx, _client) = folded_review(&socket, cx);
+        answer
+            .send(Answer::File(Box::new(lock_file(5, Some("old")))))
+            .ok();
+        answer
+            .send(Answer::File(Box::new(lock_file(6, Some("new")))))
+            .ok();
+
+        show_the_file(&workspace, cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.apply_diff(folded_diff(2, 6), cx);
+        });
+        let shown = wait_until(cx, |cx| {
+            redraw(cx);
+            load_of(&review, cx) == Some(FileLoad::Loaded)
+        });
+
+        assert!(shown, "the lines never arrived");
+        assert_eq!(
+            lines_of_the_file(&workspace, cx),
+            ["new"],
+            "the old answer landed in the new card"
+        );
+        assert_eq!(requests.try_iter().count(), 2, "no second request");
+    }
+
+    #[gpui::test]
+    fn a_failed_load_shows_the_error_keeps_the_button_and_can_be_tried_again(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::review_model::FileLoad;
+
+        let (socket, requests, answer) = file_daemon();
+        let (workspace, review, cx, _client) = folded_review(&socket, cx);
+        answer.send(Answer::Fail("the file is locked")).ok();
+
+        click_selector("review-show-diff-0", cx);
+        let failed = wait_until(cx, |cx| {
+            redraw(cx);
+            matches!(load_of(&review, cx), Some(FileLoad::Failed(_)))
+        });
+
+        assert!(failed);
+        assert_eq!(
+            load_of(&review, cx),
+            Some(FileLoad::Failed("the file is locked".into()))
+        );
+        assert!(cx.debug_bounds("review-load-error-0").is_some(), "no error");
+        assert!(cx.debug_bounds("review-show-diff-0").is_some(), "no button");
+        assert_eq!(rows_of_the_file(&review, cx), 1);
+
+        answer
+            .send(Answer::File(Box::new(lock_file(5, Some("lock = 1")))))
+            .ok();
+        click_selector("review-show-diff-0", cx);
+        let loaded = wait_until(cx, |cx| {
+            redraw(cx);
+            load_of(&review, cx) == Some(FileLoad::Loaded)
+        });
+
+        assert!(loaded);
+        assert_eq!(requests.try_iter().count(), 2);
+        assert_eq!(lines_of_the_file(&workspace, cx), ["lock = 1"]);
+        assert!(cx.debug_bounds("review-load-error-0").is_none());
+    }
+
+    fn stored_diff(
+        workspace: &Entity<Workspace>,
+        cx: &VisualTestContext,
+    ) -> Option<(u64, usize, u32)> {
+        workspace.read_with(cx, |workspace, _| {
+            workspace
+                .data
+                .diffs
+                .get(&(DaemonTaskId(7), ReviewSource::Live))
+                .map(|diff| (diff.fingerprint, diff.files.len(), diff.stat.files))
+        })
+    }
+
+    #[gpui::test]
+    fn a_file_the_daemon_does_not_have_fails_the_load_and_the_fresh_diff_decides(
+        cx: &mut TestAppContext,
+    ) {
+        let (socket, _requests, answer, diff_asked, fresh) = file_daemon_with_diffs();
+        let (workspace, review, cx, _client) = folded_review(&socket, cx);
+        let mut without_it = diff_of(7, ReviewSource::Live, 2);
+        without_it.stat.files = 0;
+        fresh.send(without_it).ok();
+        answer.send(Answer::Gone).ok();
+
+        click_selector("review-show-diff-0", cx);
+        let replaced = wait_until(cx, |cx| {
+            redraw(cx);
+            stored_diff(&workspace, cx) == Some((2, 0, 0))
+        });
+
+        assert!(replaced, "the fresh diff never replaced the stored one");
+        assert_eq!(diff_asked.try_iter().collect::<Vec<_>>(), [None]);
+        assert_eq!(rows_of_the_file(&review, cx), 0);
+    }
+
+    #[gpui::test]
+    fn a_file_the_daemon_does_not_have_leaves_the_stored_diff_alone(cx: &mut TestAppContext) {
+        use crate::review_model::FileLoad;
+
+        let (socket, _requests, answer, diff_asked, fresh) = file_daemon_with_diffs();
+        let (workspace, review, cx, _client) = folded_review(&socket, cx);
+        fresh.send(folded_diff(1, 5)).ok();
+        answer.send(Answer::Gone).ok();
+
+        click_selector("review-show-diff-0", cx);
+        let asked = wait_until(cx, |cx| {
+            redraw(cx);
+            !diff_asked.is_empty()
+        });
+        wait_a_little();
+        redraw(cx);
+
+        assert!(asked, "no fresh diff was asked for");
+        assert_eq!(diff_asked.try_iter().collect::<Vec<_>>(), [None]);
+        assert_eq!(stored_diff(&workspace, cx), Some((1, 1, 1)));
+        assert_eq!(
+            load_of(&review, cx),
+            Some(FileLoad::Failed("No longer in the diff".into()))
+        );
+        assert_eq!(rows_of_the_file(&review, cx), 1);
+        assert!(cx.debug_bounds("review-load-error-0").is_some(), "no error");
+        assert!(cx.debug_bounds("review-show-diff-0").is_some(), "no button");
+    }
+
+    #[gpui::test]
+    fn a_load_that_ends_after_its_task_closed_leaves_no_entry_behind(cx: &mut TestAppContext) {
+        use crate::review_model::AfterLoad;
+
+        let (workspace, cx, _client) = real_task_workspace(&fake_daemon(), cx);
+        let key = (
+            DaemonTaskId(7),
+            ReviewSource::Live,
+            PathBuf::from("/wt"),
+            PathBuf::from("Cargo.lock"),
+        );
+
+        let (next, left) = workspace.update(cx, |workspace, _| {
+            workspace.data.store_diff(folded_diff(1, 5));
+            workspace.data.loaded.begin(&key, 5);
+            let task = workspace.active_task;
+            workspace.data.remove_task(task);
+
+            let next = workspace
+                .data
+                .finish_load(&key, Ok(Some(lock_file(5, Some("late")))));
+
+            (next, workspace.data.loaded.loads(&folded_diff(1, 5)))
+        });
+
+        assert_eq!(next, AfterLoad::Nothing);
+        assert!(left.is_empty(), "an entry came back for the closed task");
+    }
+
+    #[gpui::test]
+    fn the_default_fake_daemon_answers_a_file_request(cx: &mut TestAppContext) {
+        let socket = fake_daemon();
+        let (_workspace, cx, client) = real_task_workspace(&socket, cx);
+        cx.executor().allow_parking();
+
+        let answer = client.file_hunks(
+            DaemonTaskId(7),
+            ReviewSource::Live,
+            PathBuf::from("/wt"),
+            PathBuf::from("Cargo.lock"),
+        );
+
+        assert_eq!(answer.ok(), Some(None));
     }
 }

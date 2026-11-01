@@ -8,7 +8,7 @@ pub use crate::components::{
     Dropdown, Icon, IconButton, IconButtonSize, IconName, IconSize, Kbd, Label, LabelSize, ListRow,
     Menu, MenuItem, OutputBlock, Panel, PanelRow, PopoverMenu, ProjectTile, ResizeHandle,
     SegmentedControl, StatusDot, StatusPill, StatusRing, Switch, Tab, TabBar, TabStrip, Tag,
-    TagTone, TextArea, TextInput, TextInputEvent, TileFrame, TrayChip, TrayMore,
+    TagTone, TextArea, TextInput, TextInputEvent, TileFrame, TrayChip, TrayMore, TreeRow,
 };
 pub use crate::styles::{Color, h_flex, v_flex};
 pub use crate::theme::ActiveTheme;

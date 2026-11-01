@@ -227,7 +227,7 @@ impl Workspace {
             let workspace = workspace.clone();
             |cx| ReviewView::new(workspace, cx)
         });
-        let changes_list = cx.new(|_| ChangesList::new(workspace));
+        let changes_list = cx.new(|cx| ChangesList::new(workspace, cx));
         let preview = cx.new(|_| TerminalPreview::new());
         let preview_subscription = cx.subscribe(&preview, |this, _, _: &Clicked, cx| {
             this.focus_selected_terminal(cx);
@@ -397,6 +397,10 @@ impl Workspace {
 
     /// Opens the panel, or closes it when it is already open.
     pub(crate) fn toggle_panel(&mut self, panel: RightPanel, cx: &mut Context<Self>) {
+        if panel == RightPanel::Changes && self.view == View::Review {
+            return;
+        }
+
         self.right_panel = if self.panel_in(View::Terminals) == Some(panel) {
             None
         } else {
@@ -522,8 +526,8 @@ impl Workspace {
         Some(size)
     }
 
-    /// The right panel to show. A Start or Plan task and the Swarm view have none, but the
-    /// choice is kept.
+    /// The right panel to show. A Start or Plan task and the Swarm view have none, and
+    /// Review has no Changes panel, but the choice is kept.
     pub(crate) fn visible_panel(&self) -> Option<RightPanel> {
         self.panel_in(self.view)
     }
@@ -534,12 +538,19 @@ impl Workspace {
         }
 
         // A task that is not approved has no pull request panel: Changes shows instead.
-        match self.right_panel {
+        let panel = match self.right_panel {
             Some(RightPanel::PullRequest) if !self.pr_available(self.active_task) => {
                 Some(RightPanel::Changes)
             }
             panel => panel,
+        };
+
+        // The file tree of Review lists the changes already.
+        if view == View::Review && panel == Some(RightPanel::Changes) {
+            return None;
         }
+
+        panel
     }
 }
 
@@ -926,5 +937,79 @@ mod tests {
 
         assert_eq!(on_start, (None, Some(RightPanel::Changes)));
         assert_eq!(on_task, Some(RightPanel::Changes));
+    }
+    #[gpui::test]
+    fn the_changes_panel_does_not_show_in_review_but_the_choice_comes_back(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = setup(cx);
+        redraw(cx);
+        let terminals = workspace.read_with(cx, |workspace, _| workspace.visible_panel());
+        let drawn_in_terminals = cx.debug_bounds("changes-tree").is_some();
+
+        workspace.update(cx, |workspace, cx| workspace.set_view(View::Review, cx));
+        redraw(cx);
+        let (review, choice) = workspace.read_with(cx, |workspace, _| {
+            (workspace.visible_panel(), workspace.right_panel)
+        });
+        let drawn_in_review = cx.debug_bounds("changes-tree").is_some();
+
+        workspace.update(cx, |workspace, cx| workspace.set_view(View::Terminals, cx));
+        redraw(cx);
+        let back = workspace.read_with(cx, |workspace, _| workspace.visible_panel());
+        let drawn_again = cx.debug_bounds("changes-tree").is_some();
+
+        assert_eq!(terminals, Some(RightPanel::Changes));
+        assert!(drawn_in_terminals);
+        assert_eq!((review, choice), (None, Some(RightPanel::Changes)));
+        assert!(!drawn_in_review, "Review drew the Changes panel");
+        assert_eq!(back, Some(RightPanel::Changes));
+        assert!(drawn_again);
+    }
+
+    #[gpui::test]
+    fn toggling_changes_does_nothing_in_review_and_files_still_opens(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        workspace.update(cx, |workspace, cx| workspace.set_view(View::Review, cx));
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_panel(RightPanel::Changes, cx);
+        });
+        let kept = workspace.read_with(cx, |workspace, _| workspace.right_panel);
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_panel(RightPanel::Files, cx);
+        });
+        let files = workspace.read_with(cx, |workspace, _| workspace.visible_panel());
+        workspace.update(cx, |workspace, cx| workspace.set_view(View::Terminals, cx));
+        let in_terminals = workspace.read_with(cx, |workspace, _| workspace.visible_panel());
+
+        assert_eq!(kept, Some(RightPanel::Changes));
+        assert_eq!(files, Some(RightPanel::Files));
+        assert_eq!(in_terminals, Some(RightPanel::Files));
+    }
+
+    #[gpui::test]
+    fn the_pull_request_panel_still_shows_in_review(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        workspace.update(cx, |workspace, cx| {
+            let task = workspace.active_task;
+            let fingerprint = workspace.data.merged_fingerprint(task);
+
+            if let Some(entry) = workspace
+                .data
+                .tasks
+                .iter_mut()
+                .find(|entry| entry.id == task)
+            {
+                entry.approved = fingerprint;
+            }
+            workspace.data.comments.clear();
+            workspace.right_panel = Some(RightPanel::PullRequest);
+            workspace.set_view(View::Review, cx);
+        });
+
+        let panel = workspace.read_with(cx, |workspace, _| workspace.visible_panel());
+
+        assert_eq!(panel, Some(RightPanel::PullRequest));
     }
 }

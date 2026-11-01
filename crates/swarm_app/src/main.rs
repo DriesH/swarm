@@ -3,6 +3,7 @@
 mod actions;
 mod close_task;
 mod daemon;
+mod file_tree;
 mod markdown;
 mod model;
 mod new_task;

@@ -20,6 +20,7 @@ pub enum IconName {
     Diff,
     ExternalLink,
     File,
+    Folder,
     Lock,
     Minimize,
     Minus,
@@ -58,7 +59,7 @@ macro_rules! fill_icon {
 }
 
 impl IconName {
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 26] = [
         Self::Agent,
         Self::Bee,
         Self::Branch,
@@ -71,6 +72,7 @@ impl IconName {
         Self::Diff,
         Self::ExternalLink,
         Self::File,
+        Self::Folder,
         Self::Lock,
         Self::Minimize,
         Self::Minus,
@@ -100,6 +102,7 @@ impl IconName {
             Self::Diff => "diff",
             Self::ExternalLink => "external_link",
             Self::File => "file",
+            Self::Folder => "folder",
             Self::Lock => "lock",
             Self::Minimize => "minimize",
             Self::Minus => "minus",
@@ -151,6 +154,10 @@ impl IconName {
             Self::File => stroke_icon!(
                 "1.8",
                 r#"<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/>"#
+            ),
+            Self::Folder => stroke_icon!(
+                "1.8",
+                r#"<path d="M3 7a2 2 0 0 1 2-2h4.2a2 2 0 0 1 1.5.7L12 7h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>"#
             ),
             Self::Lock => stroke_icon!(
                 "1.9",

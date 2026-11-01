@@ -2,7 +2,7 @@
 
 use std::cmp::Reverse;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -10,8 +10,8 @@ use std::rc::Rc;
 use gpui::SharedString;
 use swarm_protocol::{
     AgentId as DaemonAgentId, CommentAnchor, CommentEvent, CommentId, CommentState, DiffHunk,
-    DiffLine, DiffLineKind, DiffSide, DiffStat, FileChange, FileDiff, NewComment, ReviewComment,
-    ReviewSource, TaskDiff, TaskId,
+    DiffLine, DiffLineKind, DiffSide, DiffStat, FileChange, FileDiff, Fold, NewComment,
+    ReviewComment, ReviewSource, TaskDiff, TaskId,
 };
 
 use crate::model::AgentKind;
@@ -19,18 +19,34 @@ use crate::model::AgentKind;
 /// The worktree and the path inside it: what tells two changed files apart.
 pub(crate) type FileKey = (PathBuf, PathBuf);
 
+/// Where the lines of a folded file stand, once the user asked for them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FileLoad {
+    /// The daemon is sending the lines.
+    Loading,
+    /// The last try failed, with a short reason.
+    Failed(SharedString),
+    /// The lines are in the diff.
+    Loaded,
+}
+
+/// The loads of one diff, by file.
+pub(crate) type FileLoads = HashMap<FileKey, FileLoad>;
+
+/// True while a file shows as one header row: it came folded and its lines are not loaded.
+pub(crate) fn is_folded(file: &FileDiff, loads: &FileLoads) -> bool {
+    file.fold.is_some()
+        && !matches!(
+            loads.get(&(file.worktree.clone(), file.path.clone())),
+            Some(FileLoad::Loaded)
+        )
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum DiffStyle {
     #[default]
     Unified,
     Split,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum Grouping {
-    #[default]
-    ByAgent,
-    ByFolder,
 }
 
 /// An agent of the open task, as the file lists name it.
@@ -41,24 +57,6 @@ pub(crate) struct AgentLabel {
     pub kind: AgentKind,
 }
 
-pub(crate) const OTHER_CHANGES: &str = "Other changes";
-pub(crate) const ROOT_FOLDER: &str = "Repository root";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum GroupKind {
-    Agent(AgentKind),
-    Folder,
-    Other,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct FileGroup {
-    pub title: SharedString,
-    pub kind: GroupKind,
-    /// Indexes into [`TaskDiff::files`], in diff order.
-    pub files: Vec<usize>,
-}
-
 /// The files to show: all of them, or those of one agent.
 pub(crate) fn visible_files(diff: &TaskDiff, agent: Option<DaemonAgentId>) -> Vec<usize> {
     diff.files
@@ -66,90 +64,6 @@ pub(crate) fn visible_files(diff: &TaskDiff, agent: Option<DaemonAgentId>) -> Ve
         .enumerate()
         .filter(|(_, file)| agent.is_none() || file.agent == agent)
         .map(|(index, _)| index)
-        .collect()
-}
-
-/// Groups the files by the agent that touched them, or by their folder. Files no known
-/// agent touched go in "Other changes", last.
-pub(crate) fn group_files(
-    files: &[FileDiff],
-    visible: &[usize],
-    grouping: Grouping,
-    agents: &[AgentLabel],
-) -> Vec<FileGroup> {
-    match grouping {
-        Grouping::ByAgent => group_by_agent(files, visible, agents),
-        Grouping::ByFolder => group_by_folder(files, visible),
-    }
-}
-
-fn group_by_agent(files: &[FileDiff], visible: &[usize], agents: &[AgentLabel]) -> Vec<FileGroup> {
-    let mut groups: Vec<FileGroup> = Vec::new();
-    let mut other = Vec::new();
-
-    for agent in agents {
-        let owned: Vec<usize> = visible
-            .iter()
-            .copied()
-            .filter(|index| files.get(*index).is_some_and(|f| f.agent == Some(agent.id)))
-            .collect();
-
-        if !owned.is_empty() {
-            groups.push(FileGroup {
-                title: agent.name.clone(),
-                kind: GroupKind::Agent(agent.kind),
-                files: owned,
-            });
-        }
-    }
-
-    for index in visible {
-        let known = files
-            .get(*index)
-            .and_then(|file| file.agent)
-            .is_some_and(|id| agents.iter().any(|agent| agent.id == id));
-
-        if !known {
-            other.push(*index);
-        }
-    }
-
-    if !other.is_empty() {
-        groups.push(FileGroup {
-            title: OTHER_CHANGES.into(),
-            kind: GroupKind::Other,
-            files: other,
-        });
-    }
-
-    groups
-}
-
-fn group_by_folder(files: &[FileDiff], visible: &[usize]) -> Vec<FileGroup> {
-    let mut folders: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-
-    for index in visible {
-        let Some(file) = files.get(*index) else {
-            continue;
-        };
-
-        folders
-            .entry(folder_of(&file.path))
-            .or_default()
-            .push(*index);
-    }
-
-    folders
-        .into_iter()
-        .map(|(folder, files)| FileGroup {
-            title: if folder.is_empty() {
-                ROOT_FOLDER.into()
-            } else {
-                folder.into()
-            },
-            kind: GroupKind::Folder,
-            files,
-        })
         .collect()
 }
 
@@ -167,8 +81,8 @@ pub(crate) struct FileInfo {
     pub folder: SharedString,
     pub name: SharedString,
     pub path: SharedString,
-    /// Changes when any hunk of the file changes, see [`file_hash`].
-    pub hash: u64,
+    /// Changes when the change of the file does, also while its lines are not loaded.
+    pub digest: u64,
     /// Changed lines the daemon left out because of its caps.
     pub omitted: u32,
 }
@@ -199,7 +113,7 @@ fn file_info(file: &FileDiff) -> FileInfo {
         },
         name: name.into(),
         path: path.into(),
-        hash: file_hash(file),
+        digest: file.digest,
         omitted,
     }
 }
@@ -215,33 +129,6 @@ fn shown_lines(file: &FileDiff, kind: DiffLineKind) -> u32 {
     u32::try_from(count).unwrap_or(u32::MAX)
 }
 
-/// A hash of the file's hunks. A viewed file stops being viewed when it changes.
-pub(crate) fn file_hash(file: &FileDiff) -> u64 {
-    let mut hasher = DefaultHasher::new();
-
-    (file.change as u8).hash(&mut hasher);
-    file.binary.hash(&mut hasher);
-    file.truncated.hash(&mut hasher);
-    file.mode_change.hash(&mut hasher);
-    file.additions.hash(&mut hasher);
-    file.deletions.hash(&mut hasher);
-
-    for hunk in &file.hunks {
-        hunk.old_start.hash(&mut hasher);
-        hunk.old_lines.hash(&mut hasher);
-        hunk.new_start.hash(&mut hasher);
-        hunk.new_lines.hash(&mut hasher);
-        hunk.section.hash(&mut hasher);
-
-        for line in &hunk.lines {
-            (line.kind as u8).hash(&mut hasher);
-            line.text.hash(&mut hasher);
-        }
-    }
-
-    hasher.finish()
-}
-
 /// How many worktrees the files come from.
 pub(crate) fn worktree_count(diff: &TaskDiff) -> usize {
     let mut worktrees: Vec<&Path> = diff
@@ -254,6 +141,262 @@ pub(crate) fn worktree_count(diff: &TaskDiff) -> usize {
     worktrees.dedup();
 
     worktrees.len()
+}
+
+/// A folded file of a task and source: the worktree and the path inside it.
+pub(crate) type LoadKey = (TaskId, ReviewSource, PathBuf, PathBuf);
+
+#[derive(Clone, Debug)]
+struct Lines {
+    /// The digest of the file these lines belong to.
+    digest: u64,
+    hunks: Vec<DiffHunk>,
+    truncated: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct Loaded {
+    lines: Option<Lines>,
+    /// The digest the file had when the last request for its lines went out.
+    asked: u64,
+    loading: bool,
+    error: Option<SharedString>,
+}
+
+/// What the app does next, once the daemon answered a request for the lines of a file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AfterLoad {
+    Nothing,
+    /// The diff moved on while the request ran. The file is marked as loading for its new
+    /// digest, and the caller asks again.
+    LoadAgain,
+    /// The answer does not fit the stored diff. The load is marked as failed, and the
+    /// caller asks the daemon for the whole diff again.
+    FreshDiff,
+}
+
+/// The lines of folded files the user asked for. A new diff of the daemon comes without
+/// them, so they are kept here and put back while the digest of the file still matches.
+/// Lines of another digest are never shown.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LoadedFiles {
+    files: HashMap<LoadKey, Loaded>,
+}
+
+fn file_of<'a>(diff: &'a TaskDiff, key: &LoadKey) -> Option<&'a FileDiff> {
+    diff.files
+        .iter()
+        .find(|file| file.worktree == key.2 && file.path == key.3)
+}
+
+impl LoadedFiles {
+    /// Marks the file as loading, for the `digest` it has now. False when it is loading
+    /// already.
+    pub(crate) fn begin(&mut self, key: &LoadKey, digest: u64) -> bool {
+        let loaded = self.files.entry(key.clone()).or_default();
+
+        if loaded.loading {
+            return false;
+        }
+
+        loaded.loading = true;
+        loaded.error = None;
+        loaded.asked = digest;
+
+        true
+    }
+
+    /// Settles a load with the daemon's answer, and merges the lines into `diff`. The lines
+    /// go in only when the stored file is still folded and has the digest of the answer.
+    /// A load of a task that closed in the meantime changes nothing.
+    pub(crate) fn finish(
+        &mut self,
+        key: &LoadKey,
+        answer: Result<Option<FileDiff>, SharedString>,
+        diff: Option<&mut Rc<TaskDiff>>,
+    ) -> AfterLoad {
+        let Some(asked) = self.files.get(key).map(|loaded| loaded.asked) else {
+            return AfterLoad::Nothing;
+        };
+
+        let current = diff
+            .as_deref()
+            .and_then(|diff| file_of(diff, key))
+            .filter(|file| file.fold.is_some())
+            .map(|file| file.digest);
+        let (Some(digest), Some(diff)) = (current, diff) else {
+            self.files.remove(key);
+
+            return AfterLoad::Nothing;
+        };
+
+        if digest != asked {
+            if let Some(loaded) = self.files.get_mut(key) {
+                loaded.asked = digest;
+            }
+
+            return AfterLoad::LoadAgain;
+        }
+
+        match answer {
+            Ok(Some(file)) if file.digest == digest => {
+                self.files.insert(
+                    key.clone(),
+                    Loaded {
+                        lines: Some(Lines {
+                            digest,
+                            hunks: file.hunks,
+                            truncated: file.truncated,
+                        }),
+                        asked,
+                        loading: false,
+                        error: None,
+                    },
+                );
+                self.merge(key, Rc::make_mut(diff));
+
+                AfterLoad::Nothing
+            }
+            Ok(Some(_)) => {
+                self.fail(key, "Changed while loading".into());
+
+                AfterLoad::FreshDiff
+            }
+            Ok(None) => {
+                self.fail(key, "No longer in the diff".into());
+
+                AfterLoad::FreshDiff
+            }
+            Err(message) => {
+                self.fail(key, message);
+
+                AfterLoad::Nothing
+            }
+        }
+    }
+
+    /// Ends a load that failed. Lines kept earlier stay, but they are shown only for the
+    /// digest they belong to.
+    fn fail(&mut self, key: &LoadKey, message: SharedString) {
+        if let Some(loaded) = self.files.get_mut(key) {
+            loaded.loading = false;
+            loaded.error = Some(message);
+        }
+    }
+
+    pub(crate) fn forget_task(&mut self, task: TaskId) {
+        self.files.retain(|key, _| key.0 != task);
+    }
+
+    /// The state of every folded file of `diff` the user asked for.
+    pub(crate) fn loads(&self, diff: &TaskDiff) -> FileLoads {
+        diff.files
+            .iter()
+            .filter(|file| file.fold.is_some())
+            .filter_map(|file| {
+                let key = (
+                    diff.task,
+                    diff.source,
+                    file.worktree.clone(),
+                    file.path.clone(),
+                );
+                let loaded = self.files.get(&key)?;
+                let current = loaded
+                    .lines
+                    .as_ref()
+                    .is_some_and(|lines| lines.digest == file.digest);
+
+                let load = if current {
+                    FileLoad::Loaded
+                } else if loaded.loading {
+                    FileLoad::Loading
+                } else {
+                    FileLoad::Failed(loaded.error.clone()?)
+                };
+
+                Some(((key.2, key.3), load))
+            })
+            .collect()
+    }
+
+    /// Puts the kept lines into the folded files of a diff that just came in, and forgets
+    /// files the diff no longer folds. A file with another digest than its lines stays
+    /// without lines, see [`LoadedFiles::begin_stale`].
+    pub(crate) fn restore(&mut self, diff: &mut TaskDiff) {
+        let (task, source) = (diff.task, diff.source);
+        let folded: HashSet<(&Path, &Path)> = diff
+            .files
+            .iter()
+            .filter(|file| file.fold.is_some())
+            .map(|file| (file.worktree.as_path(), file.path.as_path()))
+            .collect();
+
+        self.files.retain(|key, loaded| {
+            key.0 != task
+                || key.1 != source
+                || loaded.loading
+                || folded.contains(&(key.2.as_path(), key.3.as_path()))
+        });
+
+        for file in diff.files.iter_mut().filter(|file| file.fold.is_some()) {
+            let key = (task, source, file.worktree.clone(), file.path.clone());
+
+            if let Some(lines) = self
+                .files
+                .get(&key)
+                .and_then(|loaded| loaded.lines.as_ref())
+                .filter(|lines| lines.digest == file.digest)
+            {
+                file.hunks.clone_from(&lines.hunks);
+                file.truncated = lines.truncated;
+            }
+        }
+    }
+
+    /// Puts the kept lines of one file into the diff. The file keeps its fold. Lines of
+    /// another digest than the file has stay out.
+    fn merge(&self, key: &LoadKey, diff: &mut TaskDiff) {
+        let Some(lines) = self.files.get(key).and_then(|loaded| loaded.lines.as_ref()) else {
+            return;
+        };
+
+        let file = diff.files.iter_mut().find(|file| {
+            file.worktree == key.2
+                && file.path == key.3
+                && file.fold.is_some()
+                && file.digest == lines.digest
+        });
+
+        if let Some(file) = file {
+            file.hunks.clone_from(&lines.hunks);
+            file.truncated = lines.truncated;
+        }
+    }
+
+    /// Marks the folded files of a diff as loading when the user asked for them and their
+    /// digest is not the one of the last request. Returns the files to ask for.
+    pub(crate) fn begin_stale(&mut self, diff: &TaskDiff) -> Vec<LoadKey> {
+        let mut started = Vec::new();
+
+        for file in diff.files.iter().filter(|file| file.fold.is_some()) {
+            let key = (
+                diff.task,
+                diff.source,
+                file.worktree.clone(),
+                file.path.clone(),
+            );
+            let stale = self
+                .files
+                .get(&key)
+                .is_some_and(|loaded| !loaded.loading && loaded.asked != file.digest);
+
+            if stale && self.begin(&key, file.digest) {
+                started.push(key);
+            }
+        }
+
+        started
+    }
 }
 
 /// A line of a hunk with its number on one side, 0 when it has none there.
@@ -364,12 +507,13 @@ impl BodyRows {
     }
 }
 
-/// Flattens the shown files into rows. A collapsed file keeps only its header.
+/// Flattens the shown files into rows. A collapsed file and a folded file keep only their
+/// header.
 pub(crate) fn build_rows(
     diff: &TaskDiff,
     infos: &[FileInfo],
     shown: &[usize],
-    collapsed: impl Fn(usize) -> bool,
+    (collapsed, folded): (impl Fn(usize) -> bool, impl Fn(usize) -> bool),
     style: DiffStyle,
     marks: &Marks,
 ) -> BodyRows {
@@ -390,7 +534,7 @@ pub(crate) fn build_rows(
         }
         body.rows.push(Row::Header { file: at });
 
-        if collapsed(*index) {
+        if collapsed(*index) || folded(*index) {
             continue;
         }
 
@@ -771,6 +915,8 @@ pub(crate) enum Place {
     Line { hunk: u32, line: u32 },
     /// At the top of the file card: outdated, or on a line no hunk holds.
     Top,
+    /// The file is folded and its lines are not loaded, so the thread has no place yet.
+    Folded,
 }
 
 /// A top-level comment placed on a file of the diff.
@@ -784,9 +930,14 @@ pub(crate) struct Thread {
 }
 
 /// Places the top-level comments made on the diff's source on its files. Comments of
-/// other sources, and of files the diff does not hold, are left out. The result is
-/// ordered by file, then top before lines, then position, then age.
-pub(crate) fn place_threads(diff: &TaskDiff, comments: &[ReviewComment]) -> Vec<Thread> {
+/// other sources, and of files the diff does not hold, are left out. A file that is still
+/// folded has no lines to place them on, so its threads wait as [`Place::Folded`]. The
+/// result is ordered by file, then top before lines, then position, then age.
+pub(crate) fn place_threads(
+    diff: &TaskDiff,
+    comments: &[ReviewComment],
+    loads: &FileLoads,
+) -> Vec<Thread> {
     let files: HashMap<FileKey, usize> = diff
         .files
         .iter()
@@ -804,25 +955,34 @@ pub(crate) fn place_threads(diff: &TaskDiff, comments: &[ReviewComment]) -> Vec<
         let Some(file) = files.get(&key).copied() else {
             continue;
         };
-        let found = if comment.outdated {
+        let folded = diff
+            .files
+            .get(file)
+            .is_some_and(|data| is_folded(data, loads));
+        let found = if comment.outdated || folded {
             None
         } else {
             diff.files
                 .get(file)
                 .and_then(|data| find_line(data, comment.anchor.side, comment.anchor.line))
         };
+        let place = if folded {
+            Place::Folded
+        } else {
+            found.map_or(Place::Top, |(hunk, line)| Place::Line { hunk, line })
+        };
 
         threads.push(Thread {
             root,
             file,
             side: comment.anchor.side,
-            place: found.map_or(Place::Top, |(hunk, line)| Place::Line { hunk, line }),
+            place,
         });
     }
 
     threads.sort_by_key(|thread| {
         let order = match thread.place {
-            Place::Top => (0, 0, 0),
+            Place::Top | Place::Folded => (0, 0, 0),
             Place::Line { hunk, line } => (1, hunk, line),
         };
 
@@ -864,6 +1024,7 @@ impl<'a> Lookup<'a> {
             let index = row_index(index);
 
             match thread.place {
+                Place::Folded => {}
                 Place::Top => tops.entry(thread.file).or_default().push(index),
                 Place::Line { hunk, line } => lines
                     .entry((thread.file, hunk, line))
@@ -1335,6 +1496,27 @@ const SAMPLE_FILES: [(usize, &str, FileChange, u32, u32); 9] = [
     (2, "crates/swarm-ui/src/lib.rs", FileChange::Modified, 6, 0),
 ];
 
+/// Files of the sample task that come folded: pty-io's lock file and a large file of
+/// term-render.
+const SAMPLE_FOLDED: [(usize, &str, FileChange, u32, u32, Fold); 2] = [
+    (
+        1,
+        "Cargo.lock",
+        FileChange::Modified,
+        1_690,
+        312,
+        Fold::Lock,
+    ),
+    (
+        0,
+        "crates/swarm-term/src/glyphs.rs",
+        FileChange::Modified,
+        612,
+        41,
+        Fold::Large,
+    ),
+];
+
 /// The sample task's diff. `agents` are term-render, pty-io and ui-tokens. Live keeps the
 /// files of the first two in their own worktrees; Merged holds all in the task worktree.
 pub(crate) fn sample_diff(
@@ -1348,10 +1530,17 @@ pub(crate) fn sample_diff(
         PathBuf::from("/work/swarm/terminal-renderer--pty-io"),
     ];
 
+    let folded = SAMPLE_FOLDED
+        .iter()
+        .map(|(agent, path, change, additions, deletions, _)| {
+            (*agent, *path, *change, *additions, *deletions)
+        });
     let mut files: Vec<FileDiff> = SAMPLE_FILES
         .iter()
+        .copied()
+        .chain(folded)
         .map(|(agent, path, change, additions, deletions)| {
-            let worktree = match (source, own.get(*agent)) {
+            let worktree = match (source, own.get(agent)) {
                 (ReviewSource::Live, Some(worktree)) => worktree.clone(),
                 _ => task_worktree.clone(),
             };
@@ -1359,10 +1548,10 @@ pub(crate) fn sample_diff(
             generated_file(
                 worktree,
                 path,
-                agents.get(*agent).copied(),
-                *change,
-                *additions,
-                *deletions,
+                agents.get(agent).copied(),
+                change,
+                additions,
+                deletions,
             )
         })
         .collect();
@@ -1379,6 +1568,18 @@ pub(crate) fn sample_diff(
                 kind: DiffLineKind::NoNewline,
                 text: String::new(),
             });
+        }
+
+        file.digest = sample_digest(file);
+
+        let fold = SAMPLE_FOLDED
+            .iter()
+            .find(|(_, path, ..)| file.path.ends_with(path))
+            .map(|(.., fold)| *fold);
+
+        if fold.is_some() {
+            file.hunks.clear();
+            file.fold = fold;
         }
     }
     files.sort_by(|a, b| (&a.worktree, &a.path).cmp(&(&b.worktree, &b.path)));
@@ -1414,6 +1615,65 @@ pub(crate) fn generated_file(
     additions: u32,
     deletions: u32,
 ) -> FileDiff {
+    FileDiff {
+        worktree,
+        path: PathBuf::from(path),
+        agent,
+        change,
+        mode_change: None,
+        additions,
+        deletions,
+        binary: false,
+        hunks: sample_hunks(path, change, additions, deletions),
+        truncated: false,
+        digest: 0,
+        fold: None,
+    }
+}
+
+/// The file as the sample daemon sends it when asked for its lines.
+pub(crate) fn sample_lines(file: &FileDiff) -> FileDiff {
+    FileDiff {
+        hunks: sample_hunks(
+            &file.path.to_string_lossy(),
+            file.change,
+            file.additions,
+            file.deletions,
+        ),
+        truncated: false,
+        ..file.clone()
+    }
+}
+
+/// A hash of the sample file's change, so each sample file has its own stable digest.
+fn sample_digest(file: &FileDiff) -> u64 {
+    let mut hasher = DefaultHasher::new();
+
+    file.path.hash(&mut hasher);
+    (file.change as u8).hash(&mut hasher);
+    file.binary.hash(&mut hasher);
+    file.truncated.hash(&mut hasher);
+    file.mode_change.hash(&mut hasher);
+    file.additions.hash(&mut hasher);
+    file.deletions.hash(&mut hasher);
+
+    for hunk in &file.hunks {
+        hunk.old_start.hash(&mut hasher);
+        hunk.old_lines.hash(&mut hasher);
+        hunk.new_start.hash(&mut hasher);
+        hunk.new_lines.hash(&mut hasher);
+        hunk.section.hash(&mut hasher);
+
+        for line in &hunk.lines {
+            (line.kind as u8).hash(&mut hasher);
+            line.text.hash(&mut hasher);
+        }
+    }
+
+    hasher.finish()
+}
+
+fn sample_hunks(path: &str, change: FileChange, additions: u32, deletions: u32) -> Vec<DiffHunk> {
     let section = path
         .rsplit('/')
         .next()
@@ -1421,7 +1681,7 @@ pub(crate) fn generated_file(
         .map(|name| format!("impl {} ", name.replace(['-', '_'], "")))
         .unwrap_or_default();
 
-    let hunks = if change == FileChange::Added {
+    if change == FileChange::Added {
         vec![DiffHunk {
             old_start: 0,
             old_lines: 0,
@@ -1437,19 +1697,6 @@ pub(crate) fn generated_file(
         }]
     } else {
         modified_hunks(&section, additions, deletions)
-    };
-
-    FileDiff {
-        worktree,
-        path: PathBuf::from(path),
-        agent,
-        change,
-        mode_change: None,
-        additions,
-        deletions,
-        binary: false,
-        hunks,
-        truncated: false,
     }
 }
 
@@ -1559,6 +1806,8 @@ mod tests {
                 lines,
             }],
             truncated: false,
+            digest: 0,
+            fold: None,
         }
     }
 
@@ -1573,74 +1822,19 @@ mod tests {
         }
     }
 
-    fn label(id: u64, name: &str, kind: AgentKind) -> AgentLabel {
-        AgentLabel {
-            id: DaemonAgentId(id),
-            name: name.to_owned().into(),
-            kind,
-        }
-    }
-
     fn rows_of(diff: &TaskDiff, style: DiffStyle) -> Vec<Row> {
         let infos = file_infos(diff);
         let shown: Vec<usize> = (0..diff.files.len()).collect();
 
-        build_rows(diff, &infos, &shown, |_| false, style, &Marks::default()).rows
-    }
-
-    #[test]
-    fn files_group_by_agent_with_other_changes_last() {
-        let diff = diff(vec![
-            file("a.rs", None, Vec::new()),
-            file("b.rs", Some(2), Vec::new()),
-            file("c.rs", Some(1), Vec::new()),
-            file("d.rs", Some(99), Vec::new()),
-        ]);
-        let agents = [
-            label(1, "term-render", AgentKind::ClaudeCode),
-            label(2, "pty-io", AgentKind::Codex),
-        ];
-        let visible = visible_files(&diff, None);
-
-        let groups = group_files(&diff.files, &visible, Grouping::ByAgent, &agents);
-
-        let summary: Vec<_> = groups
-            .iter()
-            .map(|group| (group.title.to_string(), group.files.clone()))
-            .collect();
-        assert_eq!(
-            summary,
-            [
-                ("term-render".to_owned(), vec![2]),
-                ("pty-io".to_owned(), vec![1]),
-                (OTHER_CHANGES.to_owned(), vec![0, 3]),
-            ]
-        );
-        assert_eq!(groups[1].kind, GroupKind::Agent(AgentKind::Codex));
-    }
-
-    #[test]
-    fn files_group_by_their_folder() {
-        let diff = diff(vec![
-            file("src/b.rs", None, Vec::new()),
-            file("Cargo.toml", None, Vec::new()),
-            file("src/a.rs", None, Vec::new()),
-        ]);
-        let visible = visible_files(&diff, None);
-
-        let groups = group_files(&diff.files, &visible, Grouping::ByFolder, &[]);
-
-        let summary: Vec<_> = groups
-            .iter()
-            .map(|group| (group.title.to_string(), group.files.clone()))
-            .collect();
-        assert_eq!(
-            summary,
-            [
-                (ROOT_FOLDER.to_owned(), vec![1]),
-                ("src".to_owned(), vec![0, 2]),
-            ]
-        );
+        build_rows(
+            diff,
+            &infos,
+            &shown,
+            (|_| false, |_| false),
+            style,
+            &Marks::default(),
+        )
+        .rows
     }
 
     #[test]
@@ -1732,7 +1926,7 @@ mod tests {
             &diff,
             &infos,
             &[0, 1],
-            |index| index == 0,
+            (|index| index == 0, |_| false),
             DiffStyle::Unified,
             &Marks::default(),
         );
@@ -1847,12 +2041,12 @@ mod tests {
     }
 
     #[test]
-    fn a_mode_change_changes_the_hash() {
+    fn a_mode_change_changes_the_sample_digest() {
         let plain = file("a.rs", None, vec![line(DiffLineKind::Added, "x")]);
         let mut moded = plain.clone();
         moded.mode_change = Some((0o100_644, 0o100_755));
 
-        assert_ne!(file_hash(&plain), file_hash(&moded));
+        assert_ne!(sample_digest(&plain), sample_digest(&moded));
     }
 
     #[test]
@@ -1869,13 +2063,15 @@ mod tests {
     }
 
     #[test]
-    fn the_hash_changes_with_the_hunks() {
+    fn the_sample_digest_changes_with_the_hunks_and_the_path() {
         let one = file("a.rs", None, vec![line(DiffLineKind::Added, "x")]);
         let same = one.clone();
         let other = file("a.rs", None, vec![line(DiffLineKind::Added, "y")]);
+        let moved = file("b.rs", None, vec![line(DiffLineKind::Added, "x")]);
 
-        assert_eq!(file_hash(&one), file_hash(&same));
-        assert_ne!(file_hash(&one), file_hash(&other));
+        assert_eq!(sample_digest(&one), sample_digest(&same));
+        assert_ne!(sample_digest(&one), sample_digest(&other));
+        assert_ne!(sample_digest(&one), sample_digest(&moved));
     }
 
     #[test]
@@ -1894,12 +2090,19 @@ mod tests {
 
         assert_eq!(
             (live.stat.files, live.stat.additions, live.stat.deletions),
-            (9, 321, 41)
+            (11, 2_623, 394)
         );
         assert_eq!(worktree_count(&live), 3);
         assert_eq!(worktree_count(&merged), 1);
 
         for file in &merged.files {
+            let file = if file.fold.is_some() {
+                assert!(file.hunks.is_empty());
+
+                sample_lines(file)
+            } else {
+                file.clone()
+            };
             let counted = |kind| {
                 file.hunks
                     .iter()
@@ -1910,6 +2113,453 @@ mod tests {
 
             assert_eq!(counted(DiffLineKind::Added), file.additions as usize);
             assert_eq!(counted(DiffLineKind::Deleted), file.deletions as usize);
+        }
+    }
+
+    #[test]
+    fn the_sample_diff_folds_a_lock_file_and_a_large_file_with_distinct_digests() {
+        let agents = [DaemonAgentId(1), DaemonAgentId(2), DaemonAgentId(3)];
+
+        for source in [ReviewSource::Live, ReviewSource::Merged] {
+            let diff = sample_diff(TaskId(0), source, agents);
+            let folds: Vec<_> = diff
+                .files
+                .iter()
+                .filter_map(|file| file.fold.map(|fold| (file.path.clone(), fold)))
+                .collect();
+            let mut digests: Vec<u64> = diff.files.iter().map(|file| file.digest).collect();
+            digests.sort_unstable();
+            digests.dedup();
+
+            assert_eq!(
+                folds,
+                [
+                    (PathBuf::from("Cargo.lock"), Fold::Lock),
+                    (
+                        PathBuf::from("crates/swarm-term/src/glyphs.rs"),
+                        Fold::Large
+                    ),
+                ]
+            );
+            assert_eq!(
+                digests.len(),
+                diff.files.len(),
+                "a digest repeats in {source:?}"
+            );
+            assert!(diff.files.iter().all(|file| file.digest != 0));
+            assert_eq!(
+                diff,
+                sample_diff(TaskId(0), source, agents),
+                "the digests are not stable"
+            );
+        }
+    }
+
+    fn folded(path: &str, fold: Fold) -> FileDiff {
+        let mut folded = file(path, None, Vec::new());
+
+        folded.hunks.clear();
+        folded.additions = 90;
+        folded.deletions = 10;
+        folded.fold = Some(fold);
+        folded.digest = 5;
+
+        folded
+    }
+
+    fn loaded(key: &FileDiff) -> FileLoads {
+        FileLoads::from([((key.worktree.clone(), key.path.clone()), FileLoad::Loaded)])
+    }
+
+    #[test]
+    fn a_folded_file_builds_exactly_one_row() {
+        let diff = diff(vec![folded("Cargo.lock", Fold::Lock)]);
+        let infos = file_infos(&diff);
+        let comments = [comment(1, DiffSide::New, 21, CommentState::Sent)];
+        let loads = FileLoads::new();
+        let marks = Marks {
+            threads: place_threads(&diff, &comments, &loads).into(),
+            composer: Some(ComposerAt::Top { file: 0 }),
+        };
+
+        let body = build_rows(
+            &diff,
+            &infos,
+            &[0],
+            (|_| false, |index| is_folded(&diff.files[index], &loads)),
+            DiffStyle::Unified,
+            &marks,
+        );
+
+        assert_eq!(body.rows, [Row::Header { file: 0 }, Row::End]);
+        assert_eq!(body.range_of(0), Some(0..1));
+    }
+
+    #[test]
+    fn a_loaded_file_builds_its_rows_and_keeps_its_fold() {
+        let mut file = folded("Cargo.lock", Fold::Lock);
+        file.hunks = vec![DiffHunk {
+            old_start: 1,
+            old_lines: 1,
+            new_start: 1,
+            new_lines: 1,
+            section: String::new(),
+            lines: vec![line(DiffLineKind::Added, "x")],
+        }];
+        let diff = diff(vec![file]);
+        let infos = file_infos(&diff);
+        let loads = loaded(&diff.files[0]);
+
+        let body = build_rows(
+            &diff,
+            &infos,
+            &[0],
+            (|_| false, |index| is_folded(&diff.files[index], &loads)),
+            DiffStyle::Unified,
+            &Marks::default(),
+        );
+
+        assert!(body.rows.len() > 2);
+        assert_eq!(diff.files[0].fold, Some(Fold::Lock));
+        assert!(!is_folded(&diff.files[0], &loads));
+        assert!(is_folded(&diff.files[0], &FileLoads::new()));
+    }
+
+    #[test]
+    fn threads_on_a_folded_file_wait_until_its_lines_load() {
+        let mut diff = diff(vec![folded("a.rs", Fold::Generated)]);
+        let comments = [comment(1, DiffSide::New, 21, CommentState::Sent)];
+
+        let waiting = place_threads(&diff, &comments, &FileLoads::new());
+        let lines = commented_diff().files.remove(0);
+        diff.files[0].hunks.clone_from(&lines.hunks);
+        let placed = place_threads(&diff, &comments, &loaded(&diff.files[0]));
+
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].place, Place::Folded);
+        assert!(matches!(placed[0].place, Place::Line { .. }));
+    }
+
+    #[test]
+    fn an_outdated_thread_on_a_folded_file_is_not_placed_at_the_top() {
+        let diff = diff(vec![folded("a.rs", Fold::Generated)]);
+        let mut outdated = comment(1, DiffSide::New, 21, CommentState::Sent);
+        outdated.outdated = true;
+
+        let threads = place_threads(&diff, &[outdated], &FileLoads::new());
+
+        assert_eq!(threads[0].place, Place::Folded);
+    }
+
+    fn key(path: &str) -> LoadKey {
+        (
+            TaskId(1),
+            ReviewSource::Merged,
+            PathBuf::from("/wt"),
+            PathBuf::from(path),
+        )
+    }
+
+    fn lines_for(path: &str, digest: u64, text: &str) -> FileDiff {
+        let mut file = file(path, None, vec![line(DiffLineKind::Added, text)]);
+
+        file.digest = digest;
+        file.fold = Some(Fold::Lock);
+
+        file
+    }
+
+    fn folded_diff(path: &str, digest: u64) -> TaskDiff {
+        let mut folded = folded(path, Fold::Lock);
+
+        folded.worktree = PathBuf::from("/wt");
+        folded.digest = digest;
+
+        diff(vec![folded])
+    }
+
+    fn file_key() -> FileKey {
+        (PathBuf::from("/wt"), PathBuf::from("Cargo.lock"))
+    }
+
+    fn stored(path: &str, digest: u64) -> Rc<TaskDiff> {
+        Rc::new(folded_diff(path, digest))
+    }
+
+    fn texts(diff: &TaskDiff) -> Vec<&str> {
+        diff.files[0]
+            .hunks
+            .iter()
+            .flat_map(|hunk| hunk.lines.iter().map(|line| line.text.as_str()))
+            .collect()
+    }
+
+    /// A load of `Cargo.lock` that the daemon answered with `answer`.
+    fn settle(
+        loaded: &mut LoadedFiles,
+        stored: &mut Rc<TaskDiff>,
+        answer: Result<Option<FileDiff>, SharedString>,
+    ) -> AfterLoad {
+        loaded.finish(&key("Cargo.lock"), answer, Some(stored))
+    }
+
+    /// A new diff of the daemon arrives with another digest for the file.
+    fn poll(loaded: &mut LoadedFiles, stored: &mut Rc<TaskDiff>, digest: u64) {
+        let mut next = folded_diff("Cargo.lock", digest);
+
+        loaded.restore(&mut next);
+        *stored = Rc::new(next);
+    }
+
+    #[test]
+    fn loaded_lines_come_back_into_a_new_diff_with_the_same_digest() {
+        let mut loaded = LoadedFiles::default();
+        let key = key("Cargo.lock");
+        let mut kept = stored("Cargo.lock", 5);
+        assert!(loaded.begin(&key, 5));
+        let next = settle(
+            &mut loaded,
+            &mut kept,
+            Ok(Some(lines_for("Cargo.lock", 5, "kept"))),
+        );
+
+        let mut again = folded_diff("Cargo.lock", 5);
+        loaded.restore(&mut again);
+
+        assert_eq!(next, AfterLoad::Nothing);
+        assert_eq!(texts(&kept), ["kept"]);
+        assert_eq!(texts(&again), ["kept"]);
+        assert_eq!(again.files[0].fold, Some(Fold::Lock));
+        assert!(loaded.begin_stale(&again).is_empty());
+        assert_eq!(
+            loaded.loads(&again).get(&file_key()),
+            Some(&FileLoad::Loaded)
+        );
+    }
+
+    #[test]
+    fn a_new_digest_never_shows_the_old_lines_and_asks_for_new_ones() {
+        let mut loaded = LoadedFiles::default();
+        let key = key("Cargo.lock");
+        let mut kept = stored("Cargo.lock", 5);
+        loaded.begin(&key, 5);
+        settle(
+            &mut loaded,
+            &mut kept,
+            Ok(Some(lines_for("Cargo.lock", 5, "old"))),
+        );
+
+        poll(&mut loaded, &mut kept, 6);
+        assert!(
+            texts(&kept).is_empty(),
+            "the old lines went into the new file"
+        );
+        assert_eq!(loaded.loads(&kept).get(&file_key()), None);
+
+        assert_eq!(loaded.begin_stale(&kept), std::slice::from_ref(&key));
+        assert!(
+            loaded.begin_stale(&kept).is_empty(),
+            "it is loading already"
+        );
+        assert!(!loaded.begin(&key, 6), "a second load of the same file");
+        assert_eq!(
+            loaded.loads(&kept).get(&file_key()),
+            Some(&FileLoad::Loading)
+        );
+    }
+
+    #[test]
+    fn a_failed_reload_shows_its_error_and_never_the_old_lines() {
+        let mut loaded = LoadedFiles::default();
+        let key = key("Cargo.lock");
+        let mut kept = stored("Cargo.lock", 5);
+        loaded.begin(&key, 5);
+        settle(
+            &mut loaded,
+            &mut kept,
+            Ok(Some(lines_for("Cargo.lock", 5, "old"))),
+        );
+        poll(&mut loaded, &mut kept, 6);
+        loaded.begin(&key, 6);
+
+        let next = settle(&mut loaded, &mut kept, Err("no daemon".into()));
+
+        assert_eq!(next, AfterLoad::Nothing);
+        assert_eq!(
+            loaded.loads(&kept).get(&file_key()),
+            Some(&FileLoad::Failed("no daemon".into()))
+        );
+        assert!(texts(&kept).is_empty());
+        assert!(
+            loaded.begin_stale(&kept).is_empty(),
+            "no new try for the same digest"
+        );
+        poll(&mut loaded, &mut kept, 7);
+        assert_eq!(
+            loaded.begin_stale(&kept),
+            [key],
+            "a new digest is a new try"
+        );
+    }
+
+    #[test]
+    fn a_failed_load_stays_failed_until_the_next_try() {
+        let mut loaded = LoadedFiles::default();
+        let key = key("Cargo.lock");
+        let mut kept = stored("Cargo.lock", 5);
+        loaded.begin(&key, 5);
+        settle(&mut loaded, &mut kept, Err("no daemon".into()));
+        let failed = loaded.loads(&kept);
+
+        loaded.begin(&key, 5);
+        let retrying = loaded.loads(&kept);
+
+        assert_eq!(
+            failed.get(&file_key()),
+            Some(&FileLoad::Failed("no daemon".into()))
+        );
+        assert_eq!(retrying.get(&file_key()), Some(&FileLoad::Loading));
+    }
+
+    #[test]
+    fn a_file_the_diff_no_longer_folds_is_forgotten() {
+        let mut loaded = LoadedFiles::default();
+        let key = key("Cargo.lock");
+        let mut kept = stored("Cargo.lock", 5);
+        loaded.begin(&key, 5);
+        settle(
+            &mut loaded,
+            &mut kept,
+            Ok(Some(lines_for("Cargo.lock", 5, "kept"))),
+        );
+
+        let mut gone = diff(Vec::new());
+        loaded.restore(&mut gone);
+
+        assert!(loaded.loads(&folded_diff("Cargo.lock", 5)).is_empty());
+    }
+
+    #[test]
+    fn an_answer_for_an_older_digest_is_dropped_and_the_file_loads_again() {
+        let mut loaded = LoadedFiles::default();
+        let key = key("Cargo.lock");
+        let mut kept = stored("Cargo.lock", 1);
+        loaded.begin(&key, 1);
+        poll(&mut loaded, &mut kept, 2);
+
+        let late = settle(
+            &mut loaded,
+            &mut kept,
+            Ok(Some(lines_for("Cargo.lock", 1, "old"))),
+        );
+
+        assert_eq!(late, AfterLoad::LoadAgain);
+        assert!(
+            texts(&kept).is_empty(),
+            "the old answer landed in the new card"
+        );
+        assert_eq!(
+            loaded.loads(&kept).get(&file_key()),
+            Some(&FileLoad::Loading)
+        );
+        assert!(!loaded.begin(&key, 2), "the new load is running already");
+
+        let fresh = settle(
+            &mut loaded,
+            &mut kept,
+            Ok(Some(lines_for("Cargo.lock", 2, "new"))),
+        );
+
+        assert_eq!(fresh, AfterLoad::Nothing);
+        assert_eq!(texts(&kept), ["new"]);
+        assert_eq!(
+            loaded.loads(&kept).get(&file_key()),
+            Some(&FileLoad::Loaded)
+        );
+    }
+
+    #[test]
+    fn an_answer_for_a_file_that_is_not_folded_any_more_is_dropped() {
+        let mut loaded = LoadedFiles::default();
+        let key = key("Cargo.lock");
+        let mut plain = folded_diff("Cargo.lock", 1);
+        plain.files[0].fold = None;
+        let mut kept = Rc::new(plain);
+        loaded.begin(&key, 1);
+
+        let next = settle(
+            &mut loaded,
+            &mut kept,
+            Ok(Some(lines_for("Cargo.lock", 1, "old"))),
+        );
+
+        assert_eq!(next, AfterLoad::Nothing);
+        assert!(texts(&kept).is_empty());
+        assert!(loaded.loads(&stored("Cargo.lock", 1)).is_empty());
+    }
+
+    #[test]
+    fn a_file_the_daemon_does_not_have_fails_the_load_and_leaves_the_diff_alone() {
+        let mut loaded = LoadedFiles::default();
+        let key = key("Cargo.lock");
+        let mut kept = stored("Cargo.lock", 5);
+        let before = (*kept).clone();
+        loaded.begin(&key, 5);
+
+        let next = settle(&mut loaded, &mut kept, Ok(None));
+
+        assert_eq!(next, AfterLoad::FreshDiff);
+        assert_eq!(*kept, before, "the stored diff was edited");
+        assert_eq!(
+            loaded.loads(&kept).get(&file_key()),
+            Some(&FileLoad::Failed("No longer in the diff".into()))
+        );
+    }
+
+    #[test]
+    fn an_answer_with_another_digest_than_the_asked_one_asks_for_a_fresh_diff() {
+        let mut loaded = LoadedFiles::default();
+        let key = key("Cargo.lock");
+        let mut kept = stored("Cargo.lock", 5);
+        loaded.begin(&key, 5);
+
+        let next = settle(
+            &mut loaded,
+            &mut kept,
+            Ok(Some(lines_for("Cargo.lock", 7, "newer"))),
+        );
+
+        assert_eq!(next, AfterLoad::FreshDiff);
+        assert!(texts(&kept).is_empty());
+        assert_eq!(
+            loaded.loads(&kept).get(&file_key()),
+            Some(&FileLoad::Failed("Changed while loading".into()))
+        );
+    }
+
+    #[test]
+    fn a_load_that_ends_after_its_task_closed_changes_nothing() {
+        let answers: [Result<Option<FileDiff>, SharedString>; 3] = [
+            Ok(Some(lines_for("Cargo.lock", 5, "late"))),
+            Ok(None),
+            Err("late".into()),
+        ];
+
+        for answer in answers {
+            let mut loaded = LoadedFiles::default();
+            let key = key("Cargo.lock");
+            let mut kept = stored("Cargo.lock", 5);
+            loaded.begin(&key, 5);
+            loaded.forget_task(TaskId(1));
+
+            let next = settle(&mut loaded, &mut kept, answer);
+
+            assert_eq!(next, AfterLoad::Nothing);
+            assert!(
+                loaded.loads(&kept).is_empty(),
+                "an entry came back for a closed task"
+            );
+            assert!(loaded.begin_stale(&kept).is_empty());
         }
     }
 
@@ -1955,11 +2605,11 @@ mod tests {
     fn rows_with(diff: &TaskDiff, comments: &[ReviewComment], style: DiffStyle) -> Vec<Row> {
         let infos = file_infos(diff);
         let marks = Marks {
-            threads: place_threads(diff, comments).into(),
+            threads: place_threads(diff, comments, &FileLoads::new()).into(),
             composer: None,
         };
 
-        build_rows(diff, &infos, &[0], |_| false, style, &marks).rows
+        build_rows(diff, &infos, &[0], (|_| false, |_| false), style, &marks).rows
     }
 
     fn thread_rows(rows: &[Row]) -> Vec<usize> {
@@ -2071,7 +2721,7 @@ mod tests {
 
         let comments = [outdated, outside];
 
-        let threads = place_threads(&diff, &comments);
+        let threads = place_threads(&diff, &comments, &FileLoads::new());
         let rows = rows_with(&diff, &comments, DiffStyle::Unified);
 
         assert!(threads.iter().all(|thread| thread.place == Place::Top));
@@ -2090,7 +2740,7 @@ mod tests {
         let mut reply = comment(3, DiffSide::New, 21, CommentState::Sent);
         reply.parent = Some(CommentId(9));
 
-        let threads = place_threads(&diff, &[live, elsewhere, reply]);
+        let threads = place_threads(&diff, &[live, elsewhere, reply], &FileLoads::new());
 
         assert!(threads.is_empty());
     }
@@ -2101,7 +2751,7 @@ mod tests {
         let infos = file_infos(&diff);
         let comments = [comment(1, DiffSide::New, 21, CommentState::Pending)];
         let marks = Marks {
-            threads: place_threads(&diff, &comments).into(),
+            threads: place_threads(&diff, &comments, &FileLoads::new()).into(),
             composer: Some(ComposerAt::Line(LinePos {
                 file: 0,
                 hunk: 0,
@@ -2110,7 +2760,15 @@ mod tests {
             })),
         };
 
-        let rows = build_rows(&diff, &infos, &[0], |_| false, DiffStyle::Unified, &marks).rows;
+        let rows = build_rows(
+            &diff,
+            &infos,
+            &[0],
+            (|_| false, |_| false),
+            DiffStyle::Unified,
+            &marks,
+        )
+        .rows;
 
         assert!(matches!(rows[5], Row::Thread { .. }));
         assert!(matches!(rows[6], Row::Composer { .. }));
@@ -2123,11 +2781,19 @@ mod tests {
         let mut outdated = comment(1, DiffSide::New, 21, CommentState::Pending);
         outdated.outdated = true;
         let marks = Marks {
-            threads: place_threads(&diff, &[outdated]).into(),
+            threads: place_threads(&diff, &[outdated], &FileLoads::new()).into(),
             composer: Some(ComposerAt::Top { file: 0 }),
         };
 
-        let rows = build_rows(&diff, &infos, &[0], |_| false, DiffStyle::Unified, &marks).rows;
+        let rows = build_rows(
+            &diff,
+            &infos,
+            &[0],
+            (|_| false, |_| false),
+            DiffStyle::Unified,
+            &marks,
+        )
+        .rows;
 
         assert!(matches!(rows[1], Row::Thread { .. }));
         assert!(matches!(rows[2], Row::Composer { .. }));
@@ -2335,7 +3001,7 @@ mod tests {
         let comments = sample_comments(&live, &merged, agents, 1_000_000);
 
         for diff in [&live, &merged] {
-            let placed = place_threads(diff, &comments);
+            let placed = place_threads(diff, &comments, &FileLoads::new());
             let tops = placed.iter().filter(|t| t.place == Place::Top).count();
 
             assert!(!placed.is_empty());

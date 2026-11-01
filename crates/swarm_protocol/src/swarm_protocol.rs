@@ -20,7 +20,7 @@ mod client;
 pub use client::{Client, ClientError, CommentEvent, MessageEvent, PrEvent};
 
 /// Bumped on every incompatible change; the daemon refuses other versions.
-pub const VERSION: u32 = 11;
+pub const VERSION: u32 = 12;
 
 /// The most messages [`Request::ListMessages`] returns.
 pub const MESSAGES_LISTED: usize = 500;
@@ -44,6 +44,9 @@ pub const DIFF_LINES: usize = 50_000;
 
 /// Longer lines are cut to this many bytes, on a character boundary.
 pub const DIFF_LINE_BYTES: usize = 1_000;
+
+/// A file with more changed lines comes folded, see [`Fold::Large`].
+pub const FOLD_LINES: u32 = 500;
 
 /// The longest a push may run in the daemon, pre-push hooks included.
 pub const PUSH_SECS: u64 = 600;
@@ -356,6 +359,17 @@ pub enum FileChange {
     Deleted,
 }
 
+/// Why a file of a diff comes without its lines. [`Request::FileHunks`] loads them.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fold {
+    /// The lock file of a package manager, like `Cargo.lock` or `pnpm-lock.yaml`.
+    Lock,
+    /// Marked `linguist-generated` in `.gitattributes`, minified, or a source map.
+    Generated,
+    /// More than [`FOLD_LINES`] changed lines.
+    Large,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffLineKind {
     Context,
@@ -407,6 +421,12 @@ pub struct FileDiff {
     /// the whole file because it is too large to read. A file left out whole has no
     /// hunks and is not binary.
     pub truncated: bool,
+    /// A hash of the whole change of the file, also of lines left out. Equal digests
+    /// mean equal changes.
+    pub digest: u64,
+    /// Set when the file comes without its lines: `hunks` is empty, and `additions`
+    /// and `deletions` still count every line. Kept in a [`Event::FileHunks`] answer.
+    pub fold: Option<Fold>,
 }
 
 /// The changes of a task from one [`ReviewSource`].
@@ -747,6 +767,15 @@ pub enum Request {
         source: ReviewSource,
         known: Option<u64>,
     },
+    /// The lines of one file of the diff, folded or not, under the same caps as a
+    /// [`TaskDiff`]. Answered with [`Event::FileHunks`].
+    FileHunks {
+        call: CallId,
+        task: TaskId,
+        source: ReviewSource,
+        worktree: PathBuf,
+        path: PathBuf,
+    },
     /// Approves the Merged diff with this fingerprint. Refused when the Merged diff
     /// changed since, or while comments of the task are pending. Answered with [`Event::TaskChanged`] to every client, then
     /// [`Event::Done`].
@@ -976,6 +1005,11 @@ pub enum Event {
     TaskDiff {
         call: CallId,
         diff: Option<TaskDiff>,
+    },
+    /// `None` when the diff no longer holds the file.
+    FileHunks {
+        call: CallId,
+        file: Option<FileDiff>,
     },
     CloseCheck {
         call: CallId,

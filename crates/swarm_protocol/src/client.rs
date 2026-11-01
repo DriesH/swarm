@@ -17,8 +17,8 @@ use swarm_term::{TerminalChannels, TerminalInput, TerminalOutput};
 
 use crate::{
     AgentChange, AgentId, AgentInfo, AgentKind, CallId, ChecksRun, CloseCheck, CommentId,
-    CreateTask, CreateTerminal, Event, FrameError, GH_SECS, GithubStatus, MergeMethod, MessageId,
-    MessageInfo, NewComment, PUSH_SECS, Paths, PrDraft, PrPanel, ProjectId, ProjectInfo,
+    CreateTask, CreateTerminal, Event, FileDiff, FrameError, GH_SECS, GithubStatus, MergeMethod,
+    MessageId, MessageInfo, NewComment, PUSH_SECS, Paths, PrDraft, PrPanel, ProjectId, ProjectInfo,
     PullRequest, Request, ReviewComment, ReviewSource, TaskDiff, TaskId, TaskInfo, TerminalId,
     TerminalInfo, VERSION, check_private_dir, read, write,
 };
@@ -478,6 +478,34 @@ impl Client {
         match reply {
             Event::TaskDiff { diff, .. } => Ok(diff),
             other => Err(unexpected("TaskDiff", &other)),
+        }
+    }
+
+    /// The lines of one file of a task diff. Returns `None` when the diff no longer
+    /// holds the file.
+    pub fn file_hunks(
+        &self,
+        task: TaskId,
+        source: ReviewSource,
+        worktree: PathBuf,
+        path: PathBuf,
+    ) -> Result<Option<FileDiff>, ClientError> {
+        let timeout = self.reply_timeout.max(GIT_TIMEOUT);
+        let reply = self.call_with_timeout(
+            |call| Request::FileHunks {
+                call,
+                task,
+                source,
+                worktree: worktree.clone(),
+                path: path.clone(),
+            },
+            None,
+            timeout,
+        )?;
+
+        match reply {
+            Event::FileHunks { file, .. } => Ok(file),
+            other => Err(unexpected("FileHunks", &other)),
         }
     }
 
@@ -1005,6 +1033,9 @@ fn read_events(
             }
             Event::TaskDiff { call, diff } => {
                 deliver(shared, call, Event::TaskDiff { call, diff });
+            }
+            Event::FileHunks { call, file } => {
+                deliver(shared, call, Event::FileHunks { call, file });
             }
             Event::CloseCheck { call, check } => {
                 deliver(shared, call, Event::CloseCheck { call, check });
