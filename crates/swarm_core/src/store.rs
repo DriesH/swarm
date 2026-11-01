@@ -506,6 +506,64 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Fails when the project is unknown or still has open tasks. The message names them.
+    pub fn check_removable(&self, id: ProjectId) -> Result<(), Error> {
+        if self.project(id)?.is_none() {
+            return Err(Error::UnknownProject(id.0));
+        }
+
+        let open = self.list_tasks(id)?;
+        if open.is_empty() {
+            return Ok(());
+        }
+
+        let names: Vec<&str> = open.iter().map(|task| task.name.as_str()).collect();
+        let noun = if names.len() == 1 { "task" } else { "tasks" };
+
+        Err(Error::Invalid(format!(
+            "close its {} {noun} first: {}",
+            names.len(),
+            names.join(", ")
+        )))
+    }
+
+    /// Deletes the project and everything recorded for it, in one transaction. The
+    /// closed tasks go with their agents, messages and comments. Refuses like
+    /// [`Self::check_removable`], checked inside the transaction.
+    pub fn remove_project(&self, id: ProjectId) -> Result<(), Error> {
+        self.atomically(|store| {
+            store.check_removable(id)?;
+
+            let project = to_row(id.0)?;
+            let of_project = "SELECT id FROM tasks WHERE project = ?1";
+
+            store.connection.execute(
+                &format!("DELETE FROM comments WHERE task IN ({of_project})"),
+                params![project],
+            )?;
+            // The count of merges outlives the project. A negative key never meets the
+            // id of a task made later, which may reuse the id of a deleted one.
+            store.connection.execute(
+                &format!("UPDATE merges SET task = -id WHERE task IN ({of_project})"),
+                params![project],
+            )?;
+            store
+                .connection
+                .execute("DELETE FROM messages WHERE project = ?1", params![project])?;
+            store
+                .connection
+                .execute("DELETE FROM agents WHERE project = ?1", params![project])?;
+            store
+                .connection
+                .execute("DELETE FROM tasks WHERE project = ?1", params![project])?;
+            store
+                .connection
+                .execute("DELETE FROM projects WHERE id = ?1", params![project])?;
+
+            Ok(())
+        })
+    }
+
     pub fn add_task(&self, task: &NewTask<'_>) -> Result<TaskInfo, Error> {
         self.add_task_by(task, None)
     }
@@ -2959,5 +3017,182 @@ mod tests {
         assert_eq!(store.open_task_count().expect("open"), 1);
         store.close_task(second).expect("close");
         assert_eq!(store.open_task_count().expect("open"), 0);
+    }
+
+    fn rows(store: &Store, table: &str) -> i64 {
+        store
+            .connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .expect("count")
+    }
+
+    /// A closed task with an agent, a message, a comment with a reply and a merge.
+    fn project_with_a_closed_task() -> (Store, StoredProject, TaskId) {
+        let (store, task) = store_with_task();
+        let project = store.list_projects().expect("projects").remove(0);
+        let agent = store.add_agent(&new_agent(task)).expect("agent");
+        store
+            .add_message(&message(None, agent.id, "brief"))
+            .expect("message");
+        let comment = store
+            .add_comment(&new_comment(task), CommentState::Pending)
+            .expect("comment");
+        let reply = NewComment {
+            parent: Some(comment.id),
+            ..new_comment(task)
+        };
+        store
+            .add_comment(&reply, CommentState::Pending)
+            .expect("reply");
+        store.record_merge(task).expect("merge");
+        store.close_task(task).expect("close");
+
+        (store, project, task)
+    }
+
+    #[test]
+    fn a_project_with_open_tasks_cannot_be_removed_and_the_message_names_them() {
+        let (store, first) = store_with_task();
+        let project = store.list_projects().expect("projects")[0].id;
+        let second = NewTask {
+            name: "Menu bar usage",
+            ..new_task(project, &[])
+        };
+        store.add_task(&second).expect("second");
+
+        let refused = store.remove_project(project).expect_err("refused");
+
+        assert_eq!(
+            refused.to_string(),
+            "close its 2 tasks first: Fix it, Menu bar usage"
+        );
+        store.close_task(first).expect("close");
+        let refused = store.remove_project(project).expect_err("still one");
+        assert_eq!(
+            refused.to_string(),
+            "close its 1 task first: Menu bar usage"
+        );
+        assert_eq!(store.list_projects().expect("projects").len(), 1);
+        assert_eq!(rows(&store, "tasks"), 2);
+    }
+
+    #[test]
+    fn an_unknown_project_cannot_be_removed() {
+        let (store, _) = store_with_task();
+
+        let refused = store.remove_project(ProjectId(42)).expect_err("refused");
+
+        assert!(matches!(refused, Error::UnknownProject(42)), "{refused}");
+        assert_eq!(store.list_projects().expect("projects").len(), 1);
+    }
+
+    #[test]
+    fn removing_a_project_deletes_its_closed_tasks_with_every_row_that_belongs_to_them() {
+        let (store, project, task) = project_with_a_closed_task();
+        let other = store
+            .add_project(Path::new("/other"), "other")
+            .expect("other project");
+        let kept = store.add_task(&new_task(other.id, &[])).expect("kept task");
+        let mut kept_agent = new_agent(kept.id);
+        kept_agent.project = other.id;
+        store.add_agent(&kept_agent).expect("kept agent");
+
+        store.remove_project(project.id).expect("removed");
+
+        assert_eq!(store.project(project.id).expect("read"), None);
+        assert_eq!(store.task_including_closed(task).expect("read"), None);
+        assert_eq!(rows(&store, "comments"), 0);
+        assert_eq!(rows(&store, "merges"), 1, "the merge still counts");
+        assert_eq!(rows(&store, "messages"), 0);
+        assert_eq!(
+            rows(&store, "agents"),
+            1,
+            "the other project keeps its agent"
+        );
+        assert_eq!(rows(&store, "tasks"), 1);
+        assert_eq!(store.list_tasks(other.id).expect("tasks").len(), 1);
+        assert_eq!(store.list_projects().expect("projects"), [other]);
+    }
+
+    #[test]
+    fn the_start_orchestrator_and_its_messages_go_with_the_project() {
+        let (store, task) = store_with_task();
+        let project = store.list_projects().expect("projects")[0].id;
+        store.close_task(task).expect("close");
+        let mut start = new_agent(task);
+        start.task = None;
+        start.role = AgentRole::StartOrchestrator;
+        let start = store.add_agent(&start).expect("start");
+        let note = NewMessage {
+            task: None,
+            ..message(None, start.id, "hello")
+        };
+        store.add_message(&note).expect("message");
+
+        store.remove_project(project).expect("removed");
+
+        assert_eq!(rows(&store, "agents"), 0);
+        assert_eq!(rows(&store, "messages"), 0);
+    }
+
+    #[test]
+    fn the_same_path_added_again_is_a_new_empty_project() {
+        let (store, project, _) = project_with_a_closed_task();
+        store.remove_project(project.id).expect("removed");
+
+        let again = store
+            .add_project(&project.path, &project.name)
+            .expect("added again");
+
+        assert_eq!(
+            store.list_projects().expect("projects"),
+            std::slice::from_ref(&again)
+        );
+        assert!(store.list_tasks(again.id).expect("tasks").is_empty());
+        assert_eq!(store.start_agent(again.id).expect("start"), None);
+        assert_eq!(rows(&store, "agents"), 0);
+    }
+
+    #[test]
+    fn a_merge_stays_counted_and_a_later_task_with_the_same_id_counts_too() {
+        let (store, project, task) = project_with_a_closed_task();
+        store.remove_project(project.id).expect("removed");
+        assert_eq!(store.merge_count().expect("count"), 1);
+
+        let again = store
+            .add_project(&project.path, &project.name)
+            .expect("added again");
+        let reused = store.add_task(&new_task(again.id, &[])).expect("task");
+        assert_eq!(reused.id, task, "the deleted row id is free again");
+
+        assert!(store.record_merge(reused.id).expect("record"));
+        assert_eq!(store.merge_count().expect("count"), 2);
+    }
+
+    #[test]
+    fn a_removal_that_fails_half_way_deletes_nothing() {
+        let (store, project, _) = project_with_a_closed_task();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER refuse_project_delete BEFORE DELETE ON projects
+                 BEGIN SELECT RAISE(ABORT, 'no'); END",
+            )
+            .expect("trigger");
+
+        store.remove_project(project.id).expect_err("failed");
+
+        assert_eq!(rows(&store, "projects"), 1);
+        assert_eq!(rows(&store, "tasks"), 1);
+        assert_eq!(rows(&store, "agents"), 1);
+        assert_eq!(rows(&store, "messages"), 1);
+        assert_eq!(rows(&store, "comments"), 2);
+        let task_of_merge: i64 = store
+            .connection
+            .query_row("SELECT task FROM merges", [], |row| row.get(0))
+            .expect("merge");
+        assert!(task_of_merge > 0, "the merge still belongs to its task");
     }
 }

@@ -159,6 +159,20 @@ impl Projects {
         self.info(project)
     }
 
+    /// Fails when the project is unknown or has open tasks, naming them.
+    pub fn check_removable(&self, project: ProjectId) -> Result<(), Error> {
+        lock(&self.store).check_removable(project)
+    }
+
+    /// Forgets the project and its closed tasks. Nothing on disk changes: the files,
+    /// branches and worktrees stay. Refuses like [`Projects::check_removable`]; no task
+    /// is made while it runs.
+    pub fn remove(&self, project: ProjectId) -> Result<(), Error> {
+        let _creating = lock(&self.creating);
+
+        lock(&self.store).remove_project(project)
+    }
+
     pub fn set_setup_terminal(
         &self,
         task: TaskId,

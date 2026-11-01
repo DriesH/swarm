@@ -16,7 +16,7 @@ use swarm_term::TerminalInput;
 use swarm_term::{ExitStatus, Palette, Rgb, Size};
 
 use crate::Services;
-use crate::agents::{CommandNotFound, Place, Start};
+use crate::agents::{Agents, CommandNotFound, Place, Start, start_key};
 use crate::hub::Extras;
 
 /// Default size and colors of a setup or agent terminal; the app resizes it when it
@@ -197,7 +197,7 @@ fn loses_more(confirmed: &CloseCheck, now: &CloseCheck) -> bool {
 }
 
 fn stop_and_close(services: &Services, id: TaskId, confirmed: &CloseCheck) -> Result<()> {
-    if !stop_processes(services, id) {
+    if !stop_processes(services, Scope::Task(id)) {
         bail!("some processes of the task did not end; try again");
     }
 
@@ -220,14 +220,47 @@ fn stop_and_close(services: &Services, id: TaskId, confirmed: &CloseCheck) -> Re
     Ok(())
 }
 
-/// Ends every agent and process terminal of the task: SIGTERM, then SIGKILL after
+/// Who a stop reaches: the agents and terminals of a task, or the Start orchestrator
+/// and the terminals of a project's Start tab.
+#[derive(Debug, Clone, Copy)]
+enum Scope {
+    Task(TaskId),
+    Start(ProjectId),
+}
+
+impl Scope {
+    /// The `task` key of the terminals in this scope.
+    fn key(self) -> String {
+        match self {
+            Self::Task(task) => task.terminal_key(),
+            Self::Start(project) => start_key(project),
+        }
+    }
+
+    /// Marks the live agents as stopped on purpose. Returns the terminals of those that run.
+    fn stop_agents(self, agents: &Agents) -> Vec<TerminalId> {
+        match self {
+            Self::Task(task) => agents.stop_task_agents(task),
+            Self::Start(project) => agents.stop_start_agents(project),
+        }
+    }
+
+    fn has_live(self, agents: &Agents) -> bool {
+        match self {
+            Self::Task(task) => agents.has_live(task),
+            Self::Start(project) => agents.has_live_start(project),
+        }
+    }
+}
+
+/// Ends every agent and process terminal of the scope: SIGTERM, then SIGKILL after
 /// [`CLOSE_GRACE`]. Repeats while new ones show up from a request that was under way.
-/// False when something of the task is still alive at the end.
-fn stop_processes(services: &Services, task: TaskId) -> bool {
-    let key = task.terminal_key();
+/// False when something of the scope is still alive at the end.
+fn stop_processes(services: &Services, scope: Scope) -> bool {
+    let key = scope.key();
 
     for _ in 0..3 {
-        let mut running = services.agents.stop_task_agents(task);
+        let mut running = scope.stop_agents(&services.agents);
         running.extend(
             services
                 .terminals
@@ -239,7 +272,7 @@ fn stop_processes(services: &Services, task: TaskId) -> bool {
         running.sort_unstable();
         running.dedup();
 
-        if running.is_empty() && !services.agents.has_live(task) {
+        if running.is_empty() && !scope.has_live(&services.agents) {
             return true;
         }
 
@@ -251,7 +284,7 @@ fn stop_processes(services: &Services, task: TaskId) -> bool {
                 hub.send_input(TerminalInput::Kill);
             }
         }
-        if wait_until_ended(services, task, &running, CLOSE_GRACE) {
+        if wait_until_ended(services, scope, &running, CLOSE_GRACE) {
             continue;
         }
 
@@ -263,30 +296,28 @@ fn stop_processes(services: &Services, task: TaskId) -> bool {
                 hub.send_input(TerminalInput::Kill);
             }
         }
-        if !wait_until_ended(services, task, &running, CLOSE_KILL_WAIT) {
-            log::warn!("task {} still has processes after SIGKILL", task.0);
+        if !wait_until_ended(services, scope, &running, CLOSE_KILL_WAIT) {
+            log::warn!("{scope:?} still has processes after SIGKILL");
 
             return false;
         }
     }
 
-    !services.agents.has_live(task) && !has_terminals(services, task)
+    !scope.has_live(&services.agents) && !has_terminals(services, &key)
 }
 
-fn has_terminals(services: &Services, task: TaskId) -> bool {
-    let key = task.terminal_key();
-
+fn has_terminals(services: &Services, key: &str) -> bool {
     services
         .terminals
         .list()
         .iter()
-        .any(|info| info.task.as_deref() == Some(key.as_str()))
+        .any(|info| info.task.as_deref() == Some(key))
 }
 
 /// True when the terminals are gone and their agents have ended, within `timeout`.
 fn wait_until_ended(
     services: &Services,
-    task: TaskId,
+    scope: Scope,
     terminals: &[TerminalId],
     timeout: Duration,
 ) -> bool {
@@ -296,7 +327,7 @@ fn wait_until_ended(
         let gone = terminals
             .iter()
             .all(|terminal| services.terminals.get(*terminal).is_none());
-        if gone && !services.agents.has_live(task) {
+        if gone && !scope.has_live(&services.agents) {
             return true;
         }
         if Instant::now() >= deadline {
@@ -305,6 +336,26 @@ fn wait_until_ended(
 
         thread::park_timeout(CLOSE_POLL);
     }
+}
+
+/// Forgets a project: stops its Start orchestrator and the terminals of its Start tab,
+/// then removes its rows. Files, branches and worktrees stay where they are. Refuses
+/// while a task is open.
+pub(crate) fn remove_project(services: &Services, project: ProjectId) -> Result<()> {
+    services.projects.check_removable(project)?;
+
+    let Some(_removing) = services.agents.begin_remove(project) else {
+        bail!("project {} is being removed already", project.0);
+    };
+
+    if !stop_processes(services, Scope::Start(project)) {
+        bail!("some terminals of the project did not end; try again");
+    }
+
+    services.projects.remove(project)?;
+    services.processes.forget_project(project);
+
+    Ok(())
 }
 
 /// Starts the project's Start orchestrator in the project root, or returns the one that

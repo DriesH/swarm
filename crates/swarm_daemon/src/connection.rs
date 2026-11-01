@@ -197,7 +197,6 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
         }
         Request::SystemCheck { call } => system_check(services, sink, call),
         Request::Stats { call } => send_stats(services, sink, call),
-        Request::RemoveProject { call, .. } => send_error(sink, call, &"not built yet"),
         Request::Usage { call } => {
             sink.send_event(&Event::Usage {
                 call,
@@ -237,6 +236,7 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
         | Request::SetCloseAfterMerge { .. }) => handle_pull_requests(services, sink, request),
         request @ (Request::ListProjects { .. }
         | Request::AddProject { .. }
+        | Request::RemoveProject { .. }
         | Request::CreateTask { .. }) => handle_projects(services, sink, request),
     }
 }
@@ -318,6 +318,12 @@ fn handle_projects(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Re
                 }
             });
         }
+        Request::RemoveProject { call, project } => {
+            let services = Arc::clone(services);
+            run_slow(sink, "remove-project", call, move |sink| {
+                done_or_error(sink, call, tasks::remove_project(&services, project));
+            });
+        }
         Request::CreateTask { call, task } => {
             let services = Arc::clone(services);
             run_slow(sink, "create-task", call, move |sink| {
@@ -345,6 +351,11 @@ fn create_terminal(
 ) {
     if services.agents.is_closing_key(terminal.task.as_deref()) {
         send_error(sink, call, &"the task is closing");
+
+        return;
+    }
+    if services.agents.is_removing_key(terminal.task.as_deref()) {
+        send_error(sink, call, &"the project is being removed");
 
         return;
     }

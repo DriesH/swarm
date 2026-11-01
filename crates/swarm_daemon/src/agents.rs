@@ -340,10 +340,24 @@ pub(crate) struct Agents {
     on_end: Mutex<Vec<EndObserver>>,
     /// Tasks being closed: nothing new starts in them, and their agents end quietly.
     closing: Mutex<HashSet<TaskId>>,
+    /// Projects being removed: nothing new starts in them.
+    removing: Mutex<HashSet<ProjectId>>,
     /// When each task last told the user it is ready for review. In memory only.
     reviews: Mutex<HashMap<TaskId, ReviewWatch>>,
     /// The daemon is stopping, so agents that end are not broken.
     shutting_down: AtomicBool,
+}
+
+/// Held while a project is removed; dropping it lets the project take agents again.
+pub(crate) struct Removing<'a> {
+    agents: &'a Agents,
+    project: ProjectId,
+}
+
+impl Drop for Removing<'_> {
+    fn drop(&mut self) {
+        lock(&self.agents.removing).remove(&self.project);
+    }
 }
 
 /// Follows one task to tell when it is ready for review.
@@ -425,6 +439,7 @@ impl Agents {
             live: Mutex::default(),
             on_end: Mutex::default(),
             closing: Mutex::default(),
+            removing: Mutex::default(),
             reviews: Mutex::default(),
             shutting_down: AtomicBool::new(false),
         })
@@ -448,12 +463,36 @@ impl Agents {
         lock(&self.closing).remove(&task);
     }
 
+    /// Starts removing the project: no agent registers and no terminal of its Start tab
+    /// starts until the guard drops. None when the project is being removed already.
+    pub(crate) fn begin_remove(&self, project: ProjectId) -> Option<Removing<'_>> {
+        let begun = lock(&self.removing).insert(project);
+
+        begun.then(|| Removing {
+            agents: self,
+            project,
+        })
+    }
+
+    pub(crate) fn is_removing(&self, project: ProjectId) -> bool {
+        lock(&self.removing).contains(&project)
+    }
+
     /// Like [`Self::is_closing`], for the `task` key of a terminal.
     pub(crate) fn is_closing_key(&self, key: Option<&str>) -> bool {
         key.is_some_and(|key| {
             lock(&self.closing)
                 .iter()
                 .any(|task| task.terminal_key() == key)
+        })
+    }
+
+    /// True for the `task` key of the Start tab of a project that is being removed.
+    pub(crate) fn is_removing_key(&self, key: Option<&str>) -> bool {
+        key.is_some_and(|key| {
+            lock(&self.removing)
+                .iter()
+                .any(|project| start_key(*project) == key)
         })
     }
 
@@ -468,6 +507,20 @@ impl Agents {
         self.mark_stopped(
             |agent| agent.info.task == Some(task),
             |agent| agent.stop_requested = true,
+        )
+    }
+
+    /// Stops the project's Start orchestrator for good, as the user's choice: it ends
+    /// `Stopped`, tells nobody and can start nothing new. Returns its terminal if it runs.
+    pub(crate) fn stop_start_agents(&self, project: ProjectId) -> Vec<TerminalId> {
+        self.mark_stopped(
+            |agent| {
+                agent.info.project == project && agent.info.role == AgentRole::StartOrchestrator
+            },
+            |agent| {
+                agent.stop_requested = true;
+                agent.stopped_by_user = true;
+            },
         )
     }
 
@@ -540,6 +593,13 @@ impl Agents {
             .any(|agent| agent.info.task == Some(task))
     }
 
+    /// True while the project's Start orchestrator still has a live entry.
+    pub(crate) fn has_live_start(&self, project: ProjectId) -> bool {
+        lock(&self.live).values().any(|agent| {
+            agent.info.project == project && agent.info.role == AgentRole::StartOrchestrator
+        })
+    }
+
     /// Calls `observer` for every agent whose process ends.
     pub(crate) fn on_end(&self, observer: EndObserver) {
         lock(&self.on_end).push(observer);
@@ -603,6 +663,9 @@ impl Agents {
     ) -> Result<AgentInfo> {
         if self.is_closing(place.task) {
             bail!("the task is closing");
+        }
+        if self.is_removing(place.project) {
+            bail!("the project is being removed");
         }
         if asker.is_some_and(|asker| self.is_stopped(asker)) {
             bail!(STOPPED_BY_USER);
@@ -2873,5 +2936,117 @@ mod tests {
 
             assert!(ready_texts(&notices(&frames)).is_empty(), "{name}");
         }
+    }
+
+    /// A Start orchestrator of `project` that was registered and not started.
+    fn register_start(agents: &Agents, project: ProjectId) -> AgentInfo {
+        let plan = Plan {
+            kind: AgentKind::ClaudeCode,
+            role: AgentRole::StartOrchestrator,
+            model: "model".to_owned(),
+            command: "agent".to_owned(),
+            skip_permissions: false,
+        };
+        let place = Place {
+            project,
+            task: None,
+            name: "start",
+            worktree: Path::new("/repo"),
+            branch: "main",
+            ports: &[],
+        };
+
+        agents
+            .register(&place, plan)
+            .expect("register the start agent")
+    }
+
+    #[test]
+    fn a_project_that_is_removed_takes_no_agent_and_no_terminal_of_its_start_tab() {
+        let (agents, task) = agents_with_a_task();
+        let key = start_key(task.project);
+        assert!(!agents.is_removing_key(Some(&key)));
+
+        let removing = agents.begin_remove(task.project).expect("begun");
+
+        assert!(agents.begin_remove(task.project).is_none(), "only once");
+        assert!(agents.is_removing(task.project));
+        assert!(agents.is_removing_key(Some(&key)));
+        assert!(!agents.is_removing_key(Some(&task.id.terminal_key())));
+        let refused = register_in(&agents, &task, None).expect_err("refused");
+        assert_eq!(refused.to_string(), "the project is being removed");
+
+        drop(removing);
+
+        assert!(!agents.is_removing(task.project));
+        assert!(!agents.is_removing_key(Some(&key)));
+        assert!(register_in(&agents, &task, None).is_ok());
+    }
+
+    #[test]
+    fn stopping_the_start_agent_leaves_the_agents_of_tasks_and_of_other_projects() {
+        let (agents, task) = agents_with_a_task();
+        let other = lock(&agents.store)
+            .add_project(Path::new("/other"), "other")
+            .expect("other project");
+        let orchestrator = register_in(&agents, &task, None).expect("orchestrator");
+        let start = register_start(&agents, task.project);
+        let other_start = register_start(&agents, other.id);
+        start_without_a_hub(&agents, start.id);
+        assert!(agents.has_live_start(task.project));
+
+        let terminals = agents.stop_start_agents(task.project);
+
+        assert_eq!(terminals, [TerminalId(99)], "its terminal is to be killed");
+        assert!(agents.is_stopped(start.id), "it can start nothing new");
+        assert!(!agents.is_stopped(orchestrator.id));
+        assert!(!agents.is_stopped(other_start.id));
+        assert!(agents.has_live_start(other.id));
+        assert!(agents.has_live(task.id));
+    }
+
+    #[test]
+    fn a_start_agent_that_never_started_ends_stopped_when_its_project_is_removed() {
+        let (agents, task) = agents_with_a_task();
+        let start = register_start(&agents, task.project);
+
+        let terminals = agents.stop_start_agents(task.project);
+
+        assert!(terminals.is_empty());
+        assert!(!agents.has_live_start(task.project));
+        let stored = lock(&agents.store)
+            .agent(start.id)
+            .expect("read")
+            .expect("row");
+        assert_eq!(stored.info.lifecycle, AgentLifecycle::Stopped);
+    }
+
+    #[test]
+    fn a_start_agent_stopped_for_a_removal_ends_stopped_and_tells_nobody() {
+        let (agents, task, frames) = agents_with_a_client();
+        let start = register_start(&agents, task.project);
+        start_without_a_hub(&agents, start.id);
+        lock(&agents.live)
+            .get_mut(&start.id)
+            .expect("live")
+            .session_confirmed = true;
+        lock(&agents.live)
+            .get_mut(&start.id)
+            .expect("live")
+            .session_id = Some("session".to_owned());
+        agents.stop_start_agents(task.project);
+
+        agents.exited(start.id, Some(&ExitStatus::Signal("SIGTERM".to_owned())));
+
+        assert!(notices(&frames).is_empty(), "a stop on purpose is no news");
+        let stored = lock(&agents.store)
+            .agent(start.id)
+            .expect("read")
+            .expect("row");
+        assert_eq!(
+            stored.info.lifecycle,
+            AgentLifecycle::Stopped,
+            "the project is gone, so the session cannot resume"
+        );
     }
 }

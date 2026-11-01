@@ -320,6 +320,9 @@ impl Processes {
         if self.agents.is_closing(caller.task) {
             bail!("the task is closing");
         }
+        if self.agents.is_removing(caller.project) {
+            bail!("the project is being removed");
+        }
 
         let cwd = inside_worktree(caller, request.cwd)?;
         let entry = Arc::new(Entry {
@@ -588,6 +591,11 @@ impl Processes {
         }
     }
 
+    /// Drops the entries of a removed project, ended ones too.
+    pub(crate) fn forget_project(&self, project: ProjectId) {
+        lock(&self.entries).retain(|_, entry| entry.project != project);
+    }
+
     /// The user closed the terminal in the app.
     pub(crate) fn stopped_by_user(&self, id: TerminalId) {
         let entry = lock(&self.entries).get(&id).cloned();
@@ -633,7 +641,7 @@ impl Processes {
         };
         entry.changed.notify_all();
 
-        if self.agents.is_closing(entry.task) {
+        if self.agents.is_closing(entry.task) || self.agents.is_removing(entry.project) {
             return;
         }
 

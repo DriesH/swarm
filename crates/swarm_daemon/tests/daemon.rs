@@ -3925,6 +3925,11 @@ impl Client {
 
     /// A user terminal that belongs to the task.
     fn create_task_terminal(&mut self, task: TaskId, command: &[&str]) -> TerminalId {
+        self.create_keyed_terminal(&task.terminal_key(), command)
+    }
+
+    /// A user terminal with the given `task` key.
+    fn create_keyed_terminal(&mut self, key: &str, command: &[&str]) -> TerminalId {
         self.send(&Request::Create {
             call: CALL,
             terminal: CreateTerminal {
@@ -3943,13 +3948,20 @@ impl Client {
                     cursor: Rgb(255, 255, 255),
                     ansi: [Rgb(120, 120, 120); 16],
                 },
-                task: Some(task.terminal_key()),
+                task: Some(key.to_owned()),
             },
         });
 
         self.wait_for(|event| match event {
             Event::Created { call: CALL, id } => Some(*id),
             _ => None,
+        })
+    }
+
+    fn remove_project(&mut self, project: ProjectId) -> Result<Vec<Event>, String> {
+        self.until_done(&Request::RemoveProject {
+            call: CALL,
+            project,
         })
     }
 }
@@ -4599,6 +4611,390 @@ sleep 300"#,
         AgentLifecycle::Stopped,
         "not resumed"
     );
+}
+
+/// The `task` key of the terminals in a project's Start tab. Keeps in step with
+/// `start_key` in the daemon.
+fn start_key(project: ProjectId) -> String {
+    format!("project:{}/start", project.0)
+}
+
+/// A Start orchestrator that runs a process terminal and goes on. `#TRAP` is replaced.
+const START_AGENT: &str = r#"case "$SWARM_ROLE" in
+start_orchestrator)
+  echo $$ > "$OUT/start-pid"
+  printf '{"hook_event_name":"SessionStart","session_id":"start-session"}' | "$SWARM" hook
+  swarm terminal spawn --name dev -- sh -c 'echo $$ > "$1"; exec sleep 300' sh "$OUT/dev-pid" > "$OUT/terminal.out" 2>&1
+  until [ -s "$OUT/dev-pid" ]; do sleep 0.1; done
+  #TRAP
+  echo ready > "$OUT/ready"
+  while :; do sleep 0.2; done
+  ;;
+esac"#;
+
+/// Ignores SIGTERM, and when it comes tries to start a terminal and a task.
+const STUBBORN: &str = r#"trap 'swarm terminal spawn -- sleep 1 > "$OUT/late-terminal.out" 2>&1; swarm task create late --brief x > "$OUT/late-task.out" 2>&1' TERM"#;
+
+fn pid_in(fixture: &Fixture, name: &str) -> i32 {
+    fixture.read_when_written(name).trim().parse().expect("pid")
+}
+
+/// What removing a project must leave alone.
+#[derive(Debug, PartialEq, Eq)]
+struct RepoState {
+    /// Every file and folder outside `.git`, with the bytes of the files.
+    files: Vec<(PathBuf, Option<Vec<u8>>)>,
+    refs: String,
+    worktrees: String,
+    exclude: String,
+}
+
+fn repo_state(repo: &Repo) -> RepoState {
+    fn collect(root: &Path, folder: &Path, files: &mut Vec<(PathBuf, Option<Vec<u8>>)>) {
+        for entry in std::fs::read_dir(folder).expect("read folder") {
+            let path = entry.expect("entry").path();
+            if path.file_name().is_some_and(|name| name == ".git") {
+                continue;
+            }
+
+            let relative = path.strip_prefix(root).expect("inside the repo").to_owned();
+            if path.is_dir() {
+                files.push((relative, None));
+                collect(root, &path, files);
+            } else {
+                files.push((relative, Some(std::fs::read(&path).expect("read a file"))));
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    collect(&repo.root, &repo.root, &mut files);
+    files.sort();
+
+    RepoState {
+        files,
+        refs: git_output(
+            &repo.root,
+            &["for-each-ref", "--format=%(refname) %(objectname)"],
+        ),
+        worktrees: git_output(&repo.root, &["worktree", "list", "--porcelain"]),
+        exclude: std::fs::read_to_string(repo.root.join(".git/info/exclude")).expect("exclude"),
+    }
+}
+
+fn task_named(project: ProjectId, name: &str) -> CreateTask {
+    CreateTask {
+        name: name.to_owned(),
+        orchestrator: None,
+        ..orchestrator_task(project, false)
+    }
+}
+
+#[test]
+fn a_project_with_open_tasks_is_refused_with_their_names_and_nothing_stops() {
+    let fixture = fixture_with_helpers(&START_AGENT.replace("#TRAP", ""));
+    let repo = sized_terminal_repo();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let start = client.start_orchestrator(project.id);
+    fixture.read_when_written("ready");
+    let (start_pid, dev_pid) = (pid_in(&fixture, "start-pid"), pid_in(&fixture, "dev-pid"));
+    let first = client.create_task(task_named(project.id, "terminal-renderer"));
+    let second = client.create_task(task_named(project.id, "menu-bar-usage"));
+
+    let refused = client.remove_project(project.id).expect_err("refused");
+
+    assert_eq!(
+        refused,
+        "close its 2 tasks first: terminal-renderer, menu-bar-usage"
+    );
+    assert!(process_alive(start_pid), "the Start orchestrator runs on");
+    assert!(process_alive(dev_pid), "its terminal runs on");
+    assert!(first.worktree.exists() && second.worktree.exists());
+    let listed = client.projects();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].tasks.len(), 2);
+    assert_eq!(
+        listed[0].start.as_ref().map(|agent| agent.id),
+        Some(start.id)
+    );
+
+    client.close_task(first.id).expect("closed the first");
+    let refused = client
+        .remove_project(project.id)
+        .expect_err("refused again");
+    assert_eq!(refused, "close its 1 task first: menu-bar-usage");
+
+    client.close_task(second.id).expect("closed the second");
+    client.remove_project(project.id).expect("removed");
+    assert!(client.projects().is_empty());
+}
+
+#[test]
+fn an_unknown_project_cannot_be_removed() {
+    let daemon = Daemon::start();
+    let mut client = daemon.connect();
+    client.hello();
+
+    let refused = client.remove_project(ProjectId(42)).expect_err("refused");
+
+    assert_eq!(refused, "no project with id 42");
+}
+
+#[test]
+fn removing_a_project_with_only_closed_tasks_changes_nothing_on_disk() {
+    let repo = repo_for_merges();
+    let daemon = Daemon::start();
+    let (mut client, task) = reviewed_task(&daemon, &repo);
+    client.close_task(task.id).expect("closed");
+    std::fs::write(repo.root.join("notes.txt"), "mine\n").expect("a user file");
+    let before = repo_state(&repo);
+    assert!(
+        before.refs.contains(&task.branch),
+        "the unmerged branch stays after the close: {}",
+        before.refs
+    );
+    assert!(before.exclude.contains("/.worktrees/"));
+
+    client.remove_project(task.project).expect("removed");
+
+    assert_eq!(repo_state(&repo), before);
+    assert!(client.projects().is_empty());
+    let store = database(&daemon);
+    assert!(store.list_projects().expect("projects").is_empty());
+    assert_eq!(store.task_including_closed(task.id).expect("read"), None);
+}
+
+#[test]
+fn removing_a_project_stops_its_start_orchestrator_and_start_terminals_and_tells_nobody() {
+    let fixture = fixture_with_helpers(&START_AGENT.replace("#TRAP", STUBBORN));
+    let repo = sized_terminal_repo();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let start = client.start_orchestrator(project.id);
+    fixture.read_when_written("ready");
+    let (start_pid, dev_pid) = (pid_in(&fixture, "start-pid"), pid_in(&fixture, "dev-pid"));
+
+    let sleeper = |file: &str| {
+        format!(
+            "echo $$ > {}; exec sleep 300",
+            fixture.out.join(file).display()
+        )
+    };
+    client.create_keyed_terminal(
+        &start_key(project.id),
+        &["/bin/sh", "-c", &sleeper("user-pid")],
+    );
+    client.create_keyed_terminal(
+        &start_key(ProjectId(project.id.0 + 1)),
+        &["/bin/sh", "-c", &sleeper("other-project-pid")],
+    );
+    client.create(&["/bin/sh", "-c", &sleeper("no-task-pid")]);
+    let (user_pid, other_project_pid, no_task_pid) = (
+        pid_in(&fixture, "user-pid"),
+        pid_in(&fixture, "other-project-pid"),
+        pid_in(&fixture, "no-task-pid"),
+    );
+
+    let mut events = client.remove_project(project.id).expect("removed");
+
+    let stopped_start = |event: &Event| {
+        matches!(
+            event,
+            Event::AgentChanged { agent }
+                if agent.id == start.id && agent.lifecycle == AgentLifecycle::Stopped
+        )
+    };
+    if !events.iter().any(stopped_start) {
+        client.wait_for(|event| {
+            events.push(event.clone());
+
+            stopped_start(event).then_some(())
+        });
+    }
+    assert!(!process_alive(start_pid), "the Start orchestrator stopped");
+    assert!(!process_alive(dev_pid), "its process terminal stopped");
+    assert!(!process_alive(user_pid), "the Start tab terminal stopped");
+    assert!(
+        process_alive(other_project_pid) && process_alive(no_task_pid),
+        "terminals of no project are left alone"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, Event::MessageSent { .. } | Event::Notice { .. })),
+        "nobody is told: {events:?}"
+    );
+    assert!(client.projects().is_empty());
+    assert!(
+        client
+            .terminals()
+            .iter()
+            .all(|terminal| terminal.task.as_deref() != Some(start_key(project.id).as_str()))
+    );
+    assert_eq!(database(&daemon).agent(start.id).expect("read"), None);
+    assert!(
+        fixture
+            .read_when_written("late-terminal.out")
+            .contains("the project is being removed")
+    );
+    assert!(
+        fixture
+            .read_when_written("late-task.out")
+            .contains("the user stopped you")
+    );
+
+    for pid in [other_project_pid, no_task_pid] {
+        // SAFETY: the pids are the sleepers this test started.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+}
+
+#[test]
+fn no_terminal_of_the_start_tab_starts_while_the_project_is_removed() {
+    let fixture = fixture_with_helpers(&START_AGENT.replace("#TRAP", "trap '' TERM"));
+    let repo = sized_terminal_repo();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let mut other = daemon.connect();
+    other.hello();
+    let project = client.add_project(&repo.root);
+    client.start_orchestrator(project.id);
+    fixture.read_when_written("ready");
+    let dev_pid = pid_in(&fixture, "dev-pid");
+
+    client.send(&Request::RemoveProject {
+        call: CALL,
+        project: project.id,
+    });
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while process_alive(dev_pid) {
+        assert!(Instant::now() < deadline, "the removal never began");
+        thread::park_timeout(Duration::from_millis(20));
+    }
+    other.send(&Request::Create {
+        call: CALL,
+        terminal: CreateTerminal {
+            kind: TerminalKind::User,
+            command: Some(vec!["/bin/sleep".to_owned(), "300".to_owned()]),
+            cwd: None,
+            size: Size {
+                cols: 80,
+                rows: 24,
+                cell_width: 8,
+                cell_height: 16,
+            },
+            palette: Palette {
+                fg: Rgb(230, 230, 230),
+                bg: Rgb(10, 10, 12),
+                cursor: Rgb(255, 255, 255),
+                ansi: [Rgb(120, 120, 120); 16],
+            },
+            task: Some(start_key(project.id)),
+        },
+    });
+    let refused = other.wait_for(|event| match event {
+        Event::Error {
+            call: Some(CALL),
+            message,
+            ..
+        } => Some(message.clone()),
+        Event::Created { call: CALL, .. } => Some("created".to_owned()),
+        _ => None,
+    });
+
+    assert_eq!(refused, "the project is being removed");
+    client.await_done().expect("removed");
+    assert!(other.terminals().is_empty());
+}
+
+#[test]
+fn adding_the_path_again_gives_a_new_empty_project() {
+    let repo = repo_for_merges();
+    let daemon = Daemon::start();
+    let (mut client, task) = reviewed_task(&daemon, &repo);
+    let first = client.projects().remove(0);
+    client.close_task(task.id).expect("closed");
+    client.remove_project(task.project).expect("removed");
+
+    let again = client.add_project(&repo.root);
+
+    assert_eq!(again.path, first.path);
+    assert!(again.tasks.is_empty(), "no task came back");
+    assert_eq!(again.start, None);
+    assert_eq!(client.projects(), std::slice::from_ref(&again));
+    assert_eq!(
+        database(&daemon)
+            .task_including_closed(task.id)
+            .expect("read"),
+        None,
+        "the closed task of the old project did not come back"
+    );
+    let fresh = client.create_task(task_named(again.id, "Fresh"));
+    assert_eq!(client.projects()[0].tasks, [fresh]);
+}
+
+#[test]
+fn the_start_orchestrator_of_a_project_added_again_sees_none_of_the_old_terminals() {
+    let fixture = fixture_with_helpers(
+        r#"case "$SWARM_ROLE" in
+start_orchestrator)
+  if [ -e "$OUT/second" ]; then
+    swarm terminal list > "$OUT/list.out" 2>&1
+    echo done > "$OUT/listed"
+    while :; do sleep 0.2; done
+  fi
+  swarm terminal spawn --name dev -- sh -c 'echo $$ > "$1"; exec sleep 300' sh "$OUT/dev-pid" > "$OUT/terminal.out" 2>&1
+  until [ -s "$OUT/dev-pid" ]; do sleep 0.1; done
+  echo ready > "$OUT/ready"
+  while :; do sleep 0.2; done
+  ;;
+esac"#,
+    );
+    let repo = sized_terminal_repo();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    client.start_orchestrator(project.id);
+    fixture.read_when_written("ready");
+    client.remove_project(project.id).expect("removed");
+    std::fs::write(fixture.out.join("second"), "").expect("marker");
+
+    let again = client.add_project(&repo.root);
+    client.start_orchestrator(again.id);
+
+    fixture.read_when_written("listed");
+    assert_eq!(
+        fixture.read_when_written("list.out").trim(),
+        "no process terminals"
+    );
+}
+
+#[test]
+fn only_the_removed_project_leaves_the_list_and_it_stays_gone_after_a_restart() {
+    let (first, second) = (Repo::new(""), Repo::new(""));
+    let mut daemon = Daemon::start();
+    let mut client = daemon.connect();
+    client.hello();
+    let removed = client.add_project(&first.root);
+    let kept = client.add_project(&second.root);
+
+    client.remove_project(removed.id).expect("removed");
+
+    assert_eq!(client.projects(), std::slice::from_ref(&kept));
+    drop(client);
+
+    daemon.crash();
+    let restarted = Daemon::start_in(daemon.home.clone());
+    let mut client = restarted.connect();
+    client.hello();
+    assert_eq!(client.projects(), [kept]);
 }
 
 fn comment_at(
