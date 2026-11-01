@@ -1,23 +1,24 @@
 //! The Remove project dialog.
 
+use std::collections::BTreeSet;
+use std::ops::Range;
+use std::path::{Path, PathBuf};
+
 use gpui::{
-    AnyElement, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable as _, Role,
-    SharedString, Window, div, px,
+    App, AppContext as _, Context, Div, Entity, EventEmitter, FocusHandle, Focusable as _,
+    HighlightStyle, Role, SharedString, StyledText, Window, div, px, relative,
 };
-use swarm_protocol::Client;
+use swarm_protocol::{Client, RemoveCheck, TaskCloseCheck};
+use swarm_ui::fonts::{MONO_FONT, UI_FONT};
 use swarm_ui::prelude::*;
 
+use crate::close_task::{CheckState, deletes_files, describe, stops_agents, stops_terminals};
 use crate::model::ProjectId;
 use crate::palette::Overlay;
+use crate::review_model::plural;
 use crate::workspace::{DataSource, Workspace};
 
 const NOT_RUNNING: &str = "The daemon is not running";
-
-/// What removing does, as short facts.
-const FACTS: [&str; 2] = [
-    "Files, branches and worktrees stay on disk.",
-    "Its Start orchestrator stops.",
-];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RemoveProjectEvent {
@@ -31,7 +32,8 @@ pub(crate) enum RemoveProjectEvent {
 pub(crate) struct RemoveProjectDialog {
     pub(crate) project: ProjectId,
     name: SharedString,
-    open_tasks: Vec<SharedString>,
+    root: Option<PathBuf>,
+    check: CheckState<RemoveCheck>,
     busy: bool,
     error: Option<SharedString>,
     focus_handle: FocusHandle,
@@ -43,7 +45,7 @@ impl RemoveProjectDialog {
     pub(crate) fn new(
         project: ProjectId,
         name: SharedString,
-        open_tasks: Vec<SharedString>,
+        root: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -53,15 +55,16 @@ impl RemoveProjectDialog {
         Self {
             project,
             name,
-            open_tasks,
+            root,
+            check: CheckState::Checking,
             busy: false,
             error: None,
             focus_handle,
         }
     }
 
-    pub(crate) fn set_open_tasks(&mut self, open_tasks: Vec<SharedString>, cx: &mut Context<Self>) {
-        self.open_tasks = open_tasks;
+    pub(crate) fn set_check(&mut self, check: CheckState<RemoveCheck>, cx: &mut Context<Self>) {
+        self.check = check;
         cx.notify();
     }
 
@@ -83,6 +86,14 @@ impl RemoveProjectDialog {
         cx.emit(RemoveProjectEvent::Dismissed);
     }
 
+    /// The check the user is looking at, once there is one.
+    pub(crate) fn confirmed(&self) -> Option<RemoveCheck> {
+        match &self.check {
+            CheckState::Ready(check) => Some(check.clone()),
+            _ => None,
+        }
+    }
+
     fn dismiss(&mut self, cx: &mut Context<Self>) {
         if !self.busy {
             cx.emit(RemoveProjectEvent::Dismissed);
@@ -90,69 +101,145 @@ impl RemoveProjectDialog {
     }
 
     pub(crate) fn title(&self) -> String {
-        format!("Remove {}?", self.name)
+        format!("Remove project \u{201c}{}\u{201d}", self.name)
     }
 
     pub(crate) fn can_confirm(&self) -> bool {
-        !self.busy && self.open_tasks.is_empty()
+        !self.busy && matches!(self.check, CheckState::Ready(_))
+    }
+
+    /// The label of the Remove button, and what a screen reader says for it.
+    pub(crate) fn confirm_labels(&self) -> (String, String) {
+        if self.busy {
+            (
+                "Removing\u{2026}".to_owned(),
+                format!("Removing project {}", self.name),
+            )
+        } else {
+            ("Remove".to_owned(), format!("Remove project {}", self.name))
+        }
+    }
+
+    /// The sentence under the title, and the range of it that shows in mono.
+    pub(crate) fn info(&self) -> (String, Option<Range<usize>>) {
+        info_text(self.root.as_deref())
+    }
+
+    /// The value lines under the info, from what the check found.
+    pub(crate) fn lines(&self) -> Vec<(String, Color)> {
+        match &self.check {
+            CheckState::Ready(check) => lines_for(check),
+            _ => Vec::new(),
+        }
     }
 
     #[cfg(test)]
-    pub(crate) fn open_tasks(&self) -> &[SharedString] {
-        &self.open_tasks
+    pub(crate) fn check_state(&self) -> &CheckState<RemoveCheck> {
+        &self.check
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_busy(&self) -> bool {
+        self.busy
     }
 
     #[cfg(test)]
     pub(crate) fn error_text(&self) -> Option<&str> {
         self.error.as_deref()
     }
-
-    /// The note that takes the place of Remove while tasks are open.
-    pub(crate) fn note(&self) -> Option<String> {
-        note_for(&self.open_tasks)
-    }
-
-    fn task_list(&self) -> Option<AnyElement> {
-        if self.open_tasks.is_empty() {
-            return None;
-        }
-
-        Some(
-            v_flex()
-                .id("remove-project-tasks")
-                .role(Role::List)
-                .aria_label("Open tasks")
-                .gap(px(4.))
-                .child(
-                    Label::new("Open tasks")
-                        .size(LabelSize::Small)
-                        .color(Color::Faint),
-                )
-                .children(self.open_tasks.iter().enumerate().map(|(index, name)| {
-                    div()
-                        .id(("remove-project-task", index))
-                        .role(Role::ListItem)
-                        .aria_label(name.clone())
-                        .child(Label::new(name.clone()).mono())
-                }))
-                .into_any_element(),
-        )
-    }
 }
 
-/// "Close login, signup and cart first.", or `None` when no task is open.
-fn note_for(open_tasks: &[SharedString]) -> Option<String> {
-    let (last, rest) = open_tasks.split_last()?;
+/// What the dialog says about the files, with the home folder shown as `~`.
+fn info_text(root: Option<&Path>) -> (String, Option<Range<usize>>) {
+    const HEAD: &str = "Removes only Swarm's tasks, agents and worktrees.";
 
-    let names = if rest.is_empty() {
-        last.to_string()
-    } else {
-        let rest: Vec<&str> = rest.iter().map(|name| &**name).collect();
-
-        format!("{} and {last}", rest.join(", "))
+    let Some(root) = root else {
+        return (format!("{HEAD} The code stays on disk."), None);
     };
 
-    Some(format!("Close {names} first."))
+    let shown = crate::settings::tilde(root);
+    let before = format!("{HEAD} The code in ");
+    let range = before.len()..before.len() + shown.len();
+
+    (format!("{before}{shown} stays on disk."), Some(range))
+}
+
+fn lines_for(check: &RemoveCheck) -> Vec<(String, Color)> {
+    let mut lines = Vec::new();
+
+    if !check.tasks.is_empty() {
+        let names: Vec<&str> = check.tasks.iter().map(|task| task.name.as_str()).collect();
+        let count = u32::try_from(names.len()).unwrap_or(u32::MAX);
+
+        lines.push((
+            format!(
+                "Closes {}: {}",
+                plural(count, "task", "tasks"),
+                names.join(", ")
+            ),
+            Color::Default,
+        ));
+    }
+
+    let total = |count: fn(&TaskCloseCheck) -> u32| {
+        check
+            .tasks
+            .iter()
+            .fold(0, |sum: u32, task| sum.saturating_add(count(task)))
+    };
+    let (agents, terminals) = (
+        total(|task| task.check.running_agents),
+        total(|task| task.check.user_terminals),
+    );
+
+    if agents > 0 {
+        lines.push((stops_agents(agents), Color::Default));
+    }
+    if terminals > 0 {
+        lines.push((stops_terminals(terminals), Color::Default));
+    }
+
+    for task in &check.tasks {
+        if task.check.uncommitted_files > 0 {
+            lines.push((
+                format!(
+                    "{} in {}",
+                    deletes_files(task.check.uncommitted_files),
+                    task.name
+                ),
+                Color::Warn,
+            ));
+        }
+    }
+
+    let merged: BTreeSet<&str> = check
+        .tasks
+        .iter()
+        .flat_map(|task| task.check.merged_branches.iter().map(String::as_str))
+        .collect();
+    if !merged.is_empty() {
+        let count = u32::try_from(merged.len()).unwrap_or(u32::MAX);
+
+        lines.push((
+            format!(
+                "Deletes {}",
+                plural(count, "merged branch", "merged branches")
+            ),
+            Color::Default,
+        ));
+    }
+
+    lines
+}
+
+/// Body text that wraps: the dialog is narrow, and a task name or a message can be long.
+fn wrapping(text: impl Into<SharedString>, color: Color, cx: &App) -> Div {
+    div()
+        .font_family(UI_FONT)
+        .text_size(px(13.))
+        .line_height(relative(1.4))
+        .text_color(color.hsla(cx))
+        .child(text.into())
 }
 
 impl Render for RemoveProjectDialog {
@@ -160,18 +247,62 @@ impl Render for RemoveProjectDialog {
         let on_dismiss = cx.entity();
         let busy = self.busy;
 
-        let facts = v_flex()
-            .id("remove-project-facts")
-            .role(Role::List)
-            .aria_label("What removing does")
-            .gap(px(6.))
-            .children(FACTS.iter().enumerate().map(|(index, text)| {
+        let (text, mono) = self.info();
+        let mut styled = StyledText::new(text.clone());
+        if let Some(range) = mono {
+            // A run of its own, so the font override has a run to apply to.
+            styled = styled
+                .with_highlights([(range.clone(), HighlightStyle::default())])
+                .with_font_family_overrides([(range, SharedString::new_static(MONO_FONT))]);
+        }
+        let info = div()
+            .id("remove-project-info")
+            .role(Role::Label)
+            .aria_label(text)
+            .debug_selector(|| "remove-project-info".to_owned())
+            .font_family(UI_FONT)
+            .text_size(px(13.))
+            .line_height(relative(1.4))
+            .text_color(Color::Muted.hsla(cx))
+            .child(styled);
+
+        let body = match &self.check {
+            CheckState::Checking => Some(
                 div()
-                    .id(("remove-project-fact", index))
-                    .role(Role::ListItem)
-                    .aria_label(*text)
-                    .child(Label::new(*text))
-            }));
+                    .id("remove-project-checking")
+                    .role(Role::Status)
+                    .aria_label("Checking")
+                    .child(Label::new("Checking\u{2026}").color(Color::Faint))
+                    .into_any_element(),
+            ),
+            CheckState::Failed(message) => Some(
+                div()
+                    .id("remove-project-check-error")
+                    .role(Role::Alert)
+                    .aria_label(message.clone())
+                    .child(wrapping(message.clone(), Color::Del, cx))
+                    .into_any_element(),
+            ),
+            CheckState::Ready(_) => {
+                let lines = self.lines();
+
+                (!lines.is_empty()).then(|| {
+                    v_flex()
+                        .id("remove-project-lines")
+                        .role(Role::List)
+                        .aria_label("What removing does")
+                        .gap(px(6.))
+                        .children(lines.into_iter().enumerate().map(|(index, (text, color))| {
+                            div()
+                                .id(("remove-project-line", index))
+                                .role(Role::ListItem)
+                                .aria_label(text.clone())
+                                .child(wrapping(text, color, cx))
+                        }))
+                        .into_any_element()
+                })
+            }
+        };
 
         let error = self.error.clone().map(|message| {
             div()
@@ -183,35 +314,29 @@ impl Render for RemoveProjectDialog {
                 .child(message)
         });
 
-        let cancel = Button::new("remove-project-cancel", "Cancel")
-            .variant(ButtonVariant::Secondary)
-            .debug_selector(|| "remove-project-cancel".to_owned())
-            .disabled(busy)
-            .on_click(cx.listener(|this, _, _, cx| this.dismiss(cx)));
-
-        let action = match self.note() {
-            Some(note) => div()
-                .id("remove-project-note")
-                .role(Role::Status)
-                .aria_label(note.clone())
-                .debug_selector(|| "remove-project-note".to_owned())
-                .flex_1()
-                .min_w_0()
-                .text_size(px(12.))
-                .text_color(Color::Muted.hsla(cx))
-                .child(note)
-                .into_any_element(),
-            None => Button::new("remove-project-confirm", "Remove")
-                .variant(ButtonVariant::Destructive)
-                .debug_selector(|| "remove-project-confirm".to_owned())
-                .disabled(!self.can_confirm())
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if this.can_confirm() {
-                        cx.emit(RemoveProjectEvent::Confirmed);
-                    }
-                }))
-                .into_any_element(),
-        };
+        let (label, accessible) = self.confirm_labels();
+        let footer = h_flex()
+            .gap(px(8.))
+            .child(
+                Button::new("remove-project-cancel", "Cancel")
+                    .variant(ButtonVariant::Secondary)
+                    .debug_selector(|| "remove-project-cancel".to_owned())
+                    .disabled(busy)
+                    .on_click(cx.listener(|this, _, _, cx| this.dismiss(cx))),
+            )
+            .child(
+                Button::new("remove-project-confirm", label)
+                    .variant(ButtonVariant::Destructive)
+                    .accessible_label(accessible)
+                    .debug_selector(|| "remove-project-confirm".to_owned())
+                    .loading(busy)
+                    .disabled(!matches!(self.check, CheckState::Ready(_)))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if this.can_confirm() {
+                            cx.emit(RemoveProjectEvent::Confirmed);
+                        }
+                    })),
+            );
 
         Dialog::new("remove-project-dialog", self.title(), &self.focus_handle)
             .width(px(420.))
@@ -219,29 +344,40 @@ impl Render for RemoveProjectDialog {
             .on_dismiss(move |_, cx| {
                 on_dismiss.update(cx, Self::dismiss);
             })
-            .child(facts)
-            .children(self.task_list())
+            .child(info)
+            .children(body)
             .children(error)
-            .footer(
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(cancel)
-                    .child(action),
-            )
+            .footer(footer)
     }
 }
 
 impl Workspace {
-    /// The name and the open tasks of a project, from the app's own list.
+    /// The name and the folder of a project, from the app's own list.
     pub(crate) fn remove_project_facts(
         &self,
         project: ProjectId,
-    ) -> Option<(SharedString, Vec<SharedString>)> {
+    ) -> Option<(SharedString, Option<PathBuf>)> {
         let entry = self.data.project(project)?;
 
-        Some((entry.name.clone(), self.data.open_task_names(project)))
+        Some((entry.name.clone(), entry.root.clone()))
+    }
+
+    /// What the app knows of the project's open tasks without asking the daemon.
+    fn local_remove_check(&self, project: ProjectId) -> RemoveCheck {
+        let tasks = self
+            .data
+            .tasks_of(project)
+            .filter(|task| !task.is_start)
+            .filter_map(|task| {
+                Some(TaskCloseCheck {
+                    task: self.data.diff_id(task.id)?,
+                    name: task.name.to_string(),
+                    check: self.local_close_check(task.id),
+                })
+            })
+            .collect();
+
+        RemoveCheck { tasks }
     }
 
     /// Opens the dialog that asks before a project goes, over the main window.
@@ -251,11 +387,11 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((name, open_tasks)) = self.remove_project_facts(project) else {
+        let Some((name, root)) = self.remove_project_facts(project) else {
             return;
         };
 
-        let view = cx.new(|cx| RemoveProjectDialog::new(project, name, open_tasks, window, cx));
+        let view = cx.new(|cx| RemoveProjectDialog::new(project, name, root, window, cx));
         let subscription =
             cx.subscribe_in(&view, window, |this, view, event, window, cx| match event {
                 RemoveProjectEvent::Dismissed => this.close_remove_project(view, window, cx),
@@ -263,10 +399,12 @@ impl Workspace {
             });
 
         self.overlay = Some(Overlay::RemoveProject {
-            view,
+            view: view.clone(),
             _subscription: subscription,
         });
         cx.notify();
+
+        self.check_remove_project(&view, cx);
     }
 
     /// Closes the dialog and gives focus back to the project's row, or to the window when
@@ -287,23 +425,62 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Asks the daemon to remove the project, or removes it from the sample data. The app's
-    /// own task list is checked again first: it may have changed since the dialog opened.
+    /// Fills the dialog with what removing would throw away: the daemon's answer, or the
+    /// app's own data when it has no daemon to ask.
+    pub(crate) fn check_remove_project(
+        &mut self,
+        dialog: &Entity<RemoveProjectDialog>,
+        cx: &mut Context<Self>,
+    ) {
+        let project = dialog.read(cx).project;
+        let daemon_id = self.data.project(project).and_then(|entry| entry.daemon);
+        let client = self.daemon.clone().filter(Client::is_connected);
+
+        let (Some(client), Some(daemon_id)) = (client, daemon_id) else {
+            let state = if self.source == DataSource::Sample {
+                CheckState::Ready(self.local_remove_check(project))
+            } else {
+                CheckState::Failed(NOT_RUNNING.into())
+            };
+
+            dialog.update(cx, |dialog, cx| dialog.set_check(state, cx));
+            return;
+        };
+
+        dialog.update(cx, |dialog, cx| dialog.set_check(CheckState::Checking, cx));
+        let checking = cx.background_spawn(async move { client.check_remove_project(daemon_id) });
+        let dialog = dialog.clone();
+
+        cx.spawn(async move |_, cx| {
+            let state = match checking.await {
+                Ok(check) => CheckState::Ready(check),
+                Err(error) => {
+                    log::warn!("cannot check what removing the project does: {error}");
+                    CheckState::Failed(describe(&error))
+                }
+            };
+
+            dialog.update(cx, |dialog, cx| dialog.set_check(state, cx));
+        })
+        .detach();
+    }
+
+    /// Asks the daemon to remove the project, or removes it from the sample data. A refusal
+    /// shows in the dialog and the check runs again, as the project changed meanwhile.
     pub(crate) fn confirm_remove_project(
         &mut self,
         dialog: Entity<RemoveProjectDialog>,
         cx: &mut Context<Self>,
     ) {
         let project = dialog.read(cx).project;
-        let Some((_, open_tasks)) = self.remove_project_facts(project) else {
+
+        if self.data.project(project).is_none() {
             dialog.update(cx, RemoveProjectDialog::finish);
             return;
-        };
-
-        if !open_tasks.is_empty() {
-            dialog.update(cx, |dialog, cx| dialog.set_open_tasks(open_tasks, cx));
-            return;
         }
+        let Some(confirmed) = dialog.read(cx).confirmed() else {
+            return;
+        };
         if !dialog.read(cx).can_confirm() {
             return;
         }
@@ -323,10 +500,16 @@ impl Workspace {
         };
 
         dialog.update(cx, RemoveProjectDialog::set_busy);
-        let removing = cx.background_spawn(async move { client.remove_project(daemon_id) });
+
+        // The Start orchestrator stops while the project goes. It must not start again.
+        let guarded = self.start_requested.insert(project);
+        let again = client.clone();
+        let removing =
+            cx.background_spawn(async move { client.remove_project(daemon_id, confirmed) });
 
         cx.spawn(async move |this, cx| {
             let result = removing.await;
+            let refused = result.is_err();
 
             let updated = Self::update_with_window(&this, cx, |workspace, _, cx| match result {
                 Ok(()) => {
@@ -335,12 +518,34 @@ impl Workspace {
                 }
                 Err(error) => {
                     log::warn!("cannot remove the project: {error}");
-                    dialog.update(cx, |dialog, cx| dialog.fail(error.to_string().into(), cx));
+
+                    if guarded {
+                        workspace.start_requested.remove(&project);
+                    }
+
+                    dialog.update(cx, |dialog, cx| {
+                        dialog.fail(describe(&error), cx);
+                        dialog.set_check(CheckState::Checking, cx);
+                    });
                 }
             });
 
             if let Err(error) = updated {
                 log::debug!("the window closed before the project was removed: {error}");
+                return;
+            }
+
+            if refused {
+                let state = match cx
+                    .background_executor()
+                    .spawn(async move { again.check_remove_project(daemon_id) })
+                    .await
+                {
+                    Ok(check) => CheckState::Ready(check),
+                    Err(error) => CheckState::Failed(describe(&error)),
+                };
+
+                dialog.update(cx, |dialog, cx| dialog.set_check(state, cx));
             }
         })
         .detach();
@@ -385,6 +590,7 @@ impl Workspace {
         self.start_requested.remove(&project);
         self.previous_tabs.remove(&project);
         self.project_focus.remove(&project);
+        self.pull_requests.setups.remove(&project);
         crate::settings::project_removed(project, cx);
 
         cx.notify();
@@ -400,13 +606,23 @@ impl Workspace {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
     use gpui::{Modifiers, TestAppContext, VisualTestContext};
-    use swarm_protocol::{Event, ProjectId as DaemonProjectId, Request};
+    use swarm_protocol::{
+        AgentLifecycle, CloseCheck, Event, ProjectId as DaemonProjectId, ProjectInfo, Request,
+        TaskId as DaemonTaskId,
+    };
 
     use super::*;
     use crate::daemon::tests::{
-        fake_daemon_replying, project_info, redraw, setup, task_info, use_projects, wait_until,
+        answer_late, fake_daemon_replying, project_info, redraw, setup, start_agent, task_info,
+        use_projects, wait_until,
     };
+
+    type Requests = Arc<Mutex<Vec<Request>>>;
 
     fn dialog(
         workspace: &Entity<Workspace>,
@@ -447,98 +663,268 @@ mod tests {
         })
     }
 
-    /// A workspace on a fake daemon with the projects `demo` (id 5) and `other` (id 6). The
-    /// daemon sends every `RemoveProject` it gets over the channel and answers with `reply`.
-    fn live(
-        demo_tasks: Vec<swarm_protocol::TaskInfo>,
+    fn read_dialog<T>(
+        workspace: &Entity<Workspace>,
+        cx: &VisualTestContext,
+        read: impl FnOnce(&RemoveProjectDialog) -> T,
+    ) -> Option<T> {
+        dialog(workspace, cx).map(|dialog| dialog.read_with(cx, |dialog, _| read(dialog)))
+    }
+
+    fn is_ready(workspace: &Entity<Workspace>, cx: &VisualTestContext) -> bool {
+        read_dialog(workspace, cx, |dialog| dialog.confirmed().is_some()).unwrap_or(false)
+    }
+
+    fn texts(workspace: &Entity<Workspace>, cx: &VisualTestContext) -> Vec<String> {
+        read_dialog(workspace, cx, RemoveProjectDialog::lines)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect()
+    }
+
+    fn count(requests: &Requests, matching: impl Fn(&Request) -> bool) -> usize {
+        requests
+            .lock()
+            .expect("lock the requests")
+            .iter()
+            .filter(|request| matching(request))
+            .count()
+    }
+
+    /// The check of each `RemoveProject` the daemon got.
+    fn removals(requests: &Requests) -> Vec<RemoveCheck> {
+        requests
+            .lock()
+            .expect("lock the requests")
+            .iter()
+            .filter_map(|request| match request {
+                Request::RemoveProject { confirmed, .. } => Some(confirmed.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Waits until the daemon handled every request sent before: it answers in order.
+    fn flush(client: &Client) {
+        client.list().expect("the daemon answers");
+    }
+
+    fn task_check(task: u64, name: &str, check: CloseCheck) -> TaskCloseCheck {
+        TaskCloseCheck {
+            task: DaemonTaskId(task),
+            name: name.to_owned(),
+            check,
+        }
+    }
+
+    /// A workspace on a fake daemon that records every request and answers with `reply`
+    /// before the defaults. It lists `projects`. The client waits `timeout` for plain replies.
+    fn live_with<'a>(
+        projects: &[ProjectInfo],
+        timeout: Option<Duration>,
         reply: impl Fn(&Request) -> Option<Event> + Send + 'static,
-        cx: &mut TestAppContext,
+        cx: &'a mut TestAppContext,
     ) -> (
         Entity<Workspace>,
-        &mut VisualTestContext,
-        flume::Receiver<DaemonProjectId>,
+        &'a mut VisualTestContext,
+        Requests,
+        Client,
     ) {
-        let (sent, removals) = flume::unbounded();
+        let requests = Requests::default();
+        let record = Arc::clone(&requests);
         let socket = fake_daemon_replying(move |request| {
-            if let Request::RemoveProject { project, .. } = &request {
-                sent.send(*project).ok();
-            }
+            record
+                .lock()
+                .expect("lock the requests")
+                .push(request.clone());
 
             reply(&request)
         });
         let (workspace, cx) = setup(cx);
         cx.executor().allow_parking();
-        let client = Client::connect(&socket).expect("connect to the fake daemon");
-        use_projects(
-            &workspace,
-            &[
-                project_info(5, "demo", demo_tasks),
-                project_info(6, "other", Vec::new()),
-            ],
-            cx,
-        );
+        let mut client = Client::connect(&socket).expect("connect to the fake daemon");
+        if let Some(timeout) = timeout {
+            client = client.with_reply_timeout(timeout);
+        }
+        use_projects(&workspace, projects, cx);
+        let attached = client.clone();
         workspace.update_in(cx, |workspace, window, cx| {
-            workspace.use_daemon(client, &[], window, cx);
+            workspace.use_daemon(attached, &[], window, cx);
         });
         redraw(cx);
 
-        (workspace, cx, removals)
+        (workspace, cx, requests, client)
     }
 
-    #[gpui::test]
-    fn the_dialog_names_the_project_and_offers_cancel_and_remove(cx: &mut TestAppContext) {
-        let (workspace, cx) = setup(cx);
+    /// The projects `demo` (id 5, with `demo_tasks`) and `other` (id 6).
+    fn live(
+        demo_tasks: Vec<swarm_protocol::TaskInfo>,
+        reply: impl Fn(&Request) -> Option<Event> + Send + 'static,
+        cx: &mut TestAppContext,
+    ) -> (Entity<Workspace>, &mut VisualTestContext, Requests, Client) {
+        let projects = [
+            project_info(5, "demo", demo_tasks),
+            project_info(6, "other", Vec::new()),
+        ];
 
-        open_dialog(3, &workspace, cx);
+        live_with(&projects, None, reply, cx)
+    }
 
-        let dialog = dialog(&workspace, cx).expect("the dialog is open");
+    /// Answers a check with `check` and a removal with Done.
+    fn answering(check: RemoveCheck) -> impl Fn(&Request) -> Option<Event> + Send + 'static {
+        move |request| match request {
+            Request::CheckRemoveProject { call, .. } => Some(Event::RemoveCheck {
+                call: *call,
+                check: check.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    fn login_check() -> RemoveCheck {
+        RemoveCheck {
+            tasks: vec![task_check(
+                7,
+                "login",
+                CloseCheck {
+                    running_agents: 2,
+                    uncommitted_files: 3,
+                    merged_branches: vec!["swarm/login".to_owned()],
+                    ..CloseCheck::default()
+                },
+            )],
+        }
+    }
+
+    #[test]
+    fn the_lines_follow_the_check_in_order_and_skip_what_is_zero() {
+        let check = RemoveCheck {
+            tasks: vec![
+                task_check(
+                    1,
+                    "login",
+                    CloseCheck {
+                        running_agents: 2,
+                        user_terminals: 1,
+                        uncommitted_files: 4,
+                        unmerged_workers: vec!["a".to_owned()],
+                        merged_branches: vec!["swarm/login".to_owned()],
+                    },
+                ),
+                task_check(2, "signup", CloseCheck::default()),
+                task_check(
+                    3,
+                    "cart",
+                    CloseCheck {
+                        running_agents: 1,
+                        user_terminals: 2,
+                        uncommitted_files: 1,
+                        merged_branches: vec!["swarm/cart".to_owned(), "swarm/cart-b".to_owned()],
+                        ..CloseCheck::default()
+                    },
+                ),
+            ],
+        };
+
+        let lines = lines_for(&check);
+
         assert_eq!(
-            dialog.read_with(cx, |dialog, _| dialog.title()),
-            "Remove extensions?"
+            lines,
+            [
+                (
+                    "Closes 3 tasks: login, signup, cart".to_owned(),
+                    Color::Default
+                ),
+                ("Stops 3 agents".to_owned(), Color::Default),
+                ("Stops 3 terminals".to_owned(), Color::Default),
+                (
+                    "Deletes 4 uncommitted files in login".to_owned(),
+                    Color::Warn
+                ),
+                ("Deletes 1 uncommitted file in cart".to_owned(), Color::Warn),
+                ("Deletes 3 merged branches".to_owned(), Color::Default),
+            ]
         );
-        assert!(cx.debug_bounds("remove-project-confirm").is_some());
-        assert!(cx.debug_bounds("remove-project-note").is_none());
-        assert!(cx.debug_bounds("remove-project-cancel").is_some());
+    }
+
+    #[test]
+    fn a_task_with_nothing_to_lose_gives_only_the_closing_line() {
+        let check = RemoveCheck {
+            tasks: vec![task_check(1, "login", CloseCheck::default())],
+        };
+
+        let lines = lines_for(&check);
+
+        assert_eq!(lines, [("Closes 1 task: login".to_owned(), Color::Default)]);
+        assert!(lines_for(&RemoveCheck::default()).is_empty());
+    }
+
+    #[test]
+    fn the_info_shows_the_folder_in_mono_with_the_home_as_a_tilde() {
+        let home = std::env::var_os("HOME").expect("the test runs with a home folder");
+        let root = PathBuf::from(&home).join("personal/swarm");
+
+        let (text, mono) = info_text(Some(&root));
+
+        assert_eq!(
+            text,
+            "Removes only Swarm's tasks, agents and worktrees. The code in ~/personal/swarm stays on disk."
+        );
+        let mono = mono.expect("the folder is set in mono");
+        assert_eq!(&text[mono], "~/personal/swarm");
+    }
+
+    #[test]
+    fn a_folder_outside_the_home_shows_whole_and_no_folder_says_less() {
+        let (text, mono) = info_text(Some(Path::new("/srv/code/app")));
+        let (short, none) = info_text(None);
+
+        assert!(text.ends_with("The code in /srv/code/app stays on disk."));
+        assert_eq!(
+            mono.map(|range| text[range].to_owned()).as_deref(),
+            Some("/srv/code/app")
+        );
+        assert_eq!(
+            short,
+            "Removes only Swarm's tasks, agents and worktrees. The code stays on disk."
+        );
+        assert_eq!(none, None);
     }
 
     #[gpui::test]
-    fn open_tasks_are_listed_and_remove_gives_way_to_a_note_that_names_them(
+    fn the_title_names_the_project_in_curly_quotes_and_has_no_question_mark(
         cx: &mut TestAppContext,
     ) {
         let (workspace, cx) = setup(cx);
 
-        open_dialog(0, &workspace, cx);
+        open_dialog(3, &workspace, cx);
 
-        let dialog = dialog(&workspace, cx).expect("the dialog is open");
-        let (tasks, note) = dialog.read_with(cx, |dialog, _| {
-            (dialog.open_tasks().to_vec(), dialog.note())
-        });
+        let title = read_dialog(&workspace, cx, RemoveProjectDialog::title);
         assert_eq!(
-            tasks,
-            ["terminal-renderer", "menu-bar-usage", "worktree-scripts"]
+            title.as_deref(),
+            Some("Remove project \u{201c}extensions\u{201d}")
         );
-        assert_eq!(
-            note.as_deref(),
-            Some("Close terminal-renderer, menu-bar-usage and worktree-scripts first.")
-        );
-        assert!(cx.debug_bounds("remove-project-confirm").is_none());
-        assert!(cx.debug_bounds("remove-project-note").is_some());
+        assert!(cx.debug_bounds("remove-project-confirm").is_some());
+        assert!(cx.debug_bounds("remove-project-cancel").is_some());
+        assert!(cx.debug_bounds("remove-project-info").is_some());
     }
 
-    #[test]
-    fn the_note_names_one_task_alone() {
-        let note = |names: &[&'static str]| {
-            let names: Vec<SharedString> = names.iter().map(|name| (*name).into()).collect();
+    #[gpui::test]
+    fn without_a_daemon_the_check_comes_from_the_open_tasks_of_the_app(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
 
-            note_for(&names)
-        };
+        open_dialog(0, &workspace, cx);
 
-        assert_eq!(note(&["login"]).as_deref(), Some("Close login first."));
+        let lines = texts(&workspace, cx);
         assert_eq!(
-            note(&["login", "signup"]).as_deref(),
-            Some("Close login and signup first.")
+            lines.first().map(String::as_str),
+            Some("Closes 3 tasks: terminal-renderer, menu-bar-usage, worktree-scripts")
         );
-        assert_eq!(note(&[]), None);
+        assert!(
+            cx.debug_bounds("remove-project-confirm").is_some(),
+            "tasks no longer replace Remove"
+        );
     }
 
     #[gpui::test]
@@ -564,6 +950,26 @@ mod tests {
 
         assert!(dialog(&workspace, cx).is_none());
         assert_eq!(project_names(&workspace, cx).len(), 4);
+    }
+
+    #[gpui::test]
+    fn the_buttons_sit_on_the_right_of_the_dialog(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        open_dialog(3, &workspace, cx);
+
+        let (cancel, remove) = (
+            cx.debug_bounds("remove-project-cancel"),
+            cx.debug_bounds("remove-project-confirm"),
+        );
+        let panel = cx.debug_bounds("remove-project-info");
+
+        let (Some(cancel), Some(remove), Some(info)) = (cancel, remove, panel) else {
+            panic!("the dialog is not on screen");
+        };
+        // The info line starts at the left edge of the body, 20 px in. The buttons end 20 px
+        // before the right edge, so they sit right of the middle.
+        assert!(cancel.left() > info.left() + info.size.width / 2.);
+        assert!(remove.right() >= info.right() - px(1.));
     }
 
     #[gpui::test]
@@ -620,10 +1026,98 @@ mod tests {
     }
 
     #[gpui::test]
-    fn remove_asks_the_daemon_once_and_the_project_leaves_the_sidebar(cx: &mut TestAppContext) {
-        let (workspace, cx, removals) = live(Vec::new(), |_| None, cx);
+    fn the_dialog_says_checking_until_the_daemon_answers_and_remove_waits(cx: &mut TestAppContext) {
+        let (workspace, cx, requests, client) =
+            live(vec![task_info(7, 5, "login")], answering(login_check()), cx);
+
+        // Nothing runs until the test waits, so the dialog still checks.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_remove_project(ProjectId(0), window, cx);
+        });
+        let checking = read_dialog(&workspace, cx, |dialog| {
+            *dialog.check_state() == CheckState::Checking
+        });
+        let dialog_now = dialog(&workspace, cx).expect("the dialog is open");
+        workspace.update(cx, |workspace, cx| {
+            workspace.confirm_remove_project(dialog_now, cx);
+        });
+        let busy = read_dialog(&workspace, cx, RemoveProjectDialog::is_busy);
+
+        let ready = wait_until(cx, |cx| {
+            redraw(cx);
+            is_ready(&workspace, cx)
+        });
+        flush(&client);
+
+        assert_eq!(checking, Some(true));
+        assert_eq!(busy, Some(false), "Remove worked before the check came");
+        assert!(ready);
+        assert_eq!(removals(&requests), []);
+        assert_eq!(
+            texts(&workspace, cx),
+            [
+                "Closes 1 task: login",
+                "Stops 2 agents",
+                "Deletes 3 uncommitted files in login",
+                "Deletes 1 merged branch"
+            ]
+        );
+    }
+
+    #[gpui::test]
+    fn a_failed_check_shows_its_message_and_remove_stays_off(cx: &mut TestAppContext) {
+        let (workspace, cx, requests, client) = live(
+            Vec::new(),
+            |request| match request {
+                Request::CheckRemoveProject { call, .. } => Some(Event::Error {
+                    call: Some(*call),
+                    id: None,
+                    message: "cannot read the worktrees".into(),
+                }),
+                _ => None,
+            },
+            cx,
+        );
+        open_dialog(0, &workspace, cx);
+
+        let failed = wait_until(cx, |cx| {
+            redraw(cx);
+            read_dialog(&workspace, cx, |dialog| {
+                matches!(dialog.check_state(), CheckState::Failed(_))
+            })
+            .unwrap_or(false)
+        });
+        click("remove-project-confirm", cx);
+        flush(&client);
+
+        let message = read_dialog(&workspace, cx, |dialog| match dialog.check_state() {
+            CheckState::Failed(message) => message.to_string(),
+            _ => String::new(),
+        });
+        assert!(failed);
+        assert!(message.is_some_and(|message| message.contains("cannot read the worktrees")));
+        assert_eq!(
+            count(&requests, |request| matches!(
+                request,
+                Request::RemoveProject { .. }
+            )),
+            0
+        );
+        assert!(dialog(&workspace, cx).is_some());
+    }
+
+    #[gpui::test]
+    fn remove_sends_the_check_the_user_saw_and_the_project_leaves_the_sidebar(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx, requests, _client) =
+            live(vec![task_info(7, 5, "login")], answering(login_check()), cx);
         assert!(cx.debug_bounds("project-row-0").is_some());
         open_dialog(0, &workspace, cx);
+        wait_until(cx, |cx| {
+            redraw(cx);
+            is_ready(&workspace, cx)
+        });
 
         click("remove-project-confirm", cx);
         let gone = wait_until(cx, |cx| {
@@ -632,10 +1126,7 @@ mod tests {
         });
 
         assert!(gone, "the dialog stayed open");
-        assert_eq!(
-            removals.try_iter().collect::<Vec<_>>(),
-            [DaemonProjectId(5)]
-        );
+        assert_eq!(removals(&requests), [login_check()]);
         assert_eq!(project_names(&workspace, cx), ["other"]);
         assert!(cx.debug_bounds("project-row-0").is_none());
         assert!(cx.debug_bounds("project-row-1").is_some());
@@ -651,7 +1142,7 @@ mod tests {
 
     #[gpui::test]
     fn the_tabs_of_a_removed_project_close(cx: &mut TestAppContext) {
-        let (workspace, cx, removals) = live(Vec::new(), |_| None, cx);
+        let (workspace, cx, requests, _client) = live(Vec::new(), |_| None, cx);
         workspace.update(cx, |workspace, cx| {
             workspace.select_project(ProjectId(0), cx);
         });
@@ -659,6 +1150,10 @@ mod tests {
             workspace.data.tasks_of(ProjectId(0)).count()
         });
         open_dialog(0, &workspace, cx);
+        wait_until(cx, |cx| {
+            redraw(cx);
+            is_ready(&workspace, cx)
+        });
 
         click("remove-project-confirm", cx);
         wait_until(cx, |cx| {
@@ -667,7 +1162,7 @@ mod tests {
         });
 
         assert_eq!(before, 1, "the project had its Start tab");
-        assert_eq!(removals.len(), 1);
+        assert_eq!(removals(&requests).len(), 1);
         assert!(workspace.read_with(cx, |workspace, _| {
             workspace
                 .data
@@ -678,56 +1173,306 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_daemon_refusal_shows_in_the_dialog_and_keeps_the_project(cx: &mut TestAppContext) {
-        let (workspace, cx, removals) = live(
-            Vec::new(),
+    fn confirming_makes_the_dialog_busy_and_a_busy_dialog_ignores_cancel_and_escape(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx, _requests, _client) = live(Vec::new(), |_| None, cx);
+        open_dialog(0, &workspace, cx);
+        wait_until(cx, |cx| {
+            redraw(cx);
+            is_ready(&workspace, cx)
+        });
+        let view = dialog(&workspace, cx).expect("the dialog is open");
+
+        // The removal only starts when the test waits: the dialog is busy until then.
+        workspace.update(cx, |workspace, cx| {
+            workspace.confirm_remove_project(view.clone(), cx);
+        });
+        let (busy, labels) = read_dialog(&workspace, cx, |dialog| {
+            (dialog.is_busy(), dialog.confirm_labels())
+        })
+        .expect("the dialog is open");
+        let confirmed_again = view.read_with(cx, |dialog, _| dialog.can_confirm());
+
+        assert!(busy);
+        assert!(
+            !confirmed_again,
+            "a second click would send a second removal"
+        );
+        assert_eq!(
+            labels,
+            (
+                "Removing\u{2026}".to_owned(),
+                "Removing project demo".to_owned()
+            )
+        );
+    }
+
+    #[gpui::test]
+    fn cancel_and_escape_do_nothing_while_the_removal_runs(cx: &mut TestAppContext) {
+        let (workspace, cx, _requests, _client) = live(Vec::new(), |_| None, cx);
+        open_dialog(0, &workspace, cx);
+        wait_until(cx, |cx| {
+            redraw(cx);
+            is_ready(&workspace, cx)
+        });
+        let view = dialog(&workspace, cx).expect("the dialog is open");
+
+        view.update(cx, RemoveProjectDialog::set_busy);
+        redraw(cx);
+        click("remove-project-cancel", cx);
+        cx.simulate_keystrokes("escape");
+        let open_while_busy = dialog(&workspace, cx).is_some();
+        let remove_is_there = cx.debug_bounds("remove-project-confirm").is_some();
+
+        view.update(cx, |dialog, cx| dialog.fail("refused".into(), cx));
+        redraw(cx);
+        click("remove-project-cancel", cx);
+
+        assert!(open_while_busy, "Cancel or Escape closed a running removal");
+        assert!(remove_is_there, "Remove goes while it runs");
+        assert!(dialog(&workspace, cx).is_none());
+    }
+
+    #[gpui::test]
+    fn a_refusal_shows_in_the_dialog_and_the_check_runs_again(cx: &mut TestAppContext) {
+        let round = Arc::new(AtomicU32::new(0));
+        let (workspace, cx, requests, _client) = live(
+            vec![task_info(7, 5, "login")],
+            {
+                let round = Arc::clone(&round);
+
+                move |request| match request {
+                    Request::CheckRemoveProject { call, .. } => {
+                        let files = round.fetch_add(1, Ordering::Relaxed) + 1;
+
+                        Some(Event::RemoveCheck {
+                            call: *call,
+                            check: RemoveCheck {
+                                tasks: vec![task_check(
+                                    7,
+                                    "login",
+                                    CloseCheck {
+                                        uncommitted_files: files,
+                                        ..CloseCheck::default()
+                                    },
+                                )],
+                            },
+                        })
+                    }
+                    Request::RemoveProject {
+                        call, confirmed, ..
+                    } => {
+                        let files = confirmed
+                            .tasks
+                            .first()
+                            .map_or(0, |task| task.check.uncommitted_files);
+
+                        if files < 2 {
+                            Some(Event::Error {
+                                call: Some(*call),
+                                id: None,
+                                message: "login has more changes".into(),
+                            })
+                        } else {
+                            Some(Event::Done { call: *call })
+                        }
+                    }
+                    _ => None,
+                }
+            },
+            cx,
+        );
+        open_dialog(0, &workspace, cx);
+        wait_until(cx, |cx| {
+            redraw(cx);
+            is_ready(&workspace, cx)
+        });
+
+        click("remove-project-confirm", cx);
+        let refreshed = wait_until(cx, |cx| {
+            redraw(cx);
+            read_dialog(&workspace, cx, |dialog| {
+                dialog.error_text().is_some()
+                    && dialog.confirmed().is_some_and(|check| {
+                        check
+                            .tasks
+                            .iter()
+                            .any(|task| task.check.uncommitted_files == 2)
+                    })
+            })
+            .unwrap_or(false)
+        });
+        let lines = texts(&workspace, cx);
+        let error = read_dialog(&workspace, cx, |dialog| {
+            dialog.error_text().map(str::to_owned)
+        });
+        let guarded = workspace.read_with(cx, |workspace, _| {
+            workspace.start_requested.contains(&ProjectId(0))
+        });
+        assert_eq!(project_names(&workspace, cx), ["demo", "other"]);
+
+        click("remove-project-confirm", cx);
+        let gone = wait_until(cx, |cx| {
+            redraw(cx);
+            dialog(&workspace, cx).is_none()
+        });
+
+        assert!(refreshed, "the dialog did not show the new check");
+        assert_eq!(
+            lines,
+            [
+                "Closes 1 task: login",
+                "Deletes 2 uncommitted files in login"
+            ]
+        );
+        assert!(
+            error
+                .flatten()
+                .is_some_and(|message| message.contains("login has more changes"))
+        );
+        assert!(!guarded, "the Start orchestrator stays off after a refusal");
+        assert!(gone);
+        let sent: Vec<u32> = removals(&requests)
+            .iter()
+            .map(|check| {
+                check
+                    .tasks
+                    .first()
+                    .map_or(0, |task| task.check.uncommitted_files)
+            })
+            .collect();
+        assert_eq!(sent, [1, 2]);
+        assert_eq!(project_names(&workspace, cx), ["other"]);
+    }
+
+    #[gpui::test]
+    fn the_start_orchestrator_does_not_start_again_while_the_project_goes(cx: &mut TestAppContext) {
+        let mut listed = project_info(5, "demo", Vec::new());
+        listed.start = Some(start_agent(100, 5, swarm_protocol::AgentStatus::Idle));
+        let projects = [listed, project_info(6, "other", Vec::new())];
+        let (workspace, cx, requests, client) = live_with(&projects, None, |_| None, cx);
+        open_dialog(0, &workspace, cx);
+        wait_until(cx, |cx| {
+            redraw(cx);
+            is_ready(&workspace, cx)
+        });
+        let view = dialog(&workspace, cx).expect("the dialog is open");
+
+        // The removal only starts when the test waits. Meanwhile the daemon stops the Start
+        // orchestrator, and the window draws.
+        workspace.update(cx, |workspace, cx| {
+            workspace.confirm_remove_project(view, cx);
+        });
+        let mut ended = start_agent(100, 5, swarm_protocol::AgentStatus::Done);
+        ended.lifecycle = AgentLifecycle::Resumable;
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.agent_changed(&ended, Some(window), cx);
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let guarded = workspace.read_with(cx, |workspace, _| {
+            workspace.start_requested.contains(&ProjectId(0))
+        });
+
+        let gone = wait_until(cx, |cx| {
+            redraw(cx);
+            dialog(&workspace, cx).is_none()
+        });
+        flush(&client);
+
+        assert!(guarded);
+        assert!(gone);
+        // The next project opens on its own Start tab, which may ask for its orchestrator.
+        assert_eq!(
+            count(&requests, |request| matches!(
+                request,
+                Request::StartOrchestrator { project, .. } if *project == DaemonProjectId(5)
+            )),
+            0,
+            "the app asked for a Start orchestrator while the project went"
+        );
+    }
+
+    #[gpui::test]
+    fn a_removal_that_answers_after_the_default_timeout_still_succeeds(cx: &mut TestAppContext) {
+        let projects = [
+            project_info(5, "demo", Vec::new()),
+            project_info(6, "other", Vec::new()),
+        ];
+        let (workspace, cx, requests, client) = live_with(
+            &projects,
+            Some(Duration::from_millis(200)),
             |request| match request {
-                Request::RemoveProject { call, .. } => Some(Event::Error {
-                    call: Some(*call),
-                    id: None,
-                    message: "demo has open tasks: login".into(),
-                }),
+                Request::StopAgents { call } | Request::RemoveProject { call, .. } => {
+                    answer_late();
+
+                    Some(Event::Done { call: *call })
+                }
                 _ => None,
             },
             cx,
         );
         open_dialog(0, &workspace, cx);
+        wait_until(cx, |cx| {
+            redraw(cx);
+            is_ready(&workspace, cx)
+        });
+        let plain = client.stop_agents();
 
         click("remove-project-confirm", cx);
-        let shown = wait_until(cx, |cx| {
+        let gone = wait_until(cx, |cx| {
             redraw(cx);
-            dialog(&workspace, cx).is_some_and(|dialog| {
-                dialog.read_with(cx, |dialog, _| dialog.error_text().is_some())
-            })
+            dialog(&workspace, cx).is_none()
         });
 
-        assert!(shown, "the refusal never showed");
-        let error = dialog(&workspace, cx).and_then(|dialog| {
-            dialog.read_with(cx, |dialog, _| dialog.error_text().map(str::to_owned))
-        });
-        assert!(error.is_some_and(|message| message.contains("demo has open tasks: login")));
-        assert_eq!(removals.len(), 1);
-        assert_eq!(project_names(&workspace, cx), ["demo", "other"]);
-        assert!(cx.debug_bounds("remove-project-confirm").is_some());
+        assert!(
+            matches!(plain, Err(swarm_protocol::ClientError::Timeout)),
+            "the daemon is not slower than the default timeout: {plain:?}"
+        );
+        assert!(gone, "the removal gave up before the daemon answered");
+        assert_eq!(removals(&requests).len(), 1);
+        assert_eq!(project_names(&workspace, cx), ["other"]);
     }
 
     #[gpui::test]
-    fn a_task_that_opened_meanwhile_stops_the_request_and_shows_the_note(cx: &mut TestAppContext) {
-        let (workspace, cx, removals) = live(Vec::new(), |_| None, cx);
-        open_dialog(0, &workspace, cx);
-        workspace.update_in(cx, |workspace, window, cx| {
-            workspace.task_changed(&task_info(7, 5, "login"), Some(window), cx);
-        });
-
-        click("remove-project-confirm", cx);
-        wait_until(cx, |cx| {
-            redraw(cx);
-            cx.debug_bounds("remove-project-note").is_some()
-        });
-
-        assert!(removals.is_empty(), "the daemon was asked");
-        assert!(cx.debug_bounds("remove-project-note").is_some());
-        assert!(cx.debug_bounds("remove-project-confirm").is_none());
+    fn a_project_list_without_a_project_drops_it_with_its_tabs(cx: &mut TestAppContext) {
+        let (workspace, cx, _requests, _client) =
+            live(vec![task_info(7, 5, "login")], |_| None, cx);
         assert_eq!(project_names(&workspace, cx), ["demo", "other"]);
+
+        use_projects(&workspace, &[project_info(6, "other", Vec::new())], cx);
+        redraw(cx);
+
+        assert_eq!(project_names(&workspace, cx), ["other"]);
+        let (active, tabs, task) = workspace.read_with(cx, |workspace, _| {
+            (
+                workspace.active_project,
+                workspace.data.tasks_of(ProjectId(0)).count(),
+                workspace.data.has_daemon_task(DaemonTaskId(7)),
+            )
+        });
+        assert_eq!(active, ProjectId(1));
+        assert_eq!(tabs, 0);
+        assert!(!task, "the tab of the dropped project is still there");
+        assert!(cx.debug_bounds("project-row-0").is_none());
+    }
+
+    #[gpui::test]
+    fn removing_a_project_forgets_its_github_setup(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        workspace.update(cx, |workspace, _| {
+            workspace.pull_requests.setups.insert(
+                ProjectId(3),
+                crate::pull_request::GithubSetup::Running(crate::pull_request::SetupStep::SignIn),
+            );
+        });
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.project_removed(ProjectId(3), cx);
+        });
+
+        assert!(workspace.read_with(cx, |workspace, _| {
+            workspace.pull_requests.setups.is_empty()
+        }));
     }
 }

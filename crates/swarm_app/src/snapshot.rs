@@ -11,10 +11,16 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{AnyWindowHandle, App, AsyncApp, Context, Window};
-use swarm_protocol::{CheckState, ReviewSource, UsageProblem};
+use swarm_protocol::{
+    CheckState, CloseCheck, RemoveCheck, ReviewSource, TaskCloseCheck, TaskId as DaemonTaskId,
+    UsageProblem,
+};
 use swarm_ui::theme::{self, Appearance};
 
+use crate::close_task::CheckState as DialogCheck;
 use crate::model::{AgentKind, ProjectId, SAMPLE_NOW, TaskId, TaskStatus};
+use crate::palette::Overlay;
+use crate::remove_project::RemoveProjectDialog;
 use crate::review_model::{DiffStyle, LinePos};
 use crate::swarm_view::InspectorTab;
 use crate::workspace::{RightPanel, View, Workspace};
@@ -34,7 +40,7 @@ fn open_start_empty(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<
 }
 
 /// The menu of the "website" row, opened as the keyboard does: the row has focus and
-/// Shift-F10 is pressed. The projects get folders, so Open in Finder is on.
+/// Shift-F10 is pressed. The projects get folders, so Show in Finder is on.
 fn open_project_menu(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
     for project in &mut workspace.data.projects {
         project.root = Some(Path::new("/Users/sam/personal").join(&*project.name));
@@ -49,13 +55,81 @@ fn open_project_menu(workspace: &mut Workspace, window: &mut Window, cx: &mut Co
     window.dispatch_action(Box::new(swarm_ui::ShowContextMenu), cx);
 }
 
-/// The Remove dialog of a project that has open tasks.
+/// A folder under the home folder for each project, so the Remove dialog can say where the
+/// code stays.
+fn give_project_folders(workspace: &mut Workspace) {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+
+    for project in &mut workspace.data.projects {
+        project.root = Some(home.join("personal").join(&*project.name));
+    }
+}
+
+fn close_check(
+    running_agents: u32,
+    user_terminals: u32,
+    uncommitted_files: u32,
+    merged_branches: &[&str],
+) -> CloseCheck {
+    CloseCheck {
+        running_agents,
+        user_terminals,
+        uncommitted_files,
+        unmerged_workers: Vec::new(),
+        merged_branches: merged_branches
+            .iter()
+            .map(|&branch| branch.to_owned())
+            .collect(),
+    }
+}
+
+/// The Remove dialog of "swarm", with what the daemon would find in its three tasks. The
+/// first one has uncommitted files.
 fn open_remove_project_with_tasks(
     workspace: &mut Workspace,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    give_project_folders(workspace);
     workspace.open_remove_project(ProjectId(0), window, cx);
+
+    let task = |id, name: &str, check| TaskCloseCheck {
+        task: DaemonTaskId(id),
+        name: name.to_owned(),
+        check,
+    };
+    let check = RemoveCheck {
+        tasks: vec![
+            task(0, "terminal-renderer", close_check(4, 1, 3, &[])),
+            task(
+                1,
+                "menu-bar-usage",
+                close_check(2, 0, 0, &["swarm/menu-bar-usage"]),
+            ),
+            task(2, "worktree-scripts", close_check(1, 0, 0, &[])),
+        ],
+    };
+
+    if let Some(Overlay::RemoveProject { view, .. }) = &workspace.overlay {
+        view.update(cx, |dialog, cx| {
+            dialog.set_check(DialogCheck::Ready(check), cx);
+        });
+    }
+}
+
+/// The same dialog while the project goes.
+fn open_remove_project_busy(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    open_remove_project_with_tasks(workspace, window, cx);
+
+    if let Some(Overlay::RemoveProject { view, .. }) = &workspace.overlay {
+        view.update(cx, RemoveProjectDialog::set_busy);
+    }
 }
 
 /// The Remove dialog of a project with no open task.
@@ -64,6 +138,7 @@ fn open_remove_project(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    give_project_folders(workspace);
     workspace.open_remove_project(ProjectId(3), window, cx);
 }
 
@@ -885,6 +960,16 @@ pub(crate) fn run(directory: PathBuf, cx: &mut App) {
                 Appearance::Dark,
                 "workspace-remove-project-tasks-dark.png",
                 Some(open_remove_project_with_tasks),
+            ),
+            (
+                Appearance::Light,
+                "workspace-remove-project-busy-light.png",
+                Some(open_remove_project_busy),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-remove-project-busy-dark.png",
+                Some(open_remove_project_busy),
             ),
             (
                 Appearance::Light,
