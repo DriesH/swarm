@@ -876,13 +876,14 @@ impl Projects {
         Ok(config::read_fields(&self.project_path(project)?))
     }
 
-    /// Writes the fields that changed into the project's config file.
+    /// Writes the fields that differ from `base` into the project's config file.
     pub fn save_project_config(
         &self,
         project: ProjectId,
+        base: &ProjectConfigFields,
         fields: &ProjectConfigFields,
     ) -> Result<(), Error> {
-        config::save(&self.project_path(project)?, fields)
+        config::save(&self.project_path(project)?, base, fields)
     }
 
     /// Records the pull request of the task.

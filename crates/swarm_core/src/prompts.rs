@@ -241,14 +241,24 @@ pub fn list(
     Ok(prompts)
 }
 
-/// Writes the built-in text to the user's folder, unless a copy is already there.
-/// Returns the path of the copy.
+/// Writes the built-in text to the user's folder, unless a copy with text is already
+/// there. A blank copy counts as missing. Returns the path of the copy.
 pub fn customize(name: &str, config_dir: Option<&Path>) -> Result<PathBuf, Error> {
     let file = PromptFile::from_name(name)?;
     let path = required_user_folder(config_dir)?.join(file.file_name());
 
     match std::fs::metadata(&path) {
-        Ok(found) if found.is_file() => return Ok(path),
+        Ok(found) if found.is_file() => {
+            let read_error = |source| Error::Io {
+                action: format!("read {}", path.display()),
+                source,
+            };
+
+            let bytes = std::fs::read(&path).map_err(read_error)?;
+            if !String::from_utf8_lossy(&bytes).trim().is_empty() {
+                return Ok(path);
+            }
+        }
         Ok(_) => return Err(Error::Invalid(format!("{} is not a file", path.display()))),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(source) => {
@@ -866,6 +876,21 @@ mod tests {
             std::fs::read_to_string(&path).expect("copy"),
             "My own worker text"
         );
+    }
+
+    #[test]
+    fn customizing_a_blank_copy_writes_the_built_in_text_into_it() {
+        for blank in ["", "  \n\t\n"] {
+            let folders = Folders::new("customize-blank");
+            Folders::write(&folders.config(), "worker.md", blank);
+
+            let path = customize("worker", Some(&folders.config())).expect("customize");
+
+            assert_eq!(path, folders.config().join("prompts/worker.md"));
+            assert_eq!(std::fs::read_to_string(&path).expect("copy"), WORKER);
+            let prompts = list(Some(&folders.config()), None).expect("list");
+            assert_eq!(layer_of(&prompts, "worker"), PromptLayer::User);
+        }
     }
 
     #[test]

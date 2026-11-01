@@ -222,6 +222,23 @@ fn the_base_branch_is_the_current_branch() {
 }
 
 #[test]
+fn a_blank_configured_base_branch_counts_as_the_default_branch() {
+    let repo = Repo::new("[worktrees]\nbase_branch = \"  \"\n");
+    let current = repo.git(&["branch", "--show-current"]);
+    let projects = projects();
+
+    let project = projects.add(&repo.root).expect("add");
+    let prepared = projects
+        .create_task(&request(project.id, "Blank base"))
+        .expect("task");
+
+    assert_eq!(git::default_base_branch(&repo.root, Some(" \t")), current);
+    assert_eq!(project.base_branch, current);
+    assert_eq!(prepared.task.base, current);
+    assert_eq!(prepared.task.pr_base, current);
+}
+
+#[test]
 fn a_task_gets_a_branch_a_worktree_and_copied_files() {
     let repo = Repo::new(CONFIG);
     let projects = projects();

@@ -2,17 +2,21 @@
 
 use std::fmt::Write as _;
 use std::io::Write as _;
+use std::ops::Range;
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use serde::Deserialize;
 use swarm_protocol::ProjectConfigFields;
-use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, TableLike, Value};
+use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, TableLike, TomlError, Value};
 
 use crate::Error;
 
 const DEFAULT_FOLDER: &str = ".worktrees";
+const CONFIG_FOLDER: &str = ".swarm";
+const CONFIG_FILE: &str = "config.toml";
 
 /// Saves read the file and write it back, so two saves must not interleave.
 static SAVING: Mutex<()> = Mutex::new(());
@@ -84,11 +88,7 @@ pub struct ChecksConfig {
 impl ChecksConfig {
     /// The commands to run: trimmed, without empty ones.
     pub fn commands(&self) -> Vec<String> {
-        self.before_pr
-            .iter()
-            .map(|command| command.trim().to_owned())
-            .filter(|command| !command.is_empty())
-            .collect()
+        filled(&self.before_pr)
     }
 }
 
@@ -101,10 +101,15 @@ pub struct LoadedConfig {
 
 impl ProjectConfig {
     pub fn parse(text: &str) -> Result<Self, String> {
-        let config: Self = toml::from_str(text).map_err(|error| error.to_string())?;
+        let config = Self::read(text)?;
         config.validate()?;
 
         Ok(config)
+    }
+
+    /// The text as settings, without looking at the values.
+    fn read(text: &str) -> Result<Self, String> {
+        toml::from_str(text).map_err(|error| does_not_parse(text, error.message(), error.span()))
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -165,6 +170,15 @@ fn check_ports(ports: &PortRange) -> Result<(), String> {
     Ok(())
 }
 
+fn check_copy(entries: &[String]) -> Result<(), String> {
+    match entries.iter().find(|entry| !is_inside_repository(entry)) {
+        Some(entry) => Err(format!(
+            "worktrees.copy {entry:?} must be a path inside the repository"
+        )),
+        None => Ok(()),
+    }
+}
+
 /// A relative path that stays inside the folder it is relative to.
 pub(crate) fn is_inside_repository(path: &str) -> bool {
     !path.is_empty()
@@ -174,7 +188,7 @@ pub(crate) fn is_inside_repository(path: &str) -> bool {
 }
 
 fn config_path(root: &Path) -> PathBuf {
-    root.join(".swarm").join("config.toml")
+    root.join(CONFIG_FOLDER).join(CONFIG_FILE)
 }
 
 /// Reads `<root>/.swarm/config.toml`. A missing file gives the defaults; an invalid
@@ -215,22 +229,33 @@ pub fn read_fields(root: &Path) -> (ProjectConfigFields, Option<String>) {
     (config.fields(), error)
 }
 
-/// Writes the fields that differ from the file into `<root>/.swarm/config.toml` and keeps
-/// everything else: comments, key order and the keys Swarm does not show. A file that
+/// Writes the fields that differ from `base` into `<root>/.swarm/config.toml` and keeps
+/// everything else: comments, key order, the keys Swarm does not show and the fields the
+/// caller did not change, even when a hand edit changed them since `base`. A file that
 /// does not parse is left as it is.
-pub fn save(root: &Path, fields: &ProjectConfigFields) -> Result<(), Error> {
-    let wanted = ProjectConfigFields {
-        base_branch: fields
-            .base_branch
-            .clone()
-            .filter(|branch| !branch.trim().is_empty()),
-        ..fields.clone()
-    };
-    validate_fields(&wanted).map_err(Error::Invalid)?;
+pub fn save(
+    root: &Path,
+    base: &ProjectConfigFields,
+    fields: &ProjectConfigFields,
+) -> Result<(), Error> {
+    let base = tidy(base);
+    let wanted = tidy(fields);
+
+    let changed: Vec<Field> = Field::ALL
+        .into_iter()
+        .filter(|field| field.differs(&base, &wanted))
+        .collect();
+    if changed.is_empty() {
+        return Ok(());
+    }
+
+    for field in &changed {
+        field.check(&wanted).map_err(Error::Invalid)?;
+    }
 
     let _saving = SAVING.lock().unwrap_or_else(PoisonError::into_inner);
 
-    let path = config_path(root);
+    let path = writable_path(root)?;
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -242,54 +267,185 @@ pub fn save(root: &Path, fields: &ProjectConfigFields) -> Result<(), Error> {
         }
     };
 
-    let refuse = |problem: String| {
-        Error::Invalid(format!(
-            "{} has a problem, so Swarm leaves it alone: {problem}",
-            path.display()
-        ))
-    };
-    let current = ProjectConfig::parse(&text).map_err(refuse)?;
-    let mut document: DocumentMut = text
-        .parse()
-        .map_err(|error: toml_edit::TomlError| refuse(error.to_string()))?;
+    ProjectConfig::read(&text).map_err(Error::Invalid)?;
+    let mut document: DocumentMut = text.parse().map_err(|error: TomlError| {
+        Error::Invalid(does_not_parse(&text, error.message(), error.span()))
+    })?;
 
-    let changes = changes(&current.fields(), &wanted);
-    if changes.is_empty() {
+    for field in changed {
+        field.change(&wanted).apply(&mut document);
+    }
+
+    let updated = document.to_string();
+    if updated == text {
         return Ok(());
     }
 
-    for change in changes {
-        change.apply(&mut document);
-    }
-
-    write_atomic(&path, &document.to_string())
+    write_resolved(&path, &updated)
 }
 
-fn validate_fields(fields: &ProjectConfigFields) -> Result<(), String> {
-    check_folder(&fields.worktree_folder)?;
+/// The real path of the config file. A symlink on the way may not lead out of the
+/// repository.
+fn writable_path(root: &Path) -> Result<PathBuf, Error> {
+    let real_root = root.canonicalize().map_err(|source| Error::Io {
+        action: format!("read {}", root.display()),
+        source,
+    })?;
 
-    if !fields.port_range.is_empty() {
-        check_ports(&PortRange {
-            range: fields.port_range.clone(),
-            per_worktree: fields.ports_per_worktree,
-        })?;
+    let folder = resolve_inside(&real_root, real_root.join(CONFIG_FOLDER), CONFIG_FOLDER)?;
+    let file = folder.join(CONFIG_FILE);
+    let name = format!("{CONFIG_FOLDER}/{CONFIG_FILE}");
+
+    resolve_inside(&real_root, file, &name)
+}
+
+/// `path` with its symlinks resolved, when it exists. It must lie inside `real_root`.
+fn resolve_inside(real_root: &Path, path: PathBuf, name: &str) -> Result<PathBuf, Error> {
+    let resolved = match path.canonicalize() {
+        Ok(resolved) => resolved,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => path,
+        Err(source) => {
+            return Err(Error::Io {
+                action: format!("read {}", path.display()),
+                source,
+            });
+        }
+    };
+
+    if !resolved.starts_with(real_root) {
+        return Err(Error::Invalid(format!(
+            "{name} leads outside the repository"
+        )));
     }
 
-    if let Some(entry) = fields
-        .copy
+    Ok(resolved)
+}
+
+/// The fields as the app sends them: a blank base branch is none, and the lists are
+/// trimmed without blank entries.
+fn tidy(fields: &ProjectConfigFields) -> ProjectConfigFields {
+    ProjectConfigFields {
+        base_branch: fields
+            .base_branch
+            .clone()
+            .filter(|branch| !branch.trim().is_empty()),
+        copy: filled(&fields.copy),
+        checks: filled(&fields.checks),
+        ..fields.clone()
+    }
+}
+
+/// The entries trimmed, without the blank ones.
+fn filled(entries: &[String]) -> Vec<String> {
+    entries
         .iter()
-        .find(|entry| !is_inside_repository(entry))
-    {
-        return Err(format!(
-            "worktrees.copy {entry:?} must be a path inside the repository"
-        ));
+        .map(|entry| entry.trim().to_owned())
+        .filter(|entry| !entry.is_empty())
+        .collect()
+}
+
+/// `message` is the reason, and `span` where in `text` it was found.
+fn does_not_parse(text: &str, message: &str, span: Option<Range<usize>>) -> String {
+    let place = span
+        .and_then(|span| text.get(..span.start))
+        .map(|before| format!("line {}: ", before.matches('\n').count() + 1))
+        .unwrap_or_default();
+
+    format!("{CONFIG_FOLDER}/{CONFIG_FILE} does not parse: {place}{message}")
+}
+
+/// One field of Settings › Projects. A save compares, checks and writes them one by one.
+#[derive(Clone, Copy)]
+enum Field {
+    BaseBranch,
+    Folder,
+    Ports,
+    Copy,
+    Setup,
+    Teardown,
+    Checks,
+    ChecksRequired,
+}
+
+impl Field {
+    /// In the order they are written.
+    const ALL: [Self; 8] = [
+        Self::BaseBranch,
+        Self::Folder,
+        Self::Ports,
+        Self::Copy,
+        Self::Setup,
+        Self::Teardown,
+        Self::Checks,
+        Self::ChecksRequired,
+    ];
+
+    fn differs(self, base: &ProjectConfigFields, wanted: &ProjectConfigFields) -> bool {
+        match self {
+            Self::BaseBranch => base.base_branch != wanted.base_branch,
+            Self::Folder => base.worktree_folder != wanted.worktree_folder,
+            Self::Ports => reserved_ports(base) != reserved_ports(wanted),
+            Self::Copy => base.copy != wanted.copy,
+            Self::Setup => base.setup != wanted.setup,
+            Self::Teardown => base.teardown != wanted.teardown,
+            Self::Checks => base.checks != wanted.checks,
+            Self::ChecksRequired => base.checks_required != wanted.checks_required,
+        }
     }
 
-    if fields.checks.iter().any(|check| check.trim().is_empty()) {
-        return Err("checks.before_pr must not hold an empty command".to_owned());
+    /// The checks a file gets when it is read, plus the one for the copy list.
+    fn check(self, wanted: &ProjectConfigFields) -> Result<(), String> {
+        match self {
+            Self::Folder => check_folder(&wanted.worktree_folder),
+            Self::Ports => reserved_ports(wanted).map_or(Ok(()), |(range, per_worktree)| {
+                check_ports(&PortRange {
+                    range: range.to_owned(),
+                    per_worktree,
+                })
+            }),
+            Self::Copy => check_copy(&wanted.copy),
+            Self::BaseBranch
+            | Self::Setup
+            | Self::Teardown
+            | Self::Checks
+            | Self::ChecksRequired => Ok(()),
+        }
     }
 
-    Ok(())
+    /// The edit that writes the field.
+    fn change(self, wanted: &ProjectConfigFields) -> Change {
+        match self {
+            Self::BaseBranch => match &wanted.base_branch {
+                Some(branch) => Change::set(WORKTREES, "base_branch", Value::from(branch.as_str())),
+                None => Change::Remove {
+                    table: WORKTREES,
+                    key: "base_branch",
+                },
+            },
+            Self::Folder => Change::set(
+                WORKTREES,
+                "folder",
+                Value::from(wanted.worktree_folder.as_str()),
+            ),
+            Self::Ports => match reserved_ports(wanted) {
+                Some((range, per_worktree)) => Change::Ports {
+                    range: range.to_owned(),
+                    per_worktree,
+                },
+                None => Change::Remove {
+                    table: WORKTREES,
+                    key: "ports",
+                },
+            },
+            Self::Copy => Change::set(WORKTREES, "copy", string_array(&wanted.copy)),
+            Self::Setup => Change::set(WORKTREES, "setup", string_value(&wanted.setup)),
+            Self::Teardown => Change::set(WORKTREES, "teardown", string_value(&wanted.teardown)),
+            Self::Checks => Change::set(CHECKS, "before_pr", string_array(&wanted.checks)),
+            Self::ChecksRequired => {
+                Change::set(CHECKS, "required", Value::from(wanted.checks_required))
+            }
+        }
+    }
 }
 
 const WORKTREES: &str = "worktrees";
@@ -346,70 +502,6 @@ impl Change {
             }),
         }
     }
-}
-
-/// The edits that turn what the file holds into what is wanted, in file order.
-fn changes(current: &ProjectConfigFields, wanted: &ProjectConfigFields) -> Vec<Change> {
-    let mut changes = Vec::new();
-
-    if wanted.base_branch != current.base_branch {
-        changes.push(match &wanted.base_branch {
-            Some(branch) => Change::set(WORKTREES, "base_branch", Value::from(branch.as_str())),
-            None => Change::Remove {
-                table: WORKTREES,
-                key: "base_branch",
-            },
-        });
-    }
-
-    if wanted.worktree_folder != current.worktree_folder {
-        let folder = Value::from(wanted.worktree_folder.as_str());
-        changes.push(Change::set(WORKTREES, "folder", folder));
-    }
-
-    if reserved_ports(wanted) != reserved_ports(current) {
-        changes.push(match reserved_ports(wanted) {
-            Some((range, per_worktree)) => Change::Ports {
-                range: range.to_owned(),
-                per_worktree,
-            },
-            None => Change::Remove {
-                table: WORKTREES,
-                key: "ports",
-            },
-        });
-    }
-
-    if wanted.copy != current.copy {
-        changes.push(Change::set(WORKTREES, "copy", string_array(&wanted.copy)));
-    }
-
-    if wanted.setup != current.setup {
-        changes.push(Change::set(WORKTREES, "setup", string_value(&wanted.setup)));
-    }
-
-    if wanted.teardown != current.teardown {
-        changes.push(Change::set(
-            WORKTREES,
-            "teardown",
-            string_value(&wanted.teardown),
-        ));
-    }
-
-    if wanted.checks != current.checks {
-        changes.push(Change::set(
-            CHECKS,
-            "before_pr",
-            string_array(&wanted.checks),
-        ));
-    }
-
-    if wanted.checks_required != current.checks_required {
-        let required = Value::from(wanted.checks_required);
-        changes.push(Change::set(CHECKS, "required", required));
-    }
-
-    changes
 }
 
 /// The range and its size per worktree; none when the range is empty.
@@ -512,14 +604,20 @@ fn string_value(text: &str) -> Value {
 /// Writes the file whole or not at all: a temp file next to it, then a rename. A
 /// symlink is followed, so the link stays.
 pub(crate) fn write_atomic(path: &Path, text: &str) -> Result<(), Error> {
+    let target = path.canonicalize().unwrap_or_else(|_| path.to_owned());
+
+    write_resolved(&target, text)
+}
+
+/// Like [`write_atomic`] for a `target` that has no symlink left to follow.
+fn write_resolved(target: &Path, text: &str) -> Result<(), Error> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
     let io_error = |source| Error::Io {
-        action: format!("write {}", path.display()),
+        action: format!("write {}", target.display()),
         source,
     };
 
-    let target = path.canonicalize().unwrap_or_else(|_| path.to_owned());
     let name = target
         .file_name()
         .map_or_else(|| "file".into(), |name| name.to_string_lossy());
@@ -533,15 +631,20 @@ pub(crate) fn write_atomic(path: &Path, text: &str) -> Result<(), Error> {
         std::fs::create_dir_all(folder).map_err(io_error)?;
     }
 
-    let written = std::fs::File::create(&temporary).and_then(|mut file| {
-        file.write_all(text.as_bytes())?;
-        if let Ok(existing) = std::fs::metadata(&target) {
+    let existing = std::fs::metadata(target).ok();
+    let mode = existing
+        .as_ref()
+        .map_or(0o666, |existing| existing.permissions().mode() & 0o7777);
+    let mut file = create_new(&temporary, mode).map_err(io_error)?;
+
+    let written = file.write_all(text.as_bytes()).and_then(|()| {
+        if let Some(existing) = &existing {
             file.set_permissions(existing.permissions())?;
         }
 
         file.sync_all()
     });
-    let renamed = written.and_then(|()| std::fs::rename(&temporary, &target));
+    let renamed = written.and_then(|()| std::fs::rename(&temporary, target));
 
     if let Err(source) = renamed {
         if let Err(error) = std::fs::remove_file(&temporary) {
@@ -552,6 +655,16 @@ pub(crate) fn write_atomic(path: &Path, text: &str) -> Result<(), Error> {
     }
 
     Ok(())
+}
+
+/// Makes the file with `mode` from the start. It fails when `path` is taken, also by a
+/// symlink, so the text never goes through a link someone planted.
+fn create_new(path: &Path, mode: u32) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(path)
 }
 
 #[cfg(test)]
@@ -696,10 +809,11 @@ required = true
 
         /// What the app does: read the fields, change some, save all of them.
         fn save(&self, edit: impl FnOnce(&mut ProjectConfigFields)) -> Result<(), Error> {
-            let mut fields = self.fields();
+            let base = self.fields();
+            let mut fields = base.clone();
             edit(&mut fields);
 
-            save(&self.root, &fields)
+            save(&self.root, &base, &fields)
         }
     }
 
@@ -730,6 +844,10 @@ required = true
             checks: vec!["cargo test".to_owned(), "cargo fmt --check".to_owned()],
             checks_required: true,
         }
+    }
+
+    fn default_fields() -> ProjectConfigFields {
+        ProjectConfig::default().fields()
     }
 
     const RICH: &str = r#"# Swarm settings for this repo
@@ -809,16 +927,21 @@ required = false # flip when stable
 
     #[test]
     fn a_blank_base_branch_reads_as_none() {
-        let repo = Repo::with_config("read-blank-branch", "[worktrees]\nbase_branch = \"\"\n");
+        for blank in ["", "  ", " \t"] {
+            let repo = Repo::with_config(
+                "read-blank-branch",
+                &format!("[worktrees]\nbase_branch = \"{blank}\"\n"),
+            );
 
-        assert_eq!(repo.fields().base_branch, None);
+            assert_eq!(repo.fields().base_branch, None, "{blank:?}");
+        }
     }
 
     #[test]
     fn every_field_survives_a_save_into_a_missing_file() {
         let repo = Repo::new("round-trip");
 
-        save(&repo.root, &every_field_set()).expect("save");
+        save(&repo.root, &repo.fields(), &every_field_set()).expect("save");
 
         assert_eq!(repo.fields(), every_field_set());
         assert_eq!(read_fields(&repo.root).1, None);
@@ -1190,7 +1313,7 @@ required = false # flip when stable
 
     #[test]
     fn a_copy_path_that_is_not_inside_the_repository_is_refused() {
-        for entry in ["../secret", "/etc/passwd", "", "a/../../b"] {
+        for entry in ["../secret", "/etc/passwd", "a/../../b"] {
             let repo = Repo::new("copy");
 
             let message = refusal(repo.save(|fields| {
@@ -1203,17 +1326,24 @@ required = false # flip when stable
     }
 
     #[test]
-    fn an_empty_check_command_is_refused() {
-        for check in ["", "   "] {
-            let repo = Repo::new("check");
+    fn blank_entries_in_a_list_are_dropped_and_the_rest_is_trimmed() {
+        let repo = Repo::new("blank-entries");
 
-            let message = refusal(repo.save(|fields| {
-                fields.checks = vec!["cargo test".to_owned(), check.to_owned()];
-            }));
+        repo.save(|fields| {
+            fields.checks = vec![
+                " cargo test ".to_owned(),
+                String::new(),
+                "   ".to_owned(),
+                "cargo fmt".to_owned(),
+            ];
+            fields.copy = vec![String::new(), " .env".to_owned()];
+        })
+        .expect("save");
 
-            assert!(message.contains("checks.before_pr"), "{check:?}: {message}");
-            assert!(!repo.root.join(".swarm").exists(), "{check:?}");
-        }
+        assert_eq!(
+            repo.text(),
+            "[worktrees]\ncopy = [\".env\"]\n\n[checks]\nbefore_pr = [\"cargo test\", \"cargo fmt\"]\n"
+        );
     }
 
     #[test]
@@ -1231,19 +1361,159 @@ required = false # flip when stable
 
     #[test]
     fn a_file_that_does_not_parse_is_refused_and_never_overwritten() {
-        for broken in [
-            "[worktrees\nbroken = ",
-            "[worktrees]\ncopy = 3\n",
-            "[worktrees]\nfolder = \"../x\"\n",
-            "[worktrees]\nports = { range = \"9-3\", per_worktree = 1 }\n",
-        ] {
+        for broken in ["[worktrees\nbroken = ", "[worktrees]\ncopy = 3\n"] {
             let repo = Repo::with_config("broken", broken);
 
-            let message = refusal(save(&repo.root, &every_field_set()));
+            let message = refusal(save(
+                &repo.root,
+                &ProjectConfigFields::default(),
+                &every_field_set(),
+            ));
 
-            assert!(message.contains("config.toml"), "{message}");
+            assert!(message.starts_with(".swarm/config.toml does not parse: line "));
             assert_eq!(repo.text(), broken);
         }
+    }
+
+    #[test]
+    fn the_refusal_for_a_file_that_does_not_parse_is_one_short_line() {
+        let repo = Repo::with_config(
+            "refusal-text",
+            "[worktrees]\nfolder = \".trees\"\ncopy = 3\n",
+        );
+
+        let message = refusal(repo.save(|fields| fields.checks_required = true));
+
+        assert_eq!(
+            message,
+            ".swarm/config.toml does not parse: line 3: invalid type: integer `3`, expected a sequence"
+        );
+    }
+
+    #[test]
+    fn a_save_keeps_a_hand_edit_to_a_field_it_did_not_change() {
+        let repo = Repo::with_config("hand-edit", RICH);
+        let base = repo.fields();
+        let hand_edited = RICH.replace(
+            "setup = \"cargo fetch\"",
+            "setup = \"cargo fetch\"\nteardown = \"make clean\"",
+        );
+        std::fs::write(repo.file(), &hand_edited).expect("hand edit");
+        let mut fields = base.clone();
+        fields.checks_required = true;
+
+        save(&repo.root, &base, &fields).expect("save");
+
+        assert_eq!(
+            repo.text(),
+            hand_edited.replace(
+                "required = false # flip when stable",
+                "required = true # flip when stable"
+            )
+        );
+        assert_eq!(repo.fields().teardown, "make clean");
+    }
+
+    #[test]
+    fn a_field_the_save_changes_wins_over_a_hand_edit() {
+        let repo = Repo::with_config("hand-edit-same-field", RICH);
+        let base = repo.fields();
+        std::fs::write(repo.file(), RICH.replace("main", "trunk")).expect("hand edit");
+        let mut fields = base.clone();
+        fields.base_branch = Some("develop".to_owned());
+
+        save(&repo.root, &base, &fields).expect("save");
+
+        assert_eq!(repo.fields().base_branch.as_deref(), Some("develop"));
+    }
+
+    #[test]
+    fn a_field_the_file_no_longer_has_is_not_written_back_as_an_empty_file() {
+        let repo = Repo::new("gone");
+        let base = ProjectConfigFields {
+            base_branch: Some("main".to_owned()),
+            ..default_fields()
+        };
+
+        save(&repo.root, &base, &default_fields()).expect("save");
+
+        assert!(!repo.root.join(".swarm").exists());
+    }
+
+    #[test]
+    fn a_bad_value_in_the_file_does_not_block_saving_another_field() {
+        for (broken, field) in [
+            ("[worktrees]\nfolder = \"../x\"\n", "worktrees.folder"),
+            (
+                "[worktrees]\nports = { range = \"9-3\", per_worktree = 1 }\n",
+                "ports.range",
+            ),
+        ] {
+            let repo = Repo::with_config("bad-untouched", broken);
+            let (fields, error) = read_fields(&repo.root);
+            assert!(error.is_some_and(|message| message.contains(field)));
+
+            let mut edited = fields.clone();
+            edited.checks_required = true;
+            save(&repo.root, &fields, &edited).expect("save");
+
+            assert_eq!(
+                repo.text(),
+                format!("{broken}\n[checks]\nrequired = true\n")
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_the_save_writes_is_checked_even_when_the_file_has_other_bad_values() {
+        let repo = Repo::with_config("bad-written", "[worktrees]\nfolder = \"../x\"\n");
+        let base = default_fields();
+        let mut fields = base.clone();
+        fields.port_range = "9-3".to_owned();
+        fields.ports_per_worktree = 1;
+
+        let message = refusal(save(&repo.root, &base, &fields));
+
+        assert!(message.contains("ports.range"), "{message}");
+
+        fields.port_range = String::new();
+        fields.worktree_folder = ".trees".to_owned();
+        save(&repo.root, &base, &fields).expect("a valid folder fixes the file");
+        assert_eq!(read_fields(&repo.root).1, None);
+    }
+
+    #[test]
+    fn a_file_that_loads_without_an_error_can_always_be_saved() {
+        let text = "[worktrees]\ncopy = [\n    \".env\", # secrets\n    \"../outside\",\n    \"  \",\n]\n\n[checks]\nbefore_pr = [\"cargo test\", \"\"] # one is blank\n";
+        let repo = Repo::with_config("loads-fine", text);
+        let (base, error) = read_fields(&repo.root);
+        assert_eq!(error, None);
+
+        let mut fields = base.clone();
+        fields.teardown = "echo bye".to_owned();
+        save(&repo.root, &base, &fields).expect("save");
+
+        assert_eq!(repo.fields().teardown, "echo bye");
+        assert_eq!(repo.fields().copy, base.copy);
+        assert_eq!(repo.fields().checks, base.checks);
+    }
+
+    #[test]
+    fn a_list_the_app_trimmed_but_did_not_change_is_not_rewritten() {
+        let text = "[worktrees]\ncopy = [\n    \" .env \", # secrets\n    \"\",\n]\n\n[checks]\nbefore_pr = [\"cargo test\", \"  \"] # keep\nrequired = false\n";
+        let repo = Repo::with_config("trimmed", text);
+        let base = repo.fields();
+        let mut fields = base.clone();
+        fields.copy = vec![".env".to_owned()];
+        fields.checks = vec!["cargo test".to_owned()];
+        fields.checks_required = true;
+
+        save(&repo.root, &base, &fields).expect("save");
+
+        assert_eq!(
+            repo.text(),
+            text.replace("required = false", "required = true")
+        );
     }
 
     #[test]
@@ -1319,6 +1589,86 @@ required = false # flip when stable
             .expect("metadata")
             .permissions();
         assert_eq!(mode.mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn a_config_folder_that_links_out_of_the_repository_is_refused() {
+        use std::os::unix::fs::symlink;
+
+        let repo = Repo::new("folder-link");
+        let outside = Repo::new("folder-link-outside");
+        symlink(&outside.root, repo.root.join(".swarm")).expect("link");
+
+        let message = refusal(repo.save(|fields| fields.checks_required = true));
+
+        assert_eq!(message, ".swarm leads outside the repository");
+        assert_eq!(std::fs::read_dir(&outside.root).expect("folder").count(), 0);
+    }
+
+    #[test]
+    fn a_config_file_that_links_out_of_the_repository_is_refused() {
+        use std::os::unix::fs::symlink;
+
+        let repo = Repo::new("file-link");
+        let outside = Repo::new("file-link-outside");
+        let victim = outside.root.join("config.toml");
+        std::fs::write(&victim, RICH).expect("file");
+        std::fs::create_dir_all(repo.root.join(".swarm")).expect("folder");
+        symlink(&victim, repo.file()).expect("link");
+
+        let message = refusal(repo.save(|fields| fields.checks_required = true));
+
+        assert_eq!(message, ".swarm/config.toml leads outside the repository");
+        assert_eq!(std::fs::read_to_string(&victim).expect("file"), RICH);
+        assert_eq!(std::fs::read_dir(&outside.root).expect("folder").count(), 1);
+    }
+
+    #[test]
+    fn a_config_folder_that_links_to_another_folder_in_the_repository_is_fine() {
+        use std::os::unix::fs::symlink;
+
+        let repo = Repo::new("folder-link-inside");
+        std::fs::create_dir_all(repo.root.join("tools/swarm")).expect("folder");
+        symlink(repo.root.join("tools/swarm"), repo.root.join(".swarm")).expect("link");
+
+        repo.save(|fields| fields.checks_required = true)
+            .expect("save");
+
+        assert_eq!(
+            std::fs::read_to_string(repo.root.join("tools/swarm/config.toml")).expect("file"),
+            "[checks]\nrequired = true\n"
+        );
+    }
+
+    #[test]
+    fn the_temporary_file_is_never_made_through_a_planted_link() {
+        use std::os::unix::fs::symlink;
+
+        let repo = Repo::new("planted");
+        let victim = repo.root.join("victim.txt");
+        std::fs::write(&victim, "keep me").expect("file");
+        let planted = repo.root.join("planted.tmp");
+        symlink(&victim, &planted).expect("link");
+
+        let result = create_new(&planted, 0o600);
+
+        let error = result.expect_err("the name is taken");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&victim).expect("file"), "keep me");
+    }
+
+    #[test]
+    fn the_temporary_file_is_closed_to_others_from_the_start() {
+        let repo = Repo::new("private");
+        let path = repo.root.join("private.tmp");
+
+        create_new(&path, 0o600).expect("file");
+
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "{mode:o}");
     }
 
     #[test]

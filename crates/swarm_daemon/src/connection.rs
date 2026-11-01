@@ -321,11 +321,13 @@ fn handle_settings(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Re
         Request::SaveProjectConfig {
             call,
             project,
-            base: _,
+            base,
             fields,
         } => {
             run_slow(sink, "save-project-config", call, move |sink| {
-                let saved = services.projects.save_project_config(project, &fields);
+                let saved = services
+                    .projects
+                    .save_project_config(project, &base, &fields);
 
                 done_or_error(sink, call, saved.map_err(Into::into));
             });

@@ -9257,15 +9257,17 @@ impl Client {
         })
     }
 
+    /// `base` is what the app read before the user edited `fields`.
     fn save_project_config(
         &mut self,
         project: ProjectId,
+        base: &ProjectConfigFields,
         fields: &ProjectConfigFields,
     ) -> Result<(), String> {
         self.until_done(&Request::SaveProjectConfig {
             call: CALL,
             project,
-            base: ProjectConfigFields::default(),
+            base: base.clone(),
             fields: fields.clone(),
         })
         .map(|_| ())
@@ -9277,11 +9279,12 @@ impl Client {
         project: ProjectId,
         edit: impl FnOnce(&mut ProjectConfigFields),
     ) -> Result<(), String> {
-        let (mut fields, error) = self.project_config(project).expect("config");
+        let (base, error) = self.project_config(project).expect("config");
         assert_eq!(error, None);
+        let mut fields = base.clone();
         edit(&mut fields);
 
-        self.save_project_config(project, &fields)
+        self.save_project_config(project, &base, &fields)
     }
 
     fn prompts(&mut self, project: Option<ProjectId>) -> Result<Vec<PromptInfo>, String> {
@@ -9443,7 +9446,7 @@ fn every_project_config_field_survives_a_save_over_the_socket() {
     let (_config, _daemon, mut client, project) = settings_session(&repo);
 
     client
-        .save_project_config(project, &every_field_set())
+        .save_project_config(project, &default_fields(), &every_field_set())
         .expect("save");
     let read = client.project_config(project);
 
@@ -9484,6 +9487,69 @@ fn a_save_changes_only_the_changed_field_and_keeps_comments_and_unknown_keys() {
             "required = true # flip when stable"
         )
     );
+}
+
+#[test]
+fn a_save_keeps_a_hand_edit_made_after_the_app_read_the_config() {
+    let repo = Repo::new(COMMENTED_CONFIG);
+    let (_config, _daemon, mut client, project) = settings_session(&repo);
+    let (base, _) = client.project_config(project).expect("config");
+    let hand_edited = COMMENTED_CONFIG.replace(
+        "setup = \"cargo fetch\"",
+        "setup = \"cargo fetch\"\nteardown = \"make clean\"",
+    );
+    std::fs::write(config_file(&repo), &hand_edited).expect("edit by hand");
+    let mut fields = base.clone();
+    fields.checks_required = true;
+
+    client
+        .save_project_config(project, &base, &fields)
+        .expect("save");
+
+    assert_eq!(
+        config_text(&repo),
+        hand_edited.replace(
+            "required = false # flip when stable",
+            "required = true # flip when stable"
+        )
+    );
+}
+
+#[test]
+fn a_bad_value_in_the_file_does_not_block_a_save_of_another_field() {
+    let repo = Repo::new("[worktrees]\nfolder = \"../outside\"\n");
+    let (_config, _daemon, mut client, project) = settings_session(&repo);
+
+    let (fields, error) = client.project_config(project).expect("config");
+    let mut edited = fields.clone();
+    edited.checks_required = true;
+    client
+        .save_project_config(project, &fields, &edited)
+        .expect("save");
+    let (_, still) = client.project_config(project).expect("config");
+
+    assert!(error.is_some_and(|message| message.contains("worktrees.folder")));
+    assert!(still.is_some_and(|message| message.contains("worktrees.folder")));
+    assert_eq!(
+        config_text(&repo),
+        "[worktrees]\nfolder = \"../outside\"\n\n[checks]\nrequired = true\n"
+    );
+}
+
+#[test]
+fn a_save_does_not_follow_a_config_folder_link_out_of_the_repository() {
+    let repo = Repo::new("");
+    std::fs::remove_dir_all(repo.root.join(".swarm")).expect("remove the config folder");
+    let outside = ConfigDir::new();
+    std::os::unix::fs::symlink(&outside.dir, repo.root.join(".swarm")).expect("link");
+    let (_config, _daemon, mut client, project) = settings_session(&repo);
+
+    let refused = client
+        .edit_project_config(project, |fields| fields.teardown = "echo bye".to_owned())
+        .expect_err("the save is refused");
+
+    assert!(refused.contains("outside the repository"), "{refused}");
+    assert!(!outside.dir.join("config.toml").exists());
 }
 
 #[test]
@@ -9531,7 +9597,7 @@ fn clearing_the_port_range_removes_the_ports_and_keeps_the_rest() {
 fn a_save_with_an_invalid_field_is_refused_with_a_message_naming_the_field() {
     let repo = Repo::new(COMMENTED_CONFIG);
     let (_config, _daemon, mut client, project) = settings_session(&repo);
-    let cases: [(&str, ConfigEdit); 7] = [
+    let cases: [(&str, ConfigEdit); 6] = [
         ("worktrees.folder", |fields| {
             fields.worktree_folder = "../outside".to_owned();
         }),
@@ -9552,9 +9618,6 @@ fn a_save_with_an_invalid_field_is_refused_with_a_message_naming_the_field() {
         }),
         ("worktrees.copy", |fields| {
             fields.copy = vec!["/etc/hosts".to_owned()];
-        }),
-        ("checks.before_pr", |fields| {
-            fields.checks = vec!["cargo test".to_owned(), " ".to_owned()];
         }),
     ];
 
@@ -9577,12 +9640,15 @@ fn a_config_file_that_does_not_parse_is_reported_and_never_overwritten() {
 
     let (fields, error) = client.project_config(project).expect("config");
     let refused = client
-        .save_project_config(project, &every_field_set())
+        .save_project_config(project, &fields, &every_field_set())
         .expect_err("the save is refused");
 
     assert_eq!(fields, default_fields());
     assert!(error.is_some_and(|message| !message.is_empty()));
-    assert!(refused.contains("config.toml"), "{refused}");
+    assert!(
+        refused.starts_with(".swarm/config.toml does not parse: "),
+        "{refused}"
+    );
     assert_eq!(config_text(&repo), broken);
 }
 
@@ -9593,7 +9659,7 @@ fn project_config_requests_for_an_unknown_project_are_errors() {
     let unknown = ProjectId(9999);
 
     let read = client.project_config(unknown);
-    let saved = client.save_project_config(unknown, &every_field_set());
+    let saved = client.save_project_config(unknown, &default_fields(), &every_field_set());
     let prompts = client.prompts(Some(unknown));
 
     assert!(read.is_err());
