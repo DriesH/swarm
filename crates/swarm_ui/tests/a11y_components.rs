@@ -113,6 +113,40 @@ fn a_check_row_reads_its_name_status_and_value() {
 }
 
 #[test]
+fn a_system_check_row_reads_its_name_state_and_detail() {
+    with_window(|window, cx| {
+        let ready = a11y_info(
+            SystemCheckRow::new("git", "Git", SystemCheckState::Ready).detail("installed"),
+            window,
+            cx,
+        );
+
+        assert_eq!(ready.role, Some(Role::ListItem));
+        assert_eq!(ready.node.label(), Some("Git, Ready, installed"));
+
+        let running = a11y_info(
+            SystemCheckRow::new("gh", "GitHub CLI", SystemCheckState::InProgress)
+                .detail("installing with Homebrew"),
+            window,
+            cx,
+        );
+
+        assert_eq!(
+            running.node.label(),
+            Some("GitHub CLI, In progress, installing with Homebrew")
+        );
+
+        let bare = a11y_info(
+            SystemCheckRow::new("codex", "Codex", SystemCheckState::NotSetUp),
+            window,
+            cx,
+        );
+
+        assert_eq!(bare.node.label(), Some("Codex, Not set up"));
+    });
+}
+
+#[test]
 fn a_usage_meter_is_one_labelled_group() {
     with_window(|window, cx| {
         let plain = a11y_info(

@@ -13,6 +13,9 @@ use toml_edit::{DocumentMut, Item, Table, Value};
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 #[serde(default)]
 pub struct Settings {
+    /// The welcome screen was dealt with: skipped, or left to open a project. It shows
+    /// only while this is false.
+    pub welcome_done: bool,
     pub agents: AgentSettings,
     pub terminals: TerminalSettings,
     pub notifications: NotificationSettings,
@@ -440,6 +443,15 @@ pub fn save(path: &Path, settings: &Settings) -> Result<(), SettingsError> {
         path: path.to_owned(),
         source,
     })?;
+
+    // An unset flag stays out of a file that has none.
+    if settings.welcome_done || document.contains_key("welcome_done") {
+        set_value(
+            document.as_table_mut(),
+            "welcome_done",
+            Value::from(settings.welcome_done),
+        );
+    }
 
     let agents = table_mut(document.as_table_mut(), "agents");
     let kind = match settings.agents.orchestrator {
@@ -987,5 +999,53 @@ mod tests {
         assert!(text.contains("extra = \"x\""));
         assert!(text.contains("skip_permissions = true # careful"));
         assert_eq!(loaded, settings);
+    }
+
+    #[test]
+    fn the_welcome_is_not_done_by_default_and_an_old_file_still_loads() {
+        let empty: Settings = toml::from_str("").unwrap();
+        let old: Settings = toml::from_str("[agents]\nskip_permissions = true\n").unwrap();
+
+        assert!(!empty.welcome_done);
+        assert!(!old.welcome_done);
+    }
+
+    #[test]
+    fn the_welcome_flag_is_saved_at_the_top_and_loaded() {
+        let folder =
+            std::env::temp_dir().join(format!("swarm-settings-welcome-{}", std::process::id()));
+        let path = folder.join("settings.toml");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(&path, "# my notes\n\n[agents]\nskip_permissions = true\n").unwrap();
+        let mut settings = load(&path).unwrap();
+        settings.welcome_done = true;
+
+        save(&path, &settings).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let loaded = load(&path).unwrap();
+        std::fs::remove_dir_all(&folder).unwrap();
+
+        assert!(text.contains("# my notes"));
+        assert!(
+            text.find("welcome_done = true") < text.find("[agents]"),
+            "{text}"
+        );
+        assert!(loaded.welcome_done);
+        assert!(loaded.agents.skip_permissions);
+    }
+
+    #[test]
+    fn saving_with_the_welcome_open_adds_no_key() {
+        let folder = std::env::temp_dir().join(format!(
+            "swarm-settings-welcome-open-{}",
+            std::process::id()
+        ));
+        let path = folder.join("settings.toml");
+
+        save(&path, &Settings::default()).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_dir_all(&folder).unwrap();
+
+        assert!(!text.contains("welcome_done"), "{text}");
     }
 }

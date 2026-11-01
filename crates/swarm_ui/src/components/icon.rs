@@ -1,4 +1,7 @@
-use gpui::{AnyElement, App, ElementId, Pixels, Role, SharedString, Window, div, px, svg};
+use gpui::{
+    AnyElement, App, ElementId, Pixels, Role, SharedString, Transformation, Window, div, px,
+    radians, svg,
+};
 
 use crate::component::{Component, example, example_group};
 use crate::prelude::*;
@@ -245,6 +248,7 @@ pub struct Icon {
     name: IconName,
     size: IconSize,
     color: Color,
+    degrees: f32,
     accessible: Option<(ElementId, SharedString)>,
 }
 
@@ -254,6 +258,7 @@ impl Icon {
             name,
             size: IconSize::default(),
             color: Color::Default,
+            degrees: 0.,
             accessible: None,
         }
     }
@@ -265,6 +270,12 @@ impl Icon {
 
     pub fn color(mut self, color: Color) -> Self {
         self.color = color;
+        self
+    }
+
+    /// Turns the icon around its center, clockwise, in degrees.
+    pub fn rotate(mut self, degrees: f32) -> Self {
+        self.degrees = degrees;
         self
     }
 
@@ -283,7 +294,10 @@ impl RenderOnce for Icon {
             .data(self.name.svg().as_bytes())
             .size(size)
             .flex_none()
-            .text_color(color);
+            .text_color(color)
+            .when(self.degrees != 0., |icon| {
+                icon.with_transformation(Transformation::rotate(radians(self.degrees.to_radians())))
+            });
 
         match self.accessible {
             Some((id, label)) => div()
