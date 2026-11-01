@@ -7,6 +7,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::thread;
+use std::time::{Duration, Instant};
 
 fn swarm() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_swarm"));
@@ -820,11 +821,11 @@ fn the_mcp_server_exits_when_stdin_closes_during_a_wait() {
         "params": { "name": "wait", "arguments": { "timeout": 600 } } }),
     ];
 
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     mcp_session(&socket, "worker", &lines);
 
     assert!(
-        start.elapsed() < std::time::Duration::from_secs(10),
+        start.elapsed() < Duration::from_secs(10),
         "{:?}",
         start.elapsed()
     );
@@ -928,15 +929,12 @@ fn the_status_line_does_not_run_swarm_statusline_as_the_users_command() {
         let mut run = swarm();
         run.env("CLAUDE_CONFIG_DIR", &config);
 
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let output = run_status_line(run, b"{}");
         std::fs::remove_dir_all(&config).expect("cleanup");
 
         assert!(output.status.success(), "{name}");
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(2),
-            "{name}"
-        );
+        assert!(started.elapsed() < Duration::from_secs(2), "{name}");
         // The wrapper prints its own `echo`; the inner Swarm must print nothing.
         let expected = if name == "wrapped" { "wrapped\n" } else { "" };
         assert_eq!(String::from_utf8_lossy(&output.stdout), expected, "{name}");
@@ -949,13 +947,13 @@ fn a_slow_user_command_is_cut_off_and_still_exits_zero() {
     let mut command = swarm();
     command.env("CLAUDE_CONFIG_DIR", &config);
 
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let output = run_status_line(command, b"{}");
     std::fs::remove_dir_all(&config).expect("cleanup");
 
     assert!(output.status.success());
     assert!(output.stdout.is_empty());
-    assert!(started.elapsed() < std::time::Duration::from_secs(8));
+    assert!(started.elapsed() < Duration::from_secs(8));
 }
 
 #[test]
@@ -1026,6 +1024,102 @@ fn the_status_line_sends_the_rate_limits_to_the_daemon() {
             {"label": "7d", "used_percent": 41, "resets_at": 1_793_900_000_u64},
         ])
     );
+}
+
+/// Whether the file exists before `window` has passed.
+fn appears_within(path: &std::path::Path, window: Duration) -> bool {
+    let deadline = Instant::now() + window;
+
+    while !path.exists() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::park_timeout(Duration::from_millis(10));
+    }
+
+    true
+}
+
+#[test]
+fn the_users_command_runs_before_the_daemon_answers() {
+    let dir = temp_dir("parallel");
+    let socket = dir.join("agent.sock");
+    let marker = dir.join("started");
+    let listener = UnixListener::bind(&socket).expect("bind");
+    let seen = marker.clone();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().expect("clone"))
+            .read_line(&mut line)
+            .expect("line");
+
+        // The answer waits for the user's command; the client gives up after a second.
+        let started = appears_within(&seen, Duration::from_millis(800));
+        stream.write_all(b"{\"ok\":true}\n").ok();
+
+        started
+    });
+    let user_command = format!("touch '{}'; echo mine", marker.display());
+    let config = claude_config("parallel-config", &status_line_settings(&user_command));
+    let mut command = swarm();
+    command
+        .env("CLAUDE_CONFIG_DIR", &config)
+        .env("SWARM_SOCKET", &socket)
+        .env("SWARM_AGENT_ID", "7")
+        .env("SWARM_TOKEN", "secret");
+
+    let output = run_status_line(command, RATE_LIMITS_INPUT.as_bytes());
+    let started_while_waiting = server.join().expect("server");
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+    std::fs::remove_dir_all(&config).expect("cleanup");
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "mine\n");
+    assert!(
+        started_while_waiting,
+        "the user's command waited for the daemon"
+    );
+}
+
+#[test]
+fn a_quick_users_command_still_waits_for_the_daemon_to_take_the_call() {
+    let dir = temp_dir("takes");
+    let socket = dir.join("agent.sock");
+    let listener = UnixListener::bind(&socket).expect("bind");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().expect("clone"))
+            .read_line(&mut line)
+            .expect("line");
+        thread::park_timeout(Duration::from_millis(400));
+        stream.write_all(b"{\"ok\":true}\n").ok();
+
+        line
+    });
+    let config = claude_config("takes-config", &status_line_settings("echo mine"));
+    let mut command = swarm();
+    command
+        .env("CLAUDE_CONFIG_DIR", &config)
+        .env("SWARM_SOCKET", &socket)
+        .env("SWARM_AGENT_ID", "7")
+        .env("SWARM_TOKEN", "secret");
+
+    let started = Instant::now();
+    let output = run_status_line(command, RATE_LIMITS_INPUT.as_bytes());
+    let waited = started.elapsed();
+    let line = server.join().expect("server");
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+    std::fs::remove_dir_all(&config).expect("cleanup");
+
+    assert!(output.status.success());
+    assert!(line.contains("rate_limits"), "{line}");
+    assert!(
+        waited >= Duration::from_millis(400),
+        "it did not wait for the daemon: {waited:?}"
+    );
+    assert!(waited < Duration::from_secs(5), "{waited:?}");
 }
 
 #[test]

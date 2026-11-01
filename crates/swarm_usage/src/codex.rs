@@ -20,8 +20,33 @@ const RATE_LIMITS_ID: u64 = 2;
 /// The longest `Failed` text taken from Codex.
 const MAX_MESSAGE_CHARS: usize = 80;
 
+/// How long the app server gets to end by itself once its input is closed.
+const EXIT_GRACE: Duration = Duration::from_secs(2);
+
+/// How often the app server is checked while it ends.
+const POLL: Duration = Duration::from_millis(10);
+
 /// Kills and reaps the app server when it goes out of scope, also on a timeout.
 struct Server(Child);
+
+impl Server {
+    /// Waits up to `grace` for the server to end by itself.
+    fn wait_for_exit(&mut self, grace: Duration) {
+        let deadline = Instant::now() + grace;
+
+        loop {
+            match self.0.try_wait() {
+                Ok(None) if Instant::now() < deadline => thread::park_timeout(POLL),
+                Ok(_) => return,
+                Err(error) => {
+                    log::debug!("cannot check codex: {error}");
+
+                    return;
+                }
+            }
+        }
+    }
+}
 
 impl Drop for Server {
     fn drop(&mut self) {
@@ -44,7 +69,7 @@ pub fn window_label(minutes: u64) -> String {
 }
 
 /// Asks Codex for its rate limits, or says it is not installed when `codex` is `None`.
-/// Blocks for at most `timeout`.
+/// Blocks for at most `timeout` and, after an answer, up to [`EXIT_GRACE`] more.
 pub fn codex_usage(codex: Option<&Path>, timeout: Duration) -> Outcome {
     let Some(codex) = codex else {
         return Err(UsageProblem::NotInstalled);
@@ -56,7 +81,8 @@ pub fn codex_usage(codex: Option<&Path>, timeout: Duration) -> Outcome {
 }
 
 /// Starts `codex app-server`, sends the three messages and waits for the answer to the
-/// last one. The server is stopped on every way out.
+/// last one. After the answer the server gets a moment to end by itself; on every other
+/// way out it is killed at once.
 fn ask(codex: &Path, timeout: Duration) -> Result<Value, UsageProblem> {
     let deadline = Instant::now() + timeout;
 
@@ -73,6 +99,7 @@ fn ask(codex: &Path, timeout: Duration) -> Result<Value, UsageProblem> {
             failed("Codex did not start")
         })?,
     );
+
     let (Some(mut stdin), Some(stdout)) = (server.0.stdin.take(), server.0.stdout.take()) else {
         return Err(failed("Codex did not start"));
     };
@@ -118,6 +145,9 @@ fn ask(codex: &Path, timeout: Duration) -> Result<Value, UsageProblem> {
     // `stdin` stays open until the answer is here: Codex ends when it reads end of file.
     let answer = receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()));
     drop(stdin);
+    if answer.is_ok() {
+        server.wait_for_exit(EXIT_GRACE);
+    }
 
     answer.map_err(|error| {
         failed(match error {
@@ -487,7 +517,7 @@ exec sleep 30"#,
     }
 
     #[test]
-    fn the_server_is_stopped_after_a_good_answer_too() {
+    fn a_server_that_stays_after_a_good_answer_is_stopped_once_the_grace_is_over() {
         let scripts = Scripts::new();
         scripts.write(
             "answer",
@@ -501,14 +531,39 @@ while IFS= read -r line; do
 done"#,
         );
 
+        let started = Instant::now();
         let outcome = codex_usage(Some(&codex), TIMEOUT);
 
         assert!(outcome.is_ok());
+        assert!(started.elapsed() >= EXIT_GRACE, "{:?}", started.elapsed());
+        assert!(started.elapsed() < Duration::from_secs(10));
         let pid = scripts.read("pid");
         assert!(
             !Scripts::process_exists(pid.trim()),
             "the server still runs"
         );
+    }
+
+    #[test]
+    fn the_server_gets_time_to_end_by_itself_after_its_input_is_closed() {
+        let scripts = Scripts::new();
+        scripts.write(
+            "answer",
+            "{\"id\":2,\"result\":{\"rateLimits\":{\"primary\":{\"usedPercent\":1,\"windowDurationMins\":300}}}}\n",
+        );
+        let codex = scripts.script(
+            "codex",
+            r#"while IFS= read -r line; do
+  case "$line" in *account/rateLimits/read*) cat "$DIR/answer";; esac
+done
+sleep 0.3
+echo ended > "$DIR/clean-exit""#,
+        );
+
+        let outcome = codex_usage(Some(&codex), TIMEOUT);
+
+        assert!(outcome.is_ok());
+        assert_eq!(scripts.read("clean-exit"), "ended\n");
     }
 
     #[test]

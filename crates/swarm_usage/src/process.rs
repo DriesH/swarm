@@ -1,6 +1,9 @@
-//! Runs a command with a time limit. The child is always killed and reaped.
+//! Runs a command with a time limit. The child is always killed and reaped, with every
+//! process it started.
 
+use std::fmt;
 use std::io::{ErrorKind, Write as _};
+use std::os::unix::process::CommandExt as _;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread;
@@ -34,29 +37,69 @@ pub enum RunError {
 }
 
 /// A command that ended in time.
-#[derive(Debug)]
 pub struct Finished {
     pub status: ExitStatus,
     /// At most `max_output` bytes.
     pub stdout: Vec<u8>,
 }
 
-/// Kills and reaps the child when it goes out of scope, also on an early return.
-struct Reaper(Child);
+/// The output can hold a secret, like the Keychain item, so `Debug` shows its size only.
+impl fmt::Debug for Finished {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Finished")
+            .field("status", &self.status)
+            .field("stdout", &format_args!("{} bytes", self.stdout.len()))
+            .finish()
+    }
+}
+
+/// Kills and reaps the child when it goes out of scope, also on an early return. The
+/// child leads its own process group, and the whole group is killed.
+struct Reaper {
+    child: Child,
+    /// The child ended and was reaped already.
+    reaped: bool,
+}
 
 impl Drop for Reaper {
     fn drop(&mut self) {
-        if let Err(error) = self.0.kill() {
+        if self.reaped {
+            return;
+        }
+
+        kill_group(self.child.id());
+        if let Err(error) = self.child.kill() {
             log::debug!("cannot kill the command: {error}");
         }
-        if let Err(error) = self.0.wait() {
+        if let Err(error) = self.child.wait() {
             log::debug!("cannot reap the command: {error}");
         }
     }
 }
 
+/// Sends SIGKILL to the group that `leader` started, so a shell and the programs it
+/// started die together. Call it before the leader is reaped: until then its ID cannot
+/// belong to another process.
+fn kill_group(leader: u32) {
+    let Ok(group) = libc::pid_t::try_from(leader) else {
+        return;
+    };
+
+    // SAFETY: `killpg` takes two integers and touches no memory.
+    if unsafe { libc::killpg(group, libc::SIGKILL) } != 0 {
+        log::debug!(
+            "cannot kill the process group of the command: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
 /// Starts `command` with `input` on its stdin and waits at most `timeout` for it to end.
 /// Its stderr is dropped, and only the first `max_output` bytes of stdout are kept.
+///
+/// The command leads a process group of its own. When it takes too long, everything in
+/// that group is killed, not only the command.
 pub fn run(
     command: &mut Command,
     input: &[u8],
@@ -65,17 +108,19 @@ pub fn run(
 ) -> Result<Finished, RunError> {
     let deadline = Instant::now() + timeout;
 
-    let mut child = Reaper(
-        spawn(
+    let mut running = Reaper {
+        child: spawn(
             command
+                .process_group(0)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null()),
         )
         .map_err(RunError::Spawn)?,
-    );
-    let stdin = child.0.stdin.take();
-    let stdout = child.0.stdout.take();
+        reaped: false,
+    };
+    let stdin = running.child.stdin.take();
+    let stdout = running.child.stdout.take();
 
     // Both pipes get their own thread, so a command that reads nothing or never
     // finishes writing cannot hold this one past the deadline.
@@ -105,8 +150,12 @@ pub fn run(
     }
 
     let status = loop {
-        match child.0.try_wait() {
-            Ok(Some(status)) => break status,
+        match running.child.try_wait() {
+            Ok(Some(status)) => {
+                running.reaped = true;
+
+                break status;
+            }
             Ok(None) if Instant::now() < deadline => thread::park_timeout(POLL),
             Ok(None) => return Err(RunError::Timeout),
             Err(error) => return Err(RunError::Io(error)),
@@ -187,6 +236,37 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
         let pid = std::fs::read_to_string(&pid_file).expect("pid");
         assert!(!Scripts::process_exists(pid.trim()), "the child still runs");
+    }
+
+    #[test]
+    fn a_timeout_also_kills_the_programs_the_command_started() {
+        let scripts = Scripts::new();
+        let pid_file = scripts.dir().join("pid");
+        // No `exec` on the outside: the shell stays and the pipeline runs under it.
+        let script = format!(
+            "sh -c 'echo $$ > \"$0\"; exec sleep 30' '{}' | cat",
+            pid_file.display()
+        );
+
+        let result = run(&mut sh(&script), b"", Duration::from_secs(1), 1024);
+
+        assert!(matches!(result, Err(RunError::Timeout)));
+        let pid = std::fs::read_to_string(&pid_file).expect("pid");
+        assert!(
+            Scripts::wait_until_gone(pid.trim()),
+            "the program the shell started still runs"
+        );
+    }
+
+    #[test]
+    fn the_debug_text_shows_the_size_of_the_output_and_not_the_output() {
+        let finished = run(&mut sh("printf AB"), b"", Duration::from_secs(5), 1024).expect("run");
+
+        let shown = format!("{finished:?}");
+
+        assert!(shown.contains("stdout: 2 bytes"), "{shown}");
+        assert!(!shown.contains("65"), "{shown}");
+        assert!(!shown.contains("AB"), "{shown}");
     }
 
     #[test]

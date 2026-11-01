@@ -7563,7 +7563,7 @@ fn the_poller_reads_codex_only_while_an_app_is_connected() {
 
     thread::park_timeout(Duration::from_millis(700));
     assert_eq!(fakes.calls("codex"), 0, "nobody is connected");
-    assert_eq!(fakes.calls("claude"), 0);
+    assert_eq!(fakes.calls("security"), 0, "nobody is connected");
 
     let mut first = daemon.connect();
     first.hello();

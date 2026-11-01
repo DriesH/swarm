@@ -44,9 +44,13 @@ const DEFAULT_RETRY: u64 = 5 * 60;
 /// The longest wait after a 429 or 403. Claude Code holds off no longer either.
 const MAX_RETRY: u64 = 60 * 60;
 
-/// How soon the Keychain is read again, so a stuck prompt or an expired token does not
-/// start `security` on every tick.
+/// How soon the Keychain is read again, so an expired token does not start `security`
+/// on every tick.
 const KEYCHAIN_RECHECK: u64 = 60;
+
+/// The wait after `security` did not end. A Keychain dialog is probably open, and macOS
+/// would show another one for each new try.
+const KEYCHAIN_PROMPT_WAIT: u64 = 60 * 60;
 
 /// Windows of the status line input: the JSON key and the label, shortest first.
 const STATUS_LINE_WINDOWS: [(&str, &str); 2] = [("five_hour", "5h"), ("seven_day", "7d")];
@@ -157,6 +161,8 @@ struct State {
     next_request_at: u64,
     /// After a 429 or 403: no request before this time.
     backoff_until: u64,
+    /// After `security` did not end: no Keychain read before this time.
+    keychain_blocked_until: u64,
     /// The fingerprint of a token the server answered 401 to.
     rejected: Option<String>,
 }
@@ -170,6 +176,7 @@ pub struct ClaudeEndpoint {
     state: State,
     /// In memory only.
     next_keychain_at: u64,
+    keychain_timeout: Duration,
 }
 
 impl ClaudeEndpoint {
@@ -183,6 +190,7 @@ impl ClaudeEndpoint {
             state_file,
             state,
             next_keychain_at: 0,
+            keychain_timeout: KEYCHAIN_TIMEOUT,
         }
     }
 
@@ -199,15 +207,25 @@ impl ClaudeEndpoint {
                 retry_at: self.state.backoff_until,
             }));
         }
-        if now < self.state.next_request_at || now < self.next_keychain_at {
+        if now < self.state.next_request_at
+            || now < self.state.keychain_blocked_until
+            || now < self.next_keychain_at
+        {
             return None;
         }
 
         self.next_keychain_at = now + KEYCHAIN_RECHECK;
+
         let credential =
-            match read_credential(&self.commands, self.user.as_deref(), KEYCHAIN_TIMEOUT) {
+            match read_credential(&self.commands, self.user.as_deref(), self.keychain_timeout) {
                 Ok(credential) => credential,
-                Err(problem) => return Some(Err(problem)),
+                Err(KeychainError::PromptOpen) => {
+                    self.state.keychain_blocked_until = now + KEYCHAIN_PROMPT_WAIT;
+                    self.save();
+
+                    return Some(Err(failed("Keychain prompt open")));
+                }
+                Err(KeychainError::Problem(problem)) => return Some(Err(problem)),
             };
 
         if credential.expired(now) {
@@ -299,13 +317,27 @@ fn retry_after(header: Option<&str>) -> u64 {
         .min(MAX_RETRY)
 }
 
+/// Why the Keychain gave no credential.
+#[derive(Debug, PartialEq, Eq)]
+enum KeychainError {
+    /// `security` did not end in time.
+    PromptOpen,
+    Problem(UsageProblem),
+}
+
+impl From<UsageProblem> for KeychainError {
+    fn from(problem: UsageProblem) -> Self {
+        Self::Problem(problem)
+    }
+}
+
 /// Runs `security`, whose Keychain entry Claude Code's item already trusts, so no
 /// prompt should appear.
 fn read_credential(
     commands: &Commands,
     user: Option<&str>,
     timeout: Duration,
-) -> Result<Credential, UsageProblem> {
+) -> Result<Credential, KeychainError> {
     let mut command = Command::new(&commands.security);
     command.arg("find-generic-password");
     if let Some(user) = user {
@@ -315,19 +347,19 @@ fn read_credential(
 
     let finished = match process::run(&mut command, b"", timeout, MAX_RESPONSE_BYTES) {
         Ok(finished) => finished,
-        Err(RunError::Timeout) => return Err(failed("Keychain prompt open")),
+        Err(RunError::Timeout) => return Err(KeychainError::PromptOpen),
         Err(error) => {
             log::warn!("cannot run security: {error}");
 
-            return Err(failed("Keychain read failed"));
+            return Err(failed("Keychain read failed").into());
         }
     };
 
     if finished.status.code() == Some(ITEM_NOT_FOUND) {
-        return Err(UsageProblem::NotLoggedIn);
+        return Err(UsageProblem::NotLoggedIn.into());
     }
     if !finished.status.success() {
-        return Err(failed("Keychain read failed"));
+        return Err(failed("Keychain read failed").into());
     }
 
     // The serde message can quote part of the input, so it is not logged.
@@ -357,9 +389,13 @@ fn request(commands: &Commands, token: &Token) -> Result<Response, UsageProblem>
     let config = curl_config(token).ok_or_else(|| failed("Token cannot be sent"))?;
 
     let mut command = Command::new(&commands.curl);
-    // `-q` first: no `.curlrc` can add a proxy or a redirect.
+    // `-q` first: no `.curlrc` can add a proxy or a redirect. The daemon's environment and
+    // `--noproxy` keep every proxy out: with `--include`, the `200 Connection established`
+    // of a proxy would be read as the answer.
     command
+        .env_clear()
         .args(["-q", "--silent", "--include", "-K", "-"])
+        .args(["--noproxy", "*"])
         .args(["--proto", "=https", "--max-redirs", "0"])
         .args(["--max-time", &CURL_MAX_SECS.to_string()]);
 
@@ -887,6 +923,7 @@ exit "$(cat "$DIR/security-exit" 2>/dev/null || echo 0)""#,
                 &format!(
                     r#"echo "$@" >> "$DIR/curl-args"
 echo "$@" | grep -q '{SECRET}' && echo leaked >> "$DIR/leak"
+env > "$DIR/curl-env"
 cat > "$DIR/curl-config"
 echo called >> "$DIR/curl-calls"
 cat "$DIR/response"
@@ -913,6 +950,14 @@ exit "$(cat "$DIR/curl-exit" 2>/dev/null || echo 0)""#
                 Some("tester".to_owned()),
                 self.scripts.dir().join("backoff.json"),
             )
+        }
+
+        /// An endpoint that gives `security` this long, so a hanging fake ends the test soon.
+        fn endpoint_with_keychain_timeout(&self, timeout: Duration) -> ClaudeEndpoint {
+            let mut endpoint = self.endpoint();
+            endpoint.keychain_timeout = timeout;
+
+            endpoint
         }
 
         fn set_credentials(&self, token: &str, expires_ms: Option<u64>, plan: Option<&str>) {
@@ -987,6 +1032,48 @@ exit "$(cat "$DIR/curl-exit" 2>/dev/null || echo 0)""#
             !args.contains("api.anthropic.com"),
             "the URL was in the arguments"
         );
+    }
+
+    #[test]
+    fn curl_ignores_config_files_and_proxies() {
+        let fakes = Fakes::new();
+
+        fakes.endpoint().poll(NOW, true);
+
+        let args = fakes.scripts.read("curl-args");
+        assert!(args.starts_with("-q "), "-q must come first: {args}");
+        assert!(args.contains("--noproxy *"), "{args}");
+    }
+
+    #[test]
+    fn curl_does_not_get_the_environment_of_the_daemon() {
+        let fakes = Fakes::new();
+        // The shell makes these itself.
+        let own = ["PATH", "PWD", "OLDPWD", "SHLVL", "_"];
+        let ours: Vec<String> = std::env::vars_os()
+            .filter_map(|(name, _)| name.into_string().ok())
+            .filter(|name| !own.contains(&name.as_str()))
+            .collect();
+        assert!(!ours.is_empty(), "the test needs variables to leave out");
+
+        fakes.endpoint().poll(NOW, true);
+
+        let seen = fakes.scripts.read("curl-env");
+        let names: Vec<&str> = seen
+            .lines()
+            .filter_map(|line| line.split_once('=').map(|(name, _)| name))
+            .collect();
+        let leaked: Vec<&String> = ours
+            .iter()
+            .filter(|name| names.contains(&name.as_str()))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "curl got {} variables of the daemon, like {:?}",
+            leaked.len(),
+            leaked.first()
+        );
+        assert!(!seen.to_lowercase().contains("proxy"), "{seen}");
     }
 
     #[test]
@@ -1266,11 +1353,39 @@ exit "$(cat "$DIR/curl-exit" 2>/dev/null || echo 0)""#
         let started = std::time::Instant::now();
         let outcome = read_credential(&fakes.commands, Some("tester"), Duration::from_millis(300));
 
-        assert_eq!(
-            outcome.err(),
-            Some(UsageProblem::Failed("Keychain prompt open".to_owned()))
-        );
+        assert_eq!(outcome.err(), Some(KeychainError::PromptOpen));
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_keychain_that_does_not_answer_is_left_alone_for_an_hour_also_after_a_restart() {
+        let fakes = Fakes::new();
+        fakes.scripts.write("security-hangs", "");
+        // Long enough for a busy machine to start the fake and let it log its start.
+        let timeout = Duration::from_secs(2);
+        let mut endpoint = fakes.endpoint_with_keychain_timeout(timeout);
+
+        let first = endpoint.poll(NOW, true);
+        let soon = endpoint.poll(NOW + KEYCHAIN_RECHECK, true);
+        let mut restarted = fakes.endpoint_with_keychain_timeout(timeout);
+        let after_restart = restarted.poll(NOW + 600, true);
+        let last_second = restarted.poll(NOW + KEYCHAIN_PROMPT_WAIT - 1, true);
+
+        assert_eq!(
+            first,
+            Some(Err(UsageProblem::Failed("Keychain prompt open".to_owned())))
+        );
+        assert_eq!((soon, after_restart, last_second), (None, None, None));
+        assert_eq!(fakes.scripts.lines("security-calls"), 1);
+        let saved: State =
+            serde_json::from_str(&fakes.scripts.read("backoff.json")).expect("state file");
+        assert_eq!(saved.keychain_blocked_until, NOW + KEYCHAIN_PROMPT_WAIT);
+
+        std::fs::remove_file(fakes.scripts.dir().join("security-hangs")).ok();
+        let after_an_hour = restarted.poll(NOW + KEYCHAIN_PROMPT_WAIT, true);
+
+        assert!(matches!(after_an_hour, Some(Ok(_))), "{after_an_hour:?}");
+        assert_eq!(fakes.scripts.lines("security-calls"), 2);
     }
 
     #[test]

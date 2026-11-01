@@ -4,6 +4,8 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 static NEXT: AtomicU32 = AtomicU32::new(0);
 
@@ -60,6 +62,20 @@ impl Scripts {
         )
         .and_then(|mut child| child.wait())
         .is_ok_and(|status| status.success())
+    }
+
+    /// Waits up to 3 seconds for a process to go: its parent must still reap it.
+    pub(crate) fn wait_until_gone(pid: &str) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(3);
+
+        while Self::process_exists(pid) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::park_timeout(Duration::from_millis(20));
+        }
+
+        true
     }
 }
 

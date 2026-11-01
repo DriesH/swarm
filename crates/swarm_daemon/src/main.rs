@@ -12,6 +12,8 @@ mod processes;
 mod pull_requests;
 mod recovery;
 mod tasks;
+#[cfg(test)]
+mod temp_folder;
 mod usage;
 
 use std::fs::{DirBuilder, File, Permissions};
@@ -173,7 +175,7 @@ fn run() -> Result<()> {
         AgentConfig {
             data_dir: paths.data.clone(),
             socket: agent_socket_path.clone(),
-            settings,
+            settings: settings.clone(),
             swarm,
             github: github.clone(),
         },
@@ -203,7 +205,7 @@ fn run() -> Result<()> {
         Arc::clone(&agents),
     );
 
-    let usage = UsageService::start(&paths.data, Arc::clone(&clients), arguments.usage)?;
+    let usage = UsageService::start(&paths.data, settings, Arc::clone(&clients), arguments.usage)?;
 
     let services = Arc::new(Services {
         terminals,

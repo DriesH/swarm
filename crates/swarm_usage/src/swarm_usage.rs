@@ -17,12 +17,12 @@ pub use claude::{ClaudeEndpoint, Commands, status_line_windows};
 pub use codex::{codex_usage, window_label};
 pub use process::{Finished, RunError, run};
 
-/// One good read of a provider's usage.
+/// One good read of the usage of a subscription.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reading {
     /// Shortest window first.
     pub windows: Vec<UsageWindow>,
-    /// The plan name the provider reports, like `max` or `plus`.
+    /// The plan name of the subscription, like `max` or `plus`.
     pub plan: Option<String>,
 }
 

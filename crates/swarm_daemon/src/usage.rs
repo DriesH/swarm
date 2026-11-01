@@ -8,11 +8,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
 use swarm_core::adapters;
-use swarm_protocol::{Event, ProviderUsage, Usage, UsageWindow};
+use swarm_protocol::{AgentKind, Event, SubscriptionUsage, Usage, UsageWindow};
 use swarm_usage::{ClaudeEndpoint, Commands, Outcome, Reading, codex_usage, write_private};
 
 use crate::agents::lock;
@@ -51,8 +51,9 @@ pub(crate) struct Overrides {
 
 struct State {
     usage: Usage,
-    /// When a status line last sent windows. Not saved: it only keeps the endpoint quiet.
-    status_line_at: Option<Instant>,
+    /// When a status line last sent windows, in Unix seconds. Not saved: it only keeps the
+    /// endpoint quiet. It is not an `Instant`, which stops while the Mac sleeps.
+    status_line_at: Option<u64>,
 }
 
 pub(crate) struct UsageService {
@@ -64,16 +65,18 @@ pub(crate) struct UsageService {
 }
 
 impl UsageService {
-    /// Loads the saved usage from the data folder and starts the poller.
+    /// Loads the saved usage from the data folder and starts the poller, which looks up
+    /// the agent CLIs by the commands in the `settings` file.
     pub(crate) fn start(
         data_dir: &Path,
+        settings: Option<PathBuf>,
         clients: Arc<Clients>,
         overrides: Overrides,
     ) -> Result<Arc<Self>> {
         let (service, wake) = Self::new(data_dir.join("usage.json"), clients);
 
         if !overrides.no_polling {
-            let poller = Poller::new(Arc::clone(&service), wake, data_dir, overrides);
+            let poller = Poller::new(Arc::clone(&service), wake, data_dir, settings, overrides);
             thread::Builder::new()
                 .name("usage-poller".into())
                 .spawn(move || poller.run())
@@ -124,7 +127,7 @@ impl UsageService {
         }
 
         let mut state = lock(&self.state);
-        state.status_line_at = Some(Instant::now());
+        state.status_line_at = Some(now);
 
         let claude = &state.usage.claude;
         let same = claude.windows == windows
@@ -146,10 +149,11 @@ impl UsageService {
         self.publish(&mut state, usage);
     }
 
-    fn status_line_is_stale(&self) -> bool {
-        lock(&self.state)
-            .status_line_at
-            .is_none_or(|at| at.elapsed() >= STATUS_LINE_FRESH)
+    /// A status line from the future, after the clock was set back, is stale too.
+    fn status_line_is_stale(&self, now: u64) -> bool {
+        let fresh = |at: u64| at <= now && now < at.saturating_add(STATUS_LINE_FRESH.as_secs());
+
+        !lock(&self.state).status_line_at.is_some_and(fresh)
     }
 
     fn claude_read(&self, outcome: Outcome, now: u64) {
@@ -193,17 +197,17 @@ impl UsageService {
 
 /// A good read replaces the windows and clears the problem. A failed read keeps the
 /// last good windows and sets the problem.
-fn apply(provider: &mut ProviderUsage, outcome: Outcome, now: u64) {
+fn apply(subscription: &mut SubscriptionUsage, outcome: Outcome, now: u64) {
     match outcome {
         Ok(reading) => {
-            provider.windows = reading.windows;
+            subscription.windows = reading.windows;
             if reading.plan.is_some() {
-                provider.plan = reading.plan;
+                subscription.plan = reading.plan;
             }
-            provider.read_at = Some(now);
-            provider.problem = None;
+            subscription.read_at = Some(now);
+            subscription.problem = None;
         }
-        Err(problem) => provider.problem = Some(problem),
+        Err(problem) => subscription.problem = Some(problem),
     }
 }
 
@@ -234,10 +238,16 @@ fn load(file: &Path) -> Usage {
     }
 }
 
-fn unix_now() -> u64 {
+/// Time since the Unix epoch. Deadlines use it, not `Instant`, which stops while the Mac
+/// sleeps.
+fn unix_time() -> Duration {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs())
+        .unwrap_or_default()
+}
+
+fn unix_now() -> u64 {
+    unix_time().as_secs()
 }
 
 /// Looks the CLI up as the agents do: `PATH`, then the usual install folders. The
@@ -264,13 +274,15 @@ struct Poller {
     service: Arc<UsageService>,
     woken: flume::Receiver<()>,
     endpoint: ClaudeEndpoint,
-    /// A name to look up, or the path a test gave.
-    claude: String,
-    codex: String,
+    /// The settings file that names the agent CLIs.
+    settings: Option<PathBuf>,
+    /// A path a test gave. Without one, the command comes from the settings.
+    claude: Option<String>,
+    codex: Option<String>,
     tick: Duration,
     codex_interval: Duration,
-    /// `None` reads Codex on the next tick.
-    codex_due: Option<Instant>,
+    /// When Codex is read next, as Unix time. `None` reads Codex on the next tick.
+    codex_due: Option<Duration>,
 }
 
 impl Poller {
@@ -278,6 +290,7 @@ impl Poller {
         service: Arc<UsageService>,
         woken: flume::Receiver<()>,
         data_dir: &Path,
+        settings: Option<PathBuf>,
         overrides: Overrides,
     ) -> Self {
         let mut commands = Commands::system();
@@ -288,12 +301,7 @@ impl Poller {
             commands.curl = curl;
         }
 
-        let name = |path: Option<PathBuf>, default: &str| {
-            path.map_or_else(
-                || default.to_owned(),
-                |path| path.to_string_lossy().into_owned(),
-            )
-        };
+        let name = |path: Option<PathBuf>| path.map(|path| path.to_string_lossy().into_owned());
 
         Self {
             service,
@@ -303,8 +311,9 @@ impl Poller {
                 account(),
                 data_dir.join("claude-usage-backoff.json"),
             ),
-            claude: name(overrides.claude, "claude"),
-            codex: name(overrides.codex, "codex"),
+            settings,
+            claude: name(overrides.claude),
+            codex: name(overrides.codex),
             tick: overrides.tick.unwrap_or(POLL_TICK),
             codex_interval: overrides.codex_interval.unwrap_or(CODEX_INTERVAL),
             codex_due: None,
@@ -329,21 +338,60 @@ impl Poller {
     }
 
     fn poll(&mut self) {
-        if self.codex_due.is_none_or(|due| Instant::now() >= due) {
-            let outcome = codex_usage(find(&self.codex).as_deref(), CODEX_TIMEOUT);
-            self.service.codex_read(outcome, unix_now());
-            self.codex_due = Some(Instant::now() + self.codex_interval);
+        self.poll_codex(unix_time());
+        self.poll_claude(unix_now());
+    }
+
+    fn poll_codex(&mut self, time: Duration) {
+        if self.codex_due.is_some_and(|due| time < due) {
+            return;
         }
 
-        if self.service.status_line_is_stale() {
-            let installed = find(&self.claude).is_some();
-            let now = unix_now();
+        let outcome = codex_usage(self.find_cli(AgentKind::Codex).as_deref(), CODEX_TIMEOUT);
+        self.service.codex_read(outcome, time.as_secs());
+        self.codex_due = Some(time + self.codex_interval);
+    }
 
-            if let Some(outcome) = self.endpoint.poll(now, installed) {
-                self.service.claude_read(outcome, now);
-            }
+    fn poll_claude(&mut self, now: u64) {
+        if !self.service.status_line_is_stale(now) {
+            return;
+        }
+
+        let installed = self.find_cli(AgentKind::ClaudeCode).is_some();
+
+        if let Some(outcome) = self.endpoint.poll(now, installed) {
+            self.service.claude_read(outcome, now);
         }
     }
+
+    /// The CLI of an agent kind: the path a test gave, or the command from the settings
+    /// that `Agents::plan` uses too.
+    fn find_cli(&self, kind: AgentKind) -> Option<PathBuf> {
+        let given = match kind {
+            AgentKind::ClaudeCode => &self.claude,
+            AgentKind::Codex => &self.codex,
+        };
+        let command = given
+            .clone()
+            .unwrap_or_else(|| configured_command(self.settings.as_deref(), kind));
+
+        find(&command)
+    }
+}
+
+/// The `agents.<kind>.command` of the settings file. A file that is missing or broken
+/// gives the default: a failed usage read is no reason to stop the poller.
+fn configured_command(settings: Option<&Path>, kind: AgentKind) -> String {
+    let settings = settings
+        .map(swarm_settings::load)
+        .transpose()
+        .unwrap_or_else(|error| {
+            log::debug!("cannot read the settings for the usage poller: {error}");
+            None
+        })
+        .unwrap_or_default();
+
+    settings.agents.cli(kind).command.clone()
 }
 
 #[cfg(test)]
@@ -351,6 +399,7 @@ mod tests {
     use swarm_protocol::{UsageProblem, read};
 
     use crate::hub::{ClientSink, Frame};
+    use crate::temp_folder::TempFolder;
 
     use super::*;
 
@@ -371,21 +420,16 @@ mod tests {
         }
     }
 
-    fn temporary_file(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("swd-usage-{}-{name}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("folder");
-
-        dir.join("usage.json")
-    }
-
-    /// A service with one connected client; `changes` holds what the client was sent.
-    fn service_with_client(name: &str) -> (Arc<UsageService>, flume::Receiver<Frame>) {
+    /// A service with one connected client; `changes` holds what the client was sent. The
+    /// folder holds the saved usage and goes away with the last one who holds it.
+    fn service_with_client(name: &str) -> (Arc<UsageService>, flume::Receiver<Frame>, TempFolder) {
+        let folder = TempFolder::new(name);
         let clients = Arc::new(Clients::default());
         let (frames, received) = flume::bounded(64);
         clients.add(&Arc::new(ClientSink::new(1, frames, None)));
-        let (service, _woken) = UsageService::new(temporary_file(name), clients);
+        let (service, _woken) = UsageService::new(folder.path().join("usage.json"), clients);
 
-        (service, received)
+        (service, received, folder)
     }
 
     fn changes(received: &flume::Receiver<Frame>) -> Vec<Usage> {
@@ -404,63 +448,67 @@ mod tests {
 
     #[test]
     fn a_good_read_sets_the_windows_and_clears_the_problem() {
-        let mut provider = ProviderUsage {
+        let mut subscription = SubscriptionUsage {
             problem: Some(UsageProblem::NotLoggedIn),
-            ..ProviderUsage::default()
+            ..SubscriptionUsage::default()
         };
 
         apply(
-            &mut provider,
+            &mut subscription,
             Ok(reading(vec![window("5h", 10, 5)], Some("max"))),
             NOW,
         );
 
-        assert_eq!(provider.windows, [window("5h", 10, 5)]);
-        assert_eq!(provider.plan.as_deref(), Some("max"));
-        assert_eq!(provider.read_at, Some(NOW));
-        assert_eq!(provider.problem, None);
+        assert_eq!(subscription.windows, [window("5h", 10, 5)]);
+        assert_eq!(subscription.plan.as_deref(), Some("max"));
+        assert_eq!(subscription.read_at, Some(NOW));
+        assert_eq!(subscription.problem, None);
     }
 
     #[test]
     fn a_failed_read_keeps_the_last_windows_and_sets_the_problem() {
-        let mut provider = ProviderUsage::default();
+        let mut subscription = SubscriptionUsage::default();
         apply(
-            &mut provider,
+            &mut subscription,
             Ok(reading(vec![window("5h", 10, 5)], Some("max"))),
             NOW,
         );
 
         apply(
-            &mut provider,
+            &mut subscription,
             Err(UsageProblem::RateLimited { retry_at: NOW + 60 }),
             NOW + 30,
         );
 
-        assert_eq!(provider.windows, [window("5h", 10, 5)]);
-        assert_eq!(provider.read_at, Some(NOW), "the failed read is not a read");
+        assert_eq!(subscription.windows, [window("5h", 10, 5)]);
         assert_eq!(
-            provider.problem,
+            subscription.read_at,
+            Some(NOW),
+            "the failed read is not a read"
+        );
+        assert_eq!(
+            subscription.problem,
             Some(UsageProblem::RateLimited { retry_at: NOW + 60 })
         );
     }
 
     #[test]
     fn a_read_without_a_plan_keeps_the_known_plan() {
-        let mut provider = ProviderUsage::default();
-        apply(&mut provider, Ok(reading(Vec::new(), Some("max"))), NOW);
+        let mut subscription = SubscriptionUsage::default();
+        apply(&mut subscription, Ok(reading(Vec::new(), Some("max"))), NOW);
 
         apply(
-            &mut provider,
+            &mut subscription,
             Ok(reading(vec![window("5h", 1, 1)], None)),
             NOW + 1,
         );
 
-        assert_eq!(provider.plan.as_deref(), Some("max"));
+        assert_eq!(subscription.plan.as_deref(), Some("max"));
     }
 
     #[test]
     fn a_change_is_broadcast_and_saved() {
-        let (service, received) = service_with_client("change");
+        let (service, received, _folder) = service_with_client("change");
 
         service.codex_read(Ok(reading(vec![window("5h", 10, 5)], Some("plus"))), NOW);
 
@@ -473,7 +521,7 @@ mod tests {
 
     #[test]
     fn no_change_means_no_broadcast() {
-        let (service, received) = service_with_client("same");
+        let (service, received, _folder) = service_with_client("same");
         service.codex_read(Err(UsageProblem::NotInstalled), NOW);
         changes(&received);
 
@@ -484,7 +532,7 @@ mod tests {
 
     #[test]
     fn the_saved_usage_is_loaded_at_start() {
-        let (service, _received) = service_with_client("reload");
+        let (service, _received, _folder) = service_with_client("reload");
         service.claude_read(Ok(reading(vec![window("7d", 33, 9)], Some("pro"))), NOW);
 
         let (reloaded, _woken) =
@@ -496,7 +544,8 @@ mod tests {
 
     #[test]
     fn a_broken_file_is_ignored() {
-        let file = temporary_file("broken");
+        let folder = TempFolder::new("broken");
+        let file = folder.path().join("usage.json");
         std::fs::write(&file, "{ nope").expect("write");
 
         let (service, _woken) = UsageService::new(file, Arc::new(Clients::default()));
@@ -506,8 +555,8 @@ mod tests {
 
     #[test]
     fn a_status_line_sets_the_claude_windows_and_the_time() {
-        let (service, received) = service_with_client("statusline");
-        assert!(service.status_line_is_stale());
+        let (service, received, _folder) = service_with_client("statusline");
+        assert!(service.status_line_is_stale(NOW));
 
         service.record_status_line(vec![window("5h", 20, 7), window("7d", 30, 8)], NOW);
 
@@ -515,12 +564,12 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].claude.windows.len(), 2);
         assert_eq!(sent[0].claude.read_at, Some(NOW));
-        assert!(!service.status_line_is_stale());
+        assert!(!service.status_line_is_stale(NOW + 1));
     }
 
     #[test]
     fn a_status_line_clears_a_claude_problem() {
-        let (service, received) = service_with_client("clears");
+        let (service, received, _folder) = service_with_client("clears");
         service.claude_read(Err(UsageProblem::Unauthorized), NOW);
         changes(&received);
 
@@ -532,7 +581,7 @@ mod tests {
 
     #[test]
     fn the_same_windows_again_are_not_broadcast_before_the_read_time_step() {
-        let (service, received) = service_with_client("step");
+        let (service, received, _folder) = service_with_client("step");
         service.record_status_line(vec![window("5h", 20, 7)], NOW);
         changes(&received);
 
@@ -548,7 +597,7 @@ mod tests {
 
     #[test]
     fn other_windows_are_broadcast_at_once() {
-        let (service, received) = service_with_client("other");
+        let (service, received, _folder) = service_with_client("other");
         service.record_status_line(vec![window("5h", 20, 7)], NOW);
         changes(&received);
 
@@ -559,12 +608,31 @@ mod tests {
 
     #[test]
     fn an_empty_status_line_changes_nothing() {
-        let (service, received) = service_with_client("empty");
+        let (service, received, _folder) = service_with_client("empty");
 
         service.record_status_line(Vec::new(), NOW);
 
         assert!(changes(&received).is_empty());
-        assert!(service.status_line_is_stale());
+        assert!(service.status_line_is_stale(NOW));
+    }
+
+    #[test]
+    fn a_status_line_stays_fresh_for_ten_minutes_by_the_clock_on_the_wall() {
+        let (service, _received, _folder) = service_with_client("fresh");
+        service.record_status_line(vec![window("5h", 20, 7)], NOW);
+        let fresh_for = STATUS_LINE_FRESH.as_secs();
+
+        assert!(!service.status_line_is_stale(NOW));
+        assert!(!service.status_line_is_stale(NOW + fresh_for - 1));
+        assert!(service.status_line_is_stale(NOW + fresh_for));
+    }
+
+    #[test]
+    fn a_status_line_from_the_future_is_stale() {
+        let (service, _received, _folder) = service_with_client("future");
+        service.record_status_line(vec![window("5h", 20, 7)], NOW);
+
+        assert!(service.status_line_is_stale(NOW - 1));
     }
 
     #[test]
@@ -580,9 +648,11 @@ mod tests {
 
     #[test]
     fn only_the_first_client_wakes_the_poller() {
+        let folder = TempFolder::new("wake");
         let clients = Arc::new(Clients::default());
         let (frames, _received) = flume::bounded(8);
-        let (service, woken) = UsageService::new(temporary_file("wake"), Arc::clone(&clients));
+        let (service, woken) =
+            UsageService::new(folder.path().join("usage.json"), Arc::clone(&clients));
 
         clients.add(&Arc::new(ClientSink::new(1, frames.clone(), None)));
         service.client_connected();
@@ -597,16 +667,22 @@ mod tests {
 
     // The poller, with fake commands.
 
+    /// What the fake `codex` does: it answers a read of the rate limits.
+    const CODEX_BODY: &str = "while IFS= read -r line; do case \"$line\" in *account/rateLimits/read*) cat \"$DIR/answer\";; esac; done";
+
     /// Fake `security`, `curl`, `codex` and `claude` in a folder of their own.
     struct Fakes {
         dir: PathBuf,
+        _folder: TempFolder,
     }
 
     impl Fakes {
         fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("swd-fakes-{}-{name}", std::process::id()));
-            std::fs::create_dir_all(&dir).expect("folder");
-            let fakes = Self { dir };
+            let folder = TempFolder::new(name);
+            let fakes = Self {
+                dir: folder.path().to_owned(),
+                _folder: folder,
+            };
 
             let far = (NOW + 86_400) * 1000;
             fakes.write(
@@ -625,10 +701,7 @@ mod tests {
             );
             fakes.script("security", "cat \"$DIR/credentials\"");
             fakes.script("curl", "cat > /dev/null\ncat \"$DIR/response\"");
-            fakes.script(
-                "codex",
-                "while IFS= read -r line; do case \"$line\" in *account/rateLimits/read*) cat \"$DIR/answer\";; esac; done",
-            );
+            fakes.script("codex", CODEX_BODY);
             fakes.script("claude", "exit 0");
 
             fakes
@@ -670,7 +743,37 @@ mod tests {
         }
 
         fn poller(&self, service: &Arc<UsageService>, woken: flume::Receiver<()>) -> Poller {
-            Poller::new(Arc::clone(service), woken, &self.dir, self.overrides())
+            Poller::new(
+                Arc::clone(service),
+                woken,
+                &self.dir,
+                None,
+                self.overrides(),
+            )
+        }
+
+        /// A poller that finds `claude` and `codex` as production does, by the commands in
+        /// a settings file with this text. Only `security` and `curl` are fakes.
+        fn poller_by_settings(
+            &self,
+            service: &Arc<UsageService>,
+            woken: flume::Receiver<()>,
+            settings: &str,
+        ) -> Poller {
+            self.write("settings.toml", settings);
+            let overrides = Overrides {
+                claude: None,
+                codex: None,
+                ..self.overrides()
+            };
+
+            Poller::new(
+                Arc::clone(service),
+                woken,
+                &self.dir,
+                Some(self.dir.join("settings.toml")),
+                overrides,
+            )
         }
     }
 
@@ -726,9 +829,8 @@ mod tests {
     #[test]
     fn an_old_status_line_lets_the_endpoint_run() {
         let (fakes, service, mut poller) = poller_setup("old");
-        service.record_status_line(vec![window("5h", 7, 1)], unix_now());
-        lock(&service.state).status_line_at =
-            Instant::now().checked_sub(STATUS_LINE_FRESH + Duration::from_secs(1));
+        let long_ago = unix_now() - STATUS_LINE_FRESH.as_secs() - 1;
+        service.record_status_line(vec![window("5h", 7, 1)], long_ago);
 
         poller.poll();
 
@@ -751,10 +853,85 @@ mod tests {
     }
 
     #[test]
+    fn codex_is_due_by_the_wall_clock_so_a_sleeping_mac_counts() {
+        let (fakes, _service, mut poller) = poller_setup("wall-clock");
+        poller.codex_interval = Duration::from_secs(300);
+        let start = Duration::from_secs(NOW);
+
+        poller.poll_codex(start);
+        poller.poll_codex(start + Duration::from_secs(299));
+        assert_eq!(fakes.calls("codex"), 1);
+
+        poller.poll_codex(start + Duration::from_secs(300));
+        assert_eq!(fakes.calls("codex"), 2);
+    }
+
+    #[test]
+    fn the_cli_commands_come_from_the_settings() {
+        let fakes = Fakes::new("settings");
+        let (service, woken) =
+            UsageService::new(fakes.dir.join("usage.json"), Arc::new(Clients::default()));
+        fakes.script("my-claude", "exit 0");
+        fakes.script("my-codex", CODEX_BODY);
+        let dir = fakes.dir.display();
+        let mut poller = fakes.poller_by_settings(
+            &service,
+            woken,
+            &format!(
+                "[agents.claude_code]\ncommand = \"{dir}/my-claude\"\n\n[agents.codex]\ncommand = \"{dir}/my-codex\"\n"
+            ),
+        );
+
+        poller.poll();
+
+        let usage = service.current();
+        assert_eq!(usage.codex.windows, [window("5h", 12, 99)]);
+        assert_eq!(fakes.calls("my-codex"), 1);
+        assert_eq!(fakes.calls("codex"), 0);
+        assert_eq!(usage.claude.problem, None, "claude is installed");
+        assert_eq!(usage.claude.windows[0].used_percent, 42);
+    }
+
+    #[test]
+    fn a_command_in_the_settings_that_does_not_exist_is_not_installed() {
+        let fakes = Fakes::new("settings-missing");
+        let (service, woken) =
+            UsageService::new(fakes.dir.join("usage.json"), Arc::new(Clients::default()));
+        let mut poller = fakes.poller_by_settings(
+            &service,
+            woken,
+            "[agents.claude_code]\ncommand = \"/nonexistent/claude\"\n\n[agents.codex]\ncommand = \"/nonexistent/codex\"\n",
+        );
+
+        poller.poll();
+
+        let usage = service.current();
+        assert_eq!(usage.claude.problem, Some(UsageProblem::NotInstalled));
+        assert_eq!(usage.codex.problem, Some(UsageProblem::NotInstalled));
+        assert_eq!(fakes.calls("security"), 0);
+    }
+
+    #[test]
+    fn without_usable_settings_the_default_commands_are_looked_up() {
+        let fakes = Fakes::new("settings-default");
+        fakes.write("broken.toml", "agents = [");
+        let broken = fakes.dir.join("broken.toml");
+        let missing = fakes.dir.join("missing.toml");
+
+        for settings in [None, Some(missing.as_path()), Some(broken.as_path())] {
+            assert_eq!(
+                configured_command(settings, AgentKind::ClaudeCode),
+                "claude"
+            );
+            assert_eq!(configured_command(settings, AgentKind::Codex), "codex");
+        }
+    }
+
+    #[test]
     fn a_missing_claude_and_codex_are_not_installed() {
         let (_fakes, service, mut poller) = poller_setup("missing");
-        poller.claude = "/nonexistent/claude".to_owned();
-        poller.codex = "/nonexistent/codex".to_owned();
+        poller.claude = Some("/nonexistent/claude".to_owned());
+        poller.codex = Some("/nonexistent/codex".to_owned());
 
         poller.poll();
 

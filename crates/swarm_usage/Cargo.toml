@@ -11,6 +11,7 @@ path = "src/swarm_usage.rs"
 workspace = true
 
 [dependencies]
+libc.workspace = true
 log.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -1,13 +1,15 @@
 //! `swarm statusline`: the status line of Swarm's Claude agents. It sends the rate limits
-//! in Claude Code's status line input to the daemon, then runs the user's own status line
-//! with the same input, so the user keeps it. It never prints an error and always exits 0,
-//! because the agent must not see a broken screen.
+//! in Claude Code's status line input to the daemon while it runs the user's own status
+//! line with the same input, so the user keeps it. It never prints an error and always
+//! exits 0, because the agent must not see a broken screen.
 
 use std::ffi::OsStr;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use swarm_protocol::agent::Call;
@@ -40,45 +42,73 @@ pub(crate) fn run() {
         return;
     }
 
-    send_rate_limits(&input);
+    let sending = send_rate_limits(&input);
 
+    if let Some(output) = user_output(&input) {
+        // A closed stdout is the agent's business, not a failure of ours.
+        let mut stdout = std::io::stdout();
+        stdout.write_all(&output).and_then(|()| stdout.flush()).ok();
+    }
+
+    if let Some(sending) = sending {
+        sending.finish();
+    }
+}
+
+/// What the user's own status line prints for this input. `None` when there is none, or
+/// when this process is already part of one.
+fn user_output(input: &[u8]) -> Option<Vec<u8>> {
     if std::env::var_os(CHAINED).is_some() {
-        return;
+        return None;
     }
 
     let command = user_command(
         std::env::var_os("CLAUDE_CONFIG_DIR").as_deref(),
         std::env::var_os("HOME").as_deref(),
-    );
-    let Some(output) = command.and_then(|command| run_user_command(&command, &input)) else {
-        return;
-    };
+    )?;
 
-    // A closed stdout is the agent's business, not a failure of ours.
-    let mut stdout = std::io::stdout();
-    stdout.write_all(&output).and_then(|()| stdout.flush()).ok();
+    run_user_command(&command, input)
 }
 
-fn send_rate_limits(input: &[u8]) {
-    let Ok(value) = serde_json::from_slice::<Value>(input) else {
-        return;
-    };
-    if value.get("rate_limits").is_none() {
-        return;
+/// The rate limits call, on its own thread so the user's command does not wait for the
+/// daemon.
+struct Sending {
+    started: Instant,
+    done: mpsc::Receiver<()>,
+}
+
+impl Sending {
+    /// Waits for the call until the time it was given has passed. When the user's command
+    /// took longer than that, the call was given enough time already.
+    fn finish(self) {
+        let left = (self.started + SOCKET_TIMEOUT).saturating_duration_since(Instant::now());
+
+        self.done.recv_timeout(left).ok();
     }
-    let Ok(session) = Session::from_env() else {
-        return;
+}
+
+fn send_rate_limits(input: &[u8]) -> Option<Sending> {
+    let value = serde_json::from_slice::<Value>(input).ok()?;
+    value.get("rate_limits")?;
+    let session = Session::from_env().ok()?;
+    let call = Call::RateLimits {
+        windows: status_line_windows(&value),
     };
 
-    // Whether the daemon took it does not matter to the screen.
-    session
-        .call_within(
-            Call::RateLimits {
-                windows: status_line_windows(&value),
-            },
-            SOCKET_TIMEOUT,
-        )
-        .ok();
+    let (finished, done) = mpsc::channel();
+    thread::Builder::new()
+        .name("rate-limits".into())
+        .spawn(move || {
+            // Whether the daemon took it does not matter to the screen.
+            session.call_within(call, SOCKET_TIMEOUT).ok();
+            finished.send(()).ok();
+        })
+        .ok()?;
+
+    Some(Sending {
+        started: Instant::now(),
+        done,
+    })
 }
 
 /// The user's own status line command, from `$CLAUDE_CONFIG_DIR/settings.json` or
@@ -127,6 +157,7 @@ fn run_user_command(command: &str, input: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use std::os::unix::ffi::OsStrExt as _;
+    use std::process::Stdio;
 
     use super::*;
 
@@ -239,12 +270,54 @@ mod tests {
 
     #[test]
     fn a_user_command_that_does_not_end_gives_nothing() {
-        let started = std::time::Instant::now();
+        let started = Instant::now();
 
         let output = run_user_command("exec sleep 30", b"");
 
         assert_eq!(output, None);
         assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_user_command_that_times_out_takes_the_programs_it_started_with_it() {
+        let dir = std::env::temp_dir().join(format!("swc-tree-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("folder");
+        let pid_file = dir.join("pid");
+        // No `exec` on the outside: the shell stays and the pipeline runs under it.
+        let command = format!(
+            "sh -c 'echo $$ > \"$0\"; exec sleep 30' '{}' | cat",
+            pid_file.display()
+        );
+
+        let output = run_user_command(&command, b"");
+
+        let pid = std::fs::read_to_string(&pid_file).expect("pid");
+        let gone = process_gone(pid.trim());
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+        assert_eq!(output, None);
+        assert!(gone, "the program the shell started still runs");
+    }
+
+    /// Waits up to 3 seconds for a process to go.
+    fn process_gone(pid: &str) -> bool {
+        let exists = || {
+            Command::new("/bin/kill")
+                .args(["-0", pid])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        };
+        let deadline = Instant::now() + Duration::from_secs(3);
+
+        while exists() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::park_timeout(Duration::from_millis(20));
+        }
+
+        true
     }
 
     #[test]
