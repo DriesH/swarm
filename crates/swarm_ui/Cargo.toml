@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 gpui.workspace = true
 log.workspace = true
+swarm_sprite.workspace = true
 unicode-segmentation.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]

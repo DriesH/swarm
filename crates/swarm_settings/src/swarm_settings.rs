@@ -19,6 +19,37 @@ pub struct Settings {
     pub agents: AgentSettings,
     pub terminals: TerminalSettings,
     pub notifications: NotificationSettings,
+    pub appearance: AppearanceSettings,
+}
+
+/// The accent color of the app.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AccentSetting {
+    #[default]
+    Blue,
+    Honey,
+}
+
+/// What the app looks like, apart from light and dark.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(default)]
+pub struct AppearanceSettings {
+    /// Turns every easter egg off when false.
+    pub easter_eggs: bool,
+    pub accent: AccentSetting,
+    /// Shows a honeycomb behind the Swarm view, in place of the dots.
+    pub swarm_view_honeycomb: bool,
+}
+
+impl Default for AppearanceSettings {
+    fn default() -> Self {
+        Self {
+            easter_eggs: true,
+            accent: AccentSetting::Blue,
+            swarm_view_honeycomb: false,
+        }
+    }
 }
 
 /// Which notices become system notifications, and how they are delivered. Reading never
@@ -486,6 +517,10 @@ pub fn save(path: &Path, settings: &Settings) -> Result<(), SettingsError> {
         table_mut(document.as_table_mut(), "notifications"),
         &settings.notifications,
     );
+    set_appearance(
+        table_mut(document.as_table_mut(), "appearance"),
+        settings.appearance,
+    );
 
     if let Some(folder) = path.parent() {
         std::fs::create_dir_all(folder).map_err(io_error)?;
@@ -495,6 +530,21 @@ pub fn save(path: &Path, settings: &Settings) -> Result<(), SettingsError> {
 
     std::fs::write(&temporary, document.to_string()).map_err(io_error)?;
     std::fs::rename(&temporary, path).map_err(io_error)
+}
+
+fn set_appearance(table: &mut Table, appearance: AppearanceSettings) {
+    let accent = match appearance.accent {
+        AccentSetting::Blue => "blue",
+        AccentSetting::Honey => "honey",
+    };
+
+    set_value(table, "easter_eggs", Value::from(appearance.easter_eggs));
+    set_value(table, "accent", Value::from(accent));
+    set_value(
+        table,
+        "swarm_view_honeycomb",
+        Value::from(appearance.swarm_view_honeycomb),
+    );
 }
 
 fn set_notifications(table: &mut Table, notifications: &NotificationSettings) {
@@ -681,6 +731,42 @@ mod tests {
         assert_eq!(cli.orchestrator_model, "gpt-reserve");
         assert_eq!(cli.worker_model, "gpt-6-sol");
         assert_eq!(settings.agents.claude_code, CliSettings::claude_code());
+    }
+
+    #[test]
+    fn the_easter_eggs_are_on_by_default() {
+        let settings: Settings = toml::from_str("").unwrap();
+
+        assert!(settings.appearance.easter_eggs);
+        assert_eq!(settings.appearance.accent, AccentSetting::Blue);
+        assert!(!settings.appearance.swarm_view_honeycomb);
+    }
+
+    #[test]
+    fn an_old_appearance_section_keeps_the_eggs_on() {
+        let settings: Settings = toml::from_str("[appearance]\naccent = \"honey\"\n").unwrap();
+
+        assert!(settings.appearance.easter_eggs);
+        assert_eq!(settings.appearance.accent, AccentSetting::Honey);
+    }
+
+    #[test]
+    fn appearance_round_trips_through_a_file() {
+        let folder = temp_folder("appearance");
+        let path = folder.join("settings.toml");
+        let mut settings = Settings::default();
+        settings.appearance.easter_eggs = false;
+        settings.appearance.accent = AccentSetting::Honey;
+        settings.appearance.swarm_view_honeycomb = true;
+
+        save(&path, &settings).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let loaded = load(&path).unwrap();
+        std::fs::remove_dir_all(&folder).unwrap();
+
+        assert!(text.contains("easter_eggs = false"));
+        assert!(text.contains("accent = \"honey\""));
+        assert_eq!(loaded.appearance, settings.appearance);
     }
 
     fn temp_folder(name: &str) -> PathBuf {

@@ -443,11 +443,14 @@ impl<const MULTILINE: bool> TextField<MULTILINE> {
                 cx.background_executor().timer(BLINK_INTERVAL).await;
 
                 let toggled = field.update(cx, |field, cx| {
-                    field.blink.visible = !field.blink.visible;
+                    // Reduce Motion may have turned on since the blink started.
+                    field.blink.visible = reduce_motion(cx) || !field.blink.visible;
                     cx.notify();
+
+                    !reduce_motion(cx)
                 });
 
-                if toggled.is_err() {
+                if !toggled.unwrap_or(false) {
                     break;
                 }
             }
@@ -1877,7 +1880,56 @@ impl Component for TextInput {
 
 #[cfg(test)]
 mod tests {
+    use gpui::{TestAppContext, VisualTestContext};
+
     use super::*;
+
+    fn focus(input: &Entity<TextInput>, cx: &mut VisualTestContext) {
+        let handle = input.read_with(cx, Focusable::focus_handle);
+
+        cx.update(|window, cx| handle.focus(window, cx));
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn the_cursor_stops_blinking_when_reduce_motion_turns_on(cx: &mut TestAppContext) {
+        cx.update(crate::theme::init);
+        let (input, cx) = cx.add_window_view(|_, cx| TextInput::new(cx));
+
+        focus(&input, cx);
+        cx.executor().advance_clock(BLINK_INTERVAL);
+        cx.run_until_parked();
+        assert!(!input.read_with(cx, |input, _| input.blink.visible));
+
+        // Shown again, then Reduce Motion turns on: the next tick must not hide it.
+        cx.executor().advance_clock(BLINK_INTERVAL);
+        cx.run_until_parked();
+        assert!(input.read_with(cx, |input, _| input.blink.visible));
+
+        cx.update(|_, cx| cx.set_reduce_motion(true));
+        cx.executor().advance_clock(BLINK_INTERVAL);
+        cx.run_until_parked();
+        assert!(input.read_with(cx, |input, _| input.blink.visible));
+
+        cx.executor().advance_clock(BLINK_INTERVAL * 3);
+        cx.run_until_parked();
+        assert!(input.read_with(cx, |input, _| input.blink.visible));
+    }
+
+    #[gpui::test]
+    fn the_cursor_does_not_blink_under_reduce_motion(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let (input, cx) = cx.add_window_view(|_, cx| TextInput::new(cx));
+
+        focus(&input, cx);
+        cx.executor().advance_clock(BLINK_INTERVAL * 3);
+        cx.run_until_parked();
+
+        assert!(input.read_with(cx, |input, _| input.blink.visible));
+    }
 
     fn buffer(text: &str, cursor: usize) -> Buffer {
         Buffer {

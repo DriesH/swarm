@@ -386,3 +386,34 @@ fn dropdown_renders_closed_with_its_trigger() {
 
     assert!(host.is_some_and(|bounds| bounds.size.height > px(0.)));
 }
+
+#[test]
+fn a_toast_is_a_status_named_by_its_title_and_message() {
+    with_window(|window, cx| {
+        let info = a11y_info(
+            Toast::new("toast", "terminal-renderer", "Ready for review")
+                .action("Review", |_, _, _| {})
+                .on_dismiss(|_, _| {}),
+            window,
+            cx,
+        );
+
+        assert_eq!(info.role, Some(Role::Status));
+        assert_eq!(
+            info.node.label(),
+            Some("terminal-renderer, Ready for review")
+        );
+    });
+}
+
+#[test]
+fn the_pixel_bee_and_the_honey_fill_have_no_role() {
+    with_window(|window, cx| {
+        assert_eq!(a11y_info(PixelBee::new("bee"), window, cx).role, None);
+        assert_eq!(
+            a11y_info(PixelBee::new("flying-bee").flap(true), window, cx).role,
+            None
+        );
+        assert_eq!(a11y_info(HoneyFill::new("honey"), window, cx).role, None);
+    });
+}

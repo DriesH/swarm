@@ -5,6 +5,7 @@ mod checkbox;
 mod confirm_row;
 mod dialog;
 mod dropdown;
+mod file_icon;
 mod honeycomb;
 mod icon;
 mod icon_button;
@@ -14,6 +15,7 @@ mod list_row;
 mod menu;
 mod output_block;
 mod panel;
+mod pixel_bee;
 mod popover_menu;
 mod project_tile;
 mod resize_handle;
@@ -28,6 +30,7 @@ mod tab_strip;
 mod tag;
 pub(crate) mod text_input;
 mod tile_frame;
+mod toast;
 mod tooltip;
 mod tray_chip;
 mod tree_row;
@@ -40,6 +43,7 @@ pub use checkbox::*;
 pub use confirm_row::*;
 pub use dialog::*;
 pub use dropdown::*;
+pub use file_icon::*;
 pub use honeycomb::*;
 pub use icon::*;
 pub use icon_button::*;
@@ -49,6 +53,7 @@ pub use list_row::*;
 pub use menu::*;
 pub use output_block::*;
 pub use panel::*;
+pub use pixel_bee::*;
 pub use popover_menu::*;
 pub use project_tile::*;
 pub use resize_handle::*;
@@ -63,6 +68,7 @@ pub use tab_strip::*;
 pub use tag::*;
 pub use text_input::*;
 pub use tile_frame::*;
+pub use toast::*;
 pub use tooltip::*;
 pub use tray_chip::*;
 pub use tree_row::*;
@@ -98,16 +104,20 @@ pub fn all_components() -> Vec<ComponentEntry> {
         ComponentEntry::of::<OutputBlock>(),
         ComponentEntry::of::<ListRow>(),
         ComponentEntry::of::<TreeRow>(),
+        ComponentEntry::of::<FileIcon>(),
         ComponentEntry::of::<TrayChip>(),
         ComponentEntry::of::<TrayMore>(),
         ComponentEntry::of::<Panel>(),
         ComponentEntry::of::<UsageMeter>(),
         ComponentEntry::of::<BrandMark>(),
         ComponentEntry::of::<Honeycomb>(),
+        ComponentEntry::of::<HoneyFill>(),
+        ComponentEntry::of::<PixelBee>(),
         ComponentEntry::of::<ConfirmRow>(),
         ComponentEntry::of::<ProjectTile>(),
         ComponentEntry::of::<TileFrame>(),
         ComponentEntry::of::<Dialog>(),
+        ComponentEntry::of::<Toast>(),
         ComponentEntry::of::<Tooltip>(),
     ]
 }

@@ -26,6 +26,7 @@ Focus an element when the window opens. With nothing focused, GPUI sends Tab now
 | Component | Role (VoiceOver) |
 |---|---|
 | `Icon`, `IconName` | decorative, or `Image` with `.accessible(id, label)` |
+| `FileIcon`, `FileIconName` | decorative: the row names the file. Images from `assets/file-icons` (vscode-icons, CC BY-SA 4.0, see its `LICENSE.md`) |
 | `Label` | none: the interactive parent carries the label |
 | `Button` | `Button` |
 | `IconButton` | `Button`; the label is a required argument |
@@ -37,6 +38,10 @@ Focus an element when the window opens. With nothing focused, GPUI sends Tab now
 | `TrayChip` | `Button`, "Show name, status" |
 | `TrayMore` | `Button`, "4 more tiles" |
 | `Panel`, `PanelRow` | `Group` with `.accessible(id, label)` |
+| `PixelBee` | none: decoration, hidden from VoiceOver. Flaps only with `.flap(true)`; still under Reduce Motion |
+| `BeeFlight` | none. Bees fly across the parent once; nothing shows under Reduce Motion |
+| `HoneyFill` | none. Seven cells fill once; all filled under Reduce Motion |
+| `Toast` | `Status`, "title, message". The action and the dismiss button are in the Tab order; Escape dismisses |
 | `TileFrame` | `Group`, "name terminal" |
 | `CheckRow`, `CheckStatus` | `ListItem`, "name, status, value" |
 | `OutputBlock` | `Log` with the text as its value; a tab stop that scrolls with the arrow, Page, Home and End keys |
@@ -76,13 +81,16 @@ The gallery opens and closes one window per page. Screen recording permission is
 - **Focus ring** is a 2px inset box shadow in `accent`, so it never moves layout. An outer shadow does not work: GPUI fills it behind the element, so transparent controls showed a solid block.
 - **Element ids must be unique among siblings.** Two buttons with the same id share one focus handle and both show the ring.
 
+- **Pixel bee** is drawn from the grid in `swarm_sprite`, which `swarm buzz` also prints. Each sprite pixel is a whole number of logical pixels and every edge is snapped to a device pixel; runs of one color are one quad, so no seams show. The ring around the sprite is drawn only in dark mode (`#332c23`), because the sprite's own outline (`#17130e`) vanishes on a dark ground. The sprite's palette is art, not theme: it is the one place with raw colors.
+- **Honey accent** is amber. Light mode uses `#905500`, darker than the mockup's `#eaa93f`, so accent text passes 4.5:1 on every surface and on its tint. The mockup's amber stays as the `honey` token for fills.
+
 ## Traps
 
 - App root views must set `key_context("SwarmRoot")` (`swarm_ui::ROOT_CONTEXT`) for Tab focus to work. Terminal views will bind Tab in their own context.
 
 ## Known gaps
 
-- macOS "Reduce motion" is read at startup and each time a window becomes active (`motion::follow_reduce_motion`), not the moment the setting changes. GPUI animations then jump to their end state.
+- macOS "Reduce motion" is read at startup and each time a window becomes active (`motion::follow_reduce_motion`, kept by the main, Settings and menu bar popover windows), not the moment the setting changes. GPUI animations then jump to their end state: a repeating one shows its first frame, a one-shot one its last.
 - Plain text is not in the accessibility tree; only interactive elements and labelled groups are.
 - GPUI has no `aria-disabled`: disabled buttons are removed from the tab order but VoiceOver does not say "dimmed".
 - GPUI's test platform never activates accessibility, so tests check each component's role and properties, not the live AccessKit tree. `Icon` is not covered: its render returns `AnyElement`, which hides the role.
