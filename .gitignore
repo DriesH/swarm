@@ -3,6 +3,11 @@ target/
 **/*.rs.bk
 *.pdb
 
+# Backups from edits and merges
+*.orig
+*.bak
+*.rej
+
 # macOS
 .DS_Store
 
