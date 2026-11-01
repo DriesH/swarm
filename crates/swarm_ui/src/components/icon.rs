@@ -12,6 +12,7 @@ use crate::prelude::*;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum IconName {
     Agent,
+    Alert,
     Bee,
     Branch,
     Check,
@@ -62,8 +63,9 @@ macro_rules! fill_icon {
 }
 
 impl IconName {
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 27] = [
         Self::Agent,
+        Self::Alert,
         Self::Bee,
         Self::Branch,
         Self::Check,
@@ -94,6 +96,7 @@ impl IconName {
     pub fn name(self) -> &'static str {
         match self {
             Self::Agent => "agent",
+            Self::Alert => "alert",
             Self::Bee => "bee",
             Self::Branch => "branch",
             Self::Check => "check",
@@ -127,6 +130,10 @@ impl IconName {
             Self::Agent => stroke_icon!(
                 "1.9",
                 r#"<rect x="4" y="8" width="16" height="12" rx="3"/><path d="M12 4v4M9 13v1M15 13v1"/>"#
+            ),
+            Self::Alert => stroke_icon!(
+                "2.2",
+                r#"<path d="M10.3 3.9 1.8 18.5A2 2 0 0 0 3.5 21.5h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/>"#
             ),
             Self::Bee => stroke_icon!(
                 "2",

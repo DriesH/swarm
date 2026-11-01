@@ -13,10 +13,11 @@ use swarm_ui::fonts::UI_FONT;
 use swarm_ui::prelude::*;
 use swarm_ui::{Dismiss, ROOT_CONTEXT, theme};
 
-use super::summary::{MeterRow, NeedsYou, Summary, UsageSection};
+use super::summary::{NeedsYou, Summary};
 use crate::actions::Quit;
 use crate::lifecycle;
 use crate::model::TaskId;
+use crate::usage_text::{UsageSection, WindowRow};
 use crate::workspace::Workspace;
 
 pub(crate) const WIDTH: f32 = 320.;
@@ -31,6 +32,8 @@ const PADDING: f32 = 12.;
 const BORDER: f32 = 1.;
 const HEADER_HEIGHT: f32 = 28.;
 const SECTION_GAP: f32 = 14.;
+/// The padding inside a usage card.
+const CARD_PADDING: f32 = 12.;
 /// The footer: the line above it, the Stop all row, and the Open Swarm and Quit row.
 const FOOTER_HEIGHT: f32 = 75.;
 
@@ -60,26 +63,23 @@ pub(crate) fn height(summary: &Summary) -> f32 {
     (inner + PADDING * 2. + BORDER * 2.).ceil()
 }
 
-/// The title, then a gap and a meter for each window, then the problem line.
+/// The card: border and padding, the header, a gap and a meter for each window, then a gap
+/// and the problem line.
 fn usage_height(section: &UsageSection) -> f32 {
-    const TITLE: f32 = 18.;
-    const METER: f32 = 26.;
-    const METER_NOTE: f32 = 20.5;
+    const FRAME: f32 = 2. * (BORDER + CARD_PADDING);
+    const HEADER: f32 = 18.;
+    const METER: f32 = 47.5;
     const PROBLEM: f32 = 17.;
-    const GAP: f32 = 8.;
+    const GAP: f32 = 12.;
 
-    let meters: f32 = section
-        .meters
-        .iter()
-        .map(|meter| GAP + METER + if meter.note.is_some() { METER_NOTE } else { 0. })
-        .sum();
+    let meters: f32 = section.windows.iter().map(|_| GAP + METER).sum();
     let problem = if section.problem.is_some() {
         GAP + PROBLEM
     } else {
         0.
     };
 
-    TITLE + meters + problem
+    FRAME + HEADER + meters + problem
 }
 
 /// The heading, then the rows with a gap before each.
@@ -343,7 +343,7 @@ impl Render for Popover {
         let colors = cx.theme().colors();
         let (panel, line, fg) = (colors.panel, colors.line, colors.fg);
 
-        let mut sections: Vec<gpui::AnyElement> = summary.usage.iter().map(usage_section).collect();
+        let mut sections: Vec<gpui::AnyElement> = summary.usage.iter().map(usage_card).collect();
         if !summary.needs_you.is_empty() {
             sections.push(self.needs_you_section(&summary.needs_you, cx));
         }
@@ -526,20 +526,62 @@ fn header(running: usize) -> impl IntoElement {
         .child(Label::new(text).size(LabelSize::Small).color(Color::Faint))
 }
 
-/// The title, a meter for each window and the problem line of one agent kind. Settings ›
-/// Usage shows the same sections.
-pub(crate) fn usage_section(section: &UsageSection) -> gpui::AnyElement {
-    let id = section.id;
+/// A usage section on a raised card.
+fn usage_card(section: &UsageSection) -> gpui::AnyElement {
+    Panel::new()
+        .raised()
+        .row(
+            div()
+                .p(px(CARD_PADDING))
+                .child(usage_section(section, UsageSurface::Raised)),
+        )
+        .into_any_element()
+}
+
+/// The name of an agent kind with its plan and the age of the numbers, a meter for each
+/// window and the problem line. Settings › Usage shows the same sections. `surface` is what
+/// the section sits on.
+pub(crate) fn usage_section(section: &UsageSection, surface: UsageSurface) -> gpui::AnyElement {
+    let id = SharedString::from(format!("popover-usage-{}", section.kind.slug()));
+
+    let header = h_flex()
+        .items_baseline()
+        .gap(px(6.))
+        .child(
+            Label::new(section.kind.name())
+                .weight(FontWeight::SEMIBOLD)
+                .truncate(),
+        )
+        .children(section.plan.clone().map(|plan| {
+            let selector = format!("{id}-plan");
+
+            div()
+                .debug_selector(move || selector)
+                .child(Label::new(plan).size(LabelSize::Small).color(Color::Faint))
+        }))
+        .child(div().flex_1())
+        .children(section.age.as_ref().map(|(shown, _)| {
+            let selector = format!("{id}-age");
+
+            div().debug_selector(move || selector).child(
+                Label::new(shown.clone())
+                    .size(LabelSize::XSmall)
+                    .color(Color::Faint),
+            )
+        }));
+
     let meters = section
-        .meters
+        .windows
         .iter()
         .enumerate()
-        .map(|(index, meter)| meter_of(id, index, meter));
+        .map(|(index, window)| meter_of(&id, index, window, surface));
 
     let problem = section.problem.as_ref().map(|(shown, spoken)| {
+        let problem_id = format!("{id}-problem");
+
         div()
-            .id(SharedString::from(format!("{id}-problem")))
-            .debug_selector(move || format!("{id}-problem"))
+            .id(SharedString::from(problem_id.clone()))
+            .debug_selector(move || problem_id)
             .role(Role::Status)
             .aria_label(spoken.clone())
             .child(
@@ -550,31 +592,38 @@ pub(crate) fn usage_section(section: &UsageSection) -> gpui::AnyElement {
     });
 
     v_flex()
-        .id(id)
-        .debug_selector(move || id.to_owned())
+        .id(id.clone())
+        .debug_selector({
+            let id = id.to_string();
+            move || id
+        })
         .role(Role::Group)
-        .aria_label(format!("{} usage", section.title))
-        .gap(px(8.))
-        .child(
-            Label::new(section.title.clone())
-                .weight(FontWeight::MEDIUM)
-                .truncate(),
-        )
+        .aria_label(section.label())
+        .gap(px(12.))
+        .child(header)
         .children(meters)
         .children(problem)
         .into_any_element()
 }
 
-fn meter_of(section: &'static str, index: usize, row: &MeterRow) -> UsageMeter {
-    let meter = UsageMeter::new((section, index), row.label.clone())
-        .value(format!("{}%", row.percent))
-        .fraction(f32::from(row.percent) / 100.)
-        .accessible_label(row.spoken.clone());
+fn meter_of(
+    section: &SharedString,
+    index: usize,
+    row: &WindowRow,
+    surface: UsageSurface,
+) -> UsageDetailMeter {
+    let selector = format!("{section}-{index}");
 
-    match &row.note {
-        Some(note) => meter.note(note.clone()),
-        None => meter,
-    }
+    UsageDetailMeter::new((section.clone(), index), row.name.clone())
+        .value(format!("{}% used", row.percent))
+        .fraction(row.fraction())
+        .tone(row.tone())
+        .surface(surface)
+        .accessible_label(row.spoken.clone())
+        .debug_selector(move || selector)
+        .when_some(row.pace(), UsageDetailMeter::pace)
+        .when_some(row.risk.clone(), UsageDetailMeter::warning)
+        .when_some(row.resets.clone(), UsageDetailMeter::note)
 }
 
 #[cfg(feature = "snapshot")]
@@ -637,6 +686,7 @@ mod tests {
 
     use super::super::harness::{self, activate, popover_is_open, popover_window, setup};
     use super::*;
+    use crate::daemon::tests::drawn_color;
     use crate::daemon::tests::{
         agent_info, fake_daemon_replying, project_info, task_info, use_projects, wait_until,
     };
@@ -649,6 +699,7 @@ mod tests {
             label: label.to_owned(),
             used_percent: percent,
             resets_at: resets,
+            length_secs: resets.map(|_| if label == "7d" { 7 * 86_400 } else { 5 * 3_600 }),
         }
     }
 
@@ -772,6 +823,216 @@ mod tests {
         assert!(shown("popover-quit", &mut popover));
     }
 
+    fn sections(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Vec<UsageSection> {
+        workspace.read_with(cx, |workspace, _| {
+            Summary::of(&workspace.data, workspace.now_ms() / 1_000).usage
+        })
+    }
+
+    #[gpui::test]
+    fn a_card_shows_its_plan_only_when_it_has_one_and_the_age_of_old_numbers(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, bar, cx) = setup(cx);
+        let mut popover = open(&bar, cx);
+
+        assert!(!shown("popover-usage-claude-plan", &mut popover));
+        assert!(shown("popover-usage-codex-plan", &mut popover));
+        assert!(!shown("popover-usage-claude-age", &mut popover));
+        assert!(shown("popover-usage-codex-age", &mut popover));
+
+        workspace.update(&mut popover, |workspace, cx| {
+            let mut usage = workspace.data.usage.clone();
+            usage.claude.plan = Some("max".to_owned());
+            usage.codex.plan = None;
+            workspace.usage_changed(usage, cx);
+        });
+        draw(&mut popover);
+
+        assert!(shown("popover-usage-claude-plan", &mut popover));
+        assert!(!shown("popover-usage-codex-plan", &mut popover));
+    }
+
+    #[gpui::test]
+    fn the_age_shows_up_as_the_clock_passes_ten_minutes(cx: &mut TestAppContext) {
+        let (workspace, bar, cx) = setup(cx);
+        let mut popover = open(&bar, cx);
+        let before = shown("popover-usage-claude-age", &mut popover);
+
+        // Claude was read a minute before the sample time.
+        workspace.update(&mut popover, |workspace, cx| {
+            workspace.fixed_now = Some(SAMPLE_NOW + 9 * 60_000);
+            cx.notify();
+        });
+        draw(&mut popover);
+        let at_ten = shown("popover-usage-claude-age", &mut popover);
+
+        workspace.update(&mut popover, |workspace, cx| {
+            workspace.fixed_now = Some(SAMPLE_NOW + 9 * 60_000 + 1_000);
+            cx.notify();
+        });
+        draw(&mut popover);
+        let after = shown("popover-usage-claude-age", &mut popover);
+
+        assert_eq!((before, at_ten, after), (false, false, true));
+    }
+
+    #[gpui::test]
+    fn only_the_window_at_risk_shows_a_warning(cx: &mut TestAppContext) {
+        let (_workspace, bar, cx) = setup(cx);
+        let mut popover = open(&bar, cx);
+
+        assert!(shown("popover-usage-claude-1-warning", &mut popover));
+        assert!(!shown("popover-usage-claude-0-warning", &mut popover));
+        assert!(!shown("popover-usage-codex-0-warning", &mut popover));
+        assert!(!shown("popover-usage-codex-1-warning", &mut popover));
+    }
+
+    #[gpui::test]
+    fn only_the_window_that_warns_draws_a_warn_fill(cx: &mut TestAppContext) {
+        let (_workspace, bar, cx) = setup(cx);
+        let mut popover = open(&bar, cx);
+        let (normal, warn) = popover.update(|_, cx| {
+            let colors = cx.theme().colors();
+
+            (colors.fg, colors.warn)
+        });
+
+        let fills = [
+            "popover-usage-claude-0-fill",
+            "popover-usage-claude-1-fill",
+            "popover-usage-codex-0-fill",
+            "popover-usage-codex-1-fill",
+        ]
+        .map(|selector| drawn_color(selector, &mut popover));
+
+        assert_eq!(
+            fills,
+            [Some(normal), Some(warn), Some(normal), Some(normal)]
+        );
+    }
+
+    #[gpui::test]
+    fn a_full_window_warns_that_the_limit_is_reached(cx: &mut TestAppContext) {
+        let (workspace, bar, cx) = setup(cx);
+        workspace.update(cx, |workspace, cx| {
+            let mut usage = workspace.data.usage.clone();
+            usage.codex.windows[0].used_percent = 100;
+            workspace.usage_changed(usage, cx);
+        });
+        let mut popover = open(&bar, cx);
+        let warn = popover.update(|_, cx| cx.theme().colors().warn);
+
+        assert!(shown("popover-usage-codex-0-warning", &mut popover));
+        assert_eq!(
+            drawn_color("popover-usage-codex-0-fill", &mut popover),
+            Some(warn)
+        );
+        assert_eq!(
+            sections(&workspace, &mut popover)[1].windows[0]
+                .risk
+                .as_deref(),
+            Some("Limit reached")
+        );
+    }
+
+    #[gpui::test]
+    fn the_tick_is_cut_out_of_a_warn_fill_in_the_color_of_the_raised_card(cx: &mut TestAppContext) {
+        let (_workspace, bar, cx) = setup(cx);
+        let mut popover = open(&bar, cx);
+        let raised = popover.update(|_, cx| cx.theme().colors().raised);
+
+        assert_eq!(
+            drawn_color("popover-usage-claude-1-notch", &mut popover),
+            Some(raised)
+        );
+        assert!(!shown("popover-usage-claude-0-notch", &mut popover));
+    }
+
+    #[gpui::test]
+    fn each_window_has_a_bar_with_a_tick_and_a_reset_note(cx: &mut TestAppContext) {
+        let (workspace, bar, cx) = setup(cx);
+        let mut popover = open(&bar, cx);
+
+        macro_rules! parts {
+            ($meter:literal) => {
+                [
+                    concat!($meter, "-bar"),
+                    concat!($meter, "-tick"),
+                    concat!($meter, "-note"),
+                    concat!($meter, "-value"),
+                ]
+            };
+        }
+        let meters = [
+            parts!("popover-usage-claude-0"),
+            parts!("popover-usage-claude-1"),
+            parts!("popover-usage-codex-0"),
+            parts!("popover-usage-codex-1"),
+        ];
+
+        for parts in meters {
+            let drawn: Vec<_> = parts
+                .iter()
+                .map(|part| popover.debug_bounds(part).is_some())
+                .collect();
+
+            assert_eq!(drawn, [true; 4], "{parts:?}");
+        }
+
+        // A window without a reset has no note, and without a length no tick.
+        workspace.update(&mut popover, |workspace, cx| {
+            let mut usage = workspace.data.usage.clone();
+            usage.claude.windows[1].resets_at = None;
+            usage.claude.windows[0].length_secs = None;
+            workspace.usage_changed(usage, cx);
+        });
+        draw(&mut popover);
+
+        assert!(!shown("popover-usage-claude-1-note", &mut popover));
+        assert!(!shown("popover-usage-claude-1-tick", &mut popover));
+        assert!(!shown("popover-usage-claude-0-tick", &mut popover));
+        assert!(shown("popover-usage-claude-0-note", &mut popover));
+    }
+
+    fn label_of(meter: UsageDetailMeter, cx: &mut VisualTestContext) -> Option<String> {
+        use gpui::accesskit::Node;
+        use gpui::{Element as _, IntoElement as _, RenderOnce as _};
+
+        cx.update(|window, cx| {
+            let element = meter.render(window, cx).into_element();
+            let mut node = Node::new(Role::Unknown);
+            element.write_a11y_info(&mut node);
+
+            node.label().map(str::to_owned)
+        })
+    }
+
+    #[gpui::test]
+    fn each_window_has_one_label_with_its_percent_risk_and_reset(cx: &mut TestAppContext) {
+        let (workspace, _bar, cx) = setup(cx);
+        let sections = sections(&workspace, cx);
+        let id = SharedString::from("popover-usage-claude");
+
+        let labels: Vec<_> = sections[0]
+            .windows
+            .iter()
+            .enumerate()
+            .map(|(index, window)| label_of(meter_of(&id, index, window, UsageSurface::Raised), cx))
+            .collect();
+
+        assert_eq!(
+            labels,
+            [
+                Some("Claude session 42% used, resets in 2 hours 6 minutes".to_owned()),
+                Some(
+                    "Claude weekly 61% used, limit in 1 day 23 hours, resets in 3 days 21 hours"
+                        .to_owned()
+                ),
+            ]
+        );
+    }
+
     #[gpui::test]
     fn the_needs_you_section_is_hidden_when_no_task_needs_you(cx: &mut TestAppContext) {
         let (workspace, bar, cx) = setup(cx);
@@ -838,6 +1099,12 @@ mod tests {
             ("tasks", Usage::default(), 2, true),
             ("tasks without a reason", Usage::default(), 2, false),
             ("both", both, 1, true),
+            (
+                "sample with a warning and an age",
+                crate::model::FakeData::sample().usage,
+                2,
+                true,
+            ),
         ];
 
         for (name, usage, rows, reason) in cases {

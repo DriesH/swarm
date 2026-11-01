@@ -244,11 +244,10 @@ fn run() -> Result<()> {
 
 /// `--data-dir <folder>`, `--settings <file>` and `--gh <file>`, all optional.
 ///
-/// These only exist for tests: `--usage-security`, `--usage-curl`, `--usage-codex` and
-/// `--usage-claude` (programs to use as they are), `--usage-tick-ms` and
-/// `--usage-codex-interval-ms` (timings), and `--no-usage-polling`. The system check takes
-/// `--check-xcode-select` and `--check-security` (programs to use as they are) and
-/// `--check-timeout-ms`.
+/// These only exist for tests: `--usage-codex` (a program to use as it is),
+/// `--usage-tick-ms` and `--usage-codex-interval-ms` (timings), and `--no-usage-polling`.
+/// The system check takes `--check-xcode-select` and `--check-security` (programs to use
+/// as they are) and `--check-timeout-ms`.
 fn arguments() -> Result<Arguments> {
     let mut input = std::env::args_os().skip(1);
     let mut parsed = Arguments {
@@ -271,10 +270,7 @@ fn arguments() -> Result<Arguments> {
             "--data-dir" => parsed.data_dir = Some(PathBuf::from(value()?)),
             "--settings" => parsed.settings = Some(PathBuf::from(value()?)),
             "--gh" => parsed.gh = Some(PathBuf::from(value()?)),
-            "--usage-security" => parsed.usage.security = Some(PathBuf::from(value()?)),
-            "--usage-curl" => parsed.usage.curl = Some(PathBuf::from(value()?)),
             "--usage-codex" => parsed.usage.codex = Some(PathBuf::from(value()?)),
-            "--usage-claude" => parsed.usage.claude = Some(PathBuf::from(value()?)),
             "--usage-tick-ms" => parsed.usage.tick = Some(milliseconds(&name, &value()?)?),
             "--usage-codex-interval-ms" => {
                 parsed.usage.codex_interval = Some(milliseconds(&name, &value()?)?);

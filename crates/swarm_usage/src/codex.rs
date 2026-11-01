@@ -171,15 +171,15 @@ fn parse_answer(answer: &Value) -> Outcome {
         .filter(|limits| limits.is_object())
         .ok_or_else(|| failed("Unexpected answer from Codex"))?;
 
-    let mut windows: Vec<(Option<u64>, UsageWindow)> = ["primary", "secondary"]
+    let mut windows: Vec<UsageWindow> = ["primary", "secondary"]
         .into_iter()
         .filter_map(|key| window(limits.get(key)?))
         .collect();
     // The shortest first; a window of unknown length goes last.
-    windows.sort_by_key(|(minutes, _)| minutes.unwrap_or(u64::MAX));
+    windows.sort_by_key(|window| window.length_secs.unwrap_or(u64::MAX));
 
     Ok(Reading {
-        windows: windows.into_iter().map(|(_, window)| window).collect(),
+        windows,
         plan: limits
             .get("planType")
             .and_then(Value::as_str)
@@ -187,8 +187,8 @@ fn parse_answer(answer: &Value) -> Outcome {
     })
 }
 
-/// The window and its length in minutes. `None` when it has no percentage.
-fn window(value: &Value) -> Option<(Option<u64>, UsageWindow)> {
+/// `None` when the window has no percentage.
+fn window(value: &Value) -> Option<UsageWindow> {
     let used = value.get("usedPercent")?.as_f64()?;
     let minutes = value
         .get("windowDurationMins")
@@ -200,14 +200,12 @@ fn window(value: &Value) -> Option<(Option<u64>, UsageWindow)> {
         .and_then(Value::as_f64)
         .and_then(unix_seconds);
 
-    Some((
-        minutes,
-        UsageWindow {
-            label: minutes.map_or_else(|| "limit".to_owned(), window_label),
-            used_percent: percent(used),
-            resets_at,
-        },
-    ))
+    Some(UsageWindow {
+        label: minutes.map_or_else(|| "limit".to_owned(), window_label),
+        used_percent: percent(used),
+        resets_at,
+        length_secs: minutes.and_then(|minutes| minutes.checked_mul(60)),
+    })
 }
 
 /// A JSON-RPC error: no login is `NotLoggedIn`, the rest is a short `Failed`.
@@ -269,6 +267,15 @@ mod tests {
             .collect()
     }
 
+    fn lengths(outcome: Outcome) -> Vec<Option<u64>> {
+        outcome
+            .expect("reading")
+            .windows
+            .into_iter()
+            .map(|window| window.length_secs)
+            .collect()
+    }
+
     #[test]
     fn primary_and_secondary_become_windows_with_the_plan() {
         let reading = parse_answer(&answer(&json!({
@@ -287,6 +294,35 @@ mod tests {
                 ("7d".to_owned(), 40, None),
             ]
         );
+    }
+
+    #[test]
+    fn a_window_length_is_the_duration_in_seconds() {
+        let outcome = parse_answer(&answer(&json!({
+            "primary": {"usedPercent": 1, "windowDurationMins": 300},
+            "secondary": {"usedPercent": 2, "windowDurationMins": 10_080},
+        })));
+        assert_eq!(lengths(outcome), [Some(18_000), Some(604_800)]);
+
+        let outcome = parse_answer(&answer(&json!({
+            "primary": {"usedPercent": 3, "windowDurationMins": 43_200},
+            "secondary": {"usedPercent": 4, "windowDurationMins": 45},
+        })));
+        assert_eq!(lengths(outcome), [Some(2_700), Some(2_592_000)]);
+    }
+
+    #[test]
+    fn a_window_without_a_duration_has_no_length() {
+        let outcome = parse_answer(&answer(&json!({
+            "primary": {"usedPercent": 1},
+            "secondary": {"usedPercent": 2, "windowDurationMins": 0},
+        })));
+        assert_eq!(lengths(outcome), [None, None]);
+
+        let huge = parse_answer(&answer(&json!({
+            "primary": {"usedPercent": 1, "windowDurationMins": 1e19},
+        })));
+        assert_eq!(lengths(huge), [None]);
     }
 
     #[test]
@@ -496,9 +532,11 @@ done"#,
         let scripts = Scripts::new();
         let codex = scripts.script(
             "codex",
-            r#"echo $$ > "$DIR/pid"
+            r#"[ "$1" = warm-up ] && exit 0
+echo $$ > "$DIR/pid"
 exec sleep 30"#,
         );
+        Scripts::warm_up(&codex);
 
         let started = Instant::now();
         let outcome = codex_usage(Some(&codex), Duration::from_millis(400));

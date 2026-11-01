@@ -1,8 +1,8 @@
-//! Subscription usage for Swarm: Claude windows from the status line or the OAuth usage
-//! endpoint, and Codex windows from `codex app-server`.
+//! Subscription usage for Swarm: Claude windows from the status line of Swarm's own
+//! Claude agents, and Codex windows from `codex app-server`.
 //!
-//! The crate has no GPUI and no network of its own. Commands (`security`, `curl`,
-//! `codex`) are passed in as paths, so tests run fake scripts.
+//! The crate has no GPUI and no network of its own, and it never touches a sign-in
+//! token. `codex` is passed in as a path, so tests run a fake script.
 
 mod claude;
 mod codex;
@@ -13,7 +13,7 @@ use std::path::Path;
 
 use swarm_protocol::{UsageProblem, UsageWindow};
 
-pub use claude::{ClaudeEndpoint, Commands, status_line_windows};
+pub use claude::{length_of_label, status_line_windows};
 pub use codex::{codex_usage, window_label};
 pub use process::{Finished, RunError, run};
 

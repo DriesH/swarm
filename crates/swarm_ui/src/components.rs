@@ -112,6 +112,7 @@ pub fn all_components() -> Vec<ComponentEntry> {
         ComponentEntry::of::<TrayMore>(),
         ComponentEntry::of::<Panel>(),
         ComponentEntry::of::<UsageMeter>(),
+        ComponentEntry::of::<UsageDetailMeter>(),
         ComponentEntry::of::<BrandMark>(),
         ComponentEntry::of::<Honeycomb>(),
         ComponentEntry::of::<HoneyFill>(),

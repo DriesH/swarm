@@ -20,7 +20,7 @@ mod client;
 pub use client::{Client, ClientError, CommentEvent, MessageEvent, PrEvent};
 
 /// Bumped on every incompatible change; the daemon refuses other versions.
-pub const VERSION: u32 = 19;
+pub const VERSION: u32 = 20;
 
 /// The most messages [`Request::ListMessages`] returns.
 pub const MESSAGES_LISTED: usize = 500;
@@ -682,6 +682,8 @@ pub struct UsageWindow {
     pub used_percent: u8,
     /// Unix seconds.
     pub resets_at: Option<u64>,
+    /// How long the window lasts, so the start is `resets_at - length_secs`.
+    pub length_secs: Option<u64>,
 }
 
 /// Why the last usage read failed.
@@ -690,12 +692,6 @@ pub enum UsageProblem {
     /// The CLI is not installed.
     NotInstalled,
     NotLoggedIn,
-    /// The account refused the stored login.
-    Unauthorized,
-    /// Asked again too soon; the next read is at `retry_at` (Unix seconds).
-    RateLimited {
-        retry_at: u64,
-    },
     Failed(String),
 }
 

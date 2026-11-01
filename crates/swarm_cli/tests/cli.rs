@@ -1253,8 +1253,8 @@ fn the_status_line_sends_the_rate_limits_to_the_daemon() {
     assert_eq!(
         request["params"]["windows"],
         serde_json::json!([
-            {"label": "5h", "used_percent": 24, "resets_at": 1_793_383_200_u64},
-            {"label": "7d", "used_percent": 41, "resets_at": 1_793_900_000_u64},
+            {"label": "5h", "used_percent": 24, "resets_at": 1_793_383_200_u64, "length_secs": 18_000},
+            {"label": "7d", "used_percent": 41, "resets_at": 1_793_900_000_u64, "length_secs": 604_800},
         ])
     );
 }

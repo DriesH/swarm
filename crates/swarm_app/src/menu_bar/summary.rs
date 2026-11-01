@@ -1,11 +1,11 @@
 //! What the status item and the popover show, worked out from the workspace's data. Plain
 //! data in and out, so all of it runs without `AppKit` or a window.
 
-use swarm_protocol::{SubscriptionUsage, Usage};
+use swarm_protocol::Usage;
 use swarm_ui::AgentStatus;
 
 use crate::model::{Agent, FakeData, TaskId, TaskStatus};
-use crate::usage_text::{problem_text, resets_note, shown_percent, spoken_window};
+use crate::usage_text::{UsageSection, shown_percent, usage_sections};
 
 /// Which of the bee's two wing frames the status item shows. Flipping between them is the
 /// buzz.
@@ -88,27 +88,6 @@ impl NeedsYou {
     }
 }
 
-/// One window of a subscription, for example the 5 hour window.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct MeterRow {
-    pub label: String,
-    pub percent: u8,
-    /// For example "resets in 2h".
-    pub note: Option<String>,
-    pub spoken: String,
-}
-
-/// The usage of one agent kind.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct UsageSection {
-    pub id: &'static str,
-    /// The agent kind with its plan, for example "Claude \u{b7} Max".
-    pub title: String,
-    pub meters: Vec<MeterRow>,
-    /// Why the numbers are old or missing: the line to show and what VoiceOver reads.
-    pub problem: Option<(String, String)>,
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Summary {
     /// The fullest window of any agent kind: the one that stops the user first.
@@ -176,68 +155,9 @@ fn needs_you(data: &FakeData) -> Vec<NeedsYou> {
         .collect()
 }
 
-/// Claude first. An agent kind with no windows and no problem to report, or one that is not
-/// installed, has no section: the sidebar card follows the same rule.
-pub(crate) fn usage_sections(usage: &Usage, now: u64) -> Vec<UsageSection> {
-    [
-        ("popover-usage-claude", "Claude", &usage.claude),
-        ("popover-usage-codex", "Codex", &usage.codex),
-    ]
-    .into_iter()
-    .filter_map(|(id, name, reading)| usage_section(id, name, reading, now))
-    .collect()
-}
-
-fn usage_section(
-    id: &'static str,
-    name: &str,
-    reading: &SubscriptionUsage,
-    now: u64,
-) -> Option<UsageSection> {
-    let problem = reading
-        .problem
-        .as_ref()
-        .and_then(|problem| problem_text(problem, now));
-    if reading.windows.is_empty() && problem.is_none() {
-        return None;
-    }
-
-    let title = match &reading.plan {
-        Some(plan) => format!("{name} \u{b7} {}", capitalized(plan)),
-        None => name.to_owned(),
-    };
-
-    let meters = reading
-        .windows
-        .iter()
-        .map(|window| MeterRow {
-            label: window.label.clone(),
-            percent: shown_percent(window, now),
-            note: resets_note(window, now),
-            spoken: format!("{name} {}", spoken_window(window, now)),
-        })
-        .collect();
-
-    Some(UsageSection {
-        id,
-        title,
-        meters,
-        problem,
-    })
-}
-
-fn capitalized(text: &str) -> String {
-    let mut characters = text.chars();
-
-    match characters.next() {
-        Some(first) => first.to_uppercase().chain(characters).collect(),
-        None => String::new(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use swarm_protocol::{UsageProblem, UsageWindow};
+    use swarm_protocol::{SubscriptionUsage, UsageProblem, UsageWindow};
 
     use super::*;
     use crate::model::SAMPLE_NOW;
@@ -249,6 +169,7 @@ mod tests {
             label: label.to_owned(),
             used_percent,
             resets_at,
+            length_secs: None,
         }
     }
 
@@ -428,79 +349,5 @@ mod tests {
 
         assert!(before > 0);
         assert_eq!(after, before - 1);
-    }
-
-    #[test]
-    fn a_section_has_the_kind_with_its_plan_and_a_meter_for_each_window() {
-        let usage = Usage {
-            claude: reading(
-                Some("max"),
-                vec![
-                    window("5h", 42, Some(NOW + 2 * 3_600)),
-                    window("7d", 18, None),
-                ],
-                None,
-            ),
-            codex: reading(None, vec![window("5h", 7, Some(NOW + 600))], None),
-        };
-
-        let sections = usage_sections(&usage, NOW);
-
-        assert_eq!(sections.len(), 2);
-        assert_eq!(sections[0].title, "Claude \u{b7} Max");
-        assert_eq!(sections[0].meters.len(), 2);
-        assert_eq!(sections[0].meters[0].label, "5h");
-        assert_eq!(sections[0].meters[0].percent, 42);
-        assert_eq!(sections[0].meters[0].note.as_deref(), Some("resets in 2h"));
-        assert_eq!(sections[0].meters[1].note, None);
-        assert_eq!(
-            sections[0].meters[0].spoken,
-            "Claude 5 hour window 42%, resets in 2 hours"
-        );
-        assert_eq!(sections[1].title, "Codex");
-        assert_eq!(sections[1].meters[0].note.as_deref(), Some("resets in 10m"));
-    }
-
-    #[test]
-    fn a_problem_uses_the_text_of_the_sidebar_card() {
-        let usage = Usage {
-            claude: reading(
-                None,
-                vec![window("5h", 42, None)],
-                Some(UsageProblem::RateLimited {
-                    retry_at: NOW + 24 * 60,
-                }),
-            ),
-            codex: reading(None, Vec::new(), Some(UsageProblem::NotLoggedIn)),
-        };
-
-        let sections = usage_sections(&usage, NOW);
-
-        assert_eq!(
-            sections[0].problem,
-            Some((
-                "Rate limited \u{b7} 24m".to_owned(),
-                "Rate limited, retry in 24 minutes".to_owned()
-            ))
-        );
-        assert_eq!(sections[0].meters.len(), 1);
-        assert!(sections[1].meters.is_empty());
-        assert_eq!(
-            sections[1]
-                .problem
-                .as_ref()
-                .map(|problem| problem.0.as_str()),
-            Some("Not logged in")
-        );
-    }
-
-    #[test]
-    fn an_agent_kind_that_is_not_installed_or_has_nothing_has_no_section() {
-        let usage = Usage {
-            claude: reading(None, Vec::new(), None),
-            codex: reading(None, Vec::new(), Some(UsageProblem::NotInstalled)),
-        };
-
-        assert!(usage_sections(&usage, NOW).is_empty());
     }
 }

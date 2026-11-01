@@ -51,9 +51,9 @@ impl Daemon {
         Self::spawn_with(home, None, None)
     }
 
-    /// The usage poller is off: it would run the real `codex`, `security` and `curl`.
+    /// The usage poller is off: it would run the real `codex`.
     fn spawn_with(home: PathBuf, settings: Option<&Path>, gh: Option<&Path>) -> Self {
-        Self::spawn_usage(home, settings, gh, &["--no-usage-polling".into()])
+        Self::spawn_usage(home, settings, gh, &["--no-usage-polling".into()], &[])
     }
 
     fn spawn_usage(
@@ -61,6 +61,7 @@ impl Daemon {
         settings: Option<&Path>,
         gh: Option<&Path>,
         usage: &[std::ffi::OsString],
+        env: &[(&str, &std::ffi::OsStr)],
     ) -> Self {
         std::fs::create_dir_all(&home).expect("home");
         let log = std::fs::File::options()
@@ -78,6 +79,7 @@ impl Daemon {
             command.arg("--gh").arg(gh);
         }
         command.args(usage);
+        command.envs(env.iter().copied());
 
         let child = command
             .env("RUST_LOG", "info")
@@ -119,7 +121,7 @@ impl Daemon {
 
     /// A daemon whose usage poller runs the given fake commands.
     fn start_with_usage(usage: &[std::ffi::OsString]) -> Self {
-        let daemon = Self::spawn_usage(Self::new_home(), None, None, usage);
+        let daemon = Self::spawn_usage(Self::new_home(), None, None, usage, &[]);
         daemon.wait_until_listening();
 
         daemon
@@ -8063,15 +8065,13 @@ impl Client {
     }
 }
 
-/// Fake `codex`, `security`, `curl` and `claude` for the usage poller. Each script
-/// counts its starts in `<name>-calls`. Nothing here reaches the real programs.
+/// A fake `codex` for the usage poller, and traps for the programs it must never start.
+/// Each script counts its starts in `<name>-calls`. Nothing here reaches the real programs.
 struct UsageFakes {
     dir: PathBuf,
 }
 
 const CODEX_ANSWER: &str = r#"{"id":2,"result":{"rateLimits":{"planType":"plus","primary":{"usedPercent":12,"windowDurationMins":300,"resetsAt":1793383200},"secondary":{"usedPercent":40,"windowDurationMins":10080,"resetsAt":1793900000}}}}"#;
-
-const CLAUDE_TOKEN: &str = "sk-ant-oat01-daemon-test-secret";
 
 impl UsageFakes {
     fn new() -> Self {
@@ -8088,44 +8088,12 @@ while IFS= read -r line; do
   case "$line" in *account/rateLimits/read*) cat "$DIR/answer";; esac
 done"#,
         );
-        fakes.script(
-            "security",
-            r#"cat "$DIR/credentials" 2>/dev/null
-exit "$(cat "$DIR/security-exit" 2>/dev/null || echo 44)""#,
-        );
-        fakes.script(
-            "curl",
-            r#"echo "$@" > "$DIR/curl-args"
-cat > "$DIR/curl-config"
-cat "$DIR/response""#,
-        );
-        fakes.script("claude", "exit 0");
 
         fakes
     }
 
-    /// The Keychain holds a token and the endpoint answers with a 5-hour window.
-    fn log_in_to_claude(&self) {
-        let far = 4_000_000_000_u64 * 1000;
-        self.write(
-            "credentials",
-            &format!(
-                r#"{{"claudeAiOauth":{{"accessToken":"{CLAUDE_TOKEN}","expiresAt":{far}.0,"subscriptionType":"max"}}}}"#
-            ),
-        );
-        self.write("security-exit", "0");
-        self.write(
-            "response",
-            "HTTP/2 200 \r\n\r\n{\"five_hour\":{\"utilization\":42,\"resets_at\":\"2026-10-30T18:00:00Z\"}}",
-        );
-    }
-
     fn write(&self, name: &str, text: &str) {
         std::fs::write(self.dir.join(name), text).expect("file");
-    }
-
-    fn read(&self, name: &str) -> String {
-        std::fs::read_to_string(self.dir.join(name)).unwrap_or_default()
     }
 
     fn script(&self, name: &str, body: &str) {
@@ -8141,8 +8109,16 @@ cat "$DIR/response""#,
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("mode");
     }
 
+    /// A program that only leaves a marker, `<name>-calls`, when something starts it.
+    fn trap(&self, name: &str) {
+        self.script(name, "exit 1");
+    }
+
     fn calls(&self, name: &str) -> usize {
-        self.read(&format!("{name}-calls")).lines().count()
+        std::fs::read_to_string(self.dir.join(format!("{name}-calls")))
+            .unwrap_or_default()
+            .lines()
+            .count()
     }
 
     /// Waits until the script was started `count` times.
@@ -8158,19 +8134,11 @@ cat "$DIR/response""#,
         }
     }
 
-    /// The daemon arguments that point the poller at these fakes.
+    /// The daemon arguments that point the poller at the fake `codex`.
     fn args(&self, tick_ms: u64, codex_interval_ms: u64) -> Vec<std::ffi::OsString> {
-        let program = |name: &str| self.dir.join(name).into_os_string();
-
         vec![
             "--usage-codex".into(),
-            program("codex"),
-            "--usage-security".into(),
-            program("security"),
-            "--usage-curl".into(),
-            program("curl"),
-            "--usage-claude".into(),
-            program("claude"),
+            self.dir.join("codex").into_os_string(),
             "--usage-tick-ms".into(),
             tick_ms.to_string().into(),
             "--usage-codex-interval-ms".into(),
@@ -8218,9 +8186,7 @@ fn usage_is_answered_from_the_saved_state_after_a_restart() {
     let mut daemon = Daemon::start_with_usage(&fakes.args(50, 3_600_000));
     let mut client = daemon.connect();
     client.hello();
-    let before = client.wait_for_usage(|usage| {
-        !usage.codex.windows.is_empty() && usage.claude.problem == Some(UsageProblem::NotLoggedIn)
-    });
+    let before = client.wait_for_usage(|usage| !usage.codex.windows.is_empty());
     drop(client);
 
     daemon.crash();
@@ -8255,6 +8221,8 @@ fn a_claude_agents_status_line_reaches_every_client() {
         seen_by_watcher.claude.windows[0].resets_at,
         Some(1_793_383_200)
     );
+    assert_eq!(seen_by_watcher.claude.windows[0].length_secs, Some(18_000));
+    assert_eq!(seen_by_watcher.claude.windows[1].length_secs, Some(604_800));
     assert!(seen_by_watcher.claude.read_at.is_some());
     assert_eq!(client.usage(), seen_by_watcher);
     assert_eq!(
@@ -8262,6 +8230,35 @@ fn a_claude_agents_status_line_reaches_every_client() {
         "user-line\n",
         "the user's own status line still prints"
     );
+}
+
+/// Claude Code sends both windows, then only the weekly one, as it does once the five
+/// hour window has passed its reset.
+const STATUS_LINE_AFTER_A_RESET_AGENT: &str = r#"mkdir -p "$OUT/config"
+export CLAUDE_CONFIG_DIR="$OUT/config"
+printf '%s' '{"rate_limits":{"five_hour":{"used_percentage":23.5,"resets_at":1793383200},"seven_day":{"used_percentage":41.2,"resets_at":1793900000}}}' | "$SWARM" statusline > /dev/null
+printf '%s' '{"rate_limits":{"seven_day":{"used_percentage":45,"resets_at":1793900000}}}' | "$SWARM" statusline > /dev/null
+sleep 30"#;
+
+#[test]
+fn a_status_line_with_one_window_keeps_the_other_window_across_a_reset() {
+    let fixture = Fixture::new(STATUS_LINE_AFTER_A_RESET_AGENT);
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, _task) = start_task_of(&daemon, &repo, AgentKind::ClaudeCode);
+
+    let usage = client.wait_for_usage(|usage| {
+        usage
+            .claude
+            .windows
+            .iter()
+            .any(|window| window.label == "7d" && window.used_percent == 45)
+    });
+
+    assert_eq!(claude_windows(&usage), [("5h", 24), ("7d", 45)]);
+    assert_eq!(usage.claude.windows[0].resets_at, Some(1_793_383_200));
+    assert_eq!(usage.claude.windows[0].length_secs, Some(18_000));
+    assert_eq!(client.usage(), usage);
 }
 
 #[test]
@@ -8297,7 +8294,6 @@ fn the_poller_reads_codex_only_while_an_app_is_connected() {
 
     thread::park_timeout(Duration::from_millis(700));
     assert_eq!(fakes.calls("codex"), 0, "nobody is connected");
-    assert_eq!(fakes.calls("security"), 0, "nobody is connected");
 
     let mut first = daemon.connect();
     first.hello();
@@ -8312,6 +8308,8 @@ fn the_poller_reads_codex_only_while_an_app_is_connected() {
     assert_eq!(usage.codex.windows[0].label, "5h");
     assert_eq!(usage.codex.windows[0].used_percent, 12);
     assert_eq!(usage.codex.windows[1].label, "7d");
+    assert_eq!(usage.codex.windows[0].length_secs, Some(18_000));
+    assert_eq!(usage.codex.windows[1].length_secs, Some(604_800));
     assert_eq!(usage.codex.problem, None);
 
     let mut second = daemon.connect();
@@ -8374,82 +8372,90 @@ fn codex_usage_keeps_its_windows_when_a_read_fails() {
     assert_eq!(after.codex.windows.len(), 2, "the last good windows stay");
 }
 
+/// What an older daemon saved: problems that no longer exist, and windows without a
+/// length.
+const OLD_USAGE_FILE: &str = r#"{
+    "claude": {
+        "windows": [
+            {"label": "5h", "used_percent": 42, "resets_at": 1793383200},
+            {"label": "7d", "used_percent": 13, "resets_at": null}
+        ],
+        "plan": "max",
+        "read_at": 1793380000,
+        "problem": {"RateLimited": {"retry_at": 1793381000}}
+    },
+    "codex": {
+        "windows": [{"label": "5h", "used_percent": 4, "resets_at": 8}],
+        "plan": "plus",
+        "read_at": 1793380001,
+        "problem": "Unauthorized"
+    }
+}"#;
+
 #[test]
-fn the_endpoint_fills_claude_when_no_status_line_came() {
-    let fakes = UsageFakes::new();
-    fakes.log_in_to_claude();
-    let daemon = Daemon::start_with_usage(&fakes.args(50, 3_600_000));
+fn a_usage_file_from_an_older_daemon_loads_and_its_backoff_file_is_removed() {
+    let home = Daemon::new_home();
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::write(home.join("usage.json"), OLD_USAGE_FILE).expect("usage file");
+    std::fs::write(
+        home.join("claude-usage-backoff.json"),
+        r#"{"backoff_until":1}"#,
+    )
+    .expect("backoff file");
+
+    let daemon = Daemon::start_in(home);
     let mut client = daemon.connect();
     client.hello();
+    let usage = client.usage();
+
+    assert_eq!(claude_windows(&usage), [("5h", 42), ("7d", 13)]);
+    assert_eq!(usage.claude.windows[0].length_secs, Some(18_000));
+    assert_eq!(usage.claude.windows[1].length_secs, Some(604_800));
+    assert_eq!(usage.claude.plan, None, "Claude reports no plan now");
+    assert_eq!(usage.claude.read_at, Some(1_793_380_000));
+    assert_eq!(usage.claude.problem, None);
+    assert_eq!(usage.codex.windows[0].length_secs, Some(18_000));
+    assert_eq!(usage.codex.problem, None);
+    assert!(!daemon.home.join("claude-usage-backoff.json").exists());
+    assert!(daemon.home.join("usage.json").is_file());
+}
+
+#[test]
+fn usage_never_starts_security_or_curl() {
+    let fakes = UsageFakes::new();
+    fakes.trap("security");
+    fakes.trap("curl");
+    let fixture = Fixture::new(STATUS_LINE_AGENT);
+    let repo = Repo::new("");
+
+    // The traps come first on the daemon's `PATH`, so they win over the real programs.
+    // `--check-security` does the same for the system check's own `security`.
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let folders = std::iter::once(fakes.dir.clone()).chain(std::env::split_paths(&inherited));
+    let path = std::env::join_paths(folders).expect("path");
+    let mut arguments = fakes.args(30, 150);
+    arguments.extend([
+        "--check-security".into(),
+        fakes.dir.join("security").into_os_string(),
+    ]);
+    let daemon = Daemon::spawn_usage(
+        Daemon::new_home(),
+        Some(&fixture.settings()),
+        None,
+        &arguments,
+        &[("PATH", path.as_os_str())],
+    );
+    daemon.wait_until_listening();
+    let (mut client, _task) = start_task_of(&daemon, &repo, AgentKind::ClaudeCode);
 
     let usage = client.wait_for_usage(|usage| !usage.claude.windows.is_empty());
-
-    assert_eq!(claude_windows(&usage), [("5h", 42)]);
-    assert_eq!(usage.claude.plan.as_deref(), Some("max"));
-    assert_eq!(fakes.calls("curl"), 1);
-    assert!(fakes.read("curl-config").contains(CLAUDE_TOKEN));
-    assert!(!fakes.read("curl-args").contains(CLAUDE_TOKEN));
-    let log = std::fs::read_to_string(daemon.home.join("daemon.log")).unwrap_or_default();
-    assert!(!log.contains(CLAUDE_TOKEN), "the token reached the log");
-    assert!(
-        !std::fs::read_to_string(daemon.home.join("usage.json"))
-            .expect("usage file")
-            .contains(CLAUDE_TOKEN)
-    );
-}
-
-#[test]
-fn a_claude_that_is_not_logged_in_is_reported() {
-    let fakes = UsageFakes::new();
-    let daemon = Daemon::start_with_usage(&fakes.args(50, 3_600_000));
-    let mut client = daemon.connect();
-    client.hello();
-
-    let usage = client.wait_for_usage(|usage| usage.claude.problem.is_some());
-
-    assert_eq!(usage.claude.problem, Some(UsageProblem::NotLoggedIn));
-    assert_eq!(fakes.calls("curl"), 0);
-}
-
-#[test]
-fn a_rate_limited_endpoint_is_reported_and_the_wait_is_saved() {
-    let fakes = UsageFakes::new();
-    fakes.log_in_to_claude();
-    fakes.write(
-        "response",
-        "HTTP/2 429 \r\nretry-after: 1200\r\n\r\n{\"error\":{\"type\":\"rate_limit_error\"}}",
-    );
-    let mut daemon = Daemon::start_with_usage(&fakes.args(50, 3_600_000));
-    let mut client = daemon.connect();
-    client.hello();
-
-    let usage = client.wait_for_usage(|usage| usage.claude.problem.is_some());
-    drop(client);
-
-    let Some(UsageProblem::RateLimited { retry_at }) = usage.claude.problem else {
-        panic!("expected a rate limit, got {:?}", usage.claude.problem);
-    };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("time")
-        .as_secs();
-    assert!(
-        (now + 1100..=now + 1300).contains(&retry_at),
-        "{retry_at} at {now}"
-    );
-    assert!(daemon.home.join("claude-usage-backoff.json").is_file());
-
-    // A restarted daemon with an app does not ask the endpoint again.
-    daemon.crash();
-    let restarted =
-        Daemon::spawn_usage(daemon.home.clone(), None, None, &fakes.args(50, 3_600_000));
-    restarted.wait_until_listening();
-    let mut client = restarted.connect();
-    client.hello();
-    fakes.wait_for_calls("codex", 2);
+    fakes.wait_for_calls("codex", 3);
     thread::park_timeout(Duration::from_millis(300));
 
-    assert_eq!(fakes.calls("curl"), 1);
+    assert_eq!(claude_windows(&usage), [("5h", 24), ("7d", 41)]);
+    assert_eq!(client.usage().claude.problem, None);
+    assert_eq!(fakes.calls("security"), 0, "something started security");
+    assert_eq!(fakes.calls("curl"), 0, "something started curl");
 }
 
 impl Client {

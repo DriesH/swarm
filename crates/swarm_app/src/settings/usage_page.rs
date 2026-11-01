@@ -9,8 +9,9 @@ use swarm_ui::prelude::*;
 
 use super::SettingsState;
 use super::pages::page_title;
-use crate::menu_bar::{usage_section, usage_sections};
+use crate::menu_bar::usage_section;
 use crate::model::{FakeData, SAMPLE_NOW};
+use crate::usage_text::usage_sections;
 
 /// How often the "resets in" notes are worked out again.
 const CLOCK: Duration = Duration::from_secs(30);
@@ -61,12 +62,12 @@ impl UsagePage {
     }
 }
 
-/// The sample usage, with Codex rate limited, so every part of a section shows.
+/// The sample usage, with the last Codex read failed, so every part of a section shows.
 fn sample_usage() -> Usage {
     let mut usage = FakeData::sample().usage;
-    usage.codex.problem = Some(UsageProblem::RateLimited {
-        retry_at: SAMPLE_NOW / 1_000 + 24 * 60,
-    });
+    usage.codex.problem = Some(UsageProblem::Failed(
+        "the app server did not answer".to_owned(),
+    ));
 
     usage
 }
@@ -93,7 +94,13 @@ impl Render for UsagePage {
                 .iter()
                 .fold(
                     Panel::new().accessible("usage-sections", "Subscription usage"),
-                    |panel, section| panel.row(div().p(px(14.)).child(usage_section(section))),
+                    |panel, section| {
+                        panel.row(
+                            div()
+                                .p(px(14.))
+                                .child(usage_section(section, UsageSurface::Panel)),
+                        )
+                    },
                 )
                 .into_any_element()
         };
@@ -118,6 +125,7 @@ mod tests {
             label: "5h".to_owned(),
             used_percent: percent,
             resets_at: None,
+            length_secs: None,
         }
     }
 
@@ -200,17 +208,12 @@ mod tests {
         let (workspace, _window, mut page) = open_page(Some(usage.clone()), cx);
         let before = shown("popover-usage-claude-problem", &mut page);
 
-        let limited = Usage {
-            claude: reading(
-                42,
-                Some(UsageProblem::RateLimited {
-                    retry_at: u64::MAX / 2,
-                }),
-            ),
+        let failed = Usage {
+            claude: reading(42, Some(UsageProblem::Failed("no answer".to_owned()))),
             ..usage
         };
         workspace.update(&mut page, |workspace, cx| {
-            workspace.usage_changed(limited, cx);
+            workspace.usage_changed(failed, cx);
         });
         let after = shown("popover-usage-claude-problem", &mut page);
 

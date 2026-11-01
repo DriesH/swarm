@@ -1,5 +1,5 @@
 //! Accessibility checks for Button, Kbd, Stepper, Dropdown, `PopoverMenu`, the tray chips and
-//! `UsageMeter`.
+//! `UsageMeter` and `UsageDetailMeter`.
 
 use gpui::accesskit::{Action, Node, Role, Toggled};
 use gpui::{
@@ -168,36 +168,37 @@ fn a_button_hint_is_read_after_the_label() {
 }
 
 #[test]
-fn a_usage_meter_is_one_labelled_group() {
+fn a_usage_meter_is_one_labelled_meter() {
     with_window(|window, cx| {
         let plain = a11y_info(
-            UsageMeter::new("plain", "Claude · 5h")
+            UsageMeter::new("plain", "Session")
                 .value("42%")
                 .fraction(0.42)
-                .note("Rate limited · 24m"),
+                .pace(0.58),
             window,
             cx,
         );
 
-        assert_eq!(plain.role, Some(Role::Group));
-        assert_eq!(
-            plain.node.label(),
-            Some("Claude · 5h, 42%, Rate limited · 24m")
-        );
+        assert_eq!(plain.role, Some(Role::Meter));
+        assert_eq!(plain.node.label(), Some("Session, 42%"));
+        assert_eq!(plain.node.numeric_value(), Some(42.));
+        assert_eq!(plain.node.min_numeric_value(), Some(0.));
+        assert_eq!(plain.node.max_numeric_value(), Some(100.));
 
-        let without_value = a11y_info(
-            UsageMeter::new("none", "Codex").note("Not logged in"),
-            window,
-            cx,
-        );
+        let without_value = a11y_info(UsageMeter::new("none", "Weekly"), window, cx);
 
-        assert_eq!(without_value.node.label(), Some("Codex, Not logged in"));
+        assert_eq!(without_value.node.label(), Some("Weekly"));
+        assert_eq!(without_value.role, Some(Role::Group));
+        assert_eq!(without_value.node.numeric_value(), None);
 
         let spoken = a11y_info(
-            UsageMeter::new("spoken", "Claude · 5h")
-                .value("42%")
+            UsageMeter::new("spoken", "Weekly")
+                .value("61%")
+                .fraction(0.61)
+                .pace(0.45)
+                .tone(UsageTone::Warn)
                 .accessible_label(
-                    "Claude usage: 5 hour window 42%, resets in 2 hours; 7 day window 18%",
+                    "Claude weekly 61% used, limit in 3 days 21 hours, resets in 6 days 11 hours",
                 ),
             window,
             cx,
@@ -205,7 +206,54 @@ fn a_usage_meter_is_one_labelled_group() {
 
         assert_eq!(
             spoken.node.label(),
-            Some("Claude usage: 5 hour window 42%, resets in 2 hours; 7 day window 18%")
+            Some("Claude weekly 61% used, limit in 3 days 21 hours, resets in 6 days 11 hours")
+        );
+    });
+}
+
+#[test]
+fn a_detailed_usage_meter_is_one_labelled_meter() {
+    with_window(|window, cx| {
+        let plain = a11y_info(
+            UsageDetailMeter::new("plain", "Weekly")
+                .value("61% used")
+                .fraction(0.61)
+                .pace(0.45)
+                .warning("Limit in 3d 21h")
+                .note("Resets in 6d 11h"),
+            window,
+            cx,
+        );
+
+        assert_eq!(plain.role, Some(Role::Meter));
+        assert_eq!(
+            plain.node.label(),
+            Some("Weekly, 61% used, Limit in 3d 21h, Resets in 6d 11h")
+        );
+        assert_eq!(plain.node.numeric_value(), Some(61.));
+        assert_eq!(plain.node.min_numeric_value(), Some(0.));
+        assert_eq!(plain.node.max_numeric_value(), Some(100.));
+
+        let without_bar = a11y_info(
+            UsageDetailMeter::new("none", "Weekly").value("61% used"),
+            window,
+            cx,
+        );
+
+        assert_eq!(without_bar.role, Some(Role::Group));
+        assert_eq!(without_bar.node.numeric_value(), None);
+
+        let spoken = a11y_info(
+            UsageDetailMeter::new("spoken", "Weekly")
+                .warning("Limit in 3d 21h")
+                .accessible_label("Claude weekly 61% used, limit in 3 days 21 hours"),
+            window,
+            cx,
+        );
+
+        assert_eq!(
+            spoken.node.label(),
+            Some("Claude weekly 61% used, limit in 3 days 21 hours")
         );
     });
 }

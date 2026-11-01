@@ -10,7 +10,8 @@ pub use crate::components::{
     OutputBlock, Panel, PanelRow, PixelBee, PopoverMenu, ProjectTile, ResizeHandle,
     SegmentedControl, StatusDot, StatusPill, StatusRing, Stepper, Switch, SystemCheckRow,
     SystemCheckState, Tab, TabBar, TabStrip, Tag, TagTone, TextArea, TextInput, TextInputEvent,
-    TileFrame, Toast, TrayChip, TrayMore, TreeRow, UsageMeter,
+    TileFrame, Toast, TrayChip, TrayMore, TreeRow, UsageDetailMeter, UsageMeter, UsageSurface,
+    UsageTone,
 };
 pub use crate::file_icons::FileIconName;
 pub use crate::styles::{Color, h_flex, v_flex};

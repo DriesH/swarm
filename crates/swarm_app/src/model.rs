@@ -635,28 +635,39 @@ pub(crate) struct AgentChanges {
 }
 
 fn sample_usage() -> Usage {
-    let reading = |plan: &str, five_hours: u8, seven_days: u8, resets_in_hours: u64| {
-        let resets_at = |hours: u64| Some(SAMPLE_NOW / 1_000 + hours * 3_600);
-        let window = |label: &str, used_percent, resets_at| UsageWindow {
-            label: label.to_owned(),
-            used_percent,
-            resets_at,
-        };
+    const HOUR: u64 = 3_600;
+    const DAY: u64 = 24 * HOUR;
 
-        SubscriptionUsage {
-            windows: vec![
-                window("5h", five_hours, resets_at(resets_in_hours)),
-                window("7d", seven_days, resets_at(resets_in_hours + 72)),
-            ],
-            plan: Some(plan.to_owned()),
-            read_at: Some(SAMPLE_NOW / 1_000 - 60),
-            problem: None,
-        }
+    let now = SAMPLE_NOW / 1_000;
+    let window = |label: &str, used_percent, length, resets_in| UsageWindow {
+        label: label.to_owned(),
+        used_percent,
+        resets_at: Some(now + resets_in),
+        length_secs: Some(length),
     };
 
+    // Claude's weekly window has used more than even use would by now, so it shows the
+    // warning. Claude has no plan: nothing reports one. Codex was read a quarter of an hour
+    // ago.
     Usage {
-        claude: reading("max", 42, 18, 2),
-        codex: reading("plus", 18, 9, 3),
+        claude: SubscriptionUsage {
+            windows: vec![
+                window("5h", 42, 5 * HOUR, 2 * HOUR + 6 * 60),
+                window("7d", 61, 7 * DAY, 3 * DAY + 21 * HOUR),
+            ],
+            plan: None,
+            read_at: Some(now - 60),
+            problem: None,
+        },
+        codex: SubscriptionUsage {
+            windows: vec![
+                window("5h", 18, 5 * HOUR, 3 * HOUR),
+                window("7d", 9, 7 * DAY, 5 * DAY + 2 * HOUR),
+            ],
+            plan: Some("plus".to_owned()),
+            read_at: Some(now - 14 * 60),
+            problem: None,
+        },
     }
 }
 

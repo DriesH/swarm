@@ -3,14 +3,13 @@
 use std::path::Path;
 use std::rc::Rc;
 
-use gpui::{Context, FontWeight, Global, Pixels, Role, WeakEntity, Window, div, px};
-use swarm_protocol::{SubscriptionUsage, Usage, UsageProblem};
+use gpui::{Context, FontWeight, Global, Pixels, Role, SharedString, WeakEntity, Window, div, px};
 use swarm_ui::prelude::*;
 
 use crate::actions::{ToggleCommandPalette, ToggleSidebar};
 use crate::model::{Agent, AgentKind, Project, ProjectId, Task, TaskStatus, Terminal};
 use crate::settings::Page;
-use crate::usage_text::{problem_text, shown_percent, spoken_window};
+use crate::usage_text::{UsageSection, WindowRow, usage_sections};
 use crate::window_drag::drag_region;
 use crate::workspace::{DataSource, Workspace};
 
@@ -517,133 +516,112 @@ pub(crate) fn queen_crown(agent: &Agent) -> gpui::Div {
     )
 }
 
-/// One row of the usage card.
-#[derive(Debug, PartialEq, Eq)]
-struct UsageRow {
-    id: &'static str,
-    /// For example "Claude · 5h", from the shortest window.
-    label: String,
-    /// The used share of the shortest window.
-    percent: Option<u8>,
-    /// Why the numbers are old or missing.
-    note: Option<String>,
-    /// Every window with its reset time, for VoiceOver.
-    spoken: String,
-}
-
 fn usage_card(workspace: &Workspace) -> Option<impl IntoElement + use<>> {
-    let rows = usage_rows(&workspace.data.usage, workspace.now_ms() / 1_000);
-    if rows.is_empty() {
+    let sections = usage_sections(&workspace.data.usage, workspace.now_ms() / 1_000);
+    if sections.is_empty() {
         return None;
     }
-
-    let meters = rows.into_iter().map(|row| {
-        let meter = UsageMeter::new(row.id, row.label)
-            .accessible_label(row.spoken)
-            .debug_selector(move || row.id.to_owned());
-        let meter = match row.percent {
-            Some(percent) => meter
-                .value(format!("{percent}%"))
-                .fraction(f32::from(percent) / 100.),
-            None => meter,
-        };
-
-        match row.note {
-            Some(note) => meter.note(note),
-            None => meter,
-        }
-    });
 
     Some(
         div().debug_selector(|| "usage-card".to_owned()).child(
             Panel::new().accessible("usage", "Subscription usage").row(
                 v_flex()
-                    .gap(px(9.))
+                    .gap(px(12.))
                     .px(px(12.))
                     .py(px(10.))
-                    .children(meters),
+                    .children(sections.iter().map(usage_group)),
             ),
         ),
     )
 }
 
-/// The rows to show, Claude first. An agent kind with no windows and no problem to
-/// report, or one that is not installed, has no row.
-fn usage_rows(usage: &Usage, now: u64) -> Vec<UsageRow> {
-    [
-        ("usage-claude", "Claude", &usage.claude),
-        ("usage-codex", "Codex", &usage.codex),
-    ]
-    .into_iter()
-    .filter_map(|(id, name, reading)| usage_row(id, name, reading, now))
-    .collect()
-}
+/// An agent kind with its plan, then a meter for each window.
+fn usage_group(section: &UsageSection) -> impl IntoElement + use<> {
+    let id = SharedString::from(format!("usage-{}", section.kind.slug()));
 
-fn usage_row(
-    id: &'static str,
-    name: &str,
-    reading: &SubscriptionUsage,
-    now: u64,
-) -> Option<UsageRow> {
-    let problem = reading
-        .problem
-        .as_ref()
-        .and_then(|problem| problem_text(problem, now));
-    if reading.windows.is_empty() && problem.is_none() {
-        return None;
-    }
+    let header = h_flex()
+        .items_baseline()
+        .gap(px(6.))
+        .child(
+            Label::new(section.kind.name())
+                .size(LabelSize::Small)
+                .weight(FontWeight::MEDIUM),
+        )
+        .children(section.plan.clone().map(|plan| {
+            let selector = format!("{id}-plan");
 
-    let first = reading.windows.first();
-    let label = match first {
-        Some(window) => format!("{name} · {}", window.label),
-        None => name.to_owned(),
-    };
+            div()
+                .debug_selector(move || selector)
+                .child(Label::new(plan).size(LabelSize::XSmall).color(Color::Faint))
+        }))
+        .child(div().flex_1())
+        .children(section.age.as_ref().map(|(shown, _)| {
+            let selector = format!("{id}-age");
 
-    let mut spoken = format!("{name} usage: ");
-    let windows: Vec<String> = reading
-        .windows
-        .iter()
-        .map(|window| spoken_window(window, now))
-        .collect();
-    spoken.push_str(&windows.join("; "));
+            div().debug_selector(move || selector).child(
+                Label::new(shown.clone())
+                    .size(LabelSize::XSmall)
+                    .color(Color::Faint),
+            )
+        }));
 
-    let note = problem.map(|(shown, said)| {
-        if !windows.is_empty() {
-            spoken.push_str(". ");
-        }
-        spoken.push_str(&said);
+    let problem = section.problem.as_ref().map(|(shown, spoken)| {
+        let problem_id = format!("{id}-problem");
 
-        shown
+        div()
+            .id(SharedString::from(problem_id.clone()))
+            .debug_selector(move || problem_id)
+            .role(Role::Status)
+            .aria_label(spoken.clone())
+            .child(
+                Label::new(shown.clone())
+                    .size(LabelSize::XSmall)
+                    .color(Color::Faint),
+            )
     });
 
-    Some(UsageRow {
-        id,
-        label,
-        percent: first.map(|window| shown_percent(window, now)),
-        note,
-        spoken,
-    })
-}
-
-/// True when the card shows a time: a reset time that VoiceOver reads, or the wait of a
-/// rate limit.
-pub(crate) fn usage_shows_time(usage: &Usage) -> bool {
-    [&usage.claude, &usage.codex].into_iter().any(|reading| {
-        matches!(reading.problem, Some(UsageProblem::RateLimited { .. }))
-            || reading
+    v_flex()
+        .id(id.clone())
+        .debug_selector({
+            let selector = id.to_string();
+            move || selector
+        })
+        .role(Role::Group)
+        .aria_label(section.label())
+        .gap(px(7.))
+        .child(header)
+        .children(
+            section
                 .windows
                 .iter()
-                .any(|window| window.resets_at.is_some())
-    })
+                .enumerate()
+                .map(|(index, window)| usage_meter(&id, index, window)),
+        )
+        .children(problem)
+}
+
+fn usage_meter(group: &SharedString, index: usize, row: &WindowRow) -> UsageMeter {
+    let selector = format!("{group}-{index}");
+
+    UsageMeter::new((group.clone(), index), row.name.clone())
+        .value(format!("{}%", row.percent))
+        .fraction(row.fraction())
+        .tone(row.tone())
+        .surface(UsageSurface::Panel)
+        .accessible_label(row.spoken.clone())
+        .debug_selector(move || selector)
+        .when_some(row.pace(), UsageMeter::pace)
 }
 
 #[cfg(test)]
 mod tests {
-    use gpui::{TestAppContext, VisualTestContext};
+    use gpui::{Hsla, TestAppContext, VisualTestContext};
 
-    use swarm_protocol::UsageWindow;
+    use swarm_protocol::{SubscriptionUsage, Usage, UsageProblem, UsageWindow};
+    use swarm_ui::UsageTone;
 
     use super::*;
+    use crate::daemon::tests::drawn_color;
     use crate::model::SAMPLE_NOW;
 
     fn setup(cx: &mut TestAppContext) -> (gpui::Entity<Workspace>, &mut VisualTestContext) {
@@ -747,215 +725,6 @@ mod tests {
         );
     }
 
-    const NOW: u64 = 1_800_000_000;
-
-    fn window(label: &str, used_percent: u8, resets_at: Option<u64>) -> UsageWindow {
-        UsageWindow {
-            label: label.to_owned(),
-            used_percent,
-            resets_at,
-        }
-    }
-
-    fn reading(windows: Vec<UsageWindow>, problem: Option<UsageProblem>) -> SubscriptionUsage {
-        SubscriptionUsage {
-            windows,
-            problem,
-            ..Default::default()
-        }
-    }
-
-    fn rate_limited_in(seconds: u64) -> UsageProblem {
-        UsageProblem::RateLimited {
-            retry_at: NOW + seconds,
-        }
-    }
-
-    #[test]
-    fn a_failed_read_keeps_its_reason_for_the_screen_reader_only() {
-        let problem = UsageProblem::Failed("HTTP 500: upstream broke".to_owned());
-        let usage = Usage {
-            codex: reading(Vec::new(), Some(problem)),
-            ..Default::default()
-        };
-
-        let rows = usage_rows(&usage, NOW);
-
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].note.as_deref(), Some("Usage unavailable"));
-        assert_eq!(
-            rows[0].spoken,
-            "Codex usage: Usage unavailable: HTTP 500: upstream broke"
-        );
-    }
-
-    #[test]
-    fn the_card_has_no_rows_when_there_is_nothing_to_show() {
-        assert!(usage_rows(&Usage::default(), NOW).is_empty());
-    }
-
-    #[test]
-    fn not_installed_hides_an_agent_kind() {
-        let usage = Usage {
-            claude: reading(vec![window("5h", 42, None)], None),
-            codex: reading(Vec::new(), Some(UsageProblem::NotInstalled)),
-        };
-
-        let ids: Vec<_> = usage_rows(&usage, NOW).iter().map(|row| row.id).collect();
-
-        assert_eq!(ids, ["usage-claude"]);
-    }
-
-    #[test]
-    fn a_row_shows_the_shortest_window_and_its_percent() {
-        let usage = Usage {
-            claude: reading(vec![window("5h", 42, None), window("7d", 18, None)], None),
-            ..Default::default()
-        };
-
-        let rows = usage_rows(&usage, NOW);
-
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].label, "Claude · 5h");
-        assert_eq!(rows[0].percent, Some(42));
-        assert_eq!(rows[0].note, None);
-    }
-
-    #[test]
-    fn a_problem_before_any_numbers_shows_a_row_without_a_bar() {
-        let usage = Usage {
-            codex: reading(Vec::new(), Some(UsageProblem::NotLoggedIn)),
-            ..Default::default()
-        };
-
-        let rows = usage_rows(&usage, NOW);
-
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].label, "Codex");
-        assert_eq!(rows[0].percent, None);
-        assert_eq!(rows[0].note.as_deref(), Some("Not logged in"));
-    }
-
-    #[test]
-    fn a_problem_keeps_the_old_numbers_on_screen() {
-        let usage = Usage {
-            claude: reading(vec![window("5h", 42, None)], Some(rate_limited_in(24 * 60))),
-            ..Default::default()
-        };
-
-        let rows = usage_rows(&usage, NOW);
-
-        assert_eq!(rows[0].percent, Some(42));
-        assert_eq!(rows[0].note.as_deref(), Some("Rate limited · 24m"));
-    }
-
-    #[test]
-    fn the_screen_reader_label_lists_every_window_with_its_reset_time() {
-        let usage = Usage {
-            claude: reading(
-                vec![
-                    window("5h", 42, Some(NOW + 2 * 3_600)),
-                    window("7d", 18, None),
-                ],
-                None,
-            ),
-            ..Default::default()
-        };
-
-        let rows = usage_rows(&usage, NOW);
-
-        assert_eq!(
-            rows[0].spoken,
-            "Claude usage: 5 hour window 42%, resets in 2 hours; 7 day window 18%"
-        );
-    }
-
-    #[test]
-    fn the_screen_reader_label_says_what_went_wrong_after_the_windows() {
-        let usage = Usage {
-            claude: reading(
-                vec![window("5h", 42, Some(NOW + 600))],
-                Some(rate_limited_in(24 * 60)),
-            ),
-            ..Default::default()
-        };
-
-        let rows = usage_rows(&usage, NOW);
-
-        assert_eq!(
-            rows[0].spoken,
-            "Claude usage: 5 hour window 42%, resets in 10 minutes. Rate limited, retry in 24 minutes"
-        );
-    }
-
-    #[test]
-    fn a_window_that_has_reset_shows_zero_and_no_reset_note() {
-        let usage = Usage {
-            claude: reading(
-                vec![
-                    window("5h", 42, Some(NOW - 1)),
-                    window("7d", 18, Some(NOW + 3_600)),
-                ],
-                None,
-            ),
-            codex: reading(vec![window("5h", 90, Some(NOW))], None),
-        };
-
-        let rows = usage_rows(&usage, NOW);
-
-        assert_eq!(rows[0].percent, Some(0));
-        assert_eq!(
-            rows[0].spoken,
-            "Claude usage: 5 hour window 0%; 7 day window 18%, resets in 60 minutes"
-        );
-        assert_eq!(
-            rows[1].percent,
-            Some(0),
-            "a reset at this very second counts"
-        );
-        assert_eq!(rows[1].spoken, "Codex usage: 5 hour window 0%");
-    }
-
-    #[test]
-    fn a_window_that_has_not_reset_keeps_its_percent() {
-        let usage = Usage {
-            claude: reading(vec![window("5h", 42, Some(NOW + 1))], None),
-            ..Default::default()
-        };
-
-        let rows = usage_rows(&usage, NOW);
-
-        assert_eq!(rows[0].percent, Some(42));
-        assert_eq!(
-            rows[0].spoken,
-            "Claude usage: 5 hour window 42%, resets in 1 minute"
-        );
-    }
-
-    #[test]
-    fn only_a_reset_time_or_a_rate_limit_makes_the_card_depend_on_the_clock() {
-        let timed = Usage {
-            claude: reading(vec![window("5h", 42, Some(NOW))], None),
-            ..Default::default()
-        };
-        let limited = Usage {
-            codex: reading(Vec::new(), Some(rate_limited_in(60))),
-            ..Default::default()
-        };
-        let still = Usage {
-            claude: reading(
-                vec![window("5h", 42, None)],
-                Some(UsageProblem::NotLoggedIn),
-            ),
-            ..Default::default()
-        };
-
-        assert!(usage_shows_time(&timed));
-        assert!(usage_shows_time(&limited));
-        assert!(!usage_shows_time(&still));
-        assert!(!usage_shows_time(&Usage::default()));
-    }
-
     fn redraw(cx: &mut VisualTestContext) {
         cx.update(|window, cx| window.draw(cx).clear(cx));
     }
@@ -974,23 +743,339 @@ mod tests {
         )
     }
 
+    fn shown(selector: &'static str, cx: &mut VisualTestContext) -> bool {
+        cx.debug_bounds(selector).is_some()
+    }
+
+    /// The meters of the sample card, in order, with the selectors of their bar and tick.
+    const METERS: [(&str, &str, &str); 4] = [
+        (
+            "usage-claude-0",
+            "usage-claude-0-bar",
+            "usage-claude-0-tick",
+        ),
+        (
+            "usage-claude-1",
+            "usage-claude-1-bar",
+            "usage-claude-1-tick",
+        ),
+        ("usage-codex-0", "usage-codex-0-bar", "usage-codex-0-tick"),
+        ("usage-codex-1", "usage-codex-1-bar", "usage-codex-1-tick"),
+    ];
+
+    /// How far along the bar the middle of the tick sits, from 0 to 1.
+    fn tick_position(
+        bar: &'static str,
+        tick: &'static str,
+        cx: &mut VisualTestContext,
+    ) -> Option<f32> {
+        let bar = cx.debug_bounds(bar)?;
+        let tick = cx.debug_bounds(tick)?;
+
+        Some(f32::from(tick.center().x - bar.origin.x) / f32::from(bar.size.width))
+    }
+
+    fn sample_sections(
+        workspace: &gpui::Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> Vec<UsageSection> {
+        workspace.read_with(cx, |workspace, _| {
+            usage_sections(&workspace.data.usage, workspace.now_ms() / 1_000)
+        })
+    }
+
     #[gpui::test]
-    fn the_sample_card_shows_both_agent_kinds(cx: &mut TestAppContext) {
+    fn the_sample_card_shows_session_and_weekly_for_both_agent_kinds(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
 
         assert_eq!(card_rows(&workspace, cx), (true, true, true));
 
-        let rows = workspace.read_with(cx, |workspace, _| {
-            usage_rows(&workspace.data.usage, SAMPLE_NOW / 1_000)
-                .into_iter()
-                .map(|row| (row.label, row.percent))
-                .collect::<Vec<_>>()
-        });
+        let windows: Vec<_> = sample_sections(&workspace, cx)
+            .iter()
+            .map(|section| {
+                let names: Vec<_> = section
+                    .windows
+                    .iter()
+                    .map(|window| window.name.as_str())
+                    .collect();
+
+                (section.kind.name(), section.plan.clone(), names.join("/"))
+            })
+            .collect();
         assert_eq!(
-            rows,
+            windows,
             [
-                ("Claude · 5h".to_owned(), Some(42)),
-                ("Codex · 5h".to_owned(), Some(18)),
+                ("Claude", None, "Session/Weekly".to_owned()),
+                (
+                    "Codex",
+                    Some("Plus".to_owned()),
+                    "Session/Weekly".to_owned()
+                ),
+            ]
+        );
+        for meter in [
+            "usage-claude-0",
+            "usage-claude-1",
+            "usage-codex-0",
+            "usage-codex-1",
+        ] {
+            assert!(shown(meter, cx), "{meter}");
+        }
+        assert!(!shown("usage-claude-2", cx));
+        assert!(!shown("usage-codex-2", cx));
+    }
+
+    #[gpui::test]
+    fn each_window_has_a_tick_where_even_use_would_be(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        card_rows(&workspace, cx);
+
+        let paces: Vec<_> = sample_sections(&workspace, cx)
+            .iter()
+            .flat_map(|section| section.windows.iter().map(WindowRow::pace))
+            .collect();
+
+        assert_eq!(paces.len(), METERS.len());
+        for ((name, bar, tick), pace) in METERS.into_iter().zip(paces) {
+            let position = tick_position(bar, tick, cx);
+
+            assert!(pace.is_some(), "{name} has a pace");
+            assert!(
+                position
+                    .zip(pace)
+                    .is_some_and(|(position, pace)| (position - pace).abs() < 0.01),
+                "{name}: the tick is at {position:?}, not {pace:?}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn the_tick_moves_when_the_clock_does(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        card_rows(&workspace, cx);
+        let (_, bar, tick) = METERS[0];
+        let before = tick_position(bar, tick, cx);
+
+        workspace.update(cx, |workspace, _| {
+            workspace.fixed_now = Some(SAMPLE_NOW + 3_600_000);
+        });
+        card_rows(&workspace, cx);
+        let after = tick_position(bar, tick, cx);
+
+        // The session lasts five hours: one more hour is a fifth further.
+        assert!(
+            before
+                .zip(after)
+                .is_some_and(|(before, after)| (after - before - 0.2).abs() < 0.01),
+            "{before:?} -> {after:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn only_the_window_that_would_hit_the_limit_early_turns_warn(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+
+        let tones: Vec<_> = sample_sections(&workspace, cx)
+            .iter()
+            .flat_map(|section| {
+                section
+                    .windows
+                    .iter()
+                    .map(|window| (section.kind.slug(), window.name.clone(), window.tone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        assert_eq!(
+            tones,
+            [
+                ("claude", "Session".to_owned(), UsageTone::Normal),
+                ("claude", "Weekly".to_owned(), UsageTone::Warn),
+                ("codex", "Session".to_owned(), UsageTone::Normal),
+                ("codex", "Weekly".to_owned(), UsageTone::Normal),
+            ]
+        );
+    }
+
+    /// The fill color of a meter, for the normal and the warn tone.
+    fn fill_colors(cx: &mut VisualTestContext) -> (Hsla, Hsla) {
+        cx.update(|_, cx| {
+            let colors = cx.theme().colors();
+
+            (colors.fg, colors.warn)
+        })
+    }
+
+    #[gpui::test]
+    fn only_the_window_that_warns_draws_a_warn_fill_and_an_alert_icon(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        card_rows(&workspace, cx);
+        let (normal, warn) = fill_colors(cx);
+
+        let fills = [
+            "usage-claude-0-fill",
+            "usage-claude-1-fill",
+            "usage-codex-0-fill",
+            "usage-codex-1-fill",
+        ]
+        .map(|selector| drawn_color(selector, cx));
+        let alerts = [
+            "usage-claude-0-alert",
+            "usage-claude-1-alert",
+            "usage-codex-0-alert",
+            "usage-codex-1-alert",
+        ]
+        .map(|selector| shown(selector, cx));
+
+        assert_eq!(
+            fills,
+            [Some(normal), Some(warn), Some(normal), Some(normal)]
+        );
+        assert_eq!(alerts, [false, true, false, false]);
+    }
+
+    #[gpui::test]
+    fn a_full_window_draws_a_warn_fill_and_an_alert_icon(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        workspace.update(cx, |workspace, cx| {
+            let mut usage = workspace.data.usage.clone();
+            usage.codex.windows[0].used_percent = 100;
+            workspace.usage_changed(usage, cx);
+        });
+        card_rows(&workspace, cx);
+        let (_, warn) = fill_colors(cx);
+
+        assert_eq!(drawn_color("usage-codex-0-fill", cx), Some(warn));
+        assert!(shown("usage-codex-0-alert", cx));
+        assert_eq!(
+            sample_sections(&workspace, cx)[1].windows[0]
+                .risk
+                .as_deref(),
+            Some("Limit reached")
+        );
+    }
+
+    #[gpui::test]
+    fn the_tick_is_cut_out_of_a_warn_fill_in_the_color_of_the_card(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        card_rows(&workspace, cx);
+        let panel = cx.update(|_, cx| cx.theme().colors().panel);
+
+        assert_eq!(drawn_color("usage-claude-1-notch", cx), Some(panel));
+        assert!(!shown("usage-claude-0-notch", cx));
+    }
+
+    #[gpui::test]
+    fn the_age_of_old_numbers_shows_next_to_the_name_of_the_kind(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        card_rows(&workspace, cx);
+
+        // Codex was read 14 minutes before the sample time, Claude one minute.
+        assert!(shown("usage-codex-age", cx));
+        assert!(!shown("usage-claude-age", cx));
+
+        workspace.update(cx, |workspace, _| {
+            workspace.fixed_now = Some(SAMPLE_NOW + 10 * 60_000);
+        });
+        card_rows(&workspace, cx);
+
+        assert!(shown("usage-claude-age", cx));
+    }
+
+    #[gpui::test]
+    fn the_plan_shows_only_when_the_agent_kind_has_one(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        card_rows(&workspace, cx);
+
+        assert!(!shown("usage-claude-plan", cx));
+        assert!(shown("usage-codex-plan", cx));
+
+        workspace.update(cx, |workspace, cx| {
+            let mut usage = workspace.data.usage.clone();
+            usage.claude.plan = Some("max".to_owned());
+            usage.codex.plan = None;
+            workspace.usage_changed(usage, cx);
+        });
+        card_rows(&workspace, cx);
+
+        assert!(shown("usage-claude-plan", cx));
+        assert!(!shown("usage-codex-plan", cx));
+    }
+
+    #[gpui::test]
+    fn a_window_without_a_length_has_a_bar_and_no_tick(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        workspace.update(cx, |workspace, cx| {
+            let mut usage = workspace.data.usage.clone();
+            for window in &mut usage.claude.windows {
+                window.length_secs = None;
+            }
+            workspace.usage_changed(usage, cx);
+        });
+        card_rows(&workspace, cx);
+
+        assert!(shown("usage-claude-1-bar", cx));
+        assert!(!shown("usage-claude-1-tick", cx));
+        assert!(shown("usage-codex-1-tick", cx));
+        assert!(
+            sample_sections(&workspace, cx)[0]
+                .windows
+                .iter()
+                .all(|window| window.tone() == UsageTone::Normal)
+        );
+    }
+
+    fn label_of(meter: UsageMeter, cx: &mut VisualTestContext) -> Option<String> {
+        use gpui::accesskit::Node;
+        use gpui::{Element as _, IntoElement as _, RenderOnce as _};
+
+        cx.update(|window, cx| {
+            let element = meter.render(window, cx).into_element();
+            let mut node = Node::new(Role::Unknown);
+            element.write_a11y_info(&mut node);
+
+            node.label().map(str::to_owned)
+        })
+    }
+
+    #[gpui::test]
+    fn each_window_has_one_label_with_its_percent_risk_and_reset(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let sections = sample_sections(&workspace, cx);
+        let group = SharedString::from("usage-claude");
+
+        let labels: Vec<_> = sections[0]
+            .windows
+            .iter()
+            .enumerate()
+            .map(|(index, window)| label_of(usage_meter(&group, index, window), cx))
+            .collect();
+
+        assert_eq!(
+            labels,
+            [
+                Some("Claude session 42% used, resets in 2 hours 6 minutes".to_owned()),
+                Some(
+                    "Claude weekly 61% used, limit in 1 day 23 hours, resets in 3 days 21 hours"
+                        .to_owned()
+                ),
+            ]
+        );
+    }
+
+    #[gpui::test]
+    fn a_group_is_labelled_with_its_kind_and_plan(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let labels: Vec<_> = sample_sections(&workspace, cx)
+            .iter()
+            .map(UsageSection::label)
+            .collect();
+
+        assert_eq!(
+            labels,
+            [
+                "Claude usage",
+                "Codex usage, Plus plan, updated 14 minutes ago"
             ]
         );
     }
@@ -1007,16 +1092,40 @@ mod tests {
     }
 
     #[gpui::test]
-    fn not_installed_hides_only_that_row_of_the_card(cx: &mut TestAppContext) {
+    fn not_installed_hides_only_that_group_of_the_card(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
 
         workspace.update(cx, |workspace, cx| {
             let mut usage = workspace.data.usage.clone();
-            usage.codex = reading(Vec::new(), Some(UsageProblem::NotInstalled));
+            usage.codex = SubscriptionUsage {
+                problem: Some(UsageProblem::NotInstalled),
+                ..SubscriptionUsage::default()
+            };
             workspace.usage_changed(usage, cx);
         });
 
         assert_eq!(card_rows(&workspace, cx), (true, true, false));
+    }
+
+    #[gpui::test]
+    fn a_problem_shows_under_the_group_and_keeps_the_old_numbers(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+
+        workspace.update(cx, |workspace, cx| {
+            let mut usage = workspace.data.usage.clone();
+            usage.claude.problem = Some(UsageProblem::NotLoggedIn);
+            usage.codex = SubscriptionUsage {
+                problem: Some(UsageProblem::NotLoggedIn),
+                ..SubscriptionUsage::default()
+            };
+            workspace.usage_changed(usage, cx);
+        });
+        card_rows(&workspace, cx);
+
+        assert!(shown("usage-claude-problem", cx));
+        assert!(shown("usage-claude-1", cx));
+        assert!(shown("usage-codex-problem", cx));
+        assert!(!shown("usage-codex-0", cx));
     }
 
     #[gpui::test]
@@ -1025,25 +1134,29 @@ mod tests {
 
         workspace.update(cx, |workspace, cx| {
             let usage = Usage {
-                claude: reading(vec![window("5h", 64, None)], Some(rate_limited_in(600))),
-                codex: reading(vec![window("5h", 7, None)], None),
+                claude: SubscriptionUsage {
+                    windows: vec![UsageWindow {
+                        label: "5h".to_owned(),
+                        used_percent: 64,
+                        resets_at: None,
+                        length_secs: None,
+                    }],
+                    ..SubscriptionUsage::default()
+                },
+                ..Usage::default()
             };
             workspace.usage_changed(usage, cx);
         });
+        card_rows(&workspace, cx);
 
-        let rows = workspace.read_with(cx, |workspace, _| {
-            usage_rows(&workspace.data.usage, SAMPLE_NOW / 1_000)
-                .into_iter()
-                .map(|row| (row.percent, row.note))
-                .collect::<Vec<_>>()
-        });
-        assert_eq!(
-            rows,
-            [
-                (Some(64), Some("Rate limited · 10m".to_owned())),
-                (Some(7), None),
-            ]
-        );
+        let percents: Vec<_> = sample_sections(&workspace, cx)
+            .iter()
+            .flat_map(|section| section.windows.iter().map(|window| window.percent))
+            .collect();
+        assert_eq!(percents, [64]);
+        assert!(shown("usage-claude-0", cx));
+        assert!(!shown("usage-claude-1", cx));
+        assert!(!shown("usage-codex", cx));
     }
 
     use std::cell::RefCell;

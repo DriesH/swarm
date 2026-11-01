@@ -24,8 +24,8 @@ use gpui::{
 use self::place::Anchor;
 use self::popover::Popover;
 pub(crate) use self::popover::usage_section;
+pub(crate) use self::summary::Look;
 use self::summary::{BeeFrame, Summary};
-pub(crate) use self::summary::{Look, usage_sections};
 use crate::workspace::Workspace;
 
 /// A click on the status item blurs the popover first, and that closes it. Without this wait
@@ -482,8 +482,8 @@ mod tests {
 
         let look = bar.last_look();
 
-        assert_eq!(look, Some(Look::new(Some(42), false)));
-        assert_eq!(look.and_then(|look| look.title).as_deref(), Some(" 42%"));
+        assert_eq!(look, Some(Look::new(Some(61), false)));
+        assert_eq!(look.and_then(|look| look.title).as_deref(), Some(" 61%"));
     }
 
     #[gpui::test]
@@ -500,8 +500,8 @@ mod tests {
 
         cx.update(|_, cx| crate::settings::change_notifications(|n| n.menu_bar_dot = true, cx));
 
-        assert_eq!(with_dot, Some(Look::new(Some(42), true)));
-        assert_eq!(turned_off, Some(Look::new(Some(42), false)));
+        assert_eq!(with_dot, Some(Look::new(Some(61), true)));
+        assert_eq!(turned_off, Some(Look::new(Some(61), false)));
         assert_eq!(after_news, Some(Look::new(None, false)));
         assert_eq!(bar.last_look(), Some(Look::new(None, true)));
     }
@@ -515,7 +515,7 @@ mod tests {
             workspace.usage_changed(Usage::default(), cx);
         });
 
-        assert_eq!(first, Some(Look::new(Some(42), true)));
+        assert_eq!(first, Some(Look::new(Some(61), true)));
         assert_eq!(bar.last_look(), Some(Look::new(None, true)));
     }
 
@@ -697,6 +697,7 @@ mod tests {
                             label: "5h".to_owned(),
                             used_percent: 42,
                             resets_at: Some(resets),
+                            length_secs: Some(5 * 3_600),
                         }],
                         ..Default::default()
                     },

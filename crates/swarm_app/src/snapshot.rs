@@ -13,7 +13,7 @@ use std::time::Duration;
 use gpui::{AnyWindowHandle, App, AsyncApp, Context, Window};
 use swarm_protocol::{
     CheckState, CloseCheck, RemoveCheck, ReviewSource, TaskCloseCheck, TaskId as DaemonTaskId,
-    UsageProblem,
+    Usage, UsageProblem,
 };
 use swarm_ui::theme::{self, Appearance};
 
@@ -142,12 +142,30 @@ fn open_remove_project(
     workspace.open_remove_project(ProjectId(3), window, cx);
 }
 
-/// Claude is rate limited for 24 minutes: its row keeps the old numbers and shows the wait.
-fn open_usage_rate_limited(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
+/// The last Codex read failed: its card keeps the old numbers and says so.
+fn open_usage_failed(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
     let mut usage = workspace.data.usage.clone();
-    usage.claude.problem = Some(UsageProblem::RateLimited {
-        retry_at: SAMPLE_NOW / 1_000 + 24 * 60,
-    });
+    usage.codex.problem = Some(UsageProblem::Failed(
+        "the app server did not answer".to_owned(),
+    ));
+
+    workspace.usage_changed(usage, cx);
+}
+
+/// Claude's session is full. Codex was read an hour and a half ago, and at that rate its
+/// session has likely hit the limit by now.
+pub(crate) fn reach_limits(usage: &mut Usage) {
+    let now = SAMPLE_NOW / 1_000;
+
+    usage.claude.windows[0].used_percent = 100;
+
+    usage.codex.windows[0].used_percent = 40;
+    usage.codex.read_at = Some(now - 90 * 60);
+}
+
+fn open_usage_limits(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
+    let mut usage = workspace.data.usage.clone();
+    reach_limits(&mut usage);
 
     workspace.usage_changed(usage, cx);
 }
@@ -783,13 +801,23 @@ pub(crate) fn run(directory: PathBuf, cx: &mut App) {
             (Appearance::Dark, "workspace-dark.png", None),
             (
                 Appearance::Light,
-                "workspace-usage-rate-limited-light.png",
-                Some(open_usage_rate_limited as OpenOverlay),
+                "workspace-usage-failed-light.png",
+                Some(open_usage_failed as OpenOverlay),
             ),
             (
                 Appearance::Dark,
-                "workspace-usage-rate-limited-dark.png",
-                Some(open_usage_rate_limited),
+                "workspace-usage-failed-dark.png",
+                Some(open_usage_failed),
+            ),
+            (
+                Appearance::Light,
+                "workspace-usage-limits-light.png",
+                Some(open_usage_limits as OpenOverlay),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-usage-limits-dark.png",
+                Some(open_usage_limits),
             ),
             (
                 Appearance::Light,
