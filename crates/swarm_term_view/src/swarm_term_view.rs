@@ -26,6 +26,9 @@ use crate::element::{
     CursorGlyph, CursorLayout, Frame, LayoutCache, MarkedLayout, Metrics, TerminalElement, hsla,
 };
 
+/// The font size of a view until [`TerminalView::set_font_size`] says otherwise, in points.
+pub const DEFAULT_FONT_SIZE: f32 = 13.;
+
 /// What the app may want to react to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalEvent {
@@ -46,6 +49,9 @@ pub struct TerminalView {
     focus_handle: FocusHandle,
     accessible_name: SharedString,
     metrics: Metrics,
+    /// True after a font change: the emulator learns the new cell size even when the
+    /// columns and rows stay the same.
+    resend_size: bool,
     /// `None` until the first snapshot arrives.
     model: Option<ScreenModel>,
     layouts: LayoutCache,
@@ -129,7 +135,8 @@ impl TerminalView {
             typing_gate: None,
             focus_handle,
             accessible_name,
-            metrics: Metrics::measure(window),
+            metrics: Metrics::measure(window, DEFAULT_FONT_SIZE),
+            resend_size: false,
             model: None,
             layouts: LayoutCache::default(),
             title: None,
@@ -149,22 +156,46 @@ impl TerminalView {
         view
     }
 
-    /// The grid size that fits `bounds` with the current font. Use it to spawn a
-    /// terminal at the right size.
-    pub fn size_for(bounds: Size<Pixels>, window: &mut Window, _cx: &App) -> swarm_term::Size {
-        Metrics::measure(window).grid_for(bounds)
+    /// The grid size that fits `bounds` with the font at `font_size` points. Use it to
+    /// spawn a terminal at the right size.
+    pub fn size_for(
+        bounds: Size<Pixels>,
+        font_size: f32,
+        window: &mut Window,
+        _cx: &App,
+    ) -> swarm_term::Size {
+        Metrics::measure(window, font_size).grid_for(bounds)
     }
 
-    /// The exact size of one cell, as the view paints it. The cell sizes in
-    /// [`size_for`](Self::size_for) are whole pixels, which is too narrow for a tile that
-    /// must hold a number of columns.
-    pub fn cell_size(window: &Window, _cx: &App) -> Size<Pixels> {
-        let metrics = Metrics::measure(window);
+    /// The exact size of one cell with the font at `font_size` points, as the view paints
+    /// it. The cell sizes in [`size_for`](Self::size_for) are whole pixels, which is too
+    /// narrow for a tile that must hold a number of columns.
+    pub fn cell_size(font_size: f32, window: &Window, _cx: &App) -> Size<Pixels> {
+        let metrics = Metrics::measure(window, font_size);
 
         Size {
             width: metrics.cell_width,
             height: metrics.line_height,
         }
+    }
+
+    /// The font size in points.
+    pub fn font_size(&self) -> f32 {
+        f32::from(self.metrics.font_size)
+    }
+
+    /// Measures the cell again at `points` and draws the view again. The grid then gets
+    /// more or fewer columns and rows in the same space, and the emulator is told at the
+    /// next paint.
+    pub fn set_font_size(&mut self, points: f32, window: &Window, cx: &mut Context<Self>) {
+        if (self.font_size() - points).abs() < f32::EPSILON {
+            return;
+        }
+
+        self.metrics = Metrics::measure(window, points);
+        self.resend_size = true;
+        self.layouts.invalidate(true, &[]);
+        cx.notify();
     }
 
     /// Lets `allowed` decide, for every key, paste, text input and composing text, whether it
@@ -332,10 +363,11 @@ impl TerminalView {
                 .map(|model| (model.screen().cols, model.screen().rows))
         });
 
-        if current == Some((size.cols, size.rows)) {
+        if current == Some((size.cols, size.rows)) && !self.resend_size {
             return;
         }
 
+        self.resend_size = false;
         self.requested_grid = Some((size.cols, size.rows));
         self.send(TerminalInput::Resize(size));
     }

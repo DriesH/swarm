@@ -14,7 +14,7 @@ use swarm_term::{
     BgSpan, Colors, Cursor, CursorStyle, EmulatorChannels, ExitStatus, History, Palette, Rgb, Row,
     Screen, Snapshot, TerminalInput, TerminalOutput, TextFlags, TextSpan, Update,
 };
-use swarm_term_view::{TerminalEvent, TerminalView, palette_for};
+use swarm_term_view::{DEFAULT_FONT_SIZE, TerminalEvent, TerminalView, palette_for};
 use swarm_ui::{Appearance, Theme};
 
 type Seen = Rc<RefCell<Vec<String>>>;
@@ -179,6 +179,102 @@ fn view_sends_its_palette_and_grid_size(cx: &mut TestAppContext) {
             .iter()
             .any(|input| matches!(input, TerminalInput::Resize(_)))
     );
+}
+
+fn resizes(inputs: &[TerminalInput]) -> Vec<swarm_term::Size> {
+    inputs
+        .iter()
+        .filter_map(|input| match input {
+            TerminalInput::Resize(size) => Some(*size),
+            _ => None,
+        })
+        .collect()
+}
+
+#[gpui::test]
+fn a_bigger_font_measures_a_bigger_cell(cx: &mut TestAppContext) {
+    let setup = setup(cx);
+
+    let (small, large) = setup.cx.update(|window, cx| {
+        (
+            TerminalView::cell_size(12., window, cx),
+            TerminalView::cell_size(18., window, cx),
+        )
+    });
+
+    assert!(large.width > small.width, "{small:?} {large:?}");
+    assert!(large.height > small.height, "{small:?} {large:?}");
+}
+
+#[gpui::test]
+fn a_bigger_font_fits_fewer_columns_and_rows_in_the_same_space(cx: &mut TestAppContext) {
+    let setup = setup(cx);
+    let space = gpui::size(px(640.), px(400.));
+
+    let (small, large) = setup.cx.update(|window, cx| {
+        (
+            TerminalView::size_for(space, 12., window, cx),
+            TerminalView::size_for(space, 18., window, cx),
+        )
+    });
+
+    assert!(large.cols < small.cols, "{small:?} {large:?}");
+    assert!(large.rows < small.rows, "{small:?} {large:?}");
+}
+
+#[gpui::test]
+fn a_view_starts_at_the_default_font_size(cx: &mut TestAppContext) {
+    let setup = setup(cx);
+
+    let points = setup
+        .terminal
+        .read_with(setup.cx, |view, _| view.font_size());
+
+    assert!((points - DEFAULT_FONT_SIZE).abs() < f32::EPSILON);
+}
+
+#[gpui::test]
+fn changing_the_font_size_measures_the_cell_again_and_sends_the_new_grid(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    setup.send(snapshot(&["a"], History::default()));
+    let before = resizes(&setup.inputs());
+    let terminal = setup.terminal.clone();
+
+    setup.cx.update(|window, cx| {
+        terminal.update(cx, |view, cx| view.set_font_size(18., window, cx));
+    });
+    setup.cx.run_until_parked();
+    let after = resizes(&setup.inputs());
+
+    let points = setup
+        .terminal
+        .read_with(setup.cx, |view, _| view.font_size());
+    let (small, large) = (
+        before.last().copied().expect("a grid before the change"),
+        after.last().copied().expect("a grid after the change"),
+    );
+    assert!((points - 18.).abs() < f32::EPSILON);
+    assert!(large.cols < small.cols, "{small:?} {large:?}");
+    assert!(large.rows < small.rows, "{small:?} {large:?}");
+    assert!(large.cell_width > small.cell_width, "{small:?} {large:?}");
+    assert!(large.cell_height > small.cell_height, "{small:?} {large:?}");
+}
+
+#[gpui::test]
+fn setting_the_same_font_size_again_does_nothing(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    setup.send(snapshot(&["a"], History::default()));
+    setup.inputs();
+    let terminal = setup.terminal.clone();
+
+    setup.cx.update(|window, cx| {
+        terminal.update(cx, |view, cx| {
+            view.set_font_size(DEFAULT_FONT_SIZE, window, cx);
+        });
+    });
+    setup.cx.run_until_parked();
+
+    assert!(resizes(&setup.inputs()).is_empty());
 }
 
 #[gpui::test]
@@ -398,7 +494,7 @@ fn the_wheel_names_the_cell_under_the_pointer(cx: &mut TestAppContext) {
     setup.inputs();
     let cell = setup
         .cx
-        .update(|window, cx| TerminalView::cell_size(window, cx));
+        .update(|window, cx| TerminalView::cell_size(DEFAULT_FONT_SIZE, window, cx));
 
     // The grid starts 8 px in from the corner. Aim at the middle of column 3, row 4.
     let x = 8. + 3.5 * f32::from(cell.width);

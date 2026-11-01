@@ -17,7 +17,6 @@ use unicode_segmentation::UnicodeSegmentation as _;
 use crate::TerminalView;
 use crate::box_drawing::{self, CellRect};
 
-const FONT_SIZE: f32 = 13.;
 const LINE_HEIGHT_RATIO: f32 = 1.3;
 const CURSOR_THICKNESS: Pixels = px(2.);
 
@@ -46,9 +45,10 @@ pub(crate) struct Metrics {
 }
 
 impl Metrics {
-    pub(crate) fn measure(window: &Window) -> Self {
+    /// The metrics of the terminal font at `points`.
+    pub(crate) fn measure(window: &Window, points: f32) -> Self {
         let font = font(MONO_FONT);
-        let font_size = px(FONT_SIZE);
+        let font_size = px(points);
 
         let run = TextRun {
             len: 1,
