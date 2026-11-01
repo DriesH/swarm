@@ -3,6 +3,7 @@
 //! It speaks one JSON object per line to the daemon's agent socket. No async, no
 //! terminal socket: the daemon refuses agents on that one.
 
+mod buzz;
 mod commands;
 mod hook;
 mod mcp;
@@ -137,6 +138,9 @@ enum Action {
     /// Claude Code's status line: send its rate limits (JSON on stdin) to Swarm, then
     /// run your own status line.
     Statusline,
+    /// An easter egg: the pixel bee and the swarm's counts. Left out of the help.
+    #[command(hide = true)]
+    Buzz,
 }
 
 #[derive(Subcommand, Debug)]
@@ -346,7 +350,7 @@ impl Action {
             Self::Task { action } => action.command(stdin)?,
             Self::Exit => Command::Exit,
             Self::Terminal { action } => action.command(),
-            Self::Mcp | Self::Hook | Self::Statusline => return Ok(None),
+            Self::Mcp | Self::Hook | Self::Statusline | Self::Buzz => return Ok(None),
         };
 
         Ok(Some(command))
@@ -484,9 +488,21 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // The same for buzz: it prints the bee and exits 0, whatever follows it.
+    if arguments.get(1).map(String::as_str) == Some("buzz") {
+        buzz::run();
+
+        return ExitCode::SUCCESS;
+    }
+
     let cli = Cli::parse();
     if matches!(cli.command, Action::Mcp) {
         return mcp::run();
+    }
+    if matches!(cli.command, Action::Buzz) {
+        buzz::run();
+
+        return ExitCode::SUCCESS;
     }
 
     run(cli)
@@ -537,6 +553,7 @@ fn fail(message: &str) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    use clap::CommandFactory as _;
     use swarm_protocol::AgentKind;
 
     use super::*;
@@ -1009,6 +1026,22 @@ mod tests {
             let action = parse(&[name]).expect("parse").command;
 
             assert!(action.command(&mut std::io::empty()).expect("ok").is_none());
+        }
+    }
+
+    #[test]
+    fn buzz_is_a_hidden_command_that_is_not_run_as_a_call() {
+        let action = parse(&["buzz"]).expect("parse").command;
+        assert!(action.command(&mut std::io::empty()).expect("ok").is_none());
+
+        let command = Cli::command();
+        let buzz = command.find_subcommand("buzz").expect("buzz");
+        assert!(buzz.is_hide_set());
+        for help in [
+            command.clone().render_help(),
+            command.clone().render_long_help(),
+        ] {
+            assert!(!help.to_string().contains("buzz"), "{help}");
         }
     }
 

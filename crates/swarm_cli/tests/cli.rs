@@ -1401,3 +1401,145 @@ fn help_lists_the_statusline_command() {
 
     assert!(String::from_utf8_lossy(&output.stdout).contains("statusline"));
 }
+
+fn buzz_stats(tasks: u64, agents: u64, merged: u64) -> serde_json::Value {
+    serde_json::json!({
+        "ok": true,
+        "result": {
+            "running_agents": agents,
+            "open_tasks": tasks,
+            "merged_prs": merged,
+            "hundredth_merge_at": null,
+        },
+    })
+}
+
+/// The lines of `swarm buzz` that are not the bee.
+fn lines_under_the_bee(output: &Output) -> Vec<String> {
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .skip(12)
+        .map(str::to_owned)
+        .collect()
+}
+
+fn assert_only_the_bee(output: &Output) {
+    let text = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{text}");
+    assert_eq!(text.lines().count(), 12, "{text}");
+    assert!(text.contains("\x1b[38;2;"), "{text}");
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+}
+
+#[test]
+fn buzz_outside_an_agent_prints_only_the_bee_and_exits_zero() {
+    let mut command = swarm();
+    command.arg("buzz");
+
+    let output = run(command, "");
+
+    assert_only_the_bee(&output);
+}
+
+#[test]
+fn buzz_inside_an_agent_prints_the_counts_under_the_bee() {
+    let (socket, daemon) = fake_daemon("buzz", vec![buzz_stats(3, 7, 14)]);
+    let mut command = agent_command(&socket);
+    command.arg("buzz");
+
+    let output = run(command, "");
+    let requests = daemon.join().expect("daemon");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("\x1b[38;2;"));
+    assert_eq!(
+        lines_under_the_bee(&output),
+        ["3 tasks \u{b7} 7 agents running", "14 PRs merged"]
+    );
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["method"], "buzz");
+    assert_eq!(requests[0]["agent"], 3);
+    assert_eq!(requests[0]["token"], "tok");
+}
+
+#[test]
+fn buzz_uses_the_singular_for_one() {
+    let (socket, daemon) = fake_daemon("buzz-one", vec![buzz_stats(1, 1, 1)]);
+    let mut command = agent_command(&socket);
+    command.arg("buzz");
+
+    let output = run(command, "");
+    daemon.join().expect("daemon");
+
+    assert_eq!(
+        lines_under_the_bee(&output),
+        ["1 task \u{b7} 1 agent running", "1 PR merged"]
+    );
+}
+
+#[test]
+fn buzz_with_a_socket_that_is_not_there_prints_the_bee_and_exits_zero() {
+    let mut command = agent_command(std::path::Path::new("/tmp/swc-does-not-exist.sock"));
+    command.arg("buzz");
+
+    let output = run(command, "");
+
+    assert_only_the_bee(&output);
+}
+
+#[test]
+fn buzz_with_a_refusing_daemon_prints_the_bee_and_exits_zero() {
+    let (socket, daemon) = fake_daemon(
+        "buzz-refused",
+        vec![serde_json::json!({ "ok": false, "error": "no" })],
+    );
+    let mut command = agent_command(&socket);
+    command.arg("buzz");
+
+    let output = run(command, "");
+    daemon.join().expect("daemon");
+
+    assert_only_the_bee(&output);
+}
+
+#[test]
+fn buzz_with_an_answer_it_cannot_read_prints_the_bee_and_exits_zero() {
+    let (socket, daemon) = fake_daemon(
+        "buzz-garbled",
+        vec![serde_json::json!({ "ok": true, "result": "many" })],
+    );
+    let mut command = agent_command(&socket);
+    command.arg("buzz");
+
+    let output = run(command, "");
+    daemon.join().expect("daemon");
+
+    assert_only_the_bee(&output);
+}
+
+#[test]
+fn buzz_exits_zero_whatever_follows_it() {
+    let mut command = swarm();
+    command.args(["buzz", "--nonsense", "extra"]);
+
+    let output = run(command, "");
+
+    assert_only_the_bee(&output);
+}
+
+#[test]
+fn help_does_not_list_the_buzz_command() {
+    for flag in ["--help", "-h"] {
+        let output = swarm().arg(flag).output().expect("run");
+
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success());
+        assert!(
+            text.contains("statusline"),
+            "the help did not print:\n{text}"
+        );
+        assert!(!text.contains("buzz"), "buzz is listed:\n{text}");
+    }
+}
