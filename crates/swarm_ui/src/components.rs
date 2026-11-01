@@ -1,6 +1,8 @@
+mod brand_mark;
 mod button;
 mod check_row;
 mod checkbox;
+mod confirm_row;
 mod dialog;
 mod dropdown;
 mod icon;
@@ -28,9 +30,11 @@ mod tray_chip;
 mod tree_row;
 mod usage_meter;
 
+pub use brand_mark::*;
 pub use button::*;
 pub use check_row::*;
 pub use checkbox::*;
+pub use confirm_row::*;
 pub use dialog::*;
 pub use dropdown::*;
 pub use icon::*;
@@ -90,6 +94,8 @@ pub fn all_components() -> Vec<ComponentEntry> {
         ComponentEntry::of::<TrayMore>(),
         ComponentEntry::of::<Panel>(),
         ComponentEntry::of::<UsageMeter>(),
+        ComponentEntry::of::<BrandMark>(),
+        ComponentEntry::of::<ConfirmRow>(),
         ComponentEntry::of::<ProjectTile>(),
         ComponentEntry::of::<TileFrame>(),
         ComponentEntry::of::<Dialog>(),
