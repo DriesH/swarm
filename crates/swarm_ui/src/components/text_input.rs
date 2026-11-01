@@ -62,6 +62,11 @@ mod action {
     );
 }
 
+/// The history and clipboard actions of a text field, for the Edit menu to send.
+pub mod edit {
+    pub use super::action::{Copy, Cut, Paste, Redo, SelectAll, Undo};
+}
+
 const TEXT_INPUT_CONTEXT: &str = "TextInput";
 const TEXT_AREA_CONTEXT: &str = "TextArea";
 

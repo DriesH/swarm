@@ -4,13 +4,13 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use gpui::{
-    Context, FocusHandle, KeyBinding, Modifiers, Render, TestAppContext, VisualTestContext, Window,
-    point, px,
+    Context, FocusHandle, KeyBinding, Modifiers, MouseButton, Render, TestAppContext,
+    VisualTestContext, Window, point, px,
 };
 use swarm_ui::prelude::*;
 use swarm_ui::{
-    Confirm, Dialog, Dismiss, FocusNext, FocusPrevious, MENU_CONTEXT, Menu, MenuItem, PopoverMenu,
-    ROOT_CONTEXT, SelectNext, SelectPrevious, Toast, tab_navigation,
+    Confirm, ContextMenu, Dialog, Dismiss, FocusNext, FocusPrevious, MENU_CONTEXT, Menu, MenuItem,
+    PopoverMenu, ROOT_CONTEXT, SelectNext, SelectPrevious, ShowContextMenu, Toast, tab_navigation,
 };
 
 type Log = Rc<RefCell<Vec<String>>>;
@@ -582,4 +582,305 @@ fn a_click_on_the_toast_does_not_reach_the_tile_under_it(cx: &mut TestAppContext
         ["tile"],
         "the tile takes clicks beside the toast"
     );
+}
+
+struct ContextHarness {
+    row: FocusHandle,
+    outside: FocusHandle,
+    log: Log,
+    /// The trigger fills the window, so a right-click can land near any edge.
+    whole_window: bool,
+}
+
+impl Render for ContextHarness {
+    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let log = Rc::clone(&self.log);
+        let outside = self.outside.clone();
+
+        let trigger = if self.whole_window {
+            gpui::div()
+                .w(window.viewport_size().width)
+                .h(window.viewport_size().height - px(40.))
+                .debug_selector(|| "area".to_owned())
+                .into_any_element()
+        } else {
+            ListRow::new("row", "swarm")
+                .debug_selector(|| "row".to_owned())
+                .track_focus(&self.row)
+                .into_any_element()
+        };
+
+        let menu = ContextMenu::new("ctx", "Row actions", trigger, move |menu, _, _| {
+            let item = |id: &'static str, log: &Log| {
+                let log = Rc::clone(log);
+
+                MenuItem::new(id, id).on_select(move |_, _| log.borrow_mut().push(id.to_owned()))
+            };
+            let moving = {
+                let (log, outside) = (Rc::clone(&log), outside.clone());
+
+                MenuItem::new("move", "move").on_select(move |window, cx| {
+                    log.borrow_mut().push("move".to_owned());
+                    outside.focus(window, cx);
+                })
+            };
+
+            menu.item(item("a", &log))
+                .item(item("b", &log).disabled(true))
+                .item(item("c", &log))
+                .item(moving)
+        });
+
+        tab_navigation(
+            gpui::div()
+                .id("ctx-root")
+                .key_context(ROOT_CONTEXT)
+                .size_full()
+                .child(
+                    gpui::div()
+                        .id("outside")
+                        .track_focus(&self.outside)
+                        .size(px(40.)),
+                )
+                .child(
+                    gpui::div()
+                        .when(!self.whole_window, |wrapper| wrapper.w(px(200.)))
+                        .child(menu),
+                ),
+        )
+    }
+}
+
+struct ContextRig {
+    log: Log,
+    row: FocusHandle,
+    outside: FocusHandle,
+}
+
+fn context_setup(
+    cx: &mut TestAppContext,
+    whole_window: bool,
+) -> (ContextRig, &mut VisualTestContext) {
+    cx.update(|cx| {
+        swarm_ui::theme::init(cx);
+        cx.bind_keys([
+            KeyBinding::new("escape", Dismiss, Some(MENU_CONTEXT)),
+            KeyBinding::new("up", SelectPrevious, Some(MENU_CONTEXT)),
+            KeyBinding::new("down", SelectNext, Some(MENU_CONTEXT)),
+            KeyBinding::new("enter", Confirm, Some(MENU_CONTEXT)),
+            KeyBinding::new("shift-f10", ShowContextMenu, Some(ROOT_CONTEXT)),
+        ]);
+    });
+
+    let log = Log::default();
+    let shared = Rc::clone(&log);
+    let (harness, cx) = cx.add_window_view(move |_, cx| ContextHarness {
+        row: cx.focus_handle().tab_stop(true),
+        outside: cx.focus_handle(),
+        log: shared,
+        whole_window,
+    });
+    let (row, outside) = harness.read_with(cx, |harness, _| {
+        (harness.row.clone(), harness.outside.clone())
+    });
+    cx.update(|window, cx| outside.focus(window, cx));
+    cx.run_until_parked();
+
+    (ContextRig { log, row, outside }, cx)
+}
+
+fn right_click(position: gpui::Point<gpui::Pixels>, cx: &mut VisualTestContext) {
+    cx.simulate_mouse_down(position, MouseButton::Right, Modifiers::none());
+    cx.simulate_mouse_up(position, MouseButton::Right, Modifiers::none());
+    cx.run_until_parked();
+}
+
+fn context_menu_bounds(cx: &mut VisualTestContext) -> Option<gpui::Bounds<gpui::Pixels>> {
+    cx.debug_bounds("ctx-menu")
+}
+
+fn row_center(cx: &mut VisualTestContext) -> gpui::Point<gpui::Pixels> {
+    cx.debug_bounds("row")
+        .unwrap_or_else(|| panic!("the row is not on screen"))
+        .center()
+}
+
+#[gpui::test]
+fn a_right_click_opens_the_context_menu_at_the_pointer(cx: &mut TestAppContext) {
+    let (_, cx) = context_setup(cx, false);
+    assert!(context_menu_bounds(cx).is_none());
+    let pointer = row_center(cx);
+
+    right_click(pointer, cx);
+
+    let menu = context_menu_bounds(cx).expect("the menu is open");
+    assert_eq!(menu.origin, pointer);
+}
+
+#[gpui::test]
+fn a_control_click_opens_the_context_menu_at_the_pointer(cx: &mut TestAppContext) {
+    let (_, cx) = context_setup(cx, false);
+    let pointer = row_center(cx);
+
+    cx.simulate_click(pointer, Modifiers::control());
+    cx.run_until_parked();
+
+    let menu = context_menu_bounds(cx).expect("the menu is open");
+    assert_eq!(menu.origin, pointer);
+}
+
+#[gpui::test]
+fn a_plain_click_does_not_open_the_context_menu(cx: &mut TestAppContext) {
+    let (_, cx) = context_setup(cx, false);
+    let pointer = row_center(cx);
+
+    cx.simulate_click(pointer, Modifiers::none());
+    cx.run_until_parked();
+
+    assert!(context_menu_bounds(cx).is_none());
+}
+
+#[gpui::test]
+fn shift_f10_opens_the_context_menu_under_the_focused_row(cx: &mut TestAppContext) {
+    let (state, cx) = context_setup(cx, false);
+    cx.update(|window, cx| state.row.focus(window, cx));
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("shift-f10");
+
+    let row = cx.debug_bounds("row").expect("the row is on screen");
+    let menu = context_menu_bounds(cx).expect("the menu is open");
+    assert_eq!(menu.left(), row.left());
+    assert!(menu.top() >= row.bottom());
+    assert!(menu.top() - row.bottom() <= px(8.));
+}
+
+#[gpui::test]
+fn shift_f10_does_nothing_while_the_row_has_no_focus(cx: &mut TestAppContext) {
+    let (_, cx) = context_setup(cx, false);
+
+    cx.simulate_keystrokes("shift-f10");
+
+    assert!(context_menu_bounds(cx).is_none());
+}
+
+#[gpui::test]
+fn escape_closes_the_context_menu_and_focus_goes_back_to_the_row(cx: &mut TestAppContext) {
+    let (state, cx) = context_setup(cx, false);
+    right_click(row_center(cx), cx);
+    assert!(context_menu_bounds(cx).is_some());
+    assert!(!cx.update(|window, _| state.row.is_focused(window)));
+
+    cx.simulate_keystrokes("escape");
+
+    assert!(context_menu_bounds(cx).is_none());
+    assert!(cx.update(|window, _| state.row.is_focused(window)));
+}
+
+#[gpui::test]
+fn a_menu_from_the_keyboard_gives_focus_back_to_the_row_too(cx: &mut TestAppContext) {
+    let (state, cx) = context_setup(cx, false);
+    cx.update(|window, cx| state.row.focus(window, cx));
+    cx.simulate_keystrokes("shift-f10");
+    assert!(!cx.update(|window, _| state.row.is_focused(window)));
+
+    cx.simulate_keystrokes("escape");
+
+    assert!(cx.update(|window, _| state.row.is_focused(window)));
+}
+
+#[gpui::test]
+fn a_click_outside_closes_the_context_menu(cx: &mut TestAppContext) {
+    let (state, cx) = context_setup(cx, false);
+    right_click(row_center(cx), cx);
+
+    cx.simulate_click(point(px(700.), px(600.)), Modifiers::none());
+    cx.run_until_parked();
+
+    assert!(context_menu_bounds(cx).is_none());
+    assert!(entries(&state.log).is_empty());
+}
+
+#[gpui::test]
+fn losing_the_window_closes_the_context_menu(cx: &mut TestAppContext) {
+    let (_, cx) = context_setup(cx, false);
+    cx.update(|window, _| window.activate_window());
+    cx.run_until_parked();
+    right_click(row_center(cx), cx);
+    assert!(context_menu_bounds(cx).is_some());
+
+    cx.deactivate_window();
+    cx.run_until_parked();
+
+    assert!(context_menu_bounds(cx).is_none());
+}
+
+#[gpui::test]
+fn the_keys_move_the_highlight_and_enter_runs_the_item(cx: &mut TestAppContext) {
+    let (state, cx) = context_setup(cx, false);
+    right_click(row_center(cx), cx);
+
+    cx.simulate_keystrokes("down enter");
+
+    assert_eq!(entries(&state.log), ["c"]);
+    assert!(context_menu_bounds(cx).is_none());
+    assert!(cx.update(|window, _| state.row.is_focused(window)));
+}
+
+#[gpui::test]
+fn clicking_an_item_runs_it_and_closes_the_menu(cx: &mut TestAppContext) {
+    let (state, cx) = context_setup(cx, false);
+    right_click(row_center(cx), cx);
+    let menu = context_menu_bounds(cx).expect("the menu is open");
+
+    // Border and padding take 6 px; each item is 34 px high. The third item is "c".
+    cx.simulate_click(
+        menu.origin + point(px(40.), px(6. + 34. * 2. + 17.)),
+        Modifiers::none(),
+    );
+    cx.run_until_parked();
+
+    assert_eq!(entries(&state.log), ["c"]);
+    assert!(context_menu_bounds(cx).is_none());
+}
+
+#[gpui::test]
+fn an_item_that_moves_focus_keeps_it(cx: &mut TestAppContext) {
+    let (state, cx) = context_setup(cx, false);
+    right_click(row_center(cx), cx);
+
+    cx.simulate_keystrokes("down down enter");
+
+    assert_eq!(entries(&state.log), ["move"]);
+    assert!(context_menu_bounds(cx).is_none());
+    assert!(cx.update(|window, _| state.outside.is_focused(window)));
+    assert!(!cx.update(|window, _| state.row.is_focused(window)));
+}
+
+#[gpui::test]
+fn the_context_menu_stays_inside_the_window_near_the_edges(cx: &mut TestAppContext) {
+    let (_, cx) = context_setup(cx, true);
+    let window = cx.update(|window, _| window.viewport_size());
+
+    for pointer in [
+        point(window.width - px(3.), px(100.)),
+        point(px(100.), window.height - px(3.)),
+        point(window.width - px(3.), window.height - px(3.)),
+    ] {
+        right_click(pointer, cx);
+
+        let menu = context_menu_bounds(cx).expect("the menu is open");
+        let margin = px(8.);
+        assert!(
+            menu.right() <= window.width - margin,
+            "right edge at {pointer:?}"
+        );
+        assert!(
+            menu.bottom() <= window.height - margin,
+            "bottom edge at {pointer:?}"
+        );
+        assert!(menu.left() >= px(0.) && menu.top() >= px(0.));
+
+        cx.simulate_keystrokes("escape");
+    }
 }

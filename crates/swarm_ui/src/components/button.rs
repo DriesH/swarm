@@ -22,6 +22,9 @@ pub enum ButtonVariant {
     Ghost,
     /// Filled with `del`: an action that throws something away.
     Destructive,
+    /// Raised with a border and a `del` label: a destructive action that is not the main
+    /// action of the screen.
+    SecondaryDestructive,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -113,6 +116,13 @@ impl ButtonVariant {
                 // Solid, and toward `fg`: the label keeps its contrast in both themes.
                 hover_background: composite(colors.del, colors.fg.opacity(0.12)),
                 hover_text: colors.ground,
+            },
+            Self::SecondaryDestructive => ButtonColors {
+                background: colors.raised,
+                text: colors.del,
+                border: colors.line,
+                hover_background: colors.active,
+                hover_text: colors.del,
             },
         }
     }
@@ -356,6 +366,7 @@ impl Component for Button {
             ("Secondary", ButtonVariant::Secondary),
             ("Ghost", ButtonVariant::Ghost),
             ("Destructive", ButtonVariant::Destructive),
+            ("Secondary destructive", ButtonVariant::SecondaryDestructive),
         ];
 
         v_flex()

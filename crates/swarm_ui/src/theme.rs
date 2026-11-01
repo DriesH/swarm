@@ -727,6 +727,7 @@ mod tests {
                 ButtonVariant::Secondary,
                 ButtonVariant::Ghost,
                 ButtonVariant::Destructive,
+                ButtonVariant::SecondaryDestructive,
             ] {
                 let button = variant.colors_in(colors);
 
