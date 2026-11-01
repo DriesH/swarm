@@ -22,16 +22,17 @@ pub(super) struct Row {
     pub alternatives: Vec<Vec<SharedString>>,
 }
 
-/// The key caps of one keystroke, for example `["⌘", "⇧", "R"]`.
+/// The key caps of one keystroke in the order macOS writes them (control, option, shift,
+/// command), for example `["⇧", "⌘", "R"]`.
 fn caps(keystroke: &KeybindingKeystroke) -> Vec<SharedString> {
     let modifiers = keystroke.modifiers();
     let mut caps: Vec<SharedString> = Vec::new();
 
     for (pressed, cap) in [
         (modifiers.control, KEY_CONTROL),
-        (modifiers.platform, KEY_COMMAND),
-        (modifiers.shift, KEY_SHIFT),
         (modifiers.alt, KEY_OPTION),
+        (modifiers.shift, KEY_SHIFT),
+        (modifiers.platform, KEY_COMMAND),
     ] {
         if pressed {
             caps.push(cap.into());
@@ -179,6 +180,8 @@ impl SettingsWindow {
 
 #[cfg(test)]
 mod tests {
+    use gpui::Keystroke;
+
     use super::*;
 
     fn caps_of(name: &str) -> Vec<Vec<String>> {
@@ -196,9 +199,28 @@ mod tests {
     #[test]
     fn a_known_binding_shows_with_its_keys() {
         assert_eq!(caps_of("Open settings"), [["\u{2318}", ","]]);
-        assert_eq!(caps_of("Open Review"), [["\u{2318}", "\u{21e7}", "R"]]);
-        assert_eq!(caps_of("New terminal"), [["\u{2318}", "\u{2325}", "T"]]);
+        assert_eq!(caps_of("Open Review"), [["\u{21e7}", "\u{2318}", "R"]]);
+        assert_eq!(caps_of("New terminal"), [["\u{2325}", "\u{2318}", "T"]]);
         assert_eq!(caps_of("Command palette"), [["\u{2318}", "K"]]);
+    }
+
+    #[test]
+    fn modifiers_come_in_the_order_of_macos() {
+        let keystroke = |text: &'static str| {
+            KeybindingKeystroke::from_keystroke(Keystroke::parse(text).expect("a valid keystroke"))
+        };
+        let shown = |text: &'static str| -> Vec<String> {
+            caps(&keystroke(text))
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        };
+
+        assert_eq!(
+            shown("cmd-shift-alt-ctrl-t"),
+            ["\u{2303}", "\u{2325}", "\u{21e7}", "\u{2318}", "T"]
+        );
+        assert_eq!(shown("cmd-alt-t"), ["\u{2325}", "\u{2318}", "T"]);
     }
 
     #[test]
@@ -218,24 +240,72 @@ mod tests {
         assert_eq!(caps_of("Open row"), [["\u{21b5}"], ["Space"]]);
     }
 
-    #[test]
-    fn every_binding_the_app_registers_has_a_row() {
-        // A range like `1–9` stands for as many bindings as it names.
-        let covered = |keys: &Vec<SharedString>| {
-            keys.last()
-                .and_then(|cap| cap.split_once('\u{2013}'))
-                .map_or(1, |(from, to)| {
-                    to.parse::<usize>().unwrap_or(0) - from.parse::<usize>().unwrap_or(0) + 1
-                })
-        };
-
-        let shown: usize = rows()
+    /// Whether the rows show `keys`, counting a range like `1–9` for each digit in it.
+    fn is_shown(keys: &[SharedString]) -> bool {
+        rows()
             .iter()
             .flat_map(|row| &row.alternatives)
-            .map(covered)
+            .any(|shown| {
+                if shown.as_slice() == keys {
+                    return true;
+                }
+
+                let (Some((cap, key)), Some((range, pressed))) =
+                    (shown.split_last(), keys.split_last())
+                else {
+                    return false;
+                };
+                let digits = cap.split_once('\u{2013}');
+                let digit = |text: &str| text.parse::<u8>().ok();
+
+                cap.contains('\u{2013}')
+                    && key == pressed
+                    && digits
+                        .zip(digit(range))
+                        .is_some_and(|((from, to), pressed)| {
+                            digit(from)
+                                .zip(digit(to))
+                                .is_some_and(|(from, to)| (from..=to).contains(&pressed))
+                        })
+            })
+    }
+
+    #[gpui::test]
+    fn every_binding_in_the_keymap_of_the_app_has_a_row(cx: &mut gpui::TestAppContext) {
+        cx.update(actions::bind_keys);
+
+        let registered: Vec<Vec<SharedString>> = cx.update(|cx| {
+            cx.key_bindings()
+                .borrow()
+                .bindings()
+                .map(|binding| binding.keystrokes().iter().flat_map(caps).collect())
+                .collect()
+        });
+        let unlisted: Vec<_> = registered.iter().filter(|keys| !is_shown(keys)).collect();
+
+        assert!(!registered.is_empty());
+        assert!(unlisted.is_empty(), "no row for {unlisted:?}");
+    }
+
+    #[gpui::test]
+    fn the_rows_do_not_name_more_keys_than_the_keymap_holds(cx: &mut gpui::TestAppContext) {
+        cx.update(actions::bind_keys);
+        let held = cx.update(|cx| cx.key_bindings().borrow().bindings().len());
+
+        // A range like `1–9` stands for as many bindings as it names.
+        let named: usize = rows()
+            .iter()
+            .flat_map(|row| &row.alternatives)
+            .map(|keys| {
+                keys.last()
+                    .and_then(|cap| cap.split_once('\u{2013}'))
+                    .map_or(1, |(from, to)| {
+                        to.parse::<usize>().unwrap_or(0) - from.parse::<usize>().unwrap_or(0) + 1
+                    })
+            })
             .sum();
 
-        assert_eq!(shown, actions::shortcuts().len());
+        assert_eq!(named, held);
     }
 
     #[test]

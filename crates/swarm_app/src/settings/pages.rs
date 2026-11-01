@@ -8,7 +8,8 @@ use swarm_ui::prelude::*;
 use swarm_ui::styles::focus_ring;
 use swarm_ui::theme::{self, Appearance};
 
-use super::project::{List, Load, ProjectSettings, open_file};
+use super::open_file;
+use super::project::{List, Load, ProjectSettings};
 use super::{
     AGENTS, DELIVERY, IDLE_OPTIONS, NOTIFY_WHEN, PROJECT_MODES, PROJECT_NOTIFICATIONS, Page,
     SettingsState, SettingsWindow, delivery, delivery_mut, mode_index, notify_when,
@@ -681,7 +682,7 @@ impl SettingsWindow {
             .iter()
             .zip(&inputs.copy)
             .enumerate()
-            .fold(Panel::new(), |panel, (file_index, (file, input))| {
+            .fold(Panel::new(), |panel, (file_index, (file, row))| {
                 let remove = if file.trim().is_empty() {
                     "Remove empty row".to_owned()
                 } else {
@@ -689,7 +690,7 @@ impl SettingsWindow {
                 };
 
                 panel.row(list_row(
-                    input,
+                    &row.input,
                     ("copy-remove", file_index),
                     remove,
                     editable,
@@ -739,7 +740,7 @@ impl SettingsWindow {
             .iter()
             .zip(&inputs.checks)
             .enumerate()
-            .fold(Panel::new(), |panel, (check_index, (check, input))| {
+            .fold(Panel::new(), |panel, (check_index, (check, row))| {
                 let remove = if check.trim().is_empty() {
                     "Remove empty check".to_owned()
                 } else {
@@ -747,7 +748,7 @@ impl SettingsWindow {
                 };
 
                 panel.row(list_row(
-                    input,
+                    &row.input,
                     ("check-remove", check_index),
                     remove,
                     editable,

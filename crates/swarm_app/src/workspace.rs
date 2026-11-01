@@ -116,6 +116,9 @@ pub(crate) struct Workspace {
     pub(crate) cell_size: Option<(f32, f32)>,
     /// The font size `cell_size` was measured at, in points.
     pub(crate) font_size: f32,
+    /// Width and height of one cell at the default font size, once measured. Tiles are
+    /// sized in rows of this font, so a bigger font shows fewer rows in the same tile.
+    pub(crate) default_cell_size: Option<(f32, f32)>,
     pub(crate) daemon_launch: Option<DaemonLaunch>,
     pub(crate) reconnecting: bool,
     pub(crate) source: DataSource,
@@ -271,6 +274,7 @@ impl Workspace {
             previous_tabs: HashMap::new(),
             cell_size: None,
             font_size: swarm_term_view::DEFAULT_FONT_SIZE,
+            default_cell_size: None,
             daemon_launch: None,
             reconnecting: false,
             source,

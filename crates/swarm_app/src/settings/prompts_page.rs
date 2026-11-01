@@ -4,52 +4,23 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 
 use gpui::{
-    AnyElement, Context, Entity, FocusHandle, Global, Render, Role, SharedString, WeakEntity,
-    Window, div, px,
+    AnyElement, Context, Entity, FocusHandle, Render, Role, SharedString, WeakEntity, Window, div,
+    px,
 };
 use swarm_protocol::{Client, ClientError, PromptInfo, PromptLayer};
 use swarm_ui::prelude::*;
 
 use super::pages::{page_title, plain_row};
-use super::{Page, SettingsState, SettingsWindow};
+use super::{NOT_CONNECTED, Page, SettingsState, SettingsWindow, open_file};
+use crate::workspace::DataSource;
 
-/// Opens a file the way the system does for its type. A test records instead.
-trait FileOpener {
-    fn open(&self, path: &Path, cx: &mut App);
-}
-
-struct SystemOpener;
-
-impl FileOpener for SystemOpener {
-    fn open(&self, path: &Path, cx: &mut App) {
-        cx.open_with_system(path);
-    }
-}
-
-struct Opener(Rc<dyn FileOpener>);
-
-impl Global for Opener {}
-
-#[cfg(test)]
-fn use_opener(opener: Rc<dyn FileOpener>, cx: &mut App) {
-    cx.set_global(Opener(opener));
-}
-
-fn opener(cx: &App) -> Rc<dyn FileOpener> {
-    cx.try_global::<Opener>().map_or_else(
-        || Rc::new(SystemOpener) as Rc<dyn FileOpener>,
-        |opener| Rc::clone(&opener.0),
-    )
-}
-
-/// The prompts of the agents, for a window with no daemon behind it.
+/// The prompts of the agents, for a window with sample data.
 fn sample_prompts() -> Vec<PromptInfo> {
     let folder = Path::new("/Users/sam/.config/swarm/prompts");
 
-    ["orchestrator", "worker", "review", "pr", "commit"]
+    ["orchestrator", "worker", "start", "pr"]
         .into_iter()
         .map(|name| PromptInfo {
             name: name.to_owned(),
@@ -66,9 +37,12 @@ fn sample_prompts() -> Vec<PromptInfo> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Source {
-    /// No daemon answered: the list is made up and the buttons do nothing.
+    /// The window shows sample data: the list is made up and the buttons do nothing.
     Sample,
     Daemon,
+    /// The daemon is not connected: the list is what it last said, or empty, and the
+    /// buttons are off.
+    Offline,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -97,6 +71,8 @@ pub(super) struct PromptsPage {
     asking: Option<String>,
     /// An action is on its way to the daemon.
     busy: bool,
+    /// The daemon was connected when the page last looked.
+    connected: bool,
     handles: HashMap<(String, Control), FocusHandle>,
     cancel: FocusHandle,
     confirm: FocusHandle,
@@ -109,13 +85,14 @@ impl PromptsPage {
     pub(super) fn new(state: Entity<SettingsState>, cx: &mut Context<Self>) -> Self {
         Self {
             state,
-            prompts: sample_prompts(),
-            source: Source::Sample,
+            prompts: Vec::new(),
+            source: Source::Offline,
             revision: 0,
             list_error: None,
             action_error: None,
             asking: None,
             busy: false,
+            connected: false,
             handles: HashMap::new(),
             cancel: cx.focus_handle().tab_stop(true),
             confirm: cx.focus_handle().tab_stop(true),
@@ -135,14 +112,32 @@ impl PromptsPage {
             .filter(Client::is_connected)
     }
 
-    /// Reads the list again. Without a daemon the page shows the sample list.
+    /// The window shows sample data, or has no workspace behind it.
+    fn is_sample(&self, cx: &App) -> bool {
+        self.state
+            .read(cx)
+            .workspace
+            .as_ref()
+            .and_then(WeakEntity::upgrade)
+            .is_none_or(|workspace| workspace.read(cx).source == DataSource::Sample)
+    }
+
+    /// Reads the list again. Sample data shows the sample list. A daemon that is not
+    /// connected leaves the list as it was and turns the buttons off.
     pub(super) fn refresh(&mut self, cx: &mut Context<Self>) {
         let Some(client) = self.client(cx) else {
-            self.use_sample(cx);
+            self.connected = false;
+
+            if self.is_sample(cx) {
+                self.use_sample(cx);
+            } else {
+                self.use_offline(cx);
+            }
 
             return;
         };
 
+        self.connected = true;
         self.revision += 1;
         let revision = self.revision;
 
@@ -172,6 +167,30 @@ impl PromptsPage {
         self.list_error = None;
         self.asking = None;
         cx.notify();
+    }
+
+    fn use_offline(&mut self, cx: &mut Context<Self>) {
+        self.revision += 1;
+
+        if self.source == Source::Sample {
+            self.prompts.clear();
+        }
+
+        self.source = Source::Offline;
+        self.list_error = Some(NOT_CONNECTED.into());
+        self.asking = None;
+        self.wanted_after_listing = None;
+        cx.notify();
+    }
+
+    /// Reads the list when the daemon has just connected.
+    pub(super) fn reconnect(&mut self, cx: &mut Context<Self>) {
+        let now = self.client(cx).is_some();
+        let was = std::mem::replace(&mut self.connected, now);
+
+        if now && !was && self.source == Source::Offline {
+            self.refresh(cx);
+        }
     }
 
     fn listed(
@@ -204,11 +223,21 @@ impl PromptsPage {
         !self.busy && self.source == Source::Daemon && self.client(cx).is_some()
     }
 
+    /// The buttons are off while the daemon is out of reach. Sample data keeps them on.
+    fn controls_off(&self, cx: &App) -> bool {
+        match self.source {
+            Source::Sample => false,
+            Source::Offline => true,
+            Source::Daemon => self.client(cx).is_none(),
+        }
+    }
+
     /// Makes the user's copy of a built-in prompt and opens it.
     fn customize(&mut self, name: String, cx: &mut Context<Self>) {
         if !self.can_act(cx) {
             return;
         }
+
         let Some(client) = self.client(cx) else {
             return;
         };
@@ -241,7 +270,7 @@ impl PromptsPage {
 
         match result {
             Ok(path) => {
-                opener(cx).open(&path, cx);
+                open_file(&path, cx);
                 self.wanted_after_listing = Some(Wanted::Control(name, Control::Open));
             }
             Err(error) => {
@@ -267,7 +296,7 @@ impl PromptsPage {
 
         if let Some(path) = path {
             self.action_error = None;
-            opener(cx).open(&path, cx);
+            open_file(&path, cx);
             cx.notify();
         }
     }
@@ -300,9 +329,11 @@ impl PromptsPage {
         let Some(name) = self.asking.clone() else {
             return;
         };
+
         if !self.can_act(cx) {
             return;
         }
+
         let Some(client) = self.client(cx) else {
             return;
         };
@@ -377,9 +408,11 @@ impl PromptsPage {
     /// What sits at the end of a prompt's row: its buttons, or the question about its copy.
     fn controls(&mut self, prompt: &PromptInfo, cx: &mut Context<Self>) -> AnyElement {
         let name = prompt.name.clone();
+        let off = self.controls_off(cx);
 
         if self.asking.as_ref() == Some(&name) {
             let selector = format!("reset-{name}");
+            let page = cx.entity();
 
             let confirm = ConfirmRow::new(
                 format!("reset-confirm-{name}"),
@@ -391,6 +424,7 @@ impl PromptsPage {
             .track_focus(&self.cancel, &self.confirm)
             .debug_selector(move || selector)
             .on_cancel(cx.listener(|page, _, _, cx| page.cancel_reset(cx)))
+            .on_dismiss(move |_, cx| page.update(cx, PromptsPage::cancel_reset))
             .on_confirm(cx.listener(|page, _, _, cx| page.reset(cx)));
 
             return div().flex_1().min_w_0().child(confirm).into_any_element();
@@ -404,6 +438,7 @@ impl PromptsPage {
 
                 Button::new(selector.clone(), label)
                     .accessible_label(format!("{label} {name}"))
+                    .disabled(off)
                     .track_focus(&handle)
                     .debug_selector(move || selector)
                     .on_click(cx.listener(move |page, _, _, cx| match control {
@@ -496,11 +531,19 @@ impl SettingsWindow {
             self.prompts.update(cx, PromptsPage::refresh);
         }
     }
+
+    /// Reads the prompts when the daemon connects, while the Prompts page shows.
+    pub(super) fn reconnect_prompts(&self, cx: &mut Context<Self>) {
+        if self.page == Page::Prompts {
+            self.prompts.update(cx, PromptsPage::reconnect);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::rc::Rc;
     use std::sync::{Arc, Mutex};
 
     use gpui::{Modifiers, TestAppContext, VisualTestContext, WindowHandle, px, size};
@@ -509,6 +552,8 @@ mod tests {
     use super::*;
     use crate::actions::OpenSettings;
     use crate::daemon::tests::{fake_daemon_replying, redraw, setup, wait_until};
+    use crate::settings::use_opener;
+    use crate::workspace::Workspace;
 
     const FOLDER: &str = "/home/sam/.config/swarm/prompts";
 
@@ -594,24 +639,16 @@ mod tests {
         })
     }
 
-    #[derive(Default)]
-    struct Opened(RefCell<Vec<PathBuf>>);
-
-    impl FileOpener for Opened {
-        fn open(&self, path: &Path, _cx: &mut App) {
-            self.0.borrow_mut().push(path.to_owned());
-        }
-    }
-
     struct Fixture {
         settings: VisualTestContext,
         window: WindowHandle<SettingsWindow>,
-        opened: Rc<Opened>,
+        workspace: Entity<Workspace>,
+        opened: Rc<RefCell<Vec<PathBuf>>>,
     }
 
     impl Fixture {
         fn opened(&self) -> Vec<PathBuf> {
-            self.opened.0.borrow().clone()
+            self.opened.borrow().clone()
         }
 
         fn shown(&mut self, selector: &'static str) -> bool {
@@ -651,14 +688,33 @@ mod tests {
         }
     }
 
-    /// The Prompts page of a settings window opened from a workspace. With `daemon` the
-    /// workspace is connected to a fake daemon that knows these prompts.
+    /// The Prompts page of a settings window opened from a sample workspace. With `daemon`
+    /// the workspace is connected to a fake daemon that knows these prompts.
     fn open_page(cx: &mut TestAppContext, daemon: Option<&Shared>) -> Fixture {
-        let opened = Rc::new(Opened::default());
-        let recorder: Rc<dyn FileOpener> = Rc::clone(&opened) as Rc<dyn FileOpener>;
-        cx.update(|cx| use_opener(recorder, cx));
+        open_page_of(cx, daemon, DataSource::Sample)
+    }
+
+    /// A window of a workspace that is live, but has no daemon: the daemon is not up.
+    fn open_live_page(cx: &mut TestAppContext) -> Fixture {
+        open_page_of(cx, None, DataSource::Live)
+    }
+
+    fn open_page_of(
+        cx: &mut TestAppContext,
+        daemon: Option<&Shared>,
+        source: DataSource,
+    ) -> Fixture {
+        let opened = Rc::new(RefCell::new(Vec::<PathBuf>::new()));
+        let recorded = Rc::clone(&opened);
+        cx.update(|cx| {
+            use_opener(
+                Rc::new(move |path, _| recorded.borrow_mut().push(path.to_owned())),
+                cx,
+            );
+        });
 
         let (workspace, main) = setup(cx);
+        workspace.update(main, |workspace, _| workspace.source = source);
         if let Some(daemon) = daemon {
             main.executor().allow_parking();
             let client = Client::connect(&fake_daemon(daemon)).expect("connect to the fake daemon");
@@ -685,6 +741,7 @@ mod tests {
         Fixture {
             settings,
             window,
+            workspace,
             opened,
         }
     }
@@ -693,7 +750,7 @@ mod tests {
         shared(vec![
             prompt("orchestrator", PromptLayer::BuiltIn),
             prompt("worker", PromptLayer::User),
-            prompt("review", PromptLayer::BuiltIn),
+            prompt("start", PromptLayer::BuiltIn),
         ])
     }
 
@@ -702,14 +759,14 @@ mod tests {
         let daemon = three();
         let mut page = open_page(cx, Some(&daemon));
 
-        page.wait_for("layer-review-built-in");
+        page.wait_for("layer-start-built-in");
 
         for shown in [
             "layer-orchestrator-built-in",
             "layer-worker-yours",
-            "layer-review-built-in",
+            "layer-start-built-in",
             "customize-orchestrator",
-            "customize-review",
+            "customize-start",
             "open-worker",
             "reset-worker",
         ] {
@@ -863,11 +920,23 @@ mod tests {
     }
 
     #[gpui::test]
-    fn without_a_daemon_the_sample_list_shows_and_clicks_do_nothing(cx: &mut TestAppContext) {
+    fn sample_data_shows_the_real_prompt_names_and_clicks_do_nothing(cx: &mut TestAppContext) {
         let mut page = open_page(cx, None);
 
         page.wait_for("customize-orchestrator");
-        assert!(page.shown("layer-worker-yours"));
+        for shown in [
+            "layer-orchestrator-built-in",
+            "layer-worker-yours",
+            "layer-start-built-in",
+            "layer-pr-built-in",
+            "customize-start",
+            "customize-pr",
+        ] {
+            assert!(page.shown(shown), "{shown} is missing");
+        }
+        for made_up in ["customize-review", "customize-commit"] {
+            assert!(!page.shown(made_up), "{made_up} is not a prompt");
+        }
         page.click("customize-orchestrator");
         page.click("open-worker");
         page.click("reset-worker");
@@ -875,5 +944,141 @@ mod tests {
         assert!(page.opened().is_empty());
         assert!(!page.shown("reset-worker-confirm"));
         assert!(page.shown("customize-orchestrator"));
+        assert!(!page.shown("prompts-error"));
+    }
+
+    #[gpui::test]
+    fn a_live_workspace_without_a_daemon_shows_no_made_up_prompts(cx: &mut TestAppContext) {
+        let mut page = open_live_page(cx);
+
+        page.wait_for("prompts-error");
+
+        let message = page
+            .window
+            .read_with(&page.settings, |settings, cx| {
+                settings.prompts.read(cx).list_error.clone()
+            })
+            .expect("the window is open");
+        assert_eq!(
+            message.as_deref(),
+            Some("Not connected to the daemon"),
+            "the page says why it is empty"
+        );
+        for made_up in [
+            "customize-orchestrator",
+            "customize-worker",
+            "open-worker",
+            "customize-start",
+            "customize-pr",
+        ] {
+            assert!(!page.shown(made_up), "{made_up} is made up");
+        }
+    }
+
+    /// Focuses each tab stop in turn. Returns whether one of them is a button of the page.
+    fn tab_reaches_a_prompt_button(page: &mut Fixture) -> bool {
+        let handles: Vec<FocusHandle> = page
+            .window
+            .read_with(&page.settings, |settings, cx| {
+                settings
+                    .prompts
+                    .read(cx)
+                    .handles
+                    .values()
+                    .cloned()
+                    .collect()
+            })
+            .expect("the window is open");
+
+        (0..60).any(|_| {
+            page.settings.update(Window::focus_next);
+
+            page.settings
+                .update(|window, _| handles.iter().any(|handle| handle.is_focused(window)))
+        })
+    }
+
+    #[gpui::test]
+    fn when_the_daemon_goes_away_the_buttons_turn_off_and_the_page_says_why(
+        cx: &mut TestAppContext,
+    ) {
+        let daemon = three();
+        let mut page = open_page_of(cx, Some(&daemon), DataSource::Live);
+        page.wait_for("open-worker");
+        let before = tab_reaches_a_prompt_button(&mut page);
+
+        page.workspace
+            .update(&mut page.settings, |workspace, _| workspace.daemon = None);
+        page.come_back();
+        page.wait_for("prompts-error");
+        redraw(&mut page.settings);
+        let after = tab_reaches_a_prompt_button(&mut page);
+        page.click("customize-orchestrator");
+        page.click("reset-worker");
+
+        assert!(
+            before,
+            "a button of the page can take focus while connected"
+        );
+        assert!(!after, "a button took focus without the daemon");
+        assert!(page.shown("customize-orchestrator"), "the last list stays");
+        assert_eq!(
+            count(&daemon, |r| matches!(r, Request::CustomizePrompt { .. })),
+            0
+        );
+        assert!(!page.shown("reset-worker-confirm"));
+    }
+
+    #[gpui::test]
+    fn the_list_is_read_when_the_daemon_connects_later(cx: &mut TestAppContext) {
+        let daemon = three();
+        let mut page = open_live_page(cx);
+        page.wait_for("prompts-error");
+
+        let client = Client::connect(&fake_daemon(&daemon)).expect("connect to the fake daemon");
+        page.workspace.update(&mut page.settings, |workspace, cx| {
+            workspace.daemon = Some(client);
+            cx.notify();
+        });
+
+        page.wait_for("customize-orchestrator");
+        assert!(page.shown("open-worker"));
+        assert!(!page.shown("prompts-error"));
+        assert_eq!(count(&daemon, |r| matches!(r, Request::Prompts { .. })), 1);
+    }
+
+    #[gpui::test]
+    fn escape_cancels_the_question_and_gives_focus_back_to_reset(cx: &mut TestAppContext) {
+        let daemon = three();
+        let mut page = open_page(cx, Some(&daemon));
+
+        page.click("reset-worker");
+        assert!(page.shown("reset-worker-confirm"));
+        page.settings.simulate_keystrokes("escape");
+        redraw(&mut page.settings);
+
+        let reset_has_focus = page
+            .window
+            .read_with(&page.settings, |settings, cx| {
+                settings
+                    .prompts
+                    .read(cx)
+                    .handles
+                    .get(&("worker".to_owned(), Control::Reset))
+                    .cloned()
+            })
+            .expect("the window is open");
+
+        assert!(!page.shown("reset-worker-confirm"));
+        assert!(page.shown("open-worker"));
+        assert!(page.shown("reset-worker"));
+        assert!(
+            page.settings
+                .update(|window, _| reset_has_focus.is_some_and(|handle| handle.is_focused(window)))
+        );
+        assert_eq!(
+            count(&daemon, |r| matches!(r, Request::ResetPrompt { .. })),
+            0
+        );
     }
 }

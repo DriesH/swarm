@@ -8,18 +8,20 @@ mod terminals_page;
 mod usage_page;
 
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    App, Bounds, Context, Entity, FocusHandle, Global, KeyBinding, Pixels, Role, SharedString,
-    Size, Subscription, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowHandle,
-    WindowOptions, actions, div, px, size,
+    App, Bounds, Context, Entity, FocusHandle, Global, KeyBinding, Pixels, Role, ScrollHandle,
+    SharedString, Size, Subscription, TitlebarOptions, WeakEntity, Window, WindowBounds,
+    WindowHandle, WindowOptions, actions, div, point, px, size,
 };
 use swarm_settings::{CliSettings, NotificationSettings, ProjectMode, Settings};
 use swarm_ui::fonts::UI_FONT;
 use swarm_ui::prelude::*;
+use swarm_ui::styles::focus_ring;
 use swarm_ui::theme;
-use swarm_ui::{ROOT_CONTEXT, SelectNext, SelectPrevious, TextFieldSize};
+use swarm_ui::{ROOT_CONTEXT, SelectNext, SelectPrevious, TextFieldSize, scroll_for_key};
 
 use self::prompts_page::PromptsPage;
 use self::usage_page::UsagePage;
@@ -36,6 +38,11 @@ const NAV_CONTEXT: &str = "SettingsNav";
 
 /// Edits are saved once typing pauses this long.
 const SAVE_DELAY: Duration = Duration::from_millis(300);
+
+const NOT_CONNECTED: &str = "Not connected to the daemon";
+
+/// How far an arrow key scrolls a page without controls.
+const PAGE_LINE: Pixels = px(40.);
 
 const WINDOW_SIZE: Size<Pixels> = size(px(1280.), px(900.));
 const MIN_WINDOW_SIZE: Size<Pixels> = size(px(900.), px(600.));
@@ -352,6 +359,9 @@ pub(crate) struct SettingsWindow {
     inputs: Inputs,
     prompts: Entity<PromptsPage>,
     usage: Entity<UsagePage>,
+    /// Where a page without controls takes keyboard focus, to scroll with the keys.
+    page_focus: FocusHandle,
+    page_scroll: ScrollHandle,
     subscriptions: Vec<Subscription>,
 }
 
@@ -453,8 +463,9 @@ impl SettingsWindow {
                 // The user may come back from System Settings with a new answer.
                 if window.is_window_active() {
                     this.refresh_permission(cx);
-                    // The user edits the prompt files outside the app.
+                    // The user edits the prompt files and the project config outside the app.
                     this.refresh_prompts(cx);
+                    this.open_project(cx);
                 }
             }),
         ];
@@ -465,7 +476,10 @@ impl SettingsWindow {
             .as_ref()
             .and_then(WeakEntity::upgrade);
         if let Some(workspace) = workspace {
-            subscriptions.push(cx.observe(&workspace, |_, _, cx| cx.notify()));
+            subscriptions.push(cx.observe(&workspace, |this, _, cx| {
+                this.reconnect_prompts(cx);
+                cx.notify();
+            }));
         }
 
         let agents = state.read(cx).settings.agents.clone();
@@ -542,6 +556,8 @@ impl SettingsWindow {
             },
             prompts: cx.new(|cx| PromptsPage::new(state.clone(), cx)),
             usage: cx.new(|cx| UsagePage::new(state.clone(), cx)),
+            page_focus: cx.focus_handle().tab_stop(true),
+            page_scroll: ScrollHandle::new(),
             subscriptions,
         };
 
@@ -567,6 +583,7 @@ impl SettingsWindow {
 
     pub(crate) fn select_page(&mut self, page: Page, cx: &mut Context<Self>) {
         self.page = page;
+        self.page_scroll.set_offset(point(px(0.), px(0.)));
         self.refresh_permission(cx);
         self.refresh_prompts(cx);
         self.open_project(cx);
@@ -615,6 +632,7 @@ impl SettingsWindow {
         let next = self.page.nav_index().saturating_add_signed(step).min(last);
 
         self.page = Page::from_nav_index(next);
+        self.page_scroll.set_offset(point(px(0.), px(0.)));
         self.refresh_permission(cx);
         self.refresh_prompts(cx);
         self.open_project(cx);
@@ -723,10 +741,18 @@ impl SettingsWindow {
 impl Render for SettingsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
-        let (ground, panel, line, fg) = (colors.ground, colors.panel, colors.line, colors.fg);
+        let (ground, panel, line, fg, accent) = (
+            colors.ground,
+            colors.panel,
+            colors.line,
+            colors.fg,
+            colors.accent,
+        );
 
         let nav = self.nav(window, cx);
         let page = self.render_page(cx);
+        let scrolls_with_keys = matches!(self.page, Page::Keyboard | Page::Usage);
+        let scroll = self.page_scroll.clone();
         let gap_drag = drag_region("settings-gap-drag", window, cx);
         let page_drag = drag_region("settings-page-drag", window, cx);
 
@@ -779,9 +805,29 @@ impl Render for SettingsWindow {
                                     div()
                                         .id("settings-page")
                                         .debug_selector(|| "settings-page".to_owned())
+                                        .when(scrolls_with_keys, |page_area| {
+                                            let scroll = scroll.clone();
+
+                                            page_area
+                                                .role(Role::ScrollView)
+                                                .aria_label(self.page.title())
+                                                .track_focus(&self.page_focus)
+                                                .focus_visible(move |style| {
+                                                    focus_ring(style, accent)
+                                                })
+                                                .on_key_down(move |event, window, cx| {
+                                                    let key = event.keystroke.key.as_str();
+
+                                                    if scroll_for_key(&scroll, key, PAGE_LINE) {
+                                                        window.refresh();
+                                                        cx.stop_propagation();
+                                                    }
+                                                })
+                                        })
                                         .flex_1()
                                         .min_h_0()
                                         .overflow_y_scroll()
+                                        .track_scroll(&self.page_scroll)
                                         .child(
                                             v_flex()
                                                 .max_w(px(756.))
@@ -808,6 +854,31 @@ impl Global for Registry {}
 struct KeysBound;
 
 impl Global for KeysBound {}
+
+type Opener = Rc<dyn Fn(&Path, &mut App)>;
+
+struct OpenWith(Opener);
+
+impl Global for OpenWith {}
+
+/// Opens a file with the system's default app. This is the one place the settings pages
+/// open files, so a test can see which file would open.
+pub(crate) fn open_file(path: &Path, cx: &mut App) {
+    let opener = cx
+        .try_global::<OpenWith>()
+        .map(|opener| Rc::clone(&opener.0));
+
+    match opener {
+        Some(open) => open(path, cx),
+        None => cx.open_with_system(path),
+    }
+}
+
+/// Replaces the system call, so a test can see which file would open.
+#[cfg(test)]
+pub(crate) fn use_opener(opener: Opener, cx: &mut App) {
+    cx.set_global(OpenWith(opener));
+}
 
 fn bind_keys(cx: &mut App) {
     if cx.has_global::<KeysBound>() {
@@ -1019,7 +1090,6 @@ pub(crate) fn checks_changed(run: &swarm_protocol::ChecksRun, cx: &mut App) {
 
 #[cfg(feature = "snapshot")]
 pub(crate) fn snapshot(directory: PathBuf, cx: &mut App) {
-    use std::rc::Rc;
     use std::time::Duration;
 
     use gpui::{AnyWindowHandle, AsyncApp};
@@ -1162,8 +1232,6 @@ pub(crate) fn snapshot(directory: PathBuf, cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
-    use std::rc::Rc;
-
     use gpui::{Focusable, TestAppContext};
 
     use super::*;
@@ -1270,7 +1338,7 @@ mod tests {
 
         visual.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::none());
         visual.simulate_mouse_move(
-            start + gpui::point(px(6.), px(0.)),
+            start + point(px(6.), px(0.)),
             gpui::MouseButton::Left,
             gpui::Modifiers::none(),
         );
@@ -1738,6 +1806,126 @@ mod tests {
         assert_eq!(
             cx.update(|cx| theme::appearance(cx)),
             theme::Appearance::Dark
+        );
+    }
+
+    /// A short window on `page`, so the page is taller than the window.
+    fn short_page(
+        page: Page,
+        cx: &mut TestAppContext,
+    ) -> (WindowHandle<SettingsWindow>, gpui::VisualTestContext) {
+        cx.update(swarm_ui::init);
+        setup(cx);
+        let window = open_settings(cx);
+        window
+            .update(cx, |settings, _, cx| settings.select_page(page, cx))
+            .expect("window is open");
+
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(size(px(1280.), px(160.)));
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+
+        (window, visual)
+    }
+
+    /// Presses Tab until the page container has focus. Returns whether it ever did.
+    fn tab_to_the_page(
+        window: WindowHandle<SettingsWindow>,
+        visual: &mut gpui::VisualTestContext,
+    ) -> bool {
+        let focus = window
+            .read_with(visual, |settings, _| settings.page_focus.clone())
+            .expect("window is open");
+
+        (0..40).any(|_| {
+            visual.simulate_keystrokes("tab");
+
+            visual.update(|window, _| focus.is_focused(window))
+        })
+    }
+
+    fn top_of(selector: &'static str, visual: &mut gpui::VisualTestContext) -> f32 {
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+
+        visual
+            .debug_bounds(selector)
+            .map_or(f32::NAN, |bounds| f32::from(bounds.origin.y))
+    }
+
+    #[gpui::test]
+    fn the_keyboard_and_usage_pages_scroll_with_the_arrows_page_keys_home_and_end(
+        cx: &mut TestAppContext,
+    ) {
+        for (page, row) in [
+            (Page::Keyboard, "shortcut-open-settings"),
+            (Page::Usage, "popover-usage-claude"),
+        ] {
+            let (window, mut visual) = short_page(page, cx);
+            let reached = tab_to_the_page(window, &mut visual);
+
+            let start = top_of(row, &mut visual);
+            visual.simulate_keystrokes("down");
+            let one_line = top_of(row, &mut visual);
+            visual.simulate_keystrokes("pagedown");
+            let one_page = top_of(row, &mut visual);
+            visual.simulate_keystrokes("pageup");
+            let back = top_of(row, &mut visual);
+            visual.simulate_keystrokes("end");
+            let end = top_of(row, &mut visual);
+            visual.simulate_keystrokes("home");
+            let home = top_of(row, &mut visual);
+            visual.simulate_keystrokes("up");
+            let clamped = top_of(row, &mut visual);
+
+            assert!(reached, "{page:?}: Tab never reached the page");
+            assert!(
+                (one_line - (start - 40.)).abs() < 0.5,
+                "{page:?}: down moves a line"
+            );
+            assert!(
+                one_page < one_line - 40.,
+                "{page:?}: page down moves further"
+            );
+            assert!(back > one_page, "{page:?}: page up goes back");
+            assert!(end < one_page, "{page:?}: end goes to the bottom");
+            assert!((home - start).abs() < 0.5, "{page:?}: home goes to the top");
+            assert!(
+                (clamped - start).abs() < 0.5,
+                "{page:?}: it stops at the top"
+            );
+
+            visual.update(|window, _| window.remove_window());
+            visual.run_until_parked();
+        }
+    }
+
+    #[gpui::test]
+    fn a_page_with_controls_adds_no_stop_for_the_page_itself(cx: &mut TestAppContext) {
+        let (window, mut visual) = short_page(Page::Agents, cx);
+
+        assert!(!tab_to_the_page(window, &mut visual));
+    }
+
+    #[gpui::test]
+    fn a_page_opens_at_its_top(cx: &mut TestAppContext) {
+        let (window, mut visual) = short_page(Page::Keyboard, cx);
+        tab_to_the_page(window, &mut visual);
+        visual.simulate_keystrokes("end");
+
+        window
+            .update(&mut visual, |settings, _, cx| {
+                settings.select_page(Page::Usage, cx);
+            })
+            .expect("window is open");
+        let on_opening = top_of("popover-usage-claude", &mut visual);
+        tab_to_the_page(window, &mut visual);
+        visual.simulate_keystrokes("home");
+        let at_the_top = top_of("popover-usage-claude", &mut visual);
+
+        assert!(
+            (on_opening - at_the_top).abs() < 0.5,
+            "the page opened scrolled: {on_opening} against {at_the_top}"
         );
     }
 

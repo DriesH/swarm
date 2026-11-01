@@ -1,22 +1,20 @@
 //! Settings › Projects: a project's `.swarm/config.toml`, read and saved through the daemon.
 
-use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::path::PathBuf;
 
-use gpui::{App, Context, Entity, Focusable as _, Global, SharedString, Window};
+use gpui::{App, Context, Entity, Focusable as _, SharedString, Subscription, Window};
 use swarm_protocol::{
     ChecksRun, Client, ClientError, ProjectConfigFields, ProjectId as DaemonProjectId, PromptInfo,
     TaskId as DaemonTaskId,
 };
 use swarm_ui::prelude::*;
 
-use super::{Page, SAVE_DELAY, SettingsState, SettingsWindow, field};
+use super::{NOT_CONNECTED, Page, SAVE_DELAY, SettingsState, SettingsWindow, field};
 use crate::model::{Project, ProjectId, sample_checks_run};
 use crate::pull_request::run_is_over;
 use crate::review_comments::refusal;
 
 pub(super) const DEFAULT_BRANCH: &str = "Default branch";
-const NOT_CONNECTED: &str = "Not connected to the daemon";
 
 /// How a project's settings stand against its file.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -129,6 +127,11 @@ impl List {
             Self::Copy => "File to copy",
             Self::Checks => "Check",
         }
+    }
+
+    /// The name of the row at `index`, which VoiceOver reads: "Check 1", "Check 2".
+    fn row_label(self, index: usize) -> String {
+        format!("{} {}", self.label(), index + 1)
     }
 }
 
@@ -258,17 +261,24 @@ impl ProjectSettings {
         }
     }
 
-    /// Takes what the daemon read from the file.
+    /// Takes what the daemon read from the file. A list that holds the same entries as the
+    /// file keeps its blank rows, which the user has not filled yet.
     fn apply(&mut self, fields: ProjectConfigFields) {
         self.base_branch = fields.base_branch;
         self.worktree_folder = fields.worktree_folder;
         self.port_range = fields.port_range;
         self.ports_per_worktree = fields.ports_per_worktree.to_string();
-        self.copy_files = fields.copy;
         self.setup_script = fields.setup;
         self.teardown = fields.teardown;
-        self.checks = fields.checks;
         self.checks_required = fields.checks_required;
+
+        if filled(&self.copy_files) != fields.copy {
+            self.copy_files = fields.copy;
+        }
+
+        if filled(&self.checks) != fields.checks {
+            self.checks = fields.checks;
+        }
     }
 
     /// What a save sends, or why the page cannot be saved as it is. Blank entries in the
@@ -279,13 +289,6 @@ impl ProjectSettings {
             digits => digits
                 .parse()
                 .map_err(|_| SharedString::from("Ports per worktree is too large"))?,
-        };
-        let filled = |items: &[String]| -> Vec<String> {
-            items
-                .iter()
-                .map(|item| item.trim().to_owned())
-                .filter(|item| !item.is_empty())
-                .collect()
         };
 
         Ok(ProjectConfigFields {
@@ -302,14 +305,32 @@ impl ProjectSettings {
     }
 }
 
+/// The entries of a list that hold something, without the spaces around them.
+fn filled(items: &[String]) -> Vec<String> {
+    items
+        .iter()
+        .map(|item| item.trim().to_owned())
+        .filter(|item| !item.is_empty())
+        .collect()
+}
+
 /// What to do when a pause after an edit ends, or a save ends.
 #[derive(Debug, PartialEq, Eq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a Due is made, matched and dropped at once"
+)]
 enum Due {
     /// Nothing to send: a save is on its way, a newer pause runs, or there are no fields.
     Wait,
     /// The page matches what the daemon holds.
     Same,
-    Send(ProjectConfigFields),
+    /// `base` is the fields as the app last read or saved them. The daemon writes only the
+    /// fields of `fields` that differ from it, so a hand edit to another field stays.
+    Send {
+        base: ProjectConfigFields,
+        fields: ProjectConfigFields,
+    },
 }
 
 /// How the saves of one project stand. At most one save is on its way, and the fields it
@@ -326,7 +347,10 @@ pub(super) struct ProjectSave {
     pausing: bool,
     /// Cancels the pause when a newer edit restarts it.
     timer: Option<gpui::Task<()>>,
-    reading: bool,
+    /// Goes up with every edit.
+    edits: u64,
+    /// The count of `edits` when the read that is going started.
+    reading: Option<u64>,
 }
 
 impl ProjectSave {
@@ -343,6 +367,7 @@ impl ProjectSave {
 
         self.queued = Some(fields);
         self.pausing = true;
+        self.edits += 1;
 
         true
     }
@@ -352,6 +377,22 @@ impl ProjectSave {
         self.queued = None;
         self.pausing = false;
         self.timer = None;
+        self.edits += 1;
+    }
+
+    /// A read may start: none is going and no edit waits to be saved.
+    fn can_read(&self) -> bool {
+        self.reading.is_none() && !self.busy()
+    }
+
+    fn begin_read(&mut self) {
+        self.reading = Some(self.edits);
+    }
+
+    /// The read ended. Returns whether its answer is still the newest word: an answer that
+    /// began before an edit is older than the page, so the page keeps its value.
+    fn end_read(&mut self) -> bool {
+        self.reading.take() == Some(self.edits)
     }
 
     /// The pause is over.
@@ -367,17 +408,17 @@ impl ProjectSave {
             return Due::Wait;
         }
 
-        let Some(fields) = self.queued.clone() else {
+        let (Some(fields), Some(base)) = (self.queued.clone(), self.confirmed.clone()) else {
             return Due::Wait;
         };
 
-        if self.confirmed.as_ref() == Some(&fields) {
+        if base == fields {
             return Due::Same;
         }
 
         self.in_flight = true;
 
-        Due::Send(fields)
+        Due::Send { base, fields }
     }
 
     /// The save of `sent` ended. A newer value, if one waits, goes out now.
@@ -396,25 +437,32 @@ impl ProjectSave {
     }
 }
 
+/// One row of a list: its text field, and the subscription that writes the text into the
+/// state. The subscription ends with the row.
+pub(super) struct ListInput {
+    pub(super) input: Entity<TextInput>,
+    _subscription: Subscription,
+}
+
 /// The text fields of one project's page.
 pub(super) struct ProjectInputs {
     pub(super) worktree_folder: Entity<TextInput>,
     pub(super) port_range: Entity<TextInput>,
     pub(super) ports_per_worktree: Entity<TextInput>,
     pub(super) setup_script: Entity<TextArea>,
-    pub(super) copy: Vec<Entity<TextInput>>,
-    pub(super) checks: Vec<Entity<TextInput>>,
+    pub(super) copy: Vec<ListInput>,
+    pub(super) checks: Vec<ListInput>,
 }
 
 impl ProjectInputs {
-    fn list(&self, list: List) -> &Vec<Entity<TextInput>> {
+    fn list(&self, list: List) -> &Vec<ListInput> {
         match list {
             List::Copy => &self.copy,
             List::Checks => &self.checks,
         }
     }
 
-    fn list_mut(&mut self, list: List) -> &mut Vec<Entity<TextInput>> {
+    fn list_mut(&mut self, list: List) -> &mut Vec<ListInput> {
         match list {
             List::Copy => &mut self.copy,
             List::Checks => &mut self.checks,
@@ -512,9 +560,8 @@ impl SettingsState {
         cx: &mut Context<Self>,
     ) -> Option<(Client, DaemonProjectId)> {
         let daemon = self.projects.get(index)?.project.daemon?;
-        let save = self.saves.get(index)?;
 
-        if save.reading || save.busy() {
+        if !self.saves.get(index)?.can_read() {
             return None;
         }
 
@@ -532,7 +579,7 @@ impl SettingsState {
             entry.load = Load::Loading;
         }
 
-        self.saves.get_mut(index)?.reading = true;
+        self.saves.get_mut(index)?.begin_read();
         cx.notify();
 
         Some((client, daemon))
@@ -545,10 +592,8 @@ impl SettingsState {
             return false;
         };
 
-        save.reading = false;
-
         // An edit was made while the read ran. The read is older than the edit.
-        if save.busy() {
+        if !save.end_read() {
             return false;
         }
 
@@ -661,11 +706,17 @@ impl SettingsState {
                     cx.notify();
                 }
             }
-            Due::Send(fields) => self.send(id, fields, cx),
+            Due::Send { base, fields } => self.send(id, base, fields, cx),
         }
     }
 
-    fn send(&mut self, id: ProjectId, fields: ProjectConfigFields, cx: &mut Context<Self>) {
+    fn send(
+        &mut self,
+        id: ProjectId,
+        base: ProjectConfigFields,
+        fields: ProjectConfigFields,
+        cx: &mut Context<Self>,
+    ) {
         let Some(index) = self.index_of(id) else {
             return;
         };
@@ -684,7 +735,6 @@ impl SettingsState {
         };
 
         let sent = fields.clone();
-        let base = fields.clone();
         let saving =
             cx.background_spawn(async move { client.save_project_config(daemon, base, fields) });
 
@@ -797,11 +847,13 @@ impl SettingsState {
     }
 
     pub(crate) fn can_run_checks(&self, index: usize, cx: &App) -> bool {
-        let Some(entry) = self.projects.get(index) else {
+        let (Some(entry), Some(save)) = (self.projects.get(index), self.saves.get(index)) else {
             return false;
         };
 
-        !entry.checking.busy()
+        // The daemon runs the checks of the file, so an edit not saved yet would be missed.
+        !save.busy()
+            && !entry.checking.busy()
             && (entry.load == Load::Sample || self.checks_task(index, cx).is_some())
     }
 
@@ -909,30 +961,6 @@ impl SettingsState {
             cx.notify();
         }
     }
-}
-
-type Opener = Rc<dyn Fn(&Path, &mut App)>;
-
-struct OpenWith(Opener);
-
-impl Global for OpenWith {}
-
-/// Opens a file with the system's default app.
-pub(super) fn open_file(path: &Path, cx: &mut App) {
-    let opener = cx
-        .try_global::<OpenWith>()
-        .map(|opener| Rc::clone(&opener.0));
-
-    match opener {
-        Some(open) => open(path, cx),
-        None => cx.open_with_system(path),
-    }
-}
-
-/// Replaces the system call, so a test can see which file would open.
-#[cfg(test)]
-pub(super) fn use_opener(opener: Opener, cx: &mut App) {
-    cx.set_global(OpenWith(opener));
 }
 
 impl SettingsWindow {
@@ -1047,8 +1075,8 @@ impl SettingsWindow {
             },
         ));
 
-        let copy = self.list_inputs(index, List::Copy, &project.copy_files, cx);
-        let checks = self.list_inputs(index, List::Checks, &project.checks, cx);
+        let copy = Self::list_inputs(index, List::Copy, &project.copy_files, cx);
+        let checks = Self::list_inputs(index, List::Checks, &project.checks, cx);
 
         Some(ProjectInputs {
             worktree_folder,
@@ -1061,51 +1089,63 @@ impl SettingsWindow {
     }
 
     fn list_inputs(
-        &mut self,
         project: usize,
         list: List,
         items: &[String],
         cx: &mut Context<Self>,
-    ) -> Vec<Entity<TextInput>> {
+    ) -> Vec<ListInput> {
         items
             .iter()
-            .map(|item| self.list_input(project, list, item, cx))
+            .enumerate()
+            .map(|(index, item)| Self::list_input(project, list, index, item, cx))
             .collect()
     }
 
     fn list_input(
-        &mut self,
         project: usize,
         list: List,
+        index: usize,
         text: &str,
         cx: &mut Context<Self>,
-    ) -> Entity<TextInput> {
-        let input = field(list.label(), text, true, cx);
+    ) -> ListInput {
+        let input = field(list.row_label(index), text, true, cx);
 
-        self.subscriptions.push(cx.subscribe(
-            &input,
-            move |this, input, event: &TextInputEvent, cx| {
-                let TextInputEvent::Changed(text) = event else {
-                    return;
-                };
+        let subscription = cx.subscribe(&input, move |this, input, event: &TextInputEvent, cx| {
+            let TextInputEvent::Changed(text) = event else {
+                return;
+            };
 
-                let index = this.inputs.projects.get(project).and_then(|inputs| {
-                    inputs
-                        .list(list)
-                        .iter()
-                        .position(|candidate| *candidate == input)
+            let index = this.inputs.projects.get(project).and_then(|inputs| {
+                inputs
+                    .list(list)
+                    .iter()
+                    .position(|candidate| candidate.input == input)
+            });
+
+            if let Some(index) = index {
+                let text = text.to_string();
+                this.state.update(cx, |state, cx| {
+                    state.set_item(project, list, index, text, cx);
                 });
+            }
+        });
 
-                if let Some(index) = index {
-                    let text = text.to_string();
-                    this.state.update(cx, |state, cx| {
-                        state.set_item(project, list, index, text, cx);
-                    });
-                }
-            },
-        ));
+        ListInput {
+            input,
+            _subscription: subscription,
+        }
+    }
 
-        input
+    /// Names the rows of a list by their place, so a removed row does not leave a gap.
+    fn name_rows(&self, project: usize, list: List, cx: &mut Context<Self>) {
+        let Some(inputs) = self.inputs.projects.get(project) else {
+            return;
+        };
+
+        for (index, row) in inputs.list(list).iter().enumerate() {
+            row.input
+                .update(cx, |input, cx| input.set_label(list.row_label(index), cx));
+        }
     }
 
     /// Adds an empty row and moves focus to it.
@@ -1116,11 +1156,16 @@ impl SettingsWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let input = self.list_input(project, list, "", cx);
-        let focus = input.read(cx).focus_handle(cx);
+        let next = self
+            .inputs
+            .projects
+            .get(project)
+            .map_or(0, |inputs| inputs.list(list).len());
+        let row = Self::list_input(project, list, next, "", cx);
+        let focus = row.input.read(cx).focus_handle(cx);
 
         if let Some(inputs) = self.inputs.projects.get_mut(project) {
-            inputs.list_mut(list).push(input);
+            inputs.list_mut(list).push(row);
         }
 
         self.state
@@ -1141,6 +1186,7 @@ impl SettingsWindow {
             inputs.list_mut(list).remove(index);
         }
 
+        self.name_rows(project, list, cx);
         self.state
             .update(cx, |state, cx| state.remove_item(project, list, index, cx));
     }
@@ -1204,11 +1250,11 @@ impl SettingsWindow {
         let shown: Vec<String> = inputs
             .list(list)
             .iter()
-            .map(|input| input.read(cx).text().to_string())
+            .map(|row| row.input.read(cx).text().to_string())
             .collect();
 
         if shown != items {
-            let rebuilt = self.list_inputs(project, list, items, cx);
+            let rebuilt = Self::list_inputs(project, list, items, cx);
 
             if let Some(inputs) = self.inputs.projects.get_mut(project) {
                 *inputs.list_mut(list) = rebuilt;
@@ -1216,8 +1262,9 @@ impl SettingsWindow {
         }
 
         if let Some(inputs) = self.inputs.projects.get(project) {
-            for input in inputs.list(list) {
-                input.update(cx, |input, cx| input.set_disabled(!editable, cx));
+            for row in inputs.list(list) {
+                row.input
+                    .update(cx, |input, cx| input.set_disabled(!editable, cx));
             }
         }
     }
@@ -1226,6 +1273,7 @@ impl SettingsWindow {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::path::Path;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1239,7 +1287,7 @@ mod tests {
     use crate::daemon::tests::{
         fake_daemon_replying, project_info, redraw, task_info, wait_a_little, wait_until,
     };
-    use crate::settings::{link_workspace, open_window};
+    use crate::settings::{link_workspace, open_window, use_opener};
     use crate::workspace::Workspace;
 
     type Requests = Arc<Mutex<Vec<Request>>>;
@@ -1284,6 +1332,25 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn bases(seen: &Requests) -> Vec<ProjectConfigFields> {
+        seen.lock()
+            .expect("lock the requests")
+            .iter()
+            .filter_map(|request| match request {
+                Request::SaveProjectConfig { base, .. } => Some(base.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Where in the requests the first one that `matching` accepts stands.
+    fn place(seen: &Requests, matching: impl Fn(&Request) -> bool) -> Option<usize> {
+        seen.lock()
+            .expect("lock the requests")
+            .iter()
+            .position(matching)
     }
 
     fn run_requests(seen: &Requests) -> Vec<DaemonTaskId> {
@@ -1577,9 +1644,9 @@ mod tests {
             .window
             .read_with(&rig.cx, |settings, cx| {
                 let inputs = &settings.inputs.projects[0];
-                let read = |list: &Vec<Entity<TextInput>>| -> Vec<String> {
+                let read = |list: &Vec<ListInput>| -> Vec<String> {
                     list.iter()
-                        .map(|input| input.read(cx).text().to_string())
+                        .map(|row| row.input.read(cx).text().to_string())
                         .collect()
                 };
 
@@ -1661,6 +1728,10 @@ mod tests {
         }
     }
 
+    fn send(base: ProjectConfigFields, fields: ProjectConfigFields) -> Due {
+        Due::Send { base, fields }
+    }
+
     fn confirmed(fields: ProjectConfigFields) -> ProjectSave {
         ProjectSave {
             confirmed: Some(fields.clone()),
@@ -1679,9 +1750,9 @@ mod tests {
         let held_back = save.due();
         let after = save.ended(&with_folder(".a"), true);
 
-        assert_eq!(first, Due::Send(with_folder(".a")));
+        assert_eq!(first, send(fields(), with_folder(".a")));
         assert_eq!(held_back, Due::Wait);
-        assert_eq!(after, Due::Send(with_folder(".b")));
+        assert_eq!(after, send(with_folder(".a"), with_folder(".b")));
         assert_eq!(save.ended(&with_folder(".b"), true), Due::Wait);
         assert_eq!(save.confirmed, Some(with_folder(".b")));
     }
@@ -1696,7 +1767,7 @@ mod tests {
 
         // The save of ".a" ends while the pause of ".b" still runs.
         assert_eq!(save.ended(&with_folder(".a"), true), Due::Wait);
-        assert_eq!(save.due(), Due::Send(with_folder(".b")));
+        assert_eq!(save.due(), send(with_folder(".a"), with_folder(".b")));
     }
 
     #[test]
@@ -1709,10 +1780,10 @@ mod tests {
         let same_again = save.edited(with_folder("/bad"));
         save.edited(with_folder(".fine"));
 
-        assert_eq!(sent, Due::Send(with_folder("/bad")));
+        assert_eq!(sent, send(fields(), with_folder("/bad")));
         assert_eq!(after_refusal, Due::Wait);
         assert!(!same_again);
-        assert_eq!(save.due(), Due::Send(with_folder(".fine")));
+        assert_eq!(save.due(), send(fields(), with_folder(".fine")));
         assert_eq!(save.confirmed, Some(fields()));
     }
 
@@ -1735,7 +1806,367 @@ mod tests {
         save.edited(fields());
         save.due();
 
-        assert_eq!(save.ended(&with_folder(".a"), true), Due::Send(fields()));
+        assert_eq!(
+            save.ended(&with_folder(".a"), true),
+            send(with_folder(".a"), fields())
+        );
+    }
+
+    #[test]
+    fn a_save_names_the_last_saved_fields_as_its_base_and_a_refusal_changes_nothing() {
+        let mut save = confirmed(fields());
+
+        save.edited(with_folder(".a"));
+        let first = save.due();
+        save.ended(&with_folder(".a"), true);
+        save.edited(with_folder("/bad"));
+        let refused = save.due();
+        save.ended(&with_folder("/bad"), false);
+        save.edited(with_folder(".b"));
+
+        assert_eq!(first, send(fields(), with_folder(".a")));
+        assert_eq!(refused, send(with_folder(".a"), with_folder("/bad")));
+        assert_eq!(save.due(), send(with_folder(".a"), with_folder(".b")));
+    }
+
+    #[test]
+    fn nothing_is_sent_before_the_page_was_read() {
+        let mut save = ProjectSave::default();
+
+        save.edited(with_folder(".a"));
+
+        assert_eq!(save.due(), Due::Wait);
+    }
+
+    #[test]
+    fn a_read_that_began_before_an_edit_is_out_of_date_even_after_the_edit_was_saved() {
+        let mut save = confirmed(fields());
+
+        save.begin_read();
+        save.edited(with_folder(".a"));
+        save.due();
+        save.ended(&with_folder(".a"), true);
+
+        assert!(!save.busy());
+        assert!(!save.end_read());
+    }
+
+    #[test]
+    fn a_read_with_no_edit_meanwhile_is_current() {
+        let mut save = confirmed(fields());
+
+        save.begin_read();
+
+        assert!(save.end_read());
+        assert!(save.can_read());
+    }
+
+    #[test]
+    fn a_read_waits_for_a_pause_a_save_and_another_read() {
+        let mut save = confirmed(fields());
+
+        save.edited(with_folder(".a"));
+        let during_pause = save.can_read();
+        save.due();
+        let during_save = save.can_read();
+        save.ended(&with_folder(".a"), true);
+        let after = save.can_read();
+        save.begin_read();
+
+        assert!(!during_pause && !during_save);
+        assert!(after);
+        assert!(!save.can_read());
+    }
+
+    #[test]
+    fn fields_that_cannot_be_saved_count_as_an_edit_for_a_read() {
+        let mut save = confirmed(fields());
+
+        save.begin_read();
+        save.invalid();
+
+        assert!(!save.end_read());
+    }
+
+    #[gpui::test]
+    fn a_save_sends_the_loaded_fields_as_its_base_and_the_next_one_the_saved_fields(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut rig, seen) = loaded(cx);
+
+        rig.edit_folder(".a");
+        rig.pause(Duration::from_millis(300));
+        assert!(rig.wait_for_requests(&seen, |seen| save_count(seen) == 1));
+        assert!(rig.wait_until_saved());
+
+        rig.edit_folder(".b");
+        rig.pause(Duration::from_millis(300));
+        let second = rig.wait_for_requests(&seen, |seen| save_count(seen) == 2);
+
+        assert!(second);
+        assert_eq!(bases(&seen), [fields(), with_folder(".a")]);
+        assert_eq!(saves(&seen), [with_folder(".a"), with_folder(".b")]);
+    }
+
+    #[gpui::test]
+    fn a_base_stays_the_loaded_fields_after_a_refusal(cx: &mut TestAppContext) {
+        let (socket, seen) = daemon(|request| match request {
+            Request::SaveProjectConfig { call, fields, .. } if fields.worktree_folder == "/bad" => {
+                Some(refusal_event(*call, "the worktree folder must be inside"))
+            }
+            other => project_reply(other),
+        });
+        let mut rig = rig(&socket, vec![task_info(7, 5, "login")], Vec::new(), cx);
+        rig.show(0);
+        assert!(rig.wait_for_project(|project| project.load == Load::Ready));
+
+        rig.edit_folder("/bad");
+        rig.pause(Duration::from_millis(300));
+        assert!(rig.wait_for_project(|project| project.refusal.is_some()));
+        rig.edit_folder(".fine");
+        rig.pause(Duration::from_millis(300));
+        assert!(rig.wait_for_requests(&seen, |seen| save_count(seen) == 2));
+
+        assert_eq!(bases(&seen), [fields(), fields()]);
+    }
+
+    /// A daemon whose config the test can change, as a hand edit would.
+    fn file_on_disk() -> (PathBuf, Requests, Arc<Mutex<ProjectConfigFields>>) {
+        let on_disk = Arc::new(Mutex::new(fields()));
+        let answer = Arc::clone(&on_disk);
+        let (socket, seen) = daemon(move |request| {
+            let config = answer.lock().expect("lock the file").clone();
+
+            config_reply(request, config)
+        });
+
+        (socket, seen, on_disk)
+    }
+
+    fn config_requests(seen: &Requests) -> usize {
+        count(seen, |request| {
+            matches!(request, Request::ProjectConfig { .. })
+        })
+    }
+
+    impl Rig {
+        /// The window loses focus and gets it back, as when the user edits the file in an
+        /// editor.
+        fn come_back(&mut self) {
+            self.cx.deactivate_window();
+            self.cx.update(|window, _| window.activate_window());
+            self.cx.run_until_parked();
+        }
+
+        fn list_labels(&self, list: List) -> Vec<String> {
+            self.window
+                .read_with(&self.cx, |settings, cx| {
+                    settings.inputs.projects[0]
+                        .list(list)
+                        .iter()
+                        .map(|row| row.input.read(cx).label().to_string())
+                        .collect()
+                })
+                .expect("the settings window is open")
+        }
+
+        fn subscription_count(&self) -> usize {
+            self.window
+                .read_with(&self.cx, |settings, _| settings.subscriptions.len())
+                .expect("the settings window is open")
+        }
+    }
+
+    #[gpui::test]
+    fn a_hand_edit_shows_when_the_window_comes_back(cx: &mut TestAppContext) {
+        let (socket, seen, on_disk) = file_on_disk();
+        let mut rig = rig(&socket, vec![task_info(7, 5, "login")], Vec::new(), cx);
+        rig.show(0);
+        assert!(rig.wait_for_project(|project| project.load == Load::Ready));
+
+        on_disk.lock().expect("lock the file").worktree_folder = ".by-hand".to_owned();
+        rig.come_back();
+        let shown = rig.wait_for_project(|project| project.worktree_folder == ".by-hand");
+        let folder = rig.input(|inputs| inputs.worktree_folder.clone());
+
+        assert!(shown);
+        assert_eq!(rig.text_of(&folder), ".by-hand");
+        assert_eq!(config_requests(&seen), 2);
+    }
+
+    #[gpui::test]
+    fn the_page_is_not_read_again_while_an_edit_waits_or_is_on_its_way(cx: &mut TestAppContext) {
+        let (socket, seen, _on_disk) = file_on_disk();
+        let mut rig = rig(&socket, vec![task_info(7, 5, "login")], Vec::new(), cx);
+        rig.show(0);
+        assert!(rig.wait_for_project(|project| project.load == Load::Ready));
+
+        rig.edit_folder(".typed");
+        rig.come_back();
+        let waiting = config_requests(&seen);
+        rig.pause(Duration::from_millis(300));
+        assert!(rig.wait_for_requests(&seen, |seen| save_count(seen) == 1));
+        assert!(rig.wait_until_saved());
+
+        assert_eq!(waiting, 1);
+        assert_eq!(rig.project().worktree_folder, ".typed");
+        assert_eq!(config_requests(&seen), 1);
+    }
+
+    #[gpui::test]
+    fn a_hand_edit_to_one_field_is_not_sent_back_by_a_save_of_another(cx: &mut TestAppContext) {
+        let (socket, seen, on_disk) = file_on_disk();
+        let mut rig = rig(&socket, vec![task_info(7, 5, "login")], Vec::new(), cx);
+        rig.show(0);
+        assert!(rig.wait_for_project(|project| project.load == Load::Ready));
+
+        on_disk.lock().expect("lock the file").port_range = "7000-7009".to_owned();
+        rig.come_back();
+        assert!(rig.wait_for_project(|project| project.port_range == "7000-7009"));
+        rig.edit_folder(".new");
+        rig.pause(Duration::from_millis(300));
+        assert!(rig.wait_for_requests(&seen, |seen| save_count(seen) == 1));
+
+        let base = bases(&seen).remove(0);
+        let sent = saves(&seen).remove(0);
+        assert_eq!(base.port_range, "7000-7009");
+        assert_eq!(sent.port_range, "7000-7009");
+        assert_eq!(sent.worktree_folder, ".new");
+    }
+
+    #[gpui::test]
+    fn a_slow_reload_does_not_undo_an_edit_that_was_saved_meanwhile(cx: &mut TestAppContext) {
+        let (mut rig, seen) = loaded(cx);
+        let started = rig
+            .state
+            .update(&mut rig.cx, |state, cx| state.begin_load(0, cx));
+
+        rig.edit_folder(".saved-meanwhile");
+        rig.pause(Duration::from_millis(300));
+        assert!(rig.wait_for_requests(&seen, |seen| save_count(seen) == 1));
+        assert!(rig.wait_until_saved());
+        let stale = Loaded {
+            config: Ok((fields(), None)),
+            branches: None,
+            prompts: None,
+        };
+        let applied = rig
+            .state
+            .update(&mut rig.cx, |state, cx| state.finish_load(0, stale, cx));
+        redraw(&mut rig.cx);
+
+        assert!(started.is_some());
+        assert!(!applied);
+        assert_eq!(rig.project().worktree_folder, ".saved-meanwhile");
+        let folder = rig.input(|inputs| inputs.worktree_folder.clone());
+        assert_eq!(rig.text_of(&folder), ".saved-meanwhile");
+    }
+
+    #[gpui::test]
+    fn a_blank_row_the_user_added_survives_a_reload(cx: &mut TestAppContext) {
+        let (socket, seen, _on_disk) = file_on_disk();
+        let mut rig = rig(&socket, vec![task_info(7, 5, "login")], Vec::new(), cx);
+        rig.show(0);
+        assert!(rig.wait_for_project(|project| project.load == Load::Ready));
+
+        rig.click("add-check");
+        rig.come_back();
+        assert!(rig.wait_for_requests(&seen, |seen| config_requests(seen) == 2));
+        rig.pause(Duration::from_millis(300));
+        redraw(&mut rig.cx);
+
+        assert_eq!(rig.project().checks, ["make test", "make lint", ""]);
+        assert_eq!(rig.list_labels(List::Checks).len(), 3);
+        assert_eq!(save_count(&seen), 0);
+    }
+
+    #[gpui::test]
+    fn rows_are_named_by_their_place_in_the_list(cx: &mut TestAppContext) {
+        let (mut rig, _seen) = loaded(cx);
+        let start = (rig.list_labels(List::Copy), rig.list_labels(List::Checks));
+
+        rig.click("add-check");
+        let added = rig.list_labels(List::Checks);
+        rig.click("check-remove-0");
+        let removed = rig.list_labels(List::Checks);
+
+        assert_eq!(start.0, ["File to copy 1", "File to copy 2"]);
+        assert_eq!(start.1, ["Check 1", "Check 2"]);
+        assert_eq!(added, ["Check 1", "Check 2", "Check 3"]);
+        assert_eq!(removed, ["Check 1", "Check 2"]);
+        assert_eq!(rig.project().checks, ["make lint", ""]);
+    }
+
+    #[gpui::test]
+    fn rebuilding_the_rows_of_a_list_does_not_pile_up_subscriptions(cx: &mut TestAppContext) {
+        let (socket, seen, on_disk) = file_on_disk();
+        let mut rig = rig(&socket, vec![task_info(7, 5, "login")], Vec::new(), cx);
+        rig.show(0);
+        assert!(rig.wait_for_project(|project| project.load == Load::Ready));
+        let before = rig.subscription_count();
+
+        for round in 1..=3 {
+            on_disk.lock().expect("lock the file").checks = vec![format!("check {round}")];
+            rig.come_back();
+            let wanted = round + 1;
+            assert!(rig.wait_for_requests(&seen, |seen| config_requests(seen) == wanted));
+            assert!(rig.wait_for_project(|project| project.checks == [format!("check {round}")]));
+        }
+
+        assert_eq!(rig.subscription_count(), before);
+        assert_eq!(rig.list_labels(List::Checks), ["Check 1"]);
+    }
+
+    #[gpui::test]
+    fn typing_in_a_rebuilt_row_edits_that_row_once(cx: &mut TestAppContext) {
+        let (socket, seen, on_disk) = file_on_disk();
+        let mut rig = rig(&socket, vec![task_info(7, 5, "login")], Vec::new(), cx);
+        rig.show(0);
+        assert!(rig.wait_for_project(|project| project.load == Load::Ready));
+        on_disk.lock().expect("lock the file").checks = vec!["one".to_owned(), "two".to_owned()];
+        rig.come_back();
+        assert!(rig.wait_for_project(|project| project.checks == ["one", "two"]));
+
+        let second = rig.input(|inputs| inputs.checks[1].input.clone());
+        rig.type_into(&second, "three");
+        rig.pause(Duration::from_millis(300));
+        assert!(rig.wait_for_requests(&seen, |seen| save_count(seen) == 1));
+
+        assert_eq!(rig.project().checks, ["one", "three"]);
+        assert_eq!(saves(&seen)[0].checks, ["one", "three"]);
+    }
+
+    #[gpui::test]
+    fn run_checks_now_waits_for_an_edit_that_is_not_saved_yet(cx: &mut TestAppContext) {
+        let (mut rig, seen) = loaded(cx);
+
+        rig.edit_folder(".before-the-run");
+        let during_pause = rig
+            .state
+            .read_with(&rig.cx, |state, cx| state.can_run_checks(0, cx));
+        rig.click("run-checks");
+        let early = run_requests(&seen).len();
+        rig.pause(Duration::from_millis(300));
+        assert!(rig.wait_for_requests(&seen, |seen| save_count(seen) == 1));
+        assert!(rig.wait_until_saved());
+        redraw(&mut rig.cx);
+        let after = rig
+            .state
+            .read_with(&rig.cx, |state, cx| state.can_run_checks(0, cx));
+
+        rig.click("run-checks");
+        assert!(rig.wait_for_requests(&seen, |seen| !run_requests(seen).is_empty()));
+        let saved_at = place(&seen, |request| {
+            matches!(request, Request::SaveProjectConfig { .. })
+        });
+        let ran_at = place(&seen, |request| {
+            matches!(request, Request::RunChecks { .. })
+        });
+
+        assert!(!during_pause);
+        assert_eq!(early, 0);
+        assert!(after);
+        assert!(saved_at < ran_at, "{saved_at:?} {ran_at:?}");
     }
 
     #[gpui::test]

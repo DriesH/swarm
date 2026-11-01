@@ -31,7 +31,7 @@ const SETUP_TITLE: &str = "Setup";
 const DAEMON_BINARY: &str = "swarm-daemon";
 /// The tile's header, border and body padding.
 pub(crate) const CHROME_WIDTH: f32 = 26.;
-pub(crate) const CHROME_HEIGHT: f32 = 66.;
+pub(crate) const CHROME_HEIGHT: f32 = 56.;
 const FALLBACK_GRID: (u16, u16) = (100, 30);
 /// How often the app checks that the daemon connection is alive.
 const WATCH_INTERVAL: Duration = Duration::from_secs(1);
@@ -1380,10 +1380,15 @@ impl Workspace {
         self.data.update_process(terminal, &title, info);
     }
 
-    /// Reads the cell size of the terminal font, to size tiles in cells. A new font size in
-    /// the settings measures again and reaches every terminal view, so a tile keeps its
-    /// pixels and gets more or fewer columns and rows.
+    /// Reads the cell size of the terminal font, and of the default font that sizes the
+    /// tiles. A new font size in the settings measures the font again and reaches every
+    /// terminal view, so a tile keeps its pixels and gets more or fewer columns and rows.
     pub(crate) fn measure_cells(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.default_cell_size.is_none() {
+            let size = TerminalView::cell_size(swarm_term_view::DEFAULT_FONT_SIZE, window, cx);
+            self.default_cell_size = Some((f32::from(size.width), f32::from(size.height)));
+        }
+
         let points = crate::settings::terminal_font_size(cx);
 
         if self.cell_size.is_some() && (self.font_size - points).abs() < f32::EPSILON {

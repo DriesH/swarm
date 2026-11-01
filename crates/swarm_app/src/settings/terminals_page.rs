@@ -1,7 +1,7 @@
 //! Settings › Terminals: the font size of every terminal.
 
 use gpui::{AnyElement, px};
-use swarm_settings::{FONT_SIZE_DEFAULT, FONT_SIZE_MAX, FONT_SIZE_MIN, clamp_font_size};
+use swarm_settings::{FONT_SIZE_DEFAULT, FONT_SIZE_MAX, FONT_SIZE_MIN};
 use swarm_ui::prelude::*;
 
 use super::SettingsWindow;
@@ -26,7 +26,7 @@ impl SettingsWindow {
             let points = u8::try_from(value).unwrap_or(FONT_SIZE_DEFAULT);
 
             state.update(cx, |state, cx| {
-                state.settings.terminals.font_size = clamp_font_size(points);
+                state.settings.terminals.font_size = points;
                 cx.notify();
             });
         });
@@ -58,7 +58,7 @@ mod tests {
     };
     use crate::daemon::tests::{redraw, setup};
     use crate::model::TerminalId;
-    use crate::views::layout_style;
+    use crate::views::{layout_style, tile_grid};
     use crate::workspace::Workspace;
 
     fn temp_path(name: &str) -> PathBuf {
@@ -118,6 +118,40 @@ mod tests {
         assert!(text.contains("font_size = 14"), "{text}");
     }
 
+    /// The font size the stepper last handed to the settings. Saving would clamp it, so the
+    /// file cannot tell a stepper that stopped from one that went past the end.
+    fn stepper_value(cx: &mut TestAppContext) -> u8 {
+        cx.update(|cx| {
+            crate::settings::state(cx)
+                .read(cx)
+                .settings
+                .terminals
+                .font_size
+        })
+    }
+
+    /// Presses Tab until focus has left the nav, which is the stepper: the page's first stop.
+    fn tab_into_page(visual: &mut VisualTestContext, cx: &mut TestAppContext) {
+        let window = cx.windows()[0]
+            .downcast::<SettingsWindow>()
+            .expect("the settings window");
+        let nav = window
+            .read_with(visual, |settings, _| settings.nav_focus.clone())
+            .expect("the window is open");
+
+        for _ in 0..40 {
+            visual.simulate_keystrokes("tab");
+
+            let in_nav =
+                visual.update(|window, _| nav.iter().any(|handle| handle.is_focused(window)));
+            if !in_nav {
+                return;
+            }
+        }
+
+        panic!("Tab never left the nav");
+    }
+
     #[gpui::test]
     fn the_stepper_stops_at_the_ends_of_the_range(cx: &mut TestAppContext) {
         let path = temp_path("limits");
@@ -127,11 +161,34 @@ mod tests {
         let mut visual = terminals_page_at(&path, cx);
 
         click("font-size-increase", &mut visual);
+        let top = stepper_value(cx);
+        tab_into_page(&mut visual, cx);
+        visual.simulate_keystrokes("up");
+        let top_by_key = stepper_value(cx);
+        visual.simulate_keystrokes("home down");
+        let bottom_by_key = stepper_value(cx);
+        click("font-size-decrease", &mut visual);
+        let bottom = stepper_value(cx);
+
+        std::fs::remove_file(&path).ok();
+        assert_eq!(top, 20);
+        assert_eq!(top_by_key, 20);
+        assert_eq!(bottom_by_key, 11);
+        assert_eq!(bottom, 11);
+    }
+
+    #[gpui::test]
+    fn the_stepper_changes_the_font_size_from_the_keyboard(cx: &mut TestAppContext) {
+        let path = temp_path("keyboard");
+        let mut visual = terminals_page_at(&path, cx);
+
+        tab_into_page(&mut visual, cx);
+        visual.simulate_keystrokes("up up down");
         save_pause(&mut visual);
 
-        let after = swarm_settings::load(&path).expect("read the settings");
+        let saved = swarm_settings::load(&path).expect("read the settings");
         std::fs::remove_file(&path).ok();
-        assert_eq!(after.terminals.font_size, 20);
+        assert_eq!(saved.terminals.font_size, 14);
     }
 
     #[gpui::test]
@@ -245,6 +302,20 @@ mod tests {
         assert_eq!(after, [17.; 4]);
     }
 
+    /// The place and size of the tile of each attached terminal.
+    fn tile_rects(
+        workspace: &Entity<Workspace>,
+        attached: &[(&'static str, TerminalId, EmulatorChannels)],
+        cx: &VisualTestContext,
+    ) -> Vec<Option<swarm_layout::Rect>> {
+        workspace.read_with(cx, |workspace, _| {
+            attached
+                .iter()
+                .map(|(_, terminal, _)| workspace.layout.rect(swarm_layout::TileId(terminal.0)))
+                .collect()
+        })
+    }
+
     #[gpui::test]
     fn tiles_keep_their_pixels_and_get_fewer_rows_and_columns(cx: &mut TestAppContext) {
         let (workspace, main) = setup(cx);
@@ -256,17 +327,7 @@ mod tests {
             .iter()
             .map(|(kind, _, emulator)| (*kind, last_grid(kind, emulator)))
             .collect();
-        let tiles: Vec<_> = workspace.read_with(main, |workspace, _| {
-            attached
-                .iter()
-                .map(|(_, terminal, _)| {
-                    workspace
-                        .layout
-                        .rect(swarm_layout::TileId(terminal.0))
-                        .map(|rect| rect.size.width)
-                })
-                .collect()
-        });
+        let tiles = tile_rects(&workspace, &attached, main);
 
         main.update(|_, cx| set_terminal_font_size(18, cx));
         redraw(main);
@@ -274,37 +335,43 @@ mod tests {
             .iter()
             .map(|(kind, _, emulator)| (*kind, last_grid(kind, emulator)))
             .collect();
-        let widths: Vec<_> = workspace.read_with(main, |workspace, _| {
-            attached
-                .iter()
-                .map(|(_, terminal, _)| {
-                    workspace
-                        .layout
-                        .rect(swarm_layout::TileId(terminal.0))
-                        .map(|rect| rect.size.width)
-                })
-                .collect()
-        });
+        let tiles_after = tile_rects(&workspace, &attached, main);
 
-        // The orchestrator and the user's terminal keep their height too: they lose rows.
+        // Every kind of tile keeps its width and its height, and loses rows and columns.
         for ((kind, small), (_, large)) in before.iter().zip(&after) {
             assert!(large.cols < small.cols, "{kind}: {small:?} {large:?}");
+            assert!(large.rows < small.rows, "{kind}: {small:?} {large:?}");
             assert!(large.cell_height > small.cell_height, "{kind}");
         }
-        for kind in ["orchestrator", "user"] {
-            let rows = |grids: &[(&str, swarm_term::Size)]| {
-                grids
-                    .iter()
-                    .find(|(name, _)| *name == kind)
-                    .map(|(_, size)| size.rows)
-            };
-            assert!(rows(&after) < rows(&before), "{kind} kept its rows");
-        }
-        assert_eq!(tiles, widths);
+        assert!(tiles.iter().all(Option::is_some));
+        assert_eq!(tiles, tiles_after);
     }
 
     #[gpui::test]
-    fn the_cell_based_sizes_of_the_layout_follow_the_new_cell(cx: &mut TestAppContext) {
+    fn the_size_badge_counts_what_each_live_view_tells_its_emulator(cx: &mut TestAppContext) {
+        let (workspace, main) = setup(cx);
+        main.simulate_resize(size(px(1800.), px(2000.)));
+        redraw(main);
+        let attached = attach_every_kind(&workspace, main);
+
+        for points in [13, 16, 20] {
+            main.update(|_, cx| set_terminal_font_size(points, cx));
+            redraw(main);
+
+            let cell = workspace.read_with(main, |workspace, _| workspace.cell_size);
+            let tiles = tile_rects(&workspace, &attached, main);
+            for ((kind, _, emulator), tile) in attached.iter().zip(tiles) {
+                let tile = tile.expect("the tile is placed");
+                let told = last_grid(kind, emulator);
+                let shown = tile_grid(size(px(tile.size.width), px(tile.size.height)), cell);
+
+                assert_eq!(shown, (told.cols, told.rows), "{kind} at {points} pt");
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn the_cell_based_sizes_of_the_layout_stay_at_the_default_font(cx: &mut TestAppContext) {
         let (workspace, main) = setup(cx);
         redraw(main);
         let (cell, small, process) = workspace.read_with(main, |workspace, _| {
@@ -331,9 +398,9 @@ mod tests {
             });
 
         let height = |cell: Option<(f32, f32)>| cell.map(|(_, height)| height).unwrap_or_default();
-        assert!(height(larger_cell) > height(cell));
-        assert!(larger_small > small + 20.);
-        assert!(larger_process > process + 10.);
+        assert!(height(larger_cell) > height(cell), "the cell did not grow");
+        assert!((larger_small - small).abs() < f32::EPSILON);
+        assert!((larger_process - process).abs() < f32::EPSILON);
     }
 
     #[gpui::test]
