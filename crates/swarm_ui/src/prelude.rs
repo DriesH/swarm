@@ -9,6 +9,7 @@ pub use crate::components::{
     Menu, MenuItem, OutputBlock, Panel, PanelRow, PopoverMenu, ProjectTile, ResizeHandle,
     SegmentedControl, StatusDot, StatusPill, StatusRing, Switch, Tab, TabBar, TabStrip, Tag,
     TagTone, TextArea, TextInput, TextInputEvent, TileFrame, TrayChip, TrayMore, TreeRow,
+    UsageMeter,
 };
 pub use crate::styles::{Color, h_flex, v_flex};
 pub use crate::theme::ActiveTheme;

@@ -1,4 +1,4 @@
-//! Accessibility checks for Button, Kbd, Dropdown, `PopoverMenu` and the tray chips.
+//! Accessibility checks for Button, Kbd, Dropdown, `PopoverMenu`, the tray chips and `UsageMeter`.
 
 use gpui::accesskit::{Node, Role, Toggled};
 use gpui::{
@@ -108,6 +108,49 @@ fn a_check_row_reads_its_name_status_and_value() {
         );
 
         assert_eq!(skipped.node.label(), Some("cargo clippy, Skipped"));
+    });
+}
+
+#[test]
+fn a_usage_meter_is_one_labelled_group() {
+    with_window(|window, cx| {
+        let plain = a11y_info(
+            UsageMeter::new("plain", "Claude · 5h")
+                .value("42%")
+                .fraction(0.42)
+                .note("Rate limited · 24m"),
+            window,
+            cx,
+        );
+
+        assert_eq!(plain.role, Some(Role::Group));
+        assert_eq!(
+            plain.node.label(),
+            Some("Claude · 5h, 42%, Rate limited · 24m")
+        );
+
+        let without_value = a11y_info(
+            UsageMeter::new("none", "Codex").note("Not logged in"),
+            window,
+            cx,
+        );
+
+        assert_eq!(without_value.node.label(), Some("Codex, Not logged in"));
+
+        let spoken = a11y_info(
+            UsageMeter::new("spoken", "Claude · 5h")
+                .value("42%")
+                .accessible_label(
+                    "Claude usage: 5 hour window 42%, resets in 2 hours; 7 day window 18%",
+                ),
+            window,
+            cx,
+        );
+
+        assert_eq!(
+            spoken.node.label(),
+            Some("Claude usage: 5 hour window 42%, resets in 2 hours; 7 day window 18%")
+        );
     });
 }
 
