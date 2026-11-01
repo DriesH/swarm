@@ -2,6 +2,7 @@
 
 #![expect(clippy::expect_used, reason = "test helpers panic on failure")]
 
+use std::collections::HashMap;
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::os::unix::net::UnixStream;
@@ -7716,4 +7717,257 @@ fn a_rate_limited_endpoint_is_reported_and_the_wait_is_saved() {
     thread::park_timeout(Duration::from_millis(300));
 
     assert_eq!(fakes.calls("curl"), 1);
+}
+
+impl Client {
+    /// Sends `StopAgents`. Returns once the daemon answered and every agent in `ending`
+    /// has changed to `Stopped` or `Resumable`.
+    fn stop_agents(&mut self, ending: &[AgentId]) -> HashMap<AgentId, AgentInfo> {
+        self.send(&Request::StopAgents { call: CALL });
+
+        let mut ended = HashMap::new();
+        let mut answered = false;
+        while !answered || ended.len() < ending.len() {
+            match self.next() {
+                Event::Done { call: CALL } => answered = true,
+                Event::Error {
+                    call: Some(CALL),
+                    message,
+                    ..
+                } => panic!("stopping the agents failed: {message}"),
+                Event::AgentChanged { agent }
+                    if ending.contains(&agent.id)
+                        && matches!(
+                            agent.lifecycle,
+                            AgentLifecycle::Stopped | AgentLifecycle::Resumable
+                        ) =>
+                {
+                    ended.insert(agent.id, agent);
+                }
+                _ => {}
+            }
+        }
+
+        ended
+    }
+}
+
+/// Two tasks in two projects. Each has a working orchestrator and a worker, and the
+/// worker owns a process terminal.
+struct BusyTasks {
+    daemon: Daemon,
+    client: Client,
+    tasks: Vec<TaskInfo>,
+    agents: Vec<AgentInfo>,
+    process_ids: Vec<i32>,
+    _fixture: Fixture,
+    _repos: Vec<Repo>,
+}
+
+impl BusyTasks {
+    fn agent_ids(&self) -> Vec<AgentId> {
+        self.agents.iter().map(|agent| agent.id).collect()
+    }
+
+    fn message_count(&mut self) -> usize {
+        self.tasks
+            .iter()
+            .map(|task| self.client.list_messages(task.project, Some(task.id)).len())
+            .sum()
+    }
+
+    fn stored_lifecycle(&self, agent: AgentId) -> AgentLifecycle {
+        database(&self.daemon)
+            .agent(agent)
+            .expect("read")
+            .expect("row")
+            .info
+            .lifecycle
+    }
+}
+
+/// With `confirm_sessions`, every agent reports a session, so its conversation exists.
+fn busy_tasks(confirm_sessions: bool) -> BusyTasks {
+    let hook = |who: &str| {
+        if confirm_sessions {
+            format!(
+                r#"printf '{{"hook_event_name":"SessionStart","session_id":"{who}-%s"}}' "$SWARM_TASK" | "$SWARM" hook"#
+            )
+        } else {
+            String::new()
+        }
+    };
+    let (orchestrator_hook, worker_hook) = (hook("orchestrator"), hook("worker"));
+    let fixture = fixture_with_helpers(&format!(
+        r#"case "$SWARM_ROLE" in
+orchestrator)
+  idle
+  IFS= read -r line
+  working
+  {orchestrator_hook}
+  swarm spawn api --kind claude --brief "build the api" > "$OUT/spawn-$SWARM_TASK.out" 2>&1
+  sleep 60
+  ;;
+worker)
+  idle
+  IFS= read -r line
+  working
+  {worker_hook}
+  swarm terminal spawn --name dev -- sh -c 'echo $$ > "$1"; exec sleep 60' sh "$OUT/dev-$SWARM_TASK.pid" > "$OUT/terminal-$SWARM_TASK.out" 2>&1
+  until [ -s "$OUT/dev-$SWARM_TASK.pid" ]; do sleep 0.1; done
+  echo up > "$OUT/worker-up-$SWARM_TASK"
+  sleep 60
+  ;;
+esac"#
+    ));
+    let repos = vec![repo_for_merges(), repo_for_merges()];
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+
+    let mut tasks = Vec::new();
+    for (repo, name) in repos.iter().zip(["Login", "Billing"]) {
+        let project = client.add_project(&repo.root);
+        let mut request = orchestrator_task(project.id, false);
+        name.clone_into(&mut request.name);
+        request.first_message = Some("lead the task".to_owned());
+        tasks.push(client.create_task(request));
+    }
+
+    let mut process_ids = Vec::new();
+    for task in &tasks {
+        fixture.read_when_written(&format!("worker-up-{}", task.id.0));
+        let pid = fixture.read_when_written(&format!("dev-{}.pid", task.id.0));
+        process_ids.push(pid.trim().parse().expect("a process id"));
+    }
+
+    let agents: Vec<AgentInfo> = client
+        .projects()
+        .into_iter()
+        .flat_map(|project| project.tasks)
+        .flat_map(|task| task.agents)
+        .collect();
+    assert_eq!(agents.len(), 4, "an orchestrator and a worker per task");
+
+    if confirm_sessions {
+        let store = database(&daemon);
+        wait_until(|| {
+            agents.iter().all(|agent| {
+                store
+                    .agent(agent.id)
+                    .expect("read")
+                    .is_some_and(|stored| stored.session_confirmed)
+            })
+        });
+    }
+
+    BusyTasks {
+        daemon,
+        client,
+        tasks,
+        agents,
+        process_ids,
+        _fixture: fixture,
+        _repos: repos,
+    }
+}
+
+#[test]
+fn stopping_all_agents_ends_every_agent_and_keeps_user_terminals() {
+    let mut busy = busy_tasks(true);
+    let user_terminal = busy.client.create(&["sleep", "60"]);
+    let ids = busy.agent_ids();
+
+    let ended = busy.client.stop_agents(&ids);
+
+    assert_eq!(ended.len(), 4, "both tasks, orchestrators and workers");
+    for agent in ended.values() {
+        assert_eq!(
+            agent.lifecycle,
+            AgentLifecycle::Resumable,
+            "{} has a confirmed session",
+            agent.name
+        );
+        assert_eq!(agent.terminal, None);
+        assert!(agent.ended_at.is_some());
+    }
+    for id in &ids {
+        assert_eq!(busy.stored_lifecycle(*id), AgentLifecycle::Resumable);
+    }
+    assert!(
+        busy.client
+            .terminals()
+            .iter()
+            .any(|terminal| terminal.id == user_terminal),
+        "the user terminal still runs"
+    );
+
+    assert!(
+        busy.client.stop_agents(&[]).is_empty(),
+        "nothing runs, and the daemon still answers"
+    );
+    for id in &ids {
+        assert_eq!(busy.stored_lifecycle(*id), AgentLifecycle::Resumable);
+    }
+}
+
+#[test]
+fn stopping_all_agents_tells_no_orchestrator_and_stops_process_terminals() {
+    let mut busy = busy_tasks(true);
+    let ids = busy.agent_ids();
+    let before = busy.message_count();
+    assert!(before >= 2, "the briefs are there");
+
+    busy.client.stop_agents(&ids);
+
+    wait_until(|| busy.process_ids.iter().all(|pid| !process_alive(*pid)));
+    thread::park_timeout(Duration::from_millis(400));
+    assert_eq!(busy.message_count(), before, "nobody was told");
+}
+
+#[test]
+fn stopping_all_agents_without_a_confirmed_session_ends_them_stopped() {
+    let mut busy = busy_tasks(false);
+    let ids = busy.agent_ids();
+
+    let ended = busy.client.stop_agents(&ids);
+
+    assert!(
+        ended
+            .values()
+            .all(|agent| agent.lifecycle == AgentLifecycle::Stopped),
+        "{ended:?}"
+    );
+    for id in &ids {
+        assert_eq!(busy.stored_lifecycle(*id), AgentLifecycle::Stopped);
+    }
+}
+
+#[test]
+fn stopping_all_agents_ends_an_agent_that_has_not_started_yet() {
+    let fixture = Fixture::new(r#"echo ran > "$OUT/ran"; sleep 30"#);
+    let repo = Repo::new("[worktrees]\nsetup = \"sleep 2\"\n");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let task = client.create_task(orchestrator_task(project.id, true));
+    let agent = task.agents[0].id;
+    assert_eq!(task.agents[0].lifecycle, AgentLifecycle::Starting);
+
+    let ended = client.stop_agents(&[agent]);
+
+    assert_eq!(ended[&agent].lifecycle, AgentLifecycle::Stopped);
+    assert_eq!(ended[&agent].terminal, None);
+    assert!(ended[&agent].ended_at.is_some());
+
+    // The setup ends, and the agent must not start after it.
+    thread::park_timeout(Duration::from_millis(3000));
+    assert!(
+        !fixture.out.join("ran").exists(),
+        "the agent started anyway"
+    );
+    let stored = database(&daemon).agent(agent).expect("read").expect("row");
+    assert_eq!(stored.info.lifecycle, AgentLifecycle::Stopped);
+    assert_eq!(stored.info.status, AgentStatus::Unknown);
 }

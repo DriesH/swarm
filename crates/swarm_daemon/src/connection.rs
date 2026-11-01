@@ -198,7 +198,8 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
             });
         }
         Request::StopAgents { call } => {
-            send_error(sink, call, &"stopping every agent is not built yet");
+            services.agents.stop_all();
+            sink.send_event(&Event::Done { call });
         }
         request @ (Request::TaskDiff { .. }
         | Request::FileHunks { .. }

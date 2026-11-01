@@ -134,6 +134,10 @@ impl std::error::Error for CommandNotFound {}
 #[derive(Debug)]
 pub(crate) struct Refused;
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent flags, not one state"
+)]
 struct Live {
     info: AgentInfo,
     plan: Plan,
@@ -149,6 +153,8 @@ struct Live {
     delivery_open: bool,
     /// The agent asked to end its session: it stops for good instead of resuming.
     stop_requested: bool,
+    /// The user stopped it: it can still resume, and the orchestrator is not told.
+    stopped_by_user: bool,
     typing: UserTyping,
     /// One paste at a time, so two deliveries never interleave in the terminal.
     paste: Arc<Mutex<()>>,
@@ -332,7 +338,8 @@ pub(crate) struct Agents {
     closing: Mutex<HashSet<TaskId>>,
 }
 
-type EndObserver = Box<dyn Fn(AgentId) + Send + Sync>;
+/// Gets the agent and whether the user stopped it.
+type EndObserver = Box<dyn Fn(AgentId, bool) + Send + Sync>;
 
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -385,16 +392,39 @@ impl Agents {
     /// `Stopped` and tells nobody. Returns the terminals of those that run. An agent
     /// that never started ends here.
     pub(crate) fn stop_task_agents(&self, task: TaskId) -> Vec<TerminalId> {
+        self.mark_stopped(
+            |agent| agent.info.task == Some(task),
+            |agent| agent.stop_requested = true,
+        )
+    }
+
+    /// Stops every live agent as the user's choice: one with a confirmed session ends
+    /// `Resumable`, and no orchestrator is told. Returns once the kills are sent.
+    pub(crate) fn stop_all(&self) {
+        let terminals = self.mark_stopped(|_| true, |agent| agent.stopped_by_user = true);
+
+        for hub in terminals
+            .into_iter()
+            .filter_map(|terminal| self.terminals.get(terminal))
+        {
+            hub.send_input(TerminalInput::Kill);
+        }
+    }
+
+    /// Runs `mark` on the live agents `pick` chooses. Returns the terminals of those
+    /// that run. An agent that never started ends here, as `Stopped`.
+    fn mark_stopped(
+        &self,
+        pick: impl Fn(&Live) -> bool,
+        mark: impl Fn(&mut Live),
+    ) -> Vec<TerminalId> {
         let mut terminals = Vec::new();
         let mut unstarted = Vec::new();
 
         {
             let mut live = lock(&self.live);
-            for agent in live
-                .values_mut()
-                .filter(|agent| agent.info.task == Some(task))
-            {
-                agent.stop_requested = true;
+            for agent in live.values_mut().filter(|agent| pick(agent)) {
+                mark(agent);
                 match agent.info.terminal {
                     Some(terminal) => terminals.push(terminal),
                     None => unstarted.push(agent.info.id),
@@ -422,7 +452,7 @@ impl Agents {
             .any(|agent| agent.info.task == Some(task))
     }
 
-    /// Calls `observer` with the ID of every agent whose process ends.
+    /// Calls `observer` for every agent whose process ends.
     pub(crate) fn on_end(&self, observer: EndObserver) {
         lock(&self.on_end).push(observer);
     }
@@ -507,6 +537,7 @@ impl Agents {
                 ready: None,
                 delivery_open: true,
                 stop_requested: false,
+                stopped_by_user: false,
                 typing: UserTyping::default(),
                 paste: Arc::default(),
             },
@@ -768,6 +799,11 @@ impl Agents {
 
                 false
             });
+            hub.send_input(TerminalInput::Kill);
+        }
+
+        // A stop that ran meanwhile ended this agent as one that never started.
+        if !lock(&self.live).contains_key(&id) {
             hub.send_input(TerminalInput::Kill);
         }
 
@@ -1164,13 +1200,13 @@ impl Agents {
         agent.info.ended_at = Some(unix_millis());
         self.publish(&mut agent);
 
-        if !self.is_closing(agent.info.task) {
+        if !agent.stopped_by_user && !self.is_closing(agent.info.task) {
             let how = exit.map_or_else(|| "no exit status".to_owned(), exit_text);
             self.tell_worker_stopped(&agent.info, &format!("stopped, {how}"));
         }
 
         for observer in lock(&self.on_end).iter() {
-            observer(id);
+            observer(id, agent.stopped_by_user);
         }
     }
 
@@ -1523,6 +1559,7 @@ mod tests {
             ready: None,
             delivery_open: true,
             stop_requested: false,
+            stopped_by_user: false,
             typing: UserTyping::default(),
             paste: Arc::default(),
         }

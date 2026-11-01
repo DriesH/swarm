@@ -59,6 +59,8 @@ pub(crate) enum Stopper {
     User,
     /// Its owner's process ended, so Swarm stopped it.
     OwnerEnded,
+    /// The user stopped its owner, so Swarm stopped it. Nobody is told.
+    OwnerStopped,
 }
 
 /// The text of a terminal: scrollback and the screen, one string for each line.
@@ -283,9 +285,9 @@ impl Processes {
         });
 
         let owner_gone = Arc::downgrade(&processes);
-        agents.on_end(Box::new(move |agent| {
+        agents.on_end(Box::new(move |agent, by_user| {
             if let Some(processes) = owner_gone.upgrade() {
-                processes.owner_ended(agent);
+                processes.owner_ended(agent, by_user);
             }
         }));
 
@@ -525,8 +527,9 @@ impl Processes {
         Ok(entry.summary(&state))
     }
 
-    /// The owner's process ended: stop the terminals it started.
-    pub(crate) fn owner_ended(&self, owner: AgentId) {
+    /// The owner's process ended: stop the terminals it started. When the user stopped
+    /// the owner, nobody hears of it.
+    pub(crate) fn owner_ended(&self, owner: AgentId, by_user: bool) {
         let mine: Vec<Arc<Entry>> = lock(&self.entries)
             .values()
             .filter(|entry| entry.owner == owner)
@@ -540,7 +543,11 @@ impl Processes {
                     continue;
                 }
                 if state.stopper == Stopper::Process {
-                    state.stopper = Stopper::OwnerEnded;
+                    state.stopper = if by_user {
+                        Stopper::OwnerStopped
+                    } else {
+                        Stopper::OwnerEnded
+                    };
                 }
 
                 state.id
@@ -634,7 +641,7 @@ impl Processes {
             Stopper::Process => "exited".to_owned(),
             Stopper::Agent(who) => format!("stopped by {who}"),
             Stopper::User => "stopped by the user".to_owned(),
-            Stopper::OwnerEnded => "stopped, its owner ended".to_owned(),
+            Stopper::OwnerEnded | Stopper::OwnerStopped => "stopped, its owner ended".to_owned(),
         };
         let result = exit
             .as_ref()
@@ -667,10 +674,10 @@ impl Processes {
     /// The owner, and the task's orchestrator when that is another agent. When the
     /// owner ended, only the orchestrator hears of it.
     fn recipients(&self, entry: &Entry, stopper: &Stopper) -> Vec<AgentId> {
-        let mut recipients = if *stopper == Stopper::OwnerEnded {
-            Vec::new()
-        } else {
-            vec![entry.owner]
+        let mut recipients = match stopper {
+            Stopper::OwnerStopped => return Vec::new(),
+            Stopper::OwnerEnded => Vec::new(),
+            _ => vec![entry.owner],
         };
 
         let Some(task) = entry.task else {
