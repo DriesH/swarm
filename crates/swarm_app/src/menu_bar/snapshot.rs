@@ -59,12 +59,12 @@ fn needs_you(data: &mut FakeData) {
     }
 }
 
-/// Claude is rate limited for 24 minutes: its meters keep the old numbers.
-fn rate_limited(data: &mut FakeData) {
+/// The last Claude read failed: its meters keep the old numbers.
+fn usage_failed(data: &mut FakeData) {
     quiet(data);
-    data.usage.claude.problem = Some(UsageProblem::RateLimited {
-        retry_at: SAMPLE_NOW / 1_000 + 24 * 60,
-    });
+    data.usage.claude.problem = Some(UsageProblem::Failed(
+        "the status line sent nothing".to_owned(),
+    ));
 }
 
 /// The two wing frames of the buzzing bee on a strip of the menu bar, the way macOS tints a
@@ -151,7 +151,7 @@ pub(crate) fn run(directory: PathBuf, cx: &mut App) {
             ("popover", quiet, Stop::Button),
             ("popover-needs-you", needs_you, Stop::Button),
             ("popover-confirm", quiet, Stop::Asking),
-            ("popover-failed", rate_limited, Stop::Failed),
+            ("popover-failed", usage_failed, Stop::Failed),
         ];
 
         for (appearance, theme_name) in [(Appearance::Light, "light"), (Appearance::Dark, "dark")] {

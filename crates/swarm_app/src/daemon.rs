@@ -879,7 +879,7 @@ impl Workspace {
     pub(crate) fn sync_usage_clock(&mut self, window_active: bool, cx: &mut Context<Self>) {
         let wanted = window_active
             && self.fixed_now.is_none()
-            && crate::sidebar::usage_shows_time(&self.data.usage);
+            && crate::usage_text::usage_shows_time(&self.data.usage);
 
         if !wanted {
             self.usage_clock = None;
@@ -4125,10 +4125,11 @@ pub(crate) mod tests {
         assert_eq!(polling(&workspace, cx), (false, false));
     }
 
-    fn rate_limited_claude() -> Usage {
+    fn claude_usage_with_a_reset() -> Usage {
         let mut usage = claude_usage(42);
-        usage.claude.problem =
-            Some(swarm_protocol::UsageProblem::RateLimited { retry_at: u64::MAX });
+        for window in &mut usage.claude.windows {
+            window.resets_at = Some(4_000_000_000);
+        }
 
         usage
     }
@@ -4140,7 +4141,7 @@ pub(crate) mod tests {
         let (workspace, cx) = setup(cx);
         workspace.update(cx, |workspace, cx| {
             workspace.fixed_now = None;
-            workspace.usage_changed(rate_limited_claude(), cx);
+            workspace.usage_changed(claude_usage_with_a_reset(), cx);
         });
         let renders = Rc::new(std::cell::Cell::new(0));
         workspace.update(cx, |_, cx| {
@@ -4157,7 +4158,7 @@ pub(crate) mod tests {
 
         cx.update(|window, _| window.activate_window());
         redraw(cx);
-        assert!(clock(cx), "an active window with a rate limit ticks");
+        assert!(clock(cx), "an active window with a reset time ticks");
 
         cx.executor().advance_clock(USAGE_TICK / 2);
         cx.run_until_parked();
@@ -4874,6 +4875,7 @@ pub(crate) mod tests {
                     label: "5h".into(),
                     used_percent: percent,
                     resets_at: None,
+                    length_secs: None,
                 }],
                 ..Default::default()
             },

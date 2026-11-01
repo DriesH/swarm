@@ -142,12 +142,12 @@ fn open_remove_project(
     workspace.open_remove_project(ProjectId(3), window, cx);
 }
 
-/// Claude is rate limited for 24 minutes: its row keeps the old numbers and shows the wait.
-fn open_usage_rate_limited(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
+/// The last Claude read failed: its card keeps the old numbers and says so.
+fn open_usage_failed(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
     let mut usage = workspace.data.usage.clone();
-    usage.claude.problem = Some(UsageProblem::RateLimited {
-        retry_at: SAMPLE_NOW / 1_000 + 24 * 60,
-    });
+    usage.claude.problem = Some(UsageProblem::Failed(
+        "the status line sent nothing".to_owned(),
+    ));
 
     workspace.usage_changed(usage, cx);
 }
@@ -783,13 +783,13 @@ pub(crate) fn run(directory: PathBuf, cx: &mut App) {
             (Appearance::Dark, "workspace-dark.png", None),
             (
                 Appearance::Light,
-                "workspace-usage-rate-limited-light.png",
-                Some(open_usage_rate_limited as OpenOverlay),
+                "workspace-usage-failed-light.png",
+                Some(open_usage_failed as OpenOverlay),
             ),
             (
                 Appearance::Dark,
-                "workspace-usage-rate-limited-dark.png",
-                Some(open_usage_rate_limited),
+                "workspace-usage-failed-dark.png",
+                Some(open_usage_failed),
             ),
             (
                 Appearance::Light,
