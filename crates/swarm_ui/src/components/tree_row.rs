@@ -15,12 +15,15 @@ pub const TREE_ROW_HEIGHT: f32 = 26.;
 /// an indent guide runs under the chevron of its folder.
 pub const TREE_INDENT: f32 = 16.;
 
+/// File icons are 16px: the full-color glyphs need the room.
+const FILE_ICON_SIZE: IconSize = IconSize::Large;
+
 const TREE_PADDING: f32 = 6.;
 const GUIDE_OFFSET: f32 = 7.;
 
 /// A row of a tree, styled like a project panel: indent guides, a chevron for a folder, a
-/// plain icon, a label that truncates and a slot at the end. Stack rows with no gap, so the
-/// guides join up.
+/// plain icon or a file icon, a label that truncates and a slot at the end. Stack rows with no
+/// gap, so the guides join up.
 #[derive(IntoElement)]
 #[must_use]
 pub struct TreeRow {
@@ -30,6 +33,7 @@ pub struct TreeRow {
     level: usize,
     folder: Option<bool>,
     icon: Option<IconName>,
+    file_icon: Option<FileIconName>,
     label_color: Color,
     selected: bool,
     position_in_set: Option<(usize, usize)>,
@@ -49,6 +53,7 @@ impl TreeRow {
             level: 0,
             folder: None,
             icon: None,
+            file_icon: None,
             label_color: Color::Default,
             selected: false,
             position_in_set: None,
@@ -81,6 +86,12 @@ impl TreeRow {
     /// Replaces the folder or file icon.
     pub fn icon(mut self, icon: IconName) -> Self {
         self.icon = Some(icon);
+        self
+    }
+
+    /// Shows a full-color file or folder icon in place of the plain one.
+    pub fn file_icon(mut self, icon: FileIconName) -> Self {
+        self.file_icon = Some(icon);
         self
     }
 
@@ -154,6 +165,10 @@ impl RenderOnce for TreeRow {
             Some(_) => IconName::Folder,
             None => IconName::File,
         });
+        let file_icon_selector = self
+            .debug_selector
+            .as_ref()
+            .map(|selector| format!("{selector}-file-icon"));
         let chevron = self.folder.map(|expanded| {
             Icon::new(if expanded {
                 IconName::ChevronDown
@@ -228,7 +243,18 @@ impl RenderOnce for TreeRow {
                     .justify_center()
                     .children(chevron),
             )
-            .child(Icon::new(icon).size(IconSize::Medium).color(Color::Muted))
+            .child(match self.file_icon {
+                Some(file_icon) => FileIcon::new(file_icon)
+                    .size(FILE_ICON_SIZE)
+                    .when_some(file_icon_selector, |file_icon, selector| {
+                        file_icon.debug_selector(|| selector)
+                    })
+                    .into_any_element(),
+                None => Icon::new(icon)
+                    .size(IconSize::Medium)
+                    .color(Color::Muted)
+                    .into_any_element(),
+            })
             .child(
                 div().flex_1().min_w_0().flex().child(
                     Label::new(self.label)
@@ -249,6 +275,44 @@ type DemoRow = (
     Option<bool>,
     Option<(&'static str, &'static str)>,
 );
+
+impl TreeRow {
+    fn icon_tree() -> impl IntoElement {
+        let rows: [(usize, &str, Option<bool>); 9] = [
+            (0, "src", Some(true)),
+            (1, "main.rs", None),
+            (1, "config.json", None),
+            (0, "docs", Some(false)),
+            (0, "tests", Some(true)),
+            (1, "fixture.yml", None),
+            (0, "Cargo.toml", None),
+            (0, "README.md", None),
+            (0, "logo.png", None),
+        ];
+
+        div()
+            .id("tree-demo-icons")
+            .role(Role::Tree)
+            .aria_label("Files")
+            .w(px(272.))
+            .flex()
+            .flex_col()
+            .children(
+                rows.into_iter()
+                    .enumerate()
+                    .map(|(index, (level, label, folder))| {
+                        let row = TreeRow::new(("tree-demo-icon-row", index), label).level(level);
+
+                        match folder {
+                            Some(open) => row
+                                .folder(open)
+                                .file_icon(FileIconName::for_folder(label, open)),
+                            None => row.file_icon(FileIconName::for_file(label)),
+                        }
+                    }),
+            )
+    }
+}
 
 impl Component for TreeRow {
     fn name() -> &'static str {
@@ -330,6 +394,10 @@ impl Component for TreeRow {
                 [example("Selectable, with indent guides", tree)],
             ))
             .child(example_group(
+                "File icons",
+                [example("vscode-icons, CC BY-SA 4.0", Self::icon_tree())],
+            ))
+            .child(example_group(
                 "Focusable row",
                 [example(
                     "Own Tab stop",
@@ -375,6 +443,17 @@ mod tests {
                     TreeRow::new("deep", "lib.rs")
                         .level(2)
                         .debug_selector(|| "deep".to_owned()),
+                )
+                .child(
+                    TreeRow::new("manifest", "Cargo.toml")
+                        .file_icon(FileIconName::for_file("Cargo.toml"))
+                        .debug_selector(|| "manifest".to_owned()),
+                )
+                .child(
+                    TreeRow::new("source", "src")
+                        .folder(true)
+                        .file_icon(FileIconName::for_folder("src", true))
+                        .debug_selector(|| "source".to_owned()),
                 )
         }
     }
@@ -454,5 +533,48 @@ mod tests {
         let chevron_center = row.left() + px(TREE_PADDING) + px(TREE_INDENT / 2.);
 
         assert!((guide.center().x - chevron_center).abs() <= px(1.));
+    }
+
+    #[test]
+    fn a_file_icon_is_a_16_pixel_image_in_the_icon_slot() {
+        let mut app = TestAppContext::single();
+        let cx = rows(&mut app);
+
+        for name in ["manifest", "source"] {
+            let row = cx.debug_bounds(name).unwrap_or_default();
+            let icon = cx.debug_bounds(Box::leak(format!("{name}-file-icon").into_boxed_str()));
+
+            assert_eq!(
+                icon.map(|icon| icon.size),
+                Some(gpui::size(px(16.), px(16.))),
+                "{name}"
+            );
+            assert_eq!(icon.map(|icon| icon.center().y), Some(row.center().y));
+            assert_eq!(row.size.height, px(TREE_ROW_HEIGHT));
+        }
+    }
+
+    #[test]
+    fn a_file_icon_sits_after_the_chevron_cell() {
+        let mut app = TestAppContext::single();
+        let cx = rows(&mut app);
+
+        let row = cx.debug_bounds("source").unwrap_or_default();
+        let icon = cx.debug_bounds("source-file-icon").unwrap_or_default();
+
+        assert_eq!(
+            icon.left() - row.left(),
+            px(TREE_PADDING + TREE_INDENT + 6.)
+        );
+    }
+
+    #[test]
+    fn a_row_without_a_file_icon_has_none() {
+        let mut app = TestAppContext::single();
+        let cx = rows(&mut app);
+
+        assert!(cx.debug_bounds("file").is_some());
+        assert!(cx.debug_bounds("file-file-icon").is_none());
+        assert!(cx.debug_bounds("folder-file-icon").is_none());
     }
 }

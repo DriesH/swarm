@@ -518,6 +518,21 @@ impl Agents {
         terminals
     }
 
+    /// How many agents start or run, the same ones the app counts as running.
+    pub(crate) fn running_count(&self) -> u32 {
+        let running = lock(&self.live)
+            .values()
+            .filter(|agent| {
+                matches!(
+                    agent.info.lifecycle,
+                    AgentLifecycle::Starting | AgentLifecycle::Running
+                )
+            })
+            .count();
+
+        u32::try_from(running).unwrap_or(u32::MAX)
+    }
+
     /// True while an agent of the task still has a live entry.
     pub(crate) fn has_live(&self, task: TaskId) -> bool {
         lock(&self.live)

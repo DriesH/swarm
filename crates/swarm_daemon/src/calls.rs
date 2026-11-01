@@ -26,7 +26,7 @@ use crate::agent_socket::{MAX_WAITS, Slot, Throttle};
 use crate::agents::{Place, Refused, STOPPED_BY_USER, lock};
 use crate::messages::Claim;
 use crate::processes::Spawn;
-use crate::{pull_requests, tasks};
+use crate::{pull_requests, stats, tasks};
 
 /// `wait` without a timeout.
 const DEFAULT_WAIT_SECS: u32 = 100;
@@ -243,6 +243,7 @@ impl Calls {
             Call::AgentExit => Ok(Value::Null),
             Call::TileGrow { agent } => self.tile_request(caller, agent, true),
             Call::TileShrink { agent } => self.tile_request(caller, agent, false),
+            Call::Buzz => reply_with(stats::current(&self.services)?),
 
             // The size is accepted and ignored: a process terminal follows its tile.
             Call::TerminalSpawn {

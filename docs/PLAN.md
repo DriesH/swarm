@@ -36,6 +36,7 @@ Cargo workspace:
 | `swarm_cli` | The `swarm` CLI agents use (hooks now; spawn, send, ask and MCP next) over the daemon's agent socket (ADR 0008) |
 | `swarm_app` | Window, sidebar, tabs, Terminals / Swarm / Review views, panels, settings |
 | `swarm_usage` | Reads Claude and Codex subscription usage. No GPUI: the daemon polls, the app's menu bar shows it |
+| `swarm_sprite` | The pixel bee sprite as data, shared by the app and the CLI. No GPUI |
 
 Crate names use snake_case, like Zed. Key decisions live in [`docs/adr/`](adr/). Terms live in [`GLOSSARY.md`](../GLOSSARY.md).
 
@@ -292,7 +293,15 @@ Small, rare and never in the way. All respect **Reduce Motion**, stay silent for
 - **Queen bee**: after the 100th merged PR, the Start orchestrator gets a crown in the sidebar for a day.
 - **`swarm buzz`**: hidden CLI command that prints an ASCII bee and the swarm's live stats.
 - **⌘K "buzz"**: a few bees fly across the window once.
-- **Honey accent**: an amber accent color in Settings › Appearance.
+- **Honey accent**: an amber accent color in Settings › Appearance. Status colors do not follow it: Working stays blue, so it never looks like Blocked.
+
+The menu bar bee reads Reduce Motion again on each flap, so it stops even while Swarm is in the background. The toast stays while the pointer or the keyboard focus is on it, gives the focus back to the workspace when it goes, and blocks clicks to what is under it.
+
+The bees in the eggs are the pixel bee (24×24, two wing frames, a crown for the queen), drawn from its grid at whole-pixel steps so it stays sharp; the menu bar keeps the line bee because macOS tints template images one color. The queen bee counts pull requests merged through Swarm (the daemon keeps the count and the time of the 100th). `swarm buzz` prints the bee in color on a terminal (never when `NO_COLOR` is set, `TERM` is `dumb` or the output is not a terminal) and, when an agent runs it, the swarm's counts.
+
+### File-type icons
+
+Files and folders in the Review tree, the Changes and Files panels and the inspector's Changes tab get icons from vscode-icons (icons CC BY-SA 4.0, code MIT). Branded icons, which are product and company logos under their owners' copyright, are left out: a file whose only icon is a logo gets the generic file icon. `.toml` and `.env` files get the generic config icon, because their icons are project logos. The icons are full-color SVGs rendered as images. The attribution (source, license, what changed) sits in **Settings › General › About** and in a license file next to the icons.
 
 ### Websites
 

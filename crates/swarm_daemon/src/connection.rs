@@ -21,9 +21,8 @@ use swarm_term::TerminalInput;
 
 use crate::hub::{CREATE_HISTORY_LINES, ClientSink, Frame, Hub, QUEUE_FRAMES};
 use crate::pull_requests::{self, NewRequest};
-use crate::tasks;
 use crate::usage::configured_command;
-use crate::{Services, comments};
+use crate::{Services, comments, stats, tasks};
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -197,6 +196,7 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
             });
         }
         Request::SystemCheck { call } => system_check(services, sink, call),
+        Request::Stats { call } => send_stats(services, sink, call),
         Request::Usage { call } => {
             sink.send_event(&Event::Usage {
                 call,
@@ -237,6 +237,15 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
         request @ (Request::ListProjects { .. }
         | Request::AddProject { .. }
         | Request::CreateTask { .. }) => handle_projects(services, sink, request),
+    }
+}
+
+fn send_stats(services: &Services, sink: &ClientSink, call: CallId) {
+    match stats::current(services) {
+        Ok(stats) => {
+            sink.send_event(&Event::Stats { call, stats });
+        }
+        Err(error) => send_error(sink, call, &error),
     }
 }
 

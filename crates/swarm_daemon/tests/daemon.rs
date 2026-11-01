@@ -18,9 +18,9 @@ use swarm_protocol::{
     AgentChange, AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, CallId,
     CloseCheck, CommentId, CommentState, CreateTask, CreateTerminal, DiffStat, Event, FileDiff,
     FileStat, Fold, MessageInfo, MessageKind, Notice, NoticeKind, ProjectConfigFields, ProjectId,
-    ProjectInfo, PromptInfo, PromptLayer, Request, ReviewSource, SystemCheck, TaskDiff, TaskId,
-    TaskInfo, TerminalId, TerminalInfo, TerminalKind, ToolCheck, ToolState, Usage, UsageProblem,
-    VERSION, read, write,
+    ProjectInfo, PromptInfo, PromptLayer, Request, ReviewSource, SwarmStats, SystemCheck, TaskDiff,
+    TaskId, TaskInfo, TerminalId, TerminalInfo, TerminalKind, ToolCheck, ToolState, Usage,
+    UsageProblem, VERSION, read, write,
 };
 use swarm_term::{
     BlockedKind, ExitStatus, Palette, ProgramState, Rgb, Row, Size, TerminalInput, TerminalOutput,
@@ -5160,6 +5160,12 @@ impl FakeGh {
     fn fail(&self, key: &str, message: &str) {
         std::fs::write(self.dir.join(format!("err.{key}")), message).expect("err");
         std::fs::write(self.dir.join(format!("exit.{key}")), "1").expect("exit");
+    }
+
+    /// The call works again after a `fail`.
+    fn recover(&self, key: &str) {
+        std::fs::remove_file(self.dir.join(format!("err.{key}"))).expect("err");
+        std::fs::remove_file(self.dir.join(format!("exit.{key}"))).expect("exit");
     }
 
     /// GitHub's head of the pull request: a merge that names another commit fails.
@@ -10376,4 +10382,427 @@ esac"#,
     assert_eq!(said_by(&fixture, "grow.code"), "1");
     assert_eq!(said_by(&fixture, "shrink.out"), refusal);
     assert_eq!(said_by(&fixture, "shrink.code"), "1");
+}
+
+// The swarm's counts: `Request::Stats`, `Call::Buzz` and the announcement of a merge.
+
+impl Client {
+    fn stats(&mut self) -> SwarmStats {
+        self.send(&Request::Stats { call: CALL });
+
+        self.wait_for(|event| match event {
+            Event::Stats { call: CALL, stats } => Some(*stats),
+            _ => None,
+        })
+    }
+
+    fn wait_for_stats_change(&mut self) -> SwarmStats {
+        self.wait_for(|event| match event {
+            Event::StatsChanged { stats } => Some(*stats),
+            _ => None,
+        })
+    }
+
+    /// The stats, and every `StatsChanged` that came before the answer. The answer follows
+    /// everything the daemon broadcast before it.
+    fn stats_and_announcements(&mut self) -> (SwarmStats, Vec<SwarmStats>) {
+        self.send(&Request::Stats { call: CALL });
+
+        let mut announced = Vec::new();
+        let stats = self.wait_for(|event| match event {
+            Event::StatsChanged { stats } => {
+                announced.push(*stats);
+
+                None
+            }
+            Event::Stats { call: CALL, stats } => Some(*stats),
+            _ => None,
+        });
+
+        (stats, announced)
+    }
+}
+
+/// Counts `count` merges that happened before, for tasks that are not in the daemon. The
+/// daemon must have answered a request, so its database exists.
+fn seed_merges(daemon: &Daemon, count: u64) {
+    let store = database(daemon);
+    for number in 0..count {
+        assert!(store.record_merge(TaskId(1000 + number)).expect("record"));
+    }
+}
+
+#[test]
+fn the_stats_count_running_agents_and_open_tasks() {
+    let fixture = fixture_with_helpers(
+        r#"case "$SWARM_ROLE" in
+orchestrator)
+  idle
+  IFS= read -r line
+  swarm spawn api --brief "work" > "$OUT/spawn.out" 2>&1
+  sleep 30
+  ;;
+worker)
+  sleep 30
+  ;;
+esac"#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut watcher = daemon.connect();
+    watcher.hello();
+    assert_eq!(watcher.stats(), SwarmStats::default());
+
+    let (mut client, task) = start_task(&daemon, &repo);
+    let worker = client.wait_for_agent(|agent| {
+        agent.role == AgentRole::Worker && agent.lifecycle == AgentLifecycle::Running
+    });
+
+    let working = watcher.stats();
+    assert_eq!(working.running_agents, 2, "{working:?}");
+    assert_eq!(working.open_tasks, 1, "{working:?}");
+    assert_eq!(working.merged_prs, 0);
+    assert_eq!(working.hundredth_merge_at, None);
+    assert_eq!(client.stats(), working);
+
+    client.stop_agents(&[task.agents[0].id, worker.id]);
+    let stopped = watcher.stats();
+    assert_eq!(stopped.running_agents, 0, "{stopped:?}");
+    assert_eq!(stopped.open_tasks, 1, "{stopped:?}");
+
+    client.close_task(task.id).expect("closed");
+    assert_eq!(watcher.stats().open_tasks, 0);
+}
+
+#[test]
+fn an_agent_gets_the_stats_with_the_buzz_call() {
+    let fixture = Fixture::new(r#"echo "$SWARM_TOKEN" > "$OUT/token"; sleep 30"#);
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    seed_merges(&daemon, 3);
+    let project = client.add_project(&repo.root);
+    let task = client.create_task(orchestrator_task(project.id, false));
+    let AgentId(agent) = task.agents[0].id;
+    client.wait_for_agent(|agent| agent.lifecycle == AgentLifecycle::Running);
+    let token = fixture.read_when_written("token");
+
+    let answer = agent_request(
+        &daemon,
+        format!(
+            r#"{{"method":"buzz","agent":{agent},"token":"{}"}}"#,
+            token.trim()
+        )
+        .as_bytes(),
+    );
+
+    assert_eq!(answer["ok"], true, "{answer}");
+    let stats: SwarmStats = serde_json::from_value(answer["result"].clone()).expect("stats");
+    assert_eq!(stats, client.stats());
+    assert_eq!(
+        (stats.running_agents, stats.open_tasks, stats.merged_prs),
+        (1, 1, 3)
+    );
+}
+
+#[test]
+fn a_wrong_token_does_not_get_the_stats() {
+    let fixture = Fixture::new("sleep 30");
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let task = client.create_task(orchestrator_task(project.id, false));
+    let AgentId(agent) = task.agents[0].id;
+
+    let answer = agent_request(
+        &daemon,
+        format!(r#"{{"method":"buzz","agent":{agent},"token":"wrong"}}"#).as_bytes(),
+    );
+
+    assert_eq!(answer["ok"], false, "{answer}");
+}
+
+#[test]
+fn swarm_buzz_inside_an_agent_prints_the_counts_of_the_daemon() {
+    let fixture = Fixture::new(
+        r#""$SWARM" buzz > "$OUT/buzz.out" 2>&1
+echo $? > "$OUT/buzz.code"
+sleep 30"#,
+    );
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    seed_merges(&daemon, 13);
+    let project = client.add_project(&repo.root);
+
+    client.create_task(orchestrator_task(project.id, false));
+
+    assert_eq!(fixture.read_when_written("buzz.code").trim(), "0");
+    let printed = fixture.read_when_written("buzz.out");
+    assert_eq!(
+        printed, "1 task \u{b7} 1 agent running\n13 PRs merged\n",
+        "a file gets the counts and no bee"
+    );
+}
+
+#[test]
+fn a_merged_pull_request_raises_the_merge_count_by_one() {
+    let mut env = env_with_pull_request(false);
+    env.view("MERGED");
+    assert_eq!(env.client.stats().merged_prs, 0);
+
+    env.merge().expect("merged");
+
+    let stats = env.client.stats();
+    assert_eq!(stats.merged_prs, 1);
+    assert_eq!(stats.hundredth_merge_at, None);
+    assert_eq!(stats.open_tasks, 1, "the task stays open");
+}
+
+#[test]
+fn a_merge_that_fails_or_only_queues_is_not_counted_or_announced() {
+    let mut env = env_with_pull_request(false);
+    let mut watcher = env.daemon.connect();
+    watcher.hello();
+    let pushed = head_of(&env.task.worktree);
+    env.view("MERGED");
+    env.gh
+        .pull_request_head("0123456789012345678901234567890123456789");
+
+    let refused = env.merge().expect_err("refused");
+    assert!(refused.contains("Head branch was modified"), "{refused}");
+    env.gh.pull_request_head(&pushed);
+    env.view("OPEN");
+    env.merge().expect("queued is fine");
+    let (stats, announced) = watcher.stats_and_announcements();
+
+    assert_eq!(stats.merged_prs, 0);
+    assert!(announced.is_empty(), "{announced:?}");
+
+    env.view("MERGED");
+    env.merge().expect("merged");
+    let (stats, announced) = watcher.stats_and_announcements();
+
+    assert_eq!(stats.merged_prs, 1);
+    assert_eq!(announced, [stats]);
+}
+
+#[test]
+fn a_queued_merge_is_counted_when_a_later_status_read_shows_it_merged() {
+    let mut env = env_with_pull_request(false);
+    let mut watcher = env.daemon.connect();
+    watcher.hello();
+    env.view("OPEN");
+    env.merge().expect("queued");
+    assert_eq!(watcher.stats_and_announcements().0.merged_prs, 0);
+
+    env.view("MERGED");
+    let pull_request = env.client.pr_status(env.task.id).expect("status");
+
+    assert_eq!(pull_request.state, swarm_protocol::PrState::Merged);
+    let (stats, announced) = watcher.stats_and_announcements();
+    assert_eq!(stats.merged_prs, 1);
+    assert_eq!(announced, [stats]);
+}
+
+#[test]
+fn a_queued_merge_is_counted_when_a_push_finds_it_merged() {
+    let mut env = env_with_pull_request(false);
+    env.view("OPEN");
+    env.merge().expect("queued");
+    env.commit_and_approve("late.txt");
+    env.view("MERGED");
+
+    let refused = env.update(false).expect_err("merged already");
+
+    assert_eq!(refused, "pull request #42 is merged already");
+    assert_eq!(env.client.stats().merged_prs, 1);
+}
+
+#[test]
+fn a_queued_merge_is_counted_when_creating_a_pull_request_finds_it_merged() {
+    let mut env = env_with_pull_request(false);
+    env.view("OPEN");
+    env.merge().expect("queued");
+    env.view("MERGED");
+
+    let refused = env.create().expect_err("merged already");
+
+    assert_eq!(refused, "pull request #42 is merged already");
+    assert_eq!(env.client.stats().merged_prs, 1);
+}
+
+#[test]
+fn a_merge_whose_follow_up_read_failed_is_counted_by_the_next_status() {
+    let mut env = env_with_pull_request(false);
+    env.view("MERGED");
+    env.gh.fail("pr-view", "network is down");
+
+    let failed = env.merge().expect_err("the read failed");
+
+    assert!(
+        failed.contains("gh merged, but Swarm could not read the pull request"),
+        "{failed}"
+    );
+    assert_eq!(env.client.stats().merged_prs, 0);
+
+    env.gh.recover("pr-view");
+    env.client.pr_status(env.task.id).expect("status");
+
+    assert_eq!(env.client.stats().merged_prs, 1);
+}
+
+#[test]
+fn a_merge_is_counted_once_however_often_it_is_seen() {
+    let mut env = env_with_pull_request(false);
+    let mut watcher = env.daemon.connect();
+    watcher.hello();
+    env.view("OPEN");
+    env.merge().expect("queued");
+    env.view("MERGED");
+
+    env.client.pr_status(env.task.id).expect("first read");
+    env.client.pr_status(env.task.id).expect("second read");
+    env.merge().expect("a retry of the merge");
+    env.client.pr_status(env.task.id).expect("third read");
+
+    let (stats, announced) = watcher.stats_and_announcements();
+    assert_eq!(stats.merged_prs, 1);
+    assert_eq!(announced, [stats], "announced once");
+}
+
+#[test]
+fn a_pull_request_merged_outside_swarm_is_not_counted() {
+    let mut env = env_with_pull_request(false);
+    let mut watcher = env.daemon.connect();
+    watcher.hello();
+    env.view("MERGED");
+
+    let pull_request = env.client.pr_status(env.task.id).expect("status");
+
+    assert_eq!(pull_request.state, swarm_protocol::PrState::Merged);
+    let (stats, announced) = watcher.stats_and_announcements();
+    assert_eq!(stats.merged_prs, 0);
+    assert!(announced.is_empty(), "{announced:?}");
+    assert!(env.gh.calls_of(&["pr", "merge"]).is_empty());
+}
+
+#[test]
+fn a_merge_request_for_a_closed_pull_request_does_not_count_the_next_one() {
+    let mut env = env_with_pull_request(false);
+    env.view("OPEN");
+    env.merge().expect("queued");
+    env.view("CLOSED");
+    env.gh
+        .answer("pr-create", "https://github.com/acme/widgets/pull/43\n");
+    env.create().expect("a closed pull request is replaced");
+
+    env.gh.answer("pr-view", &view_json(43, "MERGED"));
+    env.client.pr_status(env.task.id).expect("status");
+
+    assert_eq!(env.client.stats().merged_prs, 0);
+}
+
+#[test]
+fn a_queued_merge_is_counted_after_a_daemon_restart() {
+    let mut env = env_with_pull_request(false);
+    env.view("OPEN");
+    env.merge().expect("queued");
+
+    env.daemon.crash();
+    let restarted = Daemon::spawn_with(env.daemon.home.clone(), None, Some(&env.gh.path()));
+    restarted.wait_until_listening();
+    let mut client = restarted.connect();
+    client.hello();
+    env.view("MERGED");
+    client.pr_status(env.task.id).expect("status");
+
+    assert_eq!(client.stats().merged_prs, 1);
+}
+
+#[test]
+fn a_merge_is_announced_to_every_connected_client() {
+    let mut env = env_with_pull_request(false);
+    let mut watcher = env.daemon.connect();
+    watcher.hello();
+    let protocol = swarm_protocol::Client::connect(&env.daemon.socket()).expect("protocol client");
+    env.view("MERGED");
+
+    let events = env.merge().expect("merged");
+
+    let own = events
+        .iter()
+        .find_map(|event| match event {
+            Event::StatsChanged { stats } => Some(*stats),
+            _ => None,
+        })
+        .expect("StatsChanged before Done");
+    assert_eq!(own.merged_prs, 1);
+    assert_eq!(watcher.wait_for_stats_change(), own);
+    assert_eq!(
+        protocol.stats_events().recv_timeout(READ_TIMEOUT),
+        Ok(own),
+        "the protocol client hears it too"
+    );
+    assert_eq!(protocol.stats().expect("stats"), own);
+    assert_eq!(env.client.stats(), own);
+}
+
+#[test]
+fn the_hundredth_merge_records_its_time() {
+    let mut env = env_with_pull_request(false);
+    seed_merges(&env.daemon, 99);
+    env.view("MERGED");
+    let before = env.client.stats();
+    assert_eq!((before.merged_prs, before.hundredth_merge_at), (99, None));
+    let started = unix_millis();
+
+    env.merge().expect("merged");
+
+    let after = env.client.stats();
+    assert_eq!(after.merged_prs, 100);
+    let at = after.hundredth_merge_at.expect("the hundredth time");
+    assert!((started..=unix_millis()).contains(&at), "{at}");
+}
+
+#[test]
+fn a_merge_after_the_hundredth_keeps_its_time() {
+    let mut env = env_with_pull_request(false);
+    seed_merges(&env.daemon, 100);
+    env.view("MERGED");
+    let at = env
+        .client
+        .stats()
+        .hundredth_merge_at
+        .expect("the hundredth time");
+    // So that the time of the new merge cannot be the same millisecond.
+    thread::park_timeout(Duration::from_millis(20));
+
+    env.merge().expect("merged");
+
+    let after = env.client.stats();
+    assert_eq!(after.merged_prs, 101);
+    assert_eq!(after.hundredth_merge_at, Some(at));
+}
+
+#[test]
+fn the_merge_count_and_the_hundredth_time_survive_a_daemon_restart() {
+    let mut env = env_with_pull_request(false);
+    seed_merges(&env.daemon, 99);
+    env.view("MERGED");
+    env.merge().expect("merged");
+    let before = env.client.stats();
+    assert_eq!(before.merged_prs, 100);
+    assert!(before.hundredth_merge_at.is_some());
+
+    env.daemon.crash();
+    let restarted = Daemon::start_in(env.daemon.home.clone());
+    let mut client = restarted.connect();
+    client.hello();
+
+    assert_eq!(client.stats(), before);
 }

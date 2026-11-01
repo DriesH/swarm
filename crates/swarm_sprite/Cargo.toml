@@ -1,0 +1,11 @@
+[package]
+name = "swarm_sprite"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/swarm_sprite.rs"
+
+[lints]
+workspace = true

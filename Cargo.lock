@@ -5257,6 +5257,7 @@ dependencies = [
  "serde",
  "serde_json",
  "swarm_protocol",
+ "swarm_sprite",
  "swarm_usage",
 ]
 
@@ -5328,6 +5329,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "swarm_sprite"
+version = "0.1.0"
+
+[[package]]
 name = "swarm_term"
 version = "0.1.0"
 dependencies = [
@@ -5369,6 +5374,7 @@ dependencies = [
  "gpui",
  "log",
  "objc2-app-kit 0.3.2",
+ "swarm_sprite",
  "unicode-segmentation",
 ]
 

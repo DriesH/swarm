@@ -14,7 +14,8 @@ use crate::workspace::Workspace;
 const COLUMN_WIDTH: f32 = 520.;
 /// The height of the strip at the top that moves the window.
 const DRAG_HEIGHT: f32 = 36.;
-const BEE_DEGREES: f32 = -20.;
+/// Logical pixels for each sprite pixel of the welcome bee, which makes it 26 pixels wide.
+const BEE_SCALE: u8 = 1;
 
 pub(crate) struct Welcome {
     workspace: WeakEntity<Workspace>,
@@ -124,6 +125,16 @@ impl Welcome {
     }
 }
 
+/// A small pixel bee beside the column. A decoration: no role and no label.
+fn welcome_bee() -> gpui::Div {
+    div()
+        .debug_selector(|| "welcome-bee".to_owned())
+        .absolute()
+        .left(px(-56.))
+        .bottom(px(64.))
+        .child(PixelBee::new("welcome-bee").scale(BEE_SCALE))
+}
+
 impl Render for Welcome {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
@@ -165,6 +176,8 @@ impl Render for Welcome {
                     .on_click(cx.listener(|this, _, window, cx| this.finish(true, window, cx))),
             );
 
+        let eggs = crate::settings::easter_eggs(cx);
+
         let column = v_flex()
             .relative()
             .w(px(COLUMN_WIDTH))
@@ -173,14 +186,7 @@ impl Render for Welcome {
             .child(Self::header())
             .child(self.check.clone())
             .child(buttons)
-            .child(
-                div().absolute().left(px(-56.)).bottom(px(64.)).child(
-                    Icon::new(IconName::Bee)
-                        .size(IconSize::Custom(px(22.)))
-                        .color(Color::Faint)
-                        .rotate(BEE_DEGREES),
-                ),
-            );
+            .when(eggs, |column| column.child(welcome_bee()));
 
         div()
             .id("welcome")
@@ -190,12 +196,15 @@ impl Render for Welcome {
             .relative()
             .size_full()
             .bg(ground)
-            .child(
-                div()
-                    .absolute()
-                    .size_full()
-                    .child(self.honeycomb.clone().cached(Honeycomb::cache_style())),
-            )
+            .when(eggs, |welcome| {
+                welcome.child(
+                    div()
+                        .debug_selector(|| "honeycomb".to_owned())
+                        .absolute()
+                        .size_full()
+                        .child(self.honeycomb.clone().cached(Honeycomb::cache_style())),
+                )
+            })
             .child(
                 div()
                     .id("welcome-scroll")
@@ -281,6 +290,52 @@ mod tests {
             !shown("empty-add-project"),
             "the empty state is still there"
         );
+    }
+
+    #[gpui::test]
+    fn the_welcome_honeycomb_and_bee_are_eggs(cx: &mut TestAppContext) {
+        let mut fixture = welcome_fixture(report_with(&[]), Permission::Allowed, cx);
+        let eggs = |fixture: &mut Fixture<'_>| {
+            (
+                fixture.cx.debug_bounds("honeycomb").is_some(),
+                fixture.cx.debug_bounds("welcome-bee").is_some(),
+            )
+        };
+
+        let with_eggs = eggs(&mut fixture);
+        fixture.cx.update(|_, cx| cx.set_reduce_motion(true));
+        redraw(fixture.cx);
+        let still = eggs(&mut fixture);
+
+        fixture
+            .cx
+            .update(|_, cx| crate::settings::change_appearance(|a| a.easter_eggs = false, cx));
+        redraw(fixture.cx);
+        let without = eggs(&mut fixture);
+
+        assert_eq!(with_eggs, (true, true));
+        assert_eq!(still, (true, true), "both are still pictures");
+        assert_eq!(without, (false, false));
+    }
+
+    #[gpui::test]
+    fn the_welcome_bee_is_the_pixel_bee_and_a_decoration(cx: &mut TestAppContext) {
+        use gpui::Element as _;
+
+        let fixture = welcome_fixture(report_with(&[]), Permission::Allowed, cx);
+
+        let drawn = fixture
+            .cx
+            .debug_bounds("welcome-bee")
+            .map(|bounds| bounds.size);
+        let wrapper = welcome_bee();
+        let mut node = gpui::accesskit::Node::new(Role::Unknown);
+        wrapper.write_a11y_info(&mut node);
+
+        let side = PixelBee::side(BEE_SCALE);
+        assert_eq!(drawn, Some(gpui::size(side, side)));
+        assert_eq!(wrapper.a11y_role(), None);
+        assert_eq!(node.label(), None);
     }
 
     #[gpui::test]

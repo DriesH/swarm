@@ -10,7 +10,7 @@ use gpui::{
 use swarm_ui::prelude::*;
 use swarm_ui::{
     Confirm, Dialog, Dismiss, FocusNext, FocusPrevious, MENU_CONTEXT, Menu, MenuItem, PopoverMenu,
-    ROOT_CONTEXT, SelectNext, SelectPrevious, tab_navigation,
+    ROOT_CONTEXT, SelectNext, SelectPrevious, Toast, tab_navigation,
 };
 
 type Log = Rc<RefCell<Vec<String>>>;
@@ -424,4 +424,162 @@ fn escape_outside_a_confirm_row_does_nothing(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("escape");
 
     assert!(entries(&log).is_empty());
+}
+
+struct ToastHarness {
+    log: Log,
+    outside: FocusHandle,
+}
+
+impl Render for ToastHarness {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let reviewed = Rc::clone(&self.log);
+        let dismissed = Rc::clone(&self.log);
+
+        tab_navigation(
+            gpui::div()
+                .id("toast-root")
+                .key_context(ROOT_CONTEXT)
+                .size_full()
+                .child(
+                    gpui::div()
+                        .id("outside")
+                        .track_focus(&self.outside)
+                        .size(px(10.)),
+                )
+                .child(
+                    Toast::new("toast", "terminal-renderer", "Ready for review")
+                        .debug_selector(|| "toast".to_owned())
+                        .action("Review", move |_, _, _| {
+                            reviewed.borrow_mut().push("review".to_owned());
+                        })
+                        .on_dismiss(move |_, _| dismissed.borrow_mut().push("dismiss".to_owned())),
+                ),
+        )
+    }
+}
+
+fn toast(cx: &mut TestAppContext) -> (Log, &mut VisualTestContext) {
+    cx.update(swarm_ui::init);
+
+    let log = Log::default();
+    let shared = Rc::clone(&log);
+    let (harness, cx) = cx.add_window_view(move |_, cx| ToastHarness {
+        log: shared,
+        outside: cx.focus_handle(),
+    });
+    let outside = harness.read_with(cx, |harness, _| harness.outside.clone());
+    cx.update(|window, cx| outside.focus(window, cx));
+    cx.run_until_parked();
+
+    (log, cx)
+}
+
+fn click_in(selector: &'static str, cx: &mut VisualTestContext) {
+    let bounds = cx
+        .debug_bounds(selector)
+        .unwrap_or_else(|| panic!("{selector} is not on screen"));
+    cx.simulate_click(bounds.center(), Modifiers::none());
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn the_toast_buttons_report_clicks(cx: &mut TestAppContext) {
+    let (log, cx) = toast(cx);
+
+    click_in("toast-action", cx);
+    click_in("toast-dismiss", cx);
+
+    assert_eq!(entries(&log), ["review", "dismiss"]);
+}
+
+/// A full key press: GPUI turns Enter and Space into a click on the key up.
+fn press(key: &'static str, cx: &mut VisualTestContext) {
+    let keystroke =
+        gpui::Keystroke::parse(key).unwrap_or_else(|error| panic!("{key} is not a key: {error}"));
+
+    cx.simulate_event(gpui::KeyDownEvent {
+        keystroke: keystroke.clone(),
+        is_held: false,
+        prefer_character_input: false,
+    });
+    cx.simulate_event(gpui::KeyUpEvent { keystroke });
+}
+
+#[gpui::test]
+fn tab_reaches_review_then_dismiss_and_enter_or_space_press_them(cx: &mut TestAppContext) {
+    let (log, cx) = toast(cx);
+
+    cx.simulate_keystrokes("tab");
+    press("enter", cx);
+    cx.simulate_keystrokes("tab");
+    press("space", cx);
+
+    assert_eq!(entries(&log), ["review", "dismiss"]);
+}
+
+#[gpui::test]
+fn escape_dismisses_a_toast_only_while_focus_is_in_it(cx: &mut TestAppContext) {
+    let (log, cx) = toast(cx);
+
+    cx.simulate_keystrokes("escape");
+    assert!(entries(&log).is_empty());
+
+    cx.simulate_keystrokes("tab escape");
+    assert_eq!(entries(&log), ["dismiss"]);
+}
+
+struct OverlapHarness {
+    log: Log,
+}
+
+impl Render for OverlapHarness {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let tile = Rc::clone(&self.log);
+
+        gpui::div()
+            .id("overlap-root")
+            .relative()
+            .size_full()
+            .child(
+                gpui::div()
+                    .id("tile")
+                    .w(px(700.))
+                    .h(px(300.))
+                    .debug_selector(|| "tile".to_owned())
+                    .on_click(move |_, _, _| tile.borrow_mut().push("tile".to_owned())),
+            )
+            .child(
+                gpui::div().absolute().top_0().left_0().child(
+                    Toast::new("toast", "terminal-renderer", "Ready for review")
+                        .debug_selector(|| "toast".to_owned()),
+                ),
+            )
+    }
+}
+
+#[gpui::test]
+fn a_click_on_the_toast_does_not_reach_the_tile_under_it(cx: &mut TestAppContext) {
+    cx.update(swarm_ui::init);
+
+    let log = Log::default();
+    let shared = Rc::clone(&log);
+    let (_, cx) = cx.add_window_view(move |_, _| OverlapHarness { log: shared });
+    cx.run_until_parked();
+
+    let toast = cx.debug_bounds("toast").expect("the toast is on screen");
+    let on_the_toast = toast.origin + point(px(4.), px(4.));
+    let beside_the_toast = point(toast.right() + px(40.), toast.top() + px(4.));
+
+    cx.simulate_click(on_the_toast, Modifiers::none());
+    cx.run_until_parked();
+    assert!(entries(&log).is_empty(), "the click went through the toast");
+
+    cx.simulate_click(beside_the_toast, Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        entries(&log),
+        ["tile"],
+        "the tile takes clicks beside the toast"
+    );
 }

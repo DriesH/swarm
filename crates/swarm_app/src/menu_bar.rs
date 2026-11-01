@@ -17,14 +17,14 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, AppContext as _, Bounds, Entity, Global, Pixels, Size, WindowBackgroundAppearance,
+    App, AppContext as _, Bounds, Entity, Global, Pixels, Size, Task, WindowBackgroundAppearance,
     WindowBounds, WindowHandle, WindowId, WindowKind, WindowOptions, point, px, size,
 };
 
 use self::place::Anchor;
 use self::popover::Popover;
 pub(crate) use self::popover::usage_section;
-use self::summary::Summary;
+use self::summary::{BeeFrame, Summary};
 pub(crate) use self::summary::{Look, usage_sections};
 use crate::workspace::Workspace;
 
@@ -38,6 +38,9 @@ const CORNER_GAP: f32 = 8.;
 /// How often the look is worked out again. A usage window that resets changes the percent
 /// with no news from the daemon.
 const LOOK_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How long each wing frame shows while agents work.
+const FLAP_INTERVAL: Duration = Duration::from_millis(130);
 
 /// What the menu bar needs from the status item.
 pub(crate) trait StatusItem {
@@ -70,6 +73,10 @@ struct MenuBar {
     shown: Option<Look>,
     popover: Option<WindowHandle<Popover>>,
     guard: ReopenGuard,
+    /// The wing frame the bee shows. Only the flapping changes it from `Open`.
+    frame: BeeFrame,
+    /// Flips the frame while agents work.
+    flap: Option<Task<()>>,
 }
 
 impl Global for MenuBar {}
@@ -109,6 +116,8 @@ fn start(
         shown: None,
         popover: None,
         guard: ReopenGuard::default(),
+        frame: BeeFrame::Open,
+        flap: None,
     });
 
     cx.observe(&workspace, |_, cx| refresh(cx)).detach();
@@ -151,7 +160,16 @@ fn summary(cx: &App) -> Summary {
 /// Shows the status item's new look, when it changed.
 fn refresh(cx: &mut App) {
     let dot_allowed = crate::settings::notifications(cx).menu_bar_dot;
-    let look = summary(cx).look(dot_allowed);
+    let summary = summary(cx);
+
+    // An egg: off with the switch, and still under Reduce Motion.
+    let buzzing = summary.working > 0
+        && crate::settings::easter_eggs(cx)
+        && !swarm_ui::motion::reduce_motion(cx);
+    set_buzzing(buzzing, cx);
+
+    let frame = cx.global::<MenuBar>().frame;
+    let look = summary.look(dot_allowed).with_frame(frame);
     let menu = cx.global_mut::<MenuBar>();
     if menu.shown.as_ref() == Some(&look) {
         return;
@@ -161,6 +179,40 @@ fn refresh(cx: &mut App) {
         status.show(&look);
     }
     menu.shown = Some(look);
+}
+
+/// Starts the flapping while agents work. When they stop, it ends with the wings open.
+fn set_buzzing(buzzing: bool, cx: &mut App) {
+    if !buzzing {
+        let menu = cx.global_mut::<MenuBar>();
+        menu.flap = None;
+        menu.frame = BeeFrame::Open;
+
+        return;
+    }
+
+    if cx.global::<MenuBar>().flap.is_some() {
+        return;
+    }
+
+    let flapping = cx.spawn(async move |cx| {
+        loop {
+            cx.background_executor().timer(FLAP_INTERVAL).await;
+            cx.update(flap);
+        }
+    });
+    cx.global_mut::<MenuBar>().flap = Some(flapping);
+}
+
+/// One flap. `refresh` ends the flapping when the agents stopped or motion is reduced.
+fn flap(cx: &mut App) {
+    // The setting can change while no window is active, so no window told us.
+    swarm_ui::motion::sync_reduce_motion(cx);
+
+    let menu = cx.global_mut::<MenuBar>();
+    menu.frame = menu.frame.flipped();
+
+    refresh(cx);
 }
 
 fn window_closed(cx: &mut App, window: WindowId) {
@@ -467,6 +519,155 @@ mod tests {
         assert_eq!(bar.last_look(), Some(Look::new(None, true)));
     }
 
+    fn frames(bar: &harness::Bar) -> Vec<BeeFrame> {
+        bar.item
+            .looks
+            .borrow()
+            .iter()
+            .map(|look| look.frame)
+            .collect()
+    }
+
+    fn flap_for(times: u32, cx: &mut gpui::VisualTestContext) {
+        for _ in 0..times {
+            cx.executor().advance_clock(FLAP_INTERVAL);
+            cx.run_until_parked();
+        }
+    }
+
+    fn stop_the_work(workspace: &Entity<Workspace>, cx: &mut gpui::VisualTestContext) {
+        workspace.update(cx, |workspace, cx| {
+            for agent in &mut workspace.data.agents {
+                agent.status = swarm_ui::AgentStatus::Idle;
+            }
+            cx.notify();
+        });
+    }
+
+    #[gpui::test]
+    fn the_bee_flaps_between_two_frames_while_an_agent_works(cx: &mut TestAppContext) {
+        let (_, bar, cx) = setup(cx);
+        assert_eq!(bar.last_look().map(|look| look.frame), Some(BeeFrame::Open));
+
+        flap_for(4, cx);
+        let frames = frames(&bar);
+
+        assert!(frames.contains(&BeeFrame::Flat));
+        assert!(
+            frames.windows(2).all(|pair| pair[0] != pair[1]),
+            "every look is a new frame: {frames:?}"
+        );
+        assert!(bar.item.looks.borrow().len() >= 5);
+    }
+
+    #[gpui::test]
+    fn the_bee_flaps_only_while_an_agent_works(cx: &mut TestAppContext) {
+        let (workspace, bar, cx) = setup(cx);
+        stop_the_work(&workspace, cx);
+        flap_for(1, cx);
+        let looks = bar.item.looks.borrow().len();
+
+        flap_for(6, cx);
+
+        assert_eq!(bar.item.looks.borrow().len(), looks, "no work, no flicker");
+        assert_eq!(bar.last_look().map(|look| look.frame), Some(BeeFrame::Open));
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.data.agents[0].status = swarm_ui::AgentStatus::Working;
+            cx.notify();
+        });
+        flap_for(2, cx);
+
+        assert!(frames(&bar).contains(&BeeFrame::Flat));
+    }
+
+    #[gpui::test]
+    fn the_bee_stops_with_its_wings_open_when_the_work_ends(cx: &mut TestAppContext) {
+        let (workspace, bar, cx) = setup(cx);
+        flap_for(1, cx);
+        assert_eq!(bar.last_look().map(|look| look.frame), Some(BeeFrame::Flat));
+
+        stop_the_work(&workspace, cx);
+
+        assert_eq!(bar.last_look().map(|look| look.frame), Some(BeeFrame::Open));
+    }
+
+    #[gpui::test]
+    fn the_bee_is_still_with_the_easter_eggs_off(cx: &mut TestAppContext) {
+        let (_, bar, cx) = setup(cx);
+        cx.update(|_, cx| crate::settings::change_appearance(|a| a.easter_eggs = false, cx));
+
+        flap_for(6, cx);
+
+        assert!(frames(&bar).iter().all(|frame| *frame == BeeFrame::Open));
+    }
+
+    thread_local! {
+        static SYSTEM_REDUCE_MOTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    fn system_reduce_motion() -> bool {
+        SYSTEM_REDUCE_MOTION.with(std::cell::Cell::get)
+    }
+
+    /// Stands in for System Settings. A change reaches the app only when it reads the
+    /// setting again.
+    fn set_system_reduce_motion(reduced: bool, cx: &mut gpui::VisualTestContext) {
+        SYSTEM_REDUCE_MOTION.with(|cell| cell.set(reduced));
+        cx.update(|_, cx| {
+            cx.set_global(swarm_ui::motion::ReduceMotionSource(system_reduce_motion));
+        });
+    }
+
+    #[gpui::test]
+    fn the_bee_is_still_under_reduce_motion(cx: &mut TestAppContext) {
+        let (_, bar, cx) = setup(cx);
+        set_system_reduce_motion(true, cx);
+
+        flap_for(6, cx);
+
+        assert!(frames(&bar).iter().all(|frame| *frame == BeeFrame::Open));
+    }
+
+    #[gpui::test]
+    fn the_bee_stops_within_a_tick_when_reduce_motion_turns_on_with_no_window_active(
+        cx: &mut TestAppContext,
+    ) {
+        let (_, bar, cx) = setup(cx);
+        set_system_reduce_motion(false, cx);
+        flap_for(2, cx);
+        assert!(
+            frames(&bar).contains(&BeeFrame::Flat),
+            "the bee flaps first"
+        );
+
+        set_system_reduce_motion(true, cx);
+        flap_for(1, cx);
+        let looks = bar.item.looks.borrow().len();
+
+        assert_eq!(bar.last_look().map(|look| look.frame), Some(BeeFrame::Open));
+
+        flap_for(6, cx);
+
+        assert_eq!(
+            bar.item.looks.borrow().len(),
+            looks,
+            "no flicker after the tick"
+        );
+    }
+
+    #[gpui::test]
+    fn the_flicker_does_not_change_what_voiceover_says(cx: &mut TestAppContext) {
+        let (_, bar, cx) = setup(cx);
+
+        flap_for(4, cx);
+        let looks = bar.item.looks.borrow();
+        let labels: std::collections::HashSet<_> =
+            looks.iter().map(|look| look.label.clone()).collect();
+
+        assert_eq!(labels.len(), 1);
+    }
+
     #[gpui::test]
     fn the_status_item_is_told_only_when_its_look_changes(cx: &mut TestAppContext) {
         let (workspace, bar, cx) = setup(cx);
@@ -483,6 +684,7 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         let (workspace, bar, cx) = setup(cx);
+        stop_the_work(&workspace, cx);
         let resets = SAMPLE_NOW / 1_000 + 90;
         workspace.update(cx, |workspace, cx| {
             for task in &mut workspace.data.tasks {
@@ -523,7 +725,8 @@ mod tests {
 
     #[gpui::test]
     fn the_timer_leaves_the_status_item_alone_when_the_look_is_the_same(cx: &mut TestAppContext) {
-        let (_workspace, bar, cx) = setup(cx);
+        let (workspace, bar, cx) = setup(cx);
+        stop_the_work(&workspace, cx);
         let shown = bar.item.looks.borrow().len();
 
         cx.executor().advance_clock(LOOK_INTERVAL * 3);

@@ -2,10 +2,22 @@
 
 use anyhow::{Context as _, Result};
 
-const BEE_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24"
+use super::summary::BeeFrame;
+
+const BEE_OPEN: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24"
   fill="none" stroke="#000" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
   <path d="M12 9c-1.6-3.6-6.4-4.4-7.2-1.8C4.1 9.6 8 10.6 12 9z"/>
   <path d="M12 9c1.6-3.6 6.4-4.4 7.2-1.8.7 2.4-3.2 3.4-7.2 1.8z"/>
+  <ellipse cx="12" cy="15" rx="4.5" ry="5.5"/>
+  <path d="M7.7 13.5h8.6M7.9 16.8h8.2M12 20.5V22"/>
+</svg>"##;
+
+/// The same bee with its wings squashed to 35% of their height around the shoulder, so the
+/// strokes stay as thick as in the open frame.
+const BEE_FLAT: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24"
+  fill="none" stroke="#000" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M12 9C10.4 7.74 5.6 7.46 4.8 8.37C4.1 9.21 8 9.56 12 9z"/>
+  <path d="M12 9C13.6 7.74 18.4 7.46 19.2 8.37C19.9 9.21 16 9.56 12 9z"/>
   <ellipse cx="12" cy="15" rx="4.5" ry="5.5"/>
   <path d="M7.7 13.5h8.6M7.9 16.8h8.2M12 20.5V22"/>
 </svg>"##;
@@ -19,9 +31,14 @@ const DOT: (f32, f32, f32) = (20.5, 3.5, 3.2);
 /// Clear space around the dot, so it reads over the wing.
 const DOT_GAP: f32 = 1.4;
 
-/// Draws the bee, with the dot when `with_dot` is set, and encodes it as a PNG.
-pub(crate) fn bee_png(with_dot: bool) -> Result<Vec<u8>> {
-    let tree = resvg::usvg::Tree::from_str(BEE_SVG, &resvg::usvg::Options::default())
+/// Draws the bee in one of its two wing frames, with the dot when `with_dot` is set, and
+/// encodes it as a PNG.
+pub(crate) fn bee_png(with_dot: bool, frame: BeeFrame) -> Result<Vec<u8>> {
+    let svg = match frame {
+        BeeFrame::Open => BEE_OPEN,
+        BeeFrame::Flat => BEE_FLAT,
+    };
+    let tree = resvg::usvg::Tree::from_str(svg, &resvg::usvg::Options::default())
         .context("parse the bee svg")?;
     let mut pixmap = resvg::tiny_skia::Pixmap::new(PIXELS, PIXELS).context("make a pixmap")?;
 
@@ -91,7 +108,7 @@ mod tests {
 
     #[test]
     fn the_bee_draws_something_without_the_dot() {
-        let png = bee_png(false).unwrap_or_default();
+        let png = bee_png(false, BeeFrame::Open).unwrap_or_default();
 
         assert!(png.starts_with(b"\x89PNG"));
         // The body is the middle of the image; the dot's corner stays clear.
@@ -100,8 +117,22 @@ mod tests {
     }
 
     #[test]
+    fn the_flat_frame_differs_from_the_open_one_only_in_the_wings() {
+        let open = bee_png(false, BeeFrame::Open).unwrap_or_default();
+        let flat = bee_png(false, BeeFrame::Flat).unwrap_or_default();
+
+        assert!(flat.starts_with(b"\x89PNG"));
+        assert_ne!(open, flat);
+        // The open wing arches over this pixel; the flat one stays below it.
+        assert!(alpha_at(&open, 12, 8) > 0);
+        assert_eq!(alpha_at(&flat, 12, 8), 0);
+        // The body is the same in both.
+        assert_eq!(alpha_at(&open, 18, 30), alpha_at(&flat, 18, 30));
+    }
+
+    #[test]
     fn the_dot_fills_the_top_right_corner() {
-        let png = bee_png(true).unwrap_or_default();
+        let png = bee_png(true, BeeFrame::Open).unwrap_or_default();
 
         assert!(png.starts_with(b"\x89PNG"));
         assert_eq!(alpha_at(&png, 30, 5), 255);

@@ -76,10 +76,14 @@ fn empty_state(workspace: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
         .id("empty-state")
         .role(Role::Group)
         .aria_label("No projects")
+        .relative()
         .size_full()
         .items_center()
         .justify_center()
         .gap(px(12.))
+        .when(crate::settings::easter_eggs(cx), |state| {
+            state.child(honeycomb_behind(workspace))
+        })
         .child(Label::new("No projects").color(Color::Faint))
         .child(
             Button::new("empty-add-project", "Add project")
@@ -88,6 +92,17 @@ fn empty_state(workspace: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
                 .disabled(!live)
                 .on_click(cx.listener(|_, _, window, cx| Workspace::pick_project(window, cx))),
         )
+}
+
+/// The faint honeycomb of the empty states: it fills the parent and sits under its content.
+fn honeycomb_behind(workspace: &Workspace) -> impl IntoElement + use<> {
+    div()
+        .debug_selector(|| "honeycomb".to_owned())
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+        .child(workspace.honeycomb.clone().cached(Honeycomb::cache_style()))
 }
 
 pub(crate) fn orchestrator_input(cx: &mut Context<Workspace>) -> (Entity<TextInput>, Subscription) {
@@ -552,6 +567,9 @@ fn terminals(workspace: &Workspace, cx: &mut Context<Workspace>) -> impl IntoEle
         )
         // Fills the area so its bounds are the layout area.
         .child(div().absolute().size_full())
+        .when(is_start && crate::settings::easter_eggs(cx), |area| {
+            area.child(honeycomb_behind(workspace))
+        })
         .children(tiles)
 }
 

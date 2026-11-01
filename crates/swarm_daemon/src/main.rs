@@ -11,6 +11,7 @@ mod messages;
 mod processes;
 mod pull_requests;
 mod recovery;
+mod stats;
 mod tasks;
 #[cfg(test)]
 mod temp_folder;

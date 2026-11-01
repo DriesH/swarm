@@ -7,6 +7,7 @@ use gpui::{
 
 use crate::component::{Component, example, example_group};
 use crate::prelude::*;
+use crate::theme::ThemeColors;
 
 /// What an agent is doing right now (see GLOSSARY.md).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -43,10 +44,13 @@ impl AgentStatus {
 
     /// Text or mark color.
     pub fn color(self, cx: &App) -> Hsla {
-        let colors = cx.theme().colors();
+        self.color_in(cx.theme().colors())
+    }
 
+    /// Status colors are semantic: none of them follows the accent the user picked.
+    fn color_in(self, colors: &ThemeColors) -> Hsla {
         match self {
-            Self::Working => colors.accent,
+            Self::Working => colors.working,
             Self::Blocked => colors.warn,
             Self::Done => colors.ok,
             Self::Idle => colors.faint,
@@ -61,10 +65,12 @@ impl AgentStatus {
     }
 
     fn pill_colors(self, cx: &App) -> (Hsla, Hsla) {
-        let colors = cx.theme().colors();
+        self.pill_colors_in(cx.theme().colors())
+    }
 
+    fn pill_colors_in(self, colors: &ThemeColors) -> (Hsla, Hsla) {
         match self {
-            Self::Working => (colors.accent, colors.accent_bg),
+            Self::Working => (colors.working, colors.working_bg),
             Self::Blocked => (colors.warn, colors.warn_bg),
             Self::Done => (colors.ok, colors.ok_bg),
             Self::Idle | Self::Unknown => (colors.muted, colors.soft),
@@ -304,6 +310,74 @@ mod tests {
     use gpui::{Render, TestAppContext, VisualTestContext};
 
     use super::*;
+    use crate::contrast::color_distance;
+    use crate::theme::{Accent, Theme};
+
+    /// Every look: light and dark, each with the blue and the honey accent.
+    fn themes() -> [Theme; 4] {
+        [
+            Theme::light(),
+            Theme::dark(),
+            Theme::light().with_accent(Accent::Honey),
+            Theme::dark().with_accent(Accent::Honey),
+        ]
+    }
+
+    /// Smallest CIELAB distance between two status colors. The closest pair today is 36
+    /// (Blocked and Error in light mode); 30 is far above the 10 where two colors read as
+    /// different at a glance, and far below the 0 a shared amber gave Working and Blocked.
+    const MIN_STATUS_DISTANCE: f32 = 30.;
+
+    #[test]
+    fn status_colors_differ_clearly_in_every_theme_and_accent() {
+        let mut failures = Vec::new();
+
+        for theme in themes() {
+            for (index, first) in AgentStatus::ALL.into_iter().enumerate() {
+                for second in AgentStatus::ALL.into_iter().skip(index + 1) {
+                    // The app treats these two as one activity (`Activity::Idle`) and draws
+                    // both as an empty ring in a neutral grey; the label tells them apart.
+                    if matches!((first, second), (AgentStatus::Idle, AgentStatus::Unknown)) {
+                        continue;
+                    }
+
+                    let distance = color_distance(
+                        first.color_in(theme.colors()),
+                        second.color_in(theme.colors()),
+                    );
+
+                    if distance < MIN_STATUS_DISTANCE {
+                        failures.push(format!(
+                            "{}: {} and {} are {distance:.1} apart, need {MIN_STATUS_DISTANCE}",
+                            theme.name(),
+                            first.label(),
+                            second.label(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn status_pills_do_not_follow_the_accent() {
+        for (blue, honey) in [
+            (Theme::light(), Theme::light().with_accent(Accent::Honey)),
+            (Theme::dark(), Theme::dark().with_accent(Accent::Honey)),
+        ] {
+            for status in AgentStatus::ALL {
+                assert_eq!(
+                    status.pill_colors_in(honey.colors()),
+                    status.pill_colors_in(blue.colors()),
+                    "{}: {}",
+                    honey.name(),
+                    status.label(),
+                );
+            }
+        }
+    }
 
     struct Row;
 

@@ -1081,6 +1081,7 @@ impl ReviewView {
             .level(entry.level)
             .position_in_set(entry.position_in_set, entry.size_of_set)
             .folder(open)
+            .file_icon(entry.file_icon())
             .toggle_state(selected)
             .ring(selected && ring)
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
@@ -1166,6 +1167,7 @@ impl ReviewView {
             TreeRow::new(("review-nav-row", position), info.name.clone())
                 .debug_selector(|| format!("review-nav-file-{file}"))
                 .accessible_label(label)
+                .file_icon(entry.file_icon())
                 .level(entry.level)
                 .position_in_set(entry.position_in_set, entry.size_of_set)
                 .label_color(if viewed { Color::Muted } else { Color::Default })
@@ -3383,6 +3385,70 @@ mod tests {
 
     fn selector(text: String) -> &'static str {
         Box::leak(text.into_boxed_str())
+    }
+
+    /// The row has a 16px image icon, in the middle of the row.
+    fn assert_icon_on(row: &str, cx: &mut VisualTestContext) {
+        let bounds = cx.debug_bounds(selector(row.to_owned()));
+        let icon = cx.debug_bounds(selector(format!("{row}-file-icon")));
+
+        assert!(bounds.is_some(), "{row} is not on screen");
+        assert_eq!(
+            icon.map(|icon| icon.size),
+            Some(gpui::size(px(16.), px(16.))),
+            "{row} has no image icon"
+        );
+        assert_eq!(
+            icon.map(|icon| icon.center().y),
+            bounds.map(|row| row.center().y)
+        );
+    }
+
+    #[gpui::test]
+    fn the_review_tree_shows_a_file_icon_on_every_row(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let _review = open_review(&workspace, cx);
+        let glyphs = file_named(&workspace, ReviewSource::Live, "glyphs.rs", cx);
+
+        assert_icon_on("review-nav-folder-0", cx);
+        assert_icon_on(&format!("review-nav-file-{glyphs}"), cx);
+    }
+
+    #[gpui::test]
+    fn the_changes_panel_shows_a_file_icon_on_every_row(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        redraw(cx);
+        let theme = file_named(&workspace, ReviewSource::Live, "theme.rs", cx);
+
+        assert_icon_on("change-folder-0", cx);
+        assert_icon_on(&format!("change-file-{theme}"), cx);
+    }
+
+    #[gpui::test]
+    fn the_files_panel_shows_a_file_icon_on_every_row(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_view(View::Terminals, cx);
+            workspace.right_panel = Some(crate::workspace::RightPanel::Files);
+        });
+        redraw(cx);
+
+        let rows = workspace.read_with(cx, |workspace, _| workspace.data.file_tree.len());
+        let (folder, file) = workspace.read_with(cx, |workspace, _| {
+            let tree = &workspace.data.file_tree;
+
+            (
+                tree.iter().position(|entry| entry.is_dir),
+                tree.iter().position(|entry| !entry.is_dir),
+            )
+        });
+
+        assert!(rows > 0);
+        for row in [folder, file] {
+            let row = row.expect("the sample tree has folders and files");
+
+            assert_icon_on(&format!("files-row-{row}"), cx);
+        }
     }
 
     /// Opens Review on Merged, where the folded lock file is file 0.

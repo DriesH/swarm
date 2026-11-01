@@ -17,7 +17,9 @@ use gpui::{
     SharedString, Size, Subscription, TitlebarOptions, WeakEntity, Window, WindowBounds,
     WindowHandle, WindowOptions, actions, div, point, px, size,
 };
-use swarm_settings::{CliSettings, NotificationSettings, ProjectMode, Settings};
+use swarm_settings::{
+    AccentSetting, AppearanceSettings, CliSettings, NotificationSettings, ProjectMode, Settings,
+};
 use swarm_ui::fonts::UI_FONT;
 use swarm_ui::prelude::*;
 use swarm_ui::styles::focus_ring;
@@ -472,6 +474,7 @@ impl SettingsWindow {
                 cx.notify();
             }),
             theme::follow_system_appearance(window, cx),
+            swarm_ui::motion::follow_reduce_motion(window, cx),
             cx.observe_window_activation(window, |this, window, cx| {
                 // The user may come back from System Settings with a new answer.
                 if window.is_window_active() {
@@ -966,6 +969,68 @@ pub(crate) fn notifications(cx: &App) -> NotificationSettings {
         })
 }
 
+/// The appearance settings. They stay the defaults until the settings load.
+pub(crate) fn appearance(cx: &App) -> AppearanceSettings {
+    cx.try_global::<Registry>()
+        .map_or_else(AppearanceSettings::default, |registry| {
+            registry.state.read(cx).settings.appearance
+        })
+}
+
+/// True unless the settings turn the easter eggs off. The switch turns every egg off.
+pub(crate) fn easter_eggs(cx: &App) -> bool {
+    appearance(cx).easter_eggs
+}
+
+/// True when the Swarm view shows a honeycomb behind the graph: the setting is on, and so
+/// are the eggs.
+pub(crate) fn swarm_view_honeycomb(cx: &App) -> bool {
+    let appearance = appearance(cx);
+
+    appearance.easter_eggs && appearance.swarm_view_honeycomb
+}
+
+/// The accent the theme uses for a setting.
+pub(crate) fn accent_of(accent: AccentSetting) -> theme::Accent {
+    match accent {
+        AccentSetting::Blue => theme::Accent::Blue,
+        AccentSetting::Honey => theme::Accent::Honey,
+    }
+}
+
+/// Applies the accent of the settings now and each time it changes, and draws the workspace
+/// again when any appearance setting changes: the eggs and the Swarm view background read them.
+pub(crate) fn follow_appearance(workspace: Entity<Workspace>, cx: &mut App) {
+    let settings = shared_state(None, cx);
+    let mut applied = appearance(cx);
+
+    theme::set_accent(accent_of(applied.accent), cx);
+
+    cx.observe(&settings, move |_, cx| {
+        let current = appearance(cx);
+
+        if current == applied {
+            return;
+        }
+
+        applied = current;
+        theme::set_accent(accent_of(current.accent), cx);
+        workspace.update(cx, |_, cx| cx.notify());
+    })
+    .detach();
+}
+
+/// Changes the appearance settings the way the page does.
+#[cfg(any(test, feature = "snapshot"))]
+pub(crate) fn change_appearance(edit: impl FnOnce(&mut AppearanceSettings), cx: &mut App) {
+    let state = shared_state(None, cx);
+
+    state.update(cx, |state, cx| {
+        edit(&mut state.settings.appearance);
+        cx.notify();
+    });
+}
+
 /// The shared settings state, for what must follow a change in the settings.
 pub(crate) fn state(cx: &mut App) -> Entity<SettingsState> {
     shared_state(None, cx)
@@ -1167,7 +1232,7 @@ pub(crate) fn checks_changed(run: &swarm_protocol::ChecksRun, cx: &mut App) {
 /// The pages to save, with the window size and the answer the sample delivery gives to
 /// every page for the notification permission.
 #[cfg(feature = "snapshot")]
-const SNAPSHOT_PAGES: [(Page, &str, Size<Pixels>, Permission); 10] = [
+const SNAPSHOT_PAGES: [(Page, &str, Size<Pixels>, Permission); 12] = [
     (
         Page::General,
         "general",
@@ -1228,6 +1293,18 @@ const SNAPSHOT_PAGES: [(Page, &str, Size<Pixels>, Permission); 10] = [
         size(px(1280.), px(1900.)),
         Permission::Allowed,
     ),
+    (
+        Page::Appearance,
+        "appearance",
+        size(px(1280.), px(700.)),
+        Permission::Allowed,
+    ),
+    (
+        Page::Appearance,
+        "appearance-honey",
+        size(px(1280.), px(700.)),
+        Permission::Allowed,
+    ),
 ];
 
 /// Gives the check of the General page a terminal under its GitHub CLI row.
@@ -1277,6 +1354,26 @@ pub(crate) fn snapshot(directory: PathBuf, cx: &mut App) {
 
                     let state = cx.new(|_| SettingsState::sample(None));
                     state.update(cx, SettingsState::sample_modes);
+
+                    // The Honey accent with the Swarm view honeycomb on, to see both.
+                    let honey = name == "appearance-honey";
+                    if honey {
+                        state.update(cx, |state, _| {
+                            state.settings.appearance = AppearanceSettings {
+                                accent: AccentSetting::Honey,
+                                swarm_view_honeycomb: true,
+                                ..AppearanceSettings::default()
+                            };
+                        });
+                    }
+                    theme::set_accent(
+                        if honey {
+                            theme::Accent::Honey
+                        } else {
+                            theme::Accent::Blue
+                        },
+                        cx,
+                    );
                     // Set before the first frame: the answer of the delivery comes later.
                     state.update(cx, |state, _| state.permission = Some(permission));
 
@@ -1921,6 +2018,109 @@ mod tests {
             cx.update(|cx| theme::appearance(cx)),
             theme::Appearance::Dark
         );
+    }
+
+    fn on_appearance(
+        cx: &mut TestAppContext,
+    ) -> (WindowHandle<SettingsWindow>, gpui::VisualTestContext) {
+        setup(cx);
+        let window = open_settings(cx);
+        window
+            .update(cx, |settings, _, cx| {
+                settings.select_page(Page::Appearance, cx);
+            })
+            .expect("window is open");
+
+        let visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+
+        (window, visual)
+    }
+
+    fn click_on(selector: &'static str, visual: &mut gpui::VisualTestContext) {
+        let bounds = visual
+            .debug_bounds(selector)
+            .expect("the control is on the page");
+
+        visual.simulate_click(bounds.center(), gpui::Modifiers::none());
+        visual.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn the_easter_eggs_are_on_until_the_switch_turns_them_off(cx: &mut TestAppContext) {
+        let (_, mut visual) = on_appearance(cx);
+        let before = cx.update(|cx| easter_eggs(cx));
+
+        click_on("easter-eggs", &mut visual);
+        let after = cx.update(|cx| easter_eggs(cx));
+        let saved = cx.update(|cx| appearance(cx).easter_eggs);
+
+        click_on("easter-eggs", &mut visual);
+
+        assert!(before, "on by default");
+        assert!(!after);
+        assert!(!saved);
+        assert!(cx.update(|cx| easter_eggs(cx)));
+    }
+
+    #[gpui::test]
+    fn the_honeycomb_switch_needs_the_eggs_and_follows_the_setting(cx: &mut TestAppContext) {
+        let (_, mut visual) = on_appearance(cx);
+        assert!(!cx.update(|cx| swarm_view_honeycomb(cx)), "off by default");
+
+        click_on("swarm-view-honeycomb", &mut visual);
+        let on = cx.update(|cx| swarm_view_honeycomb(cx));
+
+        click_on("easter-eggs", &mut visual);
+        let eggs_off = cx.update(|cx| swarm_view_honeycomb(cx));
+        let setting_kept = cx.update(|cx| appearance(cx).swarm_view_honeycomb);
+
+        click_on("swarm-view-honeycomb", &mut visual);
+        let disabled = cx.update(|cx| appearance(cx).swarm_view_honeycomb);
+
+        assert!(on);
+        assert!(!eggs_off, "no eggs, no honeycomb");
+        assert!(setting_kept);
+        assert!(disabled, "a dimmed switch does not change the setting");
+    }
+
+    #[gpui::test]
+    fn the_accent_control_switches_to_honey_and_back(cx: &mut TestAppContext) {
+        let (window, visual) = on_appearance(cx);
+        let state = cx.update(state);
+        let colors = |cx: &mut TestAppContext| cx.update(|cx| cx.theme().colors().accent);
+        let blue = colors(cx);
+
+        window
+            .update(cx, |_, window, cx| {
+                pages::apply_accent(&state)(1, window, cx);
+            })
+            .expect("window is open");
+        visual.run_until_parked();
+        let (honey, kept) = (
+            colors(cx),
+            cx.update(|cx| appearance(cx).accent == AccentSetting::Honey),
+        );
+
+        window
+            .update(cx, |_, window, cx| {
+                pages::apply_accent(&state)(0, window, cx);
+            })
+            .expect("window is open");
+
+        assert_ne!(honey, blue);
+        assert!(kept);
+        assert_eq!(colors(cx), blue);
+        assert_eq!(cx.update(|cx| theme::accent(cx)), theme::Accent::Blue);
+    }
+
+    #[gpui::test]
+    fn the_appearance_page_lists_theme_accent_and_easter_eggs(cx: &mut TestAppContext) {
+        let (_, mut visual) = on_appearance(cx);
+
+        for selector in ["theme", "accent", "easter-eggs", "swarm-view-honeycomb"] {
+            assert!(visual.debug_bounds(selector).is_some(), "{selector}");
+        }
     }
 
     /// A short window on `page`, so the page is taller than the window.

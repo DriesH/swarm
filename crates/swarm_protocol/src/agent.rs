@@ -71,6 +71,8 @@ pub enum Call {
     TileGrow { agent: Option<AgentId> },
     /// Like [`Call::TileGrow`], but makes the tile small again.
     TileShrink { agent: Option<AgentId> },
+    /// Any agent: the swarm's counts for `swarm buzz`. Returns [`crate::SwarmStats`].
+    Buzz,
     /// Orchestrator: asks the user for attention with a short reason.
     Notify { text: String },
     /// Orchestrator: lists its workers. Returns `Vec<`[`AgentSummary`]`>`.

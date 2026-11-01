@@ -338,6 +338,42 @@ fn tree_row_is_a_tree_item_with_level_and_state() {
 }
 
 #[test]
+fn tree_row_with_a_file_icon_keeps_its_role_and_label() {
+    with_window(|window, cx| {
+        let file = a11y_info(
+            TreeRow::new("file", "Cargo.toml")
+                .file_icon(FileIconName::for_file("Cargo.toml"))
+                .accessible_label("Cargo.toml, 3 additions"),
+            window,
+            cx,
+        );
+        let folder = a11y_info(
+            TreeRow::new("folder", "src")
+                .folder(true)
+                .file_icon(FileIconName::for_folder("src", true)),
+            window,
+            cx,
+        );
+
+        assert_eq!(file.role, Some(Role::TreeItem));
+        assert_eq!(file.node.label(), Some("Cargo.toml, 3 additions"));
+        assert_eq!(folder.role, Some(Role::TreeItem));
+        assert_eq!(folder.node.label(), Some("src"));
+        assert_eq!(folder.node.is_expanded(), Some(true));
+    });
+}
+
+#[test]
+fn file_icon_is_decorative() {
+    with_window(|window, cx| {
+        let info = a11y_info(FileIcon::file("Cargo.toml"), window, cx);
+
+        assert_eq!(info.role, None);
+        assert_eq!(info.node.label(), None);
+    });
+}
+
+#[test]
 fn tree_row_reports_its_place_among_its_siblings() {
     with_window(|window, cx| {
         let placed = a11y_info(

@@ -23,6 +23,25 @@ impl Appearance {
     }
 }
 
+/// The accent color: links, selection and the focus ring. Status colors do not follow it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Accent {
+    #[default]
+    Blue,
+    Honey,
+}
+
+impl Accent {
+    pub const ALL: [Self; 2] = [Self::Blue, Self::Honey];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Blue => "Blue",
+            Self::Honey => "Honey",
+        }
+    }
+}
+
 /// Whether a theme is light or dark.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThemeKind {
@@ -73,9 +92,12 @@ pub struct ThemeColors {
     pub muted: Hsla,
     /// Tertiary text: meta, counts, section titles.
     pub faint: Hsla,
-    /// Working status, links, focus ring.
+    /// Links and the focus ring. Follows the accent the user picked.
     pub accent: Hsla,
     pub accent_bg: Hsla,
+    /// Working status. Always blue, so it never matches `warn` (Blocked).
+    pub working: Hsla,
+    pub working_bg: Hsla,
     /// Selected text in a text field.
     pub selection: Hsla,
     /// Done status and success.
@@ -94,6 +116,11 @@ pub struct ThemeColors {
     /// Faint decoration: graph dots, honeycomb pattern.
     pub dot: Hsla,
     pub hex: Hsla,
+    /// Honey: the cells of the honeycomb in the easter eggs. The line is the outline and
+    /// the empty cell is the one not filled yet.
+    pub honey: Hsla,
+    pub honey_line: Hsla,
+    pub honey_empty: Hsla,
     /// Switch track and knob, on and off.
     pub switch_on: Hsla,
     pub switch_off: Hsla,
@@ -130,6 +157,8 @@ impl ThemeColors {
             faint,
             accent,
             accent_bg,
+            working,
+            working_bg,
             selection,
             ok,
             ok_bg,
@@ -142,6 +171,9 @@ impl ThemeColors {
             term,
             dot,
             hex,
+            honey,
+            honey_line,
+            honey_empty,
             switch_on,
             switch_off,
             knob_on,
@@ -164,6 +196,8 @@ impl ThemeColors {
             ("faint", *faint),
             ("accent", *accent),
             ("accent_bg", *accent_bg),
+            ("working", *working),
+            ("working_bg", *working_bg),
             ("selection", *selection),
             ("ok", *ok),
             ("ok_bg", *ok_bg),
@@ -176,6 +210,9 @@ impl ThemeColors {
             ("term", *term),
             ("dot", *dot),
             ("hex", *hex),
+            ("honey", *honey),
+            ("honey_line", *honey_line),
+            ("honey_empty", *honey_empty),
             ("switch_on", *switch_on),
             ("switch_off", *switch_off),
             ("knob_on", *knob_on),
@@ -220,6 +257,8 @@ impl Theme {
                 faint: rgb(0x878790).into(),
                 accent: rgb(0x6e9bff).into(),
                 accent_bg: rgba(0x6e9bff21).into(),
+                working: rgb(0x6e9bff).into(),
+                working_bg: rgba(0x6e9bff21).into(),
                 selection: rgba(0x6e9bff59).into(),
                 ok: rgb(0x4ac26b).into(),
                 ok_bg: rgba(0x4ac26b1f).into(),
@@ -232,6 +271,9 @@ impl Theme {
                 term: rgb(0x0d0d0f).into(),
                 dot: rgb(0x1f1f23).into(),
                 hex: rgb(0x17171a).into(),
+                honey: rgb(0xe8a838).into(),
+                honey_line: rgb(0xf3c56a).into(),
+                honey_empty: rgb(0x1f1d18).into(),
                 switch_on: rgb(0xededef).into(),
                 switch_off: rgb(0x3a3a40).into(),
                 knob_on: rgb(0x111113).into(),
@@ -279,6 +321,8 @@ impl Theme {
                 faint: rgb(0x696971).into(),  // #6b6b74
                 accent: rgb(0x285acb).into(), // #2f6bf0
                 accent_bg: rgba(0x2f6bf017).into(),
+                working: rgb(0x285acb).into(),
+                working_bg: rgba(0x2f6bf017).into(),
                 selection: rgba(0x285acb40).into(),
                 ok: rgb(0x176f30).into(), // #1a7f36
                 ok_bg: rgba(0x1a7f361a).into(),
@@ -291,6 +335,9 @@ impl Theme {
                 term: rgb(0xfbfbfc).into(),
                 dot: rgb(0xe4e4e8).into(),
                 hex: rgb(0xe9e9ec).into(),
+                honey: rgb(0xeaa93f).into(),
+                honey_line: rgb(0x8c5408).into(),
+                honey_empty: rgb(0xf6efe2).into(),
                 switch_on: rgb(0x18181b).into(),
                 // Mockup: #d4d4d8. A white knob on it was 1.5:1, so the off
                 // state was invisible; this gives 3:1.
@@ -322,6 +369,33 @@ impl Theme {
         }
     }
 
+    /// The theme with the accent's tokens. Blue is the base; Honey is amber, dark enough
+    /// in light mode for text to pass WCAG AA on every surface and on its own tint.
+    /// Status tokens (`working`, `warn`, `ok`, `del`) stay as they are.
+    #[must_use]
+    pub fn with_accent(mut self, accent: Accent) -> Self {
+        if accent == Accent::Blue {
+            return self;
+        }
+
+        match self.kind {
+            ThemeKind::Dark => {
+                self.name = "Graphite Dark Honey";
+                self.colors.accent = rgb(0xe8a838).into();
+                self.colors.accent_bg = rgba(0xe8a83824).into();
+                self.colors.selection = rgba(0xe8a83859).into();
+            }
+            ThemeKind::Light => {
+                self.name = "Graphite Light Honey";
+                self.colors.accent = rgb(0x905500).into();
+                self.colors.accent_bg = rgba(0xd99a1f1f).into();
+                self.colors.selection = rgba(0xe0a82a59).into();
+            }
+        }
+
+        self
+    }
+
     pub fn name(&self) -> &'static str {
         self.name
     }
@@ -337,6 +411,7 @@ impl Theme {
 
 struct GlobalTheme {
     appearance: Appearance,
+    accent: Accent,
     system: ThemeKind,
     light: Theme,
     dark: Theme,
@@ -379,10 +454,34 @@ impl ActiveTheme for App {
 pub fn init(cx: &mut App) {
     cx.set_global(GlobalTheme {
         appearance: Appearance::System,
+        accent: Accent::default(),
         system: cx.window_appearance().into(),
         light: Theme::light(),
         dark: Theme::dark(),
     });
+}
+
+pub fn accent(cx: &App) -> Accent {
+    cx.try_global::<GlobalTheme>()
+        .map_or(Accent::default(), |theme| theme.accent)
+}
+
+/// Switches the accent color and redraws every window.
+pub fn set_accent(accent: Accent, cx: &mut App) {
+    if !cx.has_global::<GlobalTheme>() {
+        init(cx);
+    }
+
+    let theme = cx.global_mut::<GlobalTheme>();
+    if theme.accent == accent {
+        return;
+    }
+
+    theme.accent = accent;
+    theme.light = Theme::light().with_accent(accent);
+    theme.dark = Theme::dark().with_accent(accent);
+
+    cx.refresh_windows();
 }
 
 pub fn appearance(cx: &App) -> Appearance {
@@ -451,8 +550,14 @@ mod tests {
     use super::*;
     use crate::contrast::{GRAPHIC_AA, TEXT_AA, composite, contrast_ratio};
 
-    fn themes() -> [Theme; 2] {
-        [Theme::light(), Theme::dark()]
+    /// Every look: light and dark, each with the blue and the honey accent.
+    fn themes() -> [Theme; 4] {
+        [
+            Theme::light(),
+            Theme::dark(),
+            Theme::light().with_accent(Accent::Honey),
+            Theme::dark().with_accent(Accent::Honey),
+        ]
     }
 
     /// Checks `foreground` on each background and collects every failure,
@@ -479,7 +584,7 @@ mod tests {
 
     #[test]
     fn light_and_dark_define_the_same_tokens() {
-        let [light, dark] = themes();
+        let [light, dark, ..] = themes();
         let light_names: Vec<_> = light
             .colors()
             .tokens()
@@ -534,6 +639,7 @@ mod tests {
                 ("muted", colors.muted),
                 ("faint", colors.faint),
                 ("accent", colors.accent),
+                ("working", colors.working),
                 ("ok", colors.ok),
                 ("warn", colors.warn),
                 ("add", colors.add),
@@ -545,6 +651,10 @@ mod tests {
             // Status pills and diff counts sit on a tint over a surface.
             for (text, tint) in [
                 (("accent", colors.accent), ("accent_bg", colors.accent_bg)),
+                (
+                    ("working", colors.working),
+                    ("working_bg", colors.working_bg),
+                ),
                 (("warn", colors.warn), ("warn_bg", colors.warn_bg)),
                 (("ok", colors.ok), ("ok_bg", colors.ok_bg)),
                 (("add", colors.add), ("add_bg", colors.add_bg)),
@@ -694,11 +804,21 @@ mod tests {
                 ("muted", colors.muted),
                 ("faint", colors.faint),
                 ("accent", colors.accent),
+                ("working", colors.working),
                 ("ok", colors.ok),
                 ("warn", colors.warn),
             ] {
                 check(&mut failures, &theme, GRAPHIC_AA, glyph, &surfaces);
             }
+
+            // The check mark in a checked box: the ground on the accent.
+            check(
+                &mut failures,
+                &theme,
+                GRAPHIC_AA,
+                ("ground", colors.ground),
+                &[("accent", colors.accent)],
+            );
 
             check(
                 &mut failures,
@@ -762,9 +882,73 @@ mod tests {
     }
 
     #[test]
+    fn the_honey_accent_is_amber_and_passes_contrast_in_light_and_dark() {
+        let mut failures = Vec::new();
+
+        for (blue, honey) in [
+            (Theme::light(), Theme::light().with_accent(Accent::Honey)),
+            (Theme::dark(), Theme::dark().with_accent(Accent::Honey)),
+        ] {
+            let colors = honey.colors();
+            let surfaces = [
+                ("ground", colors.ground),
+                ("panel", colors.panel),
+                ("raised", colors.raised),
+                ("active", colors.active),
+                ("soft", colors.soft),
+                ("term", colors.term),
+            ];
+
+            assert_ne!(colors.accent, blue.colors().accent, "{}", honey.name());
+            assert!(
+                (0.07..0.14).contains(&colors.accent.h),
+                "{}: accent hue {} is not amber",
+                honey.name(),
+                colors.accent.h
+            );
+
+            check(
+                &mut failures,
+                &honey,
+                TEXT_AA,
+                ("accent", colors.accent),
+                &surfaces,
+            );
+            check(
+                &mut failures,
+                &honey,
+                GRAPHIC_AA,
+                ("ground", colors.ground),
+                &[("accent", colors.accent)],
+            );
+
+            let tinted: Vec<(&str, Hsla)> = surfaces
+                .into_iter()
+                .map(|(name, surface)| (name, composite(surface, colors.accent_bg)))
+                .collect();
+            check(
+                &mut failures,
+                &honey,
+                TEXT_AA,
+                ("accent", colors.accent),
+                &tinted,
+            );
+
+            let selected: Vec<(&str, Hsla)> = surfaces
+                .into_iter()
+                .map(|(name, surface)| (name, composite(surface, colors.selection)))
+                .collect();
+            check(&mut failures, &honey, TEXT_AA, ("fg", colors.fg), &selected);
+        }
+
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
     fn appearance_picks_the_theme() {
         let mut global = GlobalTheme {
             appearance: Appearance::System,
+            accent: Accent::Blue,
             system: ThemeKind::Dark,
             light: Theme::light(),
             dark: Theme::dark(),

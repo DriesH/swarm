@@ -154,6 +154,8 @@ pub(crate) struct Workspace {
     /// The task the running poll asks about.
     pub(crate) polled_task: Option<TaskId>,
     _activation_subscription: Subscription,
+    /// Reads Reduce Motion again each time the window becomes active.
+    _motion_subscription: Subscription,
     pub(crate) swarm_clock: Option<gpui::Task<()>>,
     /// Refreshes the usage card's time text. Runs only while the card shows a time.
     pub(crate) usage_clock: Option<gpui::Task<()>>,
@@ -184,6 +186,12 @@ pub(crate) struct Workspace {
     pub(crate) pull_requests: PullRequests,
     /// The welcome screen, while it shows.
     pub(crate) welcome: Option<Entity<Welcome>>,
+    /// Debug builds: ⌘K opened the welcome screen, whatever the projects and the flag.
+    pub(crate) welcome_forced: bool,
+    /// What the easter eggs keep: the swarm's stats, the toast and the flying bees.
+    pub(crate) eggs: crate::eggs::Eggs,
+    /// The honeycomb behind the empty state and, when the settings ask, the Swarm view.
+    pub(crate) honeycomb: Entity<Honeycomb>,
     /// How often the window told the workspace it was activated or deactivated.
     #[cfg(test)]
     pub(crate) activation_changes: usize,
@@ -230,6 +238,7 @@ impl Workspace {
 
         let (orchestrator_input, orchestrator_subscription) = views::orchestrator_input(cx);
         let activation_subscription = Self::observe_activation(window, cx);
+        let motion_subscription = swarm_ui::motion::follow_reduce_motion(window, cx);
 
         let inspector_subscription = cx.observe(&cx.entity(), |this, _, cx| {
             this.sync_inspector(cx);
@@ -303,6 +312,7 @@ impl Workspace {
             changes_poll: None,
             polled_task: None,
             _activation_subscription: activation_subscription,
+            _motion_subscription: motion_subscription,
             swarm_clock: None,
             usage_clock: None,
             review,
@@ -322,6 +332,9 @@ impl Workspace {
             diff_intervals: (crate::daemon::REVIEW_INTERVAL, crate::daemon::LIVE_INTERVAL),
             pull_requests: PullRequests::default(),
             welcome: None,
+            welcome_forced: false,
+            eggs: crate::eggs::Eggs::default(),
+            honeycomb: cx.new(|_| Honeycomb::new()),
             #[cfg(test)]
             activation_changes: 0,
         };
@@ -356,6 +369,7 @@ impl Workspace {
     pub(crate) fn attach_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.window = Some(window.window_handle());
         self._activation_subscription = Self::observe_activation(window, cx);
+        self._motion_subscription = swarm_ui::motion::follow_reduce_motion(window, cx);
         self.pending_focus = self.focused_terminal;
         window.focus(&self.focus_handle, cx);
         self.reattach_terminals(cx);
@@ -723,9 +737,17 @@ impl Workspace {
     /// it. The daemon must have said there are none: while it connects, an app that has
     /// projects looks the same.
     pub(crate) fn shows_welcome(&self, cx: &App) -> bool {
-        self.has_no_projects()
-            && matches!(self.source, DataSource::Live | DataSource::Sample)
-            && crate::settings::welcome_pending(cx)
+        self.welcome_forced
+            || self.has_no_projects()
+                && matches!(self.source, DataSource::Live | DataSource::Sample)
+                && crate::settings::welcome_pending(cx)
+    }
+
+    /// Debug builds only: shows the welcome screen until it is finished.
+    pub(crate) fn show_welcome(&mut self, cx: &mut Context<Self>) {
+        self.welcome_forced = true;
+
+        cx.notify();
     }
 
     /// The welcome screen, made when it first shows and dropped when it ends.
@@ -752,6 +774,7 @@ impl Workspace {
     pub(crate) fn finish_welcome(&mut self, cx: &mut Context<Self>) {
         crate::settings::finish_welcome(cx);
         self.welcome = None;
+        self.welcome_forced = false;
 
         cx.notify();
     }
@@ -859,6 +882,7 @@ impl Render for Workspace {
                 ),
         )
         .children(overlay)
+        .children(self.eggs_layer(cx))
         .into_any_element()
     }
 }
