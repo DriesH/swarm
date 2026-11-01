@@ -92,18 +92,23 @@ pub(crate) fn create(
     } = services.projects.create_task_by(request, created_by)?;
 
     let agent = match plan {
-        Some(plan) => match services.agents.register(&Place::of_task(&task), plan) {
-            Ok(info) => {
-                task.agents.push(info.clone());
+        Some(plan) => {
+            match services
+                .agents
+                .register_asked_by(created_by, &Place::of_task(&task), plan)
+            {
+                Ok(info) => {
+                    task.agents.push(info.clone());
 
-                Some(info.id)
-            }
-            Err(error) => {
-                services.projects.discard_task(&task);
+                    Some(info.id)
+                }
+                Err(error) => {
+                    services.projects.discard_task(&task);
 
-                return Err(error.context("cannot record the orchestrator"));
+                    return Err(error.context("cannot record the orchestrator"));
+                }
             }
-        },
+        }
         None => None,
     };
 

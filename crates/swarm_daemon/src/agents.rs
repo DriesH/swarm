@@ -51,6 +51,9 @@ const BLOCKED_POLL: Duration = Duration::from_millis(200);
 /// last key.
 const DRAFT_PATIENCE: Duration = Duration::from_secs(60);
 
+/// Why an agent that the user stopped cannot start more agents.
+pub(crate) const STOPPED_BY_USER: &str = "the user stopped you, so nothing new starts";
+
 pub(crate) struct AgentConfig {
     /// `<data>/agents/<id>/` holds each agent's files.
     pub(crate) data_dir: PathBuf,
@@ -501,8 +504,23 @@ impl Agents {
 
     /// Writes the agent's row and makes it known to the agent socket. Nothing runs yet.
     pub(crate) fn register(&self, place: &Place<'_>, plan: Plan) -> Result<AgentInfo> {
+        self.register_asked_by(None, place, plan)
+    }
+
+    /// Like [`Self::register`], for an agent that `asker` asked for, if one did. It
+    /// refuses when the user stopped the asker. The check and the new entry are one
+    /// step, so a Stop all either stops the new agent or finds the asker marked.
+    pub(crate) fn register_asked_by(
+        &self,
+        asker: Option<AgentId>,
+        place: &Place<'_>,
+        plan: Plan,
+    ) -> Result<AgentInfo> {
         if self.is_closing(place.task) {
             bail!("the task is closing");
+        }
+        if asker.is_some_and(|asker| self.is_stopped(asker)) {
+            bail!(STOPPED_BY_USER);
         }
 
         let session_id = match plan.kind {
@@ -524,7 +542,17 @@ impl Agents {
             ports: place.ports,
         })?;
 
-        lock(&self.live).insert(
+        let mut live = lock(&self.live);
+        if asker.is_some_and(|asker| live.get(&asker).is_none_or(|agent| agent.stopped_by_user)) {
+            drop(live);
+            if let Err(error) = lock(&self.store).delete_agent(info.id) {
+                log::error!("cannot delete agent {}: {error}", info.id.0);
+            }
+
+            bail!(STOPPED_BY_USER);
+        }
+
+        live.insert(
             info.id,
             Live {
                 info: info.clone(),
@@ -544,6 +572,14 @@ impl Agents {
         );
 
         Ok(info)
+    }
+
+    /// True when the user stopped the agent, or its process ended since. A call from
+    /// such an agent must not start anything new.
+    pub(crate) fn is_stopped(&self, id: AgentId) -> bool {
+        lock(&self.live)
+            .get(&id)
+            .is_none_or(|agent| agent.stopped_by_user)
     }
 
     /// Drops an agent that never ran, without telling anyone.
@@ -792,18 +828,7 @@ impl Agents {
             .create_with(request, extras)
             .context("cannot start the agent")?;
 
-        // A close that began while the process started has not seen this terminal.
-        if self.is_closing(info.task) {
-            self.update(id, |live| {
-                live.stop_requested = true;
-
-                false
-            });
-            hub.send_input(TerminalInput::Kill);
-        }
-
-        // A stop that ran meanwhile ended this agent as one that never started.
-        if !lock(&self.live).contains_key(&id) {
+        if self.ended_while_starting(id, info.task) {
             hub.send_input(TerminalInput::Kill);
         }
 
@@ -812,6 +837,24 @@ impl Agents {
         }
 
         Ok(())
+    }
+
+    /// True when a stop, a close or `swarm exit` ran while the process started. Their
+    /// kill found no terminal to send to: the hub is not known until the process runs.
+    fn ended_while_starting(&self, id: AgentId, task: Option<TaskId>) -> bool {
+        let closing = self.is_closing(task);
+
+        let mut live = lock(&self.live);
+        let Some(agent) = live.get_mut(&id) else {
+            // A stop ended it as an agent that never started.
+            return true;
+        };
+
+        if closing {
+            agent.stop_requested = true;
+        }
+
+        agent.stopped_by_user || agent.stop_requested
     }
 
     /// `PATH` with the folder of the `swarm` binary first, so agents can run `swarm`. The
@@ -1906,5 +1949,157 @@ mod tests {
     #[test]
     fn an_empty_token_does_not_match_a_real_one() {
         assert!(!same_token("abc123", ""));
+    }
+
+    fn agents_with_a_task() -> (Arc<Agents>, TaskInfo) {
+        use swarm_core::store::NewTask;
+
+        let store = Store::open_in_memory().expect("store");
+        let project = store
+            .add_project(Path::new("/repo"), "repo")
+            .expect("project");
+        let task = store
+            .add_task(&NewTask {
+                project: project.id,
+                name: "Task",
+                branch: "swarm/task",
+                base: "main",
+                pr_base: "main",
+                worktree: Path::new("/repo/.worktrees/task"),
+                ports: &[],
+            })
+            .expect("task");
+        let store = Arc::new(Mutex::new(store));
+        let clients = Arc::new(Clients::default());
+        let terminals = Terminals::new(Arc::clone(&store));
+        let messages = Messages::new(Arc::clone(&store), Arc::clone(&clients));
+
+        let agents = Agents::new(
+            AgentConfig {
+                data_dir: PathBuf::from("/tmp/none-data"),
+                socket: PathBuf::from("/tmp/none.sock"),
+                settings: None,
+                swarm: PathBuf::from("/tmp/swarm"),
+                github: Github::with_folders(PathBuf::from("/tmp/none-bin"), None, Vec::new()),
+            },
+            store,
+            terminals,
+            clients,
+            messages,
+        );
+
+        (agents, task)
+    }
+
+    fn register_in(agents: &Agents, task: &TaskInfo, asker: Option<AgentId>) -> Result<AgentInfo> {
+        let plan = Plan {
+            kind: AgentKind::ClaudeCode,
+            role: AgentRole::Orchestrator,
+            model: "model".to_owned(),
+            command: "agent".to_owned(),
+            skip_permissions: false,
+        };
+
+        agents.register_asked_by(asker, &Place::of_task(task), plan)
+    }
+
+    /// What `on_started` does before the hub is known: the agent has a terminal that
+    /// no stop can reach.
+    fn start_without_a_hub(agents: &Agents, id: AgentId) {
+        agents.update(id, |live| {
+            live.info.terminal = Some(TerminalId(99));
+
+            true
+        });
+    }
+
+    #[test]
+    fn a_stop_all_that_found_no_hub_is_seen_when_the_process_has_started() {
+        let (agents, task) = agents_with_a_task();
+        let agent = register_in(&agents, &task, None).expect("register");
+        start_without_a_hub(&agents, agent.id);
+        assert!(!agents.ended_while_starting(agent.id, agent.task));
+
+        agents.stop_all();
+
+        assert!(agents.ended_while_starting(agent.id, agent.task));
+    }
+
+    #[test]
+    fn an_exit_that_found_no_hub_is_seen_when_the_process_has_started() {
+        let (agents, task) = agents_with_a_task();
+        let agent = register_in(&agents, &task, None).expect("register");
+        start_without_a_hub(&agents, agent.id);
+
+        agents.exit(agent.id);
+
+        assert!(agents.ended_while_starting(agent.id, agent.task));
+    }
+
+    #[test]
+    fn a_close_that_began_is_seen_when_the_process_has_started() {
+        let (agents, task) = agents_with_a_task();
+        let agent = register_in(&agents, &task, None).expect("register");
+        start_without_a_hub(&agents, agent.id);
+        assert!(!agents.ended_while_starting(agent.id, agent.task));
+
+        assert!(agents.begin_close(task.id));
+
+        assert!(agents.ended_while_starting(agent.id, agent.task));
+        assert!(
+            lock(&agents.live)[&agent.id].stop_requested,
+            "it ends as stopped, not resumable"
+        );
+    }
+
+    #[test]
+    fn an_agent_that_was_removed_is_seen_when_the_process_has_started() {
+        let (agents, task) = agents_with_a_task();
+        let agent = register_in(&agents, &task, None).expect("register");
+
+        agents.stop_all();
+
+        assert!(agents.ended_while_starting(agent.id, agent.task));
+    }
+
+    #[test]
+    fn an_agent_the_user_stopped_cannot_register_another() {
+        let (agents, task) = agents_with_a_task();
+        let asker = register_in(&agents, &task, None).expect("register");
+        start_without_a_hub(&agents, asker.id);
+        assert!(!agents.is_stopped(asker.id));
+        let before = lock(&agents.store).list_agents(task.id).expect("list");
+
+        agents.stop_all();
+        let refused = register_in(&agents, &task, Some(asker.id));
+
+        assert!(agents.is_stopped(asker.id));
+        let error = refused.expect_err("refused");
+        assert_eq!(error.to_string(), STOPPED_BY_USER);
+        assert_eq!(
+            lock(&agents.store).list_agents(task.id).expect("list"),
+            before,
+            "no row is left"
+        );
+        assert_eq!(lock(&agents.live).len(), 1);
+    }
+
+    #[test]
+    fn an_agent_that_is_gone_cannot_register_another() {
+        let (agents, task) = agents_with_a_task();
+
+        assert!(agents.is_stopped(AgentId(404)));
+        assert!(register_in(&agents, &task, Some(AgentId(404))).is_err());
+    }
+
+    #[test]
+    fn a_running_agent_registers_another() {
+        let (agents, task) = agents_with_a_task();
+        let asker = register_in(&agents, &task, None).expect("register");
+
+        let another = register_in(&agents, &task, Some(asker.id));
+
+        assert!(another.is_ok());
+        assert_eq!(lock(&agents.live).len(), 2);
     }
 }
