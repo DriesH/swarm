@@ -23,6 +23,7 @@ pub struct Dropdown {
     selected: usize,
     disabled: bool,
     full_width: bool,
+    debug_selector: Option<String>,
     on_change: Option<ChangeHandler>,
 }
 
@@ -41,8 +42,16 @@ impl Dropdown {
             selected,
             disabled: false,
             full_width: false,
+            debug_selector: None,
             on_change: None,
         }
+    }
+
+    /// Name for `VisualTestContext::debug_bounds`, set on the trigger. Only recorded in test
+    /// builds.
+    pub fn debug_selector(mut self, selector: impl FnOnce() -> String) -> Self {
+        self.debug_selector = Some(selector());
+        self
     }
 
     /// Makes the trigger fill its container, with the label left and the chevron right.
@@ -126,7 +135,10 @@ impl RenderOnce for Dropdown {
             expanded,
             self.full_width,
             cx,
-        );
+        )
+        .when_some(self.debug_selector, |trigger, selector| {
+            trigger.debug_selector(move || selector)
+        });
 
         if self.disabled {
             return trigger.opacity(0.5).into_any_element();
