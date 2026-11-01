@@ -13,13 +13,13 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use swarm_core::store::{Status, Store};
+use swarm_core::store::{Status, Store, unix_millis};
 use swarm_protocol::{
     AgentChange, AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, CallId,
     CloseCheck, CommentId, CommentState, CreateTask, CreateTerminal, DiffStat, Event, FileDiff,
-    FileStat, Fold, MessageInfo, MessageKind, ProjectId, ProjectInfo, Request, ReviewSource,
-    TaskDiff, TaskId, TaskInfo, TerminalId, TerminalInfo, TerminalKind, Usage, UsageProblem,
-    VERSION, read, write,
+    FileStat, Fold, MessageInfo, MessageKind, Notice, NoticeKind, ProjectId, ProjectInfo, Request,
+    ReviewSource, TaskDiff, TaskId, TaskInfo, TerminalId, TerminalInfo, TerminalKind, Usage,
+    UsageProblem, VERSION, read, write,
 };
 use swarm_term::{
     BlockedKind, ExitStatus, Palette, ProgramState, Rgb, Row, Size, TerminalInput, TerminalOutput,
@@ -8211,4 +8211,665 @@ sleep 30"#,
     assert!(create.starts_with("swarm: "), "{create}");
     assert!(create.contains("the user stopped you"), "{create}");
     assert!(client.projects()[0].tasks.is_empty());
+}
+
+/// Shell helpers for the fake agents of the notice tests.
+const NOTICE_HELPERS: &str = r#"
+finished() { printf '\033]7501;state=done\007'; }
+blocked() { printf '\033]7501;state=blocked:kind=%s\007' "$1"; }
+blocked_with() { printf '\033]7501;state=blocked:kind=%s:msg=%s\007' "$1" "$(printf '%s' "$2" | base64)"; }
+hook() { printf '%s' "$1" | "$SWARM" hook; }
+gate() { until [ -e "$OUT/$1" ]; do sleep 0.1; done; }
+mark() { echo ok > "$OUT/$1"; }
+"#;
+
+fn notice_fixture(body: &str) -> Fixture {
+    fixture_with_helpers(&format!("{NOTICE_HELPERS}\n{body}"))
+}
+
+impl Fixture {
+    /// Lets a fake agent that waits for `name` go on.
+    fn open_gate(&self, name: &str) {
+        std::fs::write(self.out.join(name), "").expect("gate");
+    }
+}
+
+fn ended(agent: &AgentInfo) -> bool {
+    matches!(
+        agent.lifecycle,
+        AgentLifecycle::Stopped | AgentLifecycle::Resumable
+    )
+}
+
+fn is_worker_with(status: AgentStatus) -> impl Fn(&AgentInfo) -> bool {
+    move |agent| agent.role == AgentRole::Worker && agent.status == status
+}
+
+impl Client {
+    /// Reads events until an agent change satisfies `done`. Returns the notices on the way.
+    fn notices_until(&mut self, done: impl Fn(&AgentInfo) -> bool) -> Vec<Notice> {
+        let mut notices = Vec::new();
+        self.wait_for(|event| match event {
+            Event::Notice { notice } => {
+                notices.push(notice.clone());
+
+                None
+            }
+            Event::AgentChanged { agent } if done(agent) => Some(()),
+            _ => None,
+        });
+
+        notices
+    }
+
+    fn next_notice(&mut self) -> Notice {
+        self.wait_for(|event| match event {
+            Event::Notice { notice } => Some(notice.clone()),
+            _ => None,
+        })
+    }
+
+    /// Lets the daemon finish what it does, then returns the notices that came. The reply
+    /// to a request follows everything the daemon broadcast before it.
+    fn notices_after_a_pause(&mut self) -> Vec<Notice> {
+        let deadline = Instant::now() + Duration::from_millis(400);
+        while Instant::now() < deadline {
+            thread::park_timeout(deadline.saturating_duration_since(Instant::now()));
+        }
+        self.send(&Request::ListProjects { call: CALL });
+
+        let mut notices = Vec::new();
+        self.wait_for(|event| match event {
+            Event::Notice { notice } => {
+                notices.push(notice.clone());
+
+                None
+            }
+            Event::Projects { call: CALL, .. } => Some(()),
+            _ => None,
+        });
+
+        notices
+    }
+
+    /// Every notice up to a moment after `done`.
+    fn notices_after(&mut self, done: impl Fn(&AgentInfo) -> bool) -> Vec<Notice> {
+        let mut notices = self.notices_until(done);
+        notices.extend(self.notices_after_a_pause());
+
+        notices
+    }
+
+    /// Reads until the daemon closes the connection. Returns the notices on the way.
+    fn notices_until_closed(&mut self) -> Vec<Notice> {
+        let mut notices = Vec::new();
+        while let Ok(event) = read::<Event>(&mut self.stream, &mut self.buffer) {
+            if let Event::Notice { notice } = event {
+                notices.push(notice);
+            }
+        }
+
+        notices
+    }
+}
+
+fn assert_notice(notice: &Notice, kind: NoticeKind, task: &TaskInfo, agent: AgentId, text: &str) {
+    assert_eq!(notice.kind, kind, "{notice:?}");
+    assert_eq!(notice.project, task.project, "{notice:?}");
+    assert_eq!(notice.task, Some(task.id), "{notice:?}");
+    assert_eq!(notice.agent, agent, "{notice:?}");
+    assert_eq!(notice.text, text, "{notice:?}");
+}
+
+fn kinds_and_texts(notices: &[Notice]) -> Vec<(NoticeKind, &str)> {
+    notices
+        .iter()
+        .map(|notice| (notice.kind, notice.text.as_str()))
+        .collect()
+}
+
+/// A daemon with one task whose orchestrator runs `body`, without a first message.
+fn lone_orchestrator(body: &str) -> (Fixture, Repo, Daemon, Client, TaskInfo) {
+    let fixture = notice_fixture(body);
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let task = client.create_task(orchestrator_task(project.id, false));
+
+    (fixture, repo, daemon, client, task)
+}
+
+#[test]
+fn swarm_notify_sends_a_needs_decision_notice_each_time_and_no_prompt() {
+    let fixture = notice_fixture(
+        r#"idle
+IFS= read -r line
+working
+swarm notify "Pick a database" > "$OUT/one.out" 2>&1
+swarm notify "Pick a cache" > "$OUT/two.out" 2>&1
+exit 0"#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let before = unix_millis();
+    let (mut client, task) = start_task(&daemon, &repo);
+
+    let notices = client.notices_after(ended);
+
+    let after = unix_millis();
+    assert_eq!(notices.len(), 2, "{notices:?}");
+    for (notice, text) in notices.iter().zip(["Pick a database", "Pick a cache"]) {
+        assert_notice(
+            notice,
+            NoticeKind::NeedsDecision,
+            &task,
+            task.agents[0].id,
+            text,
+        );
+        assert!((before..=after).contains(&notice.at), "{}", notice.at);
+    }
+}
+
+#[test]
+fn a_prompt_is_one_notice_per_blocked_spell_with_the_question() {
+    let fixture = notice_fixture(
+        r#"idle
+IFS= read -r line
+working
+blocked_with permission "approve Write: a.txt"
+blocked_with permission "approve Write: a.txt"
+blocked_with question "a new question"
+working
+blocked permission
+exit 0"#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, task) = start_task(&daemon, &repo);
+
+    let notices = client.notices_after(ended);
+
+    assert_eq!(
+        kinds_and_texts(&notices),
+        [
+            (NoticeKind::Prompt, "approve Write: a.txt"),
+            (NoticeKind::Prompt, "Permission prompt"),
+        ]
+    );
+    for notice in &notices {
+        assert_notice(
+            notice,
+            NoticeKind::Prompt,
+            &task,
+            task.agents[0].id,
+            &notice.text,
+        );
+    }
+}
+
+#[test]
+fn the_notification_hooks_of_claude_code_start_prompts() {
+    let (_fixture, _repo, _daemon, mut client, task) = lone_orchestrator(
+        r#"hook '{"hook_event_name":"SessionStart","session_id":"prompt-session"}'
+hook '{"hook_event_name":"UserPromptSubmit"}'
+hook '{"hook_event_name":"PermissionRequest","tool_name":"Write"}'
+hook '{"hook_event_name":"Notification","notification_type":"permission_prompt","message":"Claude needs your permission to use Write"}'
+hook '{"hook_event_name":"PostToolUse"}'
+hook '{"hook_event_name":"Notification","notification_type":"agent_needs_input","message":"Pick a side"}'
+hook '{"hook_event_name":"UserPromptSubmit"}'
+hook '{"hook_event_name":"Notification","notification_type":"elicitation_dialog","message":"Enter a token"}'
+exit 0"#,
+    );
+
+    let notices = client.notices_after(ended);
+
+    assert_eq!(
+        kinds_and_texts(&notices),
+        [
+            (NoticeKind::Prompt, "Write"),
+            (NoticeKind::Prompt, "Pick a side"),
+            (NoticeKind::Prompt, "Enter a token"),
+        ]
+    );
+    assert_eq!(notices[0].agent, task.agents[0].id);
+}
+
+#[test]
+fn the_trust_dialog_is_a_prompt() {
+    let fixture = notice_fixture(
+        r"printf 'Quick safety check\r\n  1. Yes, I trust this folder\r\n  2. No, exit\r\n'
+sleep 30",
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let task = client.create_task(orchestrator_task(project.id, false));
+
+    let notice = client.next_notice();
+
+    assert_notice(
+        &notice,
+        NoticeKind::Prompt,
+        &task,
+        task.agents[0].id,
+        "Trust this folder",
+    );
+    assert!(client.notices_after_a_pause().is_empty());
+}
+
+#[test]
+fn a_worker_prompt_names_the_worker() {
+    let fixture = notice_fixture(
+        r#"case "$SWARM_ROLE" in
+orchestrator)
+  idle
+  IFS= read -r line
+  working
+  swarm spawn api --kind claude --brief "ask" > "$OUT/spawn.out" 2>&1
+  sleep 30
+  ;;
+worker)
+  idle
+  IFS= read -r line
+  working
+  blocked_with question "Which port?"
+  sleep 30
+  ;;
+esac"#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, task) = start_task(&daemon, &repo);
+    let mut worker = None;
+
+    let notice = client.wait_for(|event| match event {
+        Event::AgentChanged { agent } if agent.role == AgentRole::Worker => {
+            worker = Some(agent.id);
+
+            None
+        }
+        Event::Notice { notice } => Some(notice.clone()),
+        _ => None,
+    });
+
+    let worker = worker.expect("the worker was announced first");
+    assert_notice(&notice, NoticeKind::Prompt, &task, worker, "Which port?");
+    assert!(client.notices_after_a_pause().is_empty());
+}
+
+#[test]
+fn a_prompt_of_the_start_orchestrator_has_no_task() {
+    let fixture = notice_fixture(
+        r#"case "$SWARM_ROLE" in
+start_orchestrator)
+  blocked_with question "Which feature first?"
+  sleep 30
+  ;;
+esac"#,
+    );
+    let repo = sized_terminal_repo();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let start = client.start_orchestrator(project.id);
+
+    let notice = client.next_notice();
+
+    assert_eq!(notice.kind, NoticeKind::Prompt);
+    assert_eq!(notice.project, project.id);
+    assert_eq!(notice.task, None);
+    assert_eq!(notice.agent, start.id);
+    assert_eq!(notice.text, "Which feature first?");
+    assert!(client.notices_after_a_pause().is_empty());
+}
+
+/// An orchestrator and a worker that each go on when the test opens the gate they wait
+/// for. The orchestrator rests (works, then finishes) once per gate `go-a` to `go-d`.
+fn review_fixture() -> Fixture {
+    notice_fixture(
+        r#"case "$SWARM_ROLE" in
+orchestrator)
+  idle
+  IFS= read -r line
+  working
+  swarm spawn api --kind claude --brief "build" > "$OUT/spawn.out" 2>&1
+  for step in a b c d; do
+    gate "go-$step"
+    working
+    finished
+    mark "rested-$step"
+  done
+  sleep 30
+  ;;
+worker)
+  idle
+  IFS= read -r line
+  working
+  gate worker-finish-1
+  finished
+  gate worker-start-2
+  working
+  gate worker-finish-2
+  finished
+  sleep 30
+  ;;
+esac"#,
+    )
+}
+
+#[test]
+fn ready_for_review_waits_for_every_worker_and_fires_once() {
+    let fixture = review_fixture();
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, task) = start_task(&daemon, &repo);
+    let orchestrator = task.agents[0].id;
+    assert!(
+        client
+            .notices_until(is_worker_with(AgentStatus::Working))
+            .is_empty()
+    );
+
+    fixture.open_gate("go-a");
+    fixture.read_when_written("rested-a");
+    assert!(
+        client.notices_after_a_pause().is_empty(),
+        "a worker still works"
+    );
+
+    fixture.open_gate("worker-finish-1");
+    assert!(
+        client
+            .notices_until(is_worker_with(AgentStatus::Done))
+            .is_empty()
+    );
+    assert!(
+        client.notices_after_a_pause().is_empty(),
+        "the orchestrator did not turn idle"
+    );
+    fixture.open_gate("go-b");
+    let notice = client.next_notice();
+
+    assert_notice(
+        &notice,
+        NoticeKind::ReadyForReview,
+        &task,
+        orchestrator,
+        "Agent task",
+    );
+    fixture.read_when_written("rested-b");
+    assert!(client.notices_after_a_pause().is_empty());
+
+    fixture.open_gate("go-c");
+    fixture.read_when_written("rested-c");
+    assert!(
+        client.notices_after_a_pause().is_empty(),
+        "no worker worked since the notice"
+    );
+}
+
+#[test]
+fn ready_for_review_fires_again_after_a_worker_worked_and_ended_again() {
+    let fixture = review_fixture();
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, task) = start_task(&daemon, &repo);
+    client.notices_until(is_worker_with(AgentStatus::Working));
+    fixture.open_gate("worker-finish-1");
+    client.notices_until(is_worker_with(AgentStatus::Done));
+    fixture.open_gate("go-a");
+    let first = client.next_notice();
+    fixture.read_when_written("rested-a");
+    assert_eq!(first.kind, NoticeKind::ReadyForReview);
+
+    fixture.open_gate("worker-start-2");
+    client.notices_until(is_worker_with(AgentStatus::Working));
+    fixture.open_gate("worker-finish-2");
+    client.notices_until(is_worker_with(AgentStatus::Done));
+    fixture.open_gate("go-b");
+    let second = client.next_notice();
+
+    assert_notice(
+        &second,
+        NoticeKind::ReadyForReview,
+        &task,
+        task.agents[0].id,
+        "Agent task",
+    );
+    assert!(second.at >= first.at);
+    assert!(client.notices_after_a_pause().is_empty());
+}
+
+#[test]
+fn a_task_that_asked_for_a_decision_is_not_ready_for_review() {
+    let fixture = notice_fixture(
+        r#"case "$SWARM_ROLE" in
+orchestrator)
+  idle
+  IFS= read -r line
+  working
+  swarm spawn api --kind claude --brief "build" > "$OUT/spawn.out" 2>&1
+  gate go
+  swarm notify "Which branch?" > "$OUT/notify.out" 2>&1
+  finished
+  mark rested
+  sleep 30
+  ;;
+worker)
+  idle
+  IFS= read -r line
+  working
+  finished
+  sleep 30
+  ;;
+esac"#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, task) = start_task(&daemon, &repo);
+    client.notices_until(is_worker_with(AgentStatus::Done));
+
+    fixture.open_gate("go");
+    fixture.read_when_written("rested");
+    let notices = client.notices_after_a_pause();
+
+    assert_eq!(
+        kinds_and_texts(&notices),
+        [(NoticeKind::NeedsDecision, "Which branch?")]
+    );
+    assert_eq!(notices[0].agent, task.agents[0].id);
+
+    let terminal = client.projects()[0].tasks[0].agents[0]
+        .terminal
+        .expect("terminal");
+    client.send(&Request::Input {
+        id: terminal,
+        input: TerminalInput::Text("x".to_owned()),
+    });
+    client.wait_for_agent(|agent| agent.status == AgentStatus::Done);
+    assert!(
+        client.notices_after_a_pause().is_empty(),
+        "an answer to the decision is not the swarm resting"
+    );
+}
+
+#[test]
+fn a_stop_failure_hook_is_a_broke_notice_with_its_reason() {
+    let (_fixture, _repo, _daemon, mut client, task) = lone_orchestrator(
+        r#"hook '{"hook_event_name":"StopFailure","error":"rate_limit"}'
+exit 0"#,
+    );
+
+    let notices = client.notices_after(ended);
+
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_notice(
+        &notices[0],
+        NoticeKind::Broke,
+        &task,
+        task.agents[0].id,
+        "rate_limit",
+    );
+}
+
+#[test]
+fn a_process_that_ends_with_an_error_code_is_a_broke_notice() {
+    let (_fixture, _repo, _daemon, mut client, task) = lone_orchestrator(
+        r"printf '\033]7501;state=working\007'
+exit 3",
+    );
+
+    let notices = client.notices_after(ended);
+
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_notice(
+        &notices[0],
+        NoticeKind::Broke,
+        &task,
+        task.agents[0].id,
+        "Exited with code 3",
+    );
+}
+
+#[test]
+fn a_worker_that_ends_by_a_signal_is_a_broke_notice_that_names_the_worker() {
+    let fixture = notice_fixture(
+        r#"case "$SWARM_ROLE" in
+orchestrator)
+  idle
+  IFS= read -r line
+  working
+  swarm spawn api --kind claude --brief "crash" > "$OUT/spawn.out" 2>&1
+  sleep 30
+  ;;
+worker)
+  idle
+  IFS= read -r line
+  working
+  kill -TERM $$
+  ;;
+esac"#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, task) = start_task(&daemon, &repo);
+    let worker = client.wait_for_agent(|agent| agent.role == AgentRole::Worker);
+
+    let notices = client.notices_after(|agent| agent.id == worker.id && ended(agent));
+
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!(notices[0].kind, NoticeKind::Broke);
+    assert_eq!(notices[0].agent, worker.id);
+    assert_eq!(notices[0].task, Some(task.id));
+    assert!(
+        notices[0].text.starts_with("Ended by signal"),
+        "{:?}",
+        notices[0]
+    );
+}
+
+#[test]
+fn stopping_all_agents_is_no_broke() {
+    let fixture = notice_fixture(
+        r"printf '\033]7501;state=working\007'
+sleep 30",
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let mut watcher = daemon.connect();
+    watcher.hello();
+    let project = client.add_project(&repo.root);
+    let task = client.create_task(orchestrator_task(project.id, false));
+    client.wait_for_agent(|agent| agent.status == AgentStatus::Working);
+
+    client.stop_agents(&[task.agents[0].id]);
+
+    assert!(watcher.notices_after_a_pause().is_empty());
+}
+
+#[test]
+fn swarm_exit_is_no_broke() {
+    let fixture = notice_fixture(
+        r#"idle
+IFS= read -r line
+working
+swarm exit > "$OUT/exit.out" 2>&1
+sleep 30"#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, task) = start_task(&daemon, &repo);
+
+    let stopped = client.wait_for_agent(ended);
+
+    assert_eq!(stopped.id, task.agents[0].id);
+    assert!(client.notices_after_a_pause().is_empty());
+}
+
+#[test]
+fn closing_a_task_is_no_broke() {
+    let fixture = notice_fixture(CLOSE_AGENT);
+    let repo = ported_repo("5170-5175", "");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, task) = start_task(&daemon, &repo);
+    let mut watcher = daemon.connect();
+    watcher.hello();
+    fixture.read_when_written("ready");
+    client.wait_for_agent(is_worker_with(AgentStatus::Working));
+
+    client.close_task(task.id).expect("closed");
+
+    assert!(watcher.notices_after_a_pause().is_empty());
+}
+
+#[test]
+fn a_daemon_that_stops_gives_no_broke() {
+    let fixture = notice_fixture(
+        r"printf '\033]7501;state=working\007'
+sleep 30",
+    );
+    let repo = repo_for_merges();
+    let mut daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let mut watcher = daemon.connect();
+    watcher.hello();
+    let project = client.add_project(&repo.root);
+    client.create_task(orchestrator_task(project.id, false));
+    client.wait_for_agent(|agent| agent.status == AgentStatus::Working);
+
+    assert!(daemon.stops_on_sigterm(), "the daemon ignored SIGTERM");
+
+    assert!(watcher.notices_until_closed().is_empty());
+}
+
+#[test]
+fn recovering_old_agents_at_start_sends_no_notice() {
+    let (_fixture, _repo, mut daemon, mut client, task) = lone_orchestrator(
+        r#"hook '{"hook_event_name":"SessionStart","session_id":"recovery-session"}'
+blocked_with permission "approve Write"
+sleep 30"#,
+    );
+    let notice = client.next_notice();
+    assert_eq!(notice.kind, NoticeKind::Prompt);
+    drop(client);
+
+    daemon.crash();
+    let restarted = Daemon::start_in(daemon.home.clone());
+    let mut client = restarted.connect();
+    client.hello();
+
+    let notices = client.notices_after_a_pause();
+
+    assert!(notices.is_empty(), "{notices:?}");
+    let agent = &client.projects()[0].tasks[0].agents[0];
+    assert_eq!(agent.id, task.agents[0].id);
+    assert_eq!(agent.status, AgentStatus::Unknown);
 }

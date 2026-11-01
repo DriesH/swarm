@@ -187,6 +187,7 @@ fn run() -> Result<()> {
 
     watch_signals(
         Arc::clone(&terminals),
+        Arc::clone(&agents),
         vec![paths.socket.clone(), agent_socket_path],
     )?;
 
@@ -406,7 +407,11 @@ extern "C" fn on_signal(_signal: libc::c_int) {
 }
 
 /// SIGTERM and SIGINT kill every terminal, remove the sockets and end the process.
-fn watch_signals(terminals: Arc<Terminals>, sockets: Vec<PathBuf>) -> Result<()> {
+fn watch_signals(
+    terminals: Arc<Terminals>,
+    agents: Arc<Agents>,
+    sockets: Vec<PathBuf>,
+) -> Result<()> {
     let mut descriptors = [0; 2];
     // SAFETY: pipe fills the two integers of the array.
     if unsafe { libc::pipe(descriptors.as_mut_ptr()) } != 0 {
@@ -434,6 +439,7 @@ fn watch_signals(terminals: Arc<Terminals>, sockets: Vec<PathBuf>) -> Result<()>
             }
 
             log::info!("shutting down");
+            agents.begin_shutdown();
             terminals.kill_all();
             if !terminals.wait_until_empty(SHUTDOWN_GRACE) {
                 log::warn!("some terminals did not exit in time");

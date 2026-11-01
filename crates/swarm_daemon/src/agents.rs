@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -14,7 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, bail};
 use serde_json::Value;
 use swarm_core::adapters::{self, LaunchSpec, Session};
-use swarm_core::agents::{StatusMerge, is_trust_prompt, new_session_id, new_token};
+use swarm_core::agents::{StatusMerge, exit_failure, is_trust_prompt, new_session_id, new_token};
 use swarm_core::git;
 use swarm_core::github::Github;
 use swarm_core::prompts::{self, Harness, PromptFile};
@@ -22,7 +23,7 @@ use swarm_core::store::{NewAgent, NewMessage, Store, unix_millis};
 use swarm_protocol::agent::render_inbox;
 use swarm_protocol::{
     AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, CreateTerminal, Event,
-    MessageKind, ProjectId, TaskId, TaskInfo, TerminalId, TerminalKind,
+    MessageKind, Notice, NoticeKind, ProjectId, TaskId, TaskInfo, TerminalId, TerminalKind,
 };
 use swarm_settings::Settings;
 use swarm_term::{ExitStatus, ProgramState, Row, TerminalInput, TerminalOutput};
@@ -339,6 +340,52 @@ pub(crate) struct Agents {
     on_end: Mutex<Vec<EndObserver>>,
     /// Tasks being closed: nothing new starts in them, and their agents end quietly.
     closing: Mutex<HashSet<TaskId>>,
+    /// When each task last told the user it is ready for review. In memory only.
+    reviews: Mutex<HashMap<TaskId, ReviewWatch>>,
+    /// The daemon is stopping, so agents that end are not broken.
+    shutting_down: AtomicBool,
+}
+
+/// Follows one task to tell when it is ready for review.
+#[derive(Default)]
+struct ReviewWatch {
+    /// The orchestrator is idle or done.
+    resting: bool,
+    /// The notice went out and no worker has worked since.
+    sent: bool,
+}
+
+impl ReviewWatch {
+    /// Returns true when the orchestrator just began to rest.
+    fn orchestrator_rests(&mut self, rests: bool) -> bool {
+        let began = rests && !self.resting;
+        self.resting = rests;
+
+        began
+    }
+
+    /// A worker works, so the next time the swarm rests is news again.
+    fn worker_worked(&mut self) {
+        self.sent = false;
+    }
+}
+
+/// The task has workers and every one of them is done or ended.
+fn workers_done(agents: &[AgentInfo]) -> bool {
+    let mut workers = agents
+        .iter()
+        .filter(|agent| agent.role == AgentRole::Worker)
+        .peekable();
+
+    workers.peek().is_some()
+        && workers.all(|worker| match worker.lifecycle {
+            AgentLifecycle::Starting => false,
+            AgentLifecycle::Running => !matches!(
+                worker.status,
+                AgentStatus::Unknown | AgentStatus::Working | AgentStatus::Blocked(_)
+            ),
+            AgentLifecycle::Resumable | AgentLifecycle::Stopped => true,
+        })
 }
 
 /// Gets the agent and whether the user stopped it.
@@ -365,12 +412,22 @@ impl Agents {
             live: Mutex::default(),
             on_end: Mutex::default(),
             closing: Mutex::default(),
+            reviews: Mutex::default(),
+            shutting_down: AtomicBool::new(false),
         })
     }
 
     /// Starts closing the task. False when it is closing already.
     pub(crate) fn begin_close(&self, task: TaskId) -> bool {
+        lock(&self.reviews).remove(&task);
+
         lock(&self.closing).insert(task)
+    }
+
+    /// The daemon is about to stop its terminals: no agent that ends then is broken.
+    pub(crate) fn begin_shutdown(&self) {
+        self.shutting_down
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The close failed; the task takes new agents again.
@@ -612,9 +669,14 @@ impl Agents {
         lock(&self.live).get(&id).map(|agent| agent.token.clone())
     }
 
-    /// Shows the agent as blocked with `text` until it works or the app types into it.
+    /// Shows the agent as blocked with `text` until it works or the app types into it,
+    /// and tells every client the user is needed.
     pub(crate) fn notify(&self, id: AgentId, text: &str) {
         self.update(id, |live| live.merge.notify(text));
+
+        if let Some(info) = self.info(id) {
+            self.send_notice(NoticeKind::NeedsDecision, &info, text.to_owned());
+        }
     }
 
     /// The user typed or pasted into a terminal: a notice on the agent in it no longer
@@ -995,6 +1057,12 @@ impl Agents {
         if outcome.changed {
             self.publish(agent);
         }
+        self.send_notices(agent);
+        if let Some(reason) = outcome.failure
+            && !self.is_ending(agent)
+        {
+            self.send_notice(NoticeKind::Broke, &agent.info, reason);
+        }
         drop(live);
 
         if outcome.stopped || outcome.changed {
@@ -1248,6 +1316,12 @@ impl Agents {
             self.tell_worker_stopped(&agent.info, &format!("stopped, {how}"));
         }
 
+        if let Some(reason) = exit_failure(exit)
+            && !self.is_ending(&agent)
+        {
+            self.send_notice(NoticeKind::Broke, &agent.info, reason);
+        }
+
         for observer in lock(&self.on_end).iter() {
             observer(id, agent.stopped_by_user);
         }
@@ -1264,6 +1338,7 @@ impl Agents {
             self.publish(agent);
         }
 
+        self.send_notices(agent);
         self.end_queue_if_stopped(agent);
     }
 
@@ -1278,6 +1353,90 @@ impl Agents {
 
         self.clients.broadcast(&Event::AgentChanged {
             agent: agent.info.clone(),
+        });
+    }
+
+    /// Tells every client what a change of the agent means for the user. Call it after
+    /// every change, published or not: a notice hides a status change from the app.
+    fn send_notices(&self, agent: &mut Live) {
+        if let Some(text) = agent.merge.take_prompt() {
+            self.send_notice(NoticeKind::Prompt, &agent.info, text);
+        }
+
+        let Some(task) = agent.info.task else {
+            return;
+        };
+
+        match agent.info.role {
+            AgentRole::Worker if agent.merge.status() == AgentStatus::Working => {
+                lock(&self.reviews).entry(task).or_default().worker_worked();
+            }
+            AgentRole::Orchestrator => self.check_review(agent, task),
+            AgentRole::Worker | AgentRole::StartOrchestrator => {}
+        }
+    }
+
+    /// Sends "ready for review" when the orchestrator just went idle with every worker
+    /// done, once per round of work. An orchestrator that asked for a decision is not
+    /// ready: it is asked again the next time it rests.
+    fn check_review(&self, orchestrator: &Live, task: TaskId) {
+        let rests = orchestrator.merge.is_resting()
+            && orchestrator.info.lifecycle == AgentLifecycle::Running;
+
+        let mut reviews = lock(&self.reviews);
+        let watch = reviews.entry(task).or_default();
+        if !watch.orchestrator_rests(rests) || watch.sent || orchestrator.merge.has_notice() {
+            return;
+        }
+
+        let Some(name) = self.name_when_workers_are_done(task) else {
+            return;
+        };
+
+        watch.sent = true;
+        drop(reviews);
+
+        self.send_notice(NoticeKind::ReadyForReview, &orchestrator.info, name);
+    }
+
+    /// The task's name when it has workers and none of them is busy.
+    fn name_when_workers_are_done(&self, task: TaskId) -> Option<String> {
+        let store = lock(&self.store);
+        let found = store
+            .list_agents(task)
+            .and_then(|agents| Ok((workers_done(&agents), store.task(task)?)));
+
+        match found {
+            Ok((true, Some(task))) => Some(task.name),
+            Ok(_) => None,
+            Err(error) => {
+                log::error!("cannot check whether task {} is ready: {error}", task.0);
+
+                None
+            }
+        }
+    }
+
+    /// The agent ends on purpose or with the daemon, so a signal or a failure is no news.
+    fn is_ending(&self, agent: &Live) -> bool {
+        agent.stop_requested
+            || agent.stopped_by_user
+            || self
+                .shutting_down
+                .load(std::sync::atomic::Ordering::Relaxed)
+            || self.is_closing(agent.info.task)
+    }
+
+    fn send_notice(&self, kind: NoticeKind, agent: &AgentInfo, text: String) {
+        self.clients.broadcast(&Event::Notice {
+            notice: Notice {
+                kind,
+                project: agent.project,
+                task: agent.task,
+                agent: agent.id,
+                text,
+                at: unix_millis(),
+            },
         });
     }
 }
@@ -1929,6 +2088,92 @@ mod tests {
 
         assert!(wait_out_block(|| Waiting::Other, Duration::from_secs(5)));
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    fn member(role: AgentRole, lifecycle: AgentLifecycle, status: AgentStatus) -> AgentInfo {
+        AgentInfo {
+            role,
+            lifecycle,
+            status,
+            ..live(AgentKind::ClaudeCode, ProgramState::Idle).info
+        }
+    }
+
+    fn worker(lifecycle: AgentLifecycle, status: AgentStatus) -> AgentInfo {
+        member(AgentRole::Worker, lifecycle, status)
+    }
+
+    #[test]
+    fn a_task_without_workers_is_not_done() {
+        assert!(!workers_done(&[]));
+        assert!(!workers_done(&[member(
+            AgentRole::Orchestrator,
+            AgentLifecycle::Running,
+            AgentStatus::Idle
+        )]));
+    }
+
+    #[test]
+    fn a_working_blocked_or_starting_worker_is_not_done() {
+        let running = |status| [worker(AgentLifecycle::Running, status)];
+
+        assert!(!workers_done(&running(AgentStatus::Working)));
+        assert!(!workers_done(&running(AgentStatus::Blocked(
+            swarm_term::BlockedKind::Permission
+        ))));
+        assert!(!workers_done(&running(AgentStatus::Unknown)));
+        assert!(!workers_done(&[worker(
+            AgentLifecycle::Starting,
+            AgentStatus::Unknown
+        )]));
+    }
+
+    #[test]
+    fn idle_done_and_failed_workers_are_done() {
+        for status in [AgentStatus::Idle, AgentStatus::Done, AgentStatus::Error] {
+            assert!(
+                workers_done(&[worker(AgentLifecycle::Running, status)]),
+                "{status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_worker_that_ended_is_done_even_with_a_stale_status() {
+        for lifecycle in [AgentLifecycle::Resumable, AgentLifecycle::Stopped] {
+            assert!(workers_done(&[worker(lifecycle, AgentStatus::Working)]));
+        }
+    }
+
+    #[test]
+    fn one_busy_worker_among_done_ones_is_not_done() {
+        assert!(!workers_done(&[
+            worker(AgentLifecycle::Running, AgentStatus::Done),
+            worker(AgentLifecycle::Running, AgentStatus::Working),
+        ]));
+    }
+
+    #[test]
+    fn the_orchestrator_beginning_to_rest_is_a_change_once() {
+        let mut watch = ReviewWatch::default();
+
+        assert!(!watch.orchestrator_rests(false));
+        assert!(watch.orchestrator_rests(true));
+        assert!(!watch.orchestrator_rests(true));
+        assert!(!watch.orchestrator_rests(false));
+        assert!(watch.orchestrator_rests(true));
+    }
+
+    #[test]
+    fn a_worker_working_makes_the_next_rest_news_again() {
+        let mut watch = ReviewWatch {
+            sent: true,
+            ..ReviewWatch::default()
+        };
+
+        watch.worker_worked();
+
+        assert!(!watch.sent);
     }
 
     #[test]
