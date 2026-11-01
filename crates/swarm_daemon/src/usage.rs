@@ -1,9 +1,9 @@
 //! Subscription usage: the numbers the daemon keeps, saves and broadcasts, and the
 //! poller that fills them (docs/PLAN.md, "Usage and menu bar").
 //!
-//! Claude's windows come from the status line of the Claude agents Swarm runs. The
-//! endpoint is the fallback when none has sent them lately. Codex is asked every few
-//! minutes. Polling runs only while an app is connected.
+//! Claude's windows come only from the status line of the Claude agents Swarm runs: with
+//! none running, the last numbers stay. Codex is asked every few minutes. Polling runs
+//! only while an app is connected.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -11,9 +11,10 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
+use serde_json::Value;
 use swarm_core::adapters;
-use swarm_protocol::{AgentKind, Event, SubscriptionUsage, Usage, UsageWindow};
-use swarm_usage::{ClaudeEndpoint, Commands, Outcome, Reading, codex_usage, write_private};
+use swarm_protocol::{AgentKind, Event, SubscriptionUsage, Usage, UsageProblem, UsageWindow};
+use swarm_usage::{Outcome, Reading, codex_usage, length_of_label, write_private};
 
 use crate::agents::lock;
 use crate::hub::Clients;
@@ -26,9 +27,6 @@ const CODEX_INTERVAL: Duration = Duration::from_mins(5);
 
 const CODEX_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The endpoint is not used while a status line sent windows this recently.
-const STATUS_LINE_FRESH: Duration = Duration::from_mins(10);
-
 /// Status lines run often. With the same windows, `read_at` moves on at this pace only.
 const READ_AT_STEP: u64 = 60;
 
@@ -36,28 +34,21 @@ const READ_AT_STEP: u64 = 60;
 const MAX_WINDOWS: usize = 8;
 const MAX_LABEL_CHARS: usize = 16;
 
+/// The file an older daemon kept the Claude endpoint backoff in.
+const OLD_BACKOFF_FILE: &str = "claude-usage-backoff.json";
+
 /// Commands and timings that tests replace. Empty in production.
 #[derive(Default)]
 pub(crate) struct Overrides {
     /// No poller at all.
     pub(crate) no_polling: bool,
-    pub(crate) security: Option<PathBuf>,
-    pub(crate) curl: Option<PathBuf>,
     pub(crate) codex: Option<PathBuf>,
-    pub(crate) claude: Option<PathBuf>,
     pub(crate) tick: Option<Duration>,
     pub(crate) codex_interval: Option<Duration>,
 }
 
-struct State {
-    usage: Usage,
-    /// When a status line last sent windows, in Unix seconds. Not saved: it only keeps the
-    /// endpoint quiet. It is not an `Instant`, which stops while the Mac sleeps.
-    status_line_at: Option<u64>,
-}
-
 pub(crate) struct UsageService {
-    state: Mutex<State>,
+    usage: Mutex<Usage>,
     file: PathBuf,
     clients: Arc<Clients>,
     /// Wakes the poller when the first app connects.
@@ -66,17 +57,19 @@ pub(crate) struct UsageService {
 
 impl UsageService {
     /// Loads the saved usage from the data folder and starts the poller, which looks up
-    /// the agent CLIs by the commands in the `settings` file.
+    /// Codex by the command in the `settings` file.
     pub(crate) fn start(
         data_dir: &Path,
         settings: Option<PathBuf>,
         clients: Arc<Clients>,
         overrides: Overrides,
     ) -> Result<Arc<Self>> {
+        remove_old_backoff_file(data_dir);
+
         let (service, wake) = Self::new(data_dir.join("usage.json"), clients);
 
         if !overrides.no_polling {
-            let poller = Poller::new(Arc::clone(&service), wake, data_dir, settings, overrides);
+            let poller = Poller::new(Arc::clone(&service), wake, settings, overrides);
             thread::Builder::new()
                 .name("usage-poller".into())
                 .spawn(move || poller.run())
@@ -91,10 +84,7 @@ impl UsageService {
         let usage = load(&file);
 
         let service = Arc::new(Self {
-            state: Mutex::new(State {
-                usage,
-                status_line_at: None,
-            }),
+            usage: Mutex::new(usage),
             file,
             clients,
             wake,
@@ -104,7 +94,7 @@ impl UsageService {
     }
 
     pub(crate) fn current(&self) -> Usage {
-        lock(&self.state).usage.clone()
+        lock(&self.usage).clone()
     }
 
     /// Call after a client was added. The first app makes the poller read at once.
@@ -126,18 +116,16 @@ impl UsageService {
             return;
         }
 
-        let mut state = lock(&self.state);
-        state.status_line_at = Some(now);
+        let mut current = lock(&self.usage);
 
-        let claude = &state.usage.claude;
-        let same = claude.windows == windows
-            && claude.problem.is_none()
-            && claude.read_at.is_some_and(|at| now < at + READ_AT_STEP);
+        let claude = &current.claude;
+        let same =
+            claude.windows == windows && claude.read_at.is_some_and(|at| now < at + READ_AT_STEP);
         if same {
             return;
         }
 
-        let mut usage = state.usage.clone();
+        let mut usage = current.clone();
         apply(
             &mut usage.claude,
             Ok(Reading {
@@ -146,41 +134,26 @@ impl UsageService {
             }),
             now,
         );
-        self.publish(&mut state, usage);
-    }
-
-    /// A status line from the future, after the clock was set back, is stale too.
-    fn status_line_is_stale(&self, now: u64) -> bool {
-        let fresh = |at: u64| at <= now && now < at.saturating_add(STATUS_LINE_FRESH.as_secs());
-
-        !lock(&self.state).status_line_at.is_some_and(fresh)
-    }
-
-    fn claude_read(&self, outcome: Outcome, now: u64) {
-        let mut state = lock(&self.state);
-        let mut usage = state.usage.clone();
-
-        apply(&mut usage.claude, outcome, now);
-        self.publish(&mut state, usage);
+        self.publish(&mut current, usage);
     }
 
     fn codex_read(&self, outcome: Outcome, now: u64) {
-        let mut state = lock(&self.state);
-        let mut usage = state.usage.clone();
+        let mut current = lock(&self.usage);
+        let mut usage = current.clone();
 
         apply(&mut usage.codex, outcome, now);
-        self.publish(&mut state, usage);
+        self.publish(&mut current, usage);
     }
 
-    /// Saves and broadcasts a change. It holds the state lock, so two changes never
-    /// reach the clients in the wrong order.
-    fn publish(&self, state: &mut State, usage: Usage) {
-        if usage == state.usage {
+    /// Saves and broadcasts a change. The caller holds the usage lock, so two changes
+    /// never reach the clients in the wrong order.
+    fn publish(&self, current: &mut Usage, usage: Usage) {
+        if usage == *current {
             return;
         }
-        state.usage = usage;
+        *current = usage;
 
-        match serde_json::to_vec(&state.usage) {
+        match serde_json::to_vec(current) {
             Ok(bytes) => {
                 if let Err(error) = write_private(&self.file, &bytes) {
                     log::warn!("cannot save {}: {error}", self.file.display());
@@ -190,7 +163,7 @@ impl UsageService {
         }
 
         self.clients.broadcast(&Event::UsageChanged {
-            usage: state.usage.clone(),
+            usage: current.clone(),
         });
     }
 }
@@ -220,13 +193,14 @@ fn clean(windows: Vec<UsageWindow>) -> Vec<UsageWindow> {
             label: window.label.chars().take(MAX_LABEL_CHARS).collect(),
             used_percent: window.used_percent.min(100),
             resets_at: window.resets_at,
+            length_secs: window.length_secs,
         })
         .collect()
 }
 
 fn load(file: &Path) -> Usage {
     match std::fs::read(file) {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+        Ok(bytes) => parse_saved(&bytes).unwrap_or_else(|error| {
             log::warn!("ignoring {}: {error}", file.display());
             Usage::default()
         }),
@@ -235,6 +209,73 @@ fn load(file: &Path) -> Usage {
             log::warn!("cannot read {}: {error}", file.display());
             Usage::default()
         }
+    }
+}
+
+/// Reads a file an older daemon may have written: a problem that no longer exists is
+/// dropped, and a window without a length gets the one its label stands for.
+fn parse_saved(bytes: &[u8]) -> serde_json::Result<Usage> {
+    let mut saved: Value = serde_json::from_slice(bytes)?;
+
+    for name in ["claude", "codex"] {
+        if let Some(subscription) = saved.get_mut(name) {
+            upgrade(subscription);
+        }
+    }
+
+    let mut usage: Usage = serde_json::from_value(saved)?;
+    // No read of Claude can fail now, so a problem it was saved with would stay for good.
+    usage.claude.problem = None;
+
+    Ok(usage)
+}
+
+fn upgrade(subscription: &mut Value) {
+    let Some(subscription) = subscription.as_object_mut() else {
+        return;
+    };
+
+    let known = subscription
+        .get("problem")
+        .is_none_or(|problem| serde_json::from_value::<UsageProblem>(problem.clone()).is_ok());
+    if !known {
+        subscription.remove("problem");
+    }
+
+    let windows = subscription
+        .get_mut("windows")
+        .and_then(Value::as_array_mut);
+    for window in windows
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object_mut)
+    {
+        if window
+            .get("length_secs")
+            .is_some_and(|length| !length.is_null())
+        {
+            continue;
+        }
+
+        let length = window
+            .get("label")
+            .and_then(Value::as_str)
+            .and_then(length_of_label);
+        if let Some(length) = length {
+            window.insert("length_secs".to_owned(), length.into());
+        }
+    }
+}
+
+/// An older daemon kept the backoff of the Claude endpoint in its data folder. Nothing
+/// reads it now.
+fn remove_old_backoff_file(data_dir: &Path) {
+    let file = data_dir.join(OLD_BACKOFF_FILE);
+
+    match std::fs::remove_file(&file) {
+        Ok(()) => log::info!("removed {}", file.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => log::warn!("cannot remove {}: {error}", file.display()),
     }
 }
 
@@ -262,22 +303,12 @@ fn find(command: &str) -> Option<PathBuf> {
     )
 }
 
-/// The account name of Claude Code's Keychain item.
-fn account() -> Option<String> {
-    ["USER", "LOGNAME"]
-        .into_iter()
-        .filter_map(|name| std::env::var(name).ok())
-        .find(|name| !name.is_empty())
-}
-
 struct Poller {
     service: Arc<UsageService>,
     woken: flume::Receiver<()>,
-    endpoint: ClaudeEndpoint,
     /// The settings file that names the agent CLIs.
     settings: Option<PathBuf>,
     /// A path a test gave. Without one, the command comes from the settings.
-    claude: Option<String>,
     codex: Option<String>,
     tick: Duration,
     codex_interval: Duration,
@@ -289,31 +320,16 @@ impl Poller {
     fn new(
         service: Arc<UsageService>,
         woken: flume::Receiver<()>,
-        data_dir: &Path,
         settings: Option<PathBuf>,
         overrides: Overrides,
     ) -> Self {
-        let mut commands = Commands::system();
-        if let Some(security) = overrides.security {
-            commands.security = security;
-        }
-        if let Some(curl) = overrides.curl {
-            commands.curl = curl;
-        }
-
-        let name = |path: Option<PathBuf>| path.map(|path| path.to_string_lossy().into_owned());
-
         Self {
             service,
             woken,
-            endpoint: ClaudeEndpoint::new(
-                commands,
-                account(),
-                data_dir.join("claude-usage-backoff.json"),
-            ),
             settings,
-            claude: name(overrides.claude),
-            codex: name(overrides.codex),
+            codex: overrides
+                .codex
+                .map(|path| path.to_string_lossy().into_owned()),
             tick: overrides.tick.unwrap_or(POLL_TICK),
             codex_interval: overrides.codex_interval.unwrap_or(CODEX_INTERVAL),
             codex_due: None,
@@ -333,47 +349,27 @@ impl Poller {
                 continue;
             }
 
-            self.poll();
+            self.poll(unix_time());
         }
     }
 
-    fn poll(&mut self) {
-        self.poll_codex(unix_time());
-        self.poll_claude(unix_now());
-    }
-
-    fn poll_codex(&mut self, time: Duration) {
+    fn poll(&mut self, time: Duration) {
         if self.codex_due.is_some_and(|due| time < due) {
             return;
         }
 
-        let outcome = codex_usage(self.find_cli(AgentKind::Codex).as_deref(), CODEX_TIMEOUT);
+        let outcome = codex_usage(self.find_codex().as_deref(), CODEX_TIMEOUT);
         self.service.codex_read(outcome, time.as_secs());
         self.codex_due = Some(time + self.codex_interval);
     }
 
-    fn poll_claude(&mut self, now: u64) {
-        if !self.service.status_line_is_stale(now) {
-            return;
-        }
-
-        let installed = self.find_cli(AgentKind::ClaudeCode).is_some();
-
-        if let Some(outcome) = self.endpoint.poll(now, installed) {
-            self.service.claude_read(outcome, now);
-        }
-    }
-
-    /// The CLI of an agent kind: the path a test gave, or the command from the settings
-    /// that `Agents::plan` uses too.
-    fn find_cli(&self, kind: AgentKind) -> Option<PathBuf> {
-        let given = match kind {
-            AgentKind::ClaudeCode => &self.claude,
-            AgentKind::Codex => &self.codex,
-        };
-        let command = given
+    /// The path a test gave, or the command from the settings that `Agents::plan` uses
+    /// too.
+    fn find_codex(&self) -> Option<PathBuf> {
+        let command = self
+            .codex
             .clone()
-            .unwrap_or_else(|| configured_command(self.settings.as_deref(), kind));
+            .unwrap_or_else(|| configured_command(self.settings.as_deref(), AgentKind::Codex));
 
         find(&command)
     }
@@ -396,7 +392,7 @@ pub(crate) fn configured_command(settings: Option<&Path>, kind: AgentKind) -> St
 
 #[cfg(test)]
 mod tests {
-    use swarm_protocol::{UsageProblem, read};
+    use swarm_protocol::read;
 
     use crate::hub::{ClientSink, Frame};
     use crate::temp_folder::TempFolder;
@@ -405,11 +401,13 @@ mod tests {
 
     const NOW: u64 = 1_800_000_000;
 
+    /// The length comes from the label, as it does for the windows of both CLIs.
     fn window(label: &str, percent: u8, resets_at: u64) -> UsageWindow {
         UsageWindow {
             label: label.to_owned(),
             used_percent: percent,
             resets_at: Some(resets_at),
+            length_secs: length_of_label(label),
         }
     }
 
@@ -476,7 +474,7 @@ mod tests {
 
         apply(
             &mut subscription,
-            Err(UsageProblem::RateLimited { retry_at: NOW + 60 }),
+            Err(UsageProblem::Failed("boom".to_owned())),
             NOW + 30,
         );
 
@@ -488,7 +486,7 @@ mod tests {
         );
         assert_eq!(
             subscription.problem,
-            Some(UsageProblem::RateLimited { retry_at: NOW + 60 })
+            Some(UsageProblem::Failed("boom".to_owned()))
         );
     }
 
@@ -533,13 +531,15 @@ mod tests {
     #[test]
     fn the_saved_usage_is_loaded_at_start() {
         let (service, _received, _folder) = service_with_client("reload");
-        service.claude_read(Ok(reading(vec![window("7d", 33, 9)], Some("pro"))), NOW);
+        service.codex_read(Ok(reading(vec![window("7d", 33, 9)], Some("pro"))), NOW);
+        service.record_status_line(vec![window("5h", 20, 7)], NOW);
 
         let (reloaded, _woken) =
             UsageService::new(service.file.clone(), Arc::new(Clients::default()));
 
         assert_eq!(reloaded.current(), service.current());
-        assert_eq!(reloaded.current().claude.plan.as_deref(), Some("pro"));
+        assert_eq!(reloaded.current().codex.plan.as_deref(), Some("pro"));
+        assert_eq!(reloaded.current().claude.windows, [window("5h", 20, 7)]);
     }
 
     #[test]
@@ -553,30 +553,168 @@ mod tests {
         assert_eq!(service.current(), Usage::default());
     }
 
+    // Files an older daemon saved.
+
+    const OLD_USAGE: &str = r#"{
+        "claude": {
+            "windows": [
+                {"label": "5h", "used_percent": 42, "resets_at": 1793383200},
+                {"label": "7d", "used_percent": 13, "resets_at": null}
+            ],
+            "plan": "max",
+            "read_at": 1793380000,
+            "problem": {"RateLimited": {"retry_at": 1793381000}}
+        },
+        "codex": {
+            "windows": [
+                {"label": "30d", "used_percent": 3, "resets_at": 9},
+                {"label": "5h", "used_percent": 4, "resets_at": 8, "length_secs": 123}
+            ],
+            "plan": "plus",
+            "read_at": 1793380001,
+            "problem": "Unauthorized"
+        }
+    }"#;
+
+    fn load_text(name: &str, text: &str) -> Usage {
+        let folder = TempFolder::new(name);
+        let file = folder.path().join("usage.json");
+        std::fs::write(&file, text).expect("write");
+
+        load(&file)
+    }
+
     #[test]
-    fn a_status_line_sets_the_claude_windows_and_the_time() {
+    fn a_problem_that_no_longer_exists_is_dropped_and_the_rest_loads() {
+        let usage = load_text("old-problems", OLD_USAGE);
+
+        assert_eq!(usage.claude.problem, None);
+        assert_eq!(usage.codex.problem, None);
+        assert_eq!(usage.claude.plan.as_deref(), Some("max"));
+        assert_eq!(usage.claude.read_at, Some(1_793_380_000));
+        assert_eq!(usage.claude.windows.len(), 2);
+        assert_eq!(usage.codex.plan.as_deref(), Some("plus"));
+        assert_eq!(usage.codex.windows.len(), 2);
+    }
+
+    #[test]
+    fn a_problem_that_still_exists_is_kept_for_codex_and_dropped_for_claude() {
+        for problem in [
+            r#""NotInstalled""#,
+            r#""NotLoggedIn""#,
+            r#"{"Failed": "boom"}"#,
+        ] {
+            let text = format!(
+                r#"{{"claude": {{"windows": [], "problem": {problem}}}, "codex": {{"windows": [], "problem": {problem}}}}}"#
+            );
+
+            let usage = load_text("known-problem", &text);
+
+            assert!(usage.codex.problem.is_some(), "{problem}");
+            assert_eq!(usage.claude.problem, None, "{problem}: Claude is not read");
+        }
+    }
+
+    #[test]
+    fn a_window_saved_without_a_length_gets_the_one_of_its_label() {
+        let usage = load_text("old-lengths", OLD_USAGE);
+
+        let lengths = |subscription: &SubscriptionUsage| -> Vec<Option<u64>> {
+            subscription
+                .windows
+                .iter()
+                .map(|window| window.length_secs)
+                .collect()
+        };
+        assert_eq!(lengths(&usage.claude), [Some(18_000), Some(604_800)]);
+        assert_eq!(
+            lengths(&usage.codex),
+            [None, Some(123)],
+            "a label of another length stays without one, and a saved length stays"
+        );
+    }
+
+    #[test]
+    fn a_window_saved_with_a_null_length_gets_the_one_of_its_label() {
+        let usage = load_text(
+            "null-length",
+            r#"{"claude": {"windows": [{"label": "7d", "used_percent": 1, "resets_at": null, "length_secs": null}]}, "codex": {"windows": []}}"#,
+        );
+
+        assert_eq!(usage.claude.windows[0].length_secs, Some(604_800));
+    }
+
+    #[test]
+    fn a_file_that_is_not_the_usage_is_ignored() {
+        for text in [
+            "[]",
+            "5",
+            r#"{"claude": 5}"#,
+            r#"{"claude": {"windows": "many"}}"#,
+        ] {
+            let usage = load_text("not-usage", text);
+
+            assert_eq!(usage, Usage::default(), "{text}");
+        }
+    }
+
+    #[test]
+    fn the_backoff_file_of_the_old_daemon_is_removed_at_start() {
+        let folder = TempFolder::new("old-backoff");
+        let backoff = folder.path().join(OLD_BACKOFF_FILE);
+        std::fs::write(&backoff, r#"{"backoff_until": 1}"#).expect("backoff");
+        std::fs::write(folder.path().join("usage.json"), OLD_USAGE).expect("usage");
+        std::fs::write(folder.path().join("claude-backoff.json"), "{}").expect("other");
+
+        let started = UsageService::start(
+            folder.path(),
+            None,
+            Arc::new(Clients::default()),
+            Overrides {
+                no_polling: true,
+                ..Overrides::default()
+            },
+        )
+        .expect("start");
+
+        assert!(!backoff.exists());
+        assert!(folder.path().join("usage.json").is_file());
+        assert!(folder.path().join("claude-backoff.json").is_file());
+        assert_eq!(started.current().claude.windows.len(), 2);
+    }
+
+    #[test]
+    fn a_start_without_a_backoff_file_works() {
+        let folder = TempFolder::new("no-backoff");
+
+        let started = UsageService::start(
+            folder.path(),
+            None,
+            Arc::new(Clients::default()),
+            Overrides {
+                no_polling: true,
+                ..Overrides::default()
+            },
+        )
+        .expect("start");
+
+        assert_eq!(started.current(), Usage::default());
+    }
+
+    // The status line.
+
+    #[test]
+    fn a_status_line_sets_the_claude_windows_with_their_length_and_the_time() {
         let (service, received, _folder) = service_with_client("statusline");
-        assert!(service.status_line_is_stale(NOW));
 
         service.record_status_line(vec![window("5h", 20, 7), window("7d", 30, 8)], NOW);
 
         let sent = changes(&received);
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].claude.windows.len(), 2);
+        assert_eq!(sent[0].claude.windows[0].length_secs, Some(18_000));
+        assert_eq!(sent[0].claude.windows[1].length_secs, Some(604_800));
         assert_eq!(sent[0].claude.read_at, Some(NOW));
-        assert!(!service.status_line_is_stale(NOW + 1));
-    }
-
-    #[test]
-    fn a_status_line_clears_a_claude_problem() {
-        let (service, received, _folder) = service_with_client("clears");
-        service.claude_read(Err(UsageProblem::Unauthorized), NOW);
-        changes(&received);
-
-        service.record_status_line(vec![window("5h", 20, 7)], NOW + 5);
-
-        let sent = changes(&received);
-        assert_eq!(sent[0].claude.problem, None);
     }
 
     #[test]
@@ -613,26 +751,7 @@ mod tests {
         service.record_status_line(Vec::new(), NOW);
 
         assert!(changes(&received).is_empty());
-        assert!(service.status_line_is_stale(NOW));
-    }
-
-    #[test]
-    fn a_status_line_stays_fresh_for_ten_minutes_by_the_clock_on_the_wall() {
-        let (service, _received, _folder) = service_with_client("fresh");
-        service.record_status_line(vec![window("5h", 20, 7)], NOW);
-        let fresh_for = STATUS_LINE_FRESH.as_secs();
-
-        assert!(!service.status_line_is_stale(NOW));
-        assert!(!service.status_line_is_stale(NOW + fresh_for - 1));
-        assert!(service.status_line_is_stale(NOW + fresh_for));
-    }
-
-    #[test]
-    fn a_status_line_from_the_future_is_stale() {
-        let (service, _received, _folder) = service_with_client("future");
-        service.record_status_line(vec![window("5h", 20, 7)], NOW);
-
-        assert!(service.status_line_is_stale(NOW - 1));
+        assert_eq!(service.current(), Usage::default());
     }
 
     #[test]
@@ -644,6 +763,16 @@ mod tests {
         assert_eq!(cleaned.len(), MAX_WINDOWS);
         assert_eq!(cleaned[0].label.chars().count(), MAX_LABEL_CHARS);
         assert_eq!(cleaned[0].used_percent, 100);
+    }
+
+    #[test]
+    fn a_window_from_an_agent_keeps_its_length() {
+        let sent = UsageWindow {
+            length_secs: Some(18_000),
+            ..window("5h", 1, 1)
+        };
+
+        assert_eq!(clean(vec![sent.clone()]), [sent]);
     }
 
     #[test]
@@ -665,12 +794,12 @@ mod tests {
         assert_eq!((first, second), (1, 0));
     }
 
-    // The poller, with fake commands.
+    // The poller, with a fake `codex`.
 
     /// What the fake `codex` does: it answers a read of the rate limits.
     const CODEX_BODY: &str = "while IFS= read -r line; do case \"$line\" in *account/rateLimits/read*) cat \"$DIR/answer\";; esac; done";
 
-    /// Fake `security`, `curl`, `codex` and `claude` in a folder of their own.
+    /// A fake `codex` in a folder of its own.
     struct Fakes {
         dir: PathBuf,
         _folder: TempFolder,
@@ -684,25 +813,11 @@ mod tests {
                 _folder: folder,
             };
 
-            let far = (NOW + 86_400) * 1000;
-            fakes.write(
-                "credentials",
-                &format!(
-                    r#"{{"claudeAiOauth":{{"accessToken":"sk-fake","expiresAt":{far}.0,"subscriptionType":"max"}}}}"#
-                ),
-            );
-            fakes.write(
-                "response",
-                "HTTP/2 200 \r\n\r\n{\"five_hour\":{\"utilization\":42,\"resets_at\":\"2026-10-30T18:00:00Z\"}}",
-            );
             fakes.write(
                 "answer",
                 "{\"id\":2,\"result\":{\"rateLimits\":{\"planType\":\"plus\",\"primary\":{\"usedPercent\":12,\"windowDurationMins\":300,\"resetsAt\":99}}}}\n",
             );
-            fakes.script("security", "cat \"$DIR/credentials\"");
-            fakes.script("curl", "cat > /dev/null\ncat \"$DIR/response\"");
             fakes.script("codex", CODEX_BODY);
-            fakes.script("claude", "exit 0");
 
             fakes
         }
@@ -732,28 +847,17 @@ mod tests {
                 .map_or(0, |text| text.lines().count())
         }
 
-        fn overrides(&self) -> Overrides {
-            Overrides {
-                security: Some(self.dir.join("security")),
-                curl: Some(self.dir.join("curl")),
-                codex: Some(self.dir.join("codex")),
-                claude: Some(self.dir.join("claude")),
-                ..Overrides::default()
-            }
-        }
-
         fn poller(&self, service: &Arc<UsageService>, woken: flume::Receiver<()>) -> Poller {
-            Poller::new(
-                Arc::clone(service),
-                woken,
-                &self.dir,
-                None,
-                self.overrides(),
-            )
+            let overrides = Overrides {
+                codex: Some(self.dir.join("codex")),
+                ..Overrides::default()
+            };
+
+            Poller::new(Arc::clone(service), woken, None, overrides)
         }
 
-        /// A poller that finds `claude` and `codex` as production does, by the commands in
-        /// a settings file with this text. Only `security` and `curl` are fakes.
+        /// A poller that finds `codex` as production does, by the command in a settings
+        /// file with this text.
         fn poller_by_settings(
             &self,
             service: &Arc<UsageService>,
@@ -761,18 +865,12 @@ mod tests {
             settings: &str,
         ) -> Poller {
             self.write("settings.toml", settings);
-            let overrides = Overrides {
-                claude: None,
-                codex: None,
-                ..self.overrides()
-            };
 
             Poller::new(
                 Arc::clone(service),
                 woken,
-                &self.dir,
                 Some(self.dir.join("settings.toml")),
-                overrides,
+                Overrides::default(),
             )
         }
     }
@@ -786,56 +884,38 @@ mod tests {
         (fakes, service, poller)
     }
 
-    #[test]
-    fn without_a_status_line_the_endpoint_and_codex_fill_the_usage() {
-        let (fakes, service, mut poller) = poller_setup("both");
+    fn now() -> Duration {
+        Duration::from_secs(NOW)
+    }
 
-        poller.poll();
+    #[test]
+    fn a_poll_fills_the_codex_usage_with_the_length_of_its_windows() {
+        let (fakes, service, mut poller) = poller_setup("codex");
+
+        poller.poll(now());
 
         let usage = service.current();
-        assert_eq!(usage.claude.windows.len(), 1);
-        assert_eq!(usage.claude.windows[0].label, "5h");
-        assert_eq!(usage.claude.windows[0].used_percent, 42);
-        assert_eq!(usage.claude.plan.as_deref(), Some("max"));
         assert_eq!(usage.codex.windows, [window("5h", 12, 99)]);
+        assert_eq!(usage.codex.windows[0].length_secs, Some(18_000));
         assert_eq!(usage.codex.plan.as_deref(), Some("plus"));
-        assert_eq!(
-            (
-                fakes.calls("security"),
-                fakes.calls("curl"),
-                fakes.calls("codex")
-            ),
-            (1, 1, 1)
-        );
+        assert_eq!(fakes.calls("codex"), 1);
     }
 
     #[test]
-    fn a_recent_status_line_keeps_the_endpoint_quiet() {
-        let (fakes, service, mut poller) = poller_setup("quiet");
-        service.record_status_line(vec![window("5h", 7, 1), window("7d", 8, 2)], unix_now());
+    fn a_poll_leaves_the_claude_numbers_as_they_are() {
+        let (_fakes, service, mut poller) = poller_setup("claude-kept");
+        let long_ago = NOW - 86_400;
+        service.record_status_line(vec![window("5h", 7, 1), window("7d", 8, 2)], long_ago);
+        let before = service.current().claude;
 
-        poller.poll();
+        poller.poll(now());
+        poller.codex_due = None;
+        poller.poll(now() + Duration::from_secs(3600));
 
-        let usage = service.current();
-        assert_eq!(
-            usage.claude.windows[0].used_percent, 7,
-            "the status line stays"
-        );
-        assert_eq!(usage.claude.problem, None);
-        assert_eq!((fakes.calls("security"), fakes.calls("curl")), (0, 0));
-        assert_eq!(fakes.calls("codex"), 1, "Codex has no status line");
-    }
-
-    #[test]
-    fn an_old_status_line_lets_the_endpoint_run() {
-        let (fakes, service, mut poller) = poller_setup("old");
-        let long_ago = unix_now() - STATUS_LINE_FRESH.as_secs() - 1;
-        service.record_status_line(vec![window("5h", 7, 1)], long_ago);
-
-        poller.poll();
-
-        assert_eq!(fakes.calls("curl"), 1);
-        assert_eq!(service.current().claude.windows[0].used_percent, 42);
+        let claude = service.current().claude;
+        assert_eq!(claude, before);
+        assert_eq!(claude.read_at, Some(long_ago));
+        assert_eq!(claude.problem, None);
     }
 
     #[test]
@@ -843,12 +923,12 @@ mod tests {
         let (fakes, _service, mut poller) = poller_setup("interval");
         poller.codex_interval = Duration::from_secs(300);
 
-        poller.poll();
-        poller.poll();
+        poller.poll(now());
+        poller.poll(now());
         assert_eq!(fakes.calls("codex"), 1);
 
         poller.codex_due = None;
-        poller.poll();
+        poller.poll(now());
         assert_eq!(fakes.calls("codex"), 2);
     }
 
@@ -856,40 +936,34 @@ mod tests {
     fn codex_is_due_by_the_wall_clock_so_a_sleeping_mac_counts() {
         let (fakes, _service, mut poller) = poller_setup("wall-clock");
         poller.codex_interval = Duration::from_secs(300);
-        let start = Duration::from_secs(NOW);
 
-        poller.poll_codex(start);
-        poller.poll_codex(start + Duration::from_secs(299));
+        poller.poll(now());
+        poller.poll(now() + Duration::from_secs(299));
         assert_eq!(fakes.calls("codex"), 1);
 
-        poller.poll_codex(start + Duration::from_secs(300));
+        poller.poll(now() + Duration::from_secs(300));
         assert_eq!(fakes.calls("codex"), 2);
     }
 
     #[test]
-    fn the_cli_commands_come_from_the_settings() {
+    fn the_codex_command_comes_from_the_settings() {
         let fakes = Fakes::new("settings");
         let (service, woken) =
             UsageService::new(fakes.dir.join("usage.json"), Arc::new(Clients::default()));
-        fakes.script("my-claude", "exit 0");
         fakes.script("my-codex", CODEX_BODY);
         let dir = fakes.dir.display();
         let mut poller = fakes.poller_by_settings(
             &service,
             woken,
-            &format!(
-                "[agents.claude_code]\ncommand = \"{dir}/my-claude\"\n\n[agents.codex]\ncommand = \"{dir}/my-codex\"\n"
-            ),
+            &format!("[agents.codex]\ncommand = \"{dir}/my-codex\"\n"),
         );
 
-        poller.poll();
+        poller.poll(now());
 
         let usage = service.current();
         assert_eq!(usage.codex.windows, [window("5h", 12, 99)]);
         assert_eq!(fakes.calls("my-codex"), 1);
         assert_eq!(fakes.calls("codex"), 0);
-        assert_eq!(usage.claude.problem, None, "claude is installed");
-        assert_eq!(usage.claude.windows[0].used_percent, 42);
     }
 
     #[test]
@@ -900,15 +974,14 @@ mod tests {
         let mut poller = fakes.poller_by_settings(
             &service,
             woken,
-            "[agents.claude_code]\ncommand = \"/nonexistent/claude\"\n\n[agents.codex]\ncommand = \"/nonexistent/codex\"\n",
+            "[agents.codex]\ncommand = \"/nonexistent/codex\"\n",
         );
 
-        poller.poll();
+        poller.poll(now());
 
         let usage = service.current();
-        assert_eq!(usage.claude.problem, Some(UsageProblem::NotInstalled));
         assert_eq!(usage.codex.problem, Some(UsageProblem::NotInstalled));
-        assert_eq!(fakes.calls("security"), 0);
+        assert_eq!(usage.claude, SubscriptionUsage::default());
     }
 
     #[test]
@@ -928,29 +1001,16 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_claude_and_codex_are_not_installed() {
-        let (_fakes, service, mut poller) = poller_setup("missing");
-        poller.claude = Some("/nonexistent/claude".to_owned());
-        poller.codex = Some("/nonexistent/codex".to_owned());
-
-        poller.poll();
-
-        let usage = service.current();
-        assert_eq!(usage.claude.problem, Some(UsageProblem::NotInstalled));
-        assert_eq!(usage.codex.problem, Some(UsageProblem::NotInstalled));
-    }
-
-    #[test]
     fn a_failed_codex_read_keeps_the_last_windows() {
         let (fakes, service, mut poller) = poller_setup("keeps");
-        poller.poll();
+        poller.poll(now());
         fakes.write(
             "answer",
             "{\"id\":2,\"error\":{\"message\":\"codex account authentication required\"}}\n",
         );
         poller.codex_due = None;
 
-        poller.poll();
+        poller.poll(now());
 
         let codex = service.current().codex;
         assert_eq!(codex.windows, [window("5h", 12, 99)]);

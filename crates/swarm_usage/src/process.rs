@@ -43,7 +43,7 @@ pub struct Finished {
     pub stdout: Vec<u8>,
 }
 
-/// The output can hold a secret, like the Keychain item, so `Debug` shows its size only.
+/// The output can be private, like a status line, so `Debug` shows its size only.
 impl fmt::Debug for Finished {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter

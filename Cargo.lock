@@ -5384,9 +5384,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "log",
- "serde",
  "serde_json",
- "sha2",
  "swarm_protocol",
  "thiserror 2.0.21",
 ]

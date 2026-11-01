@@ -1,8 +1,8 @@
-//! Subscription usage for Swarm: Claude windows from the status line or the OAuth usage
-//! endpoint, and Codex windows from `codex app-server`.
+//! Subscription usage for Swarm: Claude windows from the status line of Swarm's own
+//! Claude agents, and Codex windows from `codex app-server`.
 //!
-//! The crate has no GPUI and no network of its own. Commands (`security`, `curl`,
-//! `codex`) are passed in as paths, so tests run fake scripts.
+//! The crate has no GPUI and no network of its own, and it never touches a sign-in
+//! token. `codex` is passed in as a path, so tests run a fake script.
 
 mod claude;
 mod codex;
@@ -13,7 +13,7 @@ use std::path::Path;
 
 use swarm_protocol::{UsageProblem, UsageWindow};
 
-pub use claude::{ClaudeEndpoint, Commands, status_line_windows};
+pub use claude::status_line_windows;
 pub use codex::{codex_usage, window_label};
 pub use process::{Finished, RunError, run};
 
@@ -27,6 +27,19 @@ pub struct Reading {
 }
 
 pub type Outcome = Result<Reading, UsageProblem>;
+
+pub(crate) const FIVE_HOURS: u64 = 5 * 60 * 60;
+pub(crate) const SEVEN_DAYS: u64 = 7 * 24 * 60 * 60;
+
+/// The length of a window by its label, for windows saved before lengths were kept. Only
+/// `5h` and `7d` are known.
+pub fn length_of_label(label: &str) -> Option<u64> {
+    match label {
+        "5h" => Some(FIVE_HOURS),
+        "7d" => Some(SEVEN_DAYS),
+        _ => None,
+    }
+}
 
 /// Writes the file whole or not at all, readable by the owner only.
 pub fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
@@ -89,6 +102,14 @@ mod tests {
             .mode();
         assert_eq!(mode & 0o777, 0o600);
         assert!(!scripts.dir().join("state.tmp").exists());
+    }
+
+    #[test]
+    fn only_the_five_hour_and_seven_day_labels_have_a_known_length() {
+        assert_eq!(length_of_label("5h"), Some(18_000));
+        assert_eq!(length_of_label("7d"), Some(604_800));
+        assert_eq!(length_of_label("30d"), None);
+        assert_eq!(length_of_label("limit"), None);
     }
 
     #[test]

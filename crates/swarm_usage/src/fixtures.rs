@@ -47,11 +47,6 @@ impl Scripts {
         std::fs::read_to_string(self.dir.join(name)).unwrap_or_default()
     }
 
-    /// How many lines the script appended to `name`.
-    pub(crate) fn lines(&self, name: &str) -> usize {
-        self.read(name).lines().count()
-    }
-
     /// Whether a process we started still exists (`kill -0` also finds zombies).
     pub(crate) fn process_exists(pid: &str) -> bool {
         crate::process::spawn(
