@@ -3,10 +3,14 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext};
-use swarm_protocol::{Client, Event, Request, SystemCheck as Report, ToolCheck, ToolState};
+use swarm_protocol::{
+    Client, Event, Request, SystemCheck as Report, TerminalId, TerminalInfo, ToolCheck, ToolState,
+};
+use swarm_term::TerminalInput;
 
 use super::{SystemCheckView, Tool};
 use crate::daemon::tests::{fake_daemon_replying, redraw, setup, use_projects, wait_until};
@@ -29,6 +33,23 @@ impl Seen {
             .iter()
             .filter(|request| matching(request))
             .count()
+    }
+
+    /// The terminals the app asked to kill, in order.
+    pub(crate) fn killed(&self) -> Vec<TerminalId> {
+        self.all.borrow_mut().extend(self.requests.try_iter());
+
+        self.all
+            .borrow()
+            .iter()
+            .filter_map(|request| match request {
+                Request::Input {
+                    id,
+                    input: TerminalInput::Kill,
+                } => Some(*id),
+                _ => None,
+            })
+            .collect()
     }
 
     pub(crate) fn checks(&self) -> usize {
@@ -57,18 +78,13 @@ pub(crate) struct Fixture<'a> {
     /// What the fake daemon answers to the next system check.
     pub report: Arc<Mutex<Report>>,
     pub recorder: Rc<Recorder>,
+    /// While set, the fake daemon answers the system check with an error.
+    pub fail_checks: Arc<AtomicBool>,
 }
 
 impl Fixture<'_> {
     pub(crate) fn check(&self) -> Entity<SystemCheckView> {
-        self.workspace
-            .read_with(self.cx, |workspace, cx| {
-                workspace
-                    .welcome
-                    .as_ref()
-                    .map(|welcome| welcome.read(cx).check().clone())
-            })
-            .expect("the welcome screen shows")
+        check_of(&self.workspace, self.cx)
     }
 
     /// Draws until the daemon and macOS have answered.
@@ -107,6 +123,21 @@ impl Fixture<'_> {
     }
 }
 
+/// The check on the welcome screen of `workspace`.
+pub(crate) fn check_of(
+    workspace: &Entity<Workspace>,
+    cx: &VisualTestContext,
+) -> Entity<SystemCheckView> {
+    workspace
+        .read_with(cx, |workspace, cx| {
+            workspace
+                .welcome
+                .as_ref()
+                .map(|welcome| welcome.read(cx).check().clone())
+        })
+        .expect("the welcome screen shows")
+}
+
 pub(crate) fn tool_check(state: ToolState, version: Option<&str>, fix: &[&str]) -> ToolCheck {
     ToolCheck {
         state,
@@ -133,15 +164,35 @@ pub(crate) fn welcome_fixture_at(
     permission: Permission,
     cx: &mut TestAppContext,
 ) -> Fixture<'_> {
+    welcome_fixture_listing(settings, &[], report, permission, cx)
+}
+
+/// Like [`welcome_fixture`], with the daemon listing `listed` when the app connects.
+pub(crate) fn welcome_fixture_listing<'a>(
+    settings: Option<std::path::PathBuf>,
+    listed: &[TerminalInfo],
+    report: Report,
+    permission: Permission,
+    cx: &'a mut TestAppContext,
+) -> Fixture<'a> {
     let report = Arc::new(Mutex::new(report));
+    let fail_checks = Arc::new(AtomicBool::new(false));
     let (sent, requests) = flume::unbounded();
     let socket = fake_daemon_replying({
         let report = Arc::clone(&report);
+        let fail_checks = Arc::clone(&fail_checks);
 
         move |request| {
             sent.send(request.clone()).ok();
 
             match request {
+                Request::SystemCheck { call } if fail_checks.load(Ordering::SeqCst) => {
+                    Some(Event::Error {
+                        call: Some(call),
+                        id: None,
+                        message: "the check broke".to_owned(),
+                    })
+                }
                 Request::SystemCheck { call } => Some(Event::SystemCheck {
                     call,
                     check: report.lock().expect("lock the report").clone(),
@@ -167,7 +218,7 @@ pub(crate) fn welcome_fixture_at(
     let client = Client::connect(&socket).expect("connect to the fake daemon");
     use_projects(&workspace, &[], cx);
     workspace.update_in(cx, |workspace, window, cx| {
-        workspace.use_daemon(client, &[], window, cx);
+        workspace.use_daemon(client, listed, window, cx);
     });
     redraw(cx);
 
@@ -180,6 +231,7 @@ pub(crate) fn welcome_fixture_at(
         },
         report,
         recorder,
+        fail_checks,
     };
     fixture.settle();
 

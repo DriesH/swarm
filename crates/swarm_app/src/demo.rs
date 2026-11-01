@@ -64,31 +64,39 @@ pub(crate) fn attach_task_terminals(
     }
 }
 
-/// The lines of a Homebrew install, for the terminal under a row of the system check, with
-/// the index of the color of each one.
+/// The output of a Homebrew install, for the terminal under a row of the system check, with
+/// the index of the color of each line. The fix terminal prints the command before it.
 #[cfg(feature = "snapshot")]
-const INSTALL_LINES: [(&str, Option<usize>); 4] = [
-    ("$ brew install gh", None),
+const INSTALL_OUTPUT: [(&str, Option<usize>); 3] = [
     ("==> Fetching gh", Some(8)),
     ("==> Pouring gh--bottle.tar.gz", Some(8)),
     ("==> Installing gh\u{2026}", Some(4)),
 ];
 
-/// A terminal that shows [`INSTALL_LINES`] and then waits.
+/// A terminal that shows the install command and [`INSTALL_OUTPUT`], and then waits.
 #[cfg(feature = "snapshot")]
 pub(crate) fn install_output(cx: &gpui::App) -> TerminalChannels {
     let (input, input_receiver) = flume::unbounded();
     let (output_sender, output) = flume::unbounded();
     let palette = palette_for(cx.theme());
 
-    let rows: Vec<Row> = INSTALL_LINES
-        .iter()
+    let command = format!(
+        "$ {}",
+        crate::system_check::command_text(&crate::system_check::SAMPLE_INSTALL.map(str::to_owned))
+    );
+    let lines = std::iter::once((command, None)).chain(
+        INSTALL_OUTPUT
+            .iter()
+            .map(|(text, color)| ((*text).to_owned(), *color)),
+    );
+
+    let rows: Vec<Row> = lines
         .map(|(text, color)| Row {
             bgs: Vec::new(),
             texts: vec![TextSpan {
                 col: 0,
                 cells: u16::try_from(text.chars().count()).unwrap_or(0),
-                text: (*text).to_owned(),
+                text,
                 fg: color.map_or(palette.fg, |index| palette.ansi[index]),
                 flags: TextFlags::default(),
             }],

@@ -41,7 +41,7 @@ Crate names use snake_case, like Zed. Key decisions live in [`docs/adr/`](adr/).
 
 ### Agent harness
 
-Every agent terminal gets `SWARM_SOCKET`, `SWARM_AGENT_ID`, `SWARM_TASK` and its own `SWARM_TOKEN`, and finds `swarm` on its `PATH`.
+Every agent terminal gets `SWARM_SOCKET`, `SWARM_AGENT_ID`, `SWARM_AGENT_NAME`, `SWARM_TASK` and its own `SWARM_TOKEN`, and finds `swarm` on its `PATH`.
 
 - Orchestrator: `swarm spawn` (the worker shares the task worktree; `--own-worktree "<reason>"` gives it its own worktree and branch), `swarm send`, `swarm agents`, `swarm merge` (only for a worker with its own worktree), `swarm commit`, `swarm notify` (asks the user for attention), `swarm confirm` (the brief is understood), `swarm pr draft` (phase 6, only after the user approved the review).
 - Workers: `swarm ask`, `swarm report`, `swarm commit -m <message> <path>...`. `commit` commits only the named files in the caller's worktree, with a lock per worktree, the agent as author (`<name> (Swarm)`) and a `Swarm-Agent` trailer, so Review groups changes by worker (ADR 0009). Absolute paths, `..`, `.git` and an empty path list are refused.
@@ -274,8 +274,8 @@ Swarm depends on tools it does not ship. It checks them on first launch (welcome
 
 - Never install silently: every fix is a button, and installs run in a visible user terminal (agents can't see it, ADR 0006).
 - The daemon runs the checks, so they see the tools the agents get. Git is checked with `xcode-select -p` first, because `/usr/bin/git` without the Command Line Tools opens Apple's install dialog; the fix is `xcode-select --install`.
-- Fixes, from the official docs: Claude Code installs with `curl -fsSL https://claude.ai/install.sh | bash`; Codex with `brew install --cask codex` when Homebrew exists, else `curl -fsSL https://chatgpt.com/codex/install.sh | sh`. Both sign in by running the CLI once (`claude`, `codex`). Signed in means the `Claude Code-credentials` Keychain item exists (checked without reading the secret), and `~/.codex/auth.json` exists.
-- The welcome screen shows once, on the first launch: the system check, **Skip for now** and **Open a project**. A fix runs in a terminal under its row, and the row checks again when that terminal ends. **Settings › General** shows the same check.
+- Fixes, from the official docs: Claude Code installs with `curl -fsSL https://claude.ai/install.sh | bash`; Codex with `brew install --cask codex` when Homebrew exists, else `curl -fsSL https://chatgpt.com/codex/install.sh | sh`. Both sign in by running the CLI once (`claude`, `codex`), by the full path the check found, because a fix terminal can have a smaller `PATH` than the check. Signed in means the `Claude Code-credentials` Keychain item exists (checked without reading the secret), and `~/.codex/auth.json` exists. `CODEX_HOME` does not count: agents never get it.
+- The welcome screen shows once, on the first launch: the system check, **Skip for now** and **Open a project**. A fix runs in a terminal under its row; its first line is the command. When it ends, the row checks again and shows the exit status, and the terminal stays until the row is ready. The check also runs again when the window becomes active, and **Check again** runs it by hand. **Settings › General** shows the same check.
 - The welcome screen shows while the daemon reports no project and `welcome_done` in `settings.toml` is unset. **Skip for now** and **Open a project** both set the flag. A fix that is still running when the screen closes is stopped, like a closed tile. The first action that is not ready takes the keyboard focus; a dimmed button (the GitHub account while the GitHub CLI is missing) does nothing.
 - Missing optional tools disable only their features: no `gh` means Review and Approve work, and **Create PR** becomes **Set up GitHub**.
 - PR features show only when `origin` is on GitHub. GitLab (`glab`) later.

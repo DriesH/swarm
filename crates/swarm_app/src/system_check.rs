@@ -5,22 +5,25 @@
 //! notification authorization itself. A fix runs in a user terminal under its row, and the
 //! row asks the check again when that terminal ends.
 
+use std::cell::Cell;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use gpui::{
     AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable as _, Role,
     SharedString, Size, Subscription, WeakEntity, Window, div, px,
 };
 use swarm_protocol::{
-    Client, ClientError, CreateTerminal, SystemCheck as Report, TerminalKind as DaemonKind,
-    ToolCheck, ToolState,
+    Client, ClientError, CreateTerminal, SystemCheck as Report, TerminalInfo,
+    TerminalKind as DaemonKind, ToolCheck, ToolState,
 };
 use swarm_term::{TerminalChannels, TerminalInput};
 use swarm_term_view::{TerminalEvent, TerminalView, palette_for};
 use swarm_ui::ActiveTheme as _;
 use swarm_ui::prelude::*;
 
+use crate::daemon::exit_text;
 use crate::notifications::{self, Permission};
 use crate::workspace::{DataSource, Workspace};
 
@@ -31,6 +34,12 @@ mod tests;
 
 const SEPARATOR: &str = " \u{b7} ";
 const NOT_CONNECTED: &str = "Not connected to the daemon";
+/// The `task` key of every fix terminal. The daemon keeps user terminals when the app goes
+/// away, and the next run finds the ones left over by this key.
+const FIX_TASK: &str = "system-check";
+/// Prints the command it is given as `$1`, then runs the rest. Nothing of the command is
+/// part of this script, so no argument can change what runs.
+const ANNOUNCE: &str = r#"printf '$ %s\n' "$1"; shift; exec "$@""#;
 /// The room a fix terminal gets under its row: the daemon starts it at this size, and the
 /// view fits itself to the row once it is drawn.
 const FIX_TERMINAL: Size<gpui::Pixels> = Size {
@@ -149,16 +158,70 @@ pub(crate) enum Busy {
 
 pub(crate) type Answer = Result<Report, SharedString>;
 
-/// "installing with Homebrew": what the row says while its fix runs.
+/// "installing with Homebrew": what the row says while its fix runs. The daemon names
+/// programs by their full path.
 pub(crate) fn running_detail(kind: ActionKind, fix: &[String]) -> String {
+    let brew = fix
+        .first()
+        .and_then(|program| Path::new(program).file_name())
+        .is_some_and(|name| name == "brew");
+
     match kind {
-        ActionKind::Install if fix.first().is_some_and(|program| program == "brew") => {
-            "installing with Homebrew".to_owned()
-        }
+        ActionKind::Install if brew => "installing with Homebrew".to_owned(),
         ActionKind::Install => "installing".to_owned(),
         ActionKind::SignIn => "signing in".to_owned(),
         _ => "working".to_owned(),
     }
+}
+
+/// What VoiceOver reads on a row's button: the visible label first, then the tool.
+pub(crate) fn action_label(tool: Tool, kind: ActionKind) -> String {
+    let name = tool.name();
+
+    match kind {
+        ActionKind::Install => format!("Install {name}"),
+        ActionKind::SignIn if tool == Tool::GithubAccount => "Sign in to GitHub".to_owned(),
+        ActionKind::SignIn => format!("Sign in to {name}"),
+        ActionKind::Allow => "Allow notifications".to_owned(),
+        ActionKind::OpenSystemSettings => "Open System Settings for notifications".to_owned(),
+        ActionKind::CheckAgain => format!("Check again for {name}"),
+    }
+}
+
+/// A word as a shell reads it: quoted when it has anything but plain characters.
+fn shell_word(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "_@%+=:,./-".contains(character));
+
+    if plain {
+        word.to_owned()
+    } else {
+        format!("'{}'", word.replace('\'', r"'\''"))
+    }
+}
+
+/// The command as the user reads it, for example `/bin/sh -c 'curl -fsSL … | bash'`.
+pub(crate) fn command_text(fix: &[String]) -> String {
+    fix.iter()
+        .map(|part| shell_word(part))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// What the fix terminal runs: a shell that prints the command first, then runs it. A quiet
+/// command such as `curl -s` would show nothing otherwise.
+pub(crate) fn terminal_command(fix: &[String]) -> Vec<String> {
+    let mut command: Vec<String> = ["/bin/sh", "-c", ANNOUNCE, "sh"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+
+    command.push(command_text(fix));
+    command.extend_from_slice(fix);
+
+    command
 }
 
 fn ready_detail(tool: Tool, check: &ToolCheck) -> String {
@@ -306,7 +369,14 @@ pub(crate) fn rows(
         Some(Err(message)) => Tool::ALL
             .into_iter()
             .filter(|tool| *tool != Tool::Notifications)
-            .map(|tool| busy_row(tool, SystemCheckState::NotSetUp, message))
+            .map(|tool| Row {
+                action: Some(Action {
+                    kind: ActionKind::CheckAgain,
+                    fix: Vec::new(),
+                    dimmed: false,
+                }),
+                ..busy_row(tool, SystemCheckState::NotSetUp, message)
+            })
             .collect(),
         Some(Ok(report)) => vec![
             tool_row(Tool::Git, &report.git, &report.gh),
@@ -359,18 +429,25 @@ fn check(state: ToolState, version: Option<&str>, fix: &[&str]) -> ToolCheck {
     }
 }
 
+/// The fix of the sample's GitHub CLI row.
+pub(crate) const SAMPLE_INSTALL: [&str; 3] = ["/opt/homebrew/bin/brew", "install", "gh"];
+
 /// What the rows show with no daemon behind them: the design's sample.
 fn sample_rows() -> Vec<Row> {
     let report = Report {
         git: check(ToolState::Ready, None, &[]),
         claude: check(ToolState::Ready, Some("2.1.314"), &[]),
         codex: check(ToolState::Ready, Some("0.154.0"), &[]),
-        gh: check(ToolState::Missing, None, &["brew", "install", "gh"]),
-        github_account: check(ToolState::Missing, None, &["gh", "auth", "login", "--web"]),
+        gh: check(ToolState::Missing, None, &SAMPLE_INSTALL),
+        github_account: check(
+            ToolState::Missing,
+            None,
+            &["/opt/homebrew/bin/gh", "auth", "login", "--web"],
+        ),
     };
     let installing = Busy::Fixing(
         ActionKind::Install,
-        vec!["brew".to_owned(), "install".to_owned(), "gh".to_owned()],
+        SAMPLE_INSTALL.map(str::to_owned).to_vec(),
     );
 
     rows(
@@ -380,28 +457,73 @@ fn sample_rows() -> Vec<Row> {
     )
 }
 
-/// A fix running in its terminal. Dropping it stops the program, as closing a tile would:
-/// nobody could see or stop it afterwards.
+/// A fix in its terminal. Dropping it stops the program, as closing a tile would: nobody
+/// could see or stop it afterwards.
 struct FixTerminal {
     view: Entity<TerminalView>,
     input: flume::Sender<TerminalInput>,
-    ended: bool,
+    /// What the row says once the program is over, for example "exit 1".
+    ended: Option<String>,
+    stopped: bool,
     _subscription: Subscription,
+}
+
+impl FixTerminal {
+    fn stop(&mut self) {
+        if self.ended.is_some() || self.stopped {
+            return;
+        }
+
+        self.stopped = true;
+        kill(&self.input);
+    }
 }
 
 impl Drop for FixTerminal {
     fn drop(&mut self) {
-        if !self.ended && self.input.send(TerminalInput::Kill).is_err() {
-            log::debug!("the fix terminal is gone already");
-        }
+        self.stop();
     }
 }
 
 struct Fix {
     kind: ActionKind,
+    /// The program and its arguments, as the daemon found them.
     command: Vec<String>,
     /// `None` while the daemon makes the terminal.
     terminal: Option<FixTerminal>,
+}
+
+impl Fix {
+    /// How the program ended, once it is over. The terminal stays under the row until a
+    /// check says the tool is ready.
+    fn ended(&self) -> Option<&str> {
+        self.terminal
+            .as_ref()
+            .and_then(|terminal| terminal.ended.as_deref())
+    }
+}
+
+fn kill(input: &flume::Sender<TerminalInput>) {
+    if input.send(TerminalInput::Kill).is_err() {
+        log::debug!("the fix terminal is gone already");
+    }
+}
+
+/// Stops the fix terminals that an earlier run of the app left in the daemon: nothing shows
+/// them, and the daemon keeps user terminals when the app goes away.
+pub(crate) fn stop_stale_fixes(client: &Client, terminals: &[TerminalInfo]) {
+    let stale = terminals.iter().filter(|info| {
+        info.kind == DaemonKind::User
+            && info.task.as_deref() == Some(FIX_TASK)
+            && info.exit.is_none()
+    });
+
+    for info in stale {
+        match client.attach(info.id, 0) {
+            Ok(channels) => kill(&channels.input),
+            Err(error) => log::warn!("cannot stop the fix terminal {}: {error}", info.id.0),
+        }
+    }
 }
 
 /// Where the rows come from.
@@ -460,6 +582,13 @@ impl SystemCheckView {
             .and_then(WeakEntity::upgrade)
             .map(|workspace| cx.observe(&workspace, |this, _, cx| this.daemon_may_be_back(cx)));
 
+        // Dropping a fix on quit does not run: the daemon would keep its program.
+        let quit = cx.on_app_quit(|this, _| {
+            this.stop_fixes();
+
+            std::future::ready(())
+        });
+
         Self {
             workspace,
             sample: false,
@@ -480,7 +609,7 @@ impl SystemCheckView {
             sample_output: None,
             check_task: None,
             permission_task: None,
-            _subscriptions: [Some(activation), connection]
+            _subscriptions: [Some(activation), connection, Some(quit)]
                 .into_iter()
                 .flatten()
                 .collect(),
@@ -495,6 +624,7 @@ impl SystemCheckView {
         let Some(workspace) = self.workspace.as_ref().and_then(WeakEntity::upgrade) else {
             return Backend::Sample;
         };
+
         let workspace = workspace.read(cx);
 
         if workspace.source == DataSource::Sample {
@@ -565,7 +695,28 @@ impl SystemCheckView {
         self.answer = Some(answer.map_err(|error| SharedString::from(error.to_string())));
         self.checking = false;
         self.rechecking.clear();
+        self.fold_ready_fixes();
         cx.notify();
+    }
+
+    /// A fix that is over folds away once a check says its tool is ready.
+    fn fold_ready_fixes(&mut self) {
+        let ready: Vec<Tool> = rows(self.answer.as_ref(), self.permission, &HashMap::new())
+            .into_iter()
+            .filter(|row| row.state == SystemCheckState::Ready)
+            .map(|row| row.tool)
+            .collect();
+
+        self.fixes
+            .retain(|tool, fix| fix.ended().is_none() || !ready.contains(tool));
+    }
+
+    fn stop_fixes(&mut self) {
+        for fix in self.fixes.values_mut() {
+            if let Some(terminal) = fix.terminal.as_mut() {
+                terminal.stop();
+            }
+        }
     }
 
     fn read_permission(&mut self, cx: &mut Context<Self>) {
@@ -614,6 +765,7 @@ impl SystemCheckView {
         busy.extend(
             self.fixes
                 .iter()
+                .filter(|(_, fix)| fix.ended().is_none())
                 .map(|(tool, fix)| (*tool, Busy::Fixing(fix.kind, fix.command.clone()))),
         );
 
@@ -625,11 +777,19 @@ impl SystemCheckView {
             return sample_rows();
         }
 
-        let mut rows = rows(self.answer.as_ref(), self.permission, &self.busy());
+        let busy = self.busy();
+        let mut rows = rows(self.answer.as_ref(), self.permission, &busy);
 
         for row in &mut rows {
             if let Some(error) = self.errors.get(&row.tool) {
                 row.detail = error.to_string();
+            }
+
+            let ended = self.fixes.get(&row.tool).and_then(Fix::ended);
+            if let Some(how) = ended
+                && !busy.contains_key(&row.tool)
+            {
+                row.detail = format!("{}{SEPARATOR}{how}", row.detail);
             }
         }
 
@@ -708,7 +868,12 @@ impl SystemCheckView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.fixes.contains_key(&tool) {
+        // A fix that is over stays under its row, and a new click replaces it.
+        if self
+            .fixes
+            .get(&tool)
+            .is_some_and(|fix| fix.ended().is_none())
+        {
             return;
         }
 
@@ -731,7 +896,7 @@ impl SystemCheckView {
 
         let request = CreateTerminal {
             kind: DaemonKind::User,
-            command: Some(action.fix),
+            command: Some(terminal_command(&action.fix)),
             cwd: std::env::var_os("HOME").map(PathBuf::from),
             size: TerminalView::size_for(
                 FIX_TERMINAL,
@@ -740,20 +905,30 @@ impl SystemCheckView {
                 cx,
             ),
             palette: palette_for(cx.theme()),
-            task: None,
+            task: Some(FIX_TASK.to_owned()),
         };
         let creating = cx.background_spawn(async move { client.create(request) });
 
         cx.spawn_in(window, async move |this, cx| {
-            let created = creating.await;
+            let created = Rc::new(Cell::new(Some(creating.await)));
 
-            let updated = this.update_in(cx, |this, window, cx| match created {
-                Ok((_, channels)) => this.fix_started(tool, channels, window, cx),
-                Err(error) => this.fix_failed(tool, &error, cx),
+            let updated = this.update_in(cx, {
+                let created = Rc::clone(&created);
+
+                move |this, window, cx| match created.take() {
+                    Some(Ok((_, channels))) => this.fix_started(tool, channels, window, cx),
+                    Some(Err(error)) => this.fix_failed(tool, &error, cx),
+                    None => {}
+                }
             });
 
             if let Err(error) = updated {
                 log::debug!("the system check closed before the fix started: {error}");
+
+                // The daemon made the terminal, and nothing will show it.
+                if let Some(Ok((_, channels))) = created.take() {
+                    kill(&channels.input);
+                }
             }
         })
         .detach();
@@ -777,14 +952,14 @@ impl SystemCheckView {
         cx: &mut Context<Self>,
     ) {
         let input = channels.input.clone();
+
         let Some(fix) = self.fixes.get(&tool) else {
             // The row stopped waiting for it.
-            if input.send(TerminalInput::Kill).is_err() {
-                log::debug!("the fix terminal is gone already");
-            }
+            kill(&input);
 
             return;
         };
+
         let name = format!("{} {} terminal", tool.name(), fix.kind.verb());
 
         let view = cx.new(|cx| TerminalView::new(channels, name.into(), window, cx));
@@ -802,7 +977,8 @@ impl SystemCheckView {
             fix.terminal = Some(FixTerminal {
                 view,
                 input,
-                ended: false,
+                ended: None,
+                stopped: false,
                 _subscription: subscription,
             });
         }
@@ -817,21 +993,30 @@ impl SystemCheckView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if matches!(
-            event,
-            TerminalEvent::Exited(_) | TerminalEvent::Disconnected
-        ) {
-            self.fix_ended(tool, cx);
+        match event {
+            TerminalEvent::Exited(status) => self.fix_ended(tool, exit_text(status), cx),
+            TerminalEvent::Disconnected => self.fix_ended(tool, "disconnected".to_owned(), cx),
+            _ => {}
         }
     }
 
-    /// The terminal folds away and the row asks the check again.
-    fn fix_ended(&mut self, tool: Tool, cx: &mut Context<Self>) {
-        if let Some(mut fix) = self.fixes.remove(&tool)
-            && let Some(terminal) = fix.terminal.as_mut()
-        {
-            terminal.ended = true;
+    /// The row asks the check again. The terminal stays under it, with how it ended, until a
+    /// check says the tool is ready.
+    fn fix_ended(&mut self, tool: Tool, how: String, cx: &mut Context<Self>) {
+        let terminal = self
+            .fixes
+            .get_mut(&tool)
+            .and_then(|fix| fix.terminal.as_mut());
+
+        let Some(terminal) = terminal else {
+            return;
+        };
+
+        if terminal.ended.is_some() {
+            return;
         }
+
+        terminal.ended = Some(how);
 
         self.rechecking.push(tool);
         self.pending_focus = true;
@@ -875,15 +1060,26 @@ impl SystemCheckView {
         cx: &mut Context<Self>,
     ) -> Button {
         let tool = row.tool;
-        let label = action.kind.label();
+        let spoken = action_label(tool, action.kind);
 
-        let button = Button::new(("system-check-action", index), label)
+        let spoken = if action.dimmed {
+            format!("{spoken}, {}", row.detail)
+        } else {
+            spoken
+        };
+
+        let button = Button::new(("system-check-action", index), action.kind.label())
+            .accessible_label(spoken)
             .debug_selector(move || format!("system-check-action-{}", tool.id()));
 
+        let button = if action.fix.is_empty() {
+            button
+        } else {
+            button.hint(command_text(&action.fix))
+        };
+
         if action.dimmed {
-            return button
-                .accessible_label(format!("{label}, {}", row.detail))
-                .disabled(true);
+            return button.disabled(true);
         }
 
         let button = match self.action_focus.get(&tool) {
@@ -915,6 +1111,13 @@ impl SystemCheckView {
     }
 }
 
+/// The card around the rows. Its rows are list items.
+fn card() -> Panel {
+    Panel::new()
+        .accessible("system-check-card", "System check")
+        .list()
+}
+
 impl Render for SystemCheckView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.apply_pending_focus(window, cx);
@@ -943,12 +1146,12 @@ impl Render for SystemCheckView {
                     .color(Color::Faint),
             );
 
-        let panel = rows.iter().enumerate().fold(
-            Panel::new()
-                .accessible("system-check-card", "System check")
-                .row(header),
-            |panel, (index, row)| panel.row(self.row_element(index, row, cx)),
-        );
+        let panel = rows
+            .iter()
+            .enumerate()
+            .fold(card().row(header), |panel, (index, row)| {
+                panel.row(self.row_element(index, row, cx))
+            });
 
         div()
             .id("system-check")

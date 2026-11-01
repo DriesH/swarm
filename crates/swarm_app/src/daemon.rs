@@ -313,6 +313,7 @@ impl Workspace {
         self.daemon = Some(client.clone());
         self.forget_comment_listing();
         Self::watch_events(&client, cx);
+        crate::system_check::stop_stale_fixes(&client, terminals);
 
         if let Some(window) = window {
             self.sync_terminals(&client, terminals, window, cx);
@@ -1906,7 +1907,7 @@ fn is_ended(lifecycle: AgentLifecycle) -> bool {
     )
 }
 
-fn exit_text(status: &ExitStatus) -> String {
+pub(crate) fn exit_text(status: &ExitStatus) -> String {
     match status {
         ExitStatus::Code(code) => format!("exit {code}"),
         ExitStatus::Signal(signal) => format!("signal {signal}"),

@@ -1,12 +1,19 @@
 //! The rows of the system check, and the check against a fake daemon.
 
-use gpui::TestAppContext;
-use swarm_protocol::{Request, ToolState};
-use swarm_term::{ExitStatus, TerminalInput};
+use std::sync::atomic::Ordering;
+
+use gpui::accesskit::Node;
+use gpui::{TestAppContext, VisualTestContext};
+use swarm_protocol::{TerminalId, TerminalInfo, ToolState};
+use swarm_term::ExitStatus;
 use swarm_term_view::TerminalEvent;
 
-use super::harness::{Seen, report_with, tool_check, welcome_fixture};
+use super::harness::{Fixture, report_with, tool_check, welcome_fixture, welcome_fixture_listing};
 use super::*;
+use crate::daemon::tests::wait_until;
+
+const BREW: &str = "/opt/homebrew/bin/brew";
+const GH: &str = "/opt/homebrew/bin/gh";
 
 fn row_of(shown: &[Row], tool: Tool) -> &Row {
     shown
@@ -38,7 +45,7 @@ fn every_tool_has_a_row_with_its_state_and_detail() {
             tool_check(
                 ToolState::Missing,
                 None,
-                &["brew", "install", "--cask", "codex"],
+                &[BREW, "install", "--cask", "codex"],
             ),
         ),
     ]);
@@ -165,7 +172,7 @@ fn the_button_kind_follows_the_state() {
 
 #[test]
 fn an_install_button_carries_the_fix_command() {
-    let fix = ["brew", "install", "gh"];
+    let fix = [BREW, "install", "gh"];
     let report = report_with(&[(Tool::GithubCli, tool_check(ToolState::Missing, None, &fix))]);
 
     let rows = shown(report, Permission::Allowed);
@@ -208,11 +215,11 @@ fn the_account_button_waits_while_the_cli_is_missing() {
         report_with(&[
             (
                 Tool::GithubCli,
-                tool_check(cli, None, &["brew", "install", "gh"]),
+                tool_check(cli, None, &[BREW, "install", "gh"]),
             ),
             (
                 Tool::GithubAccount,
-                tool_check(ToolState::Missing, None, &["gh", "auth", "login", "--web"]),
+                tool_check(ToolState::Missing, None, &[GH, "auth", "login", "--web"]),
             ),
         ])
     };
@@ -273,13 +280,13 @@ fn the_first_open_action_skips_ready_rows_and_dimmed_buttons() {
 fn a_running_fix_turns_its_row_into_progress_with_no_button() {
     let report = report_with(&[(
         Tool::GithubCli,
-        tool_check(ToolState::Missing, None, &["brew", "install", "gh"]),
+        tool_check(ToolState::Missing, None, &[BREW, "install", "gh"]),
     )]);
     let busy = HashMap::from([(
         Tool::GithubCli,
         Busy::Fixing(
             ActionKind::Install,
-            vec!["brew".to_owned(), "install".to_owned(), "gh".to_owned()],
+            vec![BREW.to_owned(), "install".to_owned(), "gh".to_owned()],
         ),
     )]);
 
@@ -293,15 +300,23 @@ fn a_running_fix_turns_its_row_into_progress_with_no_button() {
 
 #[test]
 fn the_running_line_names_the_fix() {
-    let brew = ["brew".to_owned(), "install".to_owned()];
-    let curl = ["sh".to_owned(), "-c".to_owned()];
+    let fix = |program: &str| [program.to_owned(), "install".to_owned()];
+    let curl = ["/bin/sh".to_owned(), "-c".to_owned()];
 
+    for brew in [BREW, "/usr/local/bin/brew", "brew"] {
+        assert_eq!(
+            running_detail(ActionKind::Install, &fix(brew)),
+            "installing with Homebrew",
+            "{brew}"
+        );
+    }
     assert_eq!(
-        running_detail(ActionKind::Install, &brew),
-        "installing with Homebrew"
+        running_detail(ActionKind::Install, &fix("/opt/homebrew/bin/brewery")),
+        "installing"
     );
     assert_eq!(running_detail(ActionKind::Install, &curl), "installing");
     assert_eq!(running_detail(ActionKind::SignIn, &curl), "signing in");
+    assert_eq!(running_detail(ActionKind::Install, &[]), "installing");
 }
 
 #[test]
@@ -366,11 +381,11 @@ fn installable_cli() -> Report {
     report_with(&[
         (
             Tool::GithubCli,
-            tool_check(ToolState::Missing, None, &["brew", "install", "gh"]),
+            tool_check(ToolState::Missing, None, &[BREW, "install", "gh"]),
         ),
         (
             Tool::GithubAccount,
-            tool_check(ToolState::Missing, None, &["gh", "auth", "login", "--web"]),
+            tool_check(ToolState::Missing, None, &[GH, "auth", "login", "--web"]),
         ),
     ])
 }
@@ -439,10 +454,14 @@ fn a_fix_runs_in_a_user_terminal_and_the_check_asks_again_when_it_ends(cx: &mut 
     assert_eq!(created.len(), 1);
     assert_eq!(created[0].kind, swarm_protocol::TerminalKind::User);
     assert_eq!(
-        created[0].command.as_deref(),
-        Some(["brew", "install", "gh"].map(str::to_owned).as_slice())
+        created[0].command,
+        Some(terminal_command(&[
+            BREW.to_owned(),
+            "install".to_owned(),
+            "gh".to_owned()
+        ]))
     );
-    assert_eq!(created[0].task, None);
+    assert_eq!(created[0].task.as_deref(), Some("system-check"));
     let during = row_of(&during, Tool::GithubCli);
     assert_eq!(during.state, SystemCheckState::InProgress);
     assert_eq!(during.detail, "installing with Homebrew");
@@ -497,7 +516,7 @@ fn the_github_account_button_is_dimmed_and_does_nothing_while_the_cli_is_missing
 fn the_account_button_works_once_the_cli_is_there(cx: &mut TestAppContext) {
     let report = report_with(&[(
         Tool::GithubAccount,
-        tool_check(ToolState::Missing, None, &["gh", "auth", "login", "--web"]),
+        tool_check(ToolState::Missing, None, &[GH, "auth", "login", "--web"]),
     )]);
     let mut fixture = welcome_fixture(report, Permission::Allowed, cx);
 
@@ -506,12 +525,13 @@ fn the_account_button_works_once_the_cli_is_there(cx: &mut TestAppContext) {
 
     assert!(asked, "the sign-in never ran");
     assert_eq!(
-        fixture.seen.created()[0].command.as_deref(),
-        Some(
-            ["gh", "auth", "login", "--web"]
-                .map(str::to_owned)
-                .as_slice()
-        )
+        fixture.seen.created()[0].command,
+        Some(terminal_command(&[
+            GH.to_owned(),
+            "auth".to_owned(),
+            "login".to_owned(),
+            "--web".to_owned()
+        ]))
     );
 }
 
@@ -569,26 +589,15 @@ fn coming_back_from_system_settings_reads_the_permission_again(cx: &mut TestAppC
 fn leaving_while_a_fix_runs_stops_its_program(cx: &mut TestAppContext) {
     let mut fixture = welcome_fixture(installable_cli(), Permission::Allowed, cx);
     let check = fixture.check();
-    let kills = |seen: &Seen| {
-        seen.count(|request| {
-            matches!(
-                request,
-                Request::Input {
-                    input: TerminalInput::Kill,
-                    ..
-                }
-            )
-        })
-    };
 
     fixture.click("system-check-action-github-cli");
     fixture
         .wait(|_, cx| check.read_with(cx, |check, _| check.output_of(Tool::GithubCli).is_some()));
-    let before = kills(&fixture.seen);
+    let before = fixture.seen.killed().len();
     drop(check);
     let workspace = fixture.workspace.clone();
     workspace.update(fixture.cx, Workspace::finish_welcome);
-    let stopped = fixture.wait(|seen, _| kills(seen) == 1);
+    let stopped = fixture.wait(|seen, _| seen.killed().len() == 1);
 
     assert_eq!(before, 0);
     assert!(stopped, "the program kept running");
@@ -608,18 +617,436 @@ fn a_fix_that_ended_is_not_stopped_again(cx: &mut TestAppContext) {
     view.update(fixture.cx, |_, cx| {
         cx.emit(TerminalEvent::Exited(ExitStatus::Code(1)));
     });
-    fixture
-        .wait(|_, cx| check.read_with(cx, |check, _| check.output_of(Tool::GithubCli).is_none()));
+    fixture.wait(|seen, _| seen.checks() == 2);
+    drop((check, view));
+    let workspace = fixture.workspace.clone();
+    workspace.update(fixture.cx, Workspace::finish_welcome);
     fixture.wait(|_, _| false);
 
-    let kills = fixture.seen.count(|request| {
-        matches!(
-            request,
-            Request::Input {
-                input: TerminalInput::Kill,
-                ..
+    assert_eq!(fixture.seen.killed(), []);
+}
+
+fn spoken(check: &Entity<SystemCheckView>, tool: Tool, cx: &mut VisualTestContext) -> ButtonA11y {
+    cx.update(|window, cx| {
+        check.update(cx, |check, cx| {
+            let rows = check.rows();
+            let row = row_of(&rows, tool);
+            let action = row.action.as_ref().expect("the row has a button");
+
+            let element = check
+                .action_button(0, row, action, cx)
+                .render(window, cx)
+                .into_element();
+            let role = element.a11y_role();
+            let mut node = Node::new(role.unwrap_or(Role::Unknown));
+            element.write_a11y_info(&mut node);
+
+            ButtonA11y {
+                role,
+                label: node.label().map(str::to_owned),
+                description: node.description().map(str::to_owned),
             }
-        )
+        })
+    })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ButtonA11y {
+    role: Option<Role>,
+    label: Option<String>,
+    description: Option<String>,
+}
+
+fn button(label: &str, description: Option<&str>) -> ButtonA11y {
+    ButtonA11y {
+        role: Some(Role::Button),
+        label: Some(label.to_owned()),
+        description: description.map(str::to_owned),
+    }
+}
+
+#[gpui::test]
+fn each_row_button_names_its_tool_and_hints_at_the_command(cx: &mut TestAppContext) {
+    let curl = "curl -fsSL https://chatgpt.com/codex/install.sh | sh";
+    let report = report_with(&[
+        (
+            Tool::ClaudeCode,
+            tool_check(
+                ToolState::SignedOut,
+                Some("2.1.314"),
+                &["/Users/jonas/.local/bin/claude"],
+            ),
+        ),
+        (
+            Tool::Codex,
+            tool_check(ToolState::Missing, None, &["/bin/sh", "-c", curl]),
+        ),
+        (
+            Tool::GithubCli,
+            tool_check(ToolState::Missing, None, &[BREW, "install", "gh"]),
+        ),
+        (
+            Tool::GithubAccount,
+            tool_check(ToolState::Missing, None, &[GH, "auth", "login", "--web"]),
+        ),
+        (Tool::Git, tool_check(ToolState::Failed, None, &[])),
+    ]);
+    let fixture = welcome_fixture(report, Permission::NotAsked, cx);
+    let check = fixture.check();
+    let cx = fixture.cx;
+
+    let buttons: Vec<ButtonA11y> = Tool::ALL
+        .map(|tool| spoken(&check, tool, cx))
+        .into_iter()
+        .collect();
+
+    assert_eq!(
+        buttons,
+        [
+            button("Check again for Git", None),
+            button(
+                "Sign in to Claude Code",
+                Some("/Users/jonas/.local/bin/claude")
+            ),
+            button("Install Codex", Some(&format!("/bin/sh -c '{curl}'"))),
+            button(
+                "Install GitHub CLI",
+                Some("/opt/homebrew/bin/brew install gh")
+            ),
+            button(
+                "Sign in to GitHub, needs GitHub CLI",
+                Some("/opt/homebrew/bin/gh auth login --web")
+            ),
+            button("Allow notifications", None),
+        ]
+    );
+}
+
+#[test]
+fn every_button_label_starts_with_what_the_button_shows() {
+    for tool in Tool::ALL {
+        for kind in [
+            ActionKind::Install,
+            ActionKind::SignIn,
+            ActionKind::Allow,
+            ActionKind::OpenSystemSettings,
+            ActionKind::CheckAgain,
+        ] {
+            let label = action_label(tool, kind);
+
+            assert!(
+                label.starts_with(kind.label().split(' ').next().unwrap_or_default()),
+                "{label}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_card_around_the_rows_is_a_list() {
+    assert_eq!(card().role(), Role::List);
+}
+
+#[test]
+fn a_failed_check_gives_every_row_a_check_again_button() {
+    let rows = rows(
+        Some(&Err("the daemon did not answer in time".into())),
+        Some(Permission::Allowed),
+        &HashMap::new(),
+    );
+
+    let tools: Vec<Tool> = rows
+        .iter()
+        .filter(|row| kind_of(&rows, row.tool) == Some(ActionKind::CheckAgain))
+        .map(|row| row.tool)
+        .collect();
+    assert_eq!(
+        tools,
+        [
+            Tool::Git,
+            Tool::ClaudeCode,
+            Tool::Codex,
+            Tool::GithubCli,
+            Tool::GithubAccount
+        ]
+    );
+    assert!(
+        rows.iter()
+            .filter_map(|row| row.action.as_ref())
+            .all(|action| !action.dimmed)
+    );
+    assert_eq!(first_open_action(&rows), Some(Tool::Git));
+}
+
+#[gpui::test]
+fn check_again_on_a_failed_check_asks_the_daemon_again(cx: &mut TestAppContext) {
+    let mut fixture = welcome_fixture(report_with(&[]), Permission::Allowed, cx);
+    let check = fixture.check();
+    let before = fixture.seen.checks();
+
+    fixture.fail_checks.store(true, Ordering::SeqCst);
+    check.update(fixture.cx, SystemCheckView::refresh);
+    fixture.settle();
+    let failed = check.read_with(fixture.cx, |check, _| check.rows());
+    let drawn = fixture.cx.debug_bounds("system-check-action-git").is_some();
+
+    fixture.fail_checks.store(false, Ordering::SeqCst);
+    fixture.click("system-check-action-git");
+    let asked = fixture.wait(|seen, _| seen.checks() == before + 2);
+    let answered = fixture.wait(|_, cx| check.read_with(cx, |check, _| check.count() == (6, 6)));
+
+    assert_eq!(
+        row_of(&failed, Tool::Git).detail,
+        "the daemon refused the request: the check broke"
+    );
+    assert_eq!(kind_of(&failed, Tool::Codex), Some(ActionKind::CheckAgain));
+    assert!(drawn, "the button is not on screen");
+    assert!(asked, "Check again did not ask the daemon");
+    assert!(answered, "the new answer did not reach the rows");
+}
+
+fn run(fix: &[&str]) -> (String, Option<i32>) {
+    let fix: Vec<String> = fix.iter().map(|part| (*part).to_owned()).collect();
+    let command = terminal_command(&fix);
+
+    let output = std::process::Command::new(&command[0])
+        .args(&command[1..])
+        .output()
+        .expect("run the shell");
+
+    (
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        output.status.code(),
+    )
+}
+
+#[test]
+fn the_terminal_runs_the_fix_behind_a_wrapper_that_passes_it_as_arguments() {
+    let fix = [BREW.to_owned(), "install".to_owned(), "gh".to_owned()];
+
+    let command = terminal_command(&fix);
+
+    assert_eq!(
+        command,
+        [
+            "/bin/sh",
+            "-c",
+            ANNOUNCE,
+            "sh",
+            "/opt/homebrew/bin/brew install gh",
+            BREW,
+            "install",
+            "gh",
+        ]
+    );
+    assert!(
+        !ANNOUNCE.contains("brew"),
+        "the script holds no part of the fix"
+    );
+}
+
+#[test]
+fn the_wrapper_prints_the_command_first_and_keeps_its_exit_status() {
+    let (loud, loud_code) = run(&["/bin/echo", "two words", "$(exit 7)", "it's"]);
+    let (quiet, quiet_code) = run(&["/usr/bin/true"]);
+    let (_, failed_code) = run(&["/usr/bin/false"]);
+
+    assert_eq!(
+        loud,
+        "$ /bin/echo 'two words' '$(exit 7)' 'it'\\''s'\ntwo words $(exit 7) it's\n"
+    );
+    assert_eq!(loud_code, Some(0));
+    assert_eq!(quiet, "$ /usr/bin/true\n");
+    assert_eq!(quiet_code, Some(0));
+    assert_eq!(failed_code, Some(1));
+}
+
+#[test]
+fn an_argument_with_spaces_prints_in_quotes() {
+    let fix = [
+        "/bin/sh".to_owned(),
+        "-c".to_owned(),
+        "curl -fsSL https://claude.ai/install.sh | bash".to_owned(),
+        String::new(),
+    ];
+
+    assert_eq!(
+        command_text(&fix),
+        "/bin/sh -c 'curl -fsSL https://claude.ai/install.sh | bash' ''"
+    );
+}
+
+fn output_shown(check: &Entity<SystemCheckView>, tool: Tool, cx: &VisualTestContext) -> bool {
+    check.read_with(cx, |check, _| check.output_of(tool).is_some())
+}
+
+fn end_fix(
+    check: &Entity<SystemCheckView>,
+    tool: Tool,
+    status: ExitStatus,
+    fixture: &mut Fixture<'_>,
+) {
+    let view = check
+        .read_with(fixture.cx, |check, _| check.output_of(tool))
+        .expect("the terminal shows under the row");
+
+    view.update(fixture.cx, |_, cx| cx.emit(TerminalEvent::Exited(status)));
+}
+
+#[gpui::test]
+fn a_fix_that_ended_stays_under_its_row_with_its_exit_status(cx: &mut TestAppContext) {
+    let mut fixture = welcome_fixture(installable_cli(), Permission::Allowed, cx);
+    let check = fixture.check();
+    let before = fixture.seen.checks();
+
+    fixture.click("system-check-action-github-cli");
+    fixture.wait(|_, cx| output_shown(&check, Tool::GithubCli, cx));
+    let first = check
+        .read_with(fixture.cx, |check, _| check.output_of(Tool::GithubCli))
+        .expect("the terminal shows under the row");
+    end_fix(&check, Tool::GithubCli, ExitStatus::Code(1), &mut fixture);
+    let asked = fixture.wait(|seen, _| seen.checks() == before + 1);
+    let settled = fixture.wait(|_, cx| check.read_with(cx, |check, _| check.is_settled()));
+    let rows = check.read_with(fixture.cx, |check, _| check.rows());
+    let kept = output_shown(&check, Tool::GithubCli, fixture.cx);
+    let retry = fixture
+        .cx
+        .debug_bounds("system-check-action-github-cli")
+        .is_some();
+
+    fixture.click("system-check-action-github-cli");
+    let again = fixture.wait(|seen, _| seen.created().len() == 2);
+    fixture.wait(|_, cx| output_shown(&check, Tool::GithubCli, cx));
+    let second = check
+        .read_with(fixture.cx, |check, _| check.output_of(Tool::GithubCli))
+        .expect("the new terminal shows under the row");
+
+    assert!(asked, "the check was not asked again");
+    assert!(settled, "the check never answered");
+    assert!(kept, "the output folded away");
+    let row = row_of(&rows, Tool::GithubCli);
+    assert_eq!(row.state, SystemCheckState::NotSetUp);
+    assert_eq!(row.detail, "not installed \u{b7} exit 1");
+    assert_eq!(
+        row.action.as_ref().map(|action| action.kind),
+        Some(ActionKind::Install)
+    );
+    assert!(retry, "the row has no button to try again");
+    assert!(again, "Install did not start a new terminal");
+    assert_ne!(first.entity_id(), second.entity_id());
+    assert_eq!(fixture.seen.killed(), [], "the old terminal was stopped");
+}
+
+#[gpui::test]
+fn a_fix_that_ended_folds_away_when_the_window_comes_back_and_the_tool_is_ready(
+    cx: &mut TestAppContext,
+) {
+    let git = report_with(&[(
+        Tool::Git,
+        tool_check(
+            ToolState::Missing,
+            None,
+            &["/usr/bin/xcode-select", "--install"],
+        ),
+    )]);
+    let mut fixture = welcome_fixture(git, Permission::Allowed, cx);
+    let check = fixture.check();
+    let before = fixture.seen.checks();
+
+    fixture.click("system-check-action-git");
+    fixture.wait(|_, cx| output_shown(&check, Tool::Git, cx));
+    end_fix(&check, Tool::Git, ExitStatus::Code(0), &mut fixture);
+    fixture.wait(|seen, _| seen.checks() == before + 1);
+    fixture.wait(|_, cx| check.read_with(cx, |check, _| check.is_settled()));
+    let detail = check.read_with(fixture.cx, |check, _| {
+        row_of(&check.rows(), Tool::Git).detail.clone()
     });
-    assert_eq!(kills, 0);
+    let waiting = output_shown(&check, Tool::Git, fixture.cx);
+
+    // Apple's installer finishes while the user is in another window.
+    *fixture.report.lock().expect("lock the report") = report_with(&[]);
+    fixture.cx.deactivate_window();
+    fixture.cx.update(|window, _| window.activate_window());
+    let folded = fixture.wait(|_, cx| !output_shown(&check, Tool::Git, cx));
+    let ready = fixture.wait(|_, cx| check.read_with(cx, |check, _| check.count() == (6, 6)));
+
+    assert_eq!(detail, "not installed \u{b7} exit 0");
+    assert!(waiting, "the output folded before the tool was ready");
+    assert!(folded, "the output did not fold away");
+    assert!(ready);
+}
+
+#[gpui::test]
+fn quitting_stops_a_running_fix(cx: &mut TestAppContext) {
+    let mut fixture = welcome_fixture(installable_cli(), Permission::Allowed, cx);
+    let check = fixture.check();
+
+    fixture.click("system-check-action-github-cli");
+    fixture.wait(|_, cx| output_shown(&check, Tool::GithubCli, cx));
+    let before = fixture.seen.killed();
+
+    fixture.cx.cx.update(App::shutdown);
+    let seen = &fixture.seen;
+    let stopped = wait_until(fixture.cx, |_| seen.killed().len() == 1);
+
+    assert_eq!(before, []);
+    assert!(stopped, "the program kept running after the quit");
+}
+
+#[gpui::test]
+fn closing_the_screen_while_the_terminal_is_made_stops_it(cx: &mut TestAppContext) {
+    let mut fixture = welcome_fixture(installable_cli(), Permission::Allowed, cx);
+    let check = fixture.check();
+    let screen = check.downgrade();
+    let workspace = fixture.workspace.clone();
+    let rows = check.read_with(fixture.cx, |check, _| check.rows());
+    let action = row_of(&rows, Tool::GithubCli).action.clone();
+
+    // Nothing runs the executor in between: the daemon has not made the terminal yet.
+    fixture.cx.update(|window, cx| {
+        check.update(cx, |check, cx| {
+            let action = action.expect("the row has a button");
+
+            check.start_fix(Tool::GithubCli, action, window, cx);
+        });
+    });
+    drop(check);
+    workspace.update(fixture.cx, Workspace::finish_welcome);
+    fixture.cx.update(|window, cx| window.draw(cx).clear(cx));
+    let gone = screen.upgrade().is_none();
+    let stopped = fixture.wait(|seen, _| seen.killed().len() == 1);
+
+    assert!(gone, "the screen was still there when the terminal came");
+    assert!(stopped, "the terminal kept running with nothing to show it");
+}
+
+fn left_over(id: u64, task: Option<&str>, exit: Option<ExitStatus>) -> TerminalInfo {
+    TerminalInfo {
+        id: TerminalId(id),
+        kind: swarm_protocol::TerminalKind::User,
+        task: task.map(str::to_owned),
+        owner: None,
+        name: None,
+        fixed_size: None,
+        title: None,
+        cwd: None,
+        exit,
+    }
+}
+
+#[gpui::test]
+fn fix_terminals_left_by_an_earlier_run_are_stopped_when_the_app_connects(cx: &mut TestAppContext) {
+    let listed = [
+        left_over(7, Some("system-check"), None),
+        left_over(8, Some("system-check"), Some(ExitStatus::Code(0))),
+        left_over(9, Some("task:1"), None),
+        left_over(10, None, None),
+    ];
+    let mut fixture =
+        welcome_fixture_listing(None, &listed, report_with(&[]), Permission::Allowed, cx);
+
+    fixture.wait(|seen, _| !seen.killed().is_empty());
+    fixture.wait(|_, _| false);
+
+    assert_eq!(fixture.seen.killed(), [TerminalId(7)]);
 }

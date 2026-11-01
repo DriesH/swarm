@@ -278,9 +278,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let minimized = &self.minimized;
+
         let Some(worker) = self.data.worker_with_daemon_id_mut(agent) else {
             return;
         };
+
         if minimized.contains(&worker.terminal) || worker.tile_large == large {
             return;
         }

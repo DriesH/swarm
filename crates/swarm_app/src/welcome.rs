@@ -1,8 +1,8 @@
 //! The welcome screen: shown on the first launch, until the user skips it or opens a project.
 
 use gpui::{
-    AnyElement, AppContext as _, Context, Entity, FocusHandle, FontWeight, Role, WeakEntity,
-    Window, div, px,
+    AnyElement, AppContext as _, Context, Entity, FocusHandle, FontWeight, Role, Subscription,
+    WeakEntity, Window, div, px,
 };
 use swarm_ui::prelude::*;
 
@@ -21,7 +21,9 @@ pub(crate) struct Welcome {
     check: Entity<SystemCheckView>,
     honeycomb: Entity<Honeycomb>,
     skip_focus: FocusHandle,
+    check_again_focus: FocusHandle,
     open_focus: FocusHandle,
+    _activation: Subscription,
 }
 
 impl Welcome {
@@ -33,10 +35,12 @@ impl Welcome {
     ) -> Self {
         let open_focus = cx.focus_handle().tab_stop(true);
         let skip_focus = cx.focus_handle().tab_stop(true);
+        let check_again_focus = cx.focus_handle().tab_stop(true);
 
         let check = cx.new({
             let workspace = workspace.clone();
             let fallback = open_focus.clone();
+            let window = &mut *window;
 
             move |cx| {
                 let mut check = SystemCheckView::new(Some(workspace), true, window, cx);
@@ -51,13 +55,27 @@ impl Welcome {
             move |cx| check.update(cx, SystemCheckView::refresh)
         });
 
+        // The user may come back after an install the terminal could not wait for, such as
+        // Apple's installer.
+        let activation = cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() {
+                this.check_again(cx);
+            }
+        });
+
         Self {
             workspace,
             check,
             honeycomb: cx.new(|_| Honeycomb::new()),
             skip_focus,
+            check_again_focus,
             open_focus,
+            _activation: activation,
         }
+    }
+
+    fn check_again(&self, cx: &mut Context<Self>) {
+        self.check.update(cx, SystemCheckView::refresh);
     }
 
     #[cfg(any(test, feature = "snapshot"))]
@@ -128,6 +146,14 @@ impl Render for Welcome {
                     .track_focus(&self.skip_focus)
                     .debug_selector(|| "welcome-skip".to_owned())
                     .on_click(cx.listener(|this, _, window, cx| this.finish(false, window, cx))),
+            )
+            .child(
+                Button::new("welcome-check-again", "Check again")
+                    .variant(ButtonVariant::Ghost)
+                    .size(ButtonSize::Medium)
+                    .track_focus(&self.check_again_focus)
+                    .debug_selector(|| "welcome-check-again".to_owned())
+                    .on_click(cx.listener(|this, _, _, cx| this.check_again(cx))),
             )
             .child(div().flex_1())
             .child(
@@ -467,17 +493,22 @@ mod tests {
     }
 
     #[gpui::test]
-    fn tab_moves_through_the_row_buttons_and_then_the_two_buttons(cx: &mut TestAppContext) {
+    fn tab_moves_through_the_row_buttons_and_then_the_three_buttons(cx: &mut TestAppContext) {
         let mut fixture = welcome_fixture(broken_agents(), Permission::NotAsked, cx);
         let welcome = welcome_of(&fixture);
-        let (skip, open) = welcome.read_with(fixture.cx, |welcome, _| {
-            (welcome.skip_focus.clone(), welcome.open_focus.clone())
+        let (skip, check_again, open) = welcome.read_with(fixture.cx, |welcome, _| {
+            (
+                welcome.skip_focus.clone(),
+                welcome.check_again_focus.clone(),
+                welcome.open_focus.clone(),
+            )
         });
         let order = [
             action_focus(&fixture, Tool::ClaudeCode),
             action_focus(&fixture, Tool::Codex),
             action_focus(&fixture, Tool::Notifications),
             skip,
+            check_again,
             open,
         ];
 
@@ -492,7 +523,37 @@ mod tests {
             redraw(fixture.cx);
         }
 
-        assert_eq!(focused, [Some(0), Some(1), Some(2), Some(3), Some(4)]);
+        assert_eq!(
+            focused,
+            [Some(0), Some(1), Some(2), Some(3), Some(4), Some(5)]
+        );
+    }
+
+    #[gpui::test]
+    fn check_again_asks_the_daemon_again(cx: &mut TestAppContext) {
+        let mut fixture = welcome_fixture(broken_agents(), Permission::Allowed, cx);
+        let check = fixture.check();
+        let before = fixture.seen.checks();
+
+        *fixture.report.lock().expect("lock the report") = report_with(&[]);
+        fixture.click("welcome-check-again");
+        let asked = fixture.wait(|seen, _| seen.checks() == before + 1);
+        let ready = fixture.wait(|_, cx| check.read_with(cx, |check, _| check.count() == (6, 6)));
+
+        assert!(asked, "Check again did not ask the daemon");
+        assert!(ready, "the new answer did not reach the rows");
+    }
+
+    #[gpui::test]
+    fn coming_back_to_the_window_checks_again(cx: &mut TestAppContext) {
+        let mut fixture = welcome_fixture(broken_agents(), Permission::Allowed, cx);
+        let before = fixture.seen.checks();
+
+        fixture.cx.deactivate_window();
+        fixture.cx.update(|window, _| window.activate_window());
+        let asked = fixture.wait(|seen, _| seen.checks() == before + 1);
+
+        assert!(asked, "the check was not asked again");
     }
 
     #[gpui::test]
