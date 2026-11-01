@@ -1,24 +1,35 @@
 //! The settings window: a nav of sections and projects, and one page at a time.
 
+mod keyboard_page;
 mod pages;
+mod project;
+mod prompts_page;
+mod terminals_page;
+mod usage_page;
 
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    App, Bounds, Context, Entity, FocusHandle, Global, KeyBinding, Pixels, Role, SharedString,
-    Size, Subscription, TitlebarOptions, Window, WindowBounds, WindowHandle, WindowOptions,
-    actions, div, px, size,
+    App, Bounds, Context, Entity, FocusHandle, Global, KeyBinding, Pixels, Role, ScrollHandle,
+    SharedString, Size, Subscription, TitlebarOptions, WeakEntity, Window, WindowBounds,
+    WindowHandle, WindowOptions, actions, div, point, px, size,
 };
 use swarm_settings::{CliSettings, NotificationSettings, ProjectMode, Settings};
 use swarm_ui::fonts::UI_FONT;
 use swarm_ui::prelude::*;
+use swarm_ui::styles::focus_ring;
 use swarm_ui::theme;
-use swarm_ui::{ROOT_CONTEXT, SelectNext, SelectPrevious, TextFieldSize};
+use swarm_ui::{ROOT_CONTEXT, SelectNext, SelectPrevious, TextFieldSize, scroll_for_key};
 
+use self::prompts_page::PromptsPage;
+use self::usage_page::UsagePage;
 use crate::model::{FakeData, Project};
 use crate::notifications::{self, Permission};
 use crate::window_drag::drag_region;
+use crate::workspace::Workspace;
+use project::{ProjectInputs, ProjectSave, ProjectSettings};
 
 actions!(swarm_app, [CloseSettings]);
 
@@ -27,6 +38,11 @@ const NAV_CONTEXT: &str = "SettingsNav";
 
 /// Edits are saved once typing pauses this long.
 const SAVE_DELAY: Duration = Duration::from_millis(300);
+
+const NOT_CONNECTED: &str = "Not connected to the daemon";
+
+/// How far an arrow key scrolls a page without controls.
+const PAGE_LINE: Pixels = px(40.);
 
 const WINDOW_SIZE: Size<Pixels> = size(px(1280.), px(900.));
 const MIN_WINDOW_SIZE: Size<Pixels> = size(px(900.), px(600.));
@@ -113,48 +129,6 @@ fn delivery_mut(notifications: &mut NotificationSettings, index: usize) -> &mut 
     }
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct ProjectSettings {
-    pub project: Project,
-    pub base_branches: Vec<String>,
-    pub base_branch: usize,
-    pub worktree_folder: String,
-    pub port_range: String,
-    pub ports_per_worktree: String,
-    pub setup_script: String,
-    pub copy_files: Vec<String>,
-    pub checks: Vec<String>,
-    pub checks_required: bool,
-}
-
-impl ProjectSettings {
-    /// The project with sample values for the settings that are not real yet.
-    fn placeholder(project: Project) -> Self {
-        let mut base_branches = vec![project.base_branch.to_string()];
-        if project.base_branch != "main" {
-            base_branches.push("main".to_owned());
-        }
-
-        Self {
-            project,
-            base_branches,
-            base_branch: 0,
-            worktree_folder: ".worktrees".to_owned(),
-            port_range: "5170–5199".to_owned(),
-            ports_per_worktree: "3".to_owned(),
-            setup_script:
-                "cargo fetch\npnpm --dir docs install --frozen-lockfile\ncp .env.example .env"
-                    .to_owned(),
-            copy_files: vec![".env".to_owned(), "CLAUDE.local.md".to_owned()],
-            checks: vec![
-                "cargo test --workspace".to_owned(),
-                "cargo clippy --workspace".to_owned(),
-            ],
-            checks_required: true,
-        }
-    }
-}
-
 /// The agent settings of CLI number `index`, in the order of [`AGENTS`].
 pub(crate) fn cli(agents: &swarm_settings::AgentSettings, index: usize) -> &CliSettings {
     if index == 0 {
@@ -173,7 +147,8 @@ fn cli_mut(agents: &mut swarm_settings::AgentSettings, index: usize) -> &mut Cli
 }
 
 /// Settings shared by every page. The agent, terminal and notification settings live in
-/// `settings.toml`; the rest is in memory only for now.
+/// `settings.toml`. A project's settings live in its `.swarm/config.toml`, which the daemon
+/// reads and writes.
 pub(crate) struct SettingsState {
     pub settings: Settings,
     path: Option<PathBuf>,
@@ -188,6 +163,10 @@ pub(crate) struct SettingsState {
     pub max_agents_per_task: String,
     pub max_agents_total: String,
     pub projects: Vec<ProjectSettings>,
+    /// How each project's saves stand, in the order of `projects`.
+    saves: Vec<ProjectSave>,
+    /// The workspace that holds the daemon connection and the open tasks.
+    workspace: Option<WeakEntity<Workspace>>,
     /// What macOS lets the app do, once it answered.
     pub permission: Option<Permission>,
 }
@@ -196,15 +175,16 @@ impl SettingsState {
     /// Sample data for the pages that are not real yet. `path` is the settings file; with
     /// `None` the agent settings stay the defaults and nothing is read or written.
     pub(crate) fn sample(path: Option<PathBuf>) -> Self {
-        let projects = FakeData::sample()
+        let projects: Vec<ProjectSettings> = FakeData::sample()
             .projects
             .into_iter()
             .map(|mut project| {
                 project.root = Some(Path::new("/Users/sam/personal").join(&*project.name));
 
-                ProjectSettings::placeholder(project)
+                ProjectSettings::new(project)
             })
             .collect();
+        let saves = projects.iter().map(|_| ProjectSave::default()).collect();
 
         Self {
             settings: Settings::default(),
@@ -217,6 +197,8 @@ impl SettingsState {
             max_agents_per_task: "6".to_owned(),
             max_agents_total: "16".to_owned(),
             projects,
+            saves,
+            workspace: None,
             permission: None,
         }
     }
@@ -234,14 +216,6 @@ impl SettingsState {
                 self.settings.notifications.set_mode(&root, mode);
             }
         }
-    }
-
-    /// Lists the projects of the workspace. Their other settings are not real yet.
-    fn use_projects(&mut self, projects: Vec<Project>) {
-        self.projects = projects
-            .into_iter()
-            .map(ProjectSettings::placeholder)
-            .collect();
     }
 
     /// Reads the settings file again. A file that cannot be read keeps the current values
@@ -305,61 +279,6 @@ impl SettingsState {
             swarm_settings::AgentKindSetting::Codex => 1,
         }
     }
-
-    pub(crate) fn remove_copy_file(
-        &mut self,
-        project: usize,
-        index: usize,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(files) = self.projects.get_mut(project).map(|p| &mut p.copy_files)
-            && index < files.len()
-        {
-            files.remove(index);
-            cx.notify();
-        }
-    }
-
-    pub(crate) fn add_copy_file(&mut self, project: usize, cx: &mut Context<Self>) {
-        if let Some(settings) = self.projects.get_mut(project) {
-            settings.copy_files.push("new-file".to_owned());
-            cx.notify();
-        }
-    }
-
-    pub(crate) fn add_check(&mut self, project: usize, cx: &mut Context<Self>) {
-        if let Some(settings) = self.projects.get_mut(project) {
-            settings.checks.push("new-check".to_owned());
-            cx.notify();
-        }
-    }
-
-    pub(crate) fn remove_check(&mut self, project: usize, index: usize, cx: &mut Context<Self>) {
-        if let Some(checks) = self.projects.get_mut(project).map(|p| &mut p.checks)
-            && index < checks.len()
-        {
-            checks.remove(index);
-            cx.notify();
-        }
-    }
-
-    pub(crate) fn set_check(
-        &mut self,
-        project: usize,
-        index: usize,
-        text: String,
-        cx: &mut Context<Self>,
-    ) {
-        let check = self
-            .projects
-            .get_mut(project)
-            .and_then(|p| p.checks.get_mut(index));
-
-        if let Some(check) = check {
-            *check = text;
-            cx.notify();
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -420,14 +339,6 @@ impl Page {
     }
 }
 
-struct ProjectInputs {
-    worktree_folder: Entity<TextInput>,
-    port_range: Entity<TextInput>,
-    ports_per_worktree: Entity<TextInput>,
-    setup_script: Entity<TextArea>,
-    checks: Vec<Entity<TextInput>>,
-}
-
 struct CliInputs {
     command: Entity<TextInput>,
     orchestrator_model: Entity<TextInput>,
@@ -446,6 +357,11 @@ pub(crate) struct SettingsWindow {
     page: Page,
     nav_focus: Vec<FocusHandle>,
     inputs: Inputs,
+    prompts: Entity<PromptsPage>,
+    usage: Entity<UsagePage>,
+    /// Where a page without controls takes keyboard focus, to scroll with the keys.
+    page_focus: FocusHandle,
+    page_scroll: ScrollHandle,
     subscriptions: Vec<Subscription>,
 }
 
@@ -495,7 +411,10 @@ fn bind_text(
                 return;
             };
 
-            state.update(cx, |state, _| apply(state, text.to_string()));
+            state.update(cx, |state, cx| {
+                apply(state, text.to_string());
+                cx.notify();
+            });
         }),
     );
 }
@@ -533,7 +452,10 @@ impl SettingsWindow {
     ) -> Self {
         let mut subscriptions = vec![
             cx.observe(&state, |_, state, cx| {
-                state.update(cx, SettingsState::queue_save);
+                state.update(cx, |state, cx| {
+                    state.queue_save(cx);
+                    state.queue_project_saves(cx);
+                });
                 cx.notify();
             }),
             theme::follow_system_appearance(window, cx),
@@ -541,9 +463,24 @@ impl SettingsWindow {
                 // The user may come back from System Settings with a new answer.
                 if window.is_window_active() {
                     this.refresh_permission(cx);
+                    // The user edits the prompt files and the project config outside the app.
+                    this.refresh_prompts(cx);
+                    this.open_project(cx);
                 }
             }),
         ];
+
+        let workspace = state
+            .read(cx)
+            .workspace
+            .as_ref()
+            .and_then(WeakEntity::upgrade);
+        if let Some(workspace) = workspace {
+            subscriptions.push(cx.observe(&workspace, |this, _, cx| {
+                this.reconnect_prompts(cx);
+                cx.notify();
+            }));
+        }
 
         let agents = state.read(cx).settings.agents.clone();
         let settings = state.read(cx);
@@ -617,157 +554,26 @@ impl SettingsWindow {
                 max_agents_total,
                 projects: Vec::new(),
             },
+            prompts: cx.new(|cx| PromptsPage::new(state.clone(), cx)),
+            usage: cx.new(|cx| UsagePage::new(state.clone(), cx)),
+            page_focus: cx.focus_handle().tab_stop(true),
+            page_scroll: ScrollHandle::new(),
             subscriptions,
         };
 
-        for (index, project) in projects.iter().enumerate() {
-            let inputs = this.project_inputs(index, project, cx);
-            this.inputs.projects.push(inputs);
+        for index in 0..projects.len() {
+            if let Some(inputs) = this.project_inputs(index, cx) {
+                this.inputs.projects.push(inputs);
+                this.sync_inputs(index, cx);
+            }
         }
 
         this.focus_nav(window, cx);
         this.refresh_permission(cx);
+        this.refresh_prompts(cx);
+        this.open_project(cx);
 
         this
-    }
-
-    fn project_inputs(
-        &mut self,
-        index: usize,
-        project: &ProjectSettings,
-        cx: &mut Context<Self>,
-    ) -> ProjectInputs {
-        let state = self.state.clone();
-
-        let worktree_folder = field("Worktree folder", &project.worktree_folder, true, cx);
-        bind_text(
-            &mut self.subscriptions,
-            &worktree_folder,
-            &state,
-            move |state, text| {
-                if let Some(project) = state.projects.get_mut(index) {
-                    project.worktree_folder = text;
-                }
-            },
-            cx,
-        );
-
-        let port_range = field("Port range", &project.port_range, true, cx);
-        bind_text(
-            &mut self.subscriptions,
-            &port_range,
-            &state,
-            move |state, text| {
-                if let Some(project) = state.projects.get_mut(index) {
-                    project.port_range = text;
-                }
-            },
-            cx,
-        );
-
-        let ports_per_worktree =
-            numeric_field("Ports per worktree", &project.ports_per_worktree, cx);
-        bind_text(
-            &mut self.subscriptions,
-            &ports_per_worktree,
-            &state,
-            move |state, text| {
-                if let Some(project) = state.projects.get_mut(index) {
-                    project.ports_per_worktree = text;
-                }
-            },
-            cx,
-        );
-
-        let setup_script = cx.new(|cx| {
-            let mut area = TextArea::new(cx);
-            area.set_label("Setup script", cx);
-            area.set_mono(true, cx);
-            area.set_rows(3, cx);
-            area.set_text(project.setup_script.clone(), cx);
-            area
-        });
-        self.subscriptions.push(cx.subscribe(
-            &setup_script,
-            move |this, _, event: &TextInputEvent, cx| {
-                if let TextInputEvent::Changed(text) = event {
-                    let text = text.to_string();
-                    this.state.update(cx, |state, _| {
-                        if let Some(project) = state.projects.get_mut(index) {
-                            project.setup_script = text;
-                        }
-                    });
-                }
-            },
-        ));
-
-        let checks = project
-            .checks
-            .iter()
-            .map(|check| self.check_input(index, check, cx))
-            .collect();
-
-        ProjectInputs {
-            worktree_folder,
-            port_range,
-            ports_per_worktree,
-            setup_script,
-            checks,
-        }
-    }
-
-    fn check_input(
-        &mut self,
-        project: usize,
-        text: &str,
-        cx: &mut Context<Self>,
-    ) -> Entity<TextInput> {
-        let input = field("Check", text, true, cx);
-
-        self.subscriptions.push(cx.subscribe(
-            &input,
-            move |this, input, event: &TextInputEvent, cx| {
-                let TextInputEvent::Changed(text) = event else {
-                    return;
-                };
-
-                let index = this
-                    .inputs
-                    .projects
-                    .get(project)
-                    .and_then(|inputs| inputs.checks.iter().position(|check| *check == input));
-
-                if let Some(index) = index {
-                    let text = text.to_string();
-                    this.state
-                        .update(cx, |state, cx| state.set_check(project, index, text, cx));
-                }
-            },
-        ));
-
-        input
-    }
-
-    pub(crate) fn add_check(&mut self, project: usize, cx: &mut Context<Self>) {
-        let input = self.check_input(project, "new-check", cx);
-
-        if let Some(inputs) = self.inputs.projects.get_mut(project) {
-            inputs.checks.push(input);
-        }
-
-        self.state
-            .update(cx, |state, cx| state.add_check(project, cx));
-    }
-
-    pub(crate) fn remove_check(&mut self, project: usize, index: usize, cx: &mut Context<Self>) {
-        if let Some(inputs) = self.inputs.projects.get_mut(project)
-            && index < inputs.checks.len()
-        {
-            inputs.checks.remove(index);
-        }
-
-        self.state
-            .update(cx, |state, cx| state.remove_check(project, index, cx));
     }
 
     #[cfg(test)]
@@ -777,7 +583,10 @@ impl SettingsWindow {
 
     pub(crate) fn select_page(&mut self, page: Page, cx: &mut Context<Self>) {
         self.page = page;
+        self.page_scroll.set_offset(point(px(0.), px(0.)));
         self.refresh_permission(cx);
+        self.refresh_prompts(cx);
+        self.open_project(cx);
         cx.notify();
     }
 
@@ -823,7 +632,10 @@ impl SettingsWindow {
         let next = self.page.nav_index().saturating_add_signed(step).min(last);
 
         self.page = Page::from_nav_index(next);
+        self.page_scroll.set_offset(point(px(0.), px(0.)));
         self.refresh_permission(cx);
+        self.refresh_prompts(cx);
+        self.open_project(cx);
         self.focus_nav(window, cx);
         cx.notify();
     }
@@ -929,10 +741,18 @@ impl SettingsWindow {
 impl Render for SettingsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
-        let (ground, panel, line, fg) = (colors.ground, colors.panel, colors.line, colors.fg);
+        let (ground, panel, line, fg, accent) = (
+            colors.ground,
+            colors.panel,
+            colors.line,
+            colors.fg,
+            colors.accent,
+        );
 
         let nav = self.nav(window, cx);
         let page = self.render_page(cx);
+        let scrolls_with_keys = matches!(self.page, Page::Keyboard | Page::Usage);
+        let scroll = self.page_scroll.clone();
         let gap_drag = drag_region("settings-gap-drag", window, cx);
         let page_drag = drag_region("settings-page-drag", window, cx);
 
@@ -985,9 +805,29 @@ impl Render for SettingsWindow {
                                     div()
                                         .id("settings-page")
                                         .debug_selector(|| "settings-page".to_owned())
+                                        .when(scrolls_with_keys, |page_area| {
+                                            let scroll = scroll.clone();
+
+                                            page_area
+                                                .role(Role::ScrollView)
+                                                .aria_label(self.page.title())
+                                                .track_focus(&self.page_focus)
+                                                .focus_visible(move |style| {
+                                                    focus_ring(style, accent)
+                                                })
+                                                .on_key_down(move |event, window, cx| {
+                                                    let key = event.keystroke.key.as_str();
+
+                                                    if scroll_for_key(&scroll, key, PAGE_LINE) {
+                                                        window.refresh();
+                                                        cx.stop_propagation();
+                                                    }
+                                                })
+                                        })
                                         .flex_1()
                                         .min_h_0()
                                         .overflow_y_scroll()
+                                        .track_scroll(&self.page_scroll)
                                         .child(
                                             v_flex()
                                                 .max_w(px(756.))
@@ -1014,6 +854,31 @@ impl Global for Registry {}
 struct KeysBound;
 
 impl Global for KeysBound {}
+
+type Opener = Rc<dyn Fn(&Path, &mut App)>;
+
+struct OpenWith(Opener);
+
+impl Global for OpenWith {}
+
+/// Opens a file with the system's default app. This is the one place the settings pages
+/// open files, so a test can see which file would open.
+pub(crate) fn open_file(path: &Path, cx: &mut App) {
+    let opener = cx
+        .try_global::<OpenWith>()
+        .map(|opener| Rc::clone(&opener.0));
+
+    match opener {
+        Some(open) => open(path, cx),
+        None => cx.open_with_system(path),
+    }
+}
+
+/// Replaces the system call, so a test can see which file would open.
+#[cfg(test)]
+pub(crate) fn use_opener(opener: Opener, cx: &mut App) {
+    cx.set_global(OpenWith(opener));
+}
 
 fn bind_keys(cx: &mut App) {
     if cx.has_global::<KeysBound>() {
@@ -1058,6 +923,45 @@ pub(crate) fn allow_worker_typing(cx: &App) -> bool {
             .terminals
             .allow_worker_typing
     })
+}
+
+/// Draws the workspace again when the terminal font size in the settings changes. That is
+/// how a new size reaches every terminal view: the workspace measures the cell again.
+pub(crate) fn follow_font_size(workspace: Entity<Workspace>, cx: &mut App) {
+    let settings = shared_state(None, cx);
+    let mut applied = terminal_font_size(cx);
+
+    cx.observe(&settings, move |_, cx| {
+        let points = terminal_font_size(cx);
+
+        if (points - applied).abs() > f32::EPSILON {
+            applied = points;
+            workspace.update(cx, |_, cx| cx.notify());
+        }
+    })
+    .detach();
+}
+
+/// The font size of every terminal, in points. It stays the default until the settings load.
+pub(crate) fn terminal_font_size(cx: &App) -> f32 {
+    let points = cx
+        .try_global::<Registry>()
+        .map_or(swarm_settings::FONT_SIZE_DEFAULT, |registry| {
+            registry.state.read(cx).settings.terminals.font_size
+        });
+
+    f32::from(swarm_settings::clamp_font_size(points))
+}
+
+/// Sets the terminal font size the way the Terminals page does.
+#[cfg(any(test, feature = "snapshot"))]
+pub(crate) fn set_terminal_font_size(points: u8, cx: &mut App) {
+    let state = shared_state(None, cx);
+
+    state.update(cx, |state, cx| {
+        state.settings.terminals.font_size = points;
+        cx.notify();
+    });
 }
 
 #[cfg(test)]
@@ -1150,21 +1054,42 @@ fn open_window(
 }
 
 /// Opens the settings window, or focuses it when it is already open. `projects` are the
-/// workspace's: the window lists them.
+/// workspace's: the window lists them. The workspace holds the daemon connection and the
+/// open tasks the Projects pages use.
 pub(crate) fn open(
     path: Option<PathBuf>,
     projects: Vec<Project>,
+    workspace: WeakEntity<Workspace>,
     _window: &mut Window,
     cx: &mut App,
 ) {
+    link_workspace(workspace, cx);
+
     if let Err(error) = open_window(path, Some(projects), cx) {
         log::error!("could not open the settings window: {error:#}");
     }
 }
 
+fn link_workspace(workspace: WeakEntity<Workspace>, cx: &mut App) {
+    let state = shared_state(None, cx);
+
+    state.update(cx, |state, _| state.workspace = Some(workspace));
+}
+
+/// The daemon reported a run of local checks. A Projects page that started one shows it.
+pub(crate) fn checks_changed(run: &swarm_protocol::ChecksRun, cx: &mut App) {
+    let Some(state) = cx
+        .try_global::<Registry>()
+        .map(|registry| registry.state.clone())
+    else {
+        return;
+    };
+
+    state.update(cx, |state, cx| state.record_run(run, cx));
+}
+
 #[cfg(feature = "snapshot")]
 pub(crate) fn snapshot(directory: PathBuf, cx: &mut App) {
-    use std::rc::Rc;
     use std::time::Duration;
 
     use gpui::{AnyWindowHandle, AsyncApp};
@@ -1200,6 +1125,36 @@ pub(crate) fn snapshot(directory: PathBuf, cx: &mut App) {
             size(px(1280.), px(1180.)),
             Permission::Allowed,
         ),
+        (
+            Page::Terminals,
+            "terminals",
+            size(px(1280.), px(600.)),
+            Permission::Allowed,
+        ),
+        (
+            Page::Prompts,
+            "prompts",
+            size(px(1280.), px(700.)),
+            Permission::Allowed,
+        ),
+        (
+            Page::Prompts,
+            "prompts-reset",
+            size(px(1280.), px(700.)),
+            Permission::Allowed,
+        ),
+        (
+            Page::Usage,
+            "usage",
+            size(px(1280.), px(700.)),
+            Permission::Allowed,
+        ),
+        (
+            Page::Keyboard,
+            "keyboard",
+            size(px(1280.), px(1900.)),
+            Permission::Allowed,
+        ),
     ];
 
     cx.spawn(async move |cx: &mut AsyncApp| {
@@ -1226,7 +1181,21 @@ pub(crate) fn snapshot(directory: PathBuf, cx: &mut App) {
                     create_window(state, page, window_size, cx)
                 });
                 let window: AnyWindowHandle = match opened {
-                    Ok(handle) => handle.into(),
+                    Ok(handle) => {
+                        if name == "prompts-reset" {
+                            let asked = cx.update(|cx| {
+                                handle.update(cx, |settings, _, cx| {
+                                    settings.prompts.update(cx, PromptsPage::ask_for_snapshot);
+                                })
+                            });
+
+                            if let Err(error) = asked {
+                                log::error!("cannot ask the question: {error:#}");
+                            }
+                        }
+
+                        handle.into()
+                    }
                     Err(error) => {
                         log::error!("cannot open window: {error:#}");
                         continue;
@@ -1263,8 +1232,6 @@ pub(crate) fn snapshot(directory: PathBuf, cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
-    use std::rc::Rc;
-
     use gpui::{Focusable, TestAppContext};
 
     use super::*;
@@ -1371,7 +1338,7 @@ mod tests {
 
         visual.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::none());
         visual.simulate_mouse_move(
-            start + gpui::point(px(6.), px(0.)),
+            start + point(px(6.), px(0.)),
             gpui::MouseButton::Left,
             gpui::Modifiers::none(),
         );
@@ -1842,18 +1809,124 @@ mod tests {
         );
     }
 
-    #[gpui::test]
-    fn removing_a_copy_file_row_removes_it_from_state(cx: &mut TestAppContext) {
+    /// A short window on `page`, so the page is taller than the window.
+    fn short_page(
+        page: Page,
+        cx: &mut TestAppContext,
+    ) -> (WindowHandle<SettingsWindow>, gpui::VisualTestContext) {
+        cx.update(swarm_ui::init);
         setup(cx);
         let window = open_settings(cx);
-        let state = window
-            .read_with(cx, |settings, _| settings.state.clone())
+        window
+            .update(cx, |settings, _, cx| settings.select_page(page, cx))
             .expect("window is open");
 
-        state.update(cx, |state, cx| state.remove_copy_file(0, 0, cx));
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(size(px(1280.), px(160.)));
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear(cx));
 
-        let files = state.read_with(cx, |state, _| state.projects[0].copy_files.clone());
-        assert_eq!(files, vec!["CLAUDE.local.md".to_owned()]);
+        (window, visual)
+    }
+
+    /// Presses Tab until the page container has focus. Returns whether it ever did.
+    fn tab_to_the_page(
+        window: WindowHandle<SettingsWindow>,
+        visual: &mut gpui::VisualTestContext,
+    ) -> bool {
+        let focus = window
+            .read_with(visual, |settings, _| settings.page_focus.clone())
+            .expect("window is open");
+
+        (0..40).any(|_| {
+            visual.simulate_keystrokes("tab");
+
+            visual.update(|window, _| focus.is_focused(window))
+        })
+    }
+
+    fn top_of(selector: &'static str, visual: &mut gpui::VisualTestContext) -> f32 {
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+
+        visual
+            .debug_bounds(selector)
+            .map_or(f32::NAN, |bounds| f32::from(bounds.origin.y))
+    }
+
+    #[gpui::test]
+    fn the_keyboard_and_usage_pages_scroll_with_the_arrows_page_keys_home_and_end(
+        cx: &mut TestAppContext,
+    ) {
+        for (page, row) in [
+            (Page::Keyboard, "shortcut-open-settings"),
+            (Page::Usage, "popover-usage-claude"),
+        ] {
+            let (window, mut visual) = short_page(page, cx);
+            let reached = tab_to_the_page(window, &mut visual);
+
+            let start = top_of(row, &mut visual);
+            visual.simulate_keystrokes("down");
+            let one_line = top_of(row, &mut visual);
+            visual.simulate_keystrokes("pagedown");
+            let one_page = top_of(row, &mut visual);
+            visual.simulate_keystrokes("pageup");
+            let back = top_of(row, &mut visual);
+            visual.simulate_keystrokes("end");
+            let end = top_of(row, &mut visual);
+            visual.simulate_keystrokes("home");
+            let home = top_of(row, &mut visual);
+            visual.simulate_keystrokes("up");
+            let clamped = top_of(row, &mut visual);
+
+            assert!(reached, "{page:?}: Tab never reached the page");
+            assert!(
+                (one_line - (start - 40.)).abs() < 0.5,
+                "{page:?}: down moves a line"
+            );
+            assert!(
+                one_page < one_line - 40.,
+                "{page:?}: page down moves further"
+            );
+            assert!(back > one_page, "{page:?}: page up goes back");
+            assert!(end < one_page, "{page:?}: end goes to the bottom");
+            assert!((home - start).abs() < 0.5, "{page:?}: home goes to the top");
+            assert!(
+                (clamped - start).abs() < 0.5,
+                "{page:?}: it stops at the top"
+            );
+
+            visual.update(|window, _| window.remove_window());
+            visual.run_until_parked();
+        }
+    }
+
+    #[gpui::test]
+    fn a_page_with_controls_adds_no_stop_for_the_page_itself(cx: &mut TestAppContext) {
+        let (window, mut visual) = short_page(Page::Agents, cx);
+
+        assert!(!tab_to_the_page(window, &mut visual));
+    }
+
+    #[gpui::test]
+    fn a_page_opens_at_its_top(cx: &mut TestAppContext) {
+        let (window, mut visual) = short_page(Page::Keyboard, cx);
+        tab_to_the_page(window, &mut visual);
+        visual.simulate_keystrokes("end");
+
+        window
+            .update(&mut visual, |settings, _, cx| {
+                settings.select_page(Page::Usage, cx);
+            })
+            .expect("window is open");
+        let on_opening = top_of("popover-usage-claude", &mut visual);
+        tab_to_the_page(window, &mut visual);
+        visual.simulate_keystrokes("home");
+        let at_the_top = top_of("popover-usage-claude", &mut visual);
+
+        assert!(
+            (on_opening - at_the_top).abs() < 0.5,
+            "the page opened scrolled: {on_opening} against {at_the_top}"
+        );
     }
 
     fn numeric_input(

@@ -14,6 +14,7 @@ workspace = true
 flume.workspace = true
 gpui.workspace = true
 log.workspace = true
+swarm_settings.workspace = true
 swarm_term.workspace = true
 swarm_ui.workspace = true
 unicode-segmentation.workspace = true

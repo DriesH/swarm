@@ -143,7 +143,7 @@ fn needs_you(data: &FakeData) -> Vec<NeedsYou> {
 
 /// Claude first. An agent kind with no windows and no problem to report, or one that is not
 /// installed, has no section: the sidebar card follows the same rule.
-fn usage_sections(usage: &Usage, now: u64) -> Vec<UsageSection> {
+pub(crate) fn usage_sections(usage: &Usage, now: u64) -> Vec<UsageSection> {
     [
         ("popover-usage-claude", "Claude", &usage.claude),
         ("popover-usage-codex", "Codex", &usage.codex),

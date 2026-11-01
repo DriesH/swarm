@@ -326,6 +326,11 @@ impl<const MULTILINE: bool> TextField<MULTILINE> {
         cx.notify();
     }
 
+    /// The name VoiceOver reads for the field.
+    pub fn label(&self) -> &SharedString {
+        &self.label
+    }
+
     /// Geist Mono at 12.5px, for names, paths and branches.
     pub fn set_mono(&mut self, mono: bool, cx: &mut Context<Self>) {
         self.mono = mono;

@@ -525,7 +525,9 @@ fn header(running: usize) -> impl IntoElement {
         .child(Label::new(text).size(LabelSize::Small).color(Color::Faint))
 }
 
-fn usage_section(section: &UsageSection) -> gpui::AnyElement {
+/// The title, a meter for each window and the problem line of one agent kind. Settings ›
+/// Usage shows the same sections.
+pub(crate) fn usage_section(section: &UsageSection) -> gpui::AnyElement {
     let id = section.id;
     let meters = section
         .meters
@@ -536,6 +538,7 @@ fn usage_section(section: &UsageSection) -> gpui::AnyElement {
     let problem = section.problem.as_ref().map(|(shown, spoken)| {
         div()
             .id(SharedString::from(format!("{id}-problem")))
+            .debug_selector(move || format!("{id}-problem"))
             .role(Role::Status)
             .aria_label(spoken.clone())
             .child(

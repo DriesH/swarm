@@ -24,8 +24,8 @@ use std::time::{Duration, Instant};
 
 use swarm_protocol::{
     AgentChange, AgentId, AgentInfo, AgentLifecycle, AgentRole, CloseCheck, CreateTask, DIFF_FILES,
-    DiffStat, FileChange, FileDiff, GithubStatus, PrLink, ProjectId, ProjectInfo, ReviewSource,
-    TaskDiff, TaskId, TaskInfo, TerminalId,
+    DiffStat, FileChange, FileDiff, GithubStatus, PrLink, ProjectConfigFields, ProjectId,
+    ProjectInfo, ReviewSource, TaskDiff, TaskId, TaskInfo, TerminalId,
 };
 use swarm_term::ExitStatus;
 
@@ -865,6 +865,25 @@ impl Projects {
         }
 
         Ok(config.checks)
+    }
+
+    /// The project's config file as it is on disk now, and why it could not be read.
+    /// A file with a problem gives the defaults.
+    pub fn project_config(
+        &self,
+        project: ProjectId,
+    ) -> Result<(ProjectConfigFields, Option<String>), Error> {
+        Ok(config::read_fields(&self.project_path(project)?))
+    }
+
+    /// Writes the fields that differ from `base` into the project's config file.
+    pub fn save_project_config(
+        &self,
+        project: ProjectId,
+        base: &ProjectConfigFields,
+        fields: &ProjectConfigFields,
+    ) -> Result<(), Error> {
+        config::save(&self.project_path(project)?, base, fields)
     }
 
     /// Records the pull request of the task.

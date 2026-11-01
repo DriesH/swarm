@@ -1,6 +1,7 @@
-//! Accessibility checks for Button, Kbd, Dropdown, `PopoverMenu`, the tray chips and `UsageMeter`.
+//! Accessibility checks for Button, Kbd, Stepper, Dropdown, `PopoverMenu`, the tray chips and
+//! `UsageMeter`.
 
-use gpui::accesskit::{Node, Role, Toggled};
+use gpui::accesskit::{Action, Node, Role, Toggled};
 use gpui::{
     App, Context, Element as _, Render, RenderOnce, TestAppContext, VisualTestContext, Window, div,
     px,
@@ -176,6 +177,77 @@ fn kbd_is_a_label_with_a_spoken_name() {
 
         assert_eq!(info.role, Some(Role::Label));
         assert_eq!(info.node.label(), Some("Command Shift R"));
+    });
+}
+
+#[test]
+fn a_stepper_is_a_spin_button_with_its_value_range_and_actions() {
+    with_window(|window, cx| {
+        let info = a11y_info(
+            Stepper::new("size", "Font size", 13, 11, 20)
+                .unit("pt")
+                .on_change(|_, _, _| {}),
+            window,
+            cx,
+        );
+
+        assert_eq!(info.role, Some(Role::SpinButton));
+        assert_eq!(info.node.label(), Some("Font size"));
+        assert_eq!(info.node.value(), Some("13 pt"));
+        assert_eq!(info.node.numeric_value(), Some(13.));
+        assert_eq!(info.node.min_numeric_value(), Some(11.));
+        assert_eq!(info.node.max_numeric_value(), Some(20.));
+        assert_eq!(info.node.numeric_value_step(), Some(1.));
+        assert!(info.node.supports_action(Action::Increment));
+        assert!(info.node.supports_action(Action::Decrement));
+    });
+}
+
+#[test]
+fn a_stepper_at_a_limit_offers_only_the_way_back() {
+    with_window(|window, cx| {
+        let mut stepper = |value| {
+            a11y_info(
+                Stepper::new("size", "Font size", value, 11, 20).on_change(|_, _, _| {}),
+                window,
+                cx,
+            )
+        };
+
+        let (lowest, highest) = (stepper(11), stepper(20));
+
+        assert!(lowest.node.supports_action(Action::Increment));
+        assert!(!lowest.node.supports_action(Action::Decrement));
+        assert!(highest.node.supports_action(Action::Decrement));
+        assert!(!highest.node.supports_action(Action::Increment));
+    });
+}
+
+#[test]
+fn the_buttons_of_a_stepper_are_named_for_what_they_change() {
+    with_window(|window, cx| {
+        let [decrease, increase] = Stepper::new("size", "Font size", 13, 11, 20).buttons();
+
+        let decrease = a11y_info(decrease, window, cx);
+        let increase = a11y_info(increase, window, cx);
+
+        assert_eq!(decrease.role, Some(Role::Button));
+        assert_eq!(decrease.node.label(), Some("Decrease font size"));
+        assert_eq!(increase.role, Some(Role::Button));
+        assert_eq!(increase.node.label(), Some("Increase font size"));
+    });
+}
+
+#[test]
+fn a_button_at_a_limit_cannot_be_focused() {
+    with_window(|window, cx| {
+        let [decrease, increase] = Stepper::new("size", "Font size", 20, 11, 20).buttons();
+
+        let decrease = a11y_info(decrease, window, cx);
+        let increase = a11y_info(increase, window, cx);
+
+        assert!(decrease.node.supports_action(Action::Focus));
+        assert!(!increase.node.supports_action(Action::Focus));
     });
 }
 

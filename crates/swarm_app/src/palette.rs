@@ -154,7 +154,7 @@ pub(crate) fn rows(data: &FakeData, project: ProjectId, task: TaskId, view: View
             additions,
             deletions,
         })
-        .keys(&[KEY_COMMAND, KEY_SHIFT, "R"]),
+        .keys(&[KEY_SHIFT, KEY_COMMAND, "R"]),
         Row::new(
             Group::Suggested,
             IconName::ClaudeCode,
@@ -175,7 +175,7 @@ pub(crate) fn rows(data: &FakeData, project: ProjectId, task: TaskId, view: View
             "Plan with orchestrator",
             Command::PlanWithOrchestrator,
         )
-        .keys(&[KEY_COMMAND, KEY_SHIFT, "T"]),
+        .keys(&[KEY_SHIFT, KEY_COMMAND, "T"]),
     ];
 
     if data.can_create_pr(task) {
@@ -273,7 +273,7 @@ pub(crate) fn rows(data: &FakeData, project: ProjectId, task: TaskId, view: View
             "New terminal",
             Command::NewTerminal,
         )
-        .keys(&[KEY_COMMAND, KEY_OPTION, "T"]),
+        .keys(&[KEY_OPTION, KEY_COMMAND, "T"]),
         Row::new(
             Group::Swarm,
             IconName::Settings,
@@ -763,6 +763,21 @@ mod tests {
     #[test]
     fn filter_finds_nothing_for_an_unknown_word() {
         assert!(filter(&sample_rows(), "zzzz").is_empty());
+    }
+
+    #[test]
+    fn the_modifiers_of_a_shortcut_come_in_the_order_of_macos() {
+        let keys_of = |label: &str| {
+            sample_rows()
+                .into_iter()
+                .find(|row| row.label == label)
+                .map(|row| row.keys)
+                .unwrap_or_default()
+        };
+
+        assert_eq!(keys_of("Review changes"), [KEY_SHIFT, KEY_COMMAND, "R"]);
+        assert_eq!(keys_of("New terminal"), [KEY_OPTION, KEY_COMMAND, "T"]);
+        assert_eq!(keys_of("New task"), [KEY_COMMAND, "T"]);
     }
 
     use gpui::{TestAppContext, VisualTestContext};

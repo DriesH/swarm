@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use serde::de::{DeserializeOwned, Deserializer};
+use serde::de::{self, DeserializeOwned, Deserializer};
 use serde::{Deserialize, Serialize};
 use swarm_protocol::{AgentKind, AgentRole, NoticeKind};
 use toml_edit::{DocumentMut, Item, Table, Value};
@@ -174,19 +174,74 @@ pub enum ProjectMode {
     Off,
 }
 
+/// The smallest terminal font size, in points.
+pub const FONT_SIZE_MIN: u8 = 11;
+
+/// The largest terminal font size, in points.
+pub const FONT_SIZE_MAX: u8 = 20;
+
+/// The terminal font size when the settings say nothing, in points.
+pub const FONT_SIZE_DEFAULT: u8 = 13;
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(default)]
 pub struct TerminalSettings {
     /// Lets the user type into worker terminals.
     pub allow_worker_typing: bool,
+    /// The font size of every terminal, in points. A value outside
+    /// [`FONT_SIZE_MIN`]..=[`FONT_SIZE_MAX`] in the file is brought into it.
+    #[serde(deserialize_with = "read_font_size")]
+    pub font_size: u8,
 }
 
 impl Default for TerminalSettings {
     fn default() -> Self {
         Self {
             allow_worker_typing: true,
+            font_size: FONT_SIZE_DEFAULT,
         }
     }
+}
+
+/// `points` brought into the range the settings allow.
+pub fn clamp_font_size(points: u8) -> u8 {
+    points.clamp(FONT_SIZE_MIN, FONT_SIZE_MAX)
+}
+
+fn read_font_size<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u8, D::Error> {
+    struct Points;
+
+    impl de::Visitor<'_> for Points {
+        type Value = u8;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a font size in points")
+        }
+
+        fn visit_i64<E: de::Error>(self, points: i64) -> Result<u8, E> {
+            let clamped = points.clamp(i64::from(FONT_SIZE_MIN), i64::from(FONT_SIZE_MAX));
+
+            Ok(u8::try_from(clamped).unwrap_or(FONT_SIZE_DEFAULT))
+        }
+
+        fn visit_u64<E: de::Error>(self, points: u64) -> Result<u8, E> {
+            self.visit_i64(i64::try_from(points).unwrap_or(i64::MAX))
+        }
+
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "rounded and clamped into the u8 range first"
+        )]
+        fn visit_f64<E: de::Error>(self, points: f64) -> Result<u8, E> {
+            if points.is_nan() {
+                return Ok(FONT_SIZE_DEFAULT);
+            }
+
+            self.visit_i64(points.round().clamp(-1e6, 1e6) as i64)
+        }
+    }
+
+    deserializer.deserialize_any(Points)
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -403,10 +458,16 @@ pub fn save(path: &Path, settings: &Settings) -> Result<(), SettingsError> {
     );
     set_cli(table_mut(agents, "codex"), &settings.agents.codex);
 
+    let terminals = table_mut(document.as_table_mut(), "terminals");
     set_value(
-        table_mut(document.as_table_mut(), "terminals"),
+        terminals,
         "allow_worker_typing",
         Value::from(settings.terminals.allow_worker_typing),
+    );
+    set_value(
+        terminals,
+        "font_size",
+        Value::from(i64::from(clamp_font_size(settings.terminals.font_size))),
     );
 
     set_notifications(
@@ -803,12 +864,98 @@ mod tests {
         }
     }
 
+    fn font_size_of(text: &str) -> u8 {
+        let settings: Settings = toml::from_str(text).unwrap();
+
+        settings.terminals.font_size
+    }
+
+    #[test]
+    fn the_font_size_is_13_points_by_default() {
+        assert_eq!(Settings::default().terminals.font_size, 13);
+        assert_eq!(font_size_of(""), 13);
+        assert_eq!(
+            font_size_of("[terminals]\nallow_worker_typing = false\n"),
+            13
+        );
+    }
+
+    #[test]
+    fn a_font_size_in_range_is_kept() {
+        for points in [11, 13, 16, 20] {
+            assert_eq!(
+                font_size_of(&format!("[terminals]\nfont_size = {points}\n")),
+                points
+            );
+        }
+    }
+
+    #[test]
+    fn a_font_size_out_of_range_is_clamped_on_load() {
+        let sizes: Vec<u8> = [
+            "font_size = 0",
+            "font_size = 10",
+            "font_size = 21",
+            "font_size = 300",
+            "font_size = -4",
+            "font_size = 99999999999",
+        ]
+        .iter()
+        .map(|line| font_size_of(&format!("[terminals]\n{line}\n")))
+        .collect();
+
+        assert_eq!(sizes, [11, 11, 20, 20, 11, 20]);
+    }
+
+    #[test]
+    fn a_fractional_font_size_is_rounded_into_range() {
+        let sizes: Vec<u8> = ["14.4", "14.6", "3.2", "40.5"]
+            .iter()
+            .map(|points| font_size_of(&format!("[terminals]\nfont_size = {points}\n")))
+            .collect();
+
+        assert_eq!(sizes, [14, 15, 11, 20]);
+    }
+
+    #[test]
+    fn the_font_size_is_saved_and_loaded() {
+        let folder =
+            std::env::temp_dir().join(format!("swarm-settings-font-{}", std::process::id()));
+        let path = folder.join("settings.toml");
+        let mut settings = Settings::default();
+        settings.terminals.font_size = 16;
+
+        save(&path, &settings).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let loaded = load(&path).unwrap();
+        std::fs::remove_dir_all(&folder).unwrap();
+
+        assert!(text.contains("font_size = 16"));
+        assert_eq!(loaded.terminals.font_size, 16);
+    }
+
+    #[test]
+    fn saving_never_writes_a_font_size_out_of_range() {
+        let folder =
+            std::env::temp_dir().join(format!("swarm-settings-font-range-{}", std::process::id()));
+        let path = folder.join("settings.toml");
+        let mut settings = Settings::default();
+        settings.terminals.font_size = 99;
+
+        save(&path, &settings).unwrap();
+        let loaded = load(&path).unwrap();
+        std::fs::remove_dir_all(&folder).unwrap();
+
+        assert_eq!(loaded.terminals.font_size, 20);
+    }
+
     #[test]
     fn a_bad_value_outside_the_notifications_section_still_fails() {
         for text in [
             "[agents]\norchestrator = \"gemini\"\n",
             "[agents]\nskip_permissions = \"yes\"\n",
             "[terminals]\nallow_worker_typing = \"yes\"\n",
+            "[terminals]\nfont_size = \"big\"\n",
         ] {
             let result: Result<Settings, _> = toml::from_str(text);
 

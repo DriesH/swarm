@@ -26,6 +26,7 @@ pub(crate) fn start(cx: &mut App) -> anyhow::Result<()> {
     let workspace = handle.entity(cx)?;
 
     keep(workspace.clone(), cx);
+    crate::settings::follow_font_size(workspace.clone(), cx);
     crate::menu_bar::install(workspace.clone(), cx);
     crate::notifications::install(workspace, cx);
     cx.activate(true);

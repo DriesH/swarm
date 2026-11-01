@@ -39,6 +39,9 @@ pub const DIALOG_CONTEXT: &str = "Dialog";
 /// Key context of an open menu or list popup.
 pub const MENU_CONTEXT: &str = "Menu";
 
+/// Key context of a confirm row that can be dismissed.
+pub const CONFIRM_CONTEXT: &str = "ConfirmRow";
+
 /// Loads fonts, sets the theme, reads Reduce motion and binds the shared keys.
 pub fn init(cx: &mut App) {
     fonts::load(cx);
@@ -51,6 +54,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("shift-tab", FocusPrevious, Some(ROOT_CONTEXT)),
         KeyBinding::new("escape", Dismiss, Some(DIALOG_CONTEXT)),
         KeyBinding::new("escape", Dismiss, Some(MENU_CONTEXT)),
+        KeyBinding::new("escape", Dismiss, Some(CONFIRM_CONTEXT)),
         KeyBinding::new("up", SelectPrevious, Some(MENU_CONTEXT)),
         KeyBinding::new("down", SelectNext, Some(MENU_CONTEXT)),
         KeyBinding::new("enter", Confirm, Some(MENU_CONTEXT)),

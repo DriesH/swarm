@@ -1,11 +1,15 @@
 //! One render function per settings page.
 
+use std::path::Path;
+
 use gpui::{AnyElement, ElementId, Entity, FontWeight, Role, SharedString, Stateful, div, px};
 use swarm_settings::{AgentKindSetting, ProjectMode};
 use swarm_ui::prelude::*;
 use swarm_ui::styles::focus_ring;
 use swarm_ui::theme::{self, Appearance};
 
+use super::open_file;
+use super::project::{List, Load, ProjectSettings};
 use super::{
     AGENTS, DELIVERY, IDLE_OPTIONS, NOTIFY_WHEN, PROJECT_MODES, PROJECT_NOTIFICATIONS, Page,
     SettingsState, SettingsWindow, delivery, delivery_mut, mode_index, notify_when,
@@ -56,14 +60,14 @@ fn options(labels: &[&str]) -> Vec<SharedString> {
         .collect()
 }
 
-fn page_title(title: impl Into<SharedString>) -> impl IntoElement {
+pub(super) fn page_title(title: impl Into<SharedString>) -> impl IntoElement {
     Label::new(title)
         .size(LabelSize::Title)
         .weight(FontWeight::SEMIBOLD)
 }
 
 /// A labeled group: a small heading above a card.
-fn section(heading: &'static str, body: impl IntoElement) -> impl IntoElement {
+pub(super) fn section(heading: &'static str, body: impl IntoElement) -> impl IntoElement {
     v_flex()
         .id(heading)
         .role(Role::Group)
@@ -79,8 +83,21 @@ fn section(heading: &'static str, body: impl IntoElement) -> impl IntoElement {
         .child(body)
 }
 
-fn plain_row() -> gpui::Div {
+pub(super) fn plain_row() -> gpui::Div {
     h_flex().gap_3().min_h(px(46.)).px(px(14.))
+}
+
+/// The line that says why the settings file could not be read or written, in red.
+pub(super) fn save_error(state: &SettingsState, cx: &App) -> Option<impl IntoElement> {
+    state.save_error.clone().map(|message| {
+        div()
+            .id("settings-save-error")
+            .role(Role::Alert)
+            .aria_label(message.clone())
+            .text_size(px(12.))
+            .text_color(Color::Del.hsla(cx))
+            .child(message)
+    })
 }
 
 fn switch_row(
@@ -119,47 +136,67 @@ fn input_row(label: &'static str, input: &Entity<impl Render>, width: f32) -> Pa
 fn add_row(
     id: &'static str,
     label: &'static str,
+    enabled: bool,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
     cx: &App,
 ) -> Stateful<gpui::Div> {
     let colors = cx.theme().colors();
     let (accent, raised) = (colors.accent, colors.raised);
 
-    h_flex()
+    let row = h_flex()
         .id(id)
         .role(Role::Button)
         .aria_label(label)
-        .focusable()
-        .tab_stop(true)
-        .cursor_pointer()
+        .debug_selector(|| id.to_owned())
         .gap(px(6.))
         .h(px(40.))
-        .px(px(14.))
-        .hover(move |style| style.bg(raised))
-        .focus_visible(move |style| focus_ring(style, accent))
-        .on_click(on_click)
-        .child(
-            Icon::new(IconName::Plus)
-                .size(IconSize::Small)
-                .color(Color::Muted),
-        )
-        .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
+        .px(px(14.));
+
+    let row = if enabled {
+        row.focusable()
+            .tab_stop(true)
+            .cursor_pointer()
+            .hover(move |style| style.bg(raised))
+            .focus_visible(move |style| focus_ring(style, accent))
+            .on_click(on_click)
+    } else {
+        row.opacity(0.5)
+    };
+
+    row.child(
+        Icon::new(IconName::Plus)
+            .size(IconSize::Small)
+            .color(Color::Muted),
+    )
+    .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
 }
 
-fn removable_row(
-    id: impl Into<ElementId>,
-    text: SharedString,
+/// A row of a list: its text field and a button that removes it.
+fn list_row(
+    input: &Entity<TextInput>,
+    id: (&'static str, usize),
     remove_label: String,
+    enabled: bool,
     on_remove: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     plain_row()
+        .child(div().flex_1().min_w_0().child(input.clone()))
         .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .child(Label::new(text).mono().size(LabelSize::Small).truncate()),
+            IconButton::new(id, IconName::Close, remove_label)
+                .debug_selector(move || format!("{}-{}", id.0, id.1))
+                .disabled(!enabled)
+                .on_click(on_remove),
         )
-        .child(IconButton::new(id, IconName::Close, remove_label).on_click(on_remove))
+}
+
+/// The path with the home folder shortened to `~`.
+fn tilde(path: &Path) -> String {
+    let home = std::env::var_os("HOME");
+
+    match home.and_then(|home| path.strip_prefix(home).ok()) {
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
 }
 
 impl SettingsWindow {
@@ -169,7 +206,11 @@ impl SettingsWindow {
             Page::Notifications => self.notifications_page(cx),
             Page::Appearance => Self::appearance_page(cx),
             Page::Project(index) => self.project_page(index, cx),
-            other => page_title(other.title()).into_any_element(),
+            Page::Terminals => self.terminals_page(cx),
+            Page::Prompts => self.prompts.clone().into_any_element(),
+            Page::Usage => self.usage.clone().into_any_element(),
+            Page::Keyboard => Self::keyboard_page(),
+            Page::General => page_title(Page::General.title()).into_any_element(),
         }
     }
 
@@ -439,46 +480,42 @@ impl SettingsWindow {
             return div().into_any_element();
         };
 
-        let header = h_flex()
-            .gap_3()
-            .child(
-                ProjectTile::new(settings.project.letter, settings.project.tile_color)
-                    .size(px(28.)),
-            )
-            .child(
-                v_flex()
-                    .flex_1()
-                    .child(page_title(settings.project.name.clone()))
-                    .child(
-                        Label::new(format!(
-                            "~/personal/{} · .swarm/config.toml",
-                            settings.project.name
-                        ))
-                        .mono()
-                        .size(LabelSize::XSmall)
-                        .color(Color::Faint),
-                    ),
-            );
+        let editable = settings.load.editable();
+        let loading = settings.load == Load::Loading;
 
-        let branches: Vec<SharedString> = settings
-            .base_branches
-            .iter()
-            .map(|branch| SharedString::from(branch.clone()))
-            .collect();
+        let header = Self::project_header(settings, cx);
+
+        let unreadable = match &settings.load {
+            Load::Unreadable(message) => Some(Self::unreadable(index, message.clone(), cx)),
+            _ => None,
+        };
+
+        let (branches, selected): (Vec<SharedString>, usize) = if loading {
+            (vec!["Loading\u{2026}".into()], 0)
+        } else {
+            (
+                settings
+                    .base_branch_options()
+                    .into_iter()
+                    .map(SharedString::from)
+                    .collect(),
+                settings.base_branch_index(),
+            )
+        };
+
+        let base_branch = PanelRow::new("Base branch").end_slot(
+            h_flex().h(px(28.)).child(
+                Dropdown::new(("base-branch", index), "Base branch", branches, selected)
+                    .debug_selector(|| "base-branch".to_owned())
+                    .disabled(!editable)
+                    .on_change(choose(state, move |state, option| {
+                        state.choose_base_branch(index, option);
+                    })),
+            ),
+        );
 
         let worktrees = Panel::new()
-            .row(dropdown_row(
-                state,
-                ("base-branch", index),
-                "Base branch",
-                branches,
-                settings.base_branch,
-                move |state, value| {
-                    if let Some(project) = state.projects.get_mut(index) {
-                        project.base_branch = value;
-                    }
-                },
-            ))
+            .row(base_branch)
             .row(input_row("Worktree folder", &inputs.worktree_folder, 160.))
             .row(input_row("Port range", &inputs.port_range, 110.))
             .row(input_row(
@@ -491,58 +528,182 @@ impl SettingsWindow {
             .id("setup-script-field")
             .child(inputs.setup_script.clone());
 
-        let copy = self.copy_card(index, cx);
+        let copy = self.list_card(index, List::Copy, cx);
         let checks = self.checks_card(index, cx);
+        let prompts = self.prompts_card(index, cx);
+
+        let run_checks = self.run_checks_row(index, cx);
 
         v_flex()
             .gap(px(26.))
             .child(header)
+            .children(unreadable)
             .child(section("Worktrees", worktrees))
             .child(section("Setup script", setup))
             .child(section("Copy into worktrees", copy))
             .child(
-                v_flex().child(section("Checks before PR", checks)).child(
-                    h_flex().mt(px(12.)).child(
-                        Button::new("run-checks", "Run checks now").on_click(|_, _, _| {
-                            log::info!("Running checks is not built yet");
-                        }),
+                v_flex()
+                    .child(section("Checks before PR", checks))
+                    .child(run_checks),
+            )
+            .children(prompts.map(|prompts| {
+                div()
+                    .id("project-prompts")
+                    .debug_selector(|| "project-prompts".to_owned())
+                    .child(section("Prompts", prompts))
+            }))
+            .into_any_element()
+    }
+
+    /// **Run checks now** and the short result of the run.
+    fn run_checks_row(&self, index: usize, cx: &Context<Self>) -> impl IntoElement + use<> {
+        let state = self.state.clone();
+        let can_run = state.read(cx).can_run_checks(index, cx);
+        let result = state
+            .read(cx)
+            .projects
+            .get(index)
+            .and_then(|settings| settings.checking.pill());
+
+        let button = Button::new("run-checks", "Run checks now")
+            .debug_selector(|| "run-checks".to_owned())
+            .disabled(!can_run)
+            .on_click(move |_, _, cx| {
+                state.update(cx, |state, cx| state.run_checks(index, cx));
+            });
+        let result = result.map(|(tone, text)| {
+            div()
+                .id("run-checks-result")
+                .role(Role::Status)
+                .aria_label(text.clone())
+                .debug_selector(|| "run-checks-result".to_owned())
+                .child(StatusPill::new(tone).label(text))
+        });
+
+        h_flex().mt(px(12.)).gap_3().child(button).children(result)
+    }
+
+    /// The project's tile, name and path, and next to the name what the page is doing.
+    fn project_header(settings: &ProjectSettings, cx: &App) -> AnyElement {
+        let location = settings.project.root.as_deref().map_or_else(
+            || ".swarm/config.toml".to_owned(),
+            |root| format!("{} \u{b7} .swarm/config.toml", tilde(root)),
+        );
+
+        let status: Option<AnyElement> = if settings.load == Load::Loading {
+            Some(
+                StatusPill::new(AgentStatus::Working)
+                    .label("Loading")
+                    .into_any_element(),
+            )
+        } else {
+            settings.refusal.clone().map(|message| {
+                div()
+                    .id("project-refusal")
+                    .role(Role::Alert)
+                    .aria_label(message.clone())
+                    .debug_selector(|| "project-refusal".to_owned())
+                    .min_w_0()
+                    .text_size(px(12.))
+                    .text_color(Color::Del.hsla(cx))
+                    .child(message)
+                    .into_any_element()
+            })
+        };
+
+        h_flex()
+            .gap_3()
+            .child(
+                ProjectTile::new(settings.project.letter, settings.project.tile_color)
+                    .size(px(28.)),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .child(page_title(settings.project.name.clone()))
+                            .children(status),
+                    )
+                    .child(
+                        Label::new(location)
+                            .mono()
+                            .size(LabelSize::XSmall)
+                            .color(Color::Faint),
                     ),
-                ),
             )
             .into_any_element()
     }
 
-    fn copy_card(&self, index: usize, cx: &Context<Self>) -> Panel {
-        let state = &self.state;
-        let Some(settings) = state.read(cx).projects.get(index) else {
+    /// The error that makes the page read-only, and the button that reads the file again.
+    fn unreadable(index: usize, message: SharedString, cx: &Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors();
+
+        h_flex()
+            .id("config-error")
+            .role(Role::Alert)
+            .aria_label(message.clone())
+            .debug_selector(|| "config-error".to_owned())
+            .gap_3()
+            .px(px(14.))
+            .py(px(10.))
+            .rounded(px(10.))
+            .border_1()
+            .border_color(colors.line)
+            .bg(colors.del_bg)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Label::new(message).size(LabelSize::Small).color(Color::Del)),
+            )
+            .child(
+                Button::new(("reload-config", index), "Reload")
+                    .debug_selector(|| "reload-config".to_owned())
+                    .on_click(cx.listener(move |this, _, _, cx| this.load_project(index, cx))),
+            )
+            .into_any_element()
+    }
+
+    /// The files to copy into worktrees.
+    fn list_card(&self, index: usize, list: List, cx: &Context<Self>) -> Panel {
+        let (Some(settings), Some(inputs)) = (
+            self.state.read(cx).projects.get(index),
+            self.inputs.projects.get(index),
+        ) else {
             return Panel::new();
         };
+        let editable = settings.load.editable();
 
         settings
             .copy_files
             .iter()
+            .zip(&inputs.copy)
             .enumerate()
-            .fold(Panel::new(), |panel, (file_index, file)| {
-                let state = state.clone();
+            .fold(Panel::new(), |panel, (file_index, (file, row))| {
+                let remove = if file.trim().is_empty() {
+                    "Remove empty row".to_owned()
+                } else {
+                    format!("Stop copying {file}")
+                };
 
-                panel.row(removable_row(
+                panel.row(list_row(
+                    &row.input,
                     ("copy-remove", file_index),
-                    file.clone().into(),
-                    format!("Stop copying {file}"),
-                    move |_, _, cx| {
-                        state.update(cx, |state, cx| {
-                            state.remove_copy_file(index, file_index, cx);
-                        });
-                    },
+                    remove,
+                    editable,
+                    cx.listener(move |this, _, _, cx| {
+                        this.remove_item(index, list, file_index, cx);
+                    }),
                 ))
             })
             .row(add_row(
                 "add-file",
                 "Add file",
-                {
-                    let state = state.clone();
-                    move |_, _, cx| state.update(cx, |state, cx| state.add_copy_file(index, cx))
-                },
+                editable,
+                cx.listener(move |this, _, window, cx| this.add_item(index, list, window, cx)),
                 cx,
             ))
     }
@@ -555,46 +716,60 @@ impl SettingsWindow {
         ) else {
             return Panel::new();
         };
+        let editable = settings.load.editable();
 
-        settings
+        let required = {
+            let state = state.clone();
+
+            Switch::new(("checks-required", index), "Required to pass")
+                .toggle_state(settings.checks_required)
+                .disabled(!editable)
+                .on_toggle(move |on, _, cx| {
+                    state.update(cx, |state, cx| {
+                        if let Some(project) = state.projects.get_mut(index) {
+                            project.checks_required = on;
+                        }
+
+                        cx.notify();
+                    });
+                })
+        };
+
+        let panel = settings
             .checks
             .iter()
             .zip(&inputs.checks)
             .enumerate()
-            .fold(Panel::new(), |panel, (check_index, (check, input))| {
-                let row = plain_row()
-                    .child(div().flex_1().min_w_0().child(input.clone()))
-                    .child(
-                        IconButton::new(
-                            ("check-remove", check_index),
-                            IconName::Close,
-                            format!("Remove {check}"),
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.remove_check(index, check_index, cx);
-                        })),
-                    );
+            .fold(Panel::new(), |panel, (check_index, (check, row))| {
+                let remove = if check.trim().is_empty() {
+                    "Remove empty check".to_owned()
+                } else {
+                    format!("Remove {check}")
+                };
 
-                panel.row(row)
+                panel.row(list_row(
+                    &row.input,
+                    ("check-remove", check_index),
+                    remove,
+                    editable,
+                    cx.listener(move |this, _, _, cx| {
+                        this.remove_item(index, List::Checks, check_index, cx);
+                    }),
+                ))
             })
             .row(add_row(
                 "add-check",
                 "Add check",
-                cx.listener(move |this, _, _, cx| this.add_check(index, cx)),
+                editable,
+                cx.listener(move |this, _, window, cx| {
+                    this.add_item(index, List::Checks, window, cx);
+                }),
                 cx,
             ))
-            .row(switch_row(
-                state,
-                ("checks-required", index),
-                "Required to pass",
-                settings.checks_required,
-                move |state, on| {
-                    if let Some(project) = state.projects.get_mut(index) {
-                        project.checks_required = on;
-                    }
-                },
-            ))
-            .row(
+            .row(PanelRow::new("Required to pass").end_slot(required));
+
+        if settings.load == Load::Sample {
+            panel.row(
                 PanelRow::new("Git pre-push hook").end_slot(
                     h_flex()
                         .gap_2()
@@ -607,5 +782,44 @@ impl SettingsWindow {
                         .child(StatusPill::new(AgentStatus::Done).label("Detected")),
                 ),
             )
+        } else {
+            panel
+        }
+    }
+
+    /// The prompts the project overrides in `.swarm/prompts/`. `None` when there are none.
+    fn prompts_card(&self, index: usize, cx: &Context<Self>) -> Option<Panel> {
+        let settings = self.state.read(cx).projects.get(index)?;
+
+        if settings.prompts.is_empty() {
+            return None;
+        }
+
+        let panel = settings.prompts.iter().enumerate().fold(
+            Panel::new(),
+            |panel, (prompt_index, prompt)| {
+                let path = prompt.path.clone();
+
+                let open = Button::new(("open-prompt", prompt_index), "Open")
+                    .accessible_label(format!("Open {}", prompt.name))
+                    .debug_selector(move || format!("open-prompt-{prompt_index}"))
+                    .on_click(move |_, _, cx| open_file(&path, cx));
+
+                panel.row(
+                    plain_row()
+                        .child(
+                            div().flex_1().min_w_0().child(
+                                Label::new(format!("{}.md", prompt.name))
+                                    .mono()
+                                    .size(LabelSize::Small)
+                                    .truncate(),
+                            ),
+                        )
+                        .child(open),
+                )
+            },
+        );
+
+        Some(panel)
     }
 }

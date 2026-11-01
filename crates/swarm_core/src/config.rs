@@ -1,10 +1,25 @@
 //! `.swarm/config.toml`: per-repository settings, edited by hand.
 
-use std::path::{Component, Path};
+use std::fmt::Write as _;
+use std::io::Write as _;
+use std::ops::Range;
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 use serde::Deserialize;
+use swarm_protocol::ProjectConfigFields;
+use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, TableLike, TomlError, Value};
+
+use crate::Error;
 
 const DEFAULT_FOLDER: &str = ".worktrees";
+const CONFIG_FOLDER: &str = ".swarm";
+const CONFIG_FILE: &str = "config.toml";
+
+/// Saves read the file and write it back, so two saves must not interleave.
+static SAVING: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default)]
@@ -73,11 +88,7 @@ pub struct ChecksConfig {
 impl ChecksConfig {
     /// The commands to run: trimmed, without empty ones.
     pub fn commands(&self) -> Vec<String> {
-        self.before_pr
-            .iter()
-            .map(|command| command.trim().to_owned())
-            .filter(|command| !command.is_empty())
-            .collect()
+        filled(&self.before_pr)
     }
 }
 
@@ -90,43 +101,100 @@ pub struct LoadedConfig {
 
 impl ProjectConfig {
     pub fn parse(text: &str) -> Result<Self, String> {
-        let config: Self = toml::from_str(text).map_err(|error| error.to_string())?;
+        let config = Self::read(text)?;
         config.validate()?;
 
         Ok(config)
     }
 
+    /// The text as settings, without looking at the values.
+    fn read(text: &str) -> Result<Self, String> {
+        toml::from_str(text).map_err(|error| does_not_parse(text, error.message(), error.span()))
+    }
+
     fn validate(&self) -> Result<(), String> {
-        let folder = Path::new(&self.worktrees.folder);
-        let inside = !self.worktrees.folder.is_empty()
-            && folder
-                .components()
-                .all(|component| matches!(component, Component::Normal(_)));
-        if !inside {
-            return Err(format!(
-                "worktrees.folder {:?} must be a folder inside the repository",
-                self.worktrees.folder
-            ));
-        }
+        check_folder(&self.worktrees.folder)?;
 
         if let Some(ports) = &self.worktrees.ports {
-            let (first, last) = ports.bounds()?;
-            let size = u32::from(last) - u32::from(first) + 1;
-            if ports.per_worktree == 0 || u32::from(ports.per_worktree) > size {
-                return Err(format!(
-                    "ports.per_worktree must be between 1 and {size}, the size of the range"
-                ));
-            }
+            check_ports(ports)?;
         }
 
         Ok(())
     }
+
+    /// What Settings › Projects shows.
+    pub fn fields(&self) -> ProjectConfigFields {
+        let (port_range, ports_per_worktree) = match &self.worktrees.ports {
+            Some(ports) => (ports.range.clone(), ports.per_worktree),
+            None => (String::new(), 0),
+        };
+
+        ProjectConfigFields {
+            base_branch: self
+                .worktrees
+                .base_branch
+                .clone()
+                .filter(|branch| !branch.trim().is_empty()),
+            worktree_folder: self.worktrees.folder.clone(),
+            port_range,
+            ports_per_worktree,
+            copy: self.worktrees.copy.clone(),
+            setup: self.worktrees.setup.clone(),
+            teardown: self.worktrees.teardown.clone(),
+            checks: self.checks.before_pr.clone(),
+            checks_required: self.checks.required,
+        }
+    }
+}
+
+fn check_folder(folder: &str) -> Result<(), String> {
+    if is_inside_repository(folder) {
+        return Ok(());
+    }
+
+    Err(format!(
+        "worktrees.folder {folder:?} must be a folder inside the repository"
+    ))
+}
+
+fn check_ports(ports: &PortRange) -> Result<(), String> {
+    let (first, last) = ports.bounds()?;
+
+    let size = u32::from(last) - u32::from(first) + 1;
+    if ports.per_worktree == 0 || u32::from(ports.per_worktree) > size {
+        return Err(format!(
+            "ports.per_worktree must be between 1 and {size}, the size of the range"
+        ));
+    }
+
+    Ok(())
+}
+
+fn check_copy(entries: &[String]) -> Result<(), String> {
+    match entries.iter().find(|entry| !is_inside_repository(entry)) {
+        Some(entry) => Err(format!(
+            "worktrees.copy {entry:?} must be a path inside the repository"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// A relative path that stays inside the folder it is relative to.
+pub(crate) fn is_inside_repository(path: &str) -> bool {
+    !path.is_empty()
+        && Path::new(path)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+fn config_path(root: &Path) -> PathBuf {
+    root.join(CONFIG_FOLDER).join(CONFIG_FILE)
 }
 
 /// Reads `<root>/.swarm/config.toml`. A missing file gives the defaults; an invalid
 /// one gives the defaults and the reason.
 pub fn load(root: &Path) -> LoadedConfig {
-    let path = root.join(".swarm").join("config.toml");
+    let path = config_path(root);
 
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
@@ -151,6 +219,452 @@ pub fn load(root: &Path) -> LoadedConfig {
             error: Some(error),
         },
     }
+}
+
+/// What Settings › Projects shows: the fields of `<root>/.swarm/config.toml` and, when the
+/// file has a problem, why. A file with a problem gives the defaults.
+pub fn read_fields(root: &Path) -> (ProjectConfigFields, Option<String>) {
+    let LoadedConfig { config, error } = load(root);
+
+    (config.fields(), error)
+}
+
+/// Writes the fields that differ from `base` into `<root>/.swarm/config.toml` and keeps
+/// everything else: comments, key order, the keys Swarm does not show and the fields the
+/// caller did not change, even when a hand edit changed them since `base`. A file that
+/// does not parse is left as it is.
+pub fn save(
+    root: &Path,
+    base: &ProjectConfigFields,
+    fields: &ProjectConfigFields,
+) -> Result<(), Error> {
+    let base = tidy(base);
+    let wanted = tidy(fields);
+
+    let changed: Vec<Field> = Field::ALL
+        .into_iter()
+        .filter(|field| field.differs(&base, &wanted))
+        .collect();
+    if changed.is_empty() {
+        return Ok(());
+    }
+
+    for field in &changed {
+        field.check(&wanted).map_err(Error::Invalid)?;
+    }
+
+    let _saving = SAVING.lock().unwrap_or_else(PoisonError::into_inner);
+
+    let path = writable_path(root)?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(source) => {
+            return Err(Error::Io {
+                action: format!("read {}", path.display()),
+                source,
+            });
+        }
+    };
+
+    ProjectConfig::read(&text).map_err(Error::Invalid)?;
+    let mut document: DocumentMut = text.parse().map_err(|error: TomlError| {
+        Error::Invalid(does_not_parse(&text, error.message(), error.span()))
+    })?;
+
+    for field in changed {
+        field.change(&wanted).apply(&mut document);
+    }
+
+    let updated = document.to_string();
+    if updated == text {
+        return Ok(());
+    }
+
+    write_resolved(&path, &updated)
+}
+
+/// The real path of the config file. A symlink on the way may not lead out of the
+/// repository.
+fn writable_path(root: &Path) -> Result<PathBuf, Error> {
+    let real_root = root.canonicalize().map_err(|source| Error::Io {
+        action: format!("read {}", root.display()),
+        source,
+    })?;
+
+    let folder = resolve_inside(&real_root, real_root.join(CONFIG_FOLDER), CONFIG_FOLDER)?;
+    let file = folder.join(CONFIG_FILE);
+    let name = format!("{CONFIG_FOLDER}/{CONFIG_FILE}");
+
+    resolve_inside(&real_root, file, &name)
+}
+
+/// `path` with its symlinks resolved, when it exists. It must lie inside `real_root`.
+fn resolve_inside(real_root: &Path, path: PathBuf, name: &str) -> Result<PathBuf, Error> {
+    let resolved = match path.canonicalize() {
+        Ok(resolved) => resolved,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => path,
+        Err(source) => {
+            return Err(Error::Io {
+                action: format!("read {}", path.display()),
+                source,
+            });
+        }
+    };
+
+    if !resolved.starts_with(real_root) {
+        return Err(Error::Invalid(format!(
+            "{name} leads outside the repository"
+        )));
+    }
+
+    Ok(resolved)
+}
+
+/// The fields as the app sends them: a blank base branch is none, and the lists are
+/// trimmed without blank entries.
+fn tidy(fields: &ProjectConfigFields) -> ProjectConfigFields {
+    ProjectConfigFields {
+        base_branch: fields
+            .base_branch
+            .clone()
+            .filter(|branch| !branch.trim().is_empty()),
+        copy: filled(&fields.copy),
+        checks: filled(&fields.checks),
+        ..fields.clone()
+    }
+}
+
+/// The entries trimmed, without the blank ones.
+fn filled(entries: &[String]) -> Vec<String> {
+    entries
+        .iter()
+        .map(|entry| entry.trim().to_owned())
+        .filter(|entry| !entry.is_empty())
+        .collect()
+}
+
+/// `message` is the reason, and `span` where in `text` it was found.
+fn does_not_parse(text: &str, message: &str, span: Option<Range<usize>>) -> String {
+    let place = span
+        .and_then(|span| text.get(..span.start))
+        .map(|before| format!("line {}: ", before.matches('\n').count() + 1))
+        .unwrap_or_default();
+
+    format!("{CONFIG_FOLDER}/{CONFIG_FILE} does not parse: {place}{message}")
+}
+
+/// One field of Settings › Projects. A save compares, checks and writes them one by one.
+#[derive(Clone, Copy)]
+enum Field {
+    BaseBranch,
+    Folder,
+    Ports,
+    Copy,
+    Setup,
+    Teardown,
+    Checks,
+    ChecksRequired,
+}
+
+impl Field {
+    /// In the order they are written.
+    const ALL: [Self; 8] = [
+        Self::BaseBranch,
+        Self::Folder,
+        Self::Ports,
+        Self::Copy,
+        Self::Setup,
+        Self::Teardown,
+        Self::Checks,
+        Self::ChecksRequired,
+    ];
+
+    fn differs(self, base: &ProjectConfigFields, wanted: &ProjectConfigFields) -> bool {
+        match self {
+            Self::BaseBranch => base.base_branch != wanted.base_branch,
+            Self::Folder => base.worktree_folder != wanted.worktree_folder,
+            Self::Ports => reserved_ports(base) != reserved_ports(wanted),
+            Self::Copy => base.copy != wanted.copy,
+            Self::Setup => base.setup != wanted.setup,
+            Self::Teardown => base.teardown != wanted.teardown,
+            Self::Checks => base.checks != wanted.checks,
+            Self::ChecksRequired => base.checks_required != wanted.checks_required,
+        }
+    }
+
+    /// The checks a file gets when it is read, plus the one for the copy list.
+    fn check(self, wanted: &ProjectConfigFields) -> Result<(), String> {
+        match self {
+            Self::Folder => check_folder(&wanted.worktree_folder),
+            Self::Ports => reserved_ports(wanted).map_or(Ok(()), |(range, per_worktree)| {
+                check_ports(&PortRange {
+                    range: range.to_owned(),
+                    per_worktree,
+                })
+            }),
+            Self::Copy => check_copy(&wanted.copy),
+            Self::BaseBranch
+            | Self::Setup
+            | Self::Teardown
+            | Self::Checks
+            | Self::ChecksRequired => Ok(()),
+        }
+    }
+
+    /// The edit that writes the field.
+    fn change(self, wanted: &ProjectConfigFields) -> Change {
+        match self {
+            Self::BaseBranch => match &wanted.base_branch {
+                Some(branch) => Change::set(WORKTREES, "base_branch", Value::from(branch.as_str())),
+                None => Change::Remove {
+                    table: WORKTREES,
+                    key: "base_branch",
+                },
+            },
+            Self::Folder => Change::set(
+                WORKTREES,
+                "folder",
+                Value::from(wanted.worktree_folder.as_str()),
+            ),
+            Self::Ports => match reserved_ports(wanted) {
+                Some((range, per_worktree)) => Change::Ports {
+                    range: range.to_owned(),
+                    per_worktree,
+                },
+                None => Change::Remove {
+                    table: WORKTREES,
+                    key: "ports",
+                },
+            },
+            Self::Copy => Change::set(WORKTREES, "copy", string_array(&wanted.copy)),
+            Self::Setup => Change::set(WORKTREES, "setup", string_value(&wanted.setup)),
+            Self::Teardown => Change::set(WORKTREES, "teardown", string_value(&wanted.teardown)),
+            Self::Checks => Change::set(CHECKS, "before_pr", string_array(&wanted.checks)),
+            Self::ChecksRequired => {
+                Change::set(CHECKS, "required", Value::from(wanted.checks_required))
+            }
+        }
+    }
+}
+
+const WORKTREES: &str = "worktrees";
+const CHECKS: &str = "checks";
+
+/// One edit of the document.
+enum Change {
+    Set {
+        table: &'static str,
+        key: &'static str,
+        value: Value,
+    },
+    Remove {
+        table: &'static str,
+        key: &'static str,
+    },
+    /// Sets `ports`, keeping its other keys when the file has them.
+    Ports { range: String, per_worktree: u16 },
+}
+
+impl Change {
+    fn set(table: &'static str, key: &'static str, value: Value) -> Self {
+        Self::Set { table, key, value }
+    }
+
+    fn apply(self, document: &mut DocumentMut) {
+        match self {
+            Self::Set { table, key, value } => {
+                with_table(document, table, true, |table| set_value(table, key, value));
+            }
+            Self::Remove { table, key } => {
+                with_table(document, table, false, |table| {
+                    table.remove(key);
+                });
+            }
+            Self::Ports {
+                range,
+                per_worktree,
+            } => with_table(document, WORKTREES, true, |table| {
+                let per_worktree = Value::from(i64::from(per_worktree));
+
+                if let Some(ports) = table.get_mut("ports").and_then(Item::as_table_like_mut) {
+                    set_value(ports, "range", Value::from(range));
+                    set_value(ports, "per_worktree", per_worktree);
+
+                    return;
+                }
+
+                let mut ports = InlineTable::new();
+                ports.insert("range", Value::from(range));
+                ports.insert("per_worktree", per_worktree);
+                ports.fmt();
+                table.insert("ports", Item::Value(Value::InlineTable(ports)));
+            }),
+        }
+    }
+}
+
+/// The range and its size per worktree; none when the range is empty.
+fn reserved_ports(fields: &ProjectConfigFields) -> Option<(&str, u16)> {
+    (!fields.port_range.is_empty())
+        .then_some((fields.port_range.as_str(), fields.ports_per_worktree))
+}
+
+/// Runs `edit` on the table under `name`. A missing table is made when `create` is set.
+/// Inline tables and dotted keys count as tables.
+fn with_table(
+    document: &mut DocumentMut,
+    name: &str,
+    create: bool,
+    edit: impl FnOnce(&mut dyn TableLike),
+) {
+    if !document.get(name).is_some_and(Item::is_table_like) {
+        if !create {
+            return;
+        }
+
+        let mut table = Table::new();
+        table.decor_mut().set_prefix(new_table_prefix(document));
+        document.insert(name, Item::Table(table));
+    }
+
+    if let Some(table) = document.get_mut(name).and_then(Item::as_table_like_mut) {
+        edit(table);
+    }
+}
+
+/// A new table follows a blank line. Comments at the end of the file move above it, so
+/// they stay after what they followed.
+fn new_table_prefix(document: &mut DocumentMut) -> String {
+    let comments = document.trailing().as_str().unwrap_or_default().to_owned();
+
+    if !comments.trim().is_empty() {
+        document.set_trailing("");
+
+        let newline = if comments.ends_with('\n') { "" } else { "\n" };
+
+        return format!("{comments}{newline}\n");
+    }
+
+    if document.is_empty() {
+        String::new()
+    } else {
+        "\n".to_owned()
+    }
+}
+
+/// Replaces a value and keeps the comment and spacing around it.
+fn set_value(table: &mut dyn TableLike, key: &str, mut value: Value) {
+    if let Some(Item::Value(existing)) = table.get_mut(key) {
+        *value.decor_mut() = existing.decor().clone();
+        *existing = value;
+    } else {
+        table.insert(key, Item::Value(value));
+    }
+}
+
+fn string_array(entries: &[String]) -> Value {
+    Value::Array(entries.iter().map(String::as_str).collect::<Array>())
+}
+
+/// A text with several lines becomes a multi-line basic string, like the PLAN example.
+fn string_value(text: &str) -> Value {
+    if !text.contains('\n') {
+        return Value::from(text);
+    }
+
+    let mut raw = String::from("\"\"\"\n");
+    let mut quotes = 0;
+    for character in text.chars() {
+        quotes = if character == '"' { quotes + 1 } else { 0 };
+
+        match character {
+            '\\' => raw.push_str("\\\\"),
+            '"' if quotes == 3 => {
+                raw.push_str("\\\"");
+                quotes = 0;
+            }
+            '\r' => raw.push_str("\\r"),
+            '\n' | '\t' => raw.push(character),
+            other if other.is_control() => {
+                write!(raw, "\\u{:04X}", u32::from(other)).ok();
+            }
+            other => raw.push(other),
+        }
+    }
+
+    // Quotes right before the closing delimiter would join it.
+    raw.truncate(raw.len() - quotes);
+    raw.push_str(&"\\\"".repeat(quotes));
+    raw.push_str("\"\"\"");
+
+    raw.parse::<Value>().unwrap_or_else(|_| Value::from(text))
+}
+
+/// Writes the file whole or not at all: a temp file next to it, then a rename. A
+/// symlink is followed, so the link stays.
+pub(crate) fn write_atomic(path: &Path, text: &str) -> Result<(), Error> {
+    let target = path.canonicalize().unwrap_or_else(|_| path.to_owned());
+
+    write_resolved(&target, text)
+}
+
+/// Like [`write_atomic`] for a `target` that has no symlink left to follow.
+fn write_resolved(target: &Path, text: &str) -> Result<(), Error> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    let io_error = |source| Error::Io {
+        action: format!("write {}", target.display()),
+        source,
+    };
+
+    let name = target
+        .file_name()
+        .map_or_else(|| "file".into(), |name| name.to_string_lossy());
+    let temporary = target.with_file_name(format!(
+        ".{name}.{}-{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    if let Some(folder) = target.parent() {
+        std::fs::create_dir_all(folder).map_err(io_error)?;
+    }
+
+    let existing = std::fs::metadata(target).ok();
+    let mode = existing
+        .as_ref()
+        .map_or(0o666, |existing| existing.permissions().mode() & 0o7777);
+    let mut file = create_new(&temporary, mode).map_err(io_error)?;
+
+    let written = file.write_all(text.as_bytes()).and_then(|()| {
+        if let Some(existing) = &existing {
+            file.set_permissions(existing.permissions())?;
+        }
+
+        file.sync_all()
+    });
+    let renamed = written.and_then(|()| std::fs::rename(&temporary, target));
+
+    if let Err(source) = renamed {
+        if let Err(error) = std::fs::remove_file(&temporary) {
+            log::debug!("cannot remove {}: {error}", temporary.display());
+        }
+
+        return Err(io_error(source));
+    }
+
+    Ok(())
+}
+
+/// Makes the file with `mode` from the start. It fails when `path` is taken, also by a
+/// symlink, so the text never goes through a link someone planted.
+fn create_new(path: &Path, mode: u32) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(path)
 }
 
 #[cfg(test)]
@@ -253,5 +767,1011 @@ required = true
     fn a_folder_outside_the_repository_is_an_error() {
         assert!(ProjectConfig::parse("[worktrees]\nfolder = \"../x\"\n").is_err());
         assert!(ProjectConfig::parse("[worktrees]\nfolder = \"/x\"\n").is_err());
+    }
+
+    struct Repo {
+        root: PathBuf,
+    }
+
+    impl Repo {
+        fn new(name: &str) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+
+            let root = std::env::temp_dir().join(format!(
+                "swarm-config-{}-{}-{name}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&root).expect("folder");
+
+            Self { root }
+        }
+
+        fn with_config(name: &str, text: &str) -> Self {
+            let repo = Self::new(name);
+            std::fs::create_dir_all(repo.root.join(".swarm")).expect("folder");
+            std::fs::write(repo.file(), text).expect("file");
+
+            repo
+        }
+
+        fn file(&self) -> PathBuf {
+            config_path(&self.root)
+        }
+
+        fn text(&self) -> String {
+            std::fs::read_to_string(self.file()).expect("config file")
+        }
+
+        fn fields(&self) -> ProjectConfigFields {
+            read_fields(&self.root).0
+        }
+
+        /// What the app does: read the fields, change some, save all of them.
+        fn save(&self, edit: impl FnOnce(&mut ProjectConfigFields)) -> Result<(), Error> {
+            let base = self.fields();
+            let mut fields = base.clone();
+            edit(&mut fields);
+
+            save(&self.root, &base, &fields)
+        }
+    }
+
+    impl Drop for Repo {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.root).ok();
+        }
+    }
+
+    type Edit = fn(&mut ProjectConfigFields);
+
+    fn refusal(result: Result<(), Error>) -> String {
+        match result {
+            Err(Error::Invalid(message)) => message,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    fn every_field_set() -> ProjectConfigFields {
+        ProjectConfigFields {
+            base_branch: Some("develop".to_owned()),
+            worktree_folder: ".trees/tasks".to_owned(),
+            port_range: "6000-6099".to_owned(),
+            ports_per_worktree: 4,
+            copy: vec![".env".to_owned(), "config/local.toml".to_owned()],
+            setup: "cargo fetch\npnpm install\n".to_owned(),
+            teardown: "docker compose down".to_owned(),
+            checks: vec!["cargo test".to_owned(), "cargo fmt --check".to_owned()],
+            checks_required: true,
+        }
+    }
+
+    fn default_fields() -> ProjectConfigFields {
+        ProjectConfig::default().fields()
+    }
+
+    const RICH: &str = r#"# Swarm settings for this repo
+
+[worktrees] # where tasks live
+base_branch = "main"
+folder   =   ".worktrees"   # keep it out of the way
+future_key = 42
+copy = [
+    ".env",   # secrets
+    "CLAUDE.local.md",
+]
+setup = "cargo fetch"
+
+# my own tool
+[tools.fmt]
+enabled = true
+
+[checks]
+before_pr = ["cargo test"]
+required = false # flip when stable
+"#;
+
+    #[test]
+    fn the_fields_of_the_plan_example_are_the_file_values() {
+        let config = ProjectConfig::parse(PLAN_EXAMPLE).expect("config");
+
+        assert_eq!(
+            config.fields(),
+            ProjectConfigFields {
+                base_branch: Some("main".to_owned()),
+                worktree_folder: ".worktrees".to_owned(),
+                port_range: "5170-5199".to_owned(),
+                ports_per_worktree: 3,
+                copy: vec![".env".to_owned(), "CLAUDE.local.md".to_owned()],
+                setup: "cargo fetch\npnpm --dir docs install --frozen-lockfile\n".to_owned(),
+                teardown: String::new(),
+                checks: vec![
+                    "cargo test --workspace".to_owned(),
+                    "cargo clippy -- -D warnings".to_owned(),
+                    "cargo fmt --check".to_owned(),
+                ],
+                checks_required: true,
+            }
+        );
+    }
+
+    #[test]
+    fn without_ports_the_fields_have_an_empty_range_and_zero_ports() {
+        let fields = ProjectConfig::default().fields();
+
+        assert_eq!(fields.port_range, "");
+        assert_eq!(fields.ports_per_worktree, 0);
+        assert_eq!(fields.worktree_folder, ".worktrees");
+        assert_eq!(fields.base_branch, None);
+    }
+
+    #[test]
+    fn a_missing_file_reads_as_the_defaults_without_an_error() {
+        let repo = Repo::new("read-missing");
+
+        let (fields, error) = read_fields(&repo.root);
+
+        assert_eq!(fields, ProjectConfig::default().fields());
+        assert_eq!(error, None);
+    }
+
+    #[test]
+    fn a_file_that_does_not_parse_reads_as_the_defaults_with_the_message() {
+        let repo = Repo::with_config("read-broken", "[worktrees\nbroken");
+
+        let (fields, error) = read_fields(&repo.root);
+
+        assert_eq!(fields, ProjectConfig::default().fields());
+        assert!(error.is_some_and(|message| !message.is_empty()));
+    }
+
+    #[test]
+    fn a_blank_base_branch_reads_as_none() {
+        for blank in ["", "  ", " \t"] {
+            let repo = Repo::with_config(
+                "read-blank-branch",
+                &format!("[worktrees]\nbase_branch = \"{blank}\"\n"),
+            );
+
+            assert_eq!(repo.fields().base_branch, None, "{blank:?}");
+        }
+    }
+
+    #[test]
+    fn every_field_survives_a_save_into_a_missing_file() {
+        let repo = Repo::new("round-trip");
+
+        save(&repo.root, &repo.fields(), &every_field_set()).expect("save");
+
+        assert_eq!(repo.fields(), every_field_set());
+        assert_eq!(read_fields(&repo.root).1, None);
+    }
+
+    #[test]
+    fn each_field_survives_a_save_on_its_own() {
+        let edits: [(&str, Edit); 9] = [
+            ("base_branch", |fields| {
+                fields.base_branch = Some("develop".to_owned());
+            }),
+            ("folder", |fields| {
+                fields.worktree_folder = ".trees".to_owned();
+            }),
+            ("ports", |fields| {
+                fields.port_range = "6000-6009".to_owned();
+                fields.ports_per_worktree = 2;
+            }),
+            ("copy", |fields| fields.copy = vec![".env".to_owned()]),
+            ("setup", |fields| fields.setup = "make setup".to_owned()),
+            ("teardown", |fields| {
+                fields.teardown = "make clean\nmake reset\n".to_owned();
+            }),
+            ("checks", |fields| {
+                fields.checks = vec!["cargo test".to_owned()];
+            }),
+            ("required", |fields| fields.checks_required = true),
+            ("branch_none", |fields| fields.base_branch = None),
+        ];
+
+        for (name, edit) in edits {
+            let repo = Repo::with_config(name, RICH);
+            let mut expected = repo.fields();
+            edit(&mut expected);
+
+            repo.save(edit).expect(name);
+
+            assert_eq!(repo.fields(), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_save_that_changes_one_field_keeps_comments_unknown_keys_and_formatting() {
+        let repo = Repo::with_config("keeps", RICH);
+
+        repo.save(|fields| fields.checks_required = true)
+            .expect("save");
+
+        assert_eq!(
+            repo.text(),
+            RICH.replace(
+                "required = false # flip when stable",
+                "required = true # flip when stable"
+            )
+        );
+    }
+
+    #[test]
+    fn a_changed_value_keeps_the_comment_and_spacing_around_it() {
+        let repo = Repo::with_config("decor", RICH);
+
+        repo.save(|fields| fields.worktree_folder = ".trees".to_owned())
+            .expect("save");
+
+        assert_eq!(
+            repo.text(),
+            RICH.replace(
+                "folder   =   \".worktrees\"   # keep it out of the way",
+                "folder   =   \".trees\"   # keep it out of the way"
+            )
+        );
+    }
+
+    #[test]
+    fn a_changed_list_is_replaced_in_place() {
+        let repo = Repo::with_config("list", RICH);
+
+        repo.save(|fields| fields.copy = vec![".env".to_owned(), "a/b".to_owned()])
+            .expect("save");
+
+        assert_eq!(
+            repo.text(),
+            RICH.replace(
+                "copy = [\n    \".env\",   # secrets\n    \"CLAUDE.local.md\",\n]",
+                "copy = [\".env\", \"a/b\"]"
+            )
+        );
+    }
+
+    #[test]
+    fn saving_the_fields_as_they_are_changes_nothing() {
+        let repo = Repo::with_config("same", RICH);
+
+        repo.save(|_| {}).expect("save");
+
+        assert_eq!(repo.text(), RICH);
+    }
+
+    #[test]
+    fn a_field_equal_to_its_default_is_not_added() {
+        let repo = Repo::with_config("defaults", "[checks]\nrequired = true\n");
+
+        repo.save(|fields| fields.copy = Vec::new()).expect("save");
+        repo.save(|fields| fields.teardown = String::new())
+            .expect("save");
+        repo.save(|fields| fields.worktree_folder = DEFAULT_FOLDER.to_owned())
+            .expect("save");
+
+        assert_eq!(repo.text(), "[checks]\nrequired = true\n");
+    }
+
+    #[test]
+    fn a_new_field_is_added_next_to_the_ones_in_the_file() {
+        let repo = Repo::with_config("add", "[checks]\nrequired = true\n");
+
+        repo.save(|fields| {
+            fields.base_branch = Some("main".to_owned());
+            fields.teardown = "echo bye".to_owned();
+        })
+        .expect("save");
+
+        assert_eq!(
+            repo.text(),
+            "[checks]\nrequired = true\n\n[worktrees]\nbase_branch = \"main\"\nteardown = \"echo bye\"\n"
+        );
+    }
+
+    #[test]
+    fn a_missing_file_and_folder_are_made_when_something_changes() {
+        let repo = Repo::new("missing");
+        assert!(!repo.root.join(".swarm").exists());
+
+        repo.save(|fields| {
+            fields.base_branch = Some("main".to_owned());
+            fields.checks = vec!["cargo test".to_owned()];
+            fields.checks_required = true;
+        })
+        .expect("save");
+
+        assert_eq!(
+            repo.text(),
+            "[worktrees]\nbase_branch = \"main\"\n\n[checks]\nbefore_pr = [\"cargo test\"]\nrequired = true\n"
+        );
+    }
+
+    #[test]
+    fn saving_the_defaults_makes_no_file() {
+        let repo = Repo::new("missing-defaults");
+
+        repo.save(|_| {}).expect("save");
+
+        assert!(!repo.root.join(".swarm").exists());
+    }
+
+    #[test]
+    fn a_range_of_ports_is_written_as_an_inline_table() {
+        let repo = Repo::new("ports");
+
+        repo.save(|fields| {
+            fields.port_range = "5170-5199".to_owned();
+            fields.ports_per_worktree = 3;
+        })
+        .expect("save");
+
+        assert_eq!(
+            repo.text(),
+            "[worktrees]\nports = { range = \"5170-5199\", per_worktree = 3 }\n"
+        );
+    }
+
+    #[test]
+    fn changing_the_ports_keeps_the_table_they_are_in() {
+        let inline = Repo::with_config(
+            "ports-inline",
+            "[worktrees]\nports = { range = \"5170-5199\", per_worktree = 3 } # dev servers\n",
+        );
+        let standard = Repo::with_config(
+            "ports-standard",
+            "[worktrees.ports]\nrange = \"5170-5199\"\nper_worktree = 3\n",
+        );
+
+        inline
+            .save(|fields| fields.ports_per_worktree = 5)
+            .expect("save");
+        standard
+            .save(|fields| fields.port_range = "5000-5099".to_owned())
+            .expect("save");
+
+        assert_eq!(
+            inline.text(),
+            "[worktrees]\nports = { range = \"5170-5199\", per_worktree = 5 } # dev servers\n"
+        );
+        assert_eq!(
+            standard.text(),
+            "[worktrees.ports]\nrange = \"5000-5099\"\nper_worktree = 3\n"
+        );
+    }
+
+    #[test]
+    fn an_empty_range_removes_the_ports() {
+        let inline = Repo::with_config(
+            "no-ports-inline",
+            "[worktrees]\nfolder = \".trees\"\nports = { range = \"5170-5199\", per_worktree = 3 }\ncopy = [\".env\"]\n",
+        );
+        let standard = Repo::with_config(
+            "no-ports-standard",
+            "[worktrees]\nfolder = \".trees\"\n\n[worktrees.ports]\nrange = \"5170-5199\"\nper_worktree = 3\n\n[checks]\nrequired = true\n",
+        );
+
+        for repo in [&inline, &standard] {
+            repo.save(|fields| {
+                fields.port_range = String::new();
+                fields.ports_per_worktree = 0;
+            })
+            .expect("save");
+        }
+
+        assert_eq!(
+            inline.text(),
+            "[worktrees]\nfolder = \".trees\"\ncopy = [\".env\"]\n"
+        );
+        assert_eq!(
+            standard.text(),
+            "[worktrees]\nfolder = \".trees\"\n\n[checks]\nrequired = true\n"
+        );
+        assert_eq!(inline.fields().port_range, "");
+        assert_eq!(standard.fields().ports_per_worktree, 0);
+    }
+
+    #[test]
+    fn several_lines_of_setup_are_written_as_a_multi_line_basic_string() {
+        let repo = Repo::new("multi-line");
+
+        repo.save(|fields| {
+            fields.setup = "cargo fetch\npnpm --dir docs install --frozen-lockfile\n".to_owned();
+            fields.teardown = "docker compose down\nrm -rf tmp".to_owned();
+        })
+        .expect("save");
+
+        assert_eq!(
+            repo.text(),
+            "[worktrees]\nsetup = \"\"\"\ncargo fetch\npnpm --dir docs install --frozen-lockfile\n\"\"\"\nteardown = \"\"\"\ndocker compose down\nrm -rf tmp\"\"\"\n"
+        );
+        assert_eq!(
+            repo.fields().setup,
+            "cargo fetch\npnpm --dir docs install --frozen-lockfile\n"
+        );
+        assert_eq!(repo.fields().teardown, "docker compose down\nrm -rf tmp");
+    }
+
+    #[test]
+    fn several_lines_with_quotes_and_backslashes_are_still_a_basic_string() {
+        let repo = Repo::new("basic-string");
+
+        repo.save(|fields| fields.setup = "echo \"hi\"\nprintf 'a\\n'\n".to_owned())
+            .expect("save");
+
+        assert_eq!(
+            repo.text(),
+            "[worktrees]\nsetup = \"\"\"\necho \"hi\"\nprintf 'a\\\\n'\n\"\"\"\n"
+        );
+    }
+
+    #[test]
+    fn a_multi_line_value_keeps_the_comment_after_the_key() {
+        let repo = Repo::with_config("multi-line-comment", RICH);
+
+        repo.save(|fields| fields.setup = "cargo fetch\ncargo build\n".to_owned())
+            .expect("save");
+
+        assert_eq!(
+            repo.text(),
+            RICH.replace(
+                "setup = \"cargo fetch\"",
+                "setup = \"\"\"\ncargo fetch\ncargo build\n\"\"\""
+            )
+        );
+    }
+
+    #[test]
+    fn special_characters_in_several_lines_survive() {
+        let setups = [
+            "echo \"a\" \"\"\"b\"\"\" \"\"\"\"\nx\n",
+            "one\ntwo \\ three\\\nfour\n\"",
+            "\"\"\n\"\"",
+            "tab\there\r\nwindows\n\u{1}bell\u{7f}",
+            "\n\nleading newlines",
+            "multi\nline with 'single' quotes and é ü 🐝\n",
+        ];
+
+        for (number, setup) in setups.into_iter().enumerate() {
+            let repo = Repo::new(&format!("special-{number}"));
+
+            repo.save(|fields| fields.setup = setup.to_owned())
+                .expect("save");
+
+            assert_eq!(repo.fields().setup, setup, "{setup:?}");
+            assert_eq!(read_fields(&repo.root).1, None, "{setup:?}");
+        }
+    }
+
+    #[test]
+    fn a_blank_base_branch_is_saved_as_none() {
+        let repo = Repo::with_config("blank-branch", RICH);
+
+        repo.save(|fields| fields.base_branch = Some("  ".to_owned()))
+            .expect("save");
+
+        assert!(!repo.text().contains("base_branch"));
+        assert_eq!(repo.fields().base_branch, None);
+    }
+
+    #[test]
+    fn a_folder_outside_the_repository_is_refused() {
+        for folder in ["../x", "/x", "", "a/../../b", "./x"] {
+            let repo = Repo::new("folder");
+
+            let message = refusal(repo.save(|fields| fields.worktree_folder = folder.to_owned()));
+
+            assert!(message.contains("worktrees.folder"), "{folder}: {message}");
+            assert!(!repo.root.join(".swarm").exists(), "{folder}");
+        }
+    }
+
+    #[test]
+    fn a_port_range_that_does_not_look_like_a_range_is_refused() {
+        for range in [
+            "5199-5170",
+            "abc",
+            "5170",
+            "5170-",
+            "0-10",
+            "5170-70000",
+            " ",
+        ] {
+            let repo = Repo::new("range");
+
+            let message = refusal(repo.save(|fields| {
+                fields.port_range = range.to_owned();
+                fields.ports_per_worktree = 1;
+            }));
+
+            assert!(message.contains("ports.range"), "{range}: {message}");
+            assert!(!repo.root.join(".swarm").exists(), "{range}");
+        }
+    }
+
+    #[test]
+    fn ports_per_worktree_must_be_at_least_one_and_fit_the_range() {
+        for per_worktree in [0, 11] {
+            let repo = Repo::new("per-worktree");
+
+            let message = refusal(repo.save(|fields| {
+                fields.port_range = "5170-5179".to_owned();
+                fields.ports_per_worktree = per_worktree;
+            }));
+
+            assert!(message.contains("ports.per_worktree"), "{message}");
+            assert!(message.contains("between 1 and 10"), "{message}");
+        }
+
+        let repo = Repo::new("per-worktree-fits");
+        repo.save(|fields| {
+            fields.port_range = "5170-5179".to_owned();
+            fields.ports_per_worktree = 10;
+        })
+        .expect("a block as big as the range fits");
+    }
+
+    #[test]
+    fn a_copy_path_that_is_not_inside_the_repository_is_refused() {
+        for entry in ["../secret", "/etc/passwd", "a/../../b"] {
+            let repo = Repo::new("copy");
+
+            let message = refusal(repo.save(|fields| {
+                fields.copy = vec![".env".to_owned(), entry.to_owned()];
+            }));
+
+            assert!(message.contains("worktrees.copy"), "{entry}: {message}");
+            assert!(!repo.root.join(".swarm").exists(), "{entry}");
+        }
+    }
+
+    #[test]
+    fn blank_entries_in_a_list_are_dropped_and_the_rest_is_trimmed() {
+        let repo = Repo::new("blank-entries");
+
+        repo.save(|fields| {
+            fields.checks = vec![
+                " cargo test ".to_owned(),
+                String::new(),
+                "   ".to_owned(),
+                "cargo fmt".to_owned(),
+            ];
+            fields.copy = vec![String::new(), " .env".to_owned()];
+        })
+        .expect("save");
+
+        assert_eq!(
+            repo.text(),
+            "[worktrees]\ncopy = [\".env\"]\n\n[checks]\nbefore_pr = [\"cargo test\", \"cargo fmt\"]\n"
+        );
+    }
+
+    #[test]
+    fn a_refused_save_leaves_the_file_as_it_was() {
+        let repo = Repo::with_config("refused", RICH);
+
+        let message = refusal(repo.save(|fields| {
+            fields.teardown = "echo bye".to_owned();
+            fields.worktree_folder = "../out".to_owned();
+        }));
+
+        assert!(message.contains("worktrees.folder"));
+        assert_eq!(repo.text(), RICH);
+    }
+
+    #[test]
+    fn a_file_that_does_not_parse_is_refused_and_never_overwritten() {
+        for broken in ["[worktrees\nbroken = ", "[worktrees]\ncopy = 3\n"] {
+            let repo = Repo::with_config("broken", broken);
+
+            let message = refusal(save(
+                &repo.root,
+                &ProjectConfigFields::default(),
+                &every_field_set(),
+            ));
+
+            assert!(message.starts_with(".swarm/config.toml does not parse: line "));
+            assert_eq!(repo.text(), broken);
+        }
+    }
+
+    #[test]
+    fn the_refusal_for_a_file_that_does_not_parse_is_one_short_line() {
+        let repo = Repo::with_config(
+            "refusal-text",
+            "[worktrees]\nfolder = \".trees\"\ncopy = 3\n",
+        );
+
+        let message = refusal(repo.save(|fields| fields.checks_required = true));
+
+        assert_eq!(
+            message,
+            ".swarm/config.toml does not parse: line 3: invalid type: integer `3`, expected a sequence"
+        );
+    }
+
+    #[test]
+    fn a_save_keeps_a_hand_edit_to_a_field_it_did_not_change() {
+        let repo = Repo::with_config("hand-edit", RICH);
+        let base = repo.fields();
+        let hand_edited = RICH.replace(
+            "setup = \"cargo fetch\"",
+            "setup = \"cargo fetch\"\nteardown = \"make clean\"",
+        );
+        std::fs::write(repo.file(), &hand_edited).expect("hand edit");
+        let mut fields = base.clone();
+        fields.checks_required = true;
+
+        save(&repo.root, &base, &fields).expect("save");
+
+        assert_eq!(
+            repo.text(),
+            hand_edited.replace(
+                "required = false # flip when stable",
+                "required = true # flip when stable"
+            )
+        );
+        assert_eq!(repo.fields().teardown, "make clean");
+    }
+
+    #[test]
+    fn a_field_the_save_changes_wins_over_a_hand_edit() {
+        let repo = Repo::with_config("hand-edit-same-field", RICH);
+        let base = repo.fields();
+        std::fs::write(repo.file(), RICH.replace("main", "trunk")).expect("hand edit");
+        let mut fields = base.clone();
+        fields.base_branch = Some("develop".to_owned());
+
+        save(&repo.root, &base, &fields).expect("save");
+
+        assert_eq!(repo.fields().base_branch.as_deref(), Some("develop"));
+    }
+
+    #[test]
+    fn a_field_the_file_no_longer_has_is_not_written_back_as_an_empty_file() {
+        let repo = Repo::new("gone");
+        let base = ProjectConfigFields {
+            base_branch: Some("main".to_owned()),
+            ..default_fields()
+        };
+
+        save(&repo.root, &base, &default_fields()).expect("save");
+
+        assert!(!repo.root.join(".swarm").exists());
+    }
+
+    #[test]
+    fn a_bad_value_in_the_file_does_not_block_saving_another_field() {
+        for (broken, field) in [
+            ("[worktrees]\nfolder = \"../x\"\n", "worktrees.folder"),
+            (
+                "[worktrees]\nports = { range = \"9-3\", per_worktree = 1 }\n",
+                "ports.range",
+            ),
+        ] {
+            let repo = Repo::with_config("bad-untouched", broken);
+            let (fields, error) = read_fields(&repo.root);
+            assert!(error.is_some_and(|message| message.contains(field)));
+
+            let mut edited = fields.clone();
+            edited.checks_required = true;
+            save(&repo.root, &fields, &edited).expect("save");
+
+            assert_eq!(
+                repo.text(),
+                format!("{broken}\n[checks]\nrequired = true\n")
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_the_save_writes_is_checked_even_when_the_file_has_other_bad_values() {
+        let repo = Repo::with_config("bad-written", "[worktrees]\nfolder = \"../x\"\n");
+        let base = default_fields();
+        let mut fields = base.clone();
+        fields.port_range = "9-3".to_owned();
+        fields.ports_per_worktree = 1;
+
+        let message = refusal(save(&repo.root, &base, &fields));
+
+        assert!(message.contains("ports.range"), "{message}");
+
+        fields.port_range = String::new();
+        fields.worktree_folder = ".trees".to_owned();
+        save(&repo.root, &base, &fields).expect("a valid folder fixes the file");
+        assert_eq!(read_fields(&repo.root).1, None);
+    }
+
+    #[test]
+    fn a_file_that_loads_without_an_error_can_always_be_saved() {
+        let text = "[worktrees]\ncopy = [\n    \".env\", # secrets\n    \"../outside\",\n    \"  \",\n]\n\n[checks]\nbefore_pr = [\"cargo test\", \"\"] # one is blank\n";
+        let repo = Repo::with_config("loads-fine", text);
+        let (base, error) = read_fields(&repo.root);
+        assert_eq!(error, None);
+
+        let mut fields = base.clone();
+        fields.teardown = "echo bye".to_owned();
+        save(&repo.root, &base, &fields).expect("save");
+
+        assert_eq!(repo.fields().teardown, "echo bye");
+        assert_eq!(repo.fields().copy, base.copy);
+        assert_eq!(repo.fields().checks, base.checks);
+    }
+
+    #[test]
+    fn a_list_the_app_trimmed_but_did_not_change_is_not_rewritten() {
+        let text = "[worktrees]\ncopy = [\n    \" .env \", # secrets\n    \"\",\n]\n\n[checks]\nbefore_pr = [\"cargo test\", \"  \"] # keep\nrequired = false\n";
+        let repo = Repo::with_config("trimmed", text);
+        let base = repo.fields();
+        let mut fields = base.clone();
+        fields.copy = vec![".env".to_owned()];
+        fields.checks = vec!["cargo test".to_owned()];
+        fields.checks_required = true;
+
+        save(&repo.root, &base, &fields).expect("save");
+
+        assert_eq!(
+            repo.text(),
+            text.replace("required = false", "required = true")
+        );
+    }
+
+    #[test]
+    fn a_save_leaves_no_temporary_file_behind() {
+        let repo = Repo::with_config("no-temp", RICH);
+
+        repo.save(|fields| fields.checks_required = true)
+            .expect("save");
+        repo.save(|fields| fields.teardown = "echo bye".to_owned())
+            .expect("save");
+
+        let names: Vec<_> = std::fs::read_dir(repo.root.join(".swarm"))
+            .expect("folder")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(names, ["config.toml"]);
+    }
+
+    #[test]
+    fn a_failed_write_leaves_the_file_as_it_was_and_no_temporary_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let repo = Repo::with_config("read-only-folder", RICH);
+        let folder = repo.root.join(".swarm");
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).expect("mode");
+
+        let result = repo.save(|fields| fields.checks_required = true);
+
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        assert!(matches!(result, Err(Error::Io { .. })), "{result:?}");
+        assert_eq!(repo.text(), RICH);
+        assert_eq!(std::fs::read_dir(&folder).expect("folder").count(), 1);
+    }
+
+    #[test]
+    fn a_symlinked_config_file_stays_a_link() {
+        use std::os::unix::fs::symlink;
+
+        let repo = Repo::new("link");
+        let real = repo.root.join("dotfiles-config.toml");
+        std::fs::write(&real, RICH).expect("file");
+        std::fs::create_dir_all(repo.root.join(".swarm")).expect("folder");
+        symlink(&real, repo.file()).expect("link");
+
+        repo.save(|fields| fields.checks_required = true)
+            .expect("save");
+
+        assert!(
+            repo.file()
+                .symlink_metadata()
+                .expect("metadata")
+                .is_symlink()
+        );
+        assert!(
+            std::fs::read_to_string(&real)
+                .expect("real file")
+                .contains("required = true")
+        );
+    }
+
+    #[test]
+    fn a_save_keeps_the_mode_of_the_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let repo = Repo::with_config("mode", RICH);
+        std::fs::set_permissions(repo.file(), std::fs::Permissions::from_mode(0o600))
+            .expect("mode");
+
+        repo.save(|fields| fields.checks_required = true)
+            .expect("save");
+
+        let mode = std::fs::metadata(repo.file())
+            .expect("metadata")
+            .permissions();
+        assert_eq!(mode.mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn a_config_folder_that_links_out_of_the_repository_is_refused() {
+        use std::os::unix::fs::symlink;
+
+        let repo = Repo::new("folder-link");
+        let outside = Repo::new("folder-link-outside");
+        symlink(&outside.root, repo.root.join(".swarm")).expect("link");
+
+        let message = refusal(repo.save(|fields| fields.checks_required = true));
+
+        assert_eq!(message, ".swarm leads outside the repository");
+        assert_eq!(std::fs::read_dir(&outside.root).expect("folder").count(), 0);
+    }
+
+    #[test]
+    fn a_config_file_that_links_out_of_the_repository_is_refused() {
+        use std::os::unix::fs::symlink;
+
+        let repo = Repo::new("file-link");
+        let outside = Repo::new("file-link-outside");
+        let victim = outside.root.join("config.toml");
+        std::fs::write(&victim, RICH).expect("file");
+        std::fs::create_dir_all(repo.root.join(".swarm")).expect("folder");
+        symlink(&victim, repo.file()).expect("link");
+
+        let message = refusal(repo.save(|fields| fields.checks_required = true));
+
+        assert_eq!(message, ".swarm/config.toml leads outside the repository");
+        assert_eq!(std::fs::read_to_string(&victim).expect("file"), RICH);
+        assert_eq!(std::fs::read_dir(&outside.root).expect("folder").count(), 1);
+    }
+
+    #[test]
+    fn a_config_folder_that_links_to_another_folder_in_the_repository_is_fine() {
+        use std::os::unix::fs::symlink;
+
+        let repo = Repo::new("folder-link-inside");
+        std::fs::create_dir_all(repo.root.join("tools/swarm")).expect("folder");
+        symlink(repo.root.join("tools/swarm"), repo.root.join(".swarm")).expect("link");
+
+        repo.save(|fields| fields.checks_required = true)
+            .expect("save");
+
+        assert_eq!(
+            std::fs::read_to_string(repo.root.join("tools/swarm/config.toml")).expect("file"),
+            "[checks]\nrequired = true\n"
+        );
+    }
+
+    #[test]
+    fn the_temporary_file_is_never_made_through_a_planted_link() {
+        use std::os::unix::fs::symlink;
+
+        let repo = Repo::new("planted");
+        let victim = repo.root.join("victim.txt");
+        std::fs::write(&victim, "keep me").expect("file");
+        let planted = repo.root.join("planted.tmp");
+        symlink(&victim, &planted).expect("link");
+
+        let result = create_new(&planted, 0o600);
+
+        let error = result.expect_err("the name is taken");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&victim).expect("file"), "keep me");
+    }
+
+    #[test]
+    fn the_temporary_file_is_closed_to_others_from_the_start() {
+        let repo = Repo::new("private");
+        let path = repo.root.join("private.tmp");
+
+        create_new(&path, 0o600).expect("file");
+
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "{mode:o}");
+    }
+
+    #[test]
+    fn a_dotted_or_inline_worktrees_table_stays_as_it_is() {
+        let inline = Repo::with_config("inline-worktrees", "worktrees = { folder = \".trees\" }\n");
+        let dotted = Repo::with_config("dotted-worktrees", "worktrees.folder = \".trees\"\n");
+
+        for repo in [&inline, &dotted] {
+            repo.save(|fields| fields.teardown = "echo bye".to_owned())
+                .expect("save");
+        }
+
+        assert!(
+            inline
+                .text()
+                .starts_with("worktrees = { folder = \".trees\"")
+        );
+        assert_eq!(inline.fields().teardown, "echo bye");
+        assert_eq!(
+            dotted.text(),
+            "worktrees.folder = \".trees\"\nworktrees.teardown = \"echo bye\"\n"
+        );
+    }
+
+    #[test]
+    fn a_worktrees_table_that_only_holds_ports_gets_its_new_key() {
+        let repo = Repo::with_config(
+            "implicit",
+            "[worktrees.ports]\nrange = \"5170-5199\"\nper_worktree = 3\n",
+        );
+
+        repo.save(|fields| fields.teardown = "echo bye".to_owned())
+            .expect("save");
+
+        assert_eq!(repo.fields().teardown, "echo bye");
+        assert_eq!(repo.fields().port_range, "5170-5199");
+    }
+
+    #[test]
+    fn comments_at_the_end_of_the_file_stay_above_a_table_that_is_added() {
+        let repo = Repo::with_config(
+            "trailing-comments",
+            "[checks]\nrequired = true\n# ports = { range = \"5170-5199\", per_worktree = 3 }\n",
+        );
+
+        repo.save(|fields| fields.teardown = "echo bye".to_owned())
+            .expect("save");
+
+        assert_eq!(
+            repo.text(),
+            "[checks]\nrequired = true\n# ports = { range = \"5170-5199\", per_worktree = 3 }\n\n[worktrees]\nteardown = \"echo bye\"\n"
+        );
+    }
+
+    #[test]
+    fn a_file_with_only_comments_keeps_them_above_the_new_tables() {
+        let repo = Repo::with_config("only-comments", "# folder = \".trees\"\n# copy = []");
+
+        repo.save(|fields| fields.teardown = "echo bye".to_owned())
+            .expect("save");
+
+        assert_eq!(
+            repo.text(),
+            "# folder = \".trees\"\n# copy = []\n\n[worktrees]\nteardown = \"echo bye\"\n"
+        );
+    }
+
+    #[test]
+    fn a_file_without_a_final_newline_gets_its_new_key_on_a_new_line() {
+        let repo = Repo::with_config("no-final-newline", "[checks]\nrequired = true");
+
+        repo.save(|fields| fields.checks = vec!["cargo test".to_owned()])
+            .expect("save");
+
+        assert_eq!(
+            repo.text(),
+            "[checks]\nrequired = true\nbefore_pr = [\"cargo test\"]\n"
+        );
+    }
+
+    #[test]
+    fn a_file_with_windows_line_endings_is_not_rewritten_when_nothing_changes() {
+        let text = "[worktrees]\r\nfolder = \".trees\"\r\n";
+        let repo = Repo::with_config("crlf", text);
+
+        repo.save(|_| {}).expect("save");
+
+        assert_eq!(repo.text(), text);
+    }
+
+    #[test]
+    fn a_failed_rename_removes_the_temporary_file() {
+        let repo = Repo::new("failed-rename");
+        let target = repo.root.join("config.toml");
+        std::fs::create_dir_all(target.join("inside")).expect("a folder where the file should go");
+
+        let result = write_atomic(&target, "text");
+
+        assert!(matches!(result, Err(Error::Io { .. })), "{result:?}");
+        let names: Vec<_> = std::fs::read_dir(&repo.root)
+            .expect("folder")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(names, ["config.toml"]);
     }
 }

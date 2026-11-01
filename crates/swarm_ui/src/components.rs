@@ -18,6 +18,7 @@ mod project_tile;
 mod resize_handle;
 mod segmented_control;
 mod status;
+mod stepper;
 mod switch;
 mod tab;
 mod tab_bar;
@@ -50,6 +51,7 @@ pub use project_tile::*;
 pub use resize_handle::*;
 pub use segmented_control::*;
 pub use status::*;
+pub use stepper::*;
 pub use switch::*;
 pub use tab::*;
 pub use tab_bar::*;
@@ -75,6 +77,7 @@ pub fn all_components() -> Vec<ComponentEntry> {
         ComponentEntry::of::<TextInput>(),
         ComponentEntry::of::<IconButton>(),
         ComponentEntry::of::<Switch>(),
+        ComponentEntry::of::<Stepper>(),
         ComponentEntry::of::<Checkbox>(),
         ComponentEntry::of::<SegmentedControl>(),
         ComponentEntry::of::<Tab>(),

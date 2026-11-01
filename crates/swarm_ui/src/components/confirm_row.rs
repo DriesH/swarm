@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use gpui::{
     AnyElement, App, ClickEvent, ElementId, FocusHandle, Role, SharedString, Window, div, px,
     relative,
@@ -7,6 +9,9 @@ use crate::component::{Component, example, example_group};
 use crate::fonts::UI_FONT;
 use crate::prelude::*;
 use crate::traits::ClickHandler;
+use crate::{CONFIRM_CONTEXT, Dismiss};
+
+type DismissHandler = Rc<dyn Fn(&mut Window, &mut App) + 'static>;
 
 /// A question asked in place, with a Cancel and a confirm button. It takes the place of the
 /// control that asked, so nothing opens over the screen.
@@ -25,6 +30,7 @@ pub struct ConfirmRow {
     debug_selector: Option<String>,
     on_cancel: Option<ClickHandler>,
     on_confirm: Option<ClickHandler>,
+    on_dismiss: Option<DismissHandler>,
 }
 
 impl ConfirmRow {
@@ -46,6 +52,7 @@ impl ConfirmRow {
             debug_selector: None,
             on_cancel: None,
             on_confirm: None,
+            on_dismiss: None,
         }
     }
 
@@ -94,6 +101,12 @@ impl ConfirmRow {
         handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.on_confirm = Some(Box::new(handler));
+        self
+    }
+
+    /// Called on Escape while focus is in the row.
+    pub fn on_dismiss(mut self, handler: impl Fn(&mut Window, &mut App) + 'static) -> Self {
+        self.on_dismiss = Some(Rc::new(handler));
         self
     }
 }
@@ -151,6 +164,10 @@ impl RenderOnce for ConfirmRow {
             .id(self.id)
             .role(Role::Group)
             .aria_label(self.question)
+            .when_some(self.on_dismiss, |row, handler| {
+                row.key_context(CONFIRM_CONTEXT)
+                    .on_action(move |_: &Dismiss, window, cx| handler(window, cx))
+            })
             .gap(px(8.))
             .child(div().flex_1().min_w_0().flex().child(text))
             .child(cancel)

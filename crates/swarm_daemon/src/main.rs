@@ -56,6 +56,8 @@ pub(crate) struct Services {
     pub(crate) pull_requests: PullRequests,
     pub(crate) usage: Arc<UsageService>,
     pub(crate) store: Arc<Mutex<Store>>,
+    /// The folder of `settings.toml`, which also holds the user's prompts.
+    pub(crate) config_dir: Option<PathBuf>,
 }
 
 /// Where the daemon is told to keep its files and read its settings.
@@ -216,9 +218,10 @@ fn run() -> Result<()> {
         messages,
         processes,
         checks,
-        pull_requests: PullRequests::new(github, config_dir),
+        pull_requests: PullRequests::new(github, config_dir.clone()),
         usage,
         store,
+        config_dir,
     });
 
     let calls = Arc::new(Calls::new(Arc::clone(&services)));

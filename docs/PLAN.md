@@ -123,6 +123,11 @@ App settings: **General** (system check), **Agents** (per CLI: command, version,
 
 Per project, under **Projects**: everything in `.swarm/config.toml` (worktrees, setup script, files to copy, ports, checks before PR).
 
+- **Projects** reads and writes `.swarm/config.toml` through the daemon, which owns the file format. A save sends the fields as the page loaded them and the fields as edited; the daemon re-reads the file and writes only the fields that differ between the two, with `toml_edit`, so comments, formatting, keys Swarm does not show and hand edits to other fields stay. The page reads the file again when the Settings window gets focus, unless an edit waits to be saved. A file that does not parse shows its error and is never overwritten. **Run checks now** runs the checks on the project's open task.
+- **Terminals**: the font size (11–20 pt) applies to every terminal at once; tiles keep their size and get more or fewer rows and columns.
+- **Prompts**: each prompt shows the layer the agents get. **Customize** copies the built-in prompt to `~/.config/swarm/prompts/` and opens it in the default editor; **Open** opens the copy; **Reset** removes it after a confirm. A project's own prompts in `.swarm/prompts/` show on its Projects page.
+- **Usage** shows every window of both agent kinds, like the menu bar popover. **Keyboard** lists the shortcuts, read-only.
+
 ### Brand and icons
 
 - Logo: a line-drawn bee. The menu bar uses it as a template image so macOS tints it.
@@ -146,7 +151,7 @@ Four kinds:
 - **Layout engine**: tiles fill the space. Priority: user terminals (fixed size), orchestrator, terminals that need attention (`blocked`, `error`), working agents, process terminals, done or idle agents. Each tile has a minimum size; tiles that don't fit move to the **tray**: chips on the left of the status bar, each with a restore icon; chips that don't fit the bar sit behind a "+N" chip that opens a menu of them. A tile that needs attention is promoted out of the tray. The user can pin or minimize any tile.
 - When the user resizes a user terminal, the other tiles reflow around it.
 - **Tile sizes**: the orchestrator always gets the main slot on the left, about two thirds of the width (65 %), the full height, and never goes to the tray. Workers are small boxes stacked from the top of the column on the right: tall enough to see what they are doing (about 12 rows), never the full height. A blocked worker grows by itself and shrinks when it works again. Process terminals (dev servers, test runs) are the smallest tiles (about 8 rows), below the workers; they grow only when they need attention (a failed exit). Only user terminals keep a fixed size. The orchestrator can grow or shrink any of its workers with `tile.grow` / `tile.shrink`; a worker only itself (phase 8). A tile the user pinned, minimized or resized ignores these calls until the user resets it.
-- **Font size**: one global setting (Settings › Terminals, 10–20 px, default 13) for every terminal. Every tile keeps its size; the terminal inside gets more or fewer columns and rows.
+- **Font size**: one global setting (Settings › Terminals, 11–20 pt, default 13) for every terminal. Every tile keeps its size; the terminal inside gets more or fewer columns and rows.
 
 ### Terminal harness (CLI + MCP)
 
@@ -164,7 +169,7 @@ Four kinds:
 ### Prompts
 
 Layers, later wins: built-in → `~/.config/swarm/prompts/` → `.swarm/prompts/`.
-Files: `orchestrator.md`, `worker.md`, `review.md`, `pr.md`, `commit.md`.
+Files: `orchestrator.md`, `worker.md`, `start.md`, `pr.md`.
 The harness block is always added first and is not editable.
 
 ### Agent lifecycle

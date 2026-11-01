@@ -20,7 +20,7 @@ mod client;
 pub use client::{Client, ClientError, CommentEvent, MessageEvent, PrEvent};
 
 /// Bumped on every incompatible change; the daemon refuses other versions.
-pub const VERSION: u32 = 15;
+pub const VERSION: u32 = 16;
 
 /// The most messages [`Request::ListMessages`] returns.
 pub const MESSAGES_LISTED: usize = 500;
@@ -744,6 +744,46 @@ pub struct Notice {
     pub at: u64,
 }
 
+/// The parts of a project's `.swarm/config.toml` that Settings › Projects edits.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct ProjectConfigFields {
+    /// `None` uses the repository's default branch.
+    pub base_branch: Option<String>,
+    /// Relative to the repository root.
+    pub worktree_folder: String,
+    /// Like `"5170-5199"`, both ends included. Empty when no ports are reserved.
+    pub port_range: String,
+    pub ports_per_worktree: u16,
+    /// Files copied from the repository root into each task worktree.
+    pub copy: Vec<String>,
+    pub setup: String,
+    pub teardown: String,
+    /// Commands that run before a pull request.
+    pub checks: Vec<String>,
+    pub checks_required: bool,
+}
+
+/// Where a prompt comes from. A later layer wins: built in, then the user's, then the
+/// project's.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptLayer {
+    BuiltIn,
+    User,
+    Project,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PromptInfo {
+    /// The file name without `.md`, like `orchestrator`.
+    pub name: String,
+    /// The layer the agents get.
+    pub layer: PromptLayer,
+    /// The user's copy in `~/.config/swarm/prompts/`, whether it exists or not.
+    pub user_path: PathBuf,
+    /// The project's copy in `.swarm/prompts/`, when it exists.
+    pub project_path: Option<PathBuf>,
+}
+
 /// What closing a task would throw away, so the app can ask first.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct CloseCheck {
@@ -915,6 +955,41 @@ pub enum Request {
     ListBranches {
         call: CallId,
         project: ProjectId,
+    },
+    /// The project's `.swarm/config.toml` as it is on disk now. Answered with
+    /// [`Event::ProjectConfig`].
+    ProjectConfig {
+        call: CallId,
+        project: ProjectId,
+    },
+    /// Writes into `.swarm/config.toml` only the fields that differ from `base`, keeping
+    /// its comments and the keys Swarm does not show, so a hand edit to another field
+    /// stays. Refused when a field is invalid or the file does not parse. Answered with
+    /// [`Event::Done`].
+    SaveProjectConfig {
+        call: CallId,
+        project: ProjectId,
+        /// The fields as the app loaded them.
+        base: ProjectConfigFields,
+        fields: ProjectConfigFields,
+    },
+    /// Every prompt with the layer the project's agents get; with no project, the layer
+    /// outside any project. Answered with [`Event::Prompts`].
+    Prompts {
+        call: CallId,
+        project: Option<ProjectId>,
+    },
+    /// Copies the built-in prompt to the user's prompts folder, unless a copy is there.
+    /// Answered with [`Event::PromptFile`].
+    CustomizePrompt {
+        call: CallId,
+        name: String,
+    },
+    /// Removes the user's copy of a prompt, so the built-in one applies again.
+    /// Answered with [`Event::Done`].
+    ResetPrompt {
+        call: CallId,
+        name: String,
     },
     /// Starts the project's local checks in the task worktree, one process terminal per
     /// command, replacing a run that is still going. Answered with [`Event::Done`];
@@ -1132,6 +1207,20 @@ pub enum Event {
     Branches {
         call: CallId,
         branches: Vec<String>,
+    },
+    /// `error` says why the file does not parse; `fields` are the defaults then.
+    ProjectConfig {
+        call: CallId,
+        fields: ProjectConfigFields,
+        error: Option<String>,
+    },
+    Prompts {
+        call: CallId,
+        prompts: Vec<PromptInfo>,
+    },
+    PromptFile {
+        call: CallId,
+        path: PathBuf,
     },
     PrPanel {
         call: CallId,

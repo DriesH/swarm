@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 
 use anyhow::Result;
+use swarm_core::prompts;
 use swarm_protocol::{
     CallId, CreateTerminal, Event, FrameError, MESSAGES_LISTED, Request, TaskInfo, TerminalId,
     VERSION, read, write,
@@ -201,6 +202,11 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
             services.agents.stop_all();
             sink.send_event(&Event::Done { call });
         }
+        request @ (Request::ProjectConfig { .. }
+        | Request::SaveProjectConfig { .. }
+        | Request::Prompts { .. }
+        | Request::CustomizePrompt { .. }
+        | Request::ResetPrompt { .. }) => handle_settings(services, sink, request),
         request @ (Request::TaskDiff { .. }
         | Request::FileHunks { .. }
         | Request::ApproveTask { .. }
@@ -290,6 +296,80 @@ fn create_terminal(
             }
         }
         Err(error) => send_error(sink, call, &error),
+    }
+}
+
+/// Settings pages: a project's config file and the prompt layers.
+fn handle_settings(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
+    let services = Arc::clone(services);
+
+    match request {
+        Request::ProjectConfig { call, project } => {
+            run_slow(sink, "project-config", call, move |sink| {
+                match services.projects.project_config(project) {
+                    Ok((fields, error)) => {
+                        sink.send_event(&Event::ProjectConfig {
+                            call,
+                            fields,
+                            error,
+                        });
+                    }
+                    Err(error) => send_error(sink, call, &error),
+                }
+            });
+        }
+        Request::SaveProjectConfig {
+            call,
+            project,
+            base,
+            fields,
+        } => {
+            run_slow(sink, "save-project-config", call, move |sink| {
+                let saved = services
+                    .projects
+                    .save_project_config(project, &base, &fields);
+
+                done_or_error(sink, call, saved.map_err(Into::into));
+            });
+        }
+        Request::Prompts { call, project } => {
+            run_slow(sink, "prompts", call, move |sink| {
+                let listed = project
+                    .map(|project| services.projects.project_path(project))
+                    .transpose()
+                    .and_then(|root| {
+                        prompts::list(services.config_dir.as_deref(), root.as_deref())
+                    });
+
+                match listed {
+                    Ok(prompts) => {
+                        sink.send_event(&Event::Prompts { call, prompts });
+                    }
+                    Err(error) => send_error(sink, call, &error),
+                }
+            });
+        }
+        Request::CustomizePrompt { call, name } => {
+            run_slow(
+                sink,
+                "customize-prompt",
+                call,
+                move |sink| match prompts::customize(&name, services.config_dir.as_deref()) {
+                    Ok(path) => {
+                        sink.send_event(&Event::PromptFile { call, path });
+                    }
+                    Err(error) => send_error(sink, call, &error),
+                },
+            );
+        }
+        Request::ResetPrompt { call, name } => {
+            run_slow(sink, "reset-prompt", call, move |sink| {
+                let reset = prompts::reset(&name, services.config_dir.as_deref());
+
+                done_or_error(sink, call, reset.map_err(Into::into));
+            });
+        }
+        _ => {}
     }
 }
 

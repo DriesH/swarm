@@ -135,6 +135,8 @@ Three parts: 1. Usage in the daemon and the sidebar card. 2. Menu bar and popove
 
 **Scope:** welcome screen and system check, remaining settings pages (Terminals with the font size, Prompts, and Projects, which edits each repository's `.swarm/config.toml`), `tile.grow` / `tile.shrink` (the tile sizes themselves came early, after phase 5), file-type icons in the style of vscode-icons for files and folders (Changes tab, Changes and Files panels, Review), easter eggs, full VoiceOver and keyboard audit, performance pass, app bundle signing and notarization, updates, docs website and product website.
 
+Six parts: 1. Settings pages (Projects, Terminals, Prompts, Usage, Keyboard). 2. First launch: welcome screen, system check, `tile.grow` / `tile.shrink`. 3. File-type icons, easter eggs and Reduce Motion. 4. VoiceOver, keyboard and performance audit. 5. Release: bundle, signing, notarization, updates and the app socket check. 6. Docs and product websites.
+
 **Done when:**
 
 - [ ] First launch guides through the system check

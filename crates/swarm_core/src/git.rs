@@ -481,9 +481,9 @@ pub fn repository_root(path: &Path) -> Result<PathBuf, Error> {
 }
 
 /// The configured branch, else the branch `origin/HEAD` points at, else the current
-/// branch, else `main`.
+/// branch, else `main`. A blank configured branch counts as none.
 pub fn default_base_branch(root: &Path, configured: Option<&str>) -> String {
-    if let Some(branch) = configured.filter(|branch| !branch.is_empty()) {
+    if let Some(branch) = configured.filter(|branch| !branch.trim().is_empty()) {
         return branch.to_owned();
     }
 

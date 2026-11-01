@@ -2,7 +2,7 @@
 //! the terminal crates.
 
 use gpui::{AnyElement, App, Context, Entity, SharedString, Window, div, px, size};
-use swarm_term_view::TerminalView;
+use swarm_term_view::{DEFAULT_FONT_SIZE, TerminalView};
 use swarm_term_vt::{DEFAULT_SCROLLBACK_BYTES, LocalTerminal, SpawnOptions};
 use swarm_ui::component::{Component, example_group};
 use swarm_ui::prelude::*;
@@ -11,7 +11,7 @@ const TILE_WIDTH: f32 = 760.;
 const TILE_HEIGHT: f32 = 420.;
 // The tile's header, border and body padding.
 const CHROME_WIDTH: f32 = 26.;
-const CHROME_HEIGHT: f32 = 66.;
+const CHROME_HEIGHT: f32 = 56.;
 
 const SCRIPT: &str = r#"
 printf '\033[1mbold\033[0m \033[3mitalic\033[0m \033[2mfaint\033[0m \033[4munderline\033[0m \033[9mstrikethrough\033[0m \033[7minverse\033[0m\n'
@@ -53,7 +53,7 @@ impl PreviewState {
             px(TILE_WIDTH - CHROME_WIDTH),
             px(TILE_HEIGHT - CHROME_HEIGHT),
         );
-        let grid = TerminalView::size_for(body, window, cx);
+        let grid = TerminalView::size_for(body, DEFAULT_FONT_SIZE, window, cx);
 
         let (terminal_channels, emulator_channels) = swarm_term::channels();
         let options = SpawnOptions {

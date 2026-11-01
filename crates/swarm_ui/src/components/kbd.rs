@@ -35,6 +35,10 @@ impl Kbd {
                 "\u{21b5}" => "Return",
                 "esc" => "Escape",
                 "\u{232b}" => "Delete",
+                "\u{2191}" => "Up Arrow",
+                "\u{2193}" => "Down Arrow",
+                "\u{2190}" => "Left Arrow",
+                "\u{2192}" => "Right Arrow",
                 other => other,
             })
             .collect::<Vec<_>>()
@@ -110,6 +114,13 @@ mod tests {
         let kbd = Kbd::new("kbd", ["\u{2318}", "\u{21e7}", "R"]);
 
         assert_eq!(kbd.spoken(), "Command Shift R");
+    }
+
+    #[test]
+    fn spoken_label_names_the_arrow_keys() {
+        let kbd = Kbd::new("kbd", ["\u{2191}", "\u{2193}", "\u{2190}", "\u{2192}"]);
+
+        assert_eq!(kbd.spoken(), "Up Arrow Down Arrow Left Arrow Right Arrow");
     }
 
     #[test]

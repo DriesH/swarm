@@ -6,12 +6,13 @@ use gpui::{
     px,
 };
 use swarm_layout::{Activity, Layout, LayoutStyle, Rect, TileId, TileKind, TileSpec};
+use swarm_term_view::TerminalView;
 use swarm_ui::fonts::MONO_FONT;
 use swarm_ui::prelude::*;
 use swarm_ui::styles::focus_ring;
 use swarm_ui::{FocusStyle, TextFieldSize, TileRing};
 
-use crate::daemon::{CHROME_HEIGHT, exit_failed};
+use crate::daemon::{CHROME_HEIGHT, CHROME_WIDTH, exit_failed};
 use crate::model::{Agent, AgentKind, FakeLine, Terminal, TerminalId, TerminalKind};
 use crate::workspace::{DataSource, View, Workspace};
 
@@ -19,7 +20,6 @@ use crate::workspace::{DataSource, View, Workspace};
 const VIEW_PADDING: f32 = 8.;
 const CHAR_WIDTH: f32 = 7.2;
 const ROW_HEIGHT: f32 = 17.;
-const HEADER_HEIGHT: f32 = 34.;
 const HANDLE_HEIGHT: f32 = 6.;
 /// The rows of the terminal a small tile shows.
 const SMALL_TILE_ROWS: u16 = 12;
@@ -126,28 +126,31 @@ fn rows_height(cell: Option<(f32, f32)>, rows: u16) -> f32 {
 }
 
 /// The layout style with a small tile that shows [`SMALL_TILE_ROWS`] rows and a process
-/// tile that shows [`PROCESS_TILE_ROWS`].
+/// tile that shows [`PROCESS_TILE_ROWS`] rows of the default font. A tile keeps its pixels
+/// when the font size changes, and the terminal inside gets fewer rows.
 pub(crate) fn layout_style(workspace: &Workspace) -> LayoutStyle {
     LayoutStyle {
-        small_tile_height: rows_height(workspace.cell_size, SMALL_TILE_ROWS),
-        process_tile_height: rows_height(workspace.cell_size, PROCESS_TILE_ROWS),
+        small_tile_height: rows_height(workspace.default_cell_size, SMALL_TILE_ROWS),
+        process_tile_height: rows_height(workspace.default_cell_size, PROCESS_TILE_ROWS),
         ..LayoutStyle::default()
     }
 }
 
-/// Cells that fit in a tile of this size.
-fn cells(size: Size<Pixels>) -> (u32, u32) {
-    let columns = (f32::from(size.width) / CHAR_WIDTH).floor().max(0.);
-    let rows = ((f32::from(size.height) - HEADER_HEIGHT) / ROW_HEIGHT)
-        .floor()
-        .max(0.);
+/// The columns and rows of the terminal in a tile of this size, with the measured size of
+/// one cell: what the terminal view fits in the tile's body, and so what the daemon is told.
+pub(crate) fn tile_grid(size: Size<Pixels>, cell: Option<(f32, f32)>) -> (u16, u16) {
+    let (cell_width, cell_height) = cell.unwrap_or((CHAR_WIDTH, ROW_HEIGHT));
+    let body = Size {
+        width: size.width - px(CHROME_WIDTH),
+        height: size.height - px(CHROME_HEIGHT),
+    };
+    let cell = Size {
+        width: px(cell_width),
+        height: px(cell_height),
+    };
+    let grid = TerminalView::grid_in(body, cell);
 
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "both values are floored and not negative"
-    )]
-    (columns as u32, rows as u32)
+    (grid.cols, grid.rows)
 }
 
 fn activity_of(status: AgentStatus) -> Activity {
@@ -548,7 +551,7 @@ fn tile(
         .filter(|resizing| resizing.terminal == id);
     let handle =
         (terminal.kind == TerminalKind::User).then(|| resize_handle(id, resizing.is_some(), cx));
-    let badge = resizing.map(|_| size_badge(size, cx));
+    let badge = resizing.map(|_| size_badge(size, workspace.cell_size, cx));
 
     Some(
         div()
@@ -847,9 +850,9 @@ fn resize_handle(id: TerminalId, dragging: bool, cx: &mut Context<Workspace>) ->
         .into_any_element()
 }
 
-fn size_badge(size: Size<Pixels>, cx: &Context<Workspace>) -> AnyElement {
+fn size_badge(size: Size<Pixels>, cell: Option<(f32, f32)>, cx: &Context<Workspace>) -> AnyElement {
     let colors = cx.theme().colors();
-    let (columns, rows) = cells(size);
+    let (columns, rows) = tile_grid(size, cell);
 
     div()
         .absolute()
@@ -924,40 +927,93 @@ mod tests {
     }
 
     #[test]
-    fn cells_are_the_columns_and_rows_that_fit_a_tile() {
+    fn the_grid_of_a_tile_leaves_out_its_frame_and_the_padding_of_the_view() {
         let size = Size {
             width: px(648.),
             height: px(272.),
         };
 
-        assert_eq!(cells(size), (90, 14));
+        // (648 - 26 - 16) / 7.2 columns and (272 - 56 - 16) / 17 rows.
+        assert_eq!(tile_grid(size, None), (84, 11));
+    }
+
+    #[test]
+    fn a_bigger_cell_fits_fewer_cells_in_the_same_tile() {
+        let size = Size {
+            width: px(648.),
+            height: px(272.),
+        };
+
+        assert_eq!(tile_grid(size, Some((9., 22.))), (67, 9));
+    }
+
+    #[gpui::test]
+    fn the_size_badge_counts_the_grid_the_view_is_given(cx: &mut TestAppContext) {
+        let (_, cx) = setup(cx);
+        let tile = Size {
+            width: px(651.),
+            height: px(473.),
+        };
+
+        cx.update(|window, cx| {
+            let cell = TerminalView::cell_size(15., window, cx);
+            let body = Size {
+                width: tile.width - px(CHROME_WIDTH),
+                height: tile.height - px(CHROME_HEIGHT),
+            };
+            let given = TerminalView::size_for(body, 15., window, cx);
+
+            let shown = tile_grid(tile, Some((f32::from(cell.width), f32::from(cell.height))));
+
+            assert_eq!(shown, (given.cols, given.rows));
+        });
     }
 
     #[test]
     fn a_small_tile_shows_twelve_rows_of_the_terminal_font() {
-        assert!((rows_height(Some((7.2, 17.)), SMALL_TILE_ROWS) - 286.).abs() < 0.01);
-        assert!((rows_height(Some((8., 20.)), SMALL_TILE_ROWS) - 322.).abs() < 0.01);
-        assert!((rows_height(None, SMALL_TILE_ROWS) - 286.).abs() < 0.01);
+        assert!((rows_height(Some((7.2, 17.)), SMALL_TILE_ROWS) - 276.).abs() < 0.01);
+        assert!((rows_height(Some((8., 20.)), SMALL_TILE_ROWS) - 312.).abs() < 0.01);
+        assert!((rows_height(None, SMALL_TILE_ROWS) - 276.).abs() < 0.01);
     }
 
     #[gpui::test]
-    fn the_layout_style_takes_the_small_tile_from_the_measured_cell_size(cx: &mut TestAppContext) {
+    fn the_layout_style_takes_the_small_tile_from_the_cell_of_the_default_font(
+        cx: &mut TestAppContext,
+    ) {
         let (workspace, cx) = setup(cx);
 
         let measured = workspace.read_with(cx, |workspace, _| {
             (
-                workspace.cell_size,
+                workspace.default_cell_size,
                 layout_style(workspace).small_tile_height,
             )
         });
-        workspace.update(cx, |workspace, _| workspace.cell_size = Some((9., 22.)));
+        workspace.update(cx, |workspace, _| {
+            workspace.default_cell_size = Some((9., 22.));
+        });
         let larger =
             workspace.read_with(cx, |workspace, _| layout_style(workspace).small_tile_height);
 
         let (cell, height) = measured;
         assert_eq!(cell.map(|(_, height)| height), Some(17.));
-        assert!((height - 286.).abs() < 0.01);
-        assert!((larger - 346.).abs() < 0.01);
+        assert!((height - 276.).abs() < 0.01);
+        assert!((larger - 336.).abs() < 0.01);
+    }
+
+    #[gpui::test]
+    fn the_layout_style_ignores_the_cell_of_the_current_font(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let style = |workspace: &Workspace| {
+            let style = layout_style(workspace);
+
+            (style.small_tile_height, style.process_tile_height)
+        };
+
+        let before = workspace.read_with(cx, |workspace, _| style(workspace));
+        workspace.update(cx, |workspace, _| workspace.cell_size = Some((9., 22.)));
+        let after = workspace.read_with(cx, |workspace, _| style(workspace));
+
+        assert_eq!(before, after);
     }
 
     #[gpui::test]
@@ -972,7 +1028,7 @@ mod tests {
                 width: px(300.),
                 height: px(height - CHROME_HEIGHT),
             };
-            let grid = swarm_term_view::TerminalView::size_for(body, window, cx);
+            let grid = TerminalView::size_for(body, 13., window, cx);
 
             assert_eq!(grid.rows, PROCESS_TILE_ROWS);
         });

@@ -399,6 +399,7 @@ mod tests {
             clients,
             messages: Arc::clone(&messages),
             store,
+            config_dir: None,
         });
 
         (
