@@ -9,6 +9,7 @@ members = [
     "crates/swarm_layout",
     "crates/swarm_protocol",
     "crates/swarm_settings",
+    "crates/swarm_sprite",
     "crates/swarm_term",
     "crates/swarm_term_view",
     "crates/swarm_term_vt",
@@ -27,6 +28,7 @@ swarm_core = { path = "crates/swarm_core" }
 swarm_layout = { path = "crates/swarm_layout" }
 swarm_protocol = { path = "crates/swarm_protocol" }
 swarm_settings = { path = "crates/swarm_settings" }
+swarm_sprite = { path = "crates/swarm_sprite" }
 swarm_term = { path = "crates/swarm_term" }
 swarm_term_view = { path = "crates/swarm_term_view" }
 swarm_term_vt = { path = "crates/swarm_term_vt" }
