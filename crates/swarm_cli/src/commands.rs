@@ -58,6 +58,13 @@ pub(crate) enum Command {
         title: String,
         body: String,
     },
+    /// `agent` is an agent ID or a worker name; `None` is the caller's own tile.
+    TileGrow {
+        agent: Option<String>,
+    },
+    TileShrink {
+        agent: Option<String>,
+    },
     TaskCreate {
         name: String,
         from: Option<String>,
@@ -175,6 +182,8 @@ impl Command {
 
                 Ok(output(result, "pull request draft sent".to_owned()))
             }
+            Self::TileGrow { agent } => tile(session, agent, true),
+            Self::TileShrink { agent } => tile(session, agent, false),
             Self::TaskCreate { .. } | Self::TaskList | Self::TaskWait { .. } | Self::Exit => {
                 self.run_task(session)
             }
@@ -323,6 +332,22 @@ impl Command {
             other => Err(format!("{other:?} is not a terminal command")),
         }
     }
+}
+
+/// Asks for a large or a small tile. The layout decides, so the answer only says that the
+/// request went out.
+fn tile(session: &Session, agent: Option<String>, large: bool) -> Result<Output, String> {
+    let agent = agent.map(|name| resolve(session, &name)).transpose()?;
+
+    let (call, text) = if large {
+        (Call::TileGrow { agent }, "asked for a large tile")
+    } else {
+        (Call::TileShrink { agent }, "asked for a small tile")
+    };
+
+    let result = session.call(call)?;
+
+    Ok(output(result, text.to_owned()))
 }
 
 /// The task orchestrator confirmed its brief, or finished.

@@ -12,6 +12,7 @@ use swarm_protocol::{
     PullRequest, ReviewState, Reviewer,
 };
 
+use crate::process::Captured;
 use crate::store::unix_millis;
 use crate::{Error, adapters, git, process};
 
@@ -28,6 +29,9 @@ pub const TITLE_CHARS: usize = 256;
 pub const BODY_CHARS: usize = 65_536;
 
 const HOST: &str = "github.com";
+
+/// `gh` exits with success when it is signed in to [`HOST`].
+const AUTH_STATUS: [&str; 4] = ["auth", "status", "--hostname", HOST];
 
 /// The JSON fields of a lookup by branch.
 const FIND_FIELDS: &str = "number,url,state,headRefOid";
@@ -179,7 +183,7 @@ impl Github {
     }
 
     /// Homebrew, when it is installed.
-    fn brew(&self) -> Option<PathBuf> {
+    pub(crate) fn brew(&self) -> Option<PathBuf> {
         self.folders
             .iter()
             .map(|folder| folder.join("brew"))
@@ -229,10 +233,7 @@ impl Github {
     pub fn status(&self, root: &Path) -> GithubStatus {
         let gh = self.find();
         let gh_version = gh.is_some().then(|| self.version(root)).flatten();
-        let signed_in = gh.is_some()
-            && self
-                .exec(root, None, &["auth", "status", "--hostname", HOST], None)
-                .is_ok();
+        let signed_in = gh.is_some() && self.exec(root, None, &AUTH_STATUS, None).is_ok();
         let repository = git::origin_url(root).and_then(|url| parse_repository(&url));
 
         GithubStatus {
@@ -245,6 +246,23 @@ impl Github {
         }
     }
 
+    /// `gh --version` for the system check, ended after `timeout`. `None` without `gh`.
+    pub(crate) fn probe_version(&self, timeout: Duration) -> Option<std::io::Result<Captured>> {
+        self.probe(&["--version"], timeout)
+    }
+
+    /// `gh auth status` for the system check, ended after `timeout`. `None` without `gh`.
+    pub(crate) fn probe_sign_in(&self, timeout: Duration) -> Option<std::io::Result<Captured>> {
+        self.probe(&AUTH_STATUS, timeout)
+    }
+
+    fn probe(&self, arguments: &[&str], timeout: Duration) -> Option<std::io::Result<Captured>> {
+        let gh = self.find()?;
+        let command = gh_command(&gh, Path::new("/"), None, arguments);
+
+        Some(process::capture(command, None, timeout, false))
+    }
+
     fn version(&self, root: &Path) -> Option<String> {
         let output = self.exec(root, None, &["--version"], None).ok()?;
 
@@ -255,10 +273,7 @@ impl Github {
     pub fn require_ready(&self, root: &Path) -> Result<PathBuf, Error> {
         let gh = self.find().ok_or_else(missing)?;
 
-        if self
-            .exec(root, None, &["auth", "status", "--hostname", HOST], None)
-            .is_err()
-        {
+        if self.exec(root, None, &AUTH_STATUS, None).is_err() {
             return Err(Error::Invalid(
                 "the GitHub CLI is not signed in to github.com".to_owned(),
             ));
@@ -411,18 +426,7 @@ impl Github {
         input: Option<&str>,
     ) -> Result<GhOutput, Error> {
         let gh = self.find().ok_or_else(missing)?;
-
-        let mut command = Command::new(&gh);
-        command
-            .args(arguments)
-            .current_dir(folder)
-            .env("GH_PROMPT_DISABLED", "1")
-            .env("GH_NO_UPDATE_NOTIFIER", "1")
-            .env("NO_COLOR", "1")
-            .env("GIT_TERMINAL_PROMPT", "0");
-        if let Some(repository) = repository {
-            command.env("GH_REPO", repository);
-        }
+        let command = gh_command(&gh, folder, repository, arguments);
 
         let captured = process::capture(command, input.map(str::as_bytes), GH_TIMEOUT, false)
             .map_err(|source| Error::Io {
@@ -463,6 +467,23 @@ impl Github {
             output: process::last_lines(printed.trim(), ERROR_LINES),
         })
     }
+}
+
+/// `gh` with prompts off, no colors and no terminal.
+fn gh_command(gh: &Path, folder: &Path, repository: Option<&str>, arguments: &[&str]) -> Command {
+    let mut command = Command::new(gh);
+    command
+        .args(arguments)
+        .current_dir(folder)
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1")
+        .env("NO_COLOR", "1")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    if let Some(repository) = repository {
+        command.env("GH_REPO", repository);
+    }
+
+    command
 }
 
 fn missing() -> Error {

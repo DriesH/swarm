@@ -192,9 +192,7 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
                 sink.send_event(&Event::AgentChanges { call, changes });
             });
         }
-        Request::SystemCheck { call } => {
-            send_error(sink, call, &"not built yet");
-        }
+        Request::SystemCheck { call } => system_check(services, sink, call),
         Request::Usage { call } => {
             sink.send_event(&Event::Usage {
                 call,
@@ -236,6 +234,18 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
         | Request::AddProject { .. }
         | Request::CreateTask { .. }) => handle_projects(services, sink, request),
     }
+}
+
+/// Checks the tools Swarm needs on its own thread: the commands may take seconds.
+fn system_check(services: &Arc<Services>, sink: &Arc<ClientSink>, call: CallId) {
+    let services = Arc::clone(services);
+
+    run_slow(sink, "system-check", call, move |sink| {
+        sink.send_event(&Event::SystemCheck {
+            call,
+            check: services.system_check.run(),
+        });
+    });
 }
 
 /// Projects and the tasks made in them.

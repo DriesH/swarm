@@ -314,6 +314,7 @@ mod tests {
         use swarm_core::Projects;
         use swarm_core::github::Github;
         use swarm_core::store::{NewTask, Store};
+        use swarm_core::system_check::Tools;
         use swarm_protocol::{AgentKind, AgentRole};
 
         use crate::Services;
@@ -323,6 +324,7 @@ mod tests {
         use crate::messages::Messages;
         use crate::processes::Processes;
         use crate::pull_requests::PullRequests;
+        use crate::system_check::SystemChecks;
         use crate::usage::{Overrides, UsageService};
 
         let folder = TempFolder::new("agent-socket");
@@ -382,7 +384,8 @@ mod tests {
                 Arc::clone(&clients),
                 Arc::clone(&agents),
             ),
-            pull_requests: PullRequests::new(github, None),
+            pull_requests: PullRequests::new(github.clone(), None),
+            system_check: SystemChecks::new(Tools::system(), None, github),
             usage: UsageService::start(
                 folder.path(),
                 None,

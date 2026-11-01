@@ -12,6 +12,7 @@ pub mod github;
 mod process;
 pub mod prompts;
 pub mod store;
+pub mod system_check;
 pub mod task;
 
 use std::collections::{HashMap, HashSet};
