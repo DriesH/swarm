@@ -1,0 +1,19 @@
+[package]
+name = "swarm_usage"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/swarm_usage.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+swarm_protocol.workspace = true
+thiserror.workspace = true

@@ -13,6 +13,7 @@ members = [
     "crates/swarm_term_view",
     "crates/swarm_term_vt",
     "crates/swarm_ui",
+    "crates/swarm_usage",
 ]
 default-members = ["crates/gallery", "crates/swarm_ui"]
 
@@ -30,6 +31,7 @@ swarm_term = { path = "crates/swarm_term" }
 swarm_term_view = { path = "crates/swarm_term_view" }
 swarm_term_vt = { path = "crates/swarm_term_vt" }
 swarm_ui = { path = "crates/swarm_ui" }
+swarm_usage = { path = "crates/swarm_usage" }
 
 anyhow = "1"
 clap = { version = "4.6", features = ["derive"] }
