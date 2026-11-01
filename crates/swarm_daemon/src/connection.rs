@@ -197,6 +197,10 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
                 usage: services.usage.current(),
             });
         }
+        Request::StopAgents { call } => {
+            services.agents.stop_all();
+            sink.send_event(&Event::Done { call });
+        }
         request @ (Request::TaskDiff { .. }
         | Request::FileHunks { .. }
         | Request::ApproveTask { .. }

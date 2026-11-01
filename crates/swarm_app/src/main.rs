@@ -4,7 +4,9 @@ mod actions;
 mod close_task;
 mod daemon;
 mod file_tree;
+mod lifecycle;
 mod markdown;
+mod menu_bar;
 mod model;
 mod new_task;
 mod palette;
@@ -19,6 +21,7 @@ mod sidebar;
 mod status_bar;
 mod swarm_view;
 mod tab_bar;
+mod usage_text;
 mod views;
 mod window_drag;
 mod workspace;
@@ -82,9 +85,9 @@ fn open_workspace(cx: &mut App) -> anyhow::Result<gpui::WindowHandle<Workspace>>
     if !sample {
         settings::load(swarm_settings::default_path(), cx);
 
-        handle.update(cx, |workspace, window, cx| {
+        handle.update(cx, |workspace, _, cx| {
             workspace.settings_path = swarm_settings::default_path();
-            workspace.connect_daemon(window, cx);
+            workspace.connect_daemon(cx);
         })?;
     }
 
@@ -93,25 +96,31 @@ fn open_workspace(cx: &mut App) -> anyhow::Result<gpui::WindowHandle<Workspace>>
 
 #[cfg(not(feature = "frame-stats"))]
 fn open_main_window(cx: &mut App) {
-    if let Err(error) = open_workspace(cx) {
+    if let Err(error) = lifecycle::start(cx) {
         log::error!("could not open the main window: {error:#}");
         cx.quit();
-        return;
     }
-
-    cx.activate(true);
 }
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    gpui_platform::application().run(|cx: &mut App| {
+    let application = gpui_platform::application();
+    application.on_reopen(lifecycle::reopened);
+
+    application.run(|cx: &mut App| {
         swarm_ui::init(cx);
         actions::bind_keys(cx);
 
         #[cfg(feature = "snapshot")]
         if let Ok(directory) = std::env::var("SWARM_SETTINGS_SNAPSHOT_DIR") {
             settings::snapshot(directory.into(), cx);
+            return;
+        }
+
+        #[cfg(feature = "snapshot")]
+        if let Ok(directory) = std::env::var("SWARM_MENU_BAR_SNAPSHOT_DIR") {
+            menu_bar::snapshot::run(directory.into(), cx);
             return;
         }
 

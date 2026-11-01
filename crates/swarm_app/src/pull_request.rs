@@ -780,6 +780,11 @@ impl Workspace {
         }
     }
 
+    /// Stops the status poll, which needs an active window.
+    pub(crate) fn rest_pull_requests(&mut self) {
+        self.pull_requests.poll = None;
+    }
+
     /// The panel closed: the next open reads the panel data again and asks for a draft
     /// again when the last ask was refused.
     fn rest_panel(&mut self) {

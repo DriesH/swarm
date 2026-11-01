@@ -1,11 +1,12 @@
 //! Sidebar: projects, the open task's agents and the usage card.
 
 use gpui::{Context, FontWeight, Pixels, Role, Window, div, px};
-use swarm_protocol::{SubscriptionUsage, Usage, UsageProblem, UsageWindow};
+use swarm_protocol::{SubscriptionUsage, Usage, UsageProblem};
 use swarm_ui::prelude::*;
 
 use crate::actions::ToggleCommandPalette;
 use crate::model::{Agent, AgentKind, Project, Task, TaskStatus, Terminal};
+use crate::usage_text::{problem_text, shown_percent, spoken_window};
 use crate::window_drag::drag_region;
 use crate::workspace::{DataSource, Workspace};
 
@@ -79,9 +80,10 @@ fn daemon_status(workspace: &Workspace, cx: &mut Context<Workspace>) -> Option<g
                         .flex_1()
                         .child(Label::new("Daemon not running").color(Color::Muted)),
                 )
-                .child(Button::new("retry-daemon", "Retry").on_click(
-                    cx.listener(|workspace, _, window, cx| workspace.retry_daemon(window, cx)),
-                ))
+                .child(
+                    Button::new("retry-daemon", "Retry")
+                        .on_click(cx.listener(|workspace, _, _, cx| workspace.retry_daemon(cx))),
+                )
                 .into_any_element(),
         ),
         DataSource::Sample | DataSource::Live => None,
@@ -135,29 +137,13 @@ fn window_row(window: &mut Window, cx: &mut App) -> impl IntoElement {
 }
 
 fn logo_row(window: &mut Window, cx: &mut App) -> impl IntoElement {
-    let fg = cx.theme().colors().fg;
-
     let brand = drag_region("sidebar-brand-drag", window, cx)
         .flex_1()
         .h_full()
         .flex()
         .items_center()
         .gap(px(8.))
-        .child(
-            div()
-                .size(px(20.))
-                .flex()
-                .flex_none()
-                .items_center()
-                .justify_center()
-                .rounded(px(6.))
-                .bg(fg)
-                .child(
-                    Icon::new(IconName::Bee)
-                        .size(IconSize::Custom(px(13.)))
-                        .color(Color::Inverse),
-                ),
-        )
+        .child(BrandMark::new())
         .child(
             Label::new("Swarm")
                 .size(LabelSize::Large)
@@ -515,115 +501,11 @@ pub(crate) fn usage_shows_time(usage: &Usage) -> bool {
     })
 }
 
-/// The line under a row and what VoiceOver reads for a problem. A CLI that is not
-/// installed has none.
-fn problem_text(problem: &UsageProblem, now: u64) -> Option<(String, String)> {
-    let text = match problem {
-        UsageProblem::NotInstalled => return None,
-        UsageProblem::NotLoggedIn => ("Not logged in".to_owned(), "Not logged in".to_owned()),
-        UsageProblem::Unauthorized => ("Login refused".to_owned(), "Login refused".to_owned()),
-        UsageProblem::RateLimited { retry_at } => match retry_at.saturating_sub(now) {
-            0 => ("Rate limited".to_owned(), "Rate limited".to_owned()),
-            left => (
-                format!("Rate limited · {}", Wait::new(left).short()),
-                format!("Rate limited, retry in {}", Wait::new(left).spoken()),
-            ),
-        },
-        UsageProblem::Failed(reason) => (
-            "Usage unavailable".to_owned(),
-            format!("Usage unavailable: {reason}"),
-        ),
-    };
-
-    Some(text)
-}
-
-/// A window whose reset time has passed starts again at 0%, whatever was last read.
-fn shown_percent(window: &UsageWindow, now: u64) -> u8 {
-    if window.resets_at.is_some_and(|at| at <= now) {
-        0
-    } else {
-        window.used_percent
-    }
-}
-
-/// For example "5 hour window 42%, resets in 2 hours". A window that has reset has no
-/// reset note.
-fn spoken_window(window: &UsageWindow, now: u64) -> String {
-    let name = window_name(&window.label);
-    let percent = shown_percent(window, now);
-
-    match window.resets_at {
-        Some(at) if at > now => format!(
-            "{name} {percent}%, resets in {}",
-            Wait::new(at - now).spoken()
-        ),
-        _ => format!("{name} {percent}%"),
-    }
-}
-
-/// "5h" reads as "5 hour window". A label in another form is read as it is.
-fn window_name(label: &str) -> String {
-    for (suffix, unit) in [('m', "minute"), ('h', "hour"), ('d', "day")] {
-        let count = label
-            .strip_suffix(suffix)
-            .filter(|count| !count.is_empty() && count.bytes().all(|byte| byte.is_ascii_digit()));
-
-        if let Some(count) = count {
-            return format!("{count} {unit} window");
-        }
-    }
-
-    format!("{label} window")
-}
-
-/// Time left, rounded up: in minutes up to 90 of them, then in hours.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Wait {
-    Minutes(u64),
-    Hours(u64),
-}
-
-impl Wait {
-    fn new(seconds: u64) -> Self {
-        let minutes = seconds.div_ceil(60);
-
-        if minutes > 90 {
-            Self::Hours(minutes.div_ceil(60))
-        } else {
-            Self::Minutes(minutes)
-        }
-    }
-
-    /// For the screen: "24m" or "2h".
-    fn short(self) -> String {
-        match self {
-            Self::Minutes(count) => format!("{count}m"),
-            Self::Hours(count) => format!("{count}h"),
-        }
-    }
-
-    /// For VoiceOver: "24 minutes", "2 hours" or, past two days, "3 days".
-    fn spoken(self) -> String {
-        let counted = |count: u64, unit: &str| {
-            if count == 1 {
-                format!("1 {unit}")
-            } else {
-                format!("{count} {unit}s")
-            }
-        };
-
-        match self {
-            Self::Minutes(count) => counted(count, "minute"),
-            Self::Hours(count) if count > 48 => counted(count.div_ceil(24), "day"),
-            Self::Hours(count) => counted(count, "hour"),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use gpui::{TestAppContext, VisualTestContext};
+
+    use swarm_protocol::UsageWindow;
 
     use super::*;
     use crate::model::{ProjectId, SAMPLE_NOW};
@@ -751,74 +633,6 @@ mod tests {
         UsageProblem::RateLimited {
             retry_at: NOW + seconds,
         }
-    }
-
-    fn note_of(problem: &UsageProblem) -> Option<String> {
-        problem_text(problem, NOW).map(|(shown, _)| shown)
-    }
-
-    #[test]
-    fn a_rate_limit_shows_the_wait_in_minutes_then_hours() {
-        let notes: Vec<_> = [24 * 60, 5_400, 5_460, 3 * 3_600]
-            .map(|seconds| note_of(&rate_limited_in(seconds)))
-            .into();
-
-        assert_eq!(
-            notes,
-            [
-                Some("Rate limited · 24m".to_owned()),
-                Some("Rate limited · 90m".to_owned()),
-                Some("Rate limited · 2h".to_owned()),
-                Some("Rate limited · 3h".to_owned()),
-            ]
-        );
-    }
-
-    #[test]
-    fn waits_round_up() {
-        let short: Vec<_> = [1, 60, 61, 5_400, 5_401, 7_200, 7_201]
-            .map(|seconds| Wait::new(seconds).short())
-            .into();
-        let spoken: Vec<_> = [1, 61, 7_200, 48 * 3_600, 48 * 3_600 + 1]
-            .map(|seconds| Wait::new(seconds).spoken())
-            .into();
-
-        assert_eq!(short, ["1m", "1m", "2m", "90m", "2h", "2h", "3h"]);
-        assert_eq!(
-            spoken,
-            ["1 minute", "2 minutes", "2 hours", "48 hours", "3 days"]
-        );
-    }
-
-    #[test]
-    fn a_rate_limit_that_is_over_shows_no_time() {
-        assert_eq!(
-            note_of(&UsageProblem::RateLimited { retry_at: NOW - 5 }),
-            Some("Rate limited".to_owned())
-        );
-    }
-
-    #[test]
-    fn the_other_problems_have_short_texts() {
-        let notes: Vec<_> = [
-            UsageProblem::NotLoggedIn,
-            UsageProblem::Unauthorized,
-            UsageProblem::Failed("HTTP 500: upstream broke".to_owned()),
-            UsageProblem::NotInstalled,
-        ]
-        .iter()
-        .map(note_of)
-        .collect();
-
-        assert_eq!(
-            notes,
-            [
-                Some("Not logged in".to_owned()),
-                Some("Login refused".to_owned()),
-                Some("Usage unavailable".to_owned()),
-                None,
-            ]
-        );
     }
 
     #[test]
@@ -980,14 +794,6 @@ mod tests {
             rows[0].spoken,
             "Claude usage: 5 hour window 42%, resets in 1 minute"
         );
-    }
-
-    #[test]
-    fn windows_with_other_labels_are_read_as_they_are() {
-        assert_eq!(window_name("30d"), "30 day window");
-        assert_eq!(window_name("90m"), "90 minute window");
-        assert_eq!(window_name("weekly"), "weekly window");
-        assert_eq!(window_name("h"), "h window");
     }
 
     #[test]

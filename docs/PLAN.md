@@ -377,6 +377,11 @@ Reports in `docs/spikes/`. Code in `spikes/` (throwaway).
 - Codex usage: `codex app-server` → `account/rateLimits/read`. Codex keeps its own token.
 - Menu bar popover is a GPUI window under an `NSStatusItem`. Compute its position before opening it.
 - With no main window open, switch to no Dock icon; the menu bar keeps working.
+- The menu bar icon is the line bee as a template image, the highest usage percent across all windows as its title (` 42%`), and a dot drawn into a second template image while an agent needs you.
+- The popover shows usage per agent kind (each window with its percent and reset time), the tasks that need you (a click opens that task), the running agent count, **Stop all** (asks once in place), **Open Swarm** and **Quit**. Esc closes it, Tab moves through it.
+- The workspace outlives its window: closing the window keeps the workspace and its daemon connection, so the menu bar stays live, and **Open Swarm** opens a new window on the same workspace.
+- **Stop all** stops every running agent as the user's choice: agents with a session become resumable, and no orchestrator is told. An agent that the user stopped cannot start workers or tasks, also during the seconds its process takes to end.
+- The Dock icon goes only when the status item exists. A Dock click or a second launch of the app opens the main window again.
 
 **Notifications**
 

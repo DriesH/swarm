@@ -597,6 +597,54 @@ mod tests {
     }
 
     #[test]
+    fn button_labels_meet_wcag_aa_at_rest_and_on_hover() {
+        use crate::components::ButtonVariant;
+
+        let mut failures = Vec::new();
+
+        for theme in themes() {
+            let colors = theme.colors();
+            let surfaces = [
+                ("ground", colors.ground),
+                ("panel", colors.panel),
+                ("raised", colors.raised),
+                ("active", colors.active),
+                ("soft", colors.soft),
+            ];
+
+            for variant in [
+                ButtonVariant::Primary,
+                ButtonVariant::Secondary,
+                ButtonVariant::Ghost,
+                ButtonVariant::Destructive,
+            ] {
+                let button = variant.colors_in(colors);
+
+                for (state, background, text) in [
+                    ("rest", button.background, button.text),
+                    ("hover", button.hover_background, button.hover_text),
+                ] {
+                    // A translucent fill depends on what is behind the button.
+                    let behind: Vec<(&str, Hsla)> = surfaces
+                        .into_iter()
+                        .map(|(name, surface)| (name, composite(surface, background)))
+                        .collect();
+
+                    check(
+                        &mut failures,
+                        &theme,
+                        TEXT_AA,
+                        (&format!("{variant:?} {state} label"), text),
+                        &behind,
+                    );
+                }
+            }
+        }
+
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
     fn ansi_text_colors_meet_wcag_aa_on_the_terminal_background() {
         let mut failures = Vec::new();
 

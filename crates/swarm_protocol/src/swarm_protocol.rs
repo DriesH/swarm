@@ -20,7 +20,7 @@ mod client;
 pub use client::{Client, ClientError, CommentEvent, MessageEvent, PrEvent};
 
 /// Bumped on every incompatible change; the daemon refuses other versions.
-pub const VERSION: u32 = 13;
+pub const VERSION: u32 = 14;
 
 /// The most messages [`Request::ListMessages`] returns.
 pub const MESSAGES_LISTED: usize = 500;
@@ -835,6 +835,12 @@ pub enum Request {
     },
     /// The last known subscription usage. Answered with [`Event::Usage`].
     Usage {
+        call: CallId,
+    },
+    /// Stops every running agent of every project, as the user's choice: an agent
+    /// with a session becomes `Resumable`, and no orchestrator is told. Answered with
+    /// [`Event::Done`].
+    StopAgents {
         call: CallId,
     },
     /// The task's comments, oldest first, with each anchor checked against the files

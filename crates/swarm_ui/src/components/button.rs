@@ -4,8 +4,10 @@ use gpui::{
 };
 
 use crate::component::{Component, example, example_group};
+use crate::contrast::composite;
 use crate::prelude::*;
 use crate::styles::{filled_focus_ring, focus_ring};
+use crate::theme::ThemeColors;
 use crate::traits::ClickHandler;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -67,18 +69,20 @@ impl ButtonSize {
     }
 }
 
-struct ButtonColors {
-    background: Hsla,
-    text: Hsla,
-    border: Hsla,
-    hover_background: Hsla,
-    hover_text: Hsla,
+pub(crate) struct ButtonColors {
+    pub(crate) background: Hsla,
+    pub(crate) text: Hsla,
+    pub(crate) border: Hsla,
+    pub(crate) hover_background: Hsla,
+    pub(crate) hover_text: Hsla,
 }
 
 impl ButtonVariant {
     fn colors(self, cx: &App) -> ButtonColors {
-        let colors = cx.theme().colors();
+        self.colors_in(cx.theme().colors())
+    }
 
+    pub(crate) fn colors_in(self, colors: &ThemeColors) -> ButtonColors {
         match self {
             Self::Primary => ButtonColors {
                 background: colors.fg,
@@ -105,7 +109,8 @@ impl ButtonVariant {
                 background: colors.del,
                 text: colors.ground,
                 border: colors.del,
-                hover_background: colors.del.opacity(0.88),
+                // Solid, and toward `fg`: the label keeps its contrast in both themes.
+                hover_background: composite(colors.del, colors.fg.opacity(0.12)),
                 hover_text: colors.ground,
             },
         }

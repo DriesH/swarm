@@ -23,7 +23,7 @@ use swarm_protocol::{
 
 use crate::Services;
 use crate::agent_socket::{MAX_WAITS, Slot, Throttle};
-use crate::agents::{Place, Refused, lock};
+use crate::agents::{Place, Refused, STOPPED_BY_USER, lock};
 use crate::messages::Claim;
 use crate::processes::Spawn;
 use crate::{pull_requests, tasks};
@@ -345,6 +345,9 @@ impl Calls {
             own_worktree,
         } = worker;
         let task = self.orchestrated_task(caller, "spawn workers")?;
+        if self.services.agents.is_stopped(caller.id) {
+            return refuse(STOPPED_BY_USER);
+        }
 
         if brief.trim().is_empty() {
             return refuse("a worker needs a brief");
@@ -376,7 +379,8 @@ impl Calls {
         let agents = &self.services.agents;
         let register = |checkout: &WorkerCheckout| {
             agents
-                .register(
+                .register_asked_by(
+                    Some(caller.id),
                     &Place {
                         project: checkout.project,
                         task: Some(checkout.task),
@@ -538,6 +542,9 @@ impl Calls {
         kind: Option<AgentKind>,
     ) -> Outcome {
         Self::started_orchestrator(caller, "create tasks")?;
+        if self.services.agents.is_stopped(caller.id) {
+            return refuse(STOPPED_BY_USER);
+        }
 
         if name.trim().is_empty() {
             return refuse("a task needs a name");

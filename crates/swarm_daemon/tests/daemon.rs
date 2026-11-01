@@ -2,8 +2,9 @@
 
 #![expect(clippy::expect_used, reason = "test helpers panic on failure")]
 
+use std::collections::HashMap;
 use std::io::{BufRead as _, BufReader, Write as _};
-use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -12,7 +13,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use swarm_core::store::Store;
+use swarm_core::store::{Status, Store};
 use swarm_protocol::{
     AgentChange, AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, CallId,
     CloseCheck, CommentId, CommentState, CreateTask, CreateTerminal, DiffStat, Event, FileDiff,
@@ -7716,4 +7717,498 @@ fn a_rate_limited_endpoint_is_reported_and_the_wait_is_saved() {
     thread::park_timeout(Duration::from_millis(300));
 
     assert_eq!(fakes.calls("curl"), 1);
+}
+
+impl Client {
+    /// Sends `StopAgents`. Returns once the daemon answered and every agent in `ending`
+    /// has changed to `Stopped` or `Resumable`.
+    fn stop_agents(&mut self, ending: &[AgentId]) -> HashMap<AgentId, AgentInfo> {
+        self.send(&Request::StopAgents { call: CALL });
+
+        let mut ended = HashMap::new();
+        let mut answered = false;
+        while !answered || ended.len() < ending.len() {
+            match self.next() {
+                Event::Done { call: CALL } => answered = true,
+                Event::Error {
+                    call: Some(CALL),
+                    message,
+                    ..
+                } => panic!("stopping the agents failed: {message}"),
+                Event::AgentChanged { agent }
+                    if ending.contains(&agent.id)
+                        && matches!(
+                            agent.lifecycle,
+                            AgentLifecycle::Stopped | AgentLifecycle::Resumable
+                        ) =>
+                {
+                    ended.insert(agent.id, agent);
+                }
+                _ => {}
+            }
+        }
+
+        ended
+    }
+}
+
+/// Two tasks in two projects. Each has a working orchestrator and a worker, and the
+/// worker owns a process terminal.
+struct BusyTasks {
+    daemon: Daemon,
+    client: Client,
+    tasks: Vec<TaskInfo>,
+    agents: Vec<AgentInfo>,
+    process_ids: Vec<i32>,
+    _fixture: Fixture,
+    _repos: Vec<Repo>,
+}
+
+impl BusyTasks {
+    fn agent_ids(&self) -> Vec<AgentId> {
+        self.agents.iter().map(|agent| agent.id).collect()
+    }
+
+    fn message_count(&mut self) -> usize {
+        self.tasks
+            .iter()
+            .map(|task| self.client.list_messages(task.project, Some(task.id)).len())
+            .sum()
+    }
+
+    fn stored_lifecycle(&self, agent: AgentId) -> AgentLifecycle {
+        database(&self.daemon)
+            .agent(agent)
+            .expect("read")
+            .expect("row")
+            .info
+            .lifecycle
+    }
+}
+
+/// With `confirm_sessions`, every agent reports a session, so its conversation exists.
+fn busy_tasks(confirm_sessions: bool) -> BusyTasks {
+    let hook = |who: &str| {
+        if confirm_sessions {
+            format!(
+                r#"printf '{{"hook_event_name":"SessionStart","session_id":"{who}-%s"}}' "$SWARM_TASK" | "$SWARM" hook"#
+            )
+        } else {
+            String::new()
+        }
+    };
+    let (orchestrator_hook, worker_hook) = (hook("orchestrator"), hook("worker"));
+    let fixture = fixture_with_helpers(&format!(
+        r#"case "$SWARM_ROLE" in
+orchestrator)
+  idle
+  IFS= read -r line
+  working
+  {orchestrator_hook}
+  swarm spawn api --kind claude --brief "build the api" > "$OUT/spawn-$SWARM_TASK.out" 2>&1
+  sleep 60
+  ;;
+worker)
+  idle
+  IFS= read -r line
+  working
+  {worker_hook}
+  swarm terminal spawn --name dev -- sh -c 'echo $$ > "$1"; exec sleep 60' sh "$OUT/dev-$SWARM_TASK.pid" > "$OUT/terminal-$SWARM_TASK.out" 2>&1
+  until [ -s "$OUT/dev-$SWARM_TASK.pid" ]; do sleep 0.1; done
+  echo up > "$OUT/worker-up-$SWARM_TASK"
+  sleep 60
+  ;;
+esac"#
+    ));
+    let repos = vec![repo_for_merges(), repo_for_merges()];
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+
+    let mut tasks = Vec::new();
+    for (repo, name) in repos.iter().zip(["Login", "Billing"]) {
+        let project = client.add_project(&repo.root);
+        let mut request = orchestrator_task(project.id, false);
+        name.clone_into(&mut request.name);
+        request.first_message = Some("lead the task".to_owned());
+        tasks.push(client.create_task(request));
+    }
+
+    let mut process_ids = Vec::new();
+    for task in &tasks {
+        fixture.read_when_written(&format!("worker-up-{}", task.id.0));
+        let pid = fixture.read_when_written(&format!("dev-{}.pid", task.id.0));
+        process_ids.push(pid.trim().parse().expect("a process id"));
+    }
+
+    let agents: Vec<AgentInfo> = client
+        .projects()
+        .into_iter()
+        .flat_map(|project| project.tasks)
+        .flat_map(|task| task.agents)
+        .collect();
+    assert_eq!(agents.len(), 4, "an orchestrator and a worker per task");
+
+    if confirm_sessions {
+        let store = database(&daemon);
+        wait_until(|| {
+            agents.iter().all(|agent| {
+                store
+                    .agent(agent.id)
+                    .expect("read")
+                    .is_some_and(|stored| stored.session_confirmed)
+            })
+        });
+    }
+
+    BusyTasks {
+        daemon,
+        client,
+        tasks,
+        agents,
+        process_ids,
+        _fixture: fixture,
+        _repos: repos,
+    }
+}
+
+#[test]
+fn stopping_all_agents_ends_every_agent_and_keeps_user_terminals() {
+    let mut busy = busy_tasks(true);
+    let user_terminal = busy.client.create(&["sleep", "60"]);
+    let ids = busy.agent_ids();
+
+    let ended = busy.client.stop_agents(&ids);
+
+    assert_eq!(ended.len(), 4, "both tasks, orchestrators and workers");
+    for agent in ended.values() {
+        assert_eq!(
+            agent.lifecycle,
+            AgentLifecycle::Resumable,
+            "{} has a confirmed session",
+            agent.name
+        );
+        assert_eq!(agent.terminal, None);
+        assert!(agent.ended_at.is_some());
+    }
+    for id in &ids {
+        assert_eq!(busy.stored_lifecycle(*id), AgentLifecycle::Resumable);
+    }
+    assert!(
+        busy.client
+            .terminals()
+            .iter()
+            .any(|terminal| terminal.id == user_terminal),
+        "the user terminal still runs"
+    );
+
+    assert!(
+        busy.client.stop_agents(&[]).is_empty(),
+        "nothing runs, and the daemon still answers"
+    );
+    for id in &ids {
+        assert_eq!(busy.stored_lifecycle(*id), AgentLifecycle::Resumable);
+    }
+}
+
+#[test]
+fn stopping_all_agents_tells_no_orchestrator_and_stops_process_terminals() {
+    let mut busy = busy_tasks(true);
+    let ids = busy.agent_ids();
+    let before = busy.message_count();
+    assert!(before >= 2, "the briefs are there");
+
+    busy.client.stop_agents(&ids);
+
+    wait_until(|| busy.process_ids.iter().all(|pid| !process_alive(*pid)));
+    thread::park_timeout(Duration::from_millis(400));
+    assert_eq!(busy.message_count(), before, "nobody was told");
+}
+
+#[test]
+fn stopping_all_agents_without_a_confirmed_session_ends_them_stopped() {
+    let mut busy = busy_tasks(false);
+    let ids = busy.agent_ids();
+
+    let ended = busy.client.stop_agents(&ids);
+
+    assert!(
+        ended
+            .values()
+            .all(|agent| agent.lifecycle == AgentLifecycle::Stopped),
+        "{ended:?}"
+    );
+    for id in &ids {
+        assert_eq!(busy.stored_lifecycle(*id), AgentLifecycle::Stopped);
+    }
+}
+
+/// The orchestrator prompt of a repository as a pipe: the daemon cannot finish reading
+/// it until the test lets go. The agent is registered and not started meanwhile.
+struct HeldPrompt {
+    path: PathBuf,
+    writer: Option<std::fs::File>,
+}
+
+impl HeldPrompt {
+    fn new(repo: &Repo) -> Self {
+        let folder = repo.root.join(".swarm/prompts");
+        std::fs::create_dir_all(&folder).expect("prompts folder");
+        let path = folder.join("orchestrator.md");
+
+        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("path");
+        // SAFETY: `name` is a valid C string that outlives the call.
+        let made = unsafe { libc::mkfifo(name.as_ptr(), 0o600) };
+        assert_eq!(made, 0, "mkfifo failed");
+
+        Self { path, writer: None }
+    }
+
+    /// Returns once the daemon waits on the pipe: a write end opens without blocking
+    /// only when a reader has the pipe open.
+    fn wait_until_read(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let opened = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&self.path);
+            if let Ok(file) = opened {
+                self.writer = Some(file);
+
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the daemon never read the prompt"
+            );
+            thread::park_timeout(Duration::from_millis(20));
+        }
+    }
+
+    /// The daemon goes on: the pipe ends after the text.
+    fn release(mut self) {
+        let mut writer = self.writer.take().expect("wait_until_read came first");
+        writer.write_all(b"Lead the task.").expect("write");
+    }
+}
+
+#[test]
+fn stopping_all_agents_kills_an_agent_whose_process_starts_after_the_stop() {
+    let fixture = Fixture::new("sleep 30");
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let mut held = HeldPrompt::new(&repo);
+    let task = client.create_task(orchestrator_task(project.id, false));
+    let agent = task.agents[0].id;
+    assert_eq!(task.agents[0].lifecycle, AgentLifecycle::Starting);
+    held.wait_until_read();
+
+    let ended = client.stop_agents(&[agent]);
+    assert_eq!(ended[&agent].lifecycle, AgentLifecycle::Stopped);
+
+    // The agent is the first terminal of this daemon: the task has no setup.
+    held.release();
+    let store = database(&daemon);
+    wait_until(|| {
+        store
+            .status(TerminalId(1))
+            .is_ok_and(|status| status == Status::Exited)
+    });
+
+    let stored = store.agent(agent).expect("read").expect("row");
+    assert_eq!(stored.info.lifecycle, AgentLifecycle::Stopped);
+    assert_eq!(stored.info.terminal, None);
+}
+
+#[test]
+fn stopping_all_agents_ends_an_agent_that_waits_for_its_setup() {
+    let fixture = Fixture::new(r#"echo ran > "$OUT/ran"; sleep 30"#);
+    let repo = Repo::new("[worktrees]\nsetup = \"sleep 2\"\n");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let task = client.create_task(orchestrator_task(project.id, true));
+    let agent = task.agents[0].id;
+    assert_eq!(task.agents[0].lifecycle, AgentLifecycle::Starting);
+
+    let ended = client.stop_agents(&[agent]);
+
+    assert_eq!(ended[&agent].lifecycle, AgentLifecycle::Stopped);
+    assert_eq!(ended[&agent].terminal, None);
+    assert!(ended[&agent].ended_at.is_some());
+
+    // The setup ends, and the agent must not start after it.
+    thread::park_timeout(Duration::from_millis(3000));
+    assert!(
+        !fixture.out.join("ran").exists(),
+        "the agent started anyway"
+    );
+    let stored = database(&daemon).agent(agent).expect("read").expect("row");
+    assert_eq!(stored.info.lifecycle, AgentLifecycle::Stopped);
+    assert_eq!(stored.info.status, AgentStatus::Unknown);
+}
+
+/// Makes `git worktree add` wait in the new worktree whose path ends in `suffix`: it
+/// writes `reached` to the fixture, then waits for the file `go` or the end of the fixture.
+fn hold_checkout(repo: &Repo, fixture: &Fixture, suffix: &str) {
+    let hook = repo.root.join(".git/hooks/post-checkout");
+    let out = fixture.out.display();
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\ncase \"$PWD\" in\n*{suffix})\n  pwd > '{out}/reached'\n  while [ -d '{out}' ] && [ ! -e '{out}/go' ]; do sleep 0.05; done\n  ;;\nesac\n"
+        ),
+    )
+    .expect("hook");
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).expect("mode");
+}
+
+impl Fixture {
+    /// Lets the held checkout go on.
+    fn let_go(&self) {
+        std::fs::write(self.out.join("go"), "go").expect("go");
+    }
+}
+
+#[test]
+fn a_worker_that_registers_after_stop_all_never_starts() {
+    let fixture = fixture_with_helpers(
+        r#"case "$SWARM_ROLE" in
+orchestrator)
+  idle
+  IFS= read -r line
+  working
+  swarm spawn api --own-worktree "same files" --brief "never runs" > "$OUT/spawn.out" 2>&1
+  sleep 30
+  ;;
+worker)
+  echo started > "$OUT/worker-started"
+  sleep 30
+  ;;
+esac"#,
+    );
+    let repo = repo_for_merges();
+    hold_checkout(&repo, &fixture, "--api");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, task) = start_task(&daemon, &repo);
+    let orchestrator = task.agents[0].id;
+    let worktree = PathBuf::from(fixture.read_when_written("reached").trim());
+
+    client.stop_agents(&[orchestrator]);
+    fixture.let_go();
+
+    wait_until(|| !worktree.exists() || fixture.out.join("worker-started").exists());
+    assert!(
+        !fixture.out.join("worker-started").exists(),
+        "a worker started after Stop all"
+    );
+    let tasks = client.projects().remove(0).tasks;
+    assert!(
+        tasks[0]
+            .agents
+            .iter()
+            .all(|agent| agent.role != AgentRole::Worker),
+        "{:?}",
+        tasks[0].agents
+    );
+}
+
+#[test]
+fn a_task_that_gets_its_orchestrator_after_stop_all_never_starts_it() {
+    let fixture = fixture_with_helpers(
+        r#"case "$SWARM_ROLE" in
+start_orchestrator)
+  idle
+  swarm task create "Racing" --brief "never runs" > "$OUT/create.out" 2>&1
+  sleep 30
+  ;;
+orchestrator)
+  echo started > "$OUT/orchestrator-started"
+  sleep 30
+  ;;
+esac"#,
+    );
+    let repo = repo_for_merges();
+    hold_checkout(&repo, &fixture, "racing");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let start = client.start_orchestrator(project.id);
+    let worktree = PathBuf::from(fixture.read_when_written("reached").trim());
+
+    client.stop_agents(&[start.id]);
+    fixture.let_go();
+
+    wait_until(|| !worktree.exists() || fixture.out.join("orchestrator-started").exists());
+    assert!(
+        !fixture.out.join("orchestrator-started").exists(),
+        "an orchestrator started after Stop all"
+    );
+    assert!(client.projects()[0].tasks.is_empty());
+}
+
+#[test]
+fn an_orchestrator_that_outlives_stop_all_cannot_spawn_workers() {
+    let fixture = fixture_with_helpers(
+        r#"trap '' HUP
+idle
+IFS= read -r line
+working
+echo ready > "$OUT/ready"
+until [ -e "$OUT/stopped" ] || [ ! -d "$OUT" ]; do sleep 0.05; done
+swarm spawn api --brief "never runs" > "$OUT/spawn.out" 2>&1
+sleep 30"#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, _task) = start_task(&daemon, &repo);
+    fixture.read_when_written("ready");
+
+    // The agent ignores the hang-up, so it lives on until the kill after the grace time.
+    client.stop_agents(&[]);
+    std::fs::write(fixture.out.join("stopped"), "yes").expect("stopped");
+
+    let spawn = fixture.read_when_written("spawn.out");
+    assert!(spawn.starts_with("swarm: "), "{spawn}");
+    assert!(spawn.contains("the user stopped you"), "{spawn}");
+    let task = client.projects().remove(0).tasks.remove(0);
+    assert!(
+        task.agents
+            .iter()
+            .all(|agent| agent.role != AgentRole::Worker),
+        "{:?}",
+        task.agents
+    );
+}
+
+#[test]
+fn a_start_orchestrator_that_outlives_stop_all_cannot_create_tasks() {
+    let fixture = fixture_with_helpers(
+        r#"trap '' HUP
+echo ready > "$OUT/ready"
+until [ -e "$OUT/stopped" ] || [ ! -d "$OUT" ]; do sleep 0.05; done
+swarm task create "Late" --brief "never runs" > "$OUT/create.out" 2>&1
+sleep 30"#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    client.start_orchestrator(project.id);
+    fixture.read_when_written("ready");
+
+    client.stop_agents(&[]);
+    std::fs::write(fixture.out.join("stopped"), "yes").expect("stopped");
+
+    let create = fixture.read_when_written("create.out");
+    assert!(create.starts_with("swarm: "), "{create}");
+    assert!(create.contains("the user stopped you"), "{create}");
+    assert!(client.projects()[0].tasks.is_empty());
 }

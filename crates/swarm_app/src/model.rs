@@ -290,6 +290,43 @@ impl Agent {
         }
     }
 
+    /// True while the agent's process runs, whatever it does.
+    pub(crate) fn is_running(&self) -> bool {
+        match &self.daemon {
+            Some(daemon) => matches!(
+                daemon.lifecycle,
+                AgentLifecycle::Starting | AgentLifecycle::Running
+            ),
+            None => matches!(
+                self.status,
+                AgentStatus::Working | AgentStatus::Blocked | AgentStatus::Idle
+            ),
+        }
+    }
+
+    /// Why the agent needs the user, for example "permission \u{b7} Allow cargo test?". `None`
+    /// when it does not need the user. The text can be empty for a fake agent.
+    pub(crate) fn attention(&self) -> Option<String> {
+        let Some(daemon) = &self.daemon else {
+            return matches!(self.status, AgentStatus::Blocked | AgentStatus::Error).then(|| {
+                self.note
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default()
+            });
+        };
+
+        let kind = match daemon.status {
+            DaemonAgentStatus::Blocked(kind) => blocked_label(kind),
+            DaemonAgentStatus::Error => "error",
+            _ => return None,
+        };
+        let mut parts = vec![kind.to_owned()];
+        parts.extend(daemon.message.iter().map(ToString::to_string));
+
+        Some(parts.join(" \u{b7} "))
+    }
+
     /// The status word for screen readers, for example "needs you, permission".
     pub(crate) fn status_text(&self) -> String {
         let Some(daemon) = &self.daemon else {
@@ -1685,7 +1722,7 @@ impl FakeData {
         self.task_with_daemon_id(id).is_some()
     }
 
-    fn task_with_daemon_id(&self, id: swarm_protocol::TaskId) -> Option<TaskId> {
+    pub(crate) fn task_with_daemon_id(&self, id: swarm_protocol::TaskId) -> Option<TaskId> {
         self.tasks
             .iter()
             .find(|task| task.daemon.as_ref().is_some_and(|daemon| daemon.id == id))

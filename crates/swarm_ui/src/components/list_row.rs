@@ -14,6 +14,7 @@ use crate::traits::ClickHandler;
 pub struct ListRow {
     id: ElementId,
     label: SharedString,
+    detail: Option<SharedString>,
     accessible_label: Option<SharedString>,
     start: Option<AnyElement>,
     end: Option<AnyElement>,
@@ -30,6 +31,7 @@ impl ListRow {
         Self {
             id: id.into(),
             label: label.into(),
+            detail: None,
             accessible_label: None,
             start: None,
             end: None,
@@ -45,6 +47,12 @@ impl ListRow {
     /// Name for `VisualTestContext::debug_bounds`. Only recorded in test builds.
     pub fn debug_selector(mut self, selector: impl FnOnce() -> String) -> Self {
         self.debug_selector = Some(selector());
+        self
+    }
+
+    /// A second, quieter line under the label, for example why a task needs the user.
+    pub fn detail(mut self, detail: impl Into<SharedString>) -> Self {
+        self.detail = Some(detail.into());
         self
     }
 
@@ -108,13 +116,37 @@ impl RenderOnce for ListRow {
         )]
         let indent = px(14. * self.indent as f32);
 
+        let accessible = self.accessible_label.unwrap_or_else(|| self.label.clone());
+        let has_detail = self.detail.is_some();
+        let label = Label::new(self.label).weight(FontWeight::MEDIUM).truncate();
+        let text = match self.detail {
+            Some(detail) => v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap(px(1.))
+                .child(label)
+                .child(
+                    Label::new(detail)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .truncate(),
+                )
+                .into_any_element(),
+            None => div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .child(label)
+                .into_any_element(),
+        };
+
         div()
             .id(self.id)
             .when_some(self.debug_selector, |row, selector| {
                 row.debug_selector(move || selector)
             })
             .role(Role::ListItem)
-            .aria_label(self.accessible_label.unwrap_or_else(|| self.label.clone()))
+            .aria_label(accessible)
             .aria_selected(self.selected)
             .map(|row| match &self.focus_handle {
                 Some(handle) => row.track_focus(handle),
@@ -124,7 +156,11 @@ impl RenderOnce for ListRow {
             .flex()
             .items_center()
             .gap(px(10.))
-            .h(if self.compact { px(28.) } else { px(30.) })
+            .map(|row| match (has_detail, self.compact) {
+                (true, _) => row.min_h(px(44.)).py(px(6.)),
+                (false, true) => row.h(px(28.)),
+                (false, false) => row.h(px(30.)),
+            })
             .px(px(8.))
             .ml(indent)
             .rounded(px(7.))
@@ -132,13 +168,7 @@ impl RenderOnce for ListRow {
             .when(!self.selected, |row| row.hover(|style| style.bg(raised)))
             .focus_visible(|style| focus_ring(style, accent))
             .when_some(self.start, ParentElement::child)
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .child(Label::new(self.label).weight(FontWeight::MEDIUM).truncate()),
-            )
+            .child(text)
             .when_some(self.end, ParentElement::child)
             .when_some(self.on_click, |row, handler| row.on_click(handler))
     }
@@ -203,6 +233,31 @@ impl Component for ListRow {
                                             });
                                         })
                                 }),
+                        ),
+                )],
+            ))
+            .child(example_group(
+                "With detail",
+                [example(
+                    "Two lines",
+                    div()
+                        .id("needs-you")
+                        .role(Role::List)
+                        .aria_label("Needs you")
+                        .w(px(232.))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .child(
+                            ListRow::new(("needs", 0_usize), "swarm \u{b7} terminal-renderer")
+                                .detail("permission \u{b7} Allow cargo test?")
+                                .accessible_label(
+                                    "swarm, terminal-renderer, permission, Allow cargo test?",
+                                ),
+                        )
+                        .child(
+                            ListRow::new(("needs", 1_usize), "website \u{b7} signup")
+                                .detail("error \u{b7} Build failed"),
                         ),
                 )],
             ))

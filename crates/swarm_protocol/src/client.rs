@@ -371,6 +371,15 @@ impl Client {
         }
     }
 
+    /// Stops every running agent; their changes arrive through
+    /// [`Client::agent_events`].
+    pub fn stop_agents(&self) -> Result<(), ClientError> {
+        match self.call(|call| Request::StopAgents { call }, None)? {
+            Event::Done { .. } => Ok(()),
+            other => Err(unexpected("Done", &other)),
+        }
+    }
+
     /// Every `ChecksChanged` and `PrDraftChanged` the daemon sends. Use one consumer.
     pub fn pr_events(&self) -> flume::Receiver<PrEvent> {
         self.inner.pr_events.clone()
