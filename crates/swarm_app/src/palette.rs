@@ -42,6 +42,8 @@ pub(crate) enum Command {
     CloseTask,
     CreatePullRequest,
     Buzz,
+    /// Debug builds only.
+    ShowWelcome,
     Task(TaskId),
     Agent(TerminalId),
 }
@@ -686,6 +688,14 @@ impl Workspace {
         if crate::settings::easter_eggs(cx) {
             rows.push(Row::new(Group::Swarm, IconName::Bee, "Buzz", Command::Buzz).secret());
         }
+        if cfg!(debug_assertions) {
+            rows.push(Row::new(
+                Group::Swarm,
+                IconName::Bee,
+                "Show welcome screen",
+                Command::ShowWelcome,
+            ));
+        }
 
         let view = cx.new(|cx| Palette::new(rows, window, cx));
         let subscription =
@@ -731,6 +741,7 @@ impl Workspace {
             Command::CloseTask => self.open_close_task(self.active_task, window, cx),
             Command::CreatePullRequest => window.dispatch_action(Box::new(CreatePullRequest), cx),
             Command::Buzz => self.start_buzz(cx),
+            Command::ShowWelcome => self.show_welcome(cx),
         }
     }
 }
@@ -903,6 +914,28 @@ mod tests {
         assert!(!at_first.iter().any(|label| label == "Buzz"));
         assert!(partial.is_empty());
         assert_eq!(typed, Some(vec!["Buzz".to_owned()]));
+    }
+
+    // Tests build with debug assertions, like `cargo run`.
+    #[gpui::test]
+    fn show_welcome_screen_opens_it_with_projects_and_skip_closes_it(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let shows = |cx: &mut VisualTestContext| {
+            workspace.update(cx, |workspace, cx| workspace.shows_welcome(cx))
+        };
+        assert!(!shows(cx), "the sample has projects");
+
+        cx.simulate_keystrokes("cmd-k");
+        cx.simulate_input("welcome");
+        let typed = palette_labels(&workspace, cx);
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        assert_eq!(typed, Some(vec!["Show welcome screen".to_owned()]));
+        assert!(shows(cx));
+
+        workspace.update(cx, Workspace::finish_welcome);
+        assert!(!shows(cx));
     }
 
     #[gpui::test]

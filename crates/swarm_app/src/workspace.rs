@@ -186,6 +186,8 @@ pub(crate) struct Workspace {
     pub(crate) pull_requests: PullRequests,
     /// The welcome screen, while it shows.
     pub(crate) welcome: Option<Entity<Welcome>>,
+    /// Debug builds: ⌘K opened the welcome screen, whatever the projects and the flag.
+    pub(crate) welcome_forced: bool,
     /// What the easter eggs keep: the swarm's stats, the toast and the flying bees.
     pub(crate) eggs: crate::eggs::Eggs,
     /// The honeycomb behind the empty state and, when the settings ask, the Swarm view.
@@ -330,6 +332,7 @@ impl Workspace {
             diff_intervals: (crate::daemon::REVIEW_INTERVAL, crate::daemon::LIVE_INTERVAL),
             pull_requests: PullRequests::default(),
             welcome: None,
+            welcome_forced: false,
             eggs: crate::eggs::Eggs::default(),
             honeycomb: cx.new(|_| Honeycomb::new()),
             #[cfg(test)]
@@ -734,9 +737,17 @@ impl Workspace {
     /// it. The daemon must have said there are none: while it connects, an app that has
     /// projects looks the same.
     pub(crate) fn shows_welcome(&self, cx: &App) -> bool {
-        self.has_no_projects()
-            && matches!(self.source, DataSource::Live | DataSource::Sample)
-            && crate::settings::welcome_pending(cx)
+        self.welcome_forced
+            || self.has_no_projects()
+                && matches!(self.source, DataSource::Live | DataSource::Sample)
+                && crate::settings::welcome_pending(cx)
+    }
+
+    /// Debug builds only: shows the welcome screen until it is finished.
+    pub(crate) fn show_welcome(&mut self, cx: &mut Context<Self>) {
+        self.welcome_forced = true;
+
+        cx.notify();
     }
 
     /// The welcome screen, made when it first shows and dropped when it ends.
@@ -763,6 +774,7 @@ impl Workspace {
     pub(crate) fn finish_welcome(&mut self, cx: &mut Context<Self>) {
         crate::settings::finish_welcome(cx);
         self.welcome = None;
+        self.welcome_forced = false;
 
         cx.notify();
     }
