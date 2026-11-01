@@ -962,12 +962,15 @@ pub enum Request {
         call: CallId,
         project: ProjectId,
     },
-    /// Writes the fields that changed into `.swarm/config.toml`, keeping its comments and
-    /// the keys Swarm does not show. Refused when a field is invalid or the file does not
-    /// parse. Answered with [`Event::Done`].
+    /// Writes into `.swarm/config.toml` only the fields that differ from `base`, keeping
+    /// its comments and the keys Swarm does not show, so a hand edit to another field
+    /// stays. Refused when a field is invalid or the file does not parse. Answered with
+    /// [`Event::Done`].
     SaveProjectConfig {
         call: CallId,
         project: ProjectId,
+        /// The fields as the app loaded them.
+        base: ProjectConfigFields,
         fields: ProjectConfigFields,
     },
     /// Every prompt with the layer the project's agents get; with no project, the layer

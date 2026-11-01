@@ -321,6 +321,7 @@ fn handle_settings(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Re
         Request::SaveProjectConfig {
             call,
             project,
+            base: _,
             fields,
         } => {
             run_slow(sink, "save-project-config", call, move |sink| {

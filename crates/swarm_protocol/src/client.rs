@@ -645,15 +645,18 @@ impl Client {
         }
     }
 
+    /// `base` is what the app loaded; only fields that differ from it are written.
     pub fn save_project_config(
         &self,
         project: ProjectId,
+        base: ProjectConfigFields,
         fields: ProjectConfigFields,
     ) -> Result<(), ClientError> {
         self.done(
             |call| Request::SaveProjectConfig {
                 call,
                 project,
+                base,
                 fields,
             },
             "SaveProjectConfig",

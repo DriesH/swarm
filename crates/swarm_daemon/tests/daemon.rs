@@ -9265,6 +9265,7 @@ impl Client {
         self.until_done(&Request::SaveProjectConfig {
             call: CALL,
             project,
+            base: ProjectConfigFields::default(),
             fields: fields.clone(),
         })
         .map(|_| ())

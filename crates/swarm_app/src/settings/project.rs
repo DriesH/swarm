@@ -684,7 +684,9 @@ impl SettingsState {
         };
 
         let sent = fields.clone();
-        let saving = cx.background_spawn(async move { client.save_project_config(daemon, fields) });
+        let base = fields.clone();
+        let saving =
+            cx.background_spawn(async move { client.save_project_config(daemon, base, fields) });
 
         cx.spawn(async move |this, cx| {
             let result = saving.await;
