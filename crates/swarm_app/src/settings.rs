@@ -933,6 +933,8 @@ impl Render for SettingsWindow {
 
         let nav = self.nav(window, cx);
         let page = self.render_page(cx);
+        let gap_drag = drag_region("settings-gap-drag", window, cx);
+        let page_drag = drag_region("settings-page-drag", window, cx);
 
         swarm_ui::tab_navigation(
             div()
@@ -951,28 +953,49 @@ impl Render for SettingsWindow {
                 .size_full()
                 .child(nav)
                 .child(
-                    div()
+                    v_flex()
                         .flex_1()
                         .min_w_0()
                         .h_full()
-                        .py(px(8.))
+                        .pb(px(8.))
                         .pr(px(8.))
                         .child(
-                            div()
-                                .id("settings-page")
-                                .size_full()
+                            gap_drag
+                                .debug_selector(|| "settings-gap-drag".to_owned())
+                                .h(px(8.))
+                                .flex_none(),
+                        )
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_h_0()
                                 .bg(panel)
                                 .border_1()
                                 .border_color(line)
                                 .rounded(px(10.))
-                                .overflow_y_scroll()
+                                .overflow_hidden()
+                                // The top of the page moves the window, as the titlebar would.
                                 .child(
-                                    v_flex()
-                                        .max_w(px(756.))
-                                        .px(px(48.))
-                                        .py(px(36.))
-                                        .gap(px(26.))
-                                        .child(page),
+                                    page_drag
+                                        .debug_selector(|| "settings-page-drag".to_owned())
+                                        .h(px(36.))
+                                        .flex_none(),
+                                )
+                                .child(
+                                    div()
+                                        .id("settings-page")
+                                        .debug_selector(|| "settings-page".to_owned())
+                                        .flex_1()
+                                        .min_h_0()
+                                        .overflow_y_scroll()
+                                        .child(
+                                            v_flex()
+                                                .max_w(px(756.))
+                                                .px(px(48.))
+                                                .pb(px(36.))
+                                                .gap(px(26.))
+                                                .child(page),
+                                        ),
                                 ),
                         ),
                 ),
@@ -1296,6 +1319,62 @@ mod tests {
 
         assert_eq!(section, Page::Notifications);
         assert_eq!(project, Page::Project(1));
+    }
+
+    // The test platform panics in `start_window_move`, so a panic means a move began.
+    #[gpui::test]
+    #[should_panic(expected = "not implemented")]
+    fn dragging_the_top_of_the_page_moves_the_window(cx: &mut TestAppContext) {
+        setup(cx);
+        let window = open_settings(cx);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        drag_from("settings-page-drag", &mut visual);
+    }
+
+    #[gpui::test]
+    #[should_panic(expected = "not implemented")]
+    fn dragging_the_gap_above_the_page_moves_the_window(cx: &mut TestAppContext) {
+        setup(cx);
+        let window = open_settings(cx);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        drag_from("settings-gap-drag", &mut visual);
+    }
+
+    #[gpui::test]
+    fn the_top_of_the_page_spans_the_page_and_sits_above_its_title(cx: &mut TestAppContext) {
+        setup(cx);
+        let window = open_settings(cx);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+
+        let strip = visual.debug_bounds("settings-page-drag");
+        let page = visual.debug_bounds("settings-page");
+        assert!(
+            strip.is_some() && page.is_some(),
+            "the page is not on screen"
+        );
+
+        if let (Some(strip), Some(page)) = (strip, page) {
+            assert_eq!(strip.size.width, page.size.width);
+            assert_eq!(strip.bottom(), page.top());
+        }
+    }
+
+    fn drag_from(selector: &'static str, visual: &mut gpui::VisualTestContext) {
+        visual.run_until_parked();
+        let start = visual
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} is not on screen"))
+            .center();
+
+        visual.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::none());
+        visual.simulate_mouse_move(
+            start + gpui::point(px(6.), px(0.)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
     }
 
     #[gpui::test]
