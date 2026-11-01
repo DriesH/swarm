@@ -27,7 +27,8 @@ use crate::element::{
 };
 
 /// The font size of a view until [`TerminalView::set_font_size`] says otherwise, in points.
-pub const DEFAULT_FONT_SIZE: f32 = 13.;
+/// It is the settings' default, so the two never differ.
+pub const DEFAULT_FONT_SIZE: f32 = swarm_settings::FONT_SIZE_DEFAULT as f32;
 
 /// What the app may want to react to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,6 +166,13 @@ impl TerminalView {
         _cx: &App,
     ) -> swarm_term::Size {
         Metrics::measure(window, font_size).grid_for(bounds)
+    }
+
+    /// The grid that fits `bounds` for cells of the size `cell`, worked out as the view does
+    /// when it paints: padding included. `cell` comes from
+    /// [`cell_size`](Self::cell_size).
+    pub fn grid_in(bounds: Size<Pixels>, cell: Size<Pixels>) -> swarm_term::Size {
+        element::grid_in(bounds, cell.width, cell.height)
     }
 
     /// The exact size of one cell with the font at `font_size` points, as the view paints

@@ -59,15 +59,16 @@ impl OutputBlock {
     }
 }
 
-/// Moves the scroll offset for a navigation key. Returns false for any other key.
-fn scroll_for_key(scroll: &ScrollHandle, key: &str) -> bool {
+/// Moves the scroll offset of `scroll` for a navigation key: arrows move a `line`, Page Up
+/// and Page Down a page, Home and End go to the ends. Returns false for any other key.
+pub fn scroll_for_key(scroll: &ScrollHandle, key: &str, line: Pixels) -> bool {
     let top = scroll.offset();
     let bottom = -scroll.max_offset().y;
-    let page = (scroll.bounds().size.height - LINE_HEIGHT).max(LINE_HEIGHT);
+    let page = (scroll.bounds().size.height - line).max(line);
 
     let target = match key {
-        "up" => top.y + LINE_HEIGHT,
-        "down" => top.y - LINE_HEIGHT,
+        "up" => top.y + line,
+        "down" => top.y - line,
         "pageup" => top.y + page,
         "pagedown" => top.y - page,
         "home" => px(0.),
@@ -107,7 +108,7 @@ impl RenderOnce for OutputBlock {
             .tab_stop(true)
             .track_scroll(&scroll)
             .on_key_down(move |event, window, cx| {
-                if scroll_for_key(&on_key, event.keystroke.key.as_str()) {
+                if scroll_for_key(&on_key, event.keystroke.key.as_str(), LINE_HEIGHT) {
                     window.refresh();
                     cx.stop_propagation();
                 }

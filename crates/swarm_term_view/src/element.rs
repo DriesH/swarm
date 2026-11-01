@@ -78,18 +78,7 @@ impl Metrics {
 
     /// The grid that fits `bounds` after padding.
     pub(crate) fn grid_for(&self, bounds: Size<Pixels>) -> swarm_term::Size {
-        let width = bounds.width - PADDING * 2.;
-        let height = bounds.height - PADDING * 2.;
-
-        let cols = whole_cells(width / self.cell_width).max(2.);
-        let rows = whole_cells(height / self.line_height).max(1.);
-
-        swarm_term::Size {
-            cols: to_u16(cols),
-            rows: to_u16(rows),
-            cell_width: to_u16(f32::from(self.cell_width)),
-            cell_height: to_u16(f32::from(self.line_height)),
-        }
+        grid_in(bounds, self.cell_width, self.line_height)
     }
 
     /// The column and row under `offset`, counted from the grid's top left corner.
@@ -98,6 +87,26 @@ impl Metrics {
             to_u16((offset.x / self.cell_width).floor()),
             to_u16((offset.y / self.line_height).floor()),
         )
+    }
+}
+
+/// The grid that fits `bounds` after padding, for cells of this size.
+pub(crate) fn grid_in(
+    bounds: Size<Pixels>,
+    cell_width: Pixels,
+    line_height: Pixels,
+) -> swarm_term::Size {
+    let width = bounds.width - PADDING * 2.;
+    let height = bounds.height - PADDING * 2.;
+
+    let cols = whole_cells(width / cell_width).max(2.);
+    let rows = whole_cells(height / line_height).max(1.);
+
+    swarm_term::Size {
+        cols: to_u16(cols),
+        rows: to_u16(rows),
+        cell_width: to_u16(f32::from(cell_width)),
+        cell_height: to_u16(f32::from(line_height)),
     }
 }
 

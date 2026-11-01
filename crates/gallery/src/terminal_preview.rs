@@ -11,7 +11,7 @@ const TILE_WIDTH: f32 = 760.;
 const TILE_HEIGHT: f32 = 420.;
 // The tile's header, border and body padding.
 const CHROME_WIDTH: f32 = 26.;
-const CHROME_HEIGHT: f32 = 66.;
+const CHROME_HEIGHT: f32 = 56.;
 
 const SCRIPT: &str = r#"
 printf '\033[1mbold\033[0m \033[3mitalic\033[0m \033[2mfaint\033[0m \033[4munderline\033[0m \033[9mstrikethrough\033[0m \033[7minverse\033[0m\n'

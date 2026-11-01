@@ -362,3 +362,66 @@ fn an_output_block_is_a_tab_stop_and_scrolls_with_the_keyboard(cx: &mut TestAppC
         "it never scrolls above the top"
     );
 }
+
+struct AskHarness {
+    cancel: FocusHandle,
+    confirm: FocusHandle,
+    log: Log,
+}
+
+impl Render for AskHarness {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let dismissed = Rc::clone(&self.log);
+        let cancelled = Rc::clone(&self.log);
+
+        ConfirmRow::new("ask", "Reset worker.md?", "Reset")
+            .track_focus(&self.cancel, &self.confirm)
+            .on_cancel(move |_, _, _| cancelled.borrow_mut().push("cancel".to_owned()))
+            .on_dismiss(move |_, _| dismissed.borrow_mut().push("dismiss".to_owned()))
+    }
+}
+
+fn ask(cx: &mut TestAppContext) -> (Log, AskHandles, &mut VisualTestContext) {
+    cx.update(swarm_ui::init);
+
+    let log = Log::default();
+    let shared = Rc::clone(&log);
+    let (harness, cx) = cx.add_window_view(move |_, cx| AskHarness {
+        cancel: cx.focus_handle().tab_stop(true),
+        confirm: cx.focus_handle().tab_stop(true),
+        log: shared,
+    });
+    let handles = harness.read_with(cx, |harness, _| AskHandles {
+        cancel: harness.cancel.clone(),
+        confirm: harness.confirm.clone(),
+    });
+    cx.run_until_parked();
+
+    (log, handles, cx)
+}
+
+struct AskHandles {
+    cancel: FocusHandle,
+    confirm: FocusHandle,
+}
+
+#[gpui::test]
+fn escape_dismisses_a_confirm_row_from_either_button(cx: &mut TestAppContext) {
+    let (log, handles, cx) = ask(cx);
+
+    cx.update(|window, cx| handles.cancel.focus(window, cx));
+    cx.simulate_keystrokes("escape");
+    cx.update(|window, cx| handles.confirm.focus(window, cx));
+    cx.simulate_keystrokes("escape");
+
+    assert_eq!(entries(&log), ["dismiss", "dismiss"]);
+}
+
+#[gpui::test]
+fn escape_outside_a_confirm_row_does_nothing(cx: &mut TestAppContext) {
+    let (log, _, cx) = ask(cx);
+
+    cx.simulate_keystrokes("escape");
+
+    assert!(entries(&log).is_empty());
+}

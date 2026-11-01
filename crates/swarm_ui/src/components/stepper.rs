@@ -1,14 +1,19 @@
 use std::rc::Rc;
 
-use gpui::{AnyElement, App, ElementId, Role, SharedString, Window, div, px};
+use gpui::{
+    AccessibleAction, AnyElement, App, ElementId, FocusHandle, Role, SharedString, Window, div, px,
+};
 
 use crate::component::{Component, example, example_group};
 use crate::prelude::*;
+use crate::styles::focus_ring;
 
 type ChangeHandler = Rc<dyn Fn(u32, &mut Window, &mut App) + 'static>;
 
-/// A whole number between two limits, with a minus and a plus button around it. The label
-/// is required: VoiceOver reads it with the value.
+/// A whole number between two limits, with a minus and a plus button around it. It is one
+/// spin button for VoiceOver, which reads the label and the value and can raise or lower
+/// it. The keyboard reaches it as one stop: Up and Down step, Home and End go to the
+/// limits. The label is required.
 #[derive(IntoElement)]
 #[must_use]
 pub struct Stepper {
@@ -56,8 +61,8 @@ impl Stepper {
         self
     }
 
-    /// Called with the new value when a button changes it. A button at its limit does
-    /// nothing.
+    /// Called with the new value when a button, a key or VoiceOver changes it. At a limit
+    /// the way past it does nothing.
     pub fn on_change(mut self, handler: impl Fn(u32, &mut Window, &mut App) + 'static) -> Self {
         self.on_change = Some(Rc::new(handler));
         self
@@ -69,55 +74,89 @@ impl Stepper {
             None => self.value.to_string(),
         }
     }
+
+    /// The value one step down, or `None` at the minimum.
+    fn lower(&self) -> Option<u32> {
+        (self.value > self.min).then(|| self.value - 1)
+    }
+
+    /// The value one step up, or `None` at the maximum.
+    fn higher(&self) -> Option<u32> {
+        (self.value < self.max).then(|| self.value + 1)
+    }
+
+    /// The minus and the plus button. A button at its limit is disabled, so it cannot be
+    /// focused or pressed, and only its icon is faded.
+    #[doc(hidden)]
+    pub fn buttons(&self) -> [IconButton; 2] {
+        [
+            self.button("decrease", self.lower(), None),
+            self.button("increase", self.higher(), None),
+        ]
+    }
+
+    /// `owner` takes focus after a press, so the keyboard stays on the stepper when the
+    /// button turns off at its limit.
+    fn button(
+        &self,
+        suffix: &'static str,
+        to: Option<u32>,
+        owner: Option<FocusHandle>,
+    ) -> IconButton {
+        let (icon, verb) = if suffix == "decrease" {
+            (IconName::Minus, "Decrease")
+        } else {
+            (IconName::Plus, "Increase")
+        };
+        let handler = self.on_change.clone();
+        let selector = self.debug_selector.clone();
+
+        IconButton::new(
+            (self.id.clone(), suffix),
+            icon,
+            format!("{verb} {}", self.label.to_lowercase()),
+        )
+        .size(IconButtonSize::Medium)
+        .color(Color::Muted)
+        .skip_tab_stop()
+        .disabled(to.is_none())
+        .when_some(selector, |button, selector| {
+            button.debug_selector(move || format!("{selector}-{suffix}"))
+        })
+        .on_click(move |_, window, cx| {
+            if let Some(owner) = &owner {
+                window.focus(owner, cx);
+            }
+
+            if let (Some(to), Some(handler)) = (to, &handler) {
+                handler(to, window, cx);
+            }
+        })
+    }
 }
 
 impl RenderOnce for Stepper {
-    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let accent = cx.theme().colors().accent;
+        let focus = window
+            .use_keyed_state((self.id.clone(), "focus"), cx, |_, cx| {
+                cx.focus_handle().tab_stop(true)
+            })
+            .read(cx)
+            .clone();
+
         let shown = self.shown();
         let (value, min, max) = (self.value, self.min, self.max);
+        let (lower, higher) = (self.lower(), self.higher());
 
-        // A button at its limit stays focusable, so pressing it never strands the keyboard.
-        let button = |suffix: &'static str, icon: IconName, to: Option<u32>| {
-            let verb = if icon == IconName::Minus {
-                "Decrease"
-            } else {
-                "Increase"
-            };
-            let handler = self.on_change.clone();
-            let selector = self.debug_selector.clone();
+        let decrease = self.button("decrease", lower, Some(focus.clone()));
+        let increase = self.button("increase", higher, Some(focus.clone()));
 
-            div()
-                .when(to.is_none(), |at_limit| at_limit.opacity(0.4))
-                .child(
-                    IconButton::new(
-                        (self.id.clone(), suffix),
-                        icon,
-                        format!("{verb} {}", self.label.to_lowercase()),
-                    )
-                    .size(IconButtonSize::Medium)
-                    .color(Color::Muted)
-                    .when_some(selector, |button, selector| {
-                        button.debug_selector(move || format!("{selector}-{suffix}"))
-                    })
-                    .on_click(move |_, window, cx| {
-                        if let (Some(to), Some(handler)) = (to, &handler) {
-                            handler(to, window, cx);
-                        }
-                    }),
-                )
-        };
-
-        let decrease = button(
-            "decrease",
-            IconName::Minus,
-            (value > min).then(|| value - 1),
-        );
-        let increase = button("increase", IconName::Plus, (value < max).then(|| value + 1));
+        let on_key = self.on_change.clone();
+        let with_handler = |to: Option<u32>| to.zip(self.on_change.clone());
 
         let readout = div()
             .id((self.id.clone(), "value"))
-            .role(Role::Label)
-            .aria_label(format!("{}: {shown}", self.label))
             .when_some(self.debug_selector, |readout, selector| {
                 readout.debug_selector(move || format!("{selector}-value"))
             })
@@ -125,17 +164,51 @@ impl RenderOnce for Stepper {
             .items_center()
             .justify_center()
             .min_w(px(52.))
-            .child(Label::new(shown).mono());
+            .child(Label::new(shown.clone()).mono());
 
-        h_flex()
+        let mut stepper = h_flex()
             .id(self.id)
-            .role(Role::Group)
+            .role(Role::SpinButton)
             .aria_label(self.label)
+            .aria_value(shown)
+            .aria_numeric_value(f64::from(value))
+            .aria_min_numeric_value(f64::from(min))
+            .aria_max_numeric_value(f64::from(max))
+            .aria_numeric_value_step(1.)
+            .track_focus(&focus)
+            .focus_visible(move |style| focus_ring(style, accent))
+            .on_key_down(move |event, window, cx| {
+                let to = match event.keystroke.key.as_str() {
+                    "up" => higher,
+                    "down" => lower,
+                    "home" => Some(min).filter(|to| *to != value),
+                    "end" => Some(max).filter(|to| *to != value),
+                    _ => return,
+                };
+
+                cx.stop_propagation();
+
+                if let (Some(to), Some(handler)) = (to, &on_key) {
+                    handler(to, window, cx);
+                }
+            })
             .flex_none()
             .gap(px(2.))
-            .child(decrease)
-            .child(readout)
-            .child(increase)
+            .rounded(px(7.));
+
+        if let Some((to, handler)) = with_handler(higher) {
+            stepper = stepper.on_a11y_action(AccessibleAction::Increment, move |_, window, cx| {
+                handler(to, window, cx);
+            });
+        }
+
+        if let Some((to, handler)) = with_handler(lower) {
+            stepper = stepper.on_a11y_action(AccessibleAction::Decrement, move |_, window, cx| {
+                handler(to, window, cx);
+            });
+        }
+
+        stepper.child(decrease).child(readout).child(increase)
     }
 }
 
@@ -264,10 +337,72 @@ mod tests {
     }
 
     #[gpui::test]
+    fn the_stepper_is_one_tab_stop_and_up_and_down_step_the_value(cx: &mut TestAppContext) {
+        let (log, harness, cx) = setup(12, cx);
+
+        cx.update(Window::focus_next);
+        cx.simulate_keystrokes("up");
+        cx.simulate_keystrokes("up");
+        cx.simulate_keystrokes("down");
+        cx.simulate_keystrokes("down");
+        cx.simulate_keystrokes("down");
+        cx.simulate_keystrokes("down");
+
+        assert_eq!(*log.borrow(), [13, 12, 11]);
+        assert_eq!(harness.read_with(cx, |harness, _| harness.value), 11);
+    }
+
+    #[gpui::test]
+    fn home_and_end_go_to_the_limits(cx: &mut TestAppContext) {
+        let (log, _, cx) = setup(12, cx);
+
+        cx.update(Window::focus_next);
+        cx.simulate_keystrokes("end");
+        cx.simulate_keystrokes("end");
+        cx.simulate_keystrokes("home");
+
+        assert_eq!(*log.borrow(), [13, 11]);
+    }
+
+    #[gpui::test]
+    fn the_buttons_are_not_tab_stops_and_the_stepper_keeps_focus_after_a_press(
+        cx: &mut TestAppContext,
+    ) {
+        let (log, _, cx) = setup(12, cx);
+
+        cx.update(Window::focus_next);
+        let stepper = cx.update(|window, cx| window.focused(cx));
+        cx.update(Window::focus_next);
+        let again = cx.update(|window, cx| window.focused(cx));
+
+        click("size-increase", cx);
+        click("size-increase", cx);
+        let after_press = cx.update(|window, cx| window.focused(cx));
+
+        assert_eq!(stepper, again, "Tab went past the stepper to another stop");
+        assert_eq!(stepper, after_press, "the press took focus away");
+        assert_eq!(*log.borrow(), [13]);
+    }
+
+    #[gpui::test]
     fn the_value_shows_with_its_unit(cx: &mut TestAppContext) {
         let (_, _, cx) = setup(12, cx);
 
         assert!(cx.debug_bounds("size-value").is_some());
+    }
+
+    #[test]
+    fn the_buttons_at_the_limits_are_the_ones_that_cannot_step() {
+        let stepper = |value| Stepper::new("size", "Font size", value, 11, 20);
+
+        assert_eq!(
+            [stepper(11).lower(), stepper(11).higher()],
+            [None, Some(12)]
+        );
+        assert_eq!(
+            [stepper(20).lower(), stepper(20).higher()],
+            [Some(19), None]
+        );
     }
 
     #[test]

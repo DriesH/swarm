@@ -260,6 +260,101 @@ fn changing_the_font_size_measures_the_cell_again_and_sends_the_new_grid(cx: &mu
     assert!(large.cell_height > small.cell_height, "{small:?} {large:?}");
 }
 
+/// The first extent in pixels, counted from `from`, where `along` reads the same at both
+/// font sizes while the cell is not the same. `space` makes the bounds from one extent.
+fn extent_where_the_grid_stays(
+    setup: &mut Setup<'_>,
+    space: impl Fn(f32) -> gpui::Size<gpui::Pixels>,
+    along: impl Fn(swarm_term::Size) -> u16,
+    from: f32,
+) -> Option<f32> {
+    setup.cx.update(|window, cx| {
+        (0_u16..400)
+            .map(|step| from + f32::from(step))
+            .find(|extent| {
+                let (small, large) = (
+                    TerminalView::size_for(space(*extent), 13., window, cx),
+                    TerminalView::size_for(space(*extent), 14., window, cx),
+                );
+
+                along(small) == along(large) && along(small) > 2
+            })
+    })
+}
+
+#[gpui::test]
+fn a_font_change_tells_the_emulator_the_new_cell_even_when_rows_and_columns_stay(
+    cx: &mut TestAppContext,
+) {
+    let mut setup = setup(cx);
+    let width = extent_where_the_grid_stays(
+        &mut setup,
+        |width| gpui::size(px(width), px(400.)),
+        |grid| grid.cols,
+        60.,
+    )
+    .expect("a width where both fonts fit the same columns");
+    let height = extent_where_the_grid_stays(
+        &mut setup,
+        |height| gpui::size(px(width), px(height)),
+        |grid| grid.rows,
+        60.,
+    )
+    .expect("a height where both fonts fit the same rows");
+    setup.cx.simulate_resize(gpui::size(px(width), px(height)));
+    setup.send(snapshot(&["a"], History::default()));
+    setup.cx.update(|window, _| window.refresh());
+    setup.cx.run_until_parked();
+    let before = resizes(&setup.inputs());
+    let terminal = setup.terminal.clone();
+
+    setup.cx.update(|window, cx| {
+        terminal.update(cx, |view, cx| view.set_font_size(14., window, cx));
+    });
+    setup.cx.update(|window, _| window.refresh());
+    setup.cx.run_until_parked();
+    let after = resizes(&setup.inputs());
+
+    let (first, second) = (
+        before.last().copied().expect("a grid before the change"),
+        after.last().copied().expect("a grid after the change"),
+    );
+    assert_eq!(after.len(), 1, "the grid was sent again once: {after:?}");
+    assert_eq!((first.cols, first.rows), (second.cols, second.rows));
+    assert!(
+        second.cell_height > first.cell_height,
+        "{first:?} {second:?}"
+    );
+}
+
+#[gpui::test]
+fn the_grid_in_a_space_is_the_one_the_view_sends(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    setup.send(snapshot(&["a"], History::default()));
+    setup.cx.simulate_resize(gpui::size(px(703.), px(517.)));
+    setup.cx.update(|window, _| window.refresh());
+    setup.cx.run_until_parked();
+    let sent = resizes(&setup.inputs())
+        .last()
+        .copied()
+        .expect("the view sent a grid");
+
+    let counted = setup.cx.update(|window, cx| {
+        let cell = TerminalView::cell_size(DEFAULT_FONT_SIZE, window, cx);
+
+        TerminalView::grid_in(gpui::size(px(703.), px(517.)), cell)
+    });
+
+    assert_eq!(counted, sent);
+}
+
+#[test]
+fn the_default_font_size_is_the_default_of_the_settings() {
+    assert!(
+        (DEFAULT_FONT_SIZE - f32::from(swarm_settings::FONT_SIZE_DEFAULT)).abs() < f32::EPSILON
+    );
+}
+
 #[gpui::test]
 fn setting_the_same_font_size_again_does_nothing(cx: &mut TestAppContext) {
     let mut setup = setup(cx);
