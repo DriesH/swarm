@@ -147,6 +147,27 @@ fn a_system_check_row_reads_its_name_state_and_detail() {
 }
 
 #[test]
+fn a_button_hint_is_read_after_the_label() {
+    with_window(|window, cx| {
+        let hinted = a11y_info(
+            Button::new("install", "Install")
+                .accessible_label("Install GitHub CLI")
+                .hint("/opt/homebrew/bin/brew install gh"),
+            window,
+            cx,
+        );
+        let plain = a11y_info(Button::new("plain", "Install"), window, cx);
+
+        assert_eq!(hinted.node.label(), Some("Install GitHub CLI"));
+        assert_eq!(
+            hinted.node.description(),
+            Some("/opt/homebrew/bin/brew install gh")
+        );
+        assert_eq!(plain.node.description(), None);
+    });
+}
+
+#[test]
 fn a_usage_meter_is_one_labelled_group() {
     with_window(|window, cx| {
         let plain = a11y_info(

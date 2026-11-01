@@ -253,7 +253,7 @@ impl Component for SystemCheckRow {
                                 v_flex()
                                     .p(px(8.))
                                     .child(
-                                        Label::new("$ brew install gh")
+                                        Label::new("$ /opt/homebrew/bin/brew install gh")
                                             .mono()
                                             .size(LabelSize::XSmall),
                                     )
