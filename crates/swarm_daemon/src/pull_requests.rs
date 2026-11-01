@@ -16,7 +16,7 @@ use swarm_protocol::{
     PrDraft, PrLink, PrPanel, PrState, PullRequest, TaskId, TaskInfo,
 };
 
-use crate::{Services, tasks};
+use crate::{Services, stats, tasks};
 
 /// A push may run a pre-push hook, which can run the whole test suite.
 const PUSH_TIMEOUT: Duration = Duration::from_secs(PUSH_SECS);
@@ -496,6 +496,8 @@ pub(crate) fn merge(services: &Services, id: TaskId, method: MergeMethod) -> Res
 
         return Ok(());
     }
+
+    stats::record_merge(services, id);
 
     if let Err(error) = git::delete_remote_branch(&task.worktree, &task.branch, DELETE_TIMEOUT) {
         log::warn!("cannot delete the remote branch {}: {error}", task.branch);

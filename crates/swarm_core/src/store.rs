@@ -159,7 +159,16 @@ const MIGRATIONS: &[&str] = &[
             AND messages.sent_at <= comments.sent_at
         ORDER BY messages.sent_at DESC, messages.id DESC LIMIT 1
     ) WHERE sent_at IS NOT NULL",
+    // One row per task: a merge that is reported twice must not count twice.
+    "CREATE TABLE merges (
+        id INTEGER PRIMARY KEY,
+        task INTEGER NOT NULL UNIQUE,
+        merged_at INTEGER NOT NULL
+    )",
 ];
+
+/// The hundredth merge is the one that makes the queen bee.
+const QUEEN_MERGES: u64 = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -1281,6 +1290,52 @@ impl Store {
         )?;
 
         Ok(())
+    }
+
+    /// How many tasks are open, in every project.
+    pub fn open_task_count(&self) -> Result<u32, Error> {
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE closed_at IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+
+        u32::try_from(count).map_err(|_| Error::Invalid(format!("task count {count} is invalid")))
+    }
+
+    /// Records that the task's pull request merged through Swarm. Returns false when the
+    /// task was counted before.
+    pub fn record_merge(&self, task: TaskId) -> Result<bool, Error> {
+        let inserted = self.connection.execute(
+            "INSERT OR IGNORE INTO merges (task, merged_at) VALUES (?1, ?2)",
+            params![to_row(task.0)?, now_millis()],
+        )?;
+
+        Ok(inserted > 0)
+    }
+
+    /// How many pull requests merged through Swarm, ever.
+    pub fn merge_count(&self) -> Result<u64, Error> {
+        let count: i64 = self
+            .connection
+            .query_row("SELECT COUNT(*) FROM merges", [], |row| row.get(0))?;
+
+        from_row(count)
+    }
+
+    /// When the hundredth merge happened, in milliseconds since the Unix epoch. `None`
+    /// until there are a hundred.
+    pub fn hundredth_merge_at(&self) -> Result<Option<u64>, Error> {
+        let at: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT merged_at FROM merges ORDER BY id LIMIT 1 OFFSET ?1",
+                params![to_row(QUEEN_MERGES - 1)?],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        at.map(from_row).transpose()
     }
 
     /// The ports of every task and every worker that has not stopped, in every project.
@@ -2610,10 +2665,13 @@ mod tests {
         );
     }
 
+    /// The migration that adds `comments.message` is the sixteenth.
+    const COMMENT_MESSAGE_MIGRATION: usize = 15;
+
     #[test]
     fn a_database_from_before_comment_messages_links_sent_comments_to_their_message() {
         let connection = Connection::open_in_memory().expect("connection");
-        let before = MIGRATIONS.len() - 1;
+        let before = COMMENT_MESSAGE_MIGRATION;
         for migration in &MIGRATIONS[..before] {
             connection.execute_batch(migration).expect("old schema");
         }
@@ -2726,5 +2784,95 @@ mod tests {
             .expect("list");
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].text, "kept");
+    }
+
+    /// The migration that adds the `merges` table is the seventeenth.
+    const MERGES_MIGRATION: usize = 16;
+
+    #[test]
+    fn a_database_from_before_merges_keeps_its_tasks_and_counts_none() {
+        assert!(MIGRATIONS[MERGES_MIGRATION].contains("CREATE TABLE merges"));
+        let connection = Connection::open_in_memory().expect("connection");
+        for migration in &MIGRATIONS[..MERGES_MIGRATION] {
+            connection.execute_batch(migration).expect("old schema");
+        }
+        connection
+            .pragma_update(
+                None,
+                "user_version",
+                i64::try_from(MERGES_MIGRATION).expect("count"),
+            )
+            .expect("version");
+        connection
+            .execute_batch(
+                "INSERT INTO projects (path, name, added_at) VALUES ('/repo', 'repo', 1);
+                 INSERT INTO tasks (project, name, branch, base, worktree, ports, created_at)
+                     VALUES (1, 'old', 'swarm/old', 'main', '/repo/.worktrees/old', '', 1)",
+            )
+            .expect("old rows");
+
+        let store = Store::migrated(connection).expect("migrated");
+
+        assert_eq!(store.merge_count().expect("count"), 0);
+        assert_eq!(store.hundredth_merge_at().expect("hundredth"), None);
+        assert_eq!(store.open_task_count().expect("open"), 1);
+        assert!(store.record_merge(TaskId(1)).expect("record"));
+        assert_eq!(store.merge_count().expect("count"), 1);
+    }
+
+    #[test]
+    fn a_new_database_has_no_merges() {
+        let store = Store::open_in_memory().expect("store");
+
+        assert_eq!(store.merge_count().expect("count"), 0);
+        assert_eq!(store.hundredth_merge_at().expect("hundredth"), None);
+    }
+
+    #[test]
+    fn merges_are_counted_once_per_task() {
+        let store = Store::open_in_memory().expect("store");
+
+        assert!(store.record_merge(TaskId(7)).expect("first"));
+        assert!(!store.record_merge(TaskId(7)).expect("repeat"));
+        assert!(store.record_merge(TaskId(8)).expect("other"));
+
+        assert_eq!(store.merge_count().expect("count"), 2);
+    }
+
+    #[test]
+    fn the_hundredth_merge_keeps_the_time_of_the_hundredth_row() {
+        let store = Store::open_in_memory().expect("store");
+        for task in 1..=99 {
+            store.record_merge(TaskId(task)).expect("record");
+        }
+        assert_eq!(store.merge_count().expect("count"), 99);
+        assert_eq!(store.hundredth_merge_at().expect("hundredth"), None);
+
+        store.record_merge(TaskId(100)).expect("hundredth");
+        store.record_merge(TaskId(101)).expect("after");
+        store
+            .connection
+            .execute("UPDATE merges SET merged_at = id * 1000", [])
+            .expect("times");
+
+        assert_eq!(store.merge_count().expect("count"), 101);
+        assert_eq!(
+            store.hundredth_merge_at().expect("hundredth"),
+            Some(100_000)
+        );
+    }
+
+    #[test]
+    fn only_open_tasks_count() {
+        let (store, first) = store_with_task();
+        let project = store.list_projects().expect("projects")[0].id;
+        let second = store.add_task(&new_task(project, &[])).expect("second").id;
+        assert_eq!(store.open_task_count().expect("open"), 2);
+
+        store.close_task(first).expect("close");
+
+        assert_eq!(store.open_task_count().expect("open"), 1);
+        store.close_task(second).expect("close");
+        assert_eq!(store.open_task_count().expect("open"), 0);
     }
 }
