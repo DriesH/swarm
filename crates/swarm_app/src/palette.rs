@@ -45,6 +45,10 @@ pub(crate) enum Command {
     Buzz,
     /// Debug builds only.
     ShowWelcome,
+    /// Debug builds only.
+    CrownQueen,
+    /// Debug builds only.
+    ShowHoneyToast,
     Task(TaskId),
     Agent(TerminalId),
 }
@@ -701,6 +705,18 @@ impl Workspace {
                 "Show welcome screen",
                 Command::ShowWelcome,
             ));
+            rows.push(Row::new(
+                Group::Swarm,
+                IconName::Bee,
+                "Crown the queen bee",
+                Command::CrownQueen,
+            ));
+            rows.push(Row::new(
+                Group::Swarm,
+                IconName::Bee,
+                "Show Honey's ready toast",
+                Command::ShowHoneyToast,
+            ));
         }
 
         let view = cx.new(|cx| Palette::new(rows, window, cx));
@@ -748,6 +764,12 @@ impl Workspace {
             Command::CreatePullRequest => window.dispatch_action(Box::new(CreatePullRequest), cx),
             Command::Buzz => self.start_buzz(cx),
             Command::ShowWelcome => self.show_welcome(cx),
+            #[cfg(debug_assertions)]
+            Command::CrownQueen => self.crown_queen(cx),
+            #[cfg(debug_assertions)]
+            Command::ShowHoneyToast => self.show_honey_toast_now(window, cx),
+            #[cfg(not(debug_assertions))]
+            Command::CrownQueen | Command::ShowHoneyToast => {}
         }
     }
 }
@@ -942,6 +964,34 @@ mod tests {
 
         workspace.update(cx, Workspace::finish_welcome);
         assert!(!shows(cx));
+    }
+
+    #[gpui::test]
+    fn show_honeys_ready_toast_shows_it_for_the_open_task(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+
+        cx.simulate_keystrokes("cmd-k");
+        cx.simulate_input("honey");
+        let typed = palette_labels(&workspace, cx);
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        let (toast, open) = workspace.read_with(cx, |workspace, _| {
+            (
+                workspace
+                    .eggs
+                    .toast
+                    .as_ref()
+                    .map(|toast| toast.task.to_string()),
+                workspace
+                    .data
+                    .task(workspace.active_task)
+                    .map(|task| task.name.to_string()),
+            )
+        });
+        assert_eq!(typed, Some(vec!["Show Honey's ready toast".to_owned()]));
+        assert!(toast.is_some());
+        assert_eq!(toast, open);
     }
 
     #[gpui::test]
