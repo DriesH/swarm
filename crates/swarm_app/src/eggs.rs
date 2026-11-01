@@ -106,6 +106,42 @@ impl Workspace {
     }
 }
 
+/// Debug builds only: triggers for checking the eggs by hand. The eggs still follow their
+/// setting and Reduce Motion.
+#[cfg(debug_assertions)]
+impl Workspace {
+    /// Crowns the Start orchestrator as if the 100th merge happened now. The next stats
+    /// from the daemon take the crown off again.
+    pub(crate) fn crown_queen(&mut self, cx: &mut Context<Self>) {
+        self.eggs.stats.hundredth_merge_at = Some(self.now_ms());
+        self.watch_queen_expiry(cx);
+        cx.notify();
+    }
+
+    /// Shows the "Honey's ready" toast for the open task, as if its workers all finished.
+    pub(crate) fn show_honey_toast_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(task) = self.data.task(self.active_task) else {
+            return;
+        };
+        let project = self
+            .data
+            .project(self.active_project)
+            .and_then(|project| project.daemon);
+
+        let notice = Notice {
+            kind: NoticeKind::ReadyForReview,
+            project: project.unwrap_or(swarm_protocol::ProjectId(0)),
+            task: task.daemon.as_ref().map(|daemon| daemon.id),
+            agent: swarm_protocol::AgentId(0),
+            text: task.name.to_string(),
+            at: self.now_ms(),
+        };
+        let name = task.name.clone();
+
+        self.place_toast(&notice, name, Some(window), cx);
+    }
+}
+
 /// Runs `change` on the workspace, when it is still there.
 fn update(
     workspace: &WeakEntity<Workspace>,
@@ -1067,6 +1103,19 @@ mod tests {
         element.write_a11y_info(&mut node);
 
         (element.a11y_role(), node.label().map(str::to_owned))
+    }
+
+    #[gpui::test]
+    fn crown_the_queen_bee_in_the_palette_crowns_the_start_orchestrator(cx: &mut TestAppContext) {
+        let (workspace, cx) = on_the_start_task(cx);
+        assert!(!queen_crown_shows(cx));
+
+        workspace.update_in(cx, Workspace::toggle_palette);
+        cx.simulate_input("queen");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        assert!(queen_crown_shows(cx));
     }
 
     #[gpui::test]
