@@ -314,11 +314,13 @@ mod tests {
         use swarm_core::Projects;
         use swarm_core::github::Github;
         use swarm_core::store::{NewTask, Store};
+        use swarm_core::system_check::Tools;
         use swarm_protocol::{AgentKind, AgentRole};
 
         use crate::Services;
         use crate::agents::{AgentConfig, Agents, Place};
         use crate::checks::Checks;
+        use crate::connection::SystemChecks;
         use crate::hub::{Clients, Terminals};
         use crate::messages::Messages;
         use crate::processes::Processes;
@@ -382,7 +384,8 @@ mod tests {
                 Arc::clone(&clients),
                 Arc::clone(&agents),
             ),
-            pull_requests: PullRequests::new(github, None),
+            pull_requests: PullRequests::new(github.clone(), None),
+            system_check: SystemChecks::new(Tools::system(), None, github),
             usage: UsageService::start(
                 folder.path(),
                 None,

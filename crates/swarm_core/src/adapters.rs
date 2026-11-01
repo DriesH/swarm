@@ -354,13 +354,18 @@ fn text(path: &Path) -> String {
 /// Looks the CLI up the way a shell would, then in the usual install folders.
 /// A command with a slash is used as it is.
 pub fn find_command(command: &str, path: Option<&OsStr>, home: Option<&Path>) -> Option<PathBuf> {
+    find_in(command, search_folders(path, home))
+}
+
+/// Like [`find_command`], in exactly these folders, in this order.
+pub fn find_in(command: &str, folders: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
     if command.contains('/') {
         let given = PathBuf::from(command);
 
         return is_executable(&given).then_some(given);
     }
 
-    search_folders(path, home)
+    folders
         .into_iter()
         .map(|folder| folder.join(command))
         .find(|candidate| is_executable(candidate))
@@ -988,6 +993,18 @@ mod tests {
         );
 
         assert_eq!(found, Some(in_path));
+    }
+
+    #[test]
+    fn find_in_searches_only_the_folders_it_is_given() {
+        let bin = Bin::new("only");
+        let tool = bin.tool("one", "claude", 0o755);
+        bin.tool("home/.local/bin", "claude", 0o755);
+
+        let found = find_in("claude", [bin.root.join("one")]);
+
+        assert_eq!(found, Some(tool));
+        assert_eq!(find_in("claude", Vec::new()), None);
     }
 
     #[test]

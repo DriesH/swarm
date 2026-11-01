@@ -21,9 +21,11 @@ mod settings;
 mod sidebar;
 mod status_bar;
 mod swarm_view;
+mod system_check;
 mod tab_bar;
 mod usage_text;
 mod views;
+mod welcome;
 mod window_drag;
 mod workspace;
 
@@ -73,6 +75,11 @@ fn open_workspace(cx: &mut App) -> anyhow::Result<gpui::WindowHandle<Workspace>>
     // Snapshot and frame-stats runs keep the sample data and never connect.
     let sample = cfg!(any(feature = "snapshot", feature = "frame-stats"));
 
+    // Loaded before the first frame: the welcome screen reads its flag from the settings.
+    if !sample {
+        settings::load(swarm_settings::default_path(), cx);
+    }
+
     let handle = cx.open_window(options, |window, cx| {
         cx.new(|cx| {
             if sample {
@@ -84,8 +91,6 @@ fn open_workspace(cx: &mut App) -> anyhow::Result<gpui::WindowHandle<Workspace>>
     })?;
 
     if !sample {
-        settings::load(swarm_settings::default_path(), cx);
-
         handle.update(cx, |workspace, _, cx| {
             workspace.settings_path = swarm_settings::default_path();
             workspace.connect_daemon(cx);

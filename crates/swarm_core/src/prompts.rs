@@ -93,6 +93,8 @@ const ORCHESTRATOR_COMMANDS: &[&str] = &[
     "`swarm agents`: list your workers",
     "`swarm notify <text>`: ask the user for attention",
     "`swarm confirm`: say that you understood your brief",
+    "`swarm tile grow <worker>`: ask for a large tile for one of your workers; the layout may ignore it, for example when the user minimized the tile",
+    "`swarm tile shrink <worker>`: ask for a small tile again",
     "`swarm pr draft --title <title> (--body <text> | --body-file <path|->)`: send the pull request title and description the `pr draft` message asks for (only after the user approved the task)",
 ];
 
@@ -111,6 +113,8 @@ const WORKER_COMMANDS: &[&str] = &[
     "`swarm commit -m <message> <path>...`: commit only the named files in your worktree, as yourself",
     "`swarm read`: take your unread messages",
     "`swarm wait [--timeout SECS]`: wait for a message (default 100, at most 600)",
+    "`swarm tile grow`: ask for a large tile for yourself; the layout may ignore it, for example when the user minimized the tile",
+    "`swarm tile shrink`: ask for a small tile again",
 ];
 
 const START_COMMANDS: &[&str] = &[
@@ -503,17 +507,23 @@ mod tests {
 
         assert!(orchestrator.contains("- `swarm spawn "));
         assert!(orchestrator.contains("- `swarm merge <worker>`"));
+        assert!(orchestrator.contains("- `swarm tile grow <worker>`"));
+        assert!(orchestrator.contains("- `swarm tile shrink <worker>`"));
         assert!(orchestrator.contains("[--own-worktree REASON]"));
         assert!(orchestrator.contains("- `swarm commit -m <message> <path>...`"));
         assert!(!orchestrator.contains("swarm ask"));
         assert!(worker.contains("- `swarm ask <text>`"));
         assert!(worker.contains("- `swarm report <text>`"));
         assert!(worker.contains("- `swarm commit -m <message> <path>...`"));
+        assert!(worker.contains("- `swarm tile grow`"));
+        assert!(worker.contains("- `swarm tile shrink`"));
+        assert!(!orchestrator.contains("pinned") && !worker.contains("pinned"));
         assert!(!worker.contains("swarm spawn"));
         assert!(!worker.contains("swarm send"));
         assert!(start.contains("- `swarm wait "));
         assert!(!start.contains("swarm spawn"));
         assert!(!start.contains("swarm commit"));
+        assert!(!start.contains("swarm tile"));
         assert!(start.contains("Task: none"));
     }
 

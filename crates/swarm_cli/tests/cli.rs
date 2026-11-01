@@ -13,6 +13,7 @@ fn swarm() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_swarm"));
     command.env_remove("SWARM_SOCKET");
     command.env_remove("SWARM_AGENT_ID");
+    command.env_remove("SWARM_AGENT_NAME");
     command.env_remove("SWARM_TOKEN");
 
     command
@@ -394,7 +395,7 @@ fn help_lists_every_command() {
     let text = String::from_utf8_lossy(&output.stdout);
     for command in [
         "spawn", "send", "ask", "report", "commit", "notify", "read", "wait", "merge", "agents",
-        "confirm", "pr", "mcp", "hook",
+        "confirm", "pr", "tile", "mcp", "hook",
     ] {
         assert!(text.contains(command), "{command} is missing:\n{text}");
     }
@@ -451,6 +452,8 @@ fn the_mcp_server_lists_the_tools_of_the_role_over_stdio() {
             "commit",
             "read",
             "wait",
+            "tile_grow",
+            "tile_shrink",
             "terminal_spawn",
             "terminal_resize",
             "terminal_read",
@@ -600,6 +603,236 @@ fn an_mcp_pr_draft_sends_the_title_and_body() {
     assert_eq!(
         replies[0]["result"]["content"][0]["text"],
         "pull request draft sent"
+    );
+}
+
+#[test]
+fn tile_grow_resolves_a_worker_name_and_asks_for_a_large_tile() {
+    let (socket, daemon) = fake_daemon(
+        "tile-grow",
+        vec![
+            serde_json::json!({ "ok": true, "result": [worker_json(9, "api")] }),
+            serde_json::json!({ "ok": true, "result": null }),
+        ],
+    );
+    let mut command = agent_command(&socket);
+    command.args(["tile", "grow", "api"]);
+
+    let output = run(command, "");
+    let requests = daemon.join().expect("daemon");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "asked for a large tile"
+    );
+    assert_eq!(requests[0]["method"], "agents");
+    assert_eq!(requests[1]["method"], "tile_grow");
+    assert_eq!(requests[1]["params"]["agent"], 9);
+}
+
+#[test]
+fn tile_shrink_by_id_skips_the_name_lookup() {
+    let (socket, daemon) = fake_daemon(
+        "tile-shrink-id",
+        vec![serde_json::json!({ "ok": true, "result": null })],
+    );
+    let mut command = agent_command(&socket);
+    command.args(["tile", "shrink", "9"]);
+
+    let output = run(command, "");
+    let requests = daemon.join().expect("daemon");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "asked for a small tile"
+    );
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["method"], "tile_shrink");
+    assert_eq!(requests[0]["params"]["agent"], 9);
+}
+
+#[test]
+fn a_worker_asks_for_its_own_tile_without_a_name() {
+    let (socket, daemon) = fake_daemon(
+        "tile-own",
+        vec![serde_json::json!({ "ok": true, "result": null })],
+    );
+    let mut command = agent_command(&socket);
+    command.env("SWARM_ROLE", "worker").args(["tile", "grow"]);
+
+    let output = run(command, "");
+    let requests = daemon.join().expect("daemon");
+
+    assert!(output.status.success());
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["method"], "tile_grow");
+    assert!(requests[0]["params"]["agent"].is_null());
+}
+
+#[test]
+fn a_worker_names_itself_in_a_tile_request_without_a_lookup() {
+    let (socket, daemon) = fake_daemon(
+        "tile-own-name",
+        vec![serde_json::json!({ "ok": true, "result": null })],
+    );
+    let mut command = agent_command(&socket);
+    command
+        .env("SWARM_ROLE", "worker")
+        .env("SWARM_AGENT_NAME", "api")
+        .args(["tile", "grow", "api"]);
+
+    let output = run(command, "");
+    let requests = daemon.join().expect("daemon");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(requests.len(), 1, "a worker cannot list workers");
+    assert_eq!(requests[0]["method"], "tile_grow");
+    assert_eq!(requests[0]["params"]["agent"], 3);
+}
+
+#[test]
+fn a_worker_that_names_another_worker_is_still_refused() {
+    let (socket, daemon) = fake_daemon(
+        "tile-other-name",
+        vec![serde_json::json!({
+            "ok": false,
+            "error": "only a task's orchestrator can list its workers"
+        })],
+    );
+    let mut command = agent_command(&socket);
+    command
+        .env("SWARM_ROLE", "worker")
+        .env("SWARM_AGENT_NAME", "api")
+        .args(["tile", "grow", "ui"]);
+
+    let output = run(command, "");
+    let requests = daemon.join().expect("daemon");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["method"], "agents");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr).trim(),
+        "swarm: only a task's orchestrator can list its workers"
+    );
+}
+
+#[test]
+fn a_refused_tile_request_goes_to_stderr_with_exit_code_one() {
+    let (socket, daemon) = fake_daemon(
+        "tile-refused",
+        vec![serde_json::json!({ "ok": false, "error": "a worker can only resize its own tile" })],
+    );
+    let mut command = agent_command(&socket);
+    command.args(["tile", "shrink", "12"]);
+
+    let output = run(command, "");
+    daemon.join().expect("daemon");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr).trim(),
+        "swarm: a worker can only resize its own tile"
+    );
+}
+
+#[test]
+fn an_mcp_tile_grow_passes_the_agent_id_on() {
+    let (socket, daemon) = fake_daemon(
+        "mcp-tile-grow",
+        vec![serde_json::json!({ "ok": true, "result": null })],
+    );
+    let lines = [
+        serde_json::json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+        "params": { "name": "tile_grow", "arguments": { "agent": 9 } } }),
+    ];
+
+    let replies = mcp_session(&socket, "orchestrator", &lines);
+    let requests = daemon.join().expect("daemon");
+
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["method"], "tile_grow");
+    assert_eq!(requests[0]["params"]["agent"], 9);
+    assert_eq!(replies[0]["result"]["isError"], false);
+    assert_eq!(
+        replies[0]["result"]["content"][0]["text"],
+        "asked for a large tile"
+    );
+}
+
+#[test]
+fn an_mcp_tile_shrink_of_a_worker_names_no_agent() {
+    let (socket, daemon) = fake_daemon(
+        "mcp-tile-own",
+        vec![serde_json::json!({ "ok": true, "result": null })],
+    );
+    let lines = [
+        serde_json::json!({ "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+        "params": { "name": "tile_shrink", "arguments": {} } }),
+    ];
+
+    mcp_session(&socket, "worker", &lines);
+    let requests = daemon.join().expect("daemon");
+
+    assert_eq!(requests[0]["method"], "tile_shrink");
+    assert!(requests[0]["params"]["agent"].is_null());
+}
+
+#[test]
+fn an_mcp_tile_shrink_resolves_a_worker_name() {
+    let (socket, daemon) = fake_daemon(
+        "mcp-tile-shrink",
+        vec![
+            serde_json::json!({ "ok": true, "result": [worker_json(9, "api")] }),
+            serde_json::json!({ "ok": true, "result": null }),
+        ],
+    );
+    let lines = [
+        serde_json::json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+        "params": { "name": "tile_shrink", "arguments": { "agent": "api" } } }),
+    ];
+
+    let replies = mcp_session(&socket, "orchestrator", &lines);
+    let requests = daemon.join().expect("daemon");
+
+    assert_eq!(requests[0]["method"], "agents");
+    assert_eq!(requests[1]["method"], "tile_shrink");
+    assert_eq!(requests[1]["params"]["agent"], 9);
+    assert_eq!(
+        replies[0]["result"]["content"][0]["text"],
+        "asked for a small tile"
+    );
+}
+
+#[test]
+fn the_start_orchestrator_does_not_get_the_tile_tools() {
+    let lines = [
+        serde_json::json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+        "params": { "name": "tile_grow", "arguments": {} } }),
+    ];
+
+    let replies = mcp_session(
+        std::path::Path::new("/tmp/none.sock"),
+        "start_orchestrator",
+        &lines,
+    );
+
+    assert!(
+        replies[0]["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("tile_grow")
     );
 }
 

@@ -1,4 +1,4 @@
-use gpui::{AnyElement, App, ElementId, Role, SharedString, Window, div, px};
+use gpui::{AnyElement, App, Div, ElementId, Role, SharedString, Stateful, Window, div, px};
 
 use crate::component::{Component, example, example_group};
 use crate::prelude::*;
@@ -9,6 +9,7 @@ use crate::prelude::*;
 #[must_use]
 pub struct Panel {
     accessible: Option<(ElementId, SharedString)>,
+    role: Role,
     rows: Vec<AnyElement>,
     raised: bool,
 }
@@ -17,6 +18,7 @@ impl Panel {
     pub fn new() -> Self {
         Self {
             accessible: None,
+            role: Role::Group,
             rows: Vec::new(),
             raised: false,
         }
@@ -26,6 +28,18 @@ impl Panel {
     pub fn accessible(mut self, id: impl Into<ElementId>, label: impl Into<SharedString>) -> Self {
         self.accessible = Some((id.into(), label.into()));
         self
+    }
+
+    /// Exposes the named panel as a list, for rows that are list items. Use it after
+    /// `accessible`.
+    pub fn list(mut self) -> Self {
+        self.role = Role::List;
+        self
+    }
+
+    /// The role the named panel has in the accessibility tree.
+    pub fn role(&self) -> Role {
+        self.role
     }
 
     /// Uses the `raised` surface instead of `panel`.
@@ -46,8 +60,14 @@ impl Default for Panel {
     }
 }
 
-impl RenderOnce for Panel {
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+/// What a panel draws: the card, inside a named wrapper when the panel is accessible.
+enum Built {
+    Card(Div),
+    Named(Stateful<Div>),
+}
+
+impl Panel {
+    fn build(self, cx: &App) -> Built {
         let colors = cx.theme().colors();
         let line = colors.line;
 
@@ -57,7 +77,7 @@ impl RenderOnce for Panel {
             colors.panel
         };
 
-        let body = div()
+        let card = div()
             .flex()
             .flex_col()
             .rounded(px(10.))
@@ -72,13 +92,19 @@ impl RenderOnce for Panel {
             }));
 
         match self.accessible {
-            Some((id, label)) => div()
-                .id(id)
-                .role(Role::Group)
-                .aria_label(label)
-                .child(body)
-                .into_any_element(),
-            None => body.into_any_element(),
+            Some((id, label)) => {
+                Built::Named(div().id(id).role(self.role).aria_label(label).child(card))
+            }
+            None => Built::Card(card),
+        }
+    }
+}
+
+impl RenderOnce for Panel {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        match self.build(cx) {
+            Built::Card(card) => card.into_any_element(),
+            Built::Named(named) => named.into_any_element(),
         }
     }
 }
@@ -181,5 +207,48 @@ impl Component for Panel {
                 )],
             ))
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::accesskit::Node;
+    use gpui::{Element as _, TestAppContext};
+
+    use super::*;
+
+    fn named(panel: Panel, cx: &mut TestAppContext) -> (Option<Role>, Option<String>) {
+        cx.update(|cx| {
+            let Built::Named(element) = panel.build(cx) else {
+                return (None, None);
+            };
+
+            let element = element.into_element();
+            let role = element.a11y_role();
+            let mut node = Node::new(role.unwrap_or(Role::Unknown));
+            element.write_a11y_info(&mut node);
+
+            (role, node.label().map(str::to_owned))
+        })
+    }
+
+    #[gpui::test]
+    fn a_named_panel_is_a_group_unless_it_is_made_a_list(cx: &mut TestAppContext) {
+        cx.update(crate::theme::init);
+
+        let group = named(Panel::new().accessible("rows", "Checks"), cx);
+        let list = named(Panel::new().accessible("rows", "Checks").list(), cx);
+
+        assert_eq!(group, (Some(Role::Group), Some("Checks".to_owned())));
+        assert_eq!(list, (Some(Role::List), Some("Checks".to_owned())));
+    }
+
+    #[gpui::test]
+    fn a_panel_without_a_name_is_not_in_the_accessibility_tree(cx: &mut TestAppContext) {
+        cx.update(crate::theme::init);
+
+        let in_tree = cx.update(|cx| matches!(Panel::new().list().build(cx), Built::Named(_)));
+
+        assert!(!in_tree);
     }
 }

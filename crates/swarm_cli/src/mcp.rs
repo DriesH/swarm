@@ -287,6 +287,46 @@ const TOOLS: &[Tool] = &[
         },
     },
     Tool {
+        name: "tile_grow",
+        description: "Make the tile of a worker large, so the user sees more of it. The layout decides, and it ignores the request for a tile the user minimized. No agent gets a message.",
+        audience: Audience::Only(&[Role::Orchestrator, Role::Worker]),
+        schema: || {
+            schema(
+                &[(
+                    "agent",
+                    "string",
+                    "A worker's agent ID or name (orchestrator). Leave it out for your own tile (worker).",
+                )],
+                &[],
+            )
+        },
+        build: |arguments| {
+            Ok(Command::TileGrow {
+                agent: optional_identifier(arguments, "agent")?,
+            })
+        },
+    },
+    Tool {
+        name: "tile_shrink",
+        description: "Make the tile of a worker small again. The layout decides, and it ignores the request for a tile the user minimized. No agent gets a message.",
+        audience: Audience::Only(&[Role::Orchestrator, Role::Worker]),
+        schema: || {
+            schema(
+                &[(
+                    "agent",
+                    "string",
+                    "A worker's agent ID or name (orchestrator). Leave it out for your own tile (worker).",
+                )],
+                &[],
+            )
+        },
+        build: |arguments| {
+            Ok(Command::TileShrink {
+                agent: optional_identifier(arguments, "agent")?,
+            })
+        },
+    },
+    Tool {
         name: "task_create",
         description: "Make a task: a branch, a task worktree and a tab, with an orchestrator that starts on your brief. The brief states the goal, the scope and what done means.",
         audience: Audience::Only(&[Role::StartOrchestrator]),
@@ -577,6 +617,17 @@ fn identifier(arguments: &Map<String, Value>, name: &str) -> Result<String, Stri
     match arguments.get(name) {
         Some(Value::Number(number)) => Ok(number.to_string()),
         _ => required(arguments, name),
+    }
+}
+
+/// Like [`identifier`], and `None` when it is left out.
+fn optional_identifier(
+    arguments: &Map<String, Value>,
+    name: &str,
+) -> Result<Option<String>, String> {
+    match arguments.get(name) {
+        Some(Value::Number(number)) => Ok(Some(number.to_string())),
+        _ => optional(arguments, name),
     }
 }
 
@@ -1088,8 +1139,18 @@ mod tests {
         assert_eq!(
             tool_names(Role::Orchestrator),
             [
-                "spawn", "send", "commit", "read", "wait", "merge", "notify", "agents", "confirm",
-                "pr_draft"
+                "spawn",
+                "send",
+                "commit",
+                "read",
+                "wait",
+                "merge",
+                "notify",
+                "agents",
+                "confirm",
+                "pr_draft",
+                "tile_grow",
+                "tile_shrink"
             ]
             .into_iter()
             .chain(TERMINAL_TOOLS)
@@ -1101,10 +1162,18 @@ mod tests {
     fn a_worker_lists_only_its_tools() {
         assert_eq!(
             tool_names(Role::Worker),
-            ["ask", "report", "commit", "read", "wait"]
-                .into_iter()
-                .chain(TERMINAL_TOOLS)
-                .collect::<Vec<_>>()
+            [
+                "ask",
+                "report",
+                "commit",
+                "read",
+                "wait",
+                "tile_grow",
+                "tile_shrink"
+            ]
+            .into_iter()
+            .chain(TERMINAL_TOOLS)
+            .collect::<Vec<_>>()
         );
     }
 
@@ -1137,6 +1206,86 @@ mod tests {
         );
         assert_eq!(Role::parse(None), Role::Unknown);
         assert_eq!(Role::parse(Some("admin")), Role::Unknown);
+    }
+
+    fn build(tool: &str, arguments: &Value) -> Result<Command, String> {
+        let tool = TOOLS
+            .iter()
+            .find(|candidate| candidate.name == tool)
+            .expect("tool");
+
+        (tool.build)(arguments.as_object().expect("object"))
+    }
+
+    #[test]
+    fn the_tile_tools_take_an_optional_agent_id_or_name() {
+        assert_eq!(
+            build("tile_grow", &json!({})),
+            Ok(Command::TileGrow { agent: None })
+        );
+        assert_eq!(
+            build("tile_grow", &json!({ "agent": 9 })),
+            Ok(Command::TileGrow {
+                agent: Some("9".to_owned())
+            })
+        );
+        assert_eq!(
+            build("tile_shrink", &json!({ "agent": "api" })),
+            Ok(Command::TileShrink {
+                agent: Some("api".to_owned())
+            })
+        );
+        assert_eq!(
+            build("tile_shrink", &json!({ "agent": null })),
+            Ok(Command::TileShrink { agent: None })
+        );
+        assert_eq!(
+            build("tile_grow", &json!({ "agent": true })),
+            Err("agent must be a string".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_tile_tools_need_no_arguments() {
+        let reply = server(Role::Worker)
+            .handle(&request("tools/list", json!({})))
+            .expect("reply");
+
+        for name in ["tile_grow", "tile_shrink"] {
+            let tool = reply["result"]["tools"]
+                .as_array()
+                .expect("tools")
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .expect("tile tool");
+
+            assert_eq!(tool["inputSchema"]["required"], json!([]), "{name}");
+            assert_eq!(
+                tool["inputSchema"]["properties"]["agent"]["type"], "string",
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_tile_tools_name_only_what_the_app_can_do() {
+        let reply = server(Role::Worker)
+            .handle(&request("tools/list", json!({})))
+            .expect("reply");
+
+        for name in ["tile_grow", "tile_shrink"] {
+            let tool = reply["result"]["tools"]
+                .as_array()
+                .expect("tools")
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .expect("tile tool");
+            let description = tool["description"].as_str().expect("description");
+
+            assert!(description.contains("minimized"), "{name}: {description}");
+            assert!(!description.contains("pinned"), "{name}: {description}");
+            assert!(!description.contains("resized"), "{name}: {description}");
+        }
     }
 
     #[test]
@@ -1272,7 +1421,7 @@ mod tests {
         assert_eq!(reply["result"]["resultType"], "complete");
         assert_eq!(
             reply["result"]["tools"].as_array().expect("tools").len(),
-            11
+            13
         );
     }
 

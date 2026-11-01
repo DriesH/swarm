@@ -84,6 +84,8 @@ fn harness_var_from(name: &str, var: impl Fn(&str) -> Option<String>) -> Option<
 pub(crate) struct Session {
     pub(crate) socket: PathBuf,
     pub(crate) agent: AgentId,
+    /// `SWARM_AGENT_NAME`, which lets the caller name itself without asking the daemon.
+    pub(crate) name: Option<String>,
     pub(crate) token: String,
     cancel: Option<Arc<Cancel>>,
 }
@@ -106,6 +108,7 @@ impl Session {
         Ok(Self {
             socket: PathBuf::from(socket),
             agent: AgentId(agent),
+            name: var("SWARM_AGENT_NAME"),
             token,
             cancel: None,
         })
@@ -206,6 +209,19 @@ mod tests {
         assert_eq!(session.socket, PathBuf::from("/tmp/a.sock"));
         assert_eq!(session.agent, AgentId(7));
         assert_eq!(session.token, "abc");
+    }
+
+    #[test]
+    fn the_session_knows_its_own_name_when_the_daemon_gave_it() {
+        let session = Session::from_vars(vars(&[
+            ("SWARM_SOCKET", "/tmp/a.sock"),
+            ("SWARM_AGENT_ID", "7"),
+            ("SWARM_AGENT_NAME", "api"),
+            ("SWARM_TOKEN", "abc"),
+        ]))
+        .expect("session");
+
+        assert_eq!(session.name.as_deref(), Some("api"));
     }
 
     #[test]

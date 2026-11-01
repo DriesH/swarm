@@ -58,6 +58,13 @@ pub(crate) enum Command {
         title: String,
         body: String,
     },
+    /// `agent` is an agent ID or a worker name; `None` is the caller's own tile.
+    TileGrow {
+        agent: Option<String>,
+    },
+    TileShrink {
+        agent: Option<String>,
+    },
     TaskCreate {
         name: String,
         from: Option<String>,
@@ -175,6 +182,8 @@ impl Command {
 
                 Ok(output(result, "pull request draft sent".to_owned()))
             }
+            Self::TileGrow { agent } => tile(session, agent, true),
+            Self::TileShrink { agent } => tile(session, agent, false),
             Self::TaskCreate { .. } | Self::TaskList | Self::TaskWait { .. } | Self::Exit => {
                 self.run_task(session)
             }
@@ -323,6 +332,22 @@ impl Command {
             other => Err(format!("{other:?} is not a terminal command")),
         }
     }
+}
+
+/// Asks for a large or a small tile. The layout decides, so the answer only says that the
+/// request went out.
+fn tile(session: &Session, agent: Option<String>, large: bool) -> Result<Output, String> {
+    let agent = agent.map(|name| resolve(session, &name)).transpose()?;
+
+    let (call, text) = if large {
+        (Call::TileGrow { agent }, "asked for a large tile")
+    } else {
+        (Call::TileShrink { agent }, "asked for a small tile")
+    };
+
+    let result = session.call(call)?;
+
+    Ok(output(result, text.to_owned()))
 }
 
 /// The task orchestrator confirmed its brief, or finished.
@@ -566,10 +591,15 @@ pub(crate) fn parse_kind(name: &str) -> Result<AgentKind, String> {
     }
 }
 
-/// An agent ID, or the ID of the worker with this name.
+/// An agent ID, the caller's own name, or the ID of the worker with this name.
 fn resolve(session: &Session, target: &str) -> Result<AgentId, String> {
     if let Ok(id) = target.parse::<u64>() {
         return Ok(AgentId(id));
+    }
+
+    // Only an orchestrator may list its workers, so a worker names itself without asking.
+    if session.name.as_deref() == Some(target) {
+        return Ok(session.agent);
     }
 
     let result = session.call(Call::Agents)?;
@@ -658,6 +688,23 @@ mod tests {
         let workers = [worker(4, "api"), worker(5, "ui")];
 
         assert_eq!(find_worker(&workers, "ui"), Ok(AgentId(5)));
+    }
+
+    #[test]
+    fn a_caller_resolves_its_own_name_without_asking_the_daemon() {
+        let session = Session::from_vars(|name| match name {
+            "SWARM_SOCKET" => Some("/nonexistent/agent.sock".to_owned()),
+            "SWARM_AGENT_ID" => Some("7".to_owned()),
+            "SWARM_AGENT_NAME" => Some("api".to_owned()),
+            "SWARM_TOKEN" => Some("token".to_owned()),
+            _ => None,
+        })
+        .expect("session");
+
+        assert_eq!(resolve(&session, "api"), Ok(AgentId(7)));
+        assert_eq!(resolve(&session, "12"), Ok(AgentId(12)));
+        let error = resolve(&session, "ui").expect_err("another name needs the daemon");
+        assert!(error.contains("cannot reach Swarm"), "{error}");
     }
 
     #[test]

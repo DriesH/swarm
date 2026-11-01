@@ -1,5 +1,6 @@
 //! The settings window: a nav of sections and projects, and one page at a time.
 
+mod general_page;
 mod keyboard_page;
 mod pages;
 mod project;
@@ -27,6 +28,7 @@ use self::prompts_page::PromptsPage;
 use self::usage_page::UsagePage;
 use crate::model::{FakeData, Project};
 use crate::notifications::{self, Permission};
+use crate::system_check::SystemCheckView;
 use crate::window_drag::drag_region;
 use crate::workspace::Workspace;
 use project::{ProjectInputs, ProjectSave, ProjectSettings};
@@ -273,6 +275,15 @@ impl SettingsState {
         cx.notify();
     }
 
+    /// The welcome screen is dealt with. The flag is saved at once, as nothing else would
+    /// save it: no settings window needs to be open.
+    fn finish_welcome(&mut self, cx: &mut Context<Self>) {
+        self.settings.welcome_done = true;
+        self.save(cx);
+        self.queued = self.settings.clone();
+        cx.notify();
+    }
+
     pub(crate) fn orchestrator_index(&self) -> usize {
         match self.settings.agents.orchestrator {
             swarm_settings::AgentKindSetting::ClaudeCode => 0,
@@ -359,6 +370,8 @@ pub(crate) struct SettingsWindow {
     inputs: Inputs,
     prompts: Entity<PromptsPage>,
     usage: Entity<UsagePage>,
+    system_check: Entity<SystemCheckView>,
+    check_again_focus: FocusHandle,
     /// Where a page without controls takes keyboard focus, to scroll with the keys.
     page_focus: FocusHandle,
     page_scroll: ScrollHandle,
@@ -463,6 +476,8 @@ impl SettingsWindow {
                 // The user may come back from System Settings with a new answer.
                 if window.is_window_active() {
                     this.refresh_permission(cx);
+                    // The user may have fixed a tool while away.
+                    this.refresh_system_check(cx);
                     // The user edits the prompt files and the project config outside the app.
                     this.refresh_prompts(cx);
                     this.open_project(cx);
@@ -542,6 +557,8 @@ impl SettingsWindow {
             cx,
         );
 
+        let (system_check, check_again_focus) = Self::system_check_for(&state, window, cx);
+
         let mut this = Self {
             state: state.clone(),
             page,
@@ -556,6 +573,8 @@ impl SettingsWindow {
             },
             prompts: cx.new(|cx| PromptsPage::new(state.clone(), cx)),
             usage: cx.new(|cx| UsagePage::new(state.clone(), cx)),
+            system_check,
+            check_again_focus,
             page_focus: cx.focus_handle().tab_stop(true),
             page_scroll: ScrollHandle::new(),
             subscriptions,
@@ -572,8 +591,45 @@ impl SettingsWindow {
         this.refresh_permission(cx);
         this.refresh_prompts(cx);
         this.open_project(cx);
+        // The check reads the workspace, which may be the one opening this window.
+        cx.defer_in(window, |this, _, cx| this.refresh_system_check(cx));
 
         this
+    }
+
+    /// The check of the General page, and the focus of its Check again button, where focus
+    /// goes when no action is left.
+    fn system_check_for(
+        state: &Entity<SettingsState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (Entity<SystemCheckView>, FocusHandle) {
+        let workspace = state.read(cx).workspace.clone();
+        let check_again = cx.focus_handle().tab_stop(true);
+        let check = cx.new({
+            let fallback = check_again.clone();
+
+            |cx| {
+                let mut check = SystemCheckView::new(workspace, false, window, cx);
+                check.set_fallback_focus(fallback);
+
+                check
+            }
+        });
+
+        (check, check_again)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn system_check(&self) -> &Entity<SystemCheckView> {
+        &self.system_check
+    }
+
+    /// Asks the daemon about the tools again, while the General page shows.
+    fn refresh_system_check(&self, cx: &mut Context<Self>) {
+        if self.page == Page::General {
+            self.system_check.update(cx, SystemCheckView::refresh);
+        }
     }
 
     #[cfg(test)]
@@ -585,6 +641,7 @@ impl SettingsWindow {
         self.page = page;
         self.page_scroll.set_offset(point(px(0.), px(0.)));
         self.refresh_permission(cx);
+        self.refresh_system_check(cx);
         self.refresh_prompts(cx);
         self.open_project(cx);
         cx.notify();
@@ -634,6 +691,7 @@ impl SettingsWindow {
         self.page = Page::from_nav_index(next);
         self.page_scroll.set_offset(point(px(0.), px(0.)));
         self.refresh_permission(cx);
+        self.refresh_system_check(cx);
         self.refresh_prompts(cx);
         self.open_project(cx);
         self.focus_nav(window, cx);
@@ -913,6 +971,24 @@ pub(crate) fn state(cx: &mut App) -> Entity<SettingsState> {
     shared_state(None, cx)
 }
 
+/// True when the welcome screen has not been dealt with. It stays false until the settings
+/// load, and when the file cannot be read: the flag could not be saved, so the welcome
+/// would come back at every launch.
+pub(crate) fn welcome_pending(cx: &App) -> bool {
+    cx.try_global::<Registry>().is_some_and(|registry| {
+        let state = registry.state.read(cx);
+
+        !state.load_failed && !state.settings.welcome_done
+    })
+}
+
+/// Marks the welcome screen as dealt with, and saves the flag.
+pub(crate) fn finish_welcome(cx: &mut App) {
+    let state = shared_state(None, cx);
+
+    state.update(cx, SettingsState::finish_welcome);
+}
+
 /// Whether the user may type into worker terminals. It stays on until the settings turn it off.
 pub(crate) fn allow_worker_typing(cx: &App) -> bool {
     cx.try_global::<Registry>().is_none_or(|registry| {
@@ -1088,6 +1164,90 @@ pub(crate) fn checks_changed(run: &swarm_protocol::ChecksRun, cx: &mut App) {
     state.update(cx, |state, cx| state.record_run(run, cx));
 }
 
+/// The pages to save, with the window size and the answer the sample delivery gives to
+/// every page for the notification permission.
+#[cfg(feature = "snapshot")]
+const SNAPSHOT_PAGES: [(Page, &str, Size<Pixels>, Permission); 10] = [
+    (
+        Page::General,
+        "general",
+        size(px(1280.), px(900.)),
+        Permission::Allowed,
+    ),
+    (
+        Page::Agents,
+        "agents",
+        size(px(1280.), px(900.)),
+        Permission::Allowed,
+    ),
+    (
+        Page::Notifications,
+        "notifications",
+        size(px(1280.), px(1000.)),
+        Permission::NotAllowed,
+    ),
+    (
+        Page::Notifications,
+        "notifications-allowed",
+        size(px(1280.), px(1000.)),
+        Permission::Allowed,
+    ),
+    (
+        Page::Project(0),
+        "project",
+        size(px(1280.), px(1180.)),
+        Permission::Allowed,
+    ),
+    (
+        Page::Terminals,
+        "terminals",
+        size(px(1280.), px(600.)),
+        Permission::Allowed,
+    ),
+    (
+        Page::Prompts,
+        "prompts",
+        size(px(1280.), px(700.)),
+        Permission::Allowed,
+    ),
+    (
+        Page::Prompts,
+        "prompts-reset",
+        size(px(1280.), px(700.)),
+        Permission::Allowed,
+    ),
+    (
+        Page::Usage,
+        "usage",
+        size(px(1280.), px(700.)),
+        Permission::Allowed,
+    ),
+    (
+        Page::Keyboard,
+        "keyboard",
+        size(px(1280.), px(1900.)),
+        Permission::Allowed,
+    ),
+];
+
+/// Gives the check of the General page a terminal under its GitHub CLI row.
+#[cfg(feature = "snapshot")]
+fn show_install_output(handle: WindowHandle<SettingsWindow>, cx: &mut gpui::AsyncApp) {
+    let shown = cx.update(|cx| {
+        handle.update(cx, |settings, window, cx| {
+            let output = crate::demo::install_output(cx);
+
+            settings.system_check.update(cx, |check, cx| {
+                check.show_sample_output(output, window, cx);
+            });
+        })
+    });
+
+    if let Err(error) = shown {
+        log::error!("cannot show the install output: {error:#}");
+    }
+}
+
 #[cfg(feature = "snapshot")]
 pub(crate) fn snapshot(directory: PathBuf, cx: &mut App) {
     use std::time::Duration;
@@ -1099,64 +1259,6 @@ pub(crate) fn snapshot(directory: PathBuf, cx: &mut App) {
 
     const SETTLE: Duration = Duration::from_millis(700);
 
-    // The permission is the answer the sample delivery gives to every page.
-    let pages = [
-        (
-            Page::Agents,
-            "agents",
-            size(px(1280.), px(900.)),
-            Permission::Allowed,
-        ),
-        (
-            Page::Notifications,
-            "notifications",
-            size(px(1280.), px(1000.)),
-            Permission::NotAllowed,
-        ),
-        (
-            Page::Notifications,
-            "notifications-allowed",
-            size(px(1280.), px(1000.)),
-            Permission::Allowed,
-        ),
-        (
-            Page::Project(0),
-            "project",
-            size(px(1280.), px(1180.)),
-            Permission::Allowed,
-        ),
-        (
-            Page::Terminals,
-            "terminals",
-            size(px(1280.), px(600.)),
-            Permission::Allowed,
-        ),
-        (
-            Page::Prompts,
-            "prompts",
-            size(px(1280.), px(700.)),
-            Permission::Allowed,
-        ),
-        (
-            Page::Prompts,
-            "prompts-reset",
-            size(px(1280.), px(700.)),
-            Permission::Allowed,
-        ),
-        (
-            Page::Usage,
-            "usage",
-            size(px(1280.), px(700.)),
-            Permission::Allowed,
-        ),
-        (
-            Page::Keyboard,
-            "keyboard",
-            size(px(1280.), px(1900.)),
-            Permission::Allowed,
-        ),
-    ];
-
     cx.spawn(async move |cx: &mut AsyncApp| {
         if let Err(error) = std::fs::create_dir_all(&directory) {
             log::error!("cannot create {}: {error}", directory.display());
@@ -1167,7 +1269,7 @@ pub(crate) fn snapshot(directory: PathBuf, cx: &mut App) {
         for (appearance, suffix) in [(Appearance::Light, "light"), (Appearance::Dark, "dark")] {
             cx.update(|cx| theme::set_appearance(appearance, cx));
 
-            for (page, name, window_size, permission) in pages {
+            for (page, name, window_size, permission) in SNAPSHOT_PAGES {
                 let path = directory.join(format!("settings-{name}-{suffix}.png"));
 
                 let opened = cx.update(|cx| {
@@ -1182,6 +1284,10 @@ pub(crate) fn snapshot(directory: PathBuf, cx: &mut App) {
                 });
                 let window: AnyWindowHandle = match opened {
                     Ok(handle) => {
+                        if name == "general" {
+                            show_install_output(handle, cx);
+                        }
+
                         if name == "prompts-reset" {
                             let asked = cx.update(|cx| {
                                 handle.update(cx, |settings, _, cx| {
@@ -1203,6 +1309,14 @@ pub(crate) fn snapshot(directory: PathBuf, cx: &mut App) {
                 };
 
                 cx.background_executor().timer(SETTLE).await;
+
+                // A terminal screen arrives after the first frame, and a minimized window
+                // draws no more.
+                if name == "general"
+                    && let Err(error) = window.update(cx, |_, window, cx| window.draw(cx).clear(cx))
+                {
+                    log::error!("cannot draw: {error:#}");
+                }
 
                 if let Err(error) = window.update(cx, |_, window, _| window.minimize_window()) {
                     log::error!("cannot minimize: {error:#}");

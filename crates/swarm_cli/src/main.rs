@@ -24,7 +24,7 @@ use crate::session::Session;
     name = "swarm",
     version,
     about = "Talk to Swarm from an agent terminal",
-    long_about = "Talk to Swarm from an agent terminal.\n\nWhich commands work depends on your role: orchestrators spawn, send, merge, notify, agents, confirm and pr draft; workers ask and report; workers and orchestrators commit; the Start orchestrator makes tasks; every agent can read, wait, exit and run terminals.\nA text of - is read from stdin."
+    long_about = "Talk to Swarm from an agent terminal.\n\nWhich commands work depends on your role: orchestrators spawn, send, merge, notify, agents, confirm, pr draft and tile (for their workers); workers ask, report and tile (for themselves); workers and orchestrators commit; the Start orchestrator makes tasks; every agent can read, wait, exit and run terminals.\nA text of - is read from stdin."
 )]
 struct Cli {
     /// Print the raw result as JSON.
@@ -112,6 +112,12 @@ enum Action {
         #[command(subcommand)]
         action: PrAction,
     },
+    /// Make a worker's tile large or small again (orchestrator for its workers, worker
+    /// for itself).
+    Tile {
+        #[command(subcommand)]
+        action: TileAction,
+    },
     /// Make, list and wait for tasks (Start orchestrator).
     Task {
         #[command(subcommand)]
@@ -151,6 +157,23 @@ enum PrAction {
         /// A file that holds the description; - reads stdin.
         #[arg(long, value_name = "PATH")]
         body_file: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum TileAction {
+    /// Ask for a large tile. Swarm lays out the tiles and may not follow, for example when
+    /// the user minimized the tile.
+    Grow {
+        /// A worker's agent ID or name (orchestrator). Leave it out for your own tile
+        /// (worker).
+        agent: Option<String>,
+    },
+    /// Ask for a small tile again.
+    Shrink {
+        /// A worker's agent ID or name (orchestrator). Leave it out for your own tile
+        /// (worker).
+        agent: Option<String>,
     },
 }
 
@@ -319,6 +342,7 @@ impl Action {
             Self::Agents => Command::Agents,
             Self::Confirm => Command::Confirm,
             Self::Pr { action } => action.command(stdin)?,
+            Self::Tile { action } => action.command(),
             Self::Task { action } => action.command(stdin)?,
             Self::Exit => Command::Exit,
             Self::Terminal { action } => action.command(),
@@ -352,6 +376,15 @@ impl PrAction {
         };
 
         Ok(Command::PrDraft { title, body })
+    }
+}
+
+impl TileAction {
+    fn command(self) -> Command {
+        match self {
+            Self::Grow { agent } => Command::TileGrow { agent },
+            Self::Shrink { agent } => Command::TileShrink { agent },
+        }
     }
 }
 
@@ -684,6 +717,43 @@ mod tests {
                 text: "which port?".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn tile_grow_and_shrink_take_an_optional_agent() {
+        assert_eq!(
+            command(&["tile", "grow", "api"], ""),
+            Command::TileGrow {
+                agent: Some("api".to_owned())
+            }
+        );
+        assert_eq!(
+            command(&["tile", "grow", "7"], ""),
+            Command::TileGrow {
+                agent: Some("7".to_owned())
+            }
+        );
+        assert_eq!(
+            command(&["tile", "grow"], ""),
+            Command::TileGrow { agent: None }
+        );
+        assert_eq!(
+            command(&["tile", "shrink", "api"], ""),
+            Command::TileShrink {
+                agent: Some("api".to_owned())
+            }
+        );
+        assert_eq!(
+            command(&["tile", "shrink"], ""),
+            Command::TileShrink { agent: None }
+        );
+    }
+
+    #[test]
+    fn tile_needs_grow_or_shrink_and_at_most_one_agent() {
+        assert!(parse(&["tile"]).is_err());
+        assert!(parse(&["tile", "enlarge"]).is_err());
+        assert!(parse(&["tile", "grow", "api", "ui"]).is_err());
     }
 
     #[test]

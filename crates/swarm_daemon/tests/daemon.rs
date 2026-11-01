@@ -18,8 +18,9 @@ use swarm_protocol::{
     AgentChange, AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, CallId,
     CloseCheck, CommentId, CommentState, CreateTask, CreateTerminal, DiffStat, Event, FileDiff,
     FileStat, Fold, MessageInfo, MessageKind, Notice, NoticeKind, ProjectConfigFields, ProjectId,
-    ProjectInfo, PromptInfo, PromptLayer, Request, ReviewSource, TaskDiff, TaskId, TaskInfo,
-    TerminalId, TerminalInfo, TerminalKind, Usage, UsageProblem, VERSION, read, write,
+    ProjectInfo, PromptInfo, PromptLayer, Request, ReviewSource, SystemCheck, TaskDiff, TaskId,
+    TaskInfo, TerminalId, TerminalInfo, TerminalKind, ToolCheck, ToolState, Usage, UsageProblem,
+    VERSION, read, write,
 };
 use swarm_term::{
     BlockedKind, ExitStatus, Palette, ProgramState, Rgb, Row, Size, TerminalInput, TerminalOutput,
@@ -2514,6 +2515,8 @@ sleep 30"#,
             "agents",
             "confirm",
             "pr_draft",
+            "tile_grow",
+            "tile_shrink",
             "terminal_spawn",
             "terminal_resize",
             "terminal_read",
@@ -9784,4 +9787,593 @@ fn customizing_and_resetting_never_touch_the_prompts_of_a_project() {
         client.prompt(Some(project), "worker").layer,
         PromptLayer::Project
     );
+}
+
+// The system check.
+
+/// Fake tools for the system check, and the daemon that runs them. Nothing here starts the
+/// real `git`, `claude`, `codex`, `gh`, `brew`, `security` or `xcode-select`.
+struct SystemWorld {
+    dir: PathBuf,
+}
+
+impl SystemWorld {
+    /// Every tool installed and signed in.
+    fn new() -> Self {
+        let number = NEXT_HOME.fetch_add(1, Ordering::Relaxed);
+        let dir = PathBuf::from(format!("/tmp/swd-sys-{}-{number}", std::process::id()));
+        std::fs::create_dir_all(dir.join("bin")).expect("bin");
+        std::fs::create_dir_all(dir.join("home/.codex")).expect("home");
+        std::fs::write(dir.join("home/.codex/auth.json"), "{}").expect("auth.json");
+        std::fs::write(
+            dir.join("settings.toml"),
+            "[agents.claude_code]\ncommand = \"fake-claude\"\n\
+             [agents.codex]\ncommand = \"fake-codex\"\n",
+        )
+        .expect("settings");
+
+        let world = Self { dir };
+        world.script("xcode-select", "exit 0");
+        world.script("security", "exit 0");
+        world.script("bin/git", "echo 'git version 2.39.5 (Apple Git-154)'");
+        world.script("bin/fake-claude", "echo '2.1.126 (Claude Code)'");
+        world.script("bin/fake-codex", "echo 'codex-cli 0.46.0'");
+        world.script("bin/brew", "exit 0");
+        world.script(
+            "bin/gh",
+            "case \"$1\" in --version) echo 'gh version 2.62.0 (2024-11-14)';; esac",
+        );
+
+        world
+    }
+
+    /// Writes an executable script that logs its arguments to `<path>.calls`.
+    fn script(&self, relative: &str, body: &str) {
+        let path = self.dir.join(relative);
+        let log = self
+            .dir
+            .join(format!("{}.calls", relative.replace('/', "-")));
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\necho \"$*\" >> '{}'\n{body}\n", log.display()),
+        )
+        .expect("script");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("mode");
+    }
+
+    fn remove(&self, relative: &str) {
+        std::fs::remove_file(self.dir.join(relative)).expect("remove the fake");
+    }
+
+    fn calls(&self, name: &str) -> Vec<String> {
+        std::fs::read_to_string(self.dir.join(format!("{name}.calls")))
+            .map(|text| text.lines().map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
+
+    fn start(&self) -> Daemon {
+        self.start_with_codex_home(None)
+    }
+
+    /// Starts the daemon with `CODEX_HOME` set, as a user shell may have it.
+    fn start_with_codex_home(&self, codex_home: Option<&Path>) -> Daemon {
+        let home = Daemon::new_home();
+        std::fs::create_dir_all(&home).expect("home");
+        let log = std::fs::File::options()
+            .create(true)
+            .append(true)
+            .open(home.join("daemon.log"))
+            .expect("log");
+
+        let mut command = Command::new(env!("CARGO_BIN_EXE_swarm-daemon"));
+        command
+            .arg("--data-dir")
+            .arg(&home)
+            .arg("--settings")
+            .arg(self.dir.join("settings.toml"))
+            .arg("--gh")
+            .arg(self.dir.join("bin/gh"))
+            .arg("--check-xcode-select")
+            .arg(self.dir.join("xcode-select"))
+            .arg("--check-security")
+            .arg(self.dir.join("security"))
+            .args(["--check-timeout-ms", "3000", "--no-usage-polling"])
+            .env("RUST_LOG", "info")
+            .env("HOME", self.dir.join("home"))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", self.dir.join("bin").display()),
+            )
+            .env_remove("CODEX_HOME")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(log);
+        if let Some(codex_home) = codex_home {
+            command.env("CODEX_HOME", codex_home);
+        }
+        let child = command.spawn().expect("start the daemon");
+        let daemon = Daemon { home, child };
+        daemon.wait_until_listening();
+
+        daemon
+    }
+
+    fn path(&self, relative: &str) -> String {
+        self.dir.join(relative).display().to_string()
+    }
+}
+
+impl Drop for SystemWorld {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.dir).ok();
+    }
+}
+
+impl Client {
+    fn system_check(&mut self) -> SystemCheck {
+        self.send(&Request::SystemCheck { call: CALL });
+
+        self.wait_for(|event| match event {
+            Event::SystemCheck { call: CALL, check } => Some(check.clone()),
+            _ => None,
+        })
+    }
+}
+
+fn tool(state: ToolState, version: Option<&str>, fix: &[&str]) -> ToolCheck {
+    ToolCheck {
+        state,
+        version: version.map(str::to_owned),
+        detail: None,
+        fix: fix.iter().map(|word| (*word).to_owned()).collect(),
+    }
+}
+
+#[test]
+fn the_system_check_finds_every_tool_ready() {
+    let world = SystemWorld::new();
+    let daemon = world.start();
+    let mut client = daemon.connect();
+    client.hello();
+
+    let check = client.system_check();
+
+    assert_eq!(
+        check,
+        SystemCheck {
+            git: tool(ToolState::Ready, Some("2.39.5"), &[]),
+            claude: tool(ToolState::Ready, Some("2.1.126"), &[]),
+            codex: tool(ToolState::Ready, Some("0.46.0"), &[]),
+            gh: tool(ToolState::Ready, Some("2.62.0"), &[]),
+            github_account: tool(ToolState::Ready, None, &[]),
+        }
+    );
+    assert_eq!(world.calls("xcode-select"), ["-p"]);
+    assert_eq!(
+        world.calls("security"),
+        ["find-generic-password -s Claude Code-credentials"]
+    );
+}
+
+#[test]
+fn the_system_check_names_what_is_missing_and_checks_again_on_each_request() {
+    let world = SystemWorld::new();
+    world.script("xcode-select", "exit 2");
+    world.script("security", "exit 44");
+    world.script(
+        "bin/gh",
+        "case \"$1\" in --version) echo 'gh version 2.62.0 (2024-11-14)';; auth) exit 1;; esac",
+    );
+    world.remove("bin/fake-codex");
+    let daemon = world.start();
+    let mut client = daemon.connect();
+    client.hello();
+
+    let broken = client.system_check();
+
+    assert_eq!(
+        broken,
+        SystemCheck {
+            git: tool(ToolState::Missing, None, &["xcode-select", "--install"]),
+            claude: tool(
+                ToolState::SignedOut,
+                Some("2.1.126"),
+                &[&world.path("bin/fake-claude")]
+            ),
+            codex: tool(
+                ToolState::Missing,
+                None,
+                &[&world.path("bin/brew"), "install", "--cask", "codex"]
+            ),
+            gh: tool(ToolState::Ready, Some("2.62.0"), &[]),
+            github_account: tool(
+                ToolState::SignedOut,
+                None,
+                &[
+                    &world.path("bin/gh"),
+                    "auth",
+                    "login",
+                    "--web",
+                    "--hostname",
+                    "github.com"
+                ]
+            ),
+        }
+    );
+    assert!(
+        world.calls("bin-git").is_empty(),
+        "git ran although the Command Line Tools are missing"
+    );
+
+    world.script("xcode-select", "exit 0");
+    world.script("security", "exit 0");
+    world.script("bin/fake-codex", "echo 'codex-cli 0.47.1'");
+    world.script(
+        "bin/gh",
+        "case \"$1\" in --version) echo 'gh version 2.62.0 (2024-11-14)';; esac",
+    );
+    let fixed = client.system_check();
+
+    assert_eq!(fixed.git, tool(ToolState::Ready, Some("2.39.5"), &[]));
+    assert_eq!(fixed.claude, tool(ToolState::Ready, Some("2.1.126"), &[]));
+    assert_eq!(fixed.codex, tool(ToolState::Ready, Some("0.47.1"), &[]));
+    assert_eq!(fixed.github_account, tool(ToolState::Ready, None, &[]));
+}
+
+#[test]
+fn the_system_check_follows_the_agent_commands_in_the_settings() {
+    let world = SystemWorld::new();
+    world.script("bin/other-claude", "echo '9.9.9 (Claude Code)'");
+    std::fs::write(
+        world.dir.join("settings.toml"),
+        "[agents.claude_code]\ncommand = \"other-claude\"\n\
+         [agents.codex]\ncommand = \"fake-codex\"\n",
+    )
+    .expect("settings");
+    let daemon = world.start();
+    let mut client = daemon.connect();
+    client.hello();
+
+    let check = client.system_check();
+
+    assert_eq!(check.claude, tool(ToolState::Ready, Some("9.9.9"), &[]));
+}
+
+#[test]
+fn the_system_check_looks_for_the_codex_login_in_the_home_folder_even_with_codex_home_set() {
+    let world = SystemWorld::new();
+    let elsewhere = world.dir.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).expect("elsewhere");
+    let daemon = world.start_with_codex_home(Some(&elsewhere));
+    let mut client = daemon.connect();
+    client.hello();
+
+    let check = client.system_check();
+
+    assert_eq!(check.codex, tool(ToolState::Ready, Some("0.46.0"), &[]));
+}
+
+#[test]
+fn the_sign_in_fix_names_a_tool_the_daemon_found_outside_its_path() {
+    let world = SystemWorld::new();
+    std::fs::create_dir_all(world.dir.join("home/.local/bin")).expect("local bin");
+    world.script(
+        "home/.local/bin/local-claude",
+        "echo '2.1.126 (Claude Code)'",
+    );
+    world.script("home/.local/bin/local-codex", "echo 'codex-cli 0.46.0'");
+    std::fs::write(
+        world.dir.join("settings.toml"),
+        "[agents.claude_code]\ncommand = \"local-claude\"\n\
+         [agents.codex]\ncommand = \"local-codex\"\n",
+    )
+    .expect("settings");
+    world.script("security", "exit 44");
+    std::fs::remove_file(world.dir.join("home/.codex/auth.json")).expect("auth.json");
+    let daemon = world.start();
+    let mut client = daemon.connect();
+    client.hello();
+
+    let check = client.system_check();
+
+    assert_eq!(check.claude.state, ToolState::SignedOut);
+    assert_eq!(
+        check.claude.fix,
+        [world.path("home/.local/bin/local-claude")],
+        "a fix terminal has no ~/.local/bin in its PATH to find the bare name in"
+    );
+    assert_eq!(check.codex.state, ToolState::SignedOut);
+    assert_eq!(check.codex.fix, [world.path("home/.local/bin/local-codex")]);
+}
+
+#[test]
+fn a_system_check_that_hangs_fails_that_tool_and_answers_in_time() {
+    let world = SystemWorld::new();
+    world.script("security", "exec sleep 60");
+    let daemon = world.start();
+    let mut client = daemon.connect();
+    client.hello();
+
+    let start = Instant::now();
+    let check = client.system_check();
+
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        start.elapsed()
+    );
+    assert_eq!(check.claude.state, ToolState::Failed);
+    assert_eq!(check.claude.version.as_deref(), Some("2.1.126"));
+    let detail = check.claude.detail.expect("detail");
+    assert!(detail.contains("security"), "{detail}");
+    assert_eq!(check.git.state, ToolState::Ready);
+}
+
+// Tile requests.
+
+impl Client {
+    /// The next tile request: the agent and whether its tile should be large.
+    fn wait_for_tile_request(&mut self) -> (AgentId, bool) {
+        self.wait_for(|event| match event {
+            Event::TileRequest { agent, large } => Some((*agent, *large)),
+            _ => None,
+        })
+    }
+
+    fn wait_for_worker(&mut self, name: &str) -> AgentInfo {
+        self.wait_for_agent(|agent| agent.role == AgentRole::Worker && agent.name == name)
+    }
+}
+
+/// A fake task: its orchestrator runs `orchestrator`, every worker runs `worker` after it
+/// read its brief into `$line`.
+fn tile_fixture(orchestrator: &str, worker: &str) -> Fixture {
+    fixture_with_helpers(&format!(
+        r#"case "$SWARM_ROLE" in
+orchestrator)
+  idle
+  IFS= read -r line
+  working
+{orchestrator}
+  sleep 30
+  ;;
+worker)
+  idle
+  IFS= read -r line
+  working
+{worker}
+  sleep 30
+  ;;
+esac"#
+    ))
+}
+
+fn said_by(fixture: &Fixture, name: &str) -> String {
+    fixture.read_when_written(name).trim().to_owned()
+}
+
+#[test]
+fn an_orchestrator_grows_and_shrinks_its_worker_and_every_client_sees_it() {
+    let fixture = tile_fixture(
+        r#"  swarm spawn api --brief "work" > "$OUT/spawn.out" 2>&1
+  swarm tile grow api > "$OUT/grow.out" 2>&1
+  echo $? > "$OUT/grow.code"
+  swarm tile shrink api > "$OUT/shrink.out" 2>&1
+  echo $? > "$OUT/shrink.code""#,
+        "",
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut watcher = daemon.connect();
+    watcher.hello();
+    let (mut client, task) = start_task(&daemon, &repo);
+
+    let worker = client.wait_for_worker("api");
+
+    assert_eq!(client.wait_for_tile_request(), (worker.id, true));
+    assert_eq!(client.wait_for_tile_request(), (worker.id, false));
+    assert_eq!(watcher.wait_for_tile_request(), (worker.id, true));
+    assert_eq!(watcher.wait_for_tile_request(), (worker.id, false));
+    assert_eq!(said_by(&fixture, "grow.out"), "asked for a large tile");
+    assert_eq!(said_by(&fixture, "grow.code"), "0");
+    assert_eq!(said_by(&fixture, "shrink.out"), "asked for a small tile");
+    assert_eq!(said_by(&fixture, "shrink.code"), "0");
+
+    let messages = client.list_messages(task.project, Some(task.id));
+    let kinds: Vec<MessageKind> = messages.iter().map(|message| message.kind).collect();
+    assert_eq!(kinds, [MessageKind::Brief], "only the brief of the worker");
+    let store = database(&daemon);
+    assert!(!store.has_unread(worker.id).expect("unread"));
+    assert!(!store.has_unread(task.agents[0].id).expect("unread"));
+}
+
+#[test]
+fn a_worker_resizes_its_own_tile_without_a_name_or_with_its_own_id() {
+    let fixture = tile_fixture(
+        r#"  swarm spawn api --brief "work" > "$OUT/spawn.out" 2>&1"#,
+        r#"  swarm tile shrink > "$OUT/shrink.out" 2>&1
+  echo $? > "$OUT/shrink.code"
+  swarm tile grow "$SWARM_AGENT_ID" > "$OUT/grow.out" 2>&1
+  echo $? > "$OUT/grow.code""#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut watcher = daemon.connect();
+    watcher.hello();
+    let (mut client, task) = start_task(&daemon, &repo);
+
+    let worker = client.wait_for_worker("api");
+
+    assert_eq!(client.wait_for_tile_request(), (worker.id, false));
+    assert_eq!(client.wait_for_tile_request(), (worker.id, true));
+    assert_eq!(watcher.wait_for_tile_request(), (worker.id, false));
+    assert_eq!(watcher.wait_for_tile_request(), (worker.id, true));
+    assert_eq!(said_by(&fixture, "shrink.out"), "asked for a small tile");
+    assert_eq!(said_by(&fixture, "shrink.code"), "0");
+    assert_eq!(said_by(&fixture, "grow.out"), "asked for a large tile");
+    assert_eq!(said_by(&fixture, "grow.code"), "0");
+    let messages = client.list_messages(task.project, Some(task.id));
+    let kinds: Vec<MessageKind> = messages.iter().map(|message| message.kind).collect();
+    assert_eq!(kinds, [MessageKind::Brief], "only the brief of the worker");
+}
+
+#[test]
+fn a_worker_resizes_its_own_tile_by_its_own_name_and_is_refused_any_other_name() {
+    let fixture = tile_fixture(
+        r#"  swarm spawn api --brief "work" > "$OUT/spawn.out" 2>&1"#,
+        r#"  echo "$SWARM_AGENT_NAME" > "$OUT/own-name"
+  swarm tile shrink ui > "$OUT/other.out" 2>&1
+  echo $? > "$OUT/other.code"
+  swarm tile grow api > "$OUT/grow.out" 2>&1
+  echo $? > "$OUT/grow.code""#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, _task) = start_task(&daemon, &repo);
+
+    let worker = client.wait_for_worker("api");
+
+    let first = client.wait_for_tile_request();
+
+    assert_eq!(said_by(&fixture, "own-name"), "api");
+    assert_eq!(
+        said_by(&fixture, "other.out"),
+        "swarm: only a task's orchestrator can list its workers"
+    );
+    assert_eq!(said_by(&fixture, "other.code"), "1");
+    assert_eq!(said_by(&fixture, "grow.out"), "asked for a large tile");
+    assert_eq!(said_by(&fixture, "grow.code"), "0");
+    assert_eq!(
+        first,
+        (worker.id, true),
+        "the refused request was broadcast"
+    );
+}
+
+#[test]
+fn a_worker_is_refused_a_tile_request_for_any_other_agent() {
+    let fixture = tile_fixture(
+        r#"  echo "$SWARM_AGENT_ID" > "$OUT/orchestrator-id"
+  swarm spawn api --brief "first" > "$OUT/spawn-api.out" 2>&1
+  swarm spawn ui --brief "second" > "$OUT/spawn-ui.out" 2>&1"#,
+        r#"  case "$line" in
+  second)
+    echo "$SWARM_AGENT_ID" > "$OUT/ui-id"
+    ;;
+  first)
+    until [ -s "$OUT/ui-id" ] && [ -s "$OUT/orchestrator-id" ]; do sleep 0.1; done
+    swarm tile grow "$(cat "$OUT/ui-id")" > "$OUT/other.out" 2>&1
+    echo $? > "$OUT/other.code"
+    swarm tile shrink "$(cat "$OUT/orchestrator-id")" > "$OUT/lead.out" 2>&1
+    echo $? > "$OUT/lead.code"
+    swarm tile grow > "$OUT/own.out" 2>&1
+    ;;
+  esac"#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, task) = start_task(&daemon, &repo);
+    let api = client.wait_for_worker("api");
+
+    let first = client.wait_for_tile_request();
+
+    let refusal = "swarm: a worker can only resize its own tile";
+    assert_eq!(said_by(&fixture, "other.out"), refusal);
+    assert_eq!(said_by(&fixture, "other.code"), "1");
+    assert_eq!(said_by(&fixture, "lead.out"), refusal);
+    assert_eq!(said_by(&fixture, "lead.code"), "1");
+    assert_eq!(said_by(&fixture, "own.out"), "asked for a large tile");
+    assert_eq!(first, (api.id, true), "the refused requests were broadcast");
+    let messages = client.list_messages(task.project, Some(task.id));
+    let kinds: Vec<MessageKind> = messages.iter().map(|message| message.kind).collect();
+    assert_eq!(
+        kinds,
+        [MessageKind::Brief, MessageKind::Brief],
+        "only the briefs of the two workers"
+    );
+}
+
+#[test]
+fn an_orchestrator_is_refused_itself_nobody_and_a_worker_of_another_task() {
+    let fixture = tile_fixture(
+        r#"  case "$line" in
+  one)
+    swarm spawn mine --brief "mine" > "$OUT/spawn-one.out" 2>&1
+    until [ -s "$OUT/other-id" ]; do sleep 0.1; done
+    swarm tile grow "$(cat "$OUT/other-id")" > "$OUT/foreign.out" 2>&1
+    echo $? > "$OUT/foreign.code"
+    swarm tile grow "$SWARM_AGENT_ID" > "$OUT/self.out" 2>&1
+    echo $? > "$OUT/self.code"
+    swarm tile grow > "$OUT/nobody.out" 2>&1
+    echo $? > "$OUT/nobody.code"
+    swarm tile grow mine > "$OUT/mine.out" 2>&1
+    ;;
+  two)
+    swarm spawn other --brief "other" > "$OUT/spawn-two.out" 2>&1
+    ;;
+  esac"#,
+        r#"  if [ "$line" = other ]; then echo "$SWARM_AGENT_ID" > "$OUT/other-id"; fi"#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let tasks: Vec<TaskInfo> = [("Task one", "one"), ("Task two", "two")]
+        .into_iter()
+        .map(|(name, message)| {
+            let mut request = orchestrator_task(project.id, false);
+            request.name = name.to_owned();
+            request.first_message = Some(message.to_owned());
+
+            client.create_task(request)
+        })
+        .collect();
+    let mine = client.wait_for_worker("mine");
+
+    let first = client.wait_for_tile_request();
+
+    let other = said_by(&fixture, "other-id");
+    let not_a_worker = |id: &str| format!("swarm: agent {id} is not a worker of your task");
+    assert_eq!(said_by(&fixture, "foreign.out"), not_a_worker(&other));
+    assert_eq!(said_by(&fixture, "foreign.code"), "1");
+    let orchestrator = tasks[0].agents[0].id;
+    assert_eq!(
+        said_by(&fixture, "self.out"),
+        not_a_worker(&orchestrator.0.to_string())
+    );
+    assert_eq!(
+        said_by(&fixture, "nobody.out"),
+        "swarm: name one of your workers: the tile of an orchestrator never changes size"
+    );
+    assert_eq!(said_by(&fixture, "mine.out"), "asked for a large tile");
+    assert_eq!(first, (mine.id, true), "a refused request was broadcast");
+}
+
+#[test]
+fn the_start_orchestrator_cannot_resize_a_tile() {
+    let fixture = fixture_with_helpers(
+        r#"case "$SWARM_ROLE" in
+start_orchestrator)
+  swarm tile grow 1 > "$OUT/grow.out" 2>&1
+  echo $? > "$OUT/grow.code"
+  swarm tile shrink > "$OUT/shrink.out" 2>&1
+  echo $? > "$OUT/shrink.code"
+  sleep 30
+  ;;
+esac"#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+
+    client.start_orchestrator(project.id);
+
+    let refusal = "swarm: only a task's orchestrator or a worker can resize a tile";
+    assert_eq!(said_by(&fixture, "grow.out"), refusal);
+    assert_eq!(said_by(&fixture, "grow.code"), "1");
+    assert_eq!(said_by(&fixture, "shrink.out"), refusal);
+    assert_eq!(said_by(&fixture, "shrink.code"), "1");
 }

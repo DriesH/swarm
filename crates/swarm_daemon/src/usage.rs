@@ -381,7 +381,7 @@ impl Poller {
 
 /// The `agents.<kind>.command` of the settings file. A file that is missing or broken
 /// gives the default: a failed usage read is no reason to stop the poller.
-fn configured_command(settings: Option<&Path>, kind: AgentKind) -> String {
+pub(crate) fn configured_command(settings: Option<&Path>, kind: AgentKind) -> String {
     let settings = settings
         .map(swarm_settings::load)
         .transpose()

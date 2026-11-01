@@ -3,6 +3,7 @@ use gpui::{
     SharedString, Toggled, Window, div, px,
 };
 
+use super::tooltip::Tooltip;
 use crate::component::{Component, example, example_group};
 use crate::contrast::composite;
 use crate::prelude::*;
@@ -124,6 +125,7 @@ pub struct Button {
     id: ElementId,
     label: SharedString,
     accessible_label: Option<SharedString>,
+    hint: Option<SharedString>,
     variant: ButtonVariant,
     size: ButtonSize,
     icon: Option<IconName>,
@@ -142,6 +144,7 @@ impl Button {
             id: id.into(),
             label: label.into(),
             accessible_label: None,
+            hint: None,
             variant: ButtonVariant::default(),
             size: ButtonSize::default(),
             icon: None,
@@ -169,6 +172,13 @@ impl Button {
     /// "Show diff, Cargo.lock". It should start with the visible label.
     pub fn accessible_label(mut self, label: impl Into<SharedString>) -> Self {
         self.accessible_label = Some(label.into());
+        self
+    }
+
+    /// Text a tooltip shows on hover, and VoiceOver reads after the label. For a value the
+    /// label leaves out, such as the command a button runs.
+    pub fn hint(mut self, hint: impl Into<SharedString>) -> Self {
+        self.hint = Some(hint.into());
         self
     }
 
@@ -261,6 +271,11 @@ impl RenderOnce for Button {
                     .clone()
                     .unwrap_or_else(|| self.label.clone()),
             )
+            .when_some(self.hint, |button, hint| {
+                button
+                    .aria_description(hint.clone())
+                    .tooltip(move |_, cx| Tooltip::text(hint.clone(), cx))
+            })
             .when_some(self.toggle_state, |button, on| {
                 button.aria_toggled(if on { Toggled::True } else { Toggled::False })
             })

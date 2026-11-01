@@ -5,6 +5,7 @@ mod checkbox;
 mod confirm_row;
 mod dialog;
 mod dropdown;
+mod honeycomb;
 mod icon;
 mod icon_button;
 mod kbd;
@@ -20,6 +21,7 @@ mod segmented_control;
 mod status;
 mod stepper;
 mod switch;
+mod system_check_row;
 mod tab;
 mod tab_bar;
 mod tab_strip;
@@ -38,6 +40,7 @@ pub use checkbox::*;
 pub use confirm_row::*;
 pub use dialog::*;
 pub use dropdown::*;
+pub use honeycomb::*;
 pub use icon::*;
 pub use icon_button::*;
 pub use kbd::*;
@@ -53,6 +56,7 @@ pub use segmented_control::*;
 pub use status::*;
 pub use stepper::*;
 pub use switch::*;
+pub use system_check_row::*;
 pub use tab::*;
 pub use tab_bar::*;
 pub use tab_strip::*;
@@ -90,6 +94,7 @@ pub fn all_components() -> Vec<ComponentEntry> {
         ComponentEntry::of::<StatusPill>(),
         ComponentEntry::of::<Tag>(),
         ComponentEntry::of::<CheckRow>(),
+        ComponentEntry::of::<SystemCheckRow>(),
         ComponentEntry::of::<OutputBlock>(),
         ComponentEntry::of::<ListRow>(),
         ComponentEntry::of::<TreeRow>(),
@@ -98,6 +103,7 @@ pub fn all_components() -> Vec<ComponentEntry> {
         ComponentEntry::of::<Panel>(),
         ComponentEntry::of::<UsageMeter>(),
         ComponentEntry::of::<BrandMark>(),
+        ComponentEntry::of::<Honeycomb>(),
         ComponentEntry::of::<ConfirmRow>(),
         ComponentEntry::of::<ProjectTile>(),
         ComponentEntry::of::<TileFrame>(),

@@ -11,6 +11,13 @@ fn worker(id: u32, activity: Activity) -> TileSpec {
     tile(id, TileKind::Worker, activity)
 }
 
+fn large_worker(id: u32, activity: Activity) -> TileSpec {
+    TileSpec {
+        large: true,
+        ..worker(id, activity)
+    }
+}
+
 fn orchestrator(id: u32) -> TileSpec {
     tile(id, TileKind::Orchestrator, Activity::Working)
 }
@@ -513,6 +520,145 @@ fn done_and_idle_workers_stack_below_a_tall_attention_box() {
     assert_rect(&layout, 1, box_at(TOP, TALL));
     assert_rect(&layout, 2, box_at(602.0, SMALL));
     assert_eq!(layout.tray, tray(&[3]));
+}
+
+// Workers that asked for a large tile.
+
+#[test]
+fn a_worker_that_asked_for_a_large_tile_is_two_small_boxes_tall() {
+    let asked = default_layout(&[orchestrator(0), large_worker(1, Activity::Working)]);
+    let small = default_layout(&[orchestrator(0), worker(1, Activity::Working)]);
+
+    assert_rect(&asked, 1, box_at(TOP, TALL));
+    assert_rect(&small, 1, box_at(TOP, SMALL));
+}
+
+#[test]
+fn a_large_worker_grows_like_a_blocked_worker() {
+    let asked = default_layout(&[orchestrator(0), large_worker(1, Activity::Idle)]);
+    let blocked = default_layout(&[orchestrator(0), worker(1, Activity::Attention)]);
+
+    assert_eq!(asked.rect(TileId(1)), blocked.rect(TileId(1)));
+}
+
+#[test]
+fn a_blocked_worker_stays_tall_without_the_large_request() {
+    let blocked = default_layout(&[orchestrator(0), worker(1, Activity::Attention)]);
+    let both = default_layout(&[orchestrator(0), large_worker(1, Activity::Attention)]);
+
+    assert_rect(&blocked, 1, box_at(TOP, TALL));
+    assert_eq!(blocked, both);
+}
+
+#[test]
+fn a_large_worker_keeps_its_place_in_the_stack() {
+    let before = [
+        orchestrator(0),
+        worker(1, Activity::Working),
+        worker(2, Activity::Working),
+    ];
+    let after = [
+        orchestrator(0),
+        large_worker(1, Activity::Working),
+        worker(2, Activity::Working),
+    ];
+
+    let before = default_layout(&before)
+        .rect(TileId(1))
+        .map(|rect| rect.origin);
+    let after = default_layout(&after)
+        .rect(TileId(1))
+        .map(|rect| rect.origin);
+
+    assert_eq!(before, after);
+}
+
+#[test]
+fn a_large_worker_does_not_push_a_working_worker_to_the_tray() {
+    let tiles = [
+        orchestrator(0),
+        worker(1, Activity::Working),
+        large_worker(2, Activity::Working),
+    ];
+
+    let cramped = default_layout(&tiles);
+    let tall = layout(area(1030.0, 1000.0), &tiles, &LayoutStyle::default());
+
+    assert_rect(&cramped, 2, box_at(306.0, SMALL));
+    assert!(cramped.tray.is_empty());
+    assert_rect(&tall, 2, box_at(306.0, TALL));
+}
+
+#[test]
+fn a_large_request_does_not_change_the_priority() {
+    let tiles = [
+        orchestrator(0),
+        large_worker(1, Activity::Idle),
+        worker(2, Activity::Working),
+    ];
+
+    let layout = layout(area(1030.0, 400.0), &tiles, &LayoutStyle::default());
+
+    assert!(layout.rect(TileId(2)).is_some());
+    assert_eq!(layout.tray, tray(&[1]));
+}
+
+#[test]
+fn the_orchestrator_keeps_its_share_when_a_worker_asks_for_a_large_tile() {
+    let layout = default_layout(&[orchestrator(0), large_worker(1, Activity::Working)]);
+
+    assert_rect(&layout, 0, Rect::new(10.0, 10.0, COLUMN_WIDTH, 770.0));
+}
+
+#[test]
+fn the_orchestrator_ignores_the_large_request() {
+    let asked = TileSpec {
+        large: true,
+        ..orchestrator(0)
+    };
+    let tiles = [asked, worker(1, Activity::Working)];
+
+    let layout = default_layout(&tiles);
+
+    assert_rect(&layout, 0, Rect::new(10.0, 10.0, COLUMN_WIDTH, 770.0));
+    assert_rect(&layout, 1, box_at(TOP, SMALL));
+}
+
+#[test]
+fn a_process_ignores_the_large_request() {
+    let asked = TileSpec {
+        large: true,
+        ..process(1, Activity::Running)
+    };
+
+    let layout = default_layout(&[orchestrator(0), asked]);
+
+    assert_rect(&layout, 1, box_at(TOP, PROCESS));
+}
+
+#[test]
+fn a_pinned_worker_ignores_the_large_request() {
+    let pinned = TileSpec {
+        pinned: true,
+        ..large_worker(1, Activity::Working)
+    };
+
+    let layout = default_layout(&[orchestrator(0), pinned]);
+
+    assert_rect(&layout, 1, box_at(TOP, SMALL));
+}
+
+#[test]
+fn a_minimized_worker_stays_in_the_tray_whatever_it_asks() {
+    let minimized = TileSpec {
+        minimized: true,
+        ..large_worker(1, Activity::Working)
+    };
+
+    let layout = default_layout(&[orchestrator(0), minimized]);
+
+    assert_eq!(layout.tray, tray(&[1]));
+    assert_rect(&layout, 0, Rect::new(10.0, 10.0, 1010.0, 770.0));
 }
 
 // Workspace mockup: orchestrator, two workers, two processes, a done and an idle worker.
@@ -1150,6 +1296,7 @@ fn random_tile(random: &mut Random, id: u32) -> TileSpec {
         fixed,
         pinned: random.chance(15),
         minimized: random.chance(10),
+        large: random.chance(20),
     }
 }
 
@@ -1237,6 +1384,11 @@ fn separation(first: Rect, second: Rect) -> f32 {
     ]
     .into_iter()
     .fold(f32::MIN, f32::max)
+}
+
+/// An unpinned worker with the large request.
+fn asks_to_grow(tile: &TileSpec) -> bool {
+    tile.large && tile.kind == TileKind::Worker && !tile.pinned
 }
 
 /// Unpinned workers and processes rank by activity alone.
@@ -1490,7 +1642,10 @@ fn boxes_without_a_size_of_their_own_are_never_taller_than_a_small_box() {
             .max(case.style.min_tile.height.max(1.0));
 
         for tile in case.tiles.iter().filter(|tile| {
-            tile.fixed.is_none() && tile.activity != Activity::Attention && Some(tile.id) != column
+            tile.fixed.is_none()
+                && tile.activity != Activity::Attention
+                && !asks_to_grow(tile)
+                && Some(tile.id) != column
         }) {
             let Some(rect) = layout.rect(tile.id) else {
                 continue;
@@ -1667,5 +1822,51 @@ fn a_process_ignores_a_fixed_size() {
         };
 
         assert_eq!(sized.layout(), case.layout());
+    }
+}
+
+#[test]
+fn the_large_request_only_counts_for_unpinned_workers() {
+    for case in cases() {
+        let stripped = Case {
+            tiles: case
+                .tiles
+                .iter()
+                .map(|tile| TileSpec {
+                    large: asks_to_grow(tile),
+                    ..*tile
+                })
+                .collect(),
+            area: case.area,
+            style: case.style,
+        };
+
+        assert_eq!(stripped.layout(), case.layout());
+    }
+}
+
+#[test]
+fn a_worker_that_asks_to_grow_is_never_taller_than_two_small_boxes() {
+    for case in cases() {
+        let layout = case.layout();
+        let tall = 2.0
+            * case
+                .style
+                .small_tile_height
+                .max(case.style.min_tile.height.max(1.0))
+            + case.style.gap.max(0.0);
+
+        for tile in case.tiles.iter().filter(|tile| asks_to_grow(tile)) {
+            let Some(rect) = layout.rect(tile.id) else {
+                continue;
+            };
+
+            assert!(
+                rect.size.height <= tall + FLOAT_TOLERANCE,
+                "{:?} is {:?} high, a tall box is {tall}",
+                tile.id,
+                rect.size.height
+            );
+        }
     }
 }

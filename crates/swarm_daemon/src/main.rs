@@ -32,11 +32,13 @@ use anyhow::{Context as _, Result};
 use swarm_core::Projects;
 use swarm_core::github::Github;
 use swarm_core::store::Store;
+use swarm_core::system_check::Tools;
 use swarm_protocol::{Paths, check_private_dir};
 
 use crate::agents::{AgentConfig, Agents};
 use crate::calls::Calls;
 use crate::checks::Checks;
+use crate::connection::SystemChecks;
 use crate::hub::{Clients, Terminals};
 use crate::messages::Messages;
 use crate::processes::Processes;
@@ -54,6 +56,7 @@ pub(crate) struct Services {
     pub(crate) processes: Arc<Processes>,
     pub(crate) checks: Arc<Checks>,
     pub(crate) pull_requests: PullRequests,
+    pub(crate) system_check: SystemChecks,
     pub(crate) usage: Arc<UsageService>,
     pub(crate) store: Arc<Mutex<Store>>,
     /// The folder of `settings.toml`, which also holds the user's prompts.
@@ -68,6 +71,8 @@ struct Arguments {
     gh: Option<PathBuf>,
     /// Commands and timings for the usage poller (tests).
     usage: Overrides,
+    /// The programs the system check runs.
+    tools: Tools,
 }
 
 /// How long terminals get to exit on SIGTERM before the daemon leaves anyway.
@@ -173,6 +178,7 @@ fn run() -> Result<()> {
         .and_then(Path::parent)
         .map(Path::to_path_buf);
     let github = Github::new(paths.data.join("bin"), arguments.gh);
+    let system_check = SystemChecks::new(arguments.tools, settings.clone(), github.clone());
     let agents = Agents::new(
         AgentConfig {
             data_dir: paths.data.clone(),
@@ -219,6 +225,7 @@ fn run() -> Result<()> {
         processes,
         checks,
         pull_requests: PullRequests::new(github, config_dir.clone()),
+        system_check,
         usage,
         store,
         config_dir,
@@ -238,7 +245,9 @@ fn run() -> Result<()> {
 ///
 /// These only exist for tests: `--usage-security`, `--usage-curl`, `--usage-codex` and
 /// `--usage-claude` (programs to use as they are), `--usage-tick-ms` and
-/// `--usage-codex-interval-ms` (timings), and `--no-usage-polling`.
+/// `--usage-codex-interval-ms` (timings), and `--no-usage-polling`. The system check takes
+/// `--check-xcode-select` and `--check-security` (programs to use as they are) and
+/// `--check-timeout-ms`.
 fn arguments() -> Result<Arguments> {
     let mut input = std::env::args_os().skip(1);
     let mut parsed = Arguments {
@@ -246,6 +255,7 @@ fn arguments() -> Result<Arguments> {
         settings: None,
         gh: None,
         usage: Overrides::default(),
+        tools: Tools::system(),
     };
 
     while let Some(argument) = input.next() {
@@ -269,6 +279,9 @@ fn arguments() -> Result<Arguments> {
                 parsed.usage.codex_interval = Some(milliseconds(&name, &value()?)?);
             }
             "--no-usage-polling" => parsed.usage.no_polling = true,
+            "--check-xcode-select" => parsed.tools.xcode_select = PathBuf::from(value()?),
+            "--check-security" => parsed.tools.security = PathBuf::from(value()?),
+            "--check-timeout-ms" => parsed.tools.timeout = milliseconds(&name, &value()?)?,
             _ => anyhow::bail!("unknown argument {name}"),
         }
     }

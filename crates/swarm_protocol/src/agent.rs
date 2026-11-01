@@ -66,6 +66,11 @@ pub enum Call {
     /// Orchestrator: merges a worker's branch into the task branch in the task
     /// worktree. Returns [`Merged`].
     Merge { worker: AgentId },
+    /// Orchestrator: makes one of its workers' tiles large; worker: its own (`None`).
+    /// Changes the layout only, never sends a message. Returns nothing.
+    TileGrow { agent: Option<AgentId> },
+    /// Like [`Call::TileGrow`], but makes the tile small again.
+    TileShrink { agent: Option<AgentId> },
     /// Orchestrator: asks the user for attention with a short reason.
     Notify { text: String },
     /// Orchestrator: lists its workers. Returns `Vec<`[`AgentSummary`]`>`.
@@ -146,6 +151,8 @@ pub const HARNESS_CALLS: &[(&str, &str)] = &[
     ("agents", "agents"),
     ("confirm", "confirm"),
     ("pr_draft", "pr draft"),
+    ("tile_grow", "tile grow"),
+    ("tile_shrink", "tile shrink"),
     ("task_create", "task create"),
     ("task_list", "task list"),
     ("task_wait", "task wait"),

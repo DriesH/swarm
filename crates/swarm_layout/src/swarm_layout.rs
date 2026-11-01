@@ -109,10 +109,13 @@ pub struct TileSpec {
     pub pinned: bool,
     /// The user minimized the tile: it always goes to the tray.
     pub minimized: bool,
+    /// The worker asked for a large tile. The box is tall, like a box that needs
+    /// attention. Other kinds and pinned tiles ignore it.
+    pub large: bool,
 }
 
 impl TileSpec {
-    /// A tile with no fixed size that is neither pinned nor minimized.
+    /// A tile with no fixed size that is neither pinned, minimized nor large.
     pub const fn new(id: TileId, kind: TileKind, activity: Activity) -> Self {
         Self {
             id,
@@ -121,6 +124,7 @@ impl TileSpec {
             fixed: None,
             pinned: false,
             minimized: false,
+            large: false,
         }
     }
 }
@@ -493,7 +497,7 @@ fn lane_room(content: Rect, block: Option<Size>, metrics: &Metrics) -> f32 {
     below - block.width - gap
 }
 
-/// How tall the boxes of tiles that need attention are.
+/// How tall the boxes of tiles that grow are.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Growth {
     /// Room for two small boxes and the gap between them.
@@ -502,9 +506,12 @@ enum Growth {
     Small,
 }
 
-/// Boxes that are tall when there is room for it.
+/// Boxes that are tall when there is room for it: tiles that need attention and unpinned
+/// workers that asked for a large tile.
 fn grows(tile: &TileSpec) -> bool {
-    tile.activity == Activity::Attention
+    let asked = tile.large && tile.kind == TileKind::Worker && !tile.pinned;
+
+    tile.activity == Activity::Attention || asked
 }
 
 /// Tiles that rank above running processes and done or idle tiles.
@@ -611,8 +618,8 @@ impl Flow {
 
     /// Picks the tiles that fit, in priority order, and puts them in lanes in input order.
     ///
-    /// Tiles that need attention are tall unless that sends a working tile or a tile
-    /// that needs attention to the tray, which small boxes would keep on screen.
+    /// Tiles that grow are tall unless that sends a working tile or a tile that needs
+    /// attention to the tray, which small boxes would keep on screen.
     fn place(&self, column: Option<f32>, tiles: &[TileSpec], band: &[usize]) -> Vec<(usize, Rect)> {
         let lanes = self.lanes(column);
 
@@ -700,7 +707,7 @@ impl Flow {
     }
 
     /// The height a tile asks for. A process terminal is the smallest box; a tile that
-    /// needs attention may ask for two small boxes.
+    /// grows may ask for two small boxes.
     fn wanted_height(&self, tile: &TileSpec, growth: Growth) -> f32 {
         match tile.kind {
             _ if growth == Growth::Tall && grows(tile) => self.metrics.tall_height(),

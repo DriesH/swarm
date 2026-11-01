@@ -241,6 +241,8 @@ impl Calls {
             Call::RateLimits { windows } => self.rate_limits(caller, windows),
             // `handle` answers it before it gets here.
             Call::AgentExit => Ok(Value::Null),
+            Call::TileGrow { agent } => self.tile_request(caller, agent, true),
+            Call::TileShrink { agent } => self.tile_request(caller, agent, false),
 
             // The size is accepted and ignored: a process terminal follows its tile.
             Call::TerminalSpawn {
@@ -507,6 +509,40 @@ impl Calls {
             conflicts: outcome.conflicts,
             output: outcome.output,
         })
+    }
+
+    /// Tells the clients that a worker's tile should be large or small. The layout decides
+    /// what happens, and no agent gets a message.
+    fn tile_request(&self, caller: &AgentInfo, agent: Option<AgentId>, large: bool) -> Outcome {
+        let target = match caller.role {
+            AgentRole::Orchestrator => {
+                self.orchestrated_task(caller, "resize the tile of a worker")?;
+
+                let Some(worker) = agent else {
+                    return refuse(
+                        "name one of your workers: the tile of an orchestrator never changes size",
+                    );
+                };
+
+                self.worker_of(caller, worker)?.id
+            }
+            AgentRole::Worker => match agent {
+                Some(other) if other != caller.id => {
+                    return refuse("a worker can only resize its own tile");
+                }
+                _ => caller.id,
+            },
+            AgentRole::StartOrchestrator => {
+                return refuse("only a task's orchestrator or a worker can resize a tile");
+            }
+        };
+
+        self.services.clients.broadcast(&Event::TileRequest {
+            agent: target,
+            large,
+        });
+
+        Ok(Value::Null)
     }
 
     fn notify(&self, caller: &AgentInfo, text: &str) -> Outcome {
