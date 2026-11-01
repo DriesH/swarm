@@ -119,7 +119,7 @@ Three parts: 1. Review view, Approve, Changes panel and Close task. 2. Comments.
 
 **Goal:** know what the swarm is doing without opening the window.
 
-**Scope:** `swarm_usage` (Claude usage from status line data with the endpoint as fallback, Codex usage through `codex app-server`), menu bar status item with a GPUI popover, running agent count and **Stop all**, system notifications with actions, dock bounce, notification settings.
+**Scope:** `swarm_usage` (Claude usage from the status line data of Swarm's Claude agents, Codex usage through `codex app-server`), menu bar status item with a GPUI popover, running agent count and **Stop all**, system notifications with actions, dock bounce, notification settings.
 
 Three parts: 1. Usage in the daemon and the sidebar card. 2. Menu bar and popover. 3. Notifications.
 
@@ -127,7 +127,7 @@ Three parts: 1. Usage in the daemon and the sidebar card. 2. Menu bar and popove
 
 - [ ] Menu bar shows usage and a "needs you" dot, also with the window closed
 - [ ] Notifications appear for the four triggers, replace each other per task, and their buttons open the right view
-- [ ] Usage polling honors `Retry-After`
+- [ ] Usage shows Session and Weekly with pace, without reading any sign-in token
 
 ## 8. Polish and first release
 
