@@ -19,7 +19,7 @@ use swarm_term::{
     CursorStyle, ExitStatus, Key, Modifiers, Palette, Rgb, ScreenModel, TerminalChannels,
     TerminalInput, TerminalOutput,
 };
-use swarm_ui::{ActiveTheme as _, Theme};
+use swarm_ui::{ActiveTheme as _, Theme, edit};
 use unicode_segmentation::UnicodeSegmentation as _;
 
 use crate::element::{
@@ -683,6 +683,7 @@ impl Render for TerminalView {
             .bg(background)
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
+            .on_action(cx.listener(|view, _: &edit::Paste, _, cx| view.paste(cx)))
             .on_scroll(cx.listener(Self::on_scroll))
             .child(TerminalElement::new(cx.entity()))
     }
@@ -856,5 +857,44 @@ mod tests {
     #[test]
     fn light_and_dark_palettes_differ() {
         assert_ne!(palette_for(&Theme::light()), palette_for(&Theme::dark()));
+    }
+
+    #[gpui::test]
+    fn paste_from_the_edit_menu_reaches_the_program(cx: &mut gpui::TestAppContext) {
+        cx.update(swarm_ui::theme::init);
+        let (channels, emulator) = swarm_term::channels();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            TerminalView::new(channels, "terminal".into(), window, cx)
+        });
+        cx.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
+        cx.write_to_clipboard(ClipboardItem::new_string("ls -la".to_owned()));
+
+        cx.dispatch_action(edit::Paste);
+
+        let sent: Vec<TerminalInput> = emulator.input.try_iter().collect();
+        assert!(sent.contains(&TerminalInput::Paste("ls -la".to_owned())));
+    }
+
+    #[gpui::test]
+    fn paste_from_the_edit_menu_waits_for_the_typing_gate(cx: &mut gpui::TestAppContext) {
+        cx.update(swarm_ui::theme::init);
+        let (channels, emulator) = swarm_term::channels();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut view = TerminalView::new(channels, "terminal".into(), window, cx);
+            view.set_typing_gate(|_| false);
+
+            view
+        });
+        cx.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
+        cx.write_to_clipboard(ClipboardItem::new_string("rm -rf".to_owned()));
+
+        cx.dispatch_action(edit::Paste);
+
+        let sent: Vec<TerminalInput> = emulator.input.try_iter().collect();
+        assert!(
+            !sent
+                .iter()
+                .any(|input| matches!(input, TerminalInput::Paste(_)))
+        );
     }
 }

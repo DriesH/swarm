@@ -236,6 +236,8 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
         | Request::SetCloseAfterMerge { .. }) => handle_pull_requests(services, sink, request),
         request @ (Request::ListProjects { .. }
         | Request::AddProject { .. }
+        | Request::CheckRemoveProject { .. }
+        | Request::RemoveProject { .. }
         | Request::CreateTask { .. }) => handle_projects(services, sink, request),
     }
 }
@@ -317,6 +319,32 @@ fn handle_projects(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Re
                 }
             });
         }
+        Request::CheckRemoveProject { call, project } => {
+            let services = Arc::clone(services);
+            run_slow(
+                sink,
+                "check-remove-project",
+                call,
+                move |sink| match tasks::remove_check(&services, project) {
+                    Ok(check) => {
+                        sink.send_event(&Event::RemoveCheck { call, check });
+                    }
+                    Err(error) => send_error(sink, call, &error),
+                },
+            );
+        }
+        Request::RemoveProject {
+            call,
+            project,
+            confirmed,
+        } => {
+            let services = Arc::clone(services);
+            run_slow(sink, "remove-project", call, move |sink| {
+                let removed = tasks::remove_project(&services, project, &confirmed);
+
+                done_or_error(sink, call, removed);
+            });
+        }
         Request::CreateTask { call, task } => {
             let services = Arc::clone(services);
             run_slow(sink, "create-task", call, move |sink| {
@@ -344,6 +372,11 @@ fn create_terminal(
 ) {
     if services.agents.is_closing_key(terminal.task.as_deref()) {
         send_error(sink, call, &"the task is closing");
+
+        return;
+    }
+    if services.agents.is_removing_key(terminal.task.as_deref()) {
+        send_error(sink, call, &"the project is being removed");
 
         return;
     }
@@ -522,11 +555,7 @@ fn handle_review(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Requ
         } => {
             let services = Arc::clone(services);
             run_slow(sink, "close-task", call, move |sink| {
-                // A push or merge of the pull request keeps the worktree in use.
-                let closed = services
-                    .pull_requests
-                    .begin(task)
-                    .and_then(|_busy| tasks::close(&services, task, &confirmed));
+                let closed = tasks::close_asked(&services, task, &confirmed);
 
                 done_or_error(sink, call, closed);
             });

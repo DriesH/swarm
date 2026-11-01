@@ -18,11 +18,30 @@ pub(crate) enum CloseTaskEvent {
     Confirmed,
 }
 
+/// Where a dialog stands with the check of what it will throw away.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum CheckState {
+pub(crate) enum CheckState<T = CloseCheck> {
     Checking,
-    Ready(CloseCheck),
+    Ready(T),
     Failed(SharedString),
+}
+
+/// "Stops 3 agents". Close task and Remove project use the same words.
+pub(crate) fn stops_agents(count: u32) -> String {
+    format!("Stops {}", plural(count, "agent", "agents"))
+}
+
+/// "Stops 2 terminals".
+pub(crate) fn stops_terminals(count: u32) -> String {
+    format!("Stops {}", plural(count, "terminal", "terminals"))
+}
+
+/// "Deletes 4 uncommitted files".
+pub(crate) fn deletes_files(count: u32) -> String {
+    format!(
+        "Deletes {}",
+        plural(count, "uncommitted file", "uncommitted files")
+    )
 }
 
 /// The open dialog. It reports what the user chose and leaves closing to its owner.
@@ -113,33 +132,13 @@ impl CloseTaskDialog {
         let mut lines = Vec::new();
 
         if check.running_agents > 0 {
-            lines.push((
-                format!("Stops {}", plural(check.running_agents, "agent", "agents")),
-                Color::Default,
-            ));
+            lines.push((stops_agents(check.running_agents), Color::Default));
         }
         if check.user_terminals > 0 {
-            lines.push((
-                format!(
-                    "Stops {}",
-                    plural(check.user_terminals, "terminal", "terminals")
-                ),
-                Color::Default,
-            ));
+            lines.push((stops_terminals(check.user_terminals), Color::Default));
         }
         if check.uncommitted_files > 0 {
-            lines.push((
-                format!(
-                    "Deletes {} uncommitted {}",
-                    check.uncommitted_files,
-                    if check.uncommitted_files == 1 {
-                        "file"
-                    } else {
-                        "files"
-                    }
-                ),
-                Color::Warn,
-            ));
+            lines.push((deletes_files(check.uncommitted_files), Color::Warn));
         }
 
         for branch in &check.merged_branches {
@@ -250,6 +249,20 @@ impl Render for CloseTaskDialog {
 }
 
 impl Workspace {
+    /// What the app knows of a task without asking the daemon: its working agents.
+    pub(crate) fn local_close_check(&self, task: TaskId) -> CloseCheck {
+        let working = self
+            .data
+            .agents_of(task)
+            .filter(|agent| agent.is_working())
+            .count();
+
+        CloseCheck {
+            running_agents: u32::try_from(working).unwrap_or(u32::MAX),
+            ..CloseCheck::default()
+        }
+    }
+
     /// True when the open dialog asks about this task.
     pub(crate) fn close_dialog_is_for(&self, task: TaskId, cx: &App) -> bool {
         matches!(
@@ -274,16 +287,7 @@ impl Workspace {
 
         let (name, branch) = (entry.name.clone(), entry.branch.clone());
         let daemon_id = self.data.diff_id(task).filter(|_| entry.daemon.is_some());
-        let local = CloseCheck {
-            running_agents: u32::try_from(
-                self.data
-                    .agents_of(task)
-                    .filter(|agent| agent.is_working())
-                    .count(),
-            )
-            .unwrap_or(u32::MAX),
-            ..CloseCheck::default()
-        };
+        let local = self.local_close_check(task);
 
         let view = cx.new(|cx| CloseTaskDialog::new(task, name, branch, window, cx));
         let subscription =
@@ -389,6 +393,6 @@ impl Workspace {
     }
 }
 
-fn describe(error: &ClientError) -> SharedString {
+pub(crate) fn describe(error: &ClientError) -> SharedString {
     error.to_string().into()
 }

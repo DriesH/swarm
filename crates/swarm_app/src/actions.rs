@@ -18,7 +18,19 @@ actions!(
         NewTerminal,
         OpenSettings,
         ToggleCommandPalette,
-        Quit
+        Quit,
+        About,
+        AddProject,
+        CloseTask,
+        ToggleSidebar,
+        OpenHelp,
+        Hide,
+        HideOthers,
+        ShowAll,
+        Minimize,
+        Zoom,
+        BringAllToFront,
+        ToggleFullScreen
     ]
 );
 
@@ -125,17 +137,20 @@ pub(crate) struct Shortcut {
     pub binding: KeyBinding,
 }
 
-/// Every key binding of the app. [`bind_keys`] registers them and the Keyboard page lists
-/// them, so a new binding shows up on the page without more work.
-pub(crate) fn shortcuts() -> Vec<Shortcut> {
-    use ShortcutGroup::{FileTree, Review, Terminals, Workspace};
-
-    let root = Some(ROOT_CONTEXT);
-    let shortcut = |group, name, binding| Shortcut {
+fn shortcut(group: ShortcutGroup, name: &'static str, binding: KeyBinding) -> Shortcut {
+    Shortcut {
         group,
         name,
         binding,
-    };
+    }
+}
+
+/// Every key binding of the app. [`bind_keys`] registers them and the Keyboard page lists
+/// them, so a new binding shows up on the page without more work.
+pub(crate) fn shortcuts() -> Vec<Shortcut> {
+    use ShortcutGroup::{Terminals, Workspace};
+
+    let root = Some(ROOT_CONTEXT);
 
     let mut shortcuts = vec![
         shortcut(
@@ -169,6 +184,26 @@ pub(crate) fn shortcuts() -> Vec<Shortcut> {
             KeyBinding::new("cmd-k", ToggleCommandPalette, root),
         ),
         shortcut(Workspace, "Quit", KeyBinding::new("cmd-q", Quit, None)),
+        shortcut(
+            Workspace,
+            "Hide Swarm",
+            KeyBinding::new("cmd-h", Hide, None),
+        ),
+        shortcut(
+            Workspace,
+            "Hide others",
+            KeyBinding::new("cmd-alt-h", HideOthers, None),
+        ),
+        shortcut(
+            Workspace,
+            "Minimize window",
+            KeyBinding::new("cmd-m", Minimize, None),
+        ),
+        shortcut(
+            Workspace,
+            "Full screen",
+            KeyBinding::new("ctrl-cmd-f", ToggleFullScreen, None),
+        ),
     ];
 
     shortcuts.extend(FOCUS_KEYS.iter().enumerate().map(|(index, key)| {
@@ -179,10 +214,20 @@ pub(crate) fn shortcuts() -> Vec<Shortcut> {
         )
     }));
 
+    shortcuts.extend(review_shortcuts());
+
+    shortcuts
+}
+
+/// The keys of the Review view and of the file trees.
+fn review_shortcuts() -> Vec<Shortcut> {
+    use ShortcutGroup::{FileTree, Review};
+
     let review = Some(REVIEW_KEYS);
     let body = Some(BODY_KEYS);
     let tree = Some(FILE_TREE_CONTEXT);
-    shortcuts.extend([
+
+    vec![
         shortcut(Review, "Next file", KeyBinding::new("j", NextFile, review)),
         shortcut(
             Review,
@@ -245,9 +290,7 @@ pub(crate) fn shortcuts() -> Vec<Shortcut> {
             "Cancel reply",
             KeyBinding::new("escape", CancelReply, Some(REPLY_CONTEXT)),
         ),
-    ]);
-
-    shortcuts
+    ]
 }
 
 pub(crate) fn bind_keys(cx: &mut App) {

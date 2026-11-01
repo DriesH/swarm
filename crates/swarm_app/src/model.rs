@@ -1877,6 +1877,9 @@ impl FakeData {
             self.diffs.retain(|(other, _), _| *other != id);
             self.loaded.forget_task(id);
             self.comments.remove(&id);
+            self.drafts.remove(&id);
+            self.checks.remove(&id);
+            self.pull_requests.remove(&id);
         }
 
         let mut gone = self.remove_agents_of(task);
@@ -1897,6 +1900,19 @@ impl FakeData {
         self.tasks.retain(|entry| entry.id != task);
 
         gone
+    }
+
+    /// Drops the project and what only it held. Remove its tabs first.
+    pub(crate) fn forget_project(&mut self, project: ProjectId) {
+        let daemon = self.project(project).and_then(|entry| entry.daemon);
+
+        self.projects.retain(|entry| entry.id != project);
+        self.github.remove(&project);
+
+        if let Some(daemon) = daemon {
+            self.messages_revision += 1;
+            self.messages.retain(|(owner, _), _| *owner != daemon);
+        }
     }
 
     /// Keeps a message, up to the last [`MESSAGES_PER_TASK`] of its task, in id order.
@@ -2449,6 +2465,51 @@ mod tests {
 
         assert!(data.pull_requests.is_empty());
         assert!(data.tasks.iter().all(|task| task.pull_request.is_none()));
+    }
+
+    #[test]
+    fn removing_a_task_forgets_its_draft_checks_and_pull_request() {
+        let mut data = FakeData::sample();
+        let task = data.tasks.first().expect("the sample has a task").id;
+        let id = data.diff_id(task).expect("the task has an id");
+        let other = swarm_protocol::TaskId(id.0 + 100);
+
+        for key in [id, other] {
+            data.drafts.insert(
+                key,
+                PrDraft {
+                    title: "Add login".to_owned(),
+                    body: String::new(),
+                },
+            );
+            data.checks.insert(key, TaskChecks::default());
+            data.pull_requests.insert(
+                key,
+                PullRequest {
+                    number: 7,
+                    url: "https://example.test/7".to_owned(),
+                    title: "Add login".to_owned(),
+                    state: PrState::Open,
+                    draft: false,
+                    checks: Vec::new(),
+                    reviewers: Vec::new(),
+                    mergeable: true,
+                    read_at: 0,
+                },
+            );
+        }
+
+        data.remove_task(task);
+
+        assert!(!data.drafts.contains_key(&id));
+        assert!(!data.checks.contains_key(&id));
+        assert!(!data.pull_requests.contains_key(&id));
+        assert!(
+            data.drafts.contains_key(&other),
+            "another task lost its draft"
+        );
+        assert!(data.checks.contains_key(&other));
+        assert!(data.pull_requests.contains_key(&other));
     }
 
     #[test]

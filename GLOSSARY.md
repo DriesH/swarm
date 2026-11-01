@@ -96,6 +96,10 @@ _Avoid_: CI, pre-flight, tests
 Ending a task: its agents stop and its worktrees are removed. Its branch stays unless it is already merged into the base branch.
 _Avoid_: Delete task, archive, kill
 
+**Remove project**:
+Taking a project out of Swarm: its open tasks close, its agents and terminals stop, and Swarm forgets the project. The code in the project folder stays on disk.
+_Avoid_: Delete project, close project
+
 **Task worktree**:
 The worktree that holds a task branch; each tab in the window shows one.
 _Avoid_: Space, workspace

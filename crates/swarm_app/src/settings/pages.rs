@@ -219,7 +219,7 @@ fn list_row(
 }
 
 /// The path with the home folder shortened to `~`.
-fn tilde(path: &Path) -> String {
+pub(crate) fn tilde(path: &Path) -> String {
     let home = std::env::var_os("HOME");
 
     match home.and_then(|home| path.strip_prefix(home).ok()) {
@@ -234,7 +234,10 @@ impl SettingsWindow {
             Page::Agents => self.agents_page(cx),
             Page::Notifications => self.notifications_page(cx),
             Page::Appearance => self.appearance_page(cx),
-            Page::Project(index) => self.project_page(index, cx),
+            Page::Project(project) => match self.state.read(cx).index_of(project) {
+                Some(index) => self.project_page(index, cx),
+                None => div().into_any_element(),
+            },
             Page::Terminals => self.terminals_page(cx),
             Page::Prompts => self.prompts.clone().into_any_element(),
             Page::Usage => self.usage.clone().into_any_element(),
@@ -618,6 +621,17 @@ impl SettingsWindow {
                     .debug_selector(|| "project-prompts".to_owned())
                     .child(section("Prompts", prompts))
             }))
+            .child(
+                h_flex().child(
+                    Button::new(("remove-project", index), "Remove project\u{2026}")
+                        .variant(ButtonVariant::SecondaryDestructive)
+                        .track_focus(&self.remove_focus)
+                        .debug_selector(|| "remove-project".to_owned())
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_remove_project(index, window, cx);
+                        })),
+                ),
+            )
             .into_any_element()
     }
 

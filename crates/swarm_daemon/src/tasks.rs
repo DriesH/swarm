@@ -10,13 +10,13 @@ use anyhow::{Context as _, Result, bail};
 use swarm_core::{PreparedTask, PreparedWorker};
 use swarm_protocol::{
     AgentId, AgentInfo, AgentKind, AgentRole, CloseCheck, CreateTask, CreateTerminal, Event,
-    ProjectId, TaskId, TaskInfo, TerminalId, TerminalKind,
+    ProjectId, RemoveCheck, TaskCloseCheck, TaskId, TaskInfo, TerminalId, TerminalKind,
 };
 use swarm_term::TerminalInput;
 use swarm_term::{ExitStatus, Palette, Rgb, Size};
 
 use crate::Services;
-use crate::agents::{CommandNotFound, Place, Start};
+use crate::agents::{Agents, CommandNotFound, Place, Start, start_key};
 use crate::hub::Extras;
 
 /// Default size and colors of a setup or agent terminal; the app resizes it when it
@@ -80,6 +80,10 @@ pub(crate) fn create(
     created_by: Option<AgentId>,
     reply: impl FnOnce(&TaskInfo),
 ) -> Result<()> {
+    if services.agents.is_removing(request.project) {
+        bail!("the project is being removed");
+    }
+
     let plan = request
         .orchestrator
         .map(|kind| services.agents.plan(kind, AgentRole::Orchestrator))
@@ -90,6 +94,13 @@ pub(crate) fn create(
         setup,
         env,
     } = services.projects.create_task_by(request, created_by)?;
+
+    // A removal that began while the task was made did not see it.
+    if services.agents.is_removing(task.project) {
+        services.projects.discard_task(&task);
+
+        bail!("the project is being removed");
+    }
 
     let agent = match plan {
         Some(plan) => {
@@ -186,6 +197,15 @@ pub(crate) fn close(services: &Services, id: TaskId, confirmed: &CloseCheck) -> 
     result
 }
 
+/// Closes a task the user asked to close, alone or with its project. The close is refused
+/// while a push or merge of the task's pull request runs: it keeps the worktree in use.
+pub(crate) fn close_asked(services: &Services, id: TaskId, confirmed: &CloseCheck) -> Result<()> {
+    services
+        .pull_requests
+        .begin(id)
+        .and_then(|_busy| close(services, id, confirmed))
+}
+
 /// True when closing would lose something `confirmed` did not show. Running agents and
 /// terminals are left out: they were stopped since.
 fn loses_more(confirmed: &CloseCheck, now: &CloseCheck) -> bool {
@@ -197,7 +217,7 @@ fn loses_more(confirmed: &CloseCheck, now: &CloseCheck) -> bool {
 }
 
 fn stop_and_close(services: &Services, id: TaskId, confirmed: &CloseCheck) -> Result<()> {
-    if !stop_processes(services, id) {
+    if !stop_processes(services, Scope::Task(id)) {
         bail!("some processes of the task did not end; try again");
     }
 
@@ -220,14 +240,47 @@ fn stop_and_close(services: &Services, id: TaskId, confirmed: &CloseCheck) -> Re
     Ok(())
 }
 
-/// Ends every agent and process terminal of the task: SIGTERM, then SIGKILL after
+/// Who a stop reaches: the agents and terminals of a task, or the Start orchestrator
+/// and the terminals of a project's Start tab.
+#[derive(Debug, Clone, Copy)]
+enum Scope {
+    Task(TaskId),
+    Start(ProjectId),
+}
+
+impl Scope {
+    /// The `task` key of the terminals in this scope.
+    fn key(self) -> String {
+        match self {
+            Self::Task(task) => task.terminal_key(),
+            Self::Start(project) => start_key(project),
+        }
+    }
+
+    /// Marks the live agents as stopped on purpose. Returns the terminals of those that run.
+    fn stop_agents(self, agents: &Agents) -> Vec<TerminalId> {
+        match self {
+            Self::Task(task) => agents.stop_task_agents(task),
+            Self::Start(project) => agents.stop_start_agents(project),
+        }
+    }
+
+    fn has_live(self, agents: &Agents) -> bool {
+        match self {
+            Self::Task(task) => agents.has_live(task),
+            Self::Start(project) => agents.has_live_start(project),
+        }
+    }
+}
+
+/// Ends every agent and process terminal of the scope: SIGTERM, then SIGKILL after
 /// [`CLOSE_GRACE`]. Repeats while new ones show up from a request that was under way.
-/// False when something of the task is still alive at the end.
-fn stop_processes(services: &Services, task: TaskId) -> bool {
-    let key = task.terminal_key();
+/// False when something of the scope is still alive at the end.
+fn stop_processes(services: &Services, scope: Scope) -> bool {
+    let key = scope.key();
 
     for _ in 0..3 {
-        let mut running = services.agents.stop_task_agents(task);
+        let mut running = scope.stop_agents(&services.agents);
         running.extend(
             services
                 .terminals
@@ -239,7 +292,7 @@ fn stop_processes(services: &Services, task: TaskId) -> bool {
         running.sort_unstable();
         running.dedup();
 
-        if running.is_empty() && !services.agents.has_live(task) {
+        if running.is_empty() && !scope.has_live(&services.agents) {
             return true;
         }
 
@@ -251,7 +304,7 @@ fn stop_processes(services: &Services, task: TaskId) -> bool {
                 hub.send_input(TerminalInput::Kill);
             }
         }
-        if wait_until_ended(services, task, &running, CLOSE_GRACE) {
+        if wait_until_ended(services, scope, &running, CLOSE_GRACE) {
             continue;
         }
 
@@ -263,30 +316,28 @@ fn stop_processes(services: &Services, task: TaskId) -> bool {
                 hub.send_input(TerminalInput::Kill);
             }
         }
-        if !wait_until_ended(services, task, &running, CLOSE_KILL_WAIT) {
-            log::warn!("task {} still has processes after SIGKILL", task.0);
+        if !wait_until_ended(services, scope, &running, CLOSE_KILL_WAIT) {
+            log::warn!("{scope:?} still has processes after SIGKILL");
 
             return false;
         }
     }
 
-    !services.agents.has_live(task) && !has_terminals(services, task)
+    !scope.has_live(&services.agents) && !has_terminals(services, &key)
 }
 
-fn has_terminals(services: &Services, task: TaskId) -> bool {
-    let key = task.terminal_key();
-
+fn has_terminals(services: &Services, key: &str) -> bool {
     services
         .terminals
         .list()
         .iter()
-        .any(|info| info.task.as_deref() == Some(key.as_str()))
+        .any(|info| info.task.as_deref() == Some(key))
 }
 
 /// True when the terminals are gone and their agents have ended, within `timeout`.
 fn wait_until_ended(
     services: &Services,
-    task: TaskId,
+    scope: Scope,
     terminals: &[TerminalId],
     timeout: Duration,
 ) -> bool {
@@ -296,7 +347,7 @@ fn wait_until_ended(
         let gone = terminals
             .iter()
             .all(|terminal| services.terminals.get(*terminal).is_none());
-        if gone && !services.agents.has_live(task) {
+        if gone && !scope.has_live(&services.agents) {
             return true;
         }
         if Instant::now() >= deadline {
@@ -305,6 +356,69 @@ fn wait_until_ended(
 
         thread::park_timeout(CLOSE_POLL);
     }
+}
+
+/// What removing the project would throw away: the close check of each open task.
+pub(crate) fn remove_check(services: &Services, project: ProjectId) -> Result<RemoveCheck> {
+    let tasks = services
+        .projects
+        .open_tasks(project)?
+        .into_iter()
+        .map(|task| {
+            Ok(TaskCloseCheck {
+                check: close_check(services, task.id)?,
+                task: task.id,
+                name: task.name,
+            })
+        })
+        .collect::<Result<_>>()?;
+
+    Ok(RemoveCheck { tasks })
+}
+
+/// Removes a project: closes every open task as [`close`] does, stops the Start
+/// orchestrator and the terminals of its Start tab, then removes its rows. The files in
+/// the project root stay. `confirmed` is the check the user saw. Nothing is closed when
+/// a task is open that it does not list, or when a task would lose more than it showed.
+/// A task that cannot close stops the removal; the tasks closed before it stay closed.
+pub(crate) fn remove_project(
+    services: &Services,
+    project: ProjectId,
+    confirmed: &RemoveCheck,
+) -> Result<()> {
+    let Some(_removing) = services.agents.begin_remove(project) else {
+        bail!("project {} is being removed already", project.0);
+    };
+
+    // What began before the guard is recorded now, so the list below holds it.
+    services.projects.wait_for_creations();
+
+    let open = services.projects.open_tasks(project)?;
+    let mut to_close = Vec::new();
+    for task in &open {
+        let Some(shown) = confirmed.tasks.iter().find(|shown| shown.task == task.id) else {
+            bail!("a task opened since; check again");
+        };
+        if loses_more(&shown.check, &close_check(services, task.id)?) {
+            bail!("more would be lost than shown; check again");
+        }
+
+        to_close.push((task, &shown.check));
+    }
+
+    for (task, check) in to_close {
+        close_asked(services, task.id, check)
+            .with_context(|| format!("cannot close {}", task.name))?;
+    }
+
+    if !stop_processes(services, Scope::Start(project)) {
+        bail!("some terminals of the project did not end; try again");
+    }
+
+    services.projects.remove(project)?;
+    services.processes.forget_project(project);
+
+    Ok(())
 }
 
 /// Starts the project's Start orchestrator in the project root, or returns the one that

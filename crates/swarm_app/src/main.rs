@@ -1,6 +1,7 @@
 //! `swarm`: the Swarm app.
 
 mod actions;
+mod app_menus;
 mod close_task;
 mod daemon;
 mod eggs;
@@ -15,6 +16,7 @@ mod palette;
 mod panels;
 mod pull_request;
 mod pull_request_panel;
+mod remove_project;
 mod review_comments;
 mod review_model;
 mod review_view;
@@ -136,6 +138,8 @@ fn main() {
             snapshot::run(directory.into(), cx);
             return;
         }
+
+        app_menus::install(cx);
 
         #[cfg(feature = "frame-stats")]
         frame_stats::run(cx);

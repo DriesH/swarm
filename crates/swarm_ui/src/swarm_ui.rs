@@ -28,7 +28,8 @@ actions!(
         Dismiss,
         SelectPrevious,
         SelectNext,
-        Confirm
+        Confirm,
+        ShowContextMenu
     ]
 );
 
@@ -64,6 +65,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("up", SelectPrevious, Some(MENU_CONTEXT)),
         KeyBinding::new("down", SelectNext, Some(MENU_CONTEXT)),
         KeyBinding::new("enter", Confirm, Some(MENU_CONTEXT)),
+        KeyBinding::new("shift-f10", ShowContextMenu, Some(ROOT_CONTEXT)),
     ]);
 }
 

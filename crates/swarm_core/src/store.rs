@@ -168,6 +168,133 @@ const MIGRATIONS: &[&str] = &[
     // The pull request the user asked Swarm to merge. A queued merge lands later; only a
     // pull request with this mark counts as merged through Swarm.
     "ALTER TABLE tasks ADD COLUMN merge_requested_pr INTEGER",
+    // Without AUTOINCREMENT SQLite gives a new row the id of a deleted top row, and a
+    // client that cached the old row would show its data on the new one. The tables are
+    // rebuilt together: each new table points at the new parents, so no foreign key breaks
+    // while the old tables go. They go children first, and the names change at the end.
+    "CREATE TABLE projects_rebuilt (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        path TEXT NOT NULL UNIQUE,
+        name TEXT NOT NULL,
+        added_at INTEGER NOT NULL
+    );
+    CREATE TABLE tasks_rebuilt (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project INTEGER NOT NULL REFERENCES projects_rebuilt(id),
+        name TEXT NOT NULL,
+        branch TEXT NOT NULL,
+        base TEXT NOT NULL,
+        worktree TEXT NOT NULL,
+        ports TEXT NOT NULL,
+        setup_terminal INTEGER,
+        created_at INTEGER NOT NULL,
+        setup_exit TEXT,
+        briefed INTEGER NOT NULL DEFAULT 0,
+        created_by INTEGER,
+        approved INTEGER,
+        closed_at INTEGER,
+        closing_at INTEGER,
+        pr_number INTEGER,
+        pr_url TEXT,
+        close_after_merge INTEGER NOT NULL DEFAULT 0,
+        pr_head TEXT,
+        pr_base TEXT,
+        merge_requested_pr INTEGER
+    );
+    CREATE TABLE agents_rebuilt (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project INTEGER NOT NULL REFERENCES projects_rebuilt(id),
+        task INTEGER REFERENCES tasks_rebuilt(id),
+        role TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        model TEXT NOT NULL,
+        session_id TEXT,
+        terminal INTEGER,
+        status TEXT NOT NULL,
+        message TEXT,
+        lifecycle TEXT NOT NULL,
+        revision INTEGER NOT NULL DEFAULT 0,
+        session_confirmed INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        worktree TEXT NOT NULL,
+        branch TEXT NOT NULL,
+        ports TEXT NOT NULL DEFAULT '',
+        ended_at INTEGER,
+        base_commit TEXT,
+        started_at INTEGER
+    );
+    CREATE TABLE messages_rebuilt (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project INTEGER NOT NULL REFERENCES projects_rebuilt(id),
+        task INTEGER REFERENCES tasks_rebuilt(id),
+        from_agent INTEGER,
+        to_agent INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        text TEXT NOT NULL,
+        sent_at INTEGER NOT NULL,
+        delivered_at INTEGER
+    );
+    CREATE TABLE comments_rebuilt (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task INTEGER NOT NULL REFERENCES tasks_rebuilt(id),
+        parent INTEGER REFERENCES comments_rebuilt(id),
+        source TEXT NOT NULL,
+        worktree BLOB NOT NULL,
+        path BLOB NOT NULL,
+        side TEXT NOT NULL,
+        line INTEGER NOT NULL,
+        anchor_text TEXT NOT NULL,
+        before_text TEXT,
+        after_text TEXT,
+        body TEXT NOT NULL,
+        state TEXT NOT NULL,
+        to_agent INTEGER,
+        outdated INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        sent_at INTEGER,
+        message INTEGER
+    );
+    INSERT INTO projects_rebuilt (id, path, name, added_at)
+        SELECT id, path, name, added_at FROM projects;
+    INSERT INTO tasks_rebuilt
+        (id, project, name, branch, base, worktree, ports, setup_terminal, created_at,
+         setup_exit, briefed, created_by, approved, closed_at, closing_at, pr_number, pr_url,
+         close_after_merge, pr_head, pr_base, merge_requested_pr)
+        SELECT id, project, name, branch, base, worktree, ports, setup_terminal, created_at,
+            setup_exit, briefed, created_by, approved, closed_at, closing_at, pr_number, pr_url,
+            close_after_merge, pr_head, pr_base, merge_requested_pr
+        FROM tasks;
+    INSERT INTO agents_rebuilt
+        (id, project, task, role, kind, model, session_id, terminal, status, message,
+         lifecycle, revision, session_confirmed, created_at, name, worktree, branch, ports,
+         ended_at, base_commit, started_at)
+        SELECT id, project, task, role, kind, model, session_id, terminal, status, message,
+            lifecycle, revision, session_confirmed, created_at, name, worktree, branch, ports,
+            ended_at, base_commit, started_at
+        FROM agents;
+    INSERT INTO messages_rebuilt
+        (id, project, task, from_agent, to_agent, kind, text, sent_at, delivered_at)
+        SELECT id, project, task, from_agent, to_agent, kind, text, sent_at, delivered_at
+        FROM messages;
+    INSERT INTO comments_rebuilt
+        (id, task, parent, source, worktree, path, side, line, anchor_text, before_text,
+         after_text, body, state, to_agent, outdated, created_at, sent_at, message)
+        SELECT id, task, parent, source, worktree, path, side, line, anchor_text, before_text,
+            after_text, body, state, to_agent, outdated, created_at, sent_at, message
+        FROM comments;
+    DROP TABLE comments;
+    DROP TABLE messages;
+    DROP TABLE agents;
+    DROP TABLE tasks;
+    DROP TABLE projects;
+    ALTER TABLE projects_rebuilt RENAME TO projects;
+    ALTER TABLE tasks_rebuilt RENAME TO tasks;
+    ALTER TABLE agents_rebuilt RENAME TO agents;
+    ALTER TABLE messages_rebuilt RENAME TO messages;
+    ALTER TABLE comments_rebuilt RENAME TO comments;
+    CREATE INDEX messages_unread ON messages (to_agent) WHERE delivered_at IS NULL;
+    CREATE INDEX comments_task ON comments (task)",
 ];
 
 /// The hundredth merge is the one that makes the queen bee.
@@ -504,6 +631,60 @@ impl Store {
         let rows = statement.query_map([], project_from_row)?;
 
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Fails when the project is unknown or still has open tasks. The message names them.
+    pub fn check_removable(&self, id: ProjectId) -> Result<(), Error> {
+        if self.project(id)?.is_none() {
+            return Err(Error::UnknownProject(id.0));
+        }
+
+        let open = self.list_tasks(id)?;
+        if open.is_empty() {
+            return Ok(());
+        }
+
+        let names: Vec<&str> = open.iter().map(|task| task.name.as_str()).collect();
+        let noun = if names.len() == 1 { "task" } else { "tasks" };
+
+        Err(Error::Invalid(format!(
+            "close its {} {noun} first: {}",
+            names.len(),
+            names.join(", ")
+        )))
+    }
+
+    /// Deletes the project and everything recorded for it, in one transaction. The
+    /// closed tasks go with their agents, messages and comments. Refuses like
+    /// [`Self::check_removable`], checked inside the transaction.
+    pub fn remove_project(&self, id: ProjectId) -> Result<(), Error> {
+        self.atomically(|store| {
+            store.check_removable(id)?;
+
+            let project = to_row(id.0)?;
+            let of_project = "SELECT id FROM tasks WHERE project = ?1";
+
+            store.connection.execute(
+                &format!("DELETE FROM comments WHERE task IN ({of_project})"),
+                params![project],
+            )?;
+            // Merges stay: the count outlives the project, and no later task gets an id
+            // of a deleted one.
+            store
+                .connection
+                .execute("DELETE FROM messages WHERE project = ?1", params![project])?;
+            store
+                .connection
+                .execute("DELETE FROM agents WHERE project = ?1", params![project])?;
+            store
+                .connection
+                .execute("DELETE FROM tasks WHERE project = ?1", params![project])?;
+            store
+                .connection
+                .execute("DELETE FROM projects WHERE id = ?1", params![project])?;
+
+            Ok(())
+        })
     }
 
     pub fn add_task(&self, task: &NewTask<'_>) -> Result<TaskInfo, Error> {
@@ -2959,5 +3140,483 @@ mod tests {
         assert_eq!(store.open_task_count().expect("open"), 1);
         store.close_task(second).expect("close");
         assert_eq!(store.open_task_count().expect("open"), 0);
+    }
+
+    fn rows(store: &Store, table: &str) -> i64 {
+        store
+            .connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .expect("count")
+    }
+
+    /// A closed task with an agent, a message, a comment with a reply and a merge.
+    fn project_with_a_closed_task() -> (Store, StoredProject, TaskId) {
+        let (store, task) = store_with_task();
+        let project = store.list_projects().expect("projects").remove(0);
+        let agent = store.add_agent(&new_agent(task)).expect("agent");
+        store
+            .add_message(&message(None, agent.id, "brief"))
+            .expect("message");
+        let comment = store
+            .add_comment(&new_comment(task), CommentState::Pending)
+            .expect("comment");
+        let reply = NewComment {
+            parent: Some(comment.id),
+            ..new_comment(task)
+        };
+        store
+            .add_comment(&reply, CommentState::Pending)
+            .expect("reply");
+        store.record_merge(task).expect("merge");
+        store.close_task(task).expect("close");
+
+        (store, project, task)
+    }
+
+    #[test]
+    fn a_project_with_open_tasks_cannot_be_removed_and_the_message_names_them() {
+        let (store, first) = store_with_task();
+        let project = store.list_projects().expect("projects")[0].id;
+        let second = NewTask {
+            name: "Menu bar usage",
+            ..new_task(project, &[])
+        };
+        store.add_task(&second).expect("second");
+
+        let refused = store.remove_project(project).expect_err("refused");
+
+        assert_eq!(
+            refused.to_string(),
+            "close its 2 tasks first: Fix it, Menu bar usage"
+        );
+        store.close_task(first).expect("close");
+        let refused = store.remove_project(project).expect_err("still one");
+        assert_eq!(
+            refused.to_string(),
+            "close its 1 task first: Menu bar usage"
+        );
+        assert_eq!(store.list_projects().expect("projects").len(), 1);
+        assert_eq!(rows(&store, "tasks"), 2);
+    }
+
+    #[test]
+    fn an_unknown_project_cannot_be_removed() {
+        let (store, _) = store_with_task();
+
+        let refused = store.remove_project(ProjectId(42)).expect_err("refused");
+
+        assert!(matches!(refused, Error::UnknownProject(42)), "{refused}");
+        assert_eq!(store.list_projects().expect("projects").len(), 1);
+    }
+
+    #[test]
+    fn removing_a_project_deletes_its_closed_tasks_with_every_row_that_belongs_to_them() {
+        let (store, project, task) = project_with_a_closed_task();
+        let other = store
+            .add_project(Path::new("/other"), "other")
+            .expect("other project");
+        let kept = store.add_task(&new_task(other.id, &[])).expect("kept task");
+        let kept_agent = store
+            .add_agent(&NewAgent {
+                project: other.id,
+                ..new_agent(kept.id)
+            })
+            .expect("kept agent");
+        store
+            .add_message(&NewMessage {
+                project: other.id,
+                task: Some(kept.id),
+                ..message(None, kept_agent.id, "kept brief")
+            })
+            .expect("kept message");
+        store
+            .add_comment(&new_comment(kept.id), CommentState::Pending)
+            .expect("kept comment");
+        store.record_merge(kept.id).expect("kept merge");
+
+        store.remove_project(project.id).expect("removed");
+
+        assert_eq!(store.project(project.id).expect("read"), None);
+        assert_eq!(store.task_including_closed(task).expect("read"), None);
+        assert_eq!(rows(&store, "comments"), 1, "the other project keeps it");
+        assert_eq!(rows(&store, "merges"), 2, "both merges still count");
+        assert_eq!(rows(&store, "messages"), 1, "the other project keeps it");
+        assert_eq!(
+            rows(&store, "agents"),
+            1,
+            "the other project keeps its agent"
+        );
+        assert_eq!(rows(&store, "tasks"), 1);
+        assert_eq!(store.list_tasks(other.id).expect("tasks").len(), 1);
+        assert_eq!(
+            store
+                .list_messages(other.id, Some(kept.id), 10)
+                .expect("messages")
+                .len(),
+            1
+        );
+        assert_eq!(store.list_projects().expect("projects"), [other]);
+    }
+
+    #[test]
+    fn the_start_orchestrator_and_its_messages_go_with_the_project() {
+        let (store, task) = store_with_task();
+        let project = store.list_projects().expect("projects")[0].id;
+        store.close_task(task).expect("close");
+        let mut start = new_agent(task);
+        start.task = None;
+        start.role = AgentRole::StartOrchestrator;
+        let start = store.add_agent(&start).expect("start");
+        let note = NewMessage {
+            task: None,
+            ..message(None, start.id, "hello")
+        };
+        store.add_message(&note).expect("message");
+
+        store.remove_project(project).expect("removed");
+
+        assert_eq!(rows(&store, "agents"), 0);
+        assert_eq!(rows(&store, "messages"), 0);
+    }
+
+    #[test]
+    fn the_same_path_added_again_is_a_new_empty_project() {
+        let (store, project, _) = project_with_a_closed_task();
+        store.remove_project(project.id).expect("removed");
+
+        let again = store
+            .add_project(&project.path, &project.name)
+            .expect("added again");
+
+        assert_eq!(
+            store.list_projects().expect("projects"),
+            std::slice::from_ref(&again)
+        );
+        assert!(store.list_tasks(again.id).expect("tasks").is_empty());
+        assert_eq!(store.start_agent(again.id).expect("start"), None);
+        assert_eq!(rows(&store, "agents"), 0);
+    }
+
+    #[test]
+    fn a_merge_stays_counted_and_a_later_task_gets_a_new_id_and_counts_too() {
+        let (store, project, task) = project_with_a_closed_task();
+        store.remove_project(project.id).expect("removed");
+        assert_eq!(store.merge_count().expect("count"), 1);
+
+        let again = store
+            .add_project(&project.path, &project.name)
+            .expect("added again");
+        let later = store.add_task(&new_task(again.id, &[])).expect("task");
+        assert!(later.id > task, "the deleted id is not used again");
+
+        assert!(store.record_merge(later.id).expect("record"));
+        assert_eq!(store.merge_count().expect("count"), 2);
+    }
+
+    #[test]
+    fn a_removal_that_fails_half_way_deletes_nothing() {
+        let (store, project, _) = project_with_a_closed_task();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER refuse_project_delete BEFORE DELETE ON projects
+                 BEGIN SELECT RAISE(ABORT, 'no'); END",
+            )
+            .expect("trigger");
+
+        store.remove_project(project.id).expect_err("failed");
+
+        assert_eq!(rows(&store, "projects"), 1);
+        assert_eq!(rows(&store, "tasks"), 1);
+        assert_eq!(rows(&store, "agents"), 1);
+        assert_eq!(rows(&store, "messages"), 1);
+        assert_eq!(rows(&store, "comments"), 2);
+        assert_eq!(rows(&store, "merges"), 1);
+    }
+
+    /// The migration that makes row ids only grow is the nineteenth.
+    const GROWING_IDS_MIGRATION: usize = 18;
+
+    const GROWING_IDS_TABLES: [&str; 5] = ["projects", "tasks", "agents", "messages", "comments"];
+
+    type Column = (String, String, bool, Option<String>, i64);
+
+    fn columns_of(connection: &Connection, table: &str) -> Vec<Column> {
+        let mut statement = connection
+            .prepare(&format!(
+                "SELECT name, type, \"notnull\", dflt_value, pk
+                 FROM pragma_table_info('{table}') ORDER BY cid"
+            ))
+            .expect("prepare");
+
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .expect("columns")
+            .collect::<rusqlite::Result<_>>()
+            .expect("rows")
+    }
+
+    fn values_of(connection: &Connection, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
+        let mut statement = connection
+            .prepare(&format!("SELECT * FROM {table} ORDER BY id"))
+            .expect("prepare");
+        let width = statement.column_count();
+
+        statement
+            .query_map([], |row| (0..width).map(|index| row.get(index)).collect())
+            .expect("values")
+            .collect::<rusqlite::Result<_>>()
+            .expect("rows")
+    }
+
+    fn top_id(connection: &Connection, table: &str) -> i64 {
+        connection
+            .query_row(&format!("SELECT MAX(id) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .expect("top id")
+    }
+
+    /// Rows with gaps in their ids, in every table the migration rebuilds.
+    fn database_before_growing_ids() -> Connection {
+        let connection = Connection::open_in_memory().expect("connection");
+        for migration in &MIGRATIONS[..GROWING_IDS_MIGRATION] {
+            connection.execute_batch(migration).expect("old schema");
+        }
+        connection
+            .pragma_update(
+                None,
+                "user_version",
+                i64::try_from(GROWING_IDS_MIGRATION).expect("count"),
+            )
+            .expect("version");
+        connection
+            .execute_batch(
+                "INSERT INTO projects (id, path, name, added_at)
+                     VALUES (1, '/one', 'one', 10), (3, '/three', 'three', 30);
+                 INSERT INTO tasks (id, project, name, branch, base, worktree, ports,
+                     setup_terminal, created_at, setup_exit, briefed, created_by, approved,
+                     closed_at, closing_at, pr_number, pr_url, close_after_merge, pr_head,
+                     pr_base, merge_requested_pr)
+                     VALUES
+                     (2, 1, 'old', 'swarm/old', 'main', '/one/.worktrees/old', '5170,5171',
+                      7, 20, 'exit', 1, 4, -5, 25, 24, 12, 'https://example.test/12', 1,
+                      'abc123', 'develop', 12),
+                     (6, 3, 'newer', 'swarm/newer', 'main', '/three/.worktrees/newer', '',
+                      NULL, 60, NULL, 0, NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, NULL,
+                      NULL);
+                 INSERT INTO agents (id, project, task, role, kind, model, session_id,
+                     terminal, status, message, lifecycle, revision, session_confirmed,
+                     created_at, name, worktree, branch, ports, ended_at, base_commit,
+                     started_at)
+                     VALUES
+                     (4, 1, 2, 'orchestrator', 'claude', 'opus', 'session', 8, 'idle', 'hi',
+                      'running', 3, 1, 21000, 'orchestrator', '/one/.worktrees/old',
+                      'swarm/old', '5170', 22000, 'def456', 21500),
+                     (9, 3, NULL, 'start', 'claude', 'opus', NULL, NULL, 'unknown', NULL,
+                      'starting', 0, 0, 61000, 'start', '/three', 'main', '', NULL, NULL,
+                      NULL);
+                 INSERT INTO messages (id, project, task, from_agent, to_agent, kind, text,
+                     sent_at, delivered_at)
+                     VALUES
+                     (5, 1, 2, NULL, 4, 'report', 'done', 23000, 23500),
+                     (8, 3, NULL, 9, 9, 'report', 'unread', 62000, NULL);
+                 INSERT INTO comments (id, task, parent, source, worktree, path, side, line,
+                     anchor_text, before_text, after_text, body, state, to_agent, outdated,
+                     created_at, sent_at, message)
+                     VALUES
+                     (3, 2, NULL, 'live', x'2f6f6e65', x'6170692e747874', 'new', 4, 'one',
+                      NULL, 'two', 'Cache it.', 'sent', 4, 0, 24000, 24500, 5),
+                     (11, 2, 3, 'live', x'2f6f6e65', x'6170692e747874', 'new', 4, 'one',
+                      'zero', NULL, 'Done.', 'pending', NULL, 1, 25000, NULL, NULL)",
+            )
+            .expect("old rows");
+
+        connection
+    }
+
+    #[test]
+    fn a_database_from_before_growing_ids_keeps_every_row_column_and_index() {
+        let connection = database_before_growing_ids();
+        let columns: Vec<_> = GROWING_IDS_TABLES
+            .iter()
+            .map(|table| columns_of(&connection, table))
+            .collect();
+        let values: Vec<_> = GROWING_IDS_TABLES
+            .iter()
+            .map(|table| values_of(&connection, table))
+            .collect();
+
+        let store = Store::migrated(connection).expect("migrated");
+
+        for (index, table) in GROWING_IDS_TABLES.iter().enumerate() {
+            assert_eq!(
+                columns_of(&store.connection, table),
+                columns[index],
+                "the columns of {table}"
+            );
+            assert_eq!(
+                values_of(&store.connection, table),
+                values[index],
+                "the rows of {table}"
+            );
+            let sql: String = store
+                .connection
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .expect("table sql");
+            assert!(sql.contains("AUTOINCREMENT"), "{table}: {sql}");
+        }
+
+        let names = |kind: &str| -> Vec<String> {
+            let mut statement = store
+                .connection
+                .prepare("SELECT name FROM sqlite_master WHERE type = ?1 ORDER BY name")
+                .expect("prepare");
+
+            statement
+                .query_map(params![kind], |row| row.get(0))
+                .expect("names")
+                .collect::<rusqlite::Result<_>>()
+                .expect("rows")
+        };
+        assert!(
+            names("table")
+                .iter()
+                .all(|name| !name.ends_with("_rebuilt")),
+            "{:?}",
+            names("table")
+        );
+        assert_eq!(
+            names("index")
+                .into_iter()
+                .filter(|name| !name.starts_with("sqlite_"))
+                .collect::<Vec<_>>(),
+            ["comments_task", "messages_unread"]
+        );
+
+        let parents = |table: &str| -> Vec<String> {
+            let mut statement = store
+                .connection
+                .prepare(&format!(
+                    "SELECT \"table\" FROM pragma_foreign_key_list('{table}') ORDER BY \"table\""
+                ))
+                .expect("prepare");
+
+            statement
+                .query_map([], |row| row.get(0))
+                .expect("parents")
+                .collect::<rusqlite::Result<_>>()
+                .expect("rows")
+        };
+        assert_eq!(parents("tasks"), ["projects"]);
+        assert_eq!(parents("agents"), ["projects", "tasks"]);
+        assert_eq!(parents("messages"), ["projects", "tasks"]);
+        assert_eq!(parents("comments"), ["comments", "tasks"]);
+        let broken: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .expect("check");
+        assert_eq!(broken, 0);
+    }
+
+    #[test]
+    fn after_the_migration_an_id_above_every_old_row_is_used_even_when_the_top_row_goes() {
+        let connection = database_before_growing_ids();
+        let tops: Vec<i64> = GROWING_IDS_TABLES
+            .iter()
+            .map(|table| top_id(&connection, table))
+            .collect();
+        assert_eq!(tops, [3, 6, 9, 8, 11]);
+        let store = Store::migrated(connection).expect("migrated");
+
+        store
+            .connection
+            .execute_batch(
+                "DELETE FROM comments WHERE id = 11;
+                 DELETE FROM messages WHERE id = 8;
+                 DELETE FROM agents WHERE id = 9;
+                 DELETE FROM tasks WHERE id = 6;
+                 DELETE FROM projects WHERE id = 3",
+            )
+            .expect("delete the top rows");
+
+        let project = store
+            .add_project(Path::new("/four"), "four")
+            .expect("project");
+        let task = store.add_task(&new_task(project.id, &[])).expect("task");
+        let agent = store
+            .add_agent(&NewAgent {
+                project: project.id,
+                ..new_agent(task.id)
+            })
+            .expect("agent");
+        let sent = store
+            .add_message(&NewMessage {
+                project: project.id,
+                task: Some(task.id),
+                ..message(None, agent.id, "new")
+            })
+            .expect("message");
+        let comment = store
+            .add_comment(&new_comment(task.id), CommentState::Pending)
+            .expect("comment");
+
+        assert_eq!(
+            [project.id.0, task.id.0, agent.id.0, sent.id.0, comment.id.0],
+            [4, 7, 10, 9, 12]
+        );
+    }
+
+    #[test]
+    fn a_removed_project_leaves_its_ids_unused_in_every_table() {
+        let (store, project, task) = project_with_a_closed_task();
+        let tops: Vec<i64> = GROWING_IDS_TABLES
+            .iter()
+            .map(|table| top_id(&store.connection, table))
+            .collect();
+
+        store.remove_project(project.id).expect("removed");
+        let again = store
+            .add_project(&project.path, &project.name)
+            .expect("added again");
+        let later = store.add_task(&new_task(again.id, &[])).expect("task");
+        let agent = store
+            .add_agent(&NewAgent {
+                project: again.id,
+                ..new_agent(later.id)
+            })
+            .expect("agent");
+        let sent = store
+            .add_message(&NewMessage {
+                project: again.id,
+                task: Some(later.id),
+                ..message(None, agent.id, "again")
+            })
+            .expect("message");
+        let comment = store
+            .add_comment(&new_comment(later.id), CommentState::Pending)
+            .expect("comment");
+
+        assert_eq!(task.0, tops[1].unsigned_abs());
+        let ids = [again.id.0, later.id.0, agent.id.0, sent.id.0, comment.id.0];
+        for ((table, top), id) in GROWING_IDS_TABLES.iter().zip(tops).zip(ids) {
+            assert!(id > top.unsigned_abs(), "{table}: {id} is not above {top}");
+        }
     }
 }

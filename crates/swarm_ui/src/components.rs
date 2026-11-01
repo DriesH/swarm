@@ -3,6 +3,7 @@ mod button;
 mod check_row;
 mod checkbox;
 mod confirm_row;
+mod context_menu;
 mod dialog;
 mod dropdown;
 mod file_icon;
@@ -41,6 +42,7 @@ pub use button::*;
 pub use check_row::*;
 pub use checkbox::*;
 pub use confirm_row::*;
+pub use context_menu::*;
 pub use dialog::*;
 pub use dropdown::*;
 pub use file_icon::*;
@@ -96,6 +98,7 @@ pub fn all_components() -> Vec<ComponentEntry> {
         ComponentEntry::of::<ResizeHandle>(),
         ComponentEntry::of::<Menu>(),
         ComponentEntry::of::<PopoverMenu>(),
+        ComponentEntry::of::<ContextMenu>(),
         ComponentEntry::of::<Dropdown>(),
         ComponentEntry::of::<StatusPill>(),
         ComponentEntry::of::<Tag>(),

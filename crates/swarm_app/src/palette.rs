@@ -19,6 +19,7 @@ use crate::close_task::CloseTaskDialog;
 use crate::model::{AgentKind, FakeData, ProjectId, TaskId, TaskStatus, TerminalId};
 use crate::new_task::NewTaskDialog;
 use crate::pull_request::AnywayDialog;
+use crate::remove_project::RemoveProjectDialog;
 use crate::review_view::ReviewView;
 use crate::workspace::{View, Workspace};
 
@@ -664,6 +665,10 @@ pub(crate) enum Overlay {
         view: Entity<AnywayDialog>,
         _subscription: Subscription,
     },
+    RemoveProject {
+        view: Entity<RemoveProjectDialog>,
+        _subscription: Subscription,
+    },
 }
 
 impl Overlay {
@@ -673,6 +678,7 @@ impl Overlay {
             Self::NewTask { view, .. } => view.clone().into_any_element(),
             Self::CloseTask { view, .. } => view.clone().into_any_element(),
             Self::CreateAnyway { view, .. } => view.clone().into_any_element(),
+            Self::RemoveProject { view, .. } => view.clone().into_any_element(),
         }
     }
 }

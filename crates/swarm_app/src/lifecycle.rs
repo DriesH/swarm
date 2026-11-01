@@ -5,7 +5,7 @@
 //! back. **Open Swarm**, a Dock click and a second launch open a new window on the same
 //! workspace and bring the Dock icon back.
 
-use gpui::{ActivationPolicy, App, Entity, Global, QuitMode, WindowId};
+use gpui::{ActivationPolicy, AnyWindowHandle, App, Entity, Global, QuitMode, WindowId};
 
 use crate::workspace::Workspace;
 
@@ -98,6 +98,21 @@ pub(crate) fn show_main_window(cx: &mut App) {
             leave_dock(cx);
         }
     }
+}
+
+/// The workspace the lifecycle holds. `None` before the app started.
+pub(crate) fn workspace(cx: &App) -> Option<Entity<Workspace>> {
+    cx.try_global::<Lifecycle>()
+        .map(|lifecycle| lifecycle.workspace.clone())
+}
+
+/// Like [`show_main_window`], and returns the window. `None` before the app started.
+pub(crate) fn reveal_main_window(cx: &mut App) -> Option<AnyWindowHandle> {
+    let workspace = workspace(cx)?;
+
+    show_main_window(cx);
+
+    workspace.read(cx).window
 }
 
 /// Brings the app to the front after the current update. Activating calls back into GPUI,

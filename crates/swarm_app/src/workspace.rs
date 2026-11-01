@@ -12,9 +12,9 @@ use swarm_ui::fonts::UI_FONT;
 use swarm_ui::prelude::*;
 
 use crate::actions::{
-    CreatePullRequest, FocusAgent, NewTask, NewTerminal, OpenSettings, PlanWithOrchestrator,
-    SetUpGithub, ShowReview, ShowSwarm, ShowTerminals, ToggleChanges, ToggleCommandPalette,
-    ToggleFiles,
+    About, AddProject, CloseTask, CreatePullRequest, FocusAgent, NewTask, NewTerminal,
+    OpenSettings, PlanWithOrchestrator, SetUpGithub, ShowReview, ShowSwarm, ShowTerminals,
+    ToggleChanges, ToggleCommandPalette, ToggleFiles, ToggleSidebar,
 };
 use crate::daemon::DiffPoll;
 use crate::daemon::{DaemonLaunch, LiveTerminal};
@@ -25,6 +25,7 @@ use crate::palette::Overlay;
 use crate::panels::ChangesList;
 use crate::pull_request::PullRequests;
 use crate::review_view::ReviewView;
+use crate::settings::Page;
 use crate::swarm_view::{
     Clicked, DotGrid, INSPECTOR_WIDTH, InspectorTab, MessageThread, TerminalPreview,
 };
@@ -83,11 +84,16 @@ pub(crate) struct Workspace {
     pub active_task: TaskId,
     pub view: View,
     pub right_panel: Option<RightPanel>,
+    pub(crate) sidebar_visible: bool,
+    /// Tracks focus inside the sidebar, so hiding it can take focus back.
+    pub(crate) sidebar_focus: FocusHandle,
     pub minimized: HashSet<TerminalId>,
     pub focused_terminal: Option<TerminalId>,
     focus_handle: FocusHandle,
     pending_focus: Option<TerminalId>,
     pub(crate) terminal_focus: HashMap<TerminalId, FocusHandle>,
+    /// The focus of each project row in the sidebar.
+    pub(crate) project_focus: HashMap<ProjectId, FocusHandle>,
     pub(crate) overlay: Option<Overlay>,
     pub(crate) terminal_area: Option<Bounds<Pixels>>,
     /// True when the right panel was shown as `terminal_area` was measured.
@@ -156,6 +162,7 @@ pub(crate) struct Workspace {
     _activation_subscription: Subscription,
     /// Reads Reduce Motion again each time the window becomes active.
     _motion_subscription: Subscription,
+    _focus_lost_subscription: Subscription,
     pub(crate) swarm_clock: Option<gpui::Task<()>>,
     /// Refreshes the usage card's time text. Runs only while the card shows a time.
     pub(crate) usage_clock: Option<gpui::Task<()>>,
@@ -246,10 +253,7 @@ impl Workspace {
             this.sync_changes_list(cx);
         });
         let workspace = cx.weak_entity();
-        let review = cx.new({
-            let workspace = workspace.clone();
-            |cx| ReviewView::new(workspace, cx)
-        });
+        let review = cx.new(|cx| ReviewView::new(workspace.clone(), cx));
         let changes_list = cx.new(|cx| ChangesList::new(workspace, cx));
         let preview = cx.new(|_| TerminalPreview::new());
         let preview_subscription = cx.subscribe(&preview, |this, _, _: &Clicked, cx| {
@@ -263,11 +267,14 @@ impl Workspace {
             active_task,
             view: View::Terminals,
             right_panel: Some(RightPanel::Changes),
+            sidebar_visible: true,
+            sidebar_focus: cx.focus_handle(),
             minimized: HashSet::new(),
             focused_terminal,
             focus_handle,
             pending_focus: None,
             terminal_focus: HashMap::new(),
+            project_focus: HashMap::new(),
             overlay: None,
             terminal_area: None,
             terminal_area_had_panel: false,
@@ -313,6 +320,7 @@ impl Workspace {
             polled_task: None,
             _activation_subscription: activation_subscription,
             _motion_subscription: motion_subscription,
+            _focus_lost_subscription: Self::restore_focus_when_lost(window, cx),
             swarm_clock: None,
             usage_clock: None,
             review,
@@ -344,6 +352,22 @@ impl Workspace {
         workspace
     }
 
+    /// Gives focus back when it is lost: to the sidebar when the focused element of it went,
+    /// and to the workspace when nothing has focus at all. Without it, Tab and the shortcuts
+    /// would do nothing. A focus that waits for its element to show, as in a dialog or in
+    /// Review, is left alone.
+    fn restore_focus_when_lost(window: &mut Window, cx: &mut Context<Self>) -> Subscription {
+        cx.on_focus_lost(window, |this, window, cx| {
+            let target = match window.focus_lost_restore_target(cx) {
+                Some(parent) if parent == this.sidebar_focus => parent,
+                _ if window.focused(cx).is_none() => this.focus_handle.clone(),
+                _ => return,
+            };
+
+            window.focus(&target, cx);
+        })
+    }
+
     fn observe_activation(window: &mut Window, cx: &mut Context<Self>) -> Subscription {
         cx.observe_window_activation(window, |this, window, cx| {
             #[cfg(test)]
@@ -370,6 +394,7 @@ impl Workspace {
         self.window = Some(window.window_handle());
         self._activation_subscription = Self::observe_activation(window, cx);
         self._motion_subscription = swarm_ui::motion::follow_reduce_motion(window, cx);
+        self._focus_lost_subscription = Self::restore_focus_when_lost(window, cx);
         self.pending_focus = self.focused_terminal;
         window.focus(&self.focus_handle, cx);
         self.reattach_terminals(cx);
@@ -490,6 +515,29 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Shows the sidebar, or hides it when it shows. Focus inside a hidden sidebar goes to the
+    /// workspace.
+    pub(crate) fn toggle_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sidebar_visible && self.sidebar_focus.contains_focused(window, cx) {
+            window.focus(&self.focus_handle, cx);
+        }
+
+        self.sidebar_visible = !self.sidebar_visible;
+
+        cx.notify();
+    }
+
+    /// Opens the settings window, or focuses it. `page` is the page to show.
+    pub(crate) fn open_settings(&self, page: Option<Page>, cx: &mut Context<Self>) {
+        crate::settings::open(
+            self.settings_path.clone(),
+            self.data.projects.clone(),
+            cx.weak_entity(),
+            page,
+            cx,
+        );
+    }
+
     /// Opens the panel, or closes it when it is already open.
     pub(crate) fn toggle_panel(&mut self, panel: RightPanel, cx: &mut Context<Self>) {
         if panel == RightPanel::Changes && self.view == View::Review {
@@ -536,6 +584,15 @@ impl Workspace {
             .entry(terminal)
             .or_insert_with(|| cx.focus_handle().tab_stop(true))
             .clone()
+    }
+
+    /// Makes the focus handle of each project row. They are tab stops, like the rows.
+    fn ensure_project_focus(&mut self, cx: &mut Context<Self>) {
+        for project in &self.data.projects {
+            self.project_focus
+                .entry(project.id)
+                .or_insert_with(|| cx.focus_handle().tab_stop(true));
+        }
     }
 
     fn ensure_focus_handles(&mut self, cx: &mut Context<Self>) {
@@ -711,14 +768,20 @@ impl Workspace {
                 .on_action(cx.listener(|this, _: &NewTerminal, window, cx| {
                     this.new_user_terminal(window, cx);
                 }))
-                .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
-                    crate::settings::open(
-                        this.settings_path.clone(),
-                        this.data.projects.clone(),
-                        cx.weak_entity(),
-                        window,
-                        cx,
-                    );
+                .on_action(cx.listener(|_, _: &AddProject, window, cx| {
+                    Self::pick_project(window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &CloseTask, window, cx| {
+                    this.open_close_task(this.active_task, window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| {
+                    this.toggle_sidebar(window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &OpenSettings, _, cx| {
+                    this.open_settings(None, cx);
+                }))
+                .on_action(cx.listener(|this, _: &About, _, cx| {
+                    this.open_settings(Some(Page::General), cx);
                 }))
                 .on_action(cx.listener(|this, _: &ToggleCommandPalette, window, cx| {
                     this.toggle_palette(window, cx);
@@ -799,6 +862,7 @@ impl Render for Workspace {
         self.apply_pending_review_focus(window, cx);
         self.apply_pending_pr_focus(window, cx);
         self.ensure_focus_handles(cx);
+        self.ensure_project_focus(cx);
 
         if self.view == View::Swarm {
             self.ensure_swarm_handles(cx);
@@ -817,7 +881,9 @@ impl Render for Workspace {
                 .into_any_element();
         }
 
-        let sidebar = sidebar::render(self, window, cx);
+        let sidebar = self
+            .sidebar_visible
+            .then(|| sidebar::render(self, window, cx));
         let tab_bar = tab_bar::render(self, window, cx);
         let views = views::render(self, window, cx);
         let status_bar = status_bar::render(self, window, cx);
@@ -842,7 +908,7 @@ impl Render for Workspace {
 
         let root = self.root(cx);
 
-        root.child(
+        root.children(sidebar.map(|sidebar| {
             div()
                 .w(px(248.))
                 .flex_none()
@@ -850,14 +916,14 @@ impl Render for Workspace {
                 .pt(HEADER_CENTER - sidebar::WINDOW_ROW_HEIGHT / 2.)
                 .px(px(8.))
                 .pb(px(10.))
-                .child(sidebar),
-        )
+                .child(sidebar)
+        }))
         .child(
             v_flex()
                 .flex_1()
                 .min_w_0()
                 .m(px(PANEL_MARGIN))
-                .ml_0()
+                .when(self.sidebar_visible, Styled::ml_0)
                 .bg(panel)
                 .border_1()
                 .border_color(line)
@@ -1179,5 +1245,61 @@ mod tests {
         let panel = workspace.read_with(cx, |workspace, _| workspace.visible_panel());
 
         assert_eq!(panel, Some(RightPanel::PullRequest));
+    }
+
+    fn nothing_has_focus(cx: &mut VisualTestContext) -> bool {
+        cx.update(|window, cx| window.focused(cx).is_none())
+    }
+
+    #[gpui::test]
+    fn after_the_toggle_button_hides_the_sidebar_the_keys_and_actions_still_work(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = setup(cx);
+        redraw(cx);
+        let button = cx
+            .debug_bounds("toggle-sidebar")
+            .expect("the sidebar button is on screen");
+
+        cx.simulate_click(button.center(), gpui::Modifiers::none());
+        redraw(cx);
+        let hidden = workspace.read_with(cx, |workspace, _| !workspace.sidebar_visible);
+        let focus_lost = nothing_has_focus(cx);
+
+        cx.simulate_keystrokes("cmd-k");
+        redraw(cx);
+        let palette = workspace.read_with(cx, |workspace, _| workspace.overlay.is_some());
+        cx.simulate_keystrokes("escape");
+        cx.dispatch_action(ToggleSidebar);
+        redraw(cx);
+
+        assert!(hidden);
+        assert!(!focus_lost, "nothing has focus after the sidebar went");
+        assert!(palette, "Cmd-K does nothing");
+        assert!(workspace.read_with(cx, |workspace, _| workspace.sidebar_visible));
+    }
+
+    #[gpui::test]
+    fn focus_goes_to_the_workspace_when_the_focused_row_leaves_the_window(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        redraw(cx);
+        let row = workspace
+            .read_with(cx, |workspace, _| {
+                workspace.project_focus.get(&ProjectId(3)).cloned()
+            })
+            .expect("the project has a row");
+        cx.update(|window, cx| window.focus(&row, cx));
+        redraw(cx);
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.project_removed(ProjectId(3), cx);
+        });
+        redraw(cx);
+        redraw(cx);
+
+        cx.simulate_keystrokes("cmd-k");
+        redraw(cx);
+        let palette = workspace.read_with(cx, |workspace, _| workspace.overlay.is_some());
+        assert!(palette, "Cmd-K does nothing after the focused row went");
     }
 }
