@@ -792,13 +792,15 @@ impl SettingsWindow {
         let state = self.state.clone();
 
         cx.spawn(async move |this, cx| {
-            let Ok(permission) = answers.recv_async().await else {
+            let Ok(authorization) = answers.recv_async().await else {
                 return;
             };
 
+            cx.update(|cx| notifications::remember(authorization, cx));
+
             let shown = this.update(cx, |_, cx| {
                 state.update(cx, |state, cx| {
-                    state.permission = Some(permission);
+                    state.permission = Some(authorization.permission);
                     cx.notify();
                 });
             });
@@ -1243,8 +1245,8 @@ mod tests {
     use gpui::{Focusable, TestAppContext};
 
     use super::*;
-    use crate::notifications::Delivery;
-    use crate::notifications::harness::Recorder;
+    use crate::notifications::harness::{Recorder, known_authorization};
+    use crate::notifications::{Authorization, Delivery};
 
     fn setup(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -1699,6 +1701,39 @@ mod tests {
         std::fs::remove_file(&path).ok();
         assert_eq!(before, Some(Permission::NotAllowed));
         assert_eq!(after, Some(Permission::Allowed));
+    }
+
+    #[gpui::test]
+    fn the_answer_of_macos_is_kept_when_the_page_opens_and_when_the_window_comes_back(
+        cx: &mut TestAppContext,
+    ) {
+        let path = temp_path("permission-kept");
+        let (_state, recorder, mut visual) =
+            notifications_page(&path, None, Permission::NotAllowed, cx);
+        let opened = known_authorization(&visual);
+
+        recorder.permission.set(Permission::Allowed);
+        recorder.sound_enabled.set(false);
+        visual.deactivate_window();
+        visual.update(|window, _| window.activate_window());
+        visual.run_until_parked();
+
+        let back = known_authorization(&visual);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(
+            opened,
+            Some(Authorization {
+                permission: Permission::NotAllowed,
+                sound: true,
+            })
+        );
+        assert_eq!(
+            back,
+            Some(Authorization {
+                permission: Permission::Allowed,
+                sound: false,
+            })
+        );
     }
 
     #[gpui::test]

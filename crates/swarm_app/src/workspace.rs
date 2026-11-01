@@ -329,6 +329,10 @@ impl Workspace {
 
             this.sync_swarm_tasks(window.is_window_active(), cx);
             this.sync_usage_clock(window.is_window_active(), cx);
+
+            if window.is_window_active() {
+                crate::notifications::refresh_authorization(cx);
+            }
         })
     }
 

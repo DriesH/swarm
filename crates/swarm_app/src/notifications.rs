@@ -50,6 +50,26 @@ impl Permission {
     }
 }
 
+/// What macOS last said about the app's notifications.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Authorization {
+    pub permission: Permission,
+    /// The app's own "play sound" setting in System Settings is on.
+    pub sound: bool,
+}
+
+impl Authorization {
+    pub(crate) const UNAVAILABLE: Self = Self {
+        permission: Permission::Unavailable,
+        sound: false,
+    };
+
+    /// macOS shows the notifications and lets them play a sound.
+    fn allows_sound(self) -> bool {
+        self.permission == Permission::Allowed && self.sound
+    }
+}
+
 /// Everything a notification needs from outside the app.
 pub(crate) trait Delivery {
     fn post(&self, notification: SystemNotification, cx: &App);
@@ -60,7 +80,7 @@ pub(crate) trait Delivery {
     fn bounce(&self, window: &Window);
 
     /// Asks macOS for the authorization. The answer may come from any thread.
-    fn read_permission(&self, answer: flume::Sender<Permission>);
+    fn read_permission(&self, answer: flume::Sender<Authorization>);
 }
 
 /// The real thing: GPUI posts, `AppKit` plays and reads.
@@ -80,12 +100,12 @@ impl Delivery for SystemDelivery {
         window.request_attention();
     }
 
-    fn read_permission(&self, answer: flume::Sender<Permission>) {
+    fn read_permission(&self, answer: flume::Sender<Authorization>) {
         #[cfg(target_os = "macos")]
         appkit::read_permission(answer);
 
         #[cfg(not(target_os = "macos"))]
-        if answer.send(Permission::Unavailable).is_err() {
+        if answer.send(Authorization::UNAVAILABLE).is_err() {
             log::debug!("nobody waits for the notification permission");
         }
     }
@@ -103,27 +123,71 @@ impl Delivery for SampleDelivery {
 
     fn bounce(&self, _window: &Window) {}
 
-    fn read_permission(&self, answer: flume::Sender<Permission>) {
-        if answer.send(self.0).is_err() {
+    fn read_permission(&self, answer: flume::Sender<Authorization>) {
+        let authorization = Authorization {
+            permission: self.0,
+            sound: true,
+        };
+
+        if answer.send(authorization).is_err() {
             log::debug!("nobody waits for the notification permission");
         }
     }
 }
 
 /// How the app reaches macOS. The system's, unless a test or a snapshot set another.
-struct Outside(Rc<dyn Delivery>);
+struct Outside {
+    delivery: Rc<dyn Delivery>,
+    /// The last answer of macOS, which is none until the first one comes.
+    authorization: Option<Authorization>,
+}
 
 impl Global for Outside {}
 
 pub(crate) fn use_delivery(delivery: Rc<dyn Delivery>, cx: &mut App) {
-    cx.set_global(Outside(delivery));
+    cx.set_global(Outside {
+        delivery,
+        authorization: None,
+    });
 }
 
 fn delivery(cx: &App) -> Rc<dyn Delivery> {
     match cx.try_global::<Outside>() {
-        Some(outside) => Rc::clone(&outside.0),
+        Some(outside) => Rc::clone(&outside.delivery),
         None => Rc::new(SystemDelivery),
     }
+}
+
+/// macOS shows the notifications and lets them play a sound. An answer that did not come
+/// yet counts as no.
+fn sound_is_allowed(cx: &App) -> bool {
+    cx.try_global::<Outside>()
+        .and_then(|outside| outside.authorization)
+        .is_some_and(Authorization::allows_sound)
+}
+
+/// Keeps the answer of macOS for the sound.
+pub(crate) fn remember(authorization: Authorization, cx: &mut App) {
+    if cx.has_global::<Outside>() {
+        cx.global_mut::<Outside>().authorization = Some(authorization);
+    }
+}
+
+/// Asks macOS again what the app may do, and keeps the answer. The app does this at
+/// start and whenever it becomes active, as the user may change it in System Settings.
+pub(crate) fn refresh_authorization(cx: &mut App) {
+    if !cx.has_global::<Outside>() {
+        return;
+    }
+
+    let answers = check_permission(cx);
+
+    cx.spawn(async move |cx| {
+        if let Ok(authorization) = answers.recv_async().await {
+            cx.update(|cx| remember(authorization, cx));
+        }
+    })
+    .detach();
 }
 
 struct Notifier {
@@ -146,6 +210,7 @@ fn start(workspace: Entity<Workspace>, cx: &mut App) {
         last: HashMap::new(),
     });
     cx.on_system_notification_response(respond);
+    refresh_authorization(cx);
 }
 
 /// Where a notice is about, in the words of the user.
@@ -291,7 +356,7 @@ impl Workspace {
         );
         cx.global_mut::<Notifier>().last.insert(tag, notice.clone());
 
-        if post.sound {
+        if post.sound && sound_is_allowed(cx) {
             delivery.play_sound();
         }
 
@@ -357,8 +422,8 @@ impl Workspace {
 
         match (task, project) {
             (Some(task), _) => self.select_task(task, cx),
-            (None, Some(project)) => self.select_project(project, cx),
-            (None, None) => return,
+            (None, Some(project)) if notice.task.is_none() => self.select_project(project, cx),
+            (None, _) => return,
         }
 
         if notice.kind == NoticeKind::ReadyForReview {
@@ -408,14 +473,14 @@ pub(crate) fn send_test(cx: &mut App) {
         cx,
     );
 
-    if crate::settings::notifications(cx).sound {
+    if crate::settings::notifications(cx).sound && sound_is_allowed(cx) {
         delivery.play_sound();
     }
 }
 
 /// Asks macOS what the app may do. The answer reaches `answer` later, and the receiver
 /// is read on the GPUI thread.
-pub(crate) fn check_permission(cx: &App) -> flume::Receiver<Permission> {
+pub(crate) fn check_permission(cx: &App) -> flume::Receiver<Authorization> {
     let (answer, answers) = flume::bounded(1);
 
     delivery(cx).read_permission(answer);
@@ -441,6 +506,10 @@ pub(crate) mod harness {
         pub sounds: Cell<usize>,
         pub bounces: Cell<usize>,
         pub permission: Cell<Permission>,
+        /// The app's "play sound" setting in System Settings.
+        pub sound_enabled: Cell<bool>,
+        /// False while macOS has not answered: the question stays open.
+        pub answers: Cell<bool>,
     }
 
     impl Recorder {
@@ -450,6 +519,8 @@ pub(crate) mod harness {
                 sounds: Cell::new(0),
                 bounces: Cell::new(0),
                 permission: Cell::new(permission),
+                sound_enabled: Cell::new(true),
+                answers: Cell::new(true),
             })
         }
 
@@ -479,8 +550,17 @@ pub(crate) mod harness {
             self.bounces.set(self.bounces.get() + 1);
         }
 
-        fn read_permission(&self, answer: flume::Sender<Permission>) {
-            assert!(answer.send(self.permission.get()).is_ok());
+        fn read_permission(&self, answer: flume::Sender<Authorization>) {
+            if !self.answers.get() {
+                return;
+            }
+
+            let authorization = Authorization {
+                permission: self.permission.get(),
+                sound: self.sound_enabled.get(),
+            };
+
+            assert!(answer.send(authorization).is_ok());
         }
     }
 
@@ -488,18 +568,21 @@ pub(crate) mod harness {
     /// in place of macOS.
     pub(crate) fn install(
         workspace: &Entity<Workspace>,
-        permission: Permission,
+        recorder: &Rc<Recorder>,
         cx: &mut VisualTestContext,
-    ) -> Rc<Recorder> {
-        let recorder = Recorder::new(permission);
-        let delivery: Rc<dyn Delivery> = Rc::clone(&recorder) as Rc<dyn Delivery>;
+    ) {
+        let delivery: Rc<dyn Delivery> = Rc::clone(recorder) as Rc<dyn Delivery>;
 
         cx.update(|_, cx| {
             use_delivery(delivery, cx);
             start(workspace.clone(), cx);
         });
+        cx.run_until_parked();
+    }
 
-        recorder
+    /// What macOS last said, as far as the app knows.
+    pub(crate) fn known_authorization(cx: &VisualTestContext) -> Option<Authorization> {
+        cx.read_global(|outside: &Outside, _| outside.authorization)
     }
 
     /// The notice a click on `tag` would open.
@@ -515,7 +598,7 @@ mod tests {
         AgentId, AgentInfo, AgentRole, AgentStatus as DaemonAgentStatus, Client, ProjectId, TaskId,
     };
 
-    use super::harness::{Recorder, install, remembered};
+    use super::harness::{Recorder, install, known_authorization, remembered};
     use super::*;
     use crate::daemon::tests::{
         agent_info, fake_daemon_sending, project_info, send_notice, setup, start_agent, task_info,
@@ -822,6 +905,15 @@ mod tests {
     /// Task 7 "login" has the orchestrator 1 and the worker 2. Task 8 "signup" has the
     /// orchestrator 3. The user has task 7 open.
     fn rig(notices: Vec<Notice>, cx: &mut TestAppContext) -> (Rig, &mut VisualTestContext) {
+        rig_with(notices, Recorder::new(Permission::Allowed), cx)
+    }
+
+    /// Like [`rig`], with the recorder that plays macOS.
+    fn rig_with(
+        notices: Vec<Notice>,
+        recorder: Rc<Recorder>,
+        cx: &mut TestAppContext,
+    ) -> (Rig, &mut VisualTestContext) {
         let socket = fake_daemon_sending(notices);
         let (workspace, cx) = setup(cx);
         cx.executor().allow_parking();
@@ -839,7 +931,7 @@ mod tests {
             workspace.use_daemon(client.clone(), &[], window, cx);
         });
         menu_bar::install(&workspace, cx);
-        let recorder = install(&workspace, Permission::Allowed, cx);
+        install(&workspace, &recorder, cx);
 
         let worker = AgentInfo {
             role: AgentRole::Worker,
@@ -1034,9 +1126,29 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_project_that_is_off_posts_nothing(cx: &mut TestAppContext) {
-        let notices = vec![sent(NoticeKind::Broke, Some(8), 3, "Exited with code 1")];
+    fn a_project_that_is_off_posts_nothing_while_another_project_still_posts(
+        cx: &mut TestAppContext,
+    ) {
+        let notices = vec![
+            sent(NoticeKind::Broke, Some(8), 3, "Exited with code 1"),
+            Notice {
+                project: ProjectId(6),
+                ..sent(NoticeKind::Broke, Some(9), 4, "Exited with code 2")
+            },
+        ];
         let (rig, cx) = rig(notices, cx);
+        use_projects(
+            &rig.workspace,
+            &[
+                project_info(
+                    5,
+                    "demo",
+                    vec![task_info(7, 5, "login"), task_info(8, 5, "signup")],
+                ),
+                project_info(6, "other", vec![task_info(9, 6, "billing")]),
+            ],
+            cx,
+        );
         cx.update(|_, cx| {
             crate::settings::change_notifications(
                 |n| n.set_mode(std::path::Path::new("/tmp/demo"), ProjectMode::Off),
@@ -1044,11 +1156,10 @@ mod tests {
             );
         });
 
-        let posted = deliver(&rig, &[0], 1, cx);
-        let still_none = rig.recorder.posted().is_empty();
+        let posted = deliver(&rig, &[0, 1], 1, cx);
 
-        assert!(!posted);
-        assert!(still_none);
+        assert!(posted, "the notice of the other project never arrived");
+        assert_eq!(rig.recorder.tags(), ["task-9"]);
     }
 
     #[gpui::test]
@@ -1078,6 +1189,83 @@ mod tests {
         deliver(&rig, &[1], 2, cx);
 
         assert_eq!(quiet, 0);
+        assert_eq!(rig.recorder.sounds.get(), 1);
+    }
+
+    #[gpui::test]
+    fn no_sound_plays_before_macos_answered(cx: &mut TestAppContext) {
+        let notices = vec![
+            sent(NoticeKind::Prompt, Some(8), 3, "first"),
+            sent(NoticeKind::Prompt, Some(8), 3, "second"),
+        ];
+        let recorder = Recorder::new(Permission::Allowed);
+        recorder.answers.set(false);
+        let (rig, cx) = rig_with(notices, recorder, cx);
+        cx.update(|_, cx| crate::settings::change_notifications(|n| n.sound = true, cx));
+
+        deliver(&rig, &[0], 1, cx);
+        let unknown = (known_authorization(cx), rig.recorder.sounds.get());
+        rig.recorder.answers.set(true);
+        look_at_the_window(cx);
+        deliver(&rig, &[1], 2, cx);
+
+        assert_eq!(unknown, (None, 0));
+        assert_eq!(rig.recorder.sounds.get(), 1);
+    }
+
+    #[gpui::test]
+    fn no_sound_plays_when_macos_shows_nothing_or_has_the_sound_off(cx: &mut TestAppContext) {
+        let notices = (0..6)
+            .map(|index| sent(NoticeKind::Prompt, Some(8), 3, &format!("notice {index}")))
+            .collect();
+        let (rig, cx) = rig(notices, cx);
+        cx.update(|_, cx| crate::settings::change_notifications(|n| n.sound = true, cx));
+        let answers = [
+            (Permission::Allowed, true, 1),
+            (Permission::NotAllowed, true, 1),
+            (Permission::NotAsked, true, 1),
+            (Permission::Unavailable, true, 1),
+            (Permission::Allowed, false, 1),
+            (Permission::Allowed, true, 2),
+        ];
+
+        for (number, (permission, sound, sounds)) in (0..).zip(answers) {
+            rig.recorder.permission.set(permission);
+            rig.recorder.sound_enabled.set(sound);
+            cx.deactivate_window();
+            look_at_the_window(cx);
+
+            deliver(
+                &rig,
+                &[number],
+                usize::try_from(number).unwrap_or_default() + 1,
+                cx,
+            );
+
+            assert_eq!(
+                rig.recorder.sounds.get(),
+                sounds,
+                "{permission:?} with the sound {sound}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn the_test_notification_plays_no_sound_when_macos_shows_nothing(cx: &mut TestAppContext) {
+        let (rig, cx) = rig(Vec::new(), cx);
+        cx.update(|_, cx| crate::settings::change_notifications(|n| n.sound = true, cx));
+        rig.recorder.permission.set(Permission::NotAllowed);
+        cx.deactivate_window();
+        look_at_the_window(cx);
+
+        cx.update(|_, cx| send_test(cx));
+        let denied = rig.recorder.sounds.get();
+        rig.recorder.permission.set(Permission::Allowed);
+        cx.deactivate_window();
+        look_at_the_window(cx);
+        cx.update(|_, cx| send_test(cx));
+
+        assert_eq!(denied, 0);
         assert_eq!(rig.recorder.sounds.get(), 1);
     }
 
@@ -1263,6 +1451,27 @@ mod tests {
         assert!(is_start);
         assert_eq!(focused, terminal);
         assert!(terminal.is_some());
+    }
+
+    #[gpui::test]
+    fn a_click_for_a_task_the_app_no_longer_knows_only_shows_the_window(cx: &mut TestAppContext) {
+        let notices = vec![sent(NoticeKind::Prompt, Some(99), 2, "Allow cargo test?")];
+        let (rig, cx) = rig(notices, cx);
+        let signup = rig.workspace.read_with(cx, |workspace, _| {
+            workspace.data.task_with_daemon_id(TaskId(8))
+        });
+        rig.workspace.update(cx, |workspace, cx| {
+            workspace.select_task(signup.expect("task 8"), cx);
+            workspace.set_view(View::Review, cx);
+        });
+        deliver(&rig, &[0], 1, cx);
+        close_window(cx);
+
+        click("task-99", Some("open"), cx);
+
+        assert_eq!(cx.windows().len(), 1);
+        assert_eq!(open_task(&rig, cx), Some(TaskId(8)));
+        assert_eq!(view_of(&rig, cx), View::Review);
     }
 
     #[gpui::test]

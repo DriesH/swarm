@@ -9,36 +9,49 @@ use block2::RcBlock;
 use objc2_app_kit::NSSound;
 use objc2_foundation::{NSBundle, NSString};
 use objc2_user_notifications::{
-    UNAuthorizationStatus, UNNotificationSettings, UNUserNotificationCenter,
+    UNAuthorizationStatus, UNNotificationSetting, UNNotificationSettings, UNUserNotificationCenter,
 };
 
-use super::Permission;
+use super::{Authorization, Permission};
 
 /// A short system sound.
 const SOUND: &str = "Ping";
 
 /// `UNUserNotificationCenter` aborts the process outside an app bundle, and only a bundle
 /// has an identifier.
-pub(super) fn read_permission(answer: flume::Sender<Permission>) {
+pub(super) fn read_permission(answer: flume::Sender<Authorization>) {
     if NSBundle::mainBundle().bundleIdentifier().is_none() {
-        send(&answer, Permission::Unavailable);
+        send(&answer, Authorization::UNAVAILABLE);
         return;
     }
 
     let on_settings = RcBlock::new(move |settings: NonNull<UNNotificationSettings>| {
         // SAFETY: the framework passes a valid settings object for the length of the call.
-        let status = unsafe { settings.as_ref() }.authorizationStatus();
+        let settings = unsafe { settings.as_ref() };
 
-        send(&answer, permission_of(status));
+        send(
+            &answer,
+            authorization_of(settings.authorizationStatus(), settings.soundSetting()),
+        );
     });
 
     UNUserNotificationCenter::currentNotificationCenter()
         .getNotificationSettingsWithCompletionHandler(&on_settings);
 }
 
-fn send(answer: &flume::Sender<Permission>, permission: Permission) {
-    if let Err(error) = answer.send(permission) {
+fn send(answer: &flume::Sender<Authorization>, authorization: Authorization) {
+    if let Err(error) = answer.send(authorization) {
         log::debug!("nobody waits for the notification permission: {error}");
+    }
+}
+
+pub(super) fn authorization_of(
+    status: UNAuthorizationStatus,
+    sound: UNNotificationSetting,
+) -> Authorization {
+    Authorization {
+        permission: permission_of(status),
+        sound: sound == UNNotificationSetting::Enabled,
     }
 }
 
@@ -98,6 +111,29 @@ mod tests {
 
         read_permission(answer);
 
-        assert_eq!(answers.try_recv(), Ok(Permission::Unavailable));
+        assert_eq!(answers.try_recv(), Ok(Authorization::UNAVAILABLE));
+    }
+
+    #[test]
+    fn the_sound_setting_is_on_only_when_it_is_enabled() {
+        let sound = |setting| authorization_of(UNAuthorizationStatus::Authorized, setting).sound;
+
+        assert!(sound(UNNotificationSetting::Enabled));
+        assert!(!sound(UNNotificationSetting::Disabled));
+        assert!(!sound(UNNotificationSetting::NotSupported));
+    }
+
+    #[test]
+    fn the_authorization_holds_both_the_permission_and_the_sound() {
+        assert_eq!(
+            authorization_of(
+                UNAuthorizationStatus::Denied,
+                UNNotificationSetting::Enabled
+            ),
+            Authorization {
+                permission: Permission::NotAllowed,
+                sound: true,
+            }
+        );
     }
 }
