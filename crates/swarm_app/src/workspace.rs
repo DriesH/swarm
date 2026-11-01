@@ -114,6 +114,8 @@ pub(crate) struct Workspace {
     pub(crate) previous_tabs: HashMap<ProjectId, TaskId>,
     /// Width and height of one cell of the terminal font, once measured.
     pub(crate) cell_size: Option<(f32, f32)>,
+    /// The font size `cell_size` was measured at, in points.
+    pub(crate) font_size: f32,
     pub(crate) daemon_launch: Option<DaemonLaunch>,
     pub(crate) reconnecting: bool,
     pub(crate) source: DataSource,
@@ -268,6 +270,7 @@ impl Workspace {
             start_requested: HashSet::new(),
             previous_tabs: HashMap::new(),
             cell_size: None,
+            font_size: swarm_term_view::DEFAULT_FONT_SIZE,
             daemon_launch: None,
             reconnecting: false,
             source,
@@ -736,6 +739,7 @@ impl Render for Workspace {
                     crate::settings::open(
                         this.settings_path.clone(),
                         this.data.projects.clone(),
+                        cx.weak_entity(),
                         window,
                         cx,
                     );

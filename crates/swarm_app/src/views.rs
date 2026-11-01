@@ -135,10 +135,11 @@ pub(crate) fn layout_style(workspace: &Workspace) -> LayoutStyle {
     }
 }
 
-/// Cells that fit in a tile of this size.
-fn cells(size: Size<Pixels>) -> (u32, u32) {
-    let columns = (f32::from(size.width) / CHAR_WIDTH).floor().max(0.);
-    let rows = ((f32::from(size.height) - HEADER_HEIGHT) / ROW_HEIGHT)
+/// Cells that fit in a tile of this size, with the measured size of one cell.
+fn cells(size: Size<Pixels>, cell: Option<(f32, f32)>) -> (u32, u32) {
+    let (cell_width, cell_height) = cell.unwrap_or((CHAR_WIDTH, ROW_HEIGHT));
+    let columns = (f32::from(size.width) / cell_width).floor().max(0.);
+    let rows = ((f32::from(size.height) - HEADER_HEIGHT) / cell_height)
         .floor()
         .max(0.);
 
@@ -548,7 +549,7 @@ fn tile(
         .filter(|resizing| resizing.terminal == id);
     let handle =
         (terminal.kind == TerminalKind::User).then(|| resize_handle(id, resizing.is_some(), cx));
-    let badge = resizing.map(|_| size_badge(size, cx));
+    let badge = resizing.map(|_| size_badge(size, workspace.cell_size, cx));
 
     Some(
         div()
@@ -847,9 +848,9 @@ fn resize_handle(id: TerminalId, dragging: bool, cx: &mut Context<Workspace>) ->
         .into_any_element()
 }
 
-fn size_badge(size: Size<Pixels>, cx: &Context<Workspace>) -> AnyElement {
+fn size_badge(size: Size<Pixels>, cell: Option<(f32, f32)>, cx: &Context<Workspace>) -> AnyElement {
     let colors = cx.theme().colors();
-    let (columns, rows) = cells(size);
+    let (columns, rows) = cells(size, cell);
 
     div()
         .absolute()
@@ -930,7 +931,17 @@ mod tests {
             height: px(272.),
         };
 
-        assert_eq!(cells(size), (90, 14));
+        assert_eq!(cells(size, None), (90, 14));
+    }
+
+    #[test]
+    fn a_bigger_cell_fits_fewer_cells_in_the_same_tile() {
+        let size = Size {
+            width: px(648.),
+            height: px(272.),
+        };
+
+        assert_eq!(cells(size, Some((9., 22.))), (72, 10));
     }
 
     #[test]
@@ -972,7 +983,7 @@ mod tests {
                 width: px(300.),
                 height: px(height - CHROME_HEIGHT),
             };
-            let grid = swarm_term_view::TerminalView::size_for(body, window, cx);
+            let grid = swarm_term_view::TerminalView::size_for(body, 13., window, cx);
 
             assert_eq!(grid.rows, PROCESS_TILE_ROWS);
         });

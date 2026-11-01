@@ -1,0 +1,2222 @@
+//! Settings › Projects: a project's `.swarm/config.toml`, read and saved through the daemon.
+
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+
+use gpui::{App, Context, Entity, Focusable as _, Global, SharedString, Window};
+use swarm_protocol::{
+    ChecksRun, Client, ClientError, ProjectConfigFields, ProjectId as DaemonProjectId, PromptInfo,
+    TaskId as DaemonTaskId,
+};
+use swarm_ui::prelude::*;
+
+use super::{Page, SAVE_DELAY, SettingsState, SettingsWindow, field};
+use crate::model::{Project, ProjectId, sample_checks_run};
+use crate::pull_request::run_is_over;
+use crate::review_comments::refusal;
+
+pub(super) const DEFAULT_BRANCH: &str = "Default branch";
+const NOT_CONNECTED: &str = "Not connected to the daemon";
+
+/// How a project's settings stand against its file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Load {
+    /// Sample values: nothing is read or saved.
+    Sample,
+    /// Asked of the daemon, not answered yet.
+    Loading,
+    Ready,
+    /// The file does not parse, or the daemon cannot be reached. Nothing is saved.
+    Unreadable(SharedString),
+}
+
+impl Load {
+    pub(crate) fn editable(&self) -> bool {
+        matches!(self, Self::Sample | Self::Ready)
+    }
+}
+
+/// A prompt the project overrides in `.swarm/prompts/`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProjectPrompt {
+    pub name: String,
+    pub path: PathBuf,
+}
+
+/// Starting the project's local checks, and what came of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ChecksStatus {
+    Idle,
+    Checking {
+        task: DaemonTaskId,
+        /// The request to start them has not been answered yet.
+        requesting: bool,
+        /// The latest run the daemon reported since the click.
+        run: Option<ChecksRun>,
+    },
+    Refused(SharedString),
+}
+
+impl ChecksStatus {
+    /// The tone and the short text to show. `None` before the first run.
+    pub(crate) fn pill(&self) -> Option<(AgentStatus, SharedString)> {
+        match self {
+            Self::Idle => None,
+            Self::Refused(message) => Some((AgentStatus::Error, message.clone())),
+            Self::Checking {
+                requesting: true, ..
+            }
+            | Self::Checking { run: None, .. } => Some((AgentStatus::Working, "Running".into())),
+            Self::Checking { run: Some(run), .. } => {
+                let (tone, text) = run_summary(run);
+
+                Some((tone, text.into()))
+            }
+        }
+    }
+
+    /// A start request is on its way, or a run has not ended.
+    pub(crate) fn busy(&self) -> bool {
+        match self {
+            Self::Checking {
+                requesting: true, ..
+            } => true,
+            Self::Checking { run: Some(run), .. } => !run_is_over(run),
+            _ => false,
+        }
+    }
+}
+
+/// What a run adds up to, in a few words.
+pub(crate) fn run_summary(run: &ChecksRun) -> (AgentStatus, String) {
+    use swarm_protocol::CheckState;
+
+    if !run_is_over(run) {
+        return (AgentStatus::Working, "Running".to_owned());
+    }
+
+    let count = |state| {
+        run.checks
+            .iter()
+            .filter(|check| check.state == state)
+            .count()
+    };
+    let (total, failed) = (run.checks.len(), count(CheckState::Failed));
+
+    if total == 0 {
+        (AgentStatus::Idle, "No checks".to_owned())
+    } else if failed > 0 {
+        (AgentStatus::Error, format!("{failed} of {total} failed"))
+    } else if count(CheckState::Stopped) > 0 {
+        (AgentStatus::Blocked, "Stopped".to_owned())
+    } else if count(CheckState::Skipped) > 0 {
+        (AgentStatus::Blocked, "Skipped".to_owned())
+    } else {
+        (AgentStatus::Done, format!("{total} of {total} passed"))
+    }
+}
+
+/// The two lists of strings on the page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum List {
+    Copy,
+    Checks,
+}
+
+impl List {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Copy => "File to copy",
+            Self::Checks => "Check",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ProjectSettings {
+    pub project: Project,
+    pub load: Load,
+    /// The local branches of the repository.
+    pub branches: Vec<String>,
+    /// `None` is the repository's default branch.
+    pub base_branch: Option<String>,
+    pub worktree_folder: String,
+    pub port_range: String,
+    pub ports_per_worktree: String,
+    pub setup_script: String,
+    pub copy_files: Vec<String>,
+    pub checks: Vec<String>,
+    pub checks_required: bool,
+    /// The page has no field for the teardown script. A save sends it back as it was read.
+    teardown: String,
+    pub prompts: Vec<ProjectPrompt>,
+    pub checking: ChecksStatus,
+    /// Why the daemon refused the last save.
+    pub refusal: Option<SharedString>,
+}
+
+impl ProjectSettings {
+    /// A project the daemon knows starts empty and loads; any other keeps sample values.
+    pub(super) fn new(project: Project) -> Self {
+        if project.daemon.is_some() {
+            Self::blank(project, Load::Loading)
+        } else {
+            Self::sample(project)
+        }
+    }
+
+    fn blank(project: Project, load: Load) -> Self {
+        Self {
+            project,
+            load,
+            branches: Vec::new(),
+            base_branch: None,
+            worktree_folder: String::new(),
+            port_range: String::new(),
+            ports_per_worktree: String::new(),
+            setup_script: String::new(),
+            copy_files: Vec::new(),
+            checks: Vec::new(),
+            checks_required: false,
+            teardown: String::new(),
+            prompts: Vec::new(),
+            checking: ChecksStatus::Idle,
+            refusal: None,
+        }
+    }
+
+    fn sample(project: Project) -> Self {
+        let base_branch = project.base_branch.to_string();
+        let mut branches = vec![base_branch.clone()];
+        if base_branch != "main" {
+            branches.push("main".to_owned());
+        }
+
+        let prompt = ProjectPrompt {
+            name: "worker".to_owned(),
+            path: PathBuf::from(".swarm/prompts/worker.md"),
+        };
+
+        Self {
+            branches,
+            base_branch: Some(base_branch),
+            worktree_folder: ".worktrees".to_owned(),
+            port_range: "5170-5199".to_owned(),
+            ports_per_worktree: "3".to_owned(),
+            setup_script:
+                "cargo fetch\npnpm --dir docs install --frozen-lockfile\ncp .env.example .env"
+                    .to_owned(),
+            copy_files: vec![".env".to_owned(), "CLAUDE.local.md".to_owned()],
+            checks: vec![
+                "cargo test --workspace".to_owned(),
+                "cargo clippy --workspace".to_owned(),
+            ],
+            checks_required: true,
+            prompts: vec![prompt],
+            ..Self::blank(project, Load::Sample)
+        }
+    }
+
+    /// The dropdown's options: the default branch, then every branch. A base branch the
+    /// repository no longer has stays in the list so the dropdown can show it.
+    pub(super) fn base_branch_options(&self) -> Vec<String> {
+        let mut options = vec![DEFAULT_BRANCH.to_owned()];
+        options.extend(self.branches.iter().cloned());
+
+        if let Some(current) = &self.base_branch
+            && !self.branches.contains(current)
+        {
+            options.push(current.clone());
+        }
+
+        options
+    }
+
+    pub(super) fn base_branch_index(&self) -> usize {
+        let Some(current) = &self.base_branch else {
+            return 0;
+        };
+
+        self.base_branch_options()
+            .iter()
+            .skip(1)
+            .position(|option| option == current)
+            .map_or(0, |position| position + 1)
+    }
+
+    fn list(&self, list: List) -> &Vec<String> {
+        match list {
+            List::Copy => &self.copy_files,
+            List::Checks => &self.checks,
+        }
+    }
+
+    fn list_mut(&mut self, list: List) -> &mut Vec<String> {
+        match list {
+            List::Copy => &mut self.copy_files,
+            List::Checks => &mut self.checks,
+        }
+    }
+
+    /// Takes what the daemon read from the file.
+    fn apply(&mut self, fields: ProjectConfigFields) {
+        self.base_branch = fields.base_branch;
+        self.worktree_folder = fields.worktree_folder;
+        self.port_range = fields.port_range;
+        self.ports_per_worktree = fields.ports_per_worktree.to_string();
+        self.copy_files = fields.copy;
+        self.setup_script = fields.setup;
+        self.teardown = fields.teardown;
+        self.checks = fields.checks;
+        self.checks_required = fields.checks_required;
+    }
+
+    /// What a save sends, or why the page cannot be saved as it is. Blank entries in the
+    /// lists are rows the user has not filled yet.
+    pub(super) fn fields(&self) -> Result<ProjectConfigFields, SharedString> {
+        let ports_per_worktree = match self.ports_per_worktree.trim() {
+            "" => 0,
+            digits => digits
+                .parse()
+                .map_err(|_| SharedString::from("Ports per worktree is too large"))?,
+        };
+        let filled = |items: &[String]| -> Vec<String> {
+            items
+                .iter()
+                .map(|item| item.trim().to_owned())
+                .filter(|item| !item.is_empty())
+                .collect()
+        };
+
+        Ok(ProjectConfigFields {
+            base_branch: self.base_branch.clone(),
+            worktree_folder: self.worktree_folder.clone(),
+            port_range: self.port_range.clone(),
+            ports_per_worktree,
+            copy: filled(&self.copy_files),
+            setup: self.setup_script.clone(),
+            teardown: self.teardown.clone(),
+            checks: filled(&self.checks),
+            checks_required: self.checks_required,
+        })
+    }
+}
+
+/// What to do when a pause after an edit ends, or a save ends.
+#[derive(Debug, PartialEq, Eq)]
+enum Due {
+    /// Nothing to send: a save is on its way, a newer pause runs, or there are no fields.
+    Wait,
+    /// The page matches what the daemon holds.
+    Same,
+    Send(ProjectConfigFields),
+}
+
+/// How the saves of one project stand. At most one save is on its way, and the fields it
+/// sends are always the newest the page held, so the daemon never gets an older value
+/// after a newer one.
+#[derive(Default)]
+pub(super) struct ProjectSave {
+    /// What the daemon holds: the last read or saved fields.
+    confirmed: Option<ProjectConfigFields>,
+    /// The newest fields the page held.
+    queued: Option<ProjectConfigFields>,
+    in_flight: bool,
+    /// The pause after the last edit is running.
+    pausing: bool,
+    /// Cancels the pause when a newer edit restarts it.
+    timer: Option<gpui::Task<()>>,
+    reading: bool,
+}
+
+impl ProjectSave {
+    /// An edit is waiting for the pause, or on its way to the daemon.
+    fn busy(&self) -> bool {
+        self.in_flight || self.pausing
+    }
+
+    /// The page holds `fields` now. Returns whether the pause starts over.
+    fn edited(&mut self, fields: ProjectConfigFields) -> bool {
+        if self.queued.as_ref() == Some(&fields) {
+            return false;
+        }
+
+        self.queued = Some(fields);
+        self.pausing = true;
+
+        true
+    }
+
+    /// The page holds fields that cannot be saved. Nothing goes out until it does again.
+    fn invalid(&mut self) {
+        self.queued = None;
+        self.pausing = false;
+        self.timer = None;
+    }
+
+    /// The pause is over.
+    fn due(&mut self) -> Due {
+        self.pausing = false;
+        self.timer = None;
+
+        self.next()
+    }
+
+    fn next(&mut self) -> Due {
+        if self.in_flight {
+            return Due::Wait;
+        }
+
+        let Some(fields) = self.queued.clone() else {
+            return Due::Wait;
+        };
+
+        if self.confirmed.as_ref() == Some(&fields) {
+            return Due::Same;
+        }
+
+        self.in_flight = true;
+
+        Due::Send(fields)
+    }
+
+    /// The save of `sent` ended. A newer value, if one waits, goes out now.
+    fn ended(&mut self, sent: &ProjectConfigFields, saved: bool) -> Due {
+        self.in_flight = false;
+
+        if saved {
+            self.confirmed = Some(sent.clone());
+        }
+
+        if self.pausing || self.queued.as_ref() == Some(sent) {
+            return Due::Wait;
+        }
+
+        self.next()
+    }
+}
+
+/// The text fields of one project's page.
+pub(super) struct ProjectInputs {
+    pub(super) worktree_folder: Entity<TextInput>,
+    pub(super) port_range: Entity<TextInput>,
+    pub(super) ports_per_worktree: Entity<TextInput>,
+    pub(super) setup_script: Entity<TextArea>,
+    pub(super) copy: Vec<Entity<TextInput>>,
+    pub(super) checks: Vec<Entity<TextInput>>,
+}
+
+impl ProjectInputs {
+    fn list(&self, list: List) -> &Vec<Entity<TextInput>> {
+        match list {
+            List::Copy => &self.copy,
+            List::Checks => &self.checks,
+        }
+    }
+
+    fn list_mut(&mut self, list: List) -> &mut Vec<Entity<TextInput>> {
+        match list {
+            List::Copy => &mut self.copy,
+            List::Checks => &mut self.checks,
+        }
+    }
+}
+
+/// What the daemon answered when a project page opened.
+pub(super) struct Loaded {
+    config: Result<(ProjectConfigFields, Option<String>), ClientError>,
+    branches: Option<Vec<String>>,
+    prompts: Option<Vec<PromptInfo>>,
+}
+
+impl Loaded {
+    /// Blocks on the daemon: call it on the background executor.
+    fn read(client: &Client, project: DaemonProjectId) -> Self {
+        let config = client.project_config(project);
+
+        if config.is_err() {
+            return Self {
+                config,
+                branches: None,
+                prompts: None,
+            };
+        }
+
+        Self {
+            config,
+            branches: logged("branches", client.list_branches(project)),
+            prompts: logged("prompts", client.prompts(Some(project))),
+        }
+    }
+}
+
+fn logged<T>(what: &str, result: Result<T, ClientError>) -> Option<T> {
+    result
+        .inspect_err(|error| log::debug!("cannot list the {what}: {error}"))
+        .ok()
+}
+
+impl SettingsState {
+    /// Lists the projects of the workspace. A project with an edit on its way keeps it.
+    pub(super) fn use_projects(&mut self, projects: Vec<Project>) {
+        let mut old: Vec<_> = std::mem::take(&mut self.projects)
+            .into_iter()
+            .zip(std::mem::take(&mut self.saves))
+            .collect();
+
+        for project in projects {
+            let kept = old
+                .iter()
+                .position(|(entry, save)| entry.project.id == project.id && save.busy());
+
+            let (entry, save) = match kept {
+                Some(position) => {
+                    let (mut entry, save) = old.swap_remove(position);
+                    entry.project = project;
+
+                    (entry, save)
+                }
+                None => (ProjectSettings::new(project), ProjectSave::default()),
+            };
+
+            self.projects.push(entry);
+            self.saves.push(save);
+        }
+    }
+
+    fn index_of(&self, id: ProjectId) -> Option<usize> {
+        self.projects
+            .iter()
+            .position(|entry| entry.project.id == id)
+    }
+
+    /// The daemon connection, while it holds.
+    fn client(&self, cx: &App) -> Option<Client> {
+        let workspace = self.workspace.as_ref()?.upgrade()?;
+
+        workspace
+            .read(cx)
+            .daemon
+            .clone()
+            .filter(Client::is_connected)
+    }
+
+    // Load
+
+    /// Marks the project as loading. Returns what the read needs, or `None` when there is
+    /// nothing to read: a sample project, a read already going, or an edit on its way
+    /// that a read would undo.
+    fn begin_load(
+        &mut self,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> Option<(Client, DaemonProjectId)> {
+        let daemon = self.projects.get(index)?.project.daemon?;
+        let save = self.saves.get(index)?;
+
+        if save.reading || save.busy() {
+            return None;
+        }
+
+        let client = self.client(cx);
+        let entry = self.projects.get_mut(index)?;
+
+        let Some(client) = client else {
+            entry.load = Load::Unreadable(NOT_CONNECTED.into());
+            cx.notify();
+
+            return None;
+        };
+
+        if entry.load != Load::Ready {
+            entry.load = Load::Loading;
+        }
+
+        self.saves.get_mut(index)?.reading = true;
+        cx.notify();
+
+        Some((client, daemon))
+    }
+
+    /// Takes the daemon's answer. Returns whether the page values need to reach the inputs.
+    fn finish_load(&mut self, index: usize, loaded: Loaded, cx: &mut Context<Self>) -> bool {
+        let (Some(entry), Some(save)) = (self.projects.get_mut(index), self.saves.get_mut(index))
+        else {
+            return false;
+        };
+
+        save.reading = false;
+
+        // An edit was made while the read ran. The read is older than the edit.
+        if save.busy() {
+            return false;
+        }
+
+        match loaded.config {
+            Err(error) => entry.load = Load::Unreadable(refusal(&error)),
+            Ok((fields, Some(error))) => {
+                entry.apply(fields);
+                entry.load = Load::Unreadable(error.into());
+            }
+            Ok((fields, None)) => {
+                entry.apply(fields);
+                entry.load = Load::Ready;
+                entry.refusal = None;
+
+                if let Some(branches) = loaded.branches {
+                    entry.branches = branches;
+                }
+
+                if let Some(prompts) = loaded.prompts {
+                    entry.prompts = prompts
+                        .into_iter()
+                        .filter_map(|prompt| {
+                            Some(ProjectPrompt {
+                                name: prompt.name,
+                                path: prompt.project_path?,
+                            })
+                        })
+                        .collect();
+                }
+
+                save.confirmed = entry.fields().ok();
+                save.queued.clone_from(&save.confirmed);
+            }
+        }
+
+        cx.notify();
+
+        true
+    }
+
+    // Save
+
+    pub(super) fn queue_project_saves(&mut self, cx: &mut Context<Self>) {
+        for index in 0..self.projects.len() {
+            self.queue_project_save(index, cx);
+        }
+    }
+
+    /// Saves the page after a pause in editing. A newer edit restarts the pause, so only
+    /// the newest value goes out.
+    fn queue_project_save(&mut self, index: usize, cx: &mut Context<Self>) {
+        let (Some(entry), Some(save)) = (self.projects.get_mut(index), self.saves.get_mut(index))
+        else {
+            return;
+        };
+
+        if entry.load != Load::Ready {
+            return;
+        }
+
+        let fields = match entry.fields() {
+            Ok(fields) => fields,
+            Err(message) => {
+                save.invalid();
+
+                if entry.refusal.as_ref() != Some(&message) {
+                    entry.refusal = Some(message);
+                    cx.notify();
+                }
+
+                return;
+            }
+        };
+
+        if !save.edited(fields) {
+            return;
+        }
+
+        let id = entry.project.id;
+        save.timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SAVE_DELAY).await;
+
+            if let Err(error) = this.update(cx, |state, cx| state.pause_over(id, cx)) {
+                log::debug!("the settings closed before the project was saved: {error}");
+            }
+        }));
+    }
+
+    fn pause_over(&mut self, id: ProjectId, cx: &mut Context<Self>) {
+        let Some(due) = self
+            .index_of(id)
+            .and_then(|index| self.saves.get_mut(index))
+            .map(ProjectSave::due)
+        else {
+            return;
+        };
+
+        self.act(id, due, cx);
+    }
+
+    fn act(&mut self, id: ProjectId, due: Due, cx: &mut Context<Self>) {
+        match due {
+            Due::Wait => {}
+            Due::Same => {
+                let entry = self
+                    .index_of(id)
+                    .and_then(|index| self.projects.get_mut(index));
+
+                if entry.is_some_and(|entry| entry.refusal.take().is_some()) {
+                    cx.notify();
+                }
+            }
+            Due::Send(fields) => self.send(id, fields, cx),
+        }
+    }
+
+    fn send(&mut self, id: ProjectId, fields: ProjectConfigFields, cx: &mut Context<Self>) {
+        let Some(index) = self.index_of(id) else {
+            return;
+        };
+        let client = self.client(cx);
+        let (Some(entry), Some(save)) = (self.projects.get_mut(index), self.saves.get_mut(index))
+        else {
+            return;
+        };
+
+        let (Some(client), Some(daemon)) = (client, entry.project.daemon) else {
+            save.ended(&fields, false);
+            entry.refusal = Some(NOT_CONNECTED.into());
+            cx.notify();
+
+            return;
+        };
+
+        let sent = fields.clone();
+        let saving = cx.background_spawn(async move { client.save_project_config(daemon, fields) });
+
+        cx.spawn(async move |this, cx| {
+            let result = saving.await;
+            let ended = this.update(cx, |state, cx| state.saved(id, &sent, result, cx));
+
+            if let Err(error) = ended {
+                log::debug!("the settings closed before the project was saved: {error}");
+            }
+        })
+        .detach();
+    }
+
+    fn saved(
+        &mut self,
+        id: ProjectId,
+        sent: &ProjectConfigFields,
+        result: Result<(), ClientError>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.index_of(id) else {
+            return;
+        };
+        let (Some(entry), Some(save)) = (self.projects.get_mut(index), self.saves.get_mut(index))
+        else {
+            return;
+        };
+
+        let due = save.ended(sent, result.is_ok());
+
+        entry.refusal = result.err().map(|error| refusal(&error));
+        self.act(id, due, cx);
+        cx.notify();
+    }
+
+    // Lists
+
+    pub(super) fn set_item(
+        &mut self,
+        project: usize,
+        list: List,
+        index: usize,
+        text: String,
+        cx: &mut Context<Self>,
+    ) {
+        let item = self
+            .projects
+            .get_mut(project)
+            .and_then(|entry| entry.list_mut(list).get_mut(index));
+
+        if let Some(item) = item {
+            *item = text;
+            cx.notify();
+        }
+    }
+
+    pub(super) fn add_item(&mut self, project: usize, list: List, cx: &mut Context<Self>) {
+        if let Some(entry) = self.projects.get_mut(project) {
+            entry.list_mut(list).push(String::new());
+            cx.notify();
+        }
+    }
+
+    pub(super) fn remove_item(
+        &mut self,
+        project: usize,
+        list: List,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(items) = self
+            .projects
+            .get_mut(project)
+            .map(|entry| entry.list_mut(list))
+            && index < items.len()
+        {
+            items.remove(index);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn choose_base_branch(&mut self, project: usize, option: usize) {
+        let Some(entry) = self.projects.get_mut(project) else {
+            return;
+        };
+
+        entry.base_branch = match option {
+            0 => None,
+            option => entry.base_branch_options().get(option).cloned(),
+        };
+    }
+
+    // Local checks
+
+    /// The task "Run checks now" runs on: the one open in the workspace when it belongs
+    /// to the project, else the project's first open task.
+    pub(crate) fn checks_task(&self, index: usize, cx: &App) -> Option<DaemonTaskId> {
+        let project = self.projects.get(index)?.project.id;
+        let workspace = self.workspace.as_ref()?.upgrade()?;
+        let workspace = workspace.read(cx);
+
+        let usable = |task: &&crate::model::Task| {
+            task.project == project && !task.is_start && task.daemon.is_some()
+        };
+        let active = workspace.data.task(workspace.active_task).filter(usable);
+        let task = active.or_else(|| workspace.data.tasks.iter().find(usable))?;
+
+        task.daemon.as_ref().map(|daemon| daemon.id)
+    }
+
+    pub(crate) fn can_run_checks(&self, index: usize, cx: &App) -> bool {
+        let Some(entry) = self.projects.get(index) else {
+            return false;
+        };
+
+        !entry.checking.busy()
+            && (entry.load == Load::Sample || self.checks_task(index, cx).is_some())
+    }
+
+    pub(crate) fn run_checks(&mut self, index: usize, cx: &mut Context<Self>) {
+        if !self.can_run_checks(index, cx) {
+            return;
+        }
+
+        let (client, task) = (self.client(cx), self.checks_task(index, cx));
+        let Some(entry) = self.projects.get_mut(index) else {
+            return;
+        };
+
+        if entry.load == Load::Sample {
+            let sample = DaemonTaskId(0);
+            entry.checking = ChecksStatus::Checking {
+                task: sample,
+                requesting: false,
+                run: Some(sample_checks_run(sample, "sample")),
+            };
+            cx.notify();
+
+            return;
+        }
+
+        let Some(task) = task else {
+            return;
+        };
+
+        let Some(client) = client else {
+            entry.checking = ChecksStatus::Refused(NOT_CONNECTED.into());
+            cx.notify();
+
+            return;
+        };
+
+        let id = entry.project.id;
+        entry.checking = ChecksStatus::Checking {
+            task,
+            requesting: true,
+            run: None,
+        };
+        cx.notify();
+
+        let starting = cx.background_spawn(async move { client.run_checks(task) });
+
+        cx.spawn(async move |this, cx| {
+            let result = starting.await;
+            let ended = this.update(cx, |state, cx| state.checks_started(id, task, result, cx));
+
+            if let Err(error) = ended {
+                log::debug!("the settings closed before the checks started: {error}");
+            }
+        })
+        .detach();
+    }
+
+    fn checks_started(
+        &mut self,
+        id: ProjectId,
+        started: DaemonTaskId,
+        result: Result<(), ClientError>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(entry) = self
+            .index_of(id)
+            .and_then(|index| self.projects.get_mut(index))
+        else {
+            return;
+        };
+
+        match (&mut entry.checking, result) {
+            (
+                ChecksStatus::Checking {
+                    task, requesting, ..
+                },
+                Ok(()),
+            ) if *task == started => *requesting = false,
+            (ChecksStatus::Checking { task, .. }, Err(error)) if *task == started => {
+                entry.checking = ChecksStatus::Refused(refusal(&error));
+            }
+            _ => return,
+        }
+
+        cx.notify();
+    }
+
+    /// Keeps a run the daemon reported, for the page that started it.
+    pub(super) fn record_run(&mut self, run: &ChecksRun, cx: &mut Context<Self>) {
+        let mut changed = false;
+
+        for entry in &mut self.projects {
+            if let ChecksStatus::Checking {
+                task, run: shown, ..
+            } = &mut entry.checking
+                && *task == run.task
+                && shown.as_ref() != Some(run)
+            {
+                *shown = Some(run.clone());
+                changed = true;
+            }
+        }
+
+        if changed {
+            cx.notify();
+        }
+    }
+}
+
+type Opener = Rc<dyn Fn(&Path, &mut App)>;
+
+struct OpenWith(Opener);
+
+impl Global for OpenWith {}
+
+/// Opens a file with the system's default app.
+pub(super) fn open_file(path: &Path, cx: &mut App) {
+    let opener = cx
+        .try_global::<OpenWith>()
+        .map(|opener| Rc::clone(&opener.0));
+
+    match opener {
+        Some(open) => open(path, cx),
+        None => cx.open_with_system(path),
+    }
+}
+
+/// Replaces the system call, so a test can see which file would open.
+#[cfg(test)]
+pub(super) fn use_opener(opener: Opener, cx: &mut App) {
+    cx.set_global(OpenWith(opener));
+}
+
+impl SettingsWindow {
+    /// Reads the config of the project the page shows.
+    pub(super) fn open_project(&mut self, cx: &mut Context<Self>) {
+        if let Page::Project(index) = self.page {
+            self.load_project(index, cx);
+        }
+    }
+
+    pub(super) fn load_project(&mut self, index: usize, cx: &mut Context<Self>) {
+        let request = self
+            .state
+            .update(cx, |state, cx| state.begin_load(index, cx));
+        self.sync_inputs(index, cx);
+
+        let Some((client, daemon)) = request else {
+            return;
+        };
+
+        let reading = cx.background_spawn(async move { Loaded::read(&client, daemon) });
+
+        cx.spawn(async move |this, cx| {
+            let loaded = reading.await;
+            let shown = this.update(cx, |this, cx| this.finish_load(index, loaded, cx));
+
+            if let Err(error) = shown {
+                log::debug!("the settings closed before the project was read: {error}");
+            }
+        })
+        .detach();
+    }
+
+    fn finish_load(&mut self, index: usize, loaded: Loaded, cx: &mut Context<Self>) {
+        let applied = self
+            .state
+            .update(cx, |state, cx| state.finish_load(index, loaded, cx));
+
+        if applied {
+            self.sync_inputs(index, cx);
+        }
+    }
+
+    pub(super) fn project_inputs(
+        &mut self,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> Option<ProjectInputs> {
+        let project = self.state.read(cx).projects.get(index)?.clone();
+        let state = self.state.clone();
+
+        let worktree_folder = field("Worktree folder", &project.worktree_folder, true, cx);
+        super::bind_text(
+            &mut self.subscriptions,
+            &worktree_folder,
+            &state,
+            move |state, text| {
+                if let Some(project) = state.projects.get_mut(index) {
+                    project.worktree_folder = text;
+                }
+            },
+            cx,
+        );
+
+        let port_range = field("Port range", &project.port_range, true, cx);
+        super::bind_text(
+            &mut self.subscriptions,
+            &port_range,
+            &state,
+            move |state, text| {
+                if let Some(project) = state.projects.get_mut(index) {
+                    project.port_range = text;
+                }
+            },
+            cx,
+        );
+
+        let ports_per_worktree =
+            super::numeric_field("Ports per worktree", &project.ports_per_worktree, cx);
+        super::bind_text(
+            &mut self.subscriptions,
+            &ports_per_worktree,
+            &state,
+            move |state, text| {
+                if let Some(project) = state.projects.get_mut(index) {
+                    project.ports_per_worktree = text;
+                }
+            },
+            cx,
+        );
+
+        let setup_script = cx.new(|cx| {
+            let mut area = TextArea::new(cx);
+            area.set_label("Setup script", cx);
+            area.set_mono(true, cx);
+            area.set_rows(3, cx);
+            area.set_text(project.setup_script.clone(), cx);
+            area
+        });
+        self.subscriptions.push(cx.subscribe(
+            &setup_script,
+            move |this, _, event: &TextInputEvent, cx| {
+                if let TextInputEvent::Changed(text) = event {
+                    let text = text.to_string();
+                    this.state.update(cx, |state, cx| {
+                        if let Some(project) = state.projects.get_mut(index) {
+                            project.setup_script = text;
+                            cx.notify();
+                        }
+                    });
+                }
+            },
+        ));
+
+        let copy = self.list_inputs(index, List::Copy, &project.copy_files, cx);
+        let checks = self.list_inputs(index, List::Checks, &project.checks, cx);
+
+        Some(ProjectInputs {
+            worktree_folder,
+            port_range,
+            ports_per_worktree,
+            setup_script,
+            copy,
+            checks,
+        })
+    }
+
+    fn list_inputs(
+        &mut self,
+        project: usize,
+        list: List,
+        items: &[String],
+        cx: &mut Context<Self>,
+    ) -> Vec<Entity<TextInput>> {
+        items
+            .iter()
+            .map(|item| self.list_input(project, list, item, cx))
+            .collect()
+    }
+
+    fn list_input(
+        &mut self,
+        project: usize,
+        list: List,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) -> Entity<TextInput> {
+        let input = field(list.label(), text, true, cx);
+
+        self.subscriptions.push(cx.subscribe(
+            &input,
+            move |this, input, event: &TextInputEvent, cx| {
+                let TextInputEvent::Changed(text) = event else {
+                    return;
+                };
+
+                let index = this.inputs.projects.get(project).and_then(|inputs| {
+                    inputs
+                        .list(list)
+                        .iter()
+                        .position(|candidate| *candidate == input)
+                });
+
+                if let Some(index) = index {
+                    let text = text.to_string();
+                    this.state.update(cx, |state, cx| {
+                        state.set_item(project, list, index, text, cx);
+                    });
+                }
+            },
+        ));
+
+        input
+    }
+
+    /// Adds an empty row and moves focus to it.
+    pub(super) fn add_item(
+        &mut self,
+        project: usize,
+        list: List,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = self.list_input(project, list, "", cx);
+        let focus = input.read(cx).focus_handle(cx);
+
+        if let Some(inputs) = self.inputs.projects.get_mut(project) {
+            inputs.list_mut(list).push(input);
+        }
+
+        self.state
+            .update(cx, |state, cx| state.add_item(project, list, cx));
+        window.focus(&focus, cx);
+    }
+
+    pub(super) fn remove_item(
+        &mut self,
+        project: usize,
+        list: List,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(inputs) = self.inputs.projects.get_mut(project)
+            && index < inputs.list(list).len()
+        {
+            inputs.list_mut(list).remove(index);
+        }
+
+        self.state
+            .update(cx, |state, cx| state.remove_item(project, list, index, cx));
+    }
+
+    /// Writes the state of a project into its inputs, and makes them read-only while the
+    /// page cannot be edited.
+    pub(super) fn sync_inputs(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(project) = self.state.read(cx).projects.get(index).cloned() else {
+            return;
+        };
+        let editable = project.load.editable();
+        let placeholder = if project.load == Load::Loading {
+            "Loading\u{2026}"
+        } else {
+            ""
+        };
+
+        if let Some(inputs) = self.inputs.projects.get(index) {
+            for (input, text) in [
+                (&inputs.worktree_folder, &project.worktree_folder),
+                (&inputs.port_range, &project.port_range),
+                (&inputs.ports_per_worktree, &project.ports_per_worktree),
+            ] {
+                input.update(cx, |input, cx| {
+                    if input.text().as_ref() != text {
+                        input.set_text(text.clone(), cx);
+                    }
+
+                    input.set_disabled(!editable, cx);
+                    input.set_placeholder(placeholder, cx);
+                });
+            }
+
+            inputs.setup_script.update(cx, |input, cx| {
+                if input.text().as_ref() != project.setup_script {
+                    input.set_text(project.setup_script.clone(), cx);
+                }
+
+                input.set_disabled(!editable, cx);
+                input.set_placeholder(placeholder, cx);
+            });
+        }
+
+        for list in [List::Copy, List::Checks] {
+            self.sync_list(index, list, project.list(list), editable, cx);
+        }
+    }
+
+    fn sync_list(
+        &mut self,
+        project: usize,
+        list: List,
+        items: &[String],
+        editable: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(inputs) = self.inputs.projects.get(project) else {
+            return;
+        };
+
+        let shown: Vec<String> = inputs
+            .list(list)
+            .iter()
+            .map(|input| input.read(cx).text().to_string())
+            .collect();
+
+        if shown != items {
+            let rebuilt = self.list_inputs(project, list, items, cx);
+
+            if let Some(inputs) = self.inputs.projects.get_mut(project) {
+                *inputs.list_mut(list) = rebuilt;
+            }
+        }
+
+        if let Some(inputs) = self.inputs.projects.get(project) {
+            for input in inputs.list(list) {
+                input.update(cx, |input, cx| input.set_disabled(!editable, cx));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use gpui::{Focusable, Modifiers, TestAppContext, VisualTestContext, WindowHandle, px, size};
+    use swarm_protocol::{CheckState, Event, LocalCheck, PrEvent, PromptLayer, Request};
+    use swarm_term::ExitStatus;
+
+    use super::*;
+    use crate::daemon::tests::{
+        fake_daemon_replying, project_info, redraw, task_info, wait_a_little, wait_until,
+    };
+    use crate::settings::{link_workspace, open_window};
+    use crate::workspace::Workspace;
+
+    type Requests = Arc<Mutex<Vec<Request>>>;
+
+    /// A daemon that records every request, then answers with `reply` or the defaults.
+    fn daemon(reply: impl Fn(&Request) -> Option<Event> + Send + 'static) -> (PathBuf, Requests) {
+        let seen = Requests::default();
+        let record = Arc::clone(&seen);
+
+        let socket = fake_daemon_replying(move |request| {
+            record
+                .lock()
+                .expect("lock the requests")
+                .push(request.clone());
+
+            reply(&request)
+        });
+
+        (socket, seen)
+    }
+
+    fn count(seen: &Requests, matching: impl Fn(&Request) -> bool) -> usize {
+        seen.lock()
+            .expect("lock the requests")
+            .iter()
+            .filter(|request| matching(request))
+            .count()
+    }
+
+    fn save_count(seen: &Requests) -> usize {
+        count(seen, |request| {
+            matches!(request, Request::SaveProjectConfig { .. })
+        })
+    }
+
+    fn saves(seen: &Requests) -> Vec<ProjectConfigFields> {
+        seen.lock()
+            .expect("lock the requests")
+            .iter()
+            .filter_map(|request| match request {
+                Request::SaveProjectConfig { fields, .. } => Some(fields.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn run_requests(seen: &Requests) -> Vec<DaemonTaskId> {
+        seen.lock()
+            .expect("lock the requests")
+            .iter()
+            .filter_map(|request| match request {
+                Request::RunChecks { task, .. } => Some(*task),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn fields() -> ProjectConfigFields {
+        ProjectConfigFields {
+            base_branch: Some("develop".to_owned()),
+            worktree_folder: ".trees".to_owned(),
+            port_range: "6000-6009".to_owned(),
+            ports_per_worktree: 2,
+            copy: vec![".env".to_owned(), "CLAUDE.local.md".to_owned()],
+            setup: "make setup".to_owned(),
+            teardown: "make clean".to_owned(),
+            checks: vec!["make test".to_owned(), "make lint".to_owned()],
+            checks_required: false,
+        }
+    }
+
+    /// Answers the config and the branches of the project.
+    fn project_reply(request: &Request) -> Option<Event> {
+        config_reply(request, fields())
+    }
+
+    fn config_reply(request: &Request, config: ProjectConfigFields) -> Option<Event> {
+        match request {
+            Request::ProjectConfig { call, .. } => Some(Event::ProjectConfig {
+                call: *call,
+                fields: config,
+                error: None,
+            }),
+            Request::ListBranches { call, .. } => Some(Event::Branches {
+                call: *call,
+                branches: vec!["main".to_owned(), "develop".to_owned()],
+            }),
+            _ => None,
+        }
+    }
+
+    fn refusal_event(call: swarm_protocol::CallId, message: &str) -> Event {
+        Event::Error {
+            call: Some(call),
+            id: None,
+            message: message.to_owned(),
+        }
+    }
+
+    struct Rig {
+        workspace: Entity<Workspace>,
+        window: WindowHandle<SettingsWindow>,
+        state: Entity<SettingsState>,
+        cx: VisualTestContext,
+    }
+
+    fn connected_workspace(socket: &Path, cx: &mut TestAppContext) -> Entity<Workspace> {
+        cx.update(|cx| {
+            swarm_ui::init(cx);
+            crate::actions::bind_keys(cx);
+            crate::settings::bind_keys(cx);
+        });
+        cx.executor().allow_parking();
+
+        let client = Client::connect(socket).expect("connect to the fake daemon");
+        let window = cx
+            .update(|cx| {
+                cx.open_window(gpui::WindowOptions::default(), |window, cx| {
+                    cx.new(|cx| Workspace::with_sample(window, cx))
+                })
+            })
+            .expect("the workspace window opens");
+        window
+            .update(cx, |workspace, window, cx| {
+                workspace.use_daemon(client, &[], window, cx);
+            })
+            .expect("the workspace window is open");
+
+        window.root(cx).expect("the workspace")
+    }
+
+    /// A workspace on a fake daemon with the project `demo` holding `demo` tasks, and a
+    /// second project, `other`, when it has tasks.
+    fn rig(
+        socket: &Path,
+        demo: Vec<swarm_protocol::TaskInfo>,
+        other: Vec<swarm_protocol::TaskInfo>,
+        cx: &mut TestAppContext,
+    ) -> Rig {
+        let workspace = connected_workspace(socket, cx);
+
+        let mut projects = vec![project_info(5, "demo", demo)];
+        if !other.is_empty() {
+            projects.push(project_info(6, "other", other));
+        }
+        workspace.update(cx, |workspace, cx| workspace.use_projects(&projects, cx));
+
+        settings_window(workspace, cx)
+    }
+
+    fn settings_window(workspace: Entity<Workspace>, cx: &mut TestAppContext) -> Rig {
+        let projects = workspace.read_with(cx, |workspace, _| workspace.data.projects.clone());
+        let window = cx
+            .update(|cx| {
+                link_workspace(workspace.downgrade(), cx);
+
+                open_window(None, Some(projects), cx)
+            })
+            .expect("the settings window opens");
+        let state = window
+            .read_with(cx, |settings, _| settings.state.clone())
+            .expect("the settings window is open");
+
+        let visual = VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(size(px(1280.), px(2400.)));
+
+        Rig {
+            workspace,
+            window,
+            state,
+            cx: visual,
+        }
+    }
+
+    /// One task in `demo`: the usual start.
+    fn loaded(cx: &mut TestAppContext) -> (Rig, Requests) {
+        let (socket, seen) = daemon(project_reply);
+        let mut rig = rig(&socket, vec![task_info(7, 5, "login")], Vec::new(), cx);
+
+        rig.show(0);
+        assert!(rig.wait_for_project(|project| project.load == Load::Ready));
+
+        (rig, seen)
+    }
+
+    impl Rig {
+        /// Opens the page of project number `index`.
+        fn show(&mut self, index: usize) {
+            self.window
+                .update(&mut self.cx, |settings, _, cx| {
+                    settings.select_page(Page::Project(index), cx);
+                })
+                .expect("the settings window is open");
+            redraw(&mut self.cx);
+        }
+
+        /// Opens the page and draws it, before the daemon can answer.
+        fn show_without_waiting(&mut self, index: usize) {
+            self.window
+                .update(&mut self.cx, |settings, _, cx| {
+                    settings.select_page(Page::Project(index), cx);
+                })
+                .expect("the settings window is open");
+            self.cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+
+        fn project(&self) -> ProjectSettings {
+            self.state
+                .read_with(&self.cx, |state, _| state.projects[0].clone())
+        }
+
+        fn wait_until_saved(&mut self) -> bool {
+            let state = self.state.clone();
+
+            wait_until(&mut self.cx, |cx| {
+                redraw(cx);
+
+                !state.read_with(cx, |state, _| state.saves[0].busy())
+            })
+        }
+
+        fn wait_for_project(&mut self, done: impl Fn(&ProjectSettings) -> bool) -> bool {
+            let state = self.state.clone();
+
+            wait_until(&mut self.cx, |cx| {
+                redraw(cx);
+
+                state.read_with(cx, |state, _| done(&state.projects[0]))
+            })
+        }
+
+        fn wait_for_requests(&mut self, seen: &Requests, done: impl Fn(&Requests) -> bool) -> bool {
+            wait_until(&mut self.cx, |cx| {
+                redraw(cx);
+
+                done(seen)
+            })
+        }
+
+        fn input(&self, pick: impl Fn(&ProjectInputs) -> Entity<TextInput>) -> Entity<TextInput> {
+            self.window
+                .read_with(&self.cx, |settings, _| pick(&settings.inputs.projects[0]))
+                .expect("the settings window is open")
+        }
+
+        fn text_of(&self, input: &Entity<TextInput>) -> String {
+            input.read_with(&self.cx, |input, _| input.text().to_string())
+        }
+
+        /// Types over the whole text of the input, as a user would.
+        fn type_into(&mut self, input: &Entity<TextInput>, text: &str) {
+            let focus = input.read_with(&self.cx, Focusable::focus_handle);
+
+            self.cx.update(|window, cx| window.focus(&focus, cx));
+            self.cx.simulate_keystrokes("cmd-a");
+            self.cx.simulate_input(text);
+        }
+
+        fn edit_folder(&mut self, text: &str) {
+            let folder = self.input(|inputs| inputs.worktree_folder.clone());
+
+            self.type_into(&folder, text);
+        }
+
+        fn pause(&mut self, by: Duration) {
+            self.cx.executor().advance_clock(by);
+            self.cx.run_until_parked();
+        }
+
+        fn click(&mut self, selector: &'static str) {
+            let bounds = self
+                .cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} is not on screen"));
+
+            self.cx.simulate_click(bounds.center(), Modifiers::none());
+            redraw(&mut self.cx);
+        }
+
+        fn is_on_screen(&mut self, selector: &'static str) -> bool {
+            self.cx.debug_bounds(selector).is_some()
+        }
+
+        fn app_task(&self, daemon: u64) -> crate::model::TaskId {
+            self.workspace.read_with(&self.cx, |workspace, _| {
+                workspace
+                    .data
+                    .tasks
+                    .iter()
+                    .find(|task| {
+                        task.daemon.as_ref().map(|task| task.id) == Some(DaemonTaskId(daemon))
+                    })
+                    .map(|task| task.id)
+                    .expect("the task is in the workspace")
+            })
+        }
+
+        fn open_task(&mut self, daemon: u64) {
+            let task = self.app_task(daemon);
+
+            self.workspace.update(&mut self.cx, |workspace, cx| {
+                workspace.select_task(task, cx);
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn the_page_shows_loading_and_then_the_values_of_the_daemon(cx: &mut TestAppContext) {
+        let (socket, _seen) = daemon(project_reply);
+        let mut rig = rig(&socket, vec![task_info(7, 5, "login")], Vec::new(), cx);
+
+        // The daemon answers when the executor runs, so nothing has come yet.
+        rig.show_without_waiting(0);
+        let waiting = rig.project();
+        let folder = rig.input(|inputs| inputs.worktree_folder.clone());
+        let before = rig.text_of(&folder);
+
+        assert!(rig.wait_for_project(|project| project.load == Load::Ready));
+        let shown = rig.project();
+        let texts = (
+            rig.text_of(&folder),
+            rig.text_of(&rig.input(|inputs| inputs.port_range.clone())),
+            rig.text_of(&rig.input(|inputs| inputs.ports_per_worktree.clone())),
+            rig.window
+                .read_with(&rig.cx, |settings, cx| {
+                    settings.inputs.projects[0]
+                        .setup_script
+                        .read(cx)
+                        .text()
+                        .to_string()
+                })
+                .expect("the settings window is open"),
+        );
+        let lists = rig
+            .window
+            .read_with(&rig.cx, |settings, cx| {
+                let inputs = &settings.inputs.projects[0];
+                let read = |list: &Vec<Entity<TextInput>>| -> Vec<String> {
+                    list.iter()
+                        .map(|input| input.read(cx).text().to_string())
+                        .collect()
+                };
+
+                (read(&inputs.copy), read(&inputs.checks))
+            })
+            .expect("the settings window is open");
+
+        assert_eq!(waiting.load, Load::Loading);
+        assert_eq!(before, "");
+        assert!(waiting.copy_files.is_empty() && waiting.checks.is_empty());
+        assert_eq!(shown.fields(), Ok(fields()));
+        assert_eq!(shown.branches, ["main", "develop"]);
+        assert_eq!(
+            texts,
+            (
+                ".trees".to_owned(),
+                "6000-6009".to_owned(),
+                "2".to_owned(),
+                "make setup".to_owned()
+            )
+        );
+        assert_eq!(lists.0, [".env", "CLAUDE.local.md"]);
+        assert_eq!(lists.1, ["make test", "make lint"]);
+    }
+
+    #[gpui::test]
+    fn an_edit_sends_one_save_with_the_new_value_after_the_pause(cx: &mut TestAppContext) {
+        let (mut rig, seen) = loaded(cx);
+
+        rig.edit_folder(".new");
+        rig.pause(Duration::from_millis(200));
+        let early = save_count(&seen);
+        rig.pause(Duration::from_millis(100));
+        let sent = rig.wait_for_requests(&seen, |seen| save_count(seen) == 1);
+        let idle = rig.wait_until_saved();
+        rig.pause(Duration::from_secs(2));
+        wait_a_little();
+        redraw(&mut rig.cx);
+
+        assert_eq!(early, 0);
+        assert!(sent && idle);
+        assert_eq!(
+            saves(&seen),
+            [ProjectConfigFields {
+                worktree_folder: ".new".to_owned(),
+                ..fields()
+            }]
+        );
+    }
+
+    #[gpui::test]
+    fn quick_edits_send_only_the_newest_value(cx: &mut TestAppContext) {
+        let (mut rig, seen) = loaded(cx);
+
+        rig.edit_folder(".a");
+        rig.pause(Duration::from_millis(200));
+        rig.edit_folder(".b");
+        rig.pause(Duration::from_millis(200));
+        let early = save_count(&seen);
+        rig.pause(Duration::from_millis(100));
+        let sent = rig.wait_for_requests(&seen, |seen| save_count(seen) == 1);
+        rig.pause(Duration::from_secs(2));
+        wait_a_little();
+        redraw(&mut rig.cx);
+
+        assert_eq!(early, 0);
+        assert!(sent);
+        let folders: Vec<_> = saves(&seen)
+            .into_iter()
+            .map(|fields| fields.worktree_folder)
+            .collect();
+        assert_eq!(folders, [".b"]);
+    }
+
+    fn with_folder(folder: &str) -> ProjectConfigFields {
+        ProjectConfigFields {
+            worktree_folder: folder.to_owned(),
+            ..fields()
+        }
+    }
+
+    fn confirmed(fields: ProjectConfigFields) -> ProjectSave {
+        ProjectSave {
+            confirmed: Some(fields.clone()),
+            queued: Some(fields),
+            ..ProjectSave::default()
+        }
+    }
+
+    #[test]
+    fn a_newer_edit_waits_for_the_save_on_its_way_and_then_goes_out() {
+        let mut save = confirmed(fields());
+
+        assert!(save.edited(with_folder(".a")));
+        let first = save.due();
+        assert!(save.edited(with_folder(".b")));
+        let held_back = save.due();
+        let after = save.ended(&with_folder(".a"), true);
+
+        assert_eq!(first, Due::Send(with_folder(".a")));
+        assert_eq!(held_back, Due::Wait);
+        assert_eq!(after, Due::Send(with_folder(".b")));
+        assert_eq!(save.ended(&with_folder(".b"), true), Due::Wait);
+        assert_eq!(save.confirmed, Some(with_folder(".b")));
+    }
+
+    #[test]
+    fn an_edit_during_the_pause_of_a_save_on_its_way_waits_for_its_own_pause() {
+        let mut save = confirmed(fields());
+
+        save.edited(with_folder(".a"));
+        save.due();
+        save.edited(with_folder(".b"));
+
+        // The save of ".a" ends while the pause of ".b" still runs.
+        assert_eq!(save.ended(&with_folder(".a"), true), Due::Wait);
+        assert_eq!(save.due(), Due::Send(with_folder(".b")));
+    }
+
+    #[test]
+    fn a_refused_value_is_not_sent_again_and_the_next_edit_is() {
+        let mut save = confirmed(fields());
+
+        save.edited(with_folder("/bad"));
+        let sent = save.due();
+        let after_refusal = save.ended(&with_folder("/bad"), false);
+        let same_again = save.edited(with_folder("/bad"));
+        save.edited(with_folder(".fine"));
+
+        assert_eq!(sent, Due::Send(with_folder("/bad")));
+        assert_eq!(after_refusal, Due::Wait);
+        assert!(!same_again);
+        assert_eq!(save.due(), Due::Send(with_folder(".fine")));
+        assert_eq!(save.confirmed, Some(fields()));
+    }
+
+    #[test]
+    fn going_back_to_what_the_daemon_holds_sends_nothing() {
+        let mut save = confirmed(fields());
+
+        save.edited(with_folder(".a"));
+        save.edited(fields());
+
+        assert_eq!(save.due(), Due::Same);
+    }
+
+    #[test]
+    fn going_back_while_a_save_is_on_its_way_sends_the_old_value_after_it() {
+        let mut save = confirmed(fields());
+
+        save.edited(with_folder(".a"));
+        save.due();
+        save.edited(fields());
+        save.due();
+
+        assert_eq!(save.ended(&with_folder(".a"), true), Due::Send(fields()));
+    }
+
+    #[gpui::test]
+    fn a_refusal_shows_its_message_and_keeps_the_value_until_a_save_works(cx: &mut TestAppContext) {
+        let (socket, seen) = daemon(|request| match request {
+            Request::SaveProjectConfig { call, fields, .. } if fields.worktree_folder == "/bad" => {
+                Some(refusal_event(
+                    *call,
+                    "the worktree folder must be inside the repository",
+                ))
+            }
+            other => project_reply(other),
+        });
+        let mut rig = rig(&socket, vec![task_info(7, 5, "login")], Vec::new(), cx);
+        rig.show(0);
+        assert!(rig.wait_for_project(|project| project.load == Load::Ready));
+
+        rig.edit_folder("/bad");
+        rig.pause(Duration::from_millis(300));
+        let refused = rig.wait_for_project(|project| project.refusal.is_some());
+        let message = rig.project().refusal;
+        let shown = rig.is_on_screen("project-refusal");
+        let folder = rig.input(|inputs| inputs.worktree_folder.clone());
+        let kept = (rig.text_of(&folder), rig.project().worktree_folder);
+
+        rig.edit_folder(".fine");
+        rig.pause(Duration::from_millis(300));
+        let cleared = rig.wait_for_project(|project| project.refusal.is_none());
+        redraw(&mut rig.cx);
+        let gone = !rig.is_on_screen("project-refusal");
+
+        assert!(refused);
+        assert_eq!(
+            message.as_deref(),
+            Some("the worktree folder must be inside the repository")
+        );
+        assert!(shown);
+        assert_eq!(kept, ("/bad".to_owned(), "/bad".to_owned()));
+        assert!(cleared && gone);
+        assert_eq!(save_count(&seen), 2);
+    }
+
+    #[gpui::test]
+    fn a_parse_error_makes_the_fields_read_only_and_reload_asks_again(cx: &mut TestAppContext) {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let (socket, seen) = daemon({
+            let asked = Arc::clone(&asked);
+
+            move |request| match request {
+                Request::ProjectConfig { call, .. } => {
+                    let broken = asked.fetch_add(1, Ordering::SeqCst) == 0;
+                    let (config, error) = if broken {
+                        (
+                            ProjectConfigFields::default(),
+                            Some("TOML parse error at line 3, column 1".to_owned()),
+                        )
+                    } else {
+                        (fields(), None)
+                    };
+
+                    Some(Event::ProjectConfig {
+                        call: *call,
+                        fields: config,
+                        error,
+                    })
+                }
+                other => project_reply(other),
+            }
+        });
+        let mut rig = rig(&socket, vec![task_info(7, 5, "login")], Vec::new(), cx);
+
+        rig.show(0);
+        assert!(rig.wait_for_project(|project| matches!(project.load, Load::Unreadable(_))));
+        let error = rig.project().load;
+        let banner = (
+            rig.is_on_screen("config-error"),
+            rig.is_on_screen("reload-config"),
+        );
+
+        rig.edit_folder("typed");
+        rig.pause(Duration::from_secs(1));
+        wait_a_little();
+        redraw(&mut rig.cx);
+        let folder = rig.project().worktree_folder;
+
+        rig.click("reload-config");
+        let ready = rig.wait_for_project(|project| project.load == Load::Ready);
+        redraw(&mut rig.cx);
+        let after = (
+            rig.project().worktree_folder,
+            rig.is_on_screen("config-error"),
+        );
+
+        assert_eq!(
+            error,
+            Load::Unreadable("TOML parse error at line 3, column 1".into())
+        );
+        assert_eq!(banner, (true, true));
+        assert_eq!(folder, "");
+        assert_eq!(save_count(&seen), 0);
+        assert!(ready);
+        assert_eq!(after, (".trees".to_owned(), false));
+        assert_eq!(
+            count(&seen, |request| matches!(
+                request,
+                Request::ProjectConfig { .. }
+            )),
+            2
+        );
+        assert_eq!(asked.load(Ordering::SeqCst), 2);
+    }
+
+    #[gpui::test]
+    fn the_base_branch_dropdown_lists_the_branches_and_the_default(cx: &mut TestAppContext) {
+        let (socket, seen) = daemon(|request| {
+            config_reply(
+                request,
+                ProjectConfigFields {
+                    base_branch: None,
+                    ..fields()
+                },
+            )
+        });
+        let mut rig = rig(&socket, vec![task_info(7, 5, "login")], Vec::new(), cx);
+        rig.show(0);
+        assert!(rig.wait_for_project(|project| project.load == Load::Ready));
+        let project = rig.project();
+        let listed = count(
+            &seen,
+            |request| matches!(request, Request::ListBranches { project, .. } if *project == DaemonProjectId(5)),
+        );
+
+        rig.click("base-branch");
+        rig.cx.simulate_keystrokes("down down enter");
+        rig.pause(Duration::from_millis(300));
+        assert!(rig.wait_for_requests(&seen, |seen| save_count(seen) == 1));
+        assert!(rig.wait_until_saved());
+
+        rig.click("base-branch");
+        rig.cx.simulate_keystrokes("up up enter");
+        rig.pause(Duration::from_millis(300));
+        let second = rig.wait_for_requests(&seen, |seen| save_count(seen) == 2);
+
+        assert_eq!(
+            project.base_branch_options(),
+            ["Default branch", "main", "develop"]
+        );
+        assert_eq!(project.base_branch_index(), 0);
+        assert_eq!(listed, 1);
+        assert!(second);
+        let chosen: Vec<_> = saves(&seen)
+            .into_iter()
+            .map(|fields| fields.base_branch)
+            .collect();
+        assert_eq!(chosen, [Some("develop".to_owned()), None]);
+    }
+
+    fn passed_run(task: u64) -> ChecksRun {
+        let check = |command: &str, state| LocalCheck {
+            command: command.to_owned(),
+            state,
+            terminal: None,
+            exit: (state == CheckState::Passed).then_some(ExitStatus::Code(0)),
+            duration_ms: Some(1_000),
+        };
+
+        ChecksRun {
+            task: DaemonTaskId(task),
+            commit: "abc".to_owned(),
+            clean: true,
+            required: true,
+            checks: vec![
+                check("make test", CheckState::Passed),
+                check("make lint", CheckState::Passed),
+            ],
+            pre_push_hook: None,
+        }
+    }
+
+    fn send_run(rig: &mut Rig, run: ChecksRun) {
+        rig.workspace.update(&mut rig.cx, |workspace, cx| {
+            workspace.pr_event(PrEvent::Checks(Box::new(run)), cx);
+        });
+        redraw(&mut rig.cx);
+    }
+
+    fn tasks_of(rig: &Rig) -> (bool, bool) {
+        rig.state.read_with(&rig.cx, |state, cx| {
+            (state.can_run_checks(0, cx), state.can_run_checks(1, cx))
+        })
+    }
+
+    #[gpui::test]
+    fn run_checks_now_runs_the_task_open_in_the_workspace_once(cx: &mut TestAppContext) {
+        let (socket, seen) = daemon(project_reply);
+        let mut rig = rig(
+            &socket,
+            vec![task_info(7, 5, "login"), task_info(8, 5, "logout")],
+            vec![task_info(9, 6, "billing")],
+            cx,
+        );
+        rig.open_task(8);
+        rig.show(0);
+        assert!(rig.wait_for_project(|project| project.load == Load::Ready));
+
+        // Two clicks before the daemon can answer start one run.
+        rig.state.update(&mut rig.cx, |state, cx| {
+            state.run_checks(0, cx);
+            state.run_checks(0, cx);
+        });
+        let running = rig.project().checking.pill();
+        redraw(&mut rig.cx);
+        let asked = rig.wait_for_requests(&seen, |seen| !run_requests(seen).is_empty());
+        let shown = rig.is_on_screen("run-checks-result");
+        let started = rig.project().checking.pill();
+        send_run(&mut rig, passed_run(8));
+        let done = rig.project().checking.pill();
+
+        assert!(asked && shown);
+        assert_eq!(run_requests(&seen), [DaemonTaskId(8)]);
+        assert_eq!(running, Some((AgentStatus::Working, "Running".into())));
+        assert_eq!(started, Some((AgentStatus::Working, "Running".into())));
+        assert_eq!(done, Some((AgentStatus::Done, "2 of 2 passed".into())));
+    }
+
+    #[gpui::test]
+    fn the_run_checks_button_starts_a_run(cx: &mut TestAppContext) {
+        let (socket, seen) = daemon(project_reply);
+        let mut rig = rig(&socket, vec![task_info(7, 5, "login")], Vec::new(), cx);
+        rig.show(0);
+        assert!(rig.wait_for_project(|project| project.load == Load::Ready));
+
+        rig.click("run-checks");
+        let asked = rig.wait_for_requests(&seen, |seen| !run_requests(seen).is_empty());
+        wait_a_little();
+
+        assert!(asked);
+        assert_eq!(run_requests(&seen), [DaemonTaskId(7)]);
+    }
+
+    #[gpui::test]
+    fn run_checks_now_falls_back_to_the_first_open_task_of_the_project(cx: &mut TestAppContext) {
+        let (socket, seen) = daemon(project_reply);
+        let mut rig = rig(
+            &socket,
+            vec![task_info(7, 5, "login"), task_info(8, 5, "logout")],
+            vec![task_info(9, 6, "billing")],
+            cx,
+        );
+        rig.open_task(9);
+        rig.show(0);
+        assert!(rig.wait_for_project(|project| project.load == Load::Ready));
+
+        rig.click("run-checks");
+        let first = rig.wait_for_requests(&seen, |seen| run_requests(seen).len() == 1);
+        rig.show(1);
+        assert!(rig.wait_for_requests(&seen, |seen| {
+            count(seen, |request| matches!(request, Request::ProjectConfig { project, .. } if *project == DaemonProjectId(6))) == 1
+        }));
+        rig.click("run-checks");
+        let second = rig.wait_for_requests(&seen, |seen| run_requests(seen).len() == 2);
+
+        assert!(first && second);
+        assert_eq!(run_requests(&seen), [DaemonTaskId(7), DaemonTaskId(9)]);
+    }
+
+    #[gpui::test]
+    fn run_checks_now_is_disabled_without_an_open_task(cx: &mut TestAppContext) {
+        let (socket, seen) = daemon(project_reply);
+        let mut rig = rig(&socket, Vec::new(), vec![task_info(9, 6, "billing")], cx);
+        rig.show(0);
+        assert!(rig.wait_for_project(|project| project.load == Load::Ready));
+        let (without, with) = tasks_of(&rig);
+
+        rig.click("run-checks");
+        rig.pause(Duration::from_secs(1));
+        wait_a_little();
+        redraw(&mut rig.cx);
+
+        assert!(!without);
+        assert!(with);
+        assert_eq!(run_requests(&seen), []);
+        assert_eq!(rig.project().checking, ChecksStatus::Idle);
+    }
+
+    #[gpui::test]
+    fn run_checks_now_shows_the_refusal_of_the_daemon(cx: &mut TestAppContext) {
+        let (socket, _seen) = daemon(|request| match request {
+            Request::RunChecks { call, .. } => {
+                Some(refusal_event(*call, "no checks are configured"))
+            }
+            other => project_reply(other),
+        });
+        let mut rig = rig(&socket, vec![task_info(7, 5, "login")], Vec::new(), cx);
+        rig.show(0);
+        assert!(rig.wait_for_project(|project| project.load == Load::Ready));
+
+        rig.click("run-checks");
+        let refused =
+            rig.wait_for_project(|project| matches!(project.checking, ChecksStatus::Refused(_)));
+
+        assert!(refused);
+        assert_eq!(
+            rig.project().checking.pill(),
+            Some((AgentStatus::Error, "no checks are configured".into()))
+        );
+    }
+
+    #[test]
+    fn a_run_adds_up_to_a_short_result() {
+        let run = |states: &[CheckState]| ChecksRun {
+            checks: states
+                .iter()
+                .map(|state| LocalCheck {
+                    command: "make".to_owned(),
+                    state: *state,
+                    terminal: None,
+                    exit: None,
+                    duration_ms: None,
+                })
+                .collect(),
+            ..passed_run(1)
+        };
+
+        assert_eq!(
+            run_summary(&run(&[CheckState::Passed, CheckState::Running])),
+            (AgentStatus::Working, "Running".to_owned())
+        );
+        assert_eq!(
+            run_summary(&run(&[
+                CheckState::Passed,
+                CheckState::Failed,
+                CheckState::Waiting
+            ])),
+            (AgentStatus::Error, "1 of 3 failed".to_owned())
+        );
+        assert_eq!(
+            run_summary(&run(&[CheckState::Passed, CheckState::Stopped])),
+            (AgentStatus::Blocked, "Stopped".to_owned())
+        );
+        assert_eq!(
+            run_summary(&run(&[])),
+            (AgentStatus::Idle, "No checks".to_owned())
+        );
+        assert_eq!(
+            run_summary(&run(&[CheckState::Passed])),
+            (AgentStatus::Done, "1 of 1 passed".to_owned())
+        );
+    }
+
+    fn prompt(name: &str, layer: PromptLayer, project: Option<&str>) -> PromptInfo {
+        PromptInfo {
+            name: name.to_owned(),
+            layer,
+            user_path: PathBuf::from(format!("/home/sam/.config/swarm/prompts/{name}.md")),
+            project_path: project.map(PathBuf::from),
+        }
+    }
+
+    #[gpui::test]
+    fn the_prompts_section_lists_the_project_overrides_and_open_opens_the_file(
+        cx: &mut TestAppContext,
+    ) {
+        let (socket, _seen) = daemon(|request| match request {
+            Request::Prompts { call, project } => {
+                assert_eq!(*project, Some(DaemonProjectId(5)));
+
+                Some(Event::Prompts {
+                    call: *call,
+                    prompts: vec![
+                        prompt(
+                            "orchestrator",
+                            PromptLayer::Project,
+                            Some("/tmp/demo/.swarm/prompts/orchestrator.md"),
+                        ),
+                        prompt("worker", PromptLayer::BuiltIn, None),
+                        prompt(
+                            "reviewer",
+                            PromptLayer::Project,
+                            Some("/tmp/demo/.swarm/prompts/reviewer.md"),
+                        ),
+                    ],
+                })
+            }
+            other => project_reply(other),
+        });
+        let mut rig = rig(&socket, vec![task_info(7, 5, "login")], Vec::new(), cx);
+        let opened = Rc::new(RefCell::new(Vec::<PathBuf>::new()));
+        rig.cx.update(|_, cx| {
+            let opened = Rc::clone(&opened);
+
+            use_opener(
+                Rc::new(move |path, _| opened.borrow_mut().push(path.to_path_buf())),
+                cx,
+            );
+        });
+
+        rig.show(0);
+        assert!(rig.wait_for_project(|project| project.load == Load::Ready));
+        redraw(&mut rig.cx);
+        let names: Vec<_> = rig
+            .project()
+            .prompts
+            .into_iter()
+            .map(|prompt| prompt.name)
+            .collect();
+        let rows = (
+            rig.is_on_screen("project-prompts"),
+            rig.is_on_screen("open-prompt-0"),
+            rig.is_on_screen("open-prompt-1"),
+            rig.is_on_screen("open-prompt-2"),
+        );
+
+        rig.click("open-prompt-1");
+
+        assert_eq!(names, ["orchestrator", "reviewer"]);
+        assert_eq!(rows, (true, true, true, false));
+        assert_eq!(
+            *opened.borrow(),
+            [PathBuf::from("/tmp/demo/.swarm/prompts/reviewer.md")]
+        );
+    }
+
+    #[gpui::test]
+    fn the_prompts_section_is_hidden_without_project_overrides(cx: &mut TestAppContext) {
+        let (mut rig, _seen) = loaded(cx);
+        redraw(&mut rig.cx);
+
+        assert!(rig.project().prompts.is_empty());
+        assert!(!rig.is_on_screen("project-prompts"));
+    }
+
+    #[gpui::test]
+    fn sample_projects_keep_their_values_and_save_nothing(cx: &mut TestAppContext) {
+        let (socket, seen) = daemon(project_reply);
+        let workspace = connected_workspace(&socket, cx);
+        let mut rig = settings_window(workspace, cx);
+
+        rig.show(0);
+        rig.edit_folder(".edited");
+        rig.pause(Duration::from_secs(1));
+        wait_a_little();
+        redraw(&mut rig.cx);
+
+        let project = rig.project();
+        assert_eq!(project.load, Load::Sample);
+        assert_eq!(project.worktree_folder, ".edited");
+        assert_eq!(project.port_range, "5170-5199");
+        let asked = count(&seen, |request| {
+            matches!(
+                request,
+                Request::ProjectConfig { .. }
+                    | Request::SaveProjectConfig { .. }
+                    | Request::ListBranches { .. }
+                    | Request::Prompts { .. }
+            )
+        });
+        assert_eq!(asked, 0);
+    }
+
+    #[gpui::test]
+    fn added_and_removed_rows_are_saved_and_blank_rows_are_not(cx: &mut TestAppContext) {
+        let (mut rig, seen) = loaded(cx);
+
+        rig.click("add-check");
+        rig.pause(Duration::from_secs(1));
+        wait_a_little();
+        redraw(&mut rig.cx);
+        let blank = save_count(&seen);
+        rig.cx.simulate_input("make fmt");
+        rig.pause(Duration::from_millis(300));
+        let added = rig.wait_for_requests(&seen, |seen| save_count(seen) == 1);
+        assert!(rig.wait_until_saved());
+
+        rig.click("copy-remove-0");
+        rig.pause(Duration::from_millis(300));
+        let removed = rig.wait_for_requests(&seen, |seen| save_count(seen) == 2);
+
+        assert_eq!(blank, 0);
+        assert!(added && removed);
+        let sent = saves(&seen);
+        assert_eq!(sent[0].checks, ["make test", "make lint", "make fmt"]);
+        assert_eq!(sent[1].copy, ["CLAUDE.local.md"]);
+        assert_eq!(sent[1].teardown, "make clean");
+    }
+}

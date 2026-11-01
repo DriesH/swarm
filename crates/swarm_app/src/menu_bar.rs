@@ -23,8 +23,9 @@ use gpui::{
 
 use self::place::Anchor;
 use self::popover::Popover;
-pub(crate) use self::summary::Look;
+pub(crate) use self::popover::usage_section;
 use self::summary::Summary;
+pub(crate) use self::summary::{Look, usage_sections};
 use crate::workspace::Workspace;
 
 /// A click on the status item blurs the popover first, and that closes it. Without this wait

@@ -1,7 +1,7 @@
 //! A live terminal without a daemon, for the snapshot and frame-stats runs: the sample
 //! data has no real terminals, so this feeds one view a fixed screen.
 
-use gpui::{Context, Window};
+use gpui::{Context, SharedString, Window};
 use swarm_term::{
     Colors, Cursor, CursorStyle, History, Row, Screen, Snapshot, TerminalChannels, TerminalOutput,
     TextFlags, TextSpan,
@@ -9,6 +9,7 @@ use swarm_term::{
 use swarm_term_view::palette_for;
 use swarm_ui::ActiveTheme as _;
 
+use crate::model::TerminalId;
 use crate::workspace::Workspace;
 
 const COLUMNS: u16 = 100;
@@ -41,6 +42,35 @@ pub(crate) fn attach_terminal(
         return;
     };
     let (terminal, name) = (agent.terminal, agent.name.clone());
+
+    attach(workspace, terminal, name, window, cx);
+}
+
+/// Gives every agent of the open task a live terminal, so the tiles show the terminal font.
+#[cfg(feature = "snapshot")]
+pub(crate) fn attach_task_terminals(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let agents: Vec<_> = workspace
+        .data
+        .agents_of(workspace.active_task().id)
+        .map(|agent| (agent.terminal, agent.name.clone()))
+        .collect();
+
+    for (terminal, name) in agents {
+        attach(workspace, terminal, name, window, cx);
+    }
+}
+
+fn attach(
+    workspace: &mut Workspace,
+    terminal: TerminalId,
+    name: SharedString,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
     if workspace.live_terminals.contains_key(&terminal) {
         return;
     }

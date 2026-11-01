@@ -511,6 +511,26 @@ fn open_swarm_terminal_live(
     }
 }
 
+/// Every tile of the open task runs a live terminal at the font size the settings hold.
+fn open_terminal_font(
+    points: u8,
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    crate::settings::set_terminal_font_size(points, cx);
+    crate::demo::attach_task_terminals(workspace, window, cx);
+    cx.notify();
+}
+
+fn open_font_13(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    open_terminal_font(13, workspace, window, cx);
+}
+
+fn open_font_16(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    open_terminal_font(16, workspace, window, cx);
+}
+
 fn show_empty(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
     workspace.use_projects(&[], cx);
 }
@@ -881,6 +901,21 @@ pub(crate) fn run(directory: PathBuf, cx: &mut App) {
                 Appearance::Dark,
                 "workspace-unavailable-dark.png",
                 Some(show_unavailable),
+            ),
+            (
+                Appearance::Light,
+                "workspace-font-13-light.png",
+                Some(open_font_13),
+            ),
+            (
+                Appearance::Light,
+                "workspace-font-16-light.png",
+                Some(open_font_16),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-font-16-dark.png",
+                Some(open_font_16),
             ),
         ] {
             if filter

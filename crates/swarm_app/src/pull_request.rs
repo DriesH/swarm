@@ -993,6 +993,7 @@ impl Workspace {
                     *superseded = true;
                 }
 
+                crate::settings::checks_changed(&run, cx);
                 self.data.set_checks(*run);
                 cx.notify();
             }

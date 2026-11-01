@@ -90,46 +90,167 @@ const FOCUS_KEYS: [&str; 9] = [
     "cmd-1", "cmd-2", "cmd-3", "cmd-4", "cmd-5", "cmd-6", "cmd-7", "cmd-8", "cmd-9",
 ];
 
-pub(crate) fn bind_keys(cx: &mut App) {
-    let root = Some(ROOT_CONTEXT);
+/// The heading of a list of shortcuts on the Keyboard page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ShortcutGroup {
+    Workspace,
+    Terminals,
+    Review,
+    FileTree,
+}
 
-    let mut bindings = vec![
-        KeyBinding::new("cmd-shift-r", ShowReview, root),
-        KeyBinding::new("cmd-t", NewTask, root),
-        KeyBinding::new("cmd-shift-t", PlanWithOrchestrator, root),
-        KeyBinding::new("cmd-alt-t", NewTerminal, root),
-        KeyBinding::new("cmd-,", OpenSettings, root),
-        KeyBinding::new("cmd-k", ToggleCommandPalette, root),
-        KeyBinding::new("cmd-q", Quit, None),
+impl ShortcutGroup {
+    pub(crate) const ALL: [Self; 4] = [
+        Self::Workspace,
+        Self::Terminals,
+        Self::Review,
+        Self::FileTree,
     ];
 
-    bindings.extend(
-        FOCUS_KEYS
-            .iter()
-            .enumerate()
-            .map(|(index, key)| KeyBinding::new(key, FocusAgent { index }, root)),
-    );
+    pub(crate) fn title(self) -> &'static str {
+        match self {
+            Self::Workspace => "Workspace",
+            Self::Terminals => "Terminals",
+            Self::Review => "Review",
+            Self::FileTree => "File tree",
+        }
+    }
+}
+
+/// A key binding with the words the Keyboard page shows for it. Bindings that do the same
+/// thing for another key, like the nine agent keys, share a name.
+pub(crate) struct Shortcut {
+    pub group: ShortcutGroup,
+    pub name: &'static str,
+    pub binding: KeyBinding,
+}
+
+/// Every key binding of the app. [`bind_keys`] registers them and the Keyboard page lists
+/// them, so a new binding shows up on the page without more work.
+pub(crate) fn shortcuts() -> Vec<Shortcut> {
+    use ShortcutGroup::{FileTree, Review, Terminals, Workspace};
+
+    let root = Some(ROOT_CONTEXT);
+    let shortcut = |group, name, binding| Shortcut {
+        group,
+        name,
+        binding,
+    };
+
+    let mut shortcuts = vec![
+        shortcut(
+            Workspace,
+            "Open Review",
+            KeyBinding::new("cmd-shift-r", ShowReview, root),
+        ),
+        shortcut(
+            Workspace,
+            "New task",
+            KeyBinding::new("cmd-t", NewTask, root),
+        ),
+        shortcut(
+            Workspace,
+            "Plan with orchestrator",
+            KeyBinding::new("cmd-shift-t", PlanWithOrchestrator, root),
+        ),
+        shortcut(
+            Terminals,
+            "New terminal",
+            KeyBinding::new("cmd-alt-t", NewTerminal, root),
+        ),
+        shortcut(
+            Workspace,
+            "Open settings",
+            KeyBinding::new("cmd-,", OpenSettings, root),
+        ),
+        shortcut(
+            Workspace,
+            "Command palette",
+            KeyBinding::new("cmd-k", ToggleCommandPalette, root),
+        ),
+        shortcut(Workspace, "Quit", KeyBinding::new("cmd-q", Quit, None)),
+    ];
+
+    shortcuts.extend(FOCUS_KEYS.iter().enumerate().map(|(index, key)| {
+        shortcut(
+            Terminals,
+            "Focus agent",
+            KeyBinding::new(key, FocusAgent { index }, root),
+        )
+    }));
 
     let review = Some(REVIEW_KEYS);
     let body = Some(BODY_KEYS);
     let tree = Some(FILE_TREE_CONTEXT);
-    bindings.extend([
-        KeyBinding::new("j", NextFile, review),
-        KeyBinding::new("k", PreviousFile, review),
-        KeyBinding::new("v", ToggleViewed, review),
-        KeyBinding::new("c", CommentOnLine, review),
-        KeyBinding::new("up", PreviousLine, body),
-        KeyBinding::new("down", NextLine, body),
-        KeyBinding::new("up", TreePrevious, tree),
-        KeyBinding::new("down", TreeNext, tree),
-        KeyBinding::new("left", TreeCollapse, tree),
-        KeyBinding::new("right", TreeExpand, tree),
-        KeyBinding::new("enter", TreeActivate, tree),
-        KeyBinding::new("space", TreeActivate, tree),
-        KeyBinding::new("escape", CancelComment, Some(COMPOSER_CONTEXT)),
-        KeyBinding::new("escape", CancelReply, Some(REPLY_CONTEXT)),
+    shortcuts.extend([
+        shortcut(Review, "Next file", KeyBinding::new("j", NextFile, review)),
+        shortcut(
+            Review,
+            "Previous file",
+            KeyBinding::new("k", PreviousFile, review),
+        ),
+        shortcut(
+            Review,
+            "Mark file viewed",
+            KeyBinding::new("v", ToggleViewed, review),
+        ),
+        shortcut(
+            Review,
+            "Comment on line",
+            KeyBinding::new("c", CommentOnLine, review),
+        ),
+        shortcut(
+            Review,
+            "Previous line",
+            KeyBinding::new("up", PreviousLine, body),
+        ),
+        shortcut(Review, "Next line", KeyBinding::new("down", NextLine, body)),
+        shortcut(
+            FileTree,
+            "Previous row",
+            KeyBinding::new("up", TreePrevious, tree),
+        ),
+        shortcut(
+            FileTree,
+            "Next row",
+            KeyBinding::new("down", TreeNext, tree),
+        ),
+        shortcut(
+            FileTree,
+            "Close folder",
+            KeyBinding::new("left", TreeCollapse, tree),
+        ),
+        shortcut(
+            FileTree,
+            "Open folder",
+            KeyBinding::new("right", TreeExpand, tree),
+        ),
+        shortcut(
+            FileTree,
+            "Open row",
+            KeyBinding::new("enter", TreeActivate, tree),
+        ),
+        shortcut(
+            FileTree,
+            "Open row",
+            KeyBinding::new("space", TreeActivate, tree),
+        ),
+        shortcut(
+            Review,
+            "Cancel comment",
+            KeyBinding::new("escape", CancelComment, Some(COMPOSER_CONTEXT)),
+        ),
+        shortcut(
+            Review,
+            "Cancel reply",
+            KeyBinding::new("escape", CancelReply, Some(REPLY_CONTEXT)),
+        ),
     ]);
 
-    cx.bind_keys(bindings);
+    shortcuts
+}
+
+pub(crate) fn bind_keys(cx: &mut App) {
+    cx.bind_keys(shortcuts().into_iter().map(|shortcut| shortcut.binding));
     cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
 }

@@ -1380,14 +1380,24 @@ impl Workspace {
         self.data.update_process(terminal, &title, info);
     }
 
-    /// Reads the cell size of the terminal font once, to size tiles in cells.
-    pub(crate) fn measure_cells(&mut self, window: &mut Window, cx: &Context<Self>) {
-        if self.cell_size.is_some() {
+    /// Reads the cell size of the terminal font, to size tiles in cells. A new font size in
+    /// the settings measures again and reaches every terminal view, so a tile keeps its
+    /// pixels and gets more or fewer columns and rows.
+    pub(crate) fn measure_cells(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let points = crate::settings::terminal_font_size(cx);
+
+        if self.cell_size.is_some() && (self.font_size - points).abs() < f32::EPSILON {
             return;
         }
 
-        let size = TerminalView::cell_size(window, cx);
+        let size = TerminalView::cell_size(points, window, cx);
         self.cell_size = Some((f32::from(size.width), f32::from(size.height)));
+        self.font_size = points;
+
+        for live in self.live_terminals.values() {
+            live.view
+                .update(cx, |view, cx| view.set_font_size(points, window, cx));
+        }
     }
 
     /// What a screen reader announces for a live view.
@@ -1636,7 +1646,8 @@ impl Workspace {
             width: planned.width - px(CHROME_WIDTH),
             height: planned.height - px(CHROME_HEIGHT),
         };
-        let measured = TerminalView::size_for(body, window, cx);
+        let font_size = crate::settings::terminal_font_size(cx);
+        let measured = TerminalView::size_for(body, font_size, window, cx);
 
         if self.terminal_area.is_some() {
             return measured;
@@ -1687,6 +1698,8 @@ impl Workspace {
     ) -> LiveTerminal {
         let input = channels.input.clone();
         let view = cx.new(|cx| TerminalView::new(channels, accessible_name, window, cx));
+        let points = crate::settings::terminal_font_size(cx);
+        view.update(cx, |view, cx| view.set_font_size(points, window, cx));
 
         // Both the tile and the Swarm view's Terminal tab show this view, so this is the
         // only place that decides who may type.
@@ -1993,9 +2006,19 @@ pub(crate) mod tests {
                     draft: None,
                 },
             }),
-            Request::DraftPr { call, .. } | Request::StopAgents { call } => {
-                Some(Event::Done { call: *call })
-            }
+            Request::ProjectConfig { call, .. } => Some(Event::ProjectConfig {
+                call: *call,
+                fields: swarm_protocol::ProjectConfigFields::default(),
+                error: None,
+            }),
+            Request::Prompts { call, .. } => Some(Event::Prompts {
+                call: *call,
+                prompts: Vec::new(),
+            }),
+            Request::DraftPr { call, .. }
+            | Request::StopAgents { call }
+            | Request::SaveProjectConfig { call, .. }
+            | Request::RunChecks { call, .. } => Some(Event::Done { call: *call }),
             Request::PrStatus { call, .. } => Some(Event::Error {
                 call: Some(*call),
                 id: None,
