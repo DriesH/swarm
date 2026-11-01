@@ -19,9 +19,9 @@ use crate::{
     AgentChange, AgentId, AgentInfo, AgentKind, CallId, ChecksRun, CloseCheck, CommentId,
     CreateTask, CreateTerminal, Event, FileDiff, FrameError, GH_SECS, GithubStatus, MergeMethod,
     MessageId, MessageInfo, NewComment, Notice, PUSH_SECS, Paths, PrDraft, PrPanel,
-    ProjectConfigFields, ProjectId, ProjectInfo, PromptInfo, PullRequest, Request, ReviewComment,
-    ReviewSource, SwarmStats, SystemCheck, TaskDiff, TaskId, TaskInfo, TerminalId, TerminalInfo,
-    Usage, VERSION, check_private_dir, read, write,
+    ProjectConfigFields, ProjectId, ProjectInfo, PromptInfo, PullRequest, RemoveCheck, Request,
+    ReviewComment, ReviewSource, SwarmStats, SystemCheck, TaskDiff, TaskId, TaskInfo, TerminalId,
+    TerminalInfo, Usage, VERSION, check_private_dir, read, write,
 };
 
 /// Local checks moved on, or the orchestrator sent a pull request draft.
@@ -467,12 +467,37 @@ impl Client {
         }
     }
 
-    pub fn remove_project(&self, project: ProjectId) -> Result<(), ClientError> {
-        self.done(
-            |call| Request::RemoveProject { call, project },
-            "RemoveProject",
-            self.reply_timeout,
-        )
+    /// What removing the project would throw away.
+    pub fn check_remove_project(&self, project: ProjectId) -> Result<RemoveCheck, ClientError> {
+        let timeout = self.reply_timeout.max(GIT_TIMEOUT);
+        let request = |call| Request::CheckRemoveProject { call, project };
+
+        match self.call_with_timeout(request, None, timeout)? {
+            Event::RemoveCheck { check, .. } => Ok(check),
+            other => Err(unexpected("CheckRemoveProject", &other)),
+        }
+    }
+
+    /// Closes the project's tasks and removes it, refused when it would now lose more
+    /// than `confirmed`. Each task may take as long as a close.
+    pub fn remove_project(
+        &self,
+        project: ProjectId,
+        confirmed: RemoveCheck,
+    ) -> Result<(), ClientError> {
+        let closes = u32::try_from(confirmed.tasks.len())
+            .unwrap_or(u32::MAX)
+            .saturating_add(1);
+        let timeout = self
+            .reply_timeout
+            .max(CLOSE_TASK_TIMEOUT.saturating_mul(closes));
+        let request = |call| Request::RemoveProject {
+            call,
+            project,
+            confirmed,
+        };
+
+        self.done(request, "RemoveProject", timeout)
     }
 
     pub fn create_task(&self, task: CreateTask) -> Result<TaskInfo, ClientError> {
@@ -1175,6 +1200,9 @@ fn read_events(
             }
             Event::CloseCheck { call, check } => {
                 deliver(shared, call, Event::CloseCheck { call, check });
+            }
+            Event::RemoveCheck { call, check } => {
+                deliver(shared, call, Event::RemoveCheck { call, check });
             }
             Event::Done { call } => deliver(shared, call, Event::Done { call }),
             Event::Comments { call, comments } => {

@@ -845,6 +845,20 @@ pub struct CloseCheck {
     pub merged_branches: Vec<String>,
 }
 
+/// What closing one open task of a project would throw away.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct TaskCloseCheck {
+    pub task: TaskId,
+    pub name: String,
+    pub check: CloseCheck,
+}
+
+/// What removing a project would throw away: the close check of each open task.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct RemoveCheck {
+    pub tasks: Vec<TaskCloseCheck>,
+}
+
 /// Matches a reply to its request, so a late reply never answers a newer call.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CallId(pub u32);
@@ -887,12 +901,19 @@ pub enum Request {
         call: CallId,
         path: PathBuf,
     },
-    /// Forgets the project: stops its Start orchestrator and removes it from the store.
-    /// Its files, branches and worktrees stay on disk. Refused while it has open tasks.
-    /// Answered with [`Event::Done`].
+    /// Answered with [`Event::RemoveCheck`].
+    CheckRemoveProject {
+        call: CallId,
+        project: ProjectId,
+    },
+    /// Closes every open task as [`Request::CloseTask`] does, stops the Start
+    /// orchestrator and removes the project from the store. The files in the project
+    /// root stay. Refused when a task is open that `confirmed` does not list, or when a
+    /// task would lose more than its check showed. Answered with [`Event::Done`].
     RemoveProject {
         call: CallId,
         project: ProjectId,
+        confirmed: RemoveCheck,
     },
     /// Creates the task branch and task worktree, copies files, reserves ports and
     /// starts the setup script in a process terminal. Answered with [`Event::TaskCreated`].
@@ -1228,6 +1249,10 @@ pub enum Event {
     CloseCheck {
         call: CallId,
         check: CloseCheck,
+    },
+    RemoveCheck {
+        call: CallId,
+        check: RemoveCheck,
     },
     /// A request that has no other answer succeeded.
     Done {
