@@ -64,6 +64,70 @@ pub(crate) fn attach_task_terminals(
     }
 }
 
+/// The lines of a Homebrew install, for the terminal under a row of the system check, with
+/// the index of the color of each one.
+#[cfg(feature = "snapshot")]
+const INSTALL_LINES: [(&str, Option<usize>); 4] = [
+    ("$ brew install gh", None),
+    ("==> Fetching gh", Some(8)),
+    ("==> Pouring gh--bottle.tar.gz", Some(8)),
+    ("==> Installing gh\u{2026}", Some(4)),
+];
+
+/// A terminal that shows [`INSTALL_LINES`] and then waits.
+#[cfg(feature = "snapshot")]
+pub(crate) fn install_output(cx: &gpui::App) -> TerminalChannels {
+    let (input, input_receiver) = flume::unbounded();
+    let (output_sender, output) = flume::unbounded();
+    let palette = palette_for(cx.theme());
+
+    let rows: Vec<Row> = INSTALL_LINES
+        .iter()
+        .map(|(text, color)| Row {
+            bgs: Vec::new(),
+            texts: vec![TextSpan {
+                col: 0,
+                cells: u16::try_from(text.chars().count()).unwrap_or(0),
+                text: (*text).to_owned(),
+                fg: color.map_or(palette.fg, |index| palette.ansi[index]),
+                flags: TextFlags::default(),
+            }],
+        })
+        .collect();
+
+    let snapshot = TerminalOutput::Snapshot(Snapshot {
+        screen: Screen {
+            cols: 80,
+            rows: u16::try_from(rows.len()).unwrap_or(4),
+            colors: Colors {
+                fg: palette.fg,
+                bg: palette.bg,
+                cursor: None,
+            },
+            cursor: Cursor {
+                col: 0,
+                row: 0,
+                style: CursorStyle::Block,
+                visible: false,
+            },
+            alternate: false,
+            history: History { start: 0, len: 0 },
+        },
+        rows,
+        history_rows: Vec::new(),
+        title: None,
+        working_directory: None,
+    });
+    if let Err(error) = output_sender.send(snapshot) {
+        log::error!("cannot show the install output: {error}");
+    }
+
+    // The view ends when its channels close, so both stay open until the run ends.
+    Box::leak(Box::new((output_sender, input_receiver)));
+
+    TerminalChannels { input, output }
+}
+
 fn attach(
     workspace: &mut Workspace,
     terminal: TerminalId,

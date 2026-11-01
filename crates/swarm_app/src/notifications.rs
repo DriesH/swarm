@@ -81,6 +81,10 @@ pub(crate) trait Delivery {
 
     /// Asks macOS for the authorization. The answer may come from any thread.
     fn read_permission(&self, answer: flume::Sender<Authorization>);
+
+    /// Asks the user to allow notifications, when macOS has not asked yet. The answer is the
+    /// authorization afterwards, and may come from any thread.
+    fn request_permission(&self, answer: flume::Sender<Authorization>);
 }
 
 /// The real thing: GPUI posts, `AppKit` plays and reads.
@@ -103,6 +107,16 @@ impl Delivery for SystemDelivery {
     fn read_permission(&self, answer: flume::Sender<Authorization>) {
         #[cfg(target_os = "macos")]
         appkit::read_permission(answer);
+
+        #[cfg(not(target_os = "macos"))]
+        if answer.send(Authorization::UNAVAILABLE).is_err() {
+            log::debug!("nobody waits for the notification permission");
+        }
+    }
+
+    fn request_permission(&self, answer: flume::Sender<Authorization>) {
+        #[cfg(target_os = "macos")]
+        appkit::request_permission(answer);
 
         #[cfg(not(target_os = "macos"))]
         if answer.send(Authorization::UNAVAILABLE).is_err() {
@@ -132,6 +146,10 @@ impl Delivery for SampleDelivery {
         if answer.send(authorization).is_err() {
             log::debug!("nobody waits for the notification permission");
         }
+    }
+
+    fn request_permission(&self, answer: flume::Sender<Authorization>) {
+        self.read_permission(answer);
     }
 }
 
@@ -488,6 +506,16 @@ pub(crate) fn check_permission(cx: &App) -> flume::Receiver<Authorization> {
     answers
 }
 
+/// Asks the user to allow notifications. The answer reaches the receiver later, and is read
+/// on the GPUI thread.
+pub(crate) fn request_permission(cx: &App) -> flume::Receiver<Authorization> {
+    let (answer, answers) = flume::bounded(1);
+
+    delivery(cx).request_permission(answer);
+
+    answers
+}
+
 pub(crate) fn open_system_settings(cx: &App) {
     cx.open_url(NOTIFICATIONS_PANE);
 }
@@ -510,6 +538,8 @@ pub(crate) mod harness {
         pub sound_enabled: Cell<bool>,
         /// False while macOS has not answered: the question stays open.
         pub answers: Cell<bool>,
+        /// How often the user was asked to allow notifications.
+        pub requests: Cell<usize>,
     }
 
     impl Recorder {
@@ -521,6 +551,7 @@ pub(crate) mod harness {
                 permission: Cell::new(permission),
                 sound_enabled: Cell::new(true),
                 answers: Cell::new(true),
+                requests: Cell::new(0),
             })
         }
 
@@ -561,6 +592,17 @@ pub(crate) mod harness {
             };
 
             assert!(answer.send(authorization).is_ok());
+        }
+
+        /// The user allows what macOS had not asked about yet.
+        fn request_permission(&self, answer: flume::Sender<Authorization>) {
+            self.requests.set(self.requests.get() + 1);
+
+            if self.permission.get() == Permission::NotAsked {
+                self.permission.set(Permission::Allowed);
+            }
+
+            self.read_permission(answer);
         }
     }
 

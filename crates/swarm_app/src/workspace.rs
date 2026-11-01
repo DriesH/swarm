@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use gpui::{
-    AnyWindowHandle, AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable, Pixels,
-    SharedString, Size, Subscription, Window, div, px,
+    AnyWindowHandle, AppContext as _, Bounds, Context, Div, Entity, FocusHandle, Focusable, Pixels,
+    SharedString, Size, Stateful, Subscription, Window, div, px,
 };
 use swarm_protocol::{Client, ReviewSource};
 use swarm_ui::fonts::UI_FONT;
@@ -29,6 +29,7 @@ use crate::swarm_view::{
     Clicked, DotGrid, INSPECTOR_WIDTH, InspectorTab, MessageThread, TerminalPreview,
 };
 use crate::views::Resizing;
+use crate::welcome::Welcome;
 use crate::{panels, sidebar, status_bar, tab_bar, views};
 
 pub(crate) const RIGHT_PANEL_WIDTH: Pixels = px(320.);
@@ -181,6 +182,8 @@ pub(crate) struct Workspace {
     /// How often the visible Review source and the open task's Live diff are asked for.
     pub(crate) diff_intervals: (std::time::Duration, std::time::Duration),
     pub(crate) pull_requests: PullRequests,
+    /// The welcome screen, while it shows.
+    pub(crate) welcome: Option<Entity<Welcome>>,
     /// How often the window told the workspace it was activated or deactivated.
     #[cfg(test)]
     pub(crate) activation_changes: usize,
@@ -318,6 +321,7 @@ impl Workspace {
             pr_poll: None,
             diff_intervals: (crate::daemon::REVIEW_INTERVAL, crate::daemon::LIVE_INTERVAL),
             pull_requests: PullRequests::default(),
+            welcome: None,
             #[cfg(test)]
             activation_changes: 0,
         };
@@ -364,6 +368,7 @@ impl Workspace {
     /// need an active window.
     pub(crate) fn window_closed(&mut self, cx: &mut Context<Self>) {
         self.window = None;
+        self.welcome = None;
         self.overlay = None;
         self.resizing = None;
         self.inspector_dragging = false;
@@ -647,59 +652,12 @@ static NO_TASK: Task = Task {
     daemon: None,
 };
 
-impl Focusable for Workspace {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
-
-impl Render for Workspace {
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one flat element tree reads best in one place"
-    )]
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl Workspace {
+    /// The window's root element: the key context, the actions and the colors. The welcome
+    /// screen and the workspace both sit in it.
+    fn root(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let colors = cx.theme().colors();
-        let (ground, panel, line, fg) = (colors.ground, colors.panel, colors.line, colors.fg);
-
-        self.start_orchestrator_if_needed(cx);
-        self.sync_swarm_tasks(window.is_window_active(), cx);
-        self.sync_usage_clock(window.is_window_active(), cx);
-        self.sync_pull_requests(window.is_window_active(), window, cx);
-        self.apply_pending_focus(window, cx);
-        self.apply_pending_review_focus(window, cx);
-        self.apply_pending_pr_focus(window, cx);
-        self.ensure_focus_handles(cx);
-
-        if self.view == View::Swarm {
-            self.ensure_swarm_handles(cx);
-        }
-
-        self.measure_cells(window, cx);
-        self.layout = views::compute_layout(self);
-
-        let sidebar = sidebar::render(self, window, cx);
-        let tab_bar = tab_bar::render(self, window, cx);
-        let views = views::render(self, window, cx);
-        let status_bar = status_bar::render(self, window, cx);
-        let right_panel = self
-            .visible_panel()
-            .map(|_| panels::render(self, window, cx));
-        let overlay = self.overlay.as_ref().map(Overlay::element);
-
-        let body = h_flex()
-            .flex_1()
-            .min_h_0()
-            .child(div().flex_1().min_w_0().h_full().child(views))
-            .children(right_panel.map(|panel_element| {
-                div()
-                    .w(RIGHT_PANEL_WIDTH)
-                    .flex_none()
-                    .h_full()
-                    .border_l_1()
-                    .border_color(line)
-                    .child(panel_element)
-            }));
+        let (ground, fg) = (colors.ground, colors.fg);
 
         swarm_ui::tab_navigation(
             div()
@@ -759,7 +717,109 @@ impl Render for Workspace {
                 .font_family(UI_FONT)
                 .text_size(px(13.)),
         )
-        .child(
+    }
+
+    /// True while the welcome screen shows: no project yet, and the user has not dealt with
+    /// it. The daemon must have said there are none: while it connects, an app that has
+    /// projects looks the same.
+    pub(crate) fn shows_welcome(&self, cx: &App) -> bool {
+        self.has_no_projects()
+            && matches!(self.source, DataSource::Live | DataSource::Sample)
+            && crate::settings::welcome_pending(cx)
+    }
+
+    /// The welcome screen, made when it first shows and dropped when it ends.
+    pub(crate) fn welcome_screen(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<Welcome>> {
+        if !self.shows_welcome(cx) {
+            self.welcome = None;
+
+            return None;
+        }
+
+        let workspace = cx.weak_entity();
+        let welcome = self
+            .welcome
+            .get_or_insert_with(|| cx.new(|cx| Welcome::new(workspace, window, cx)));
+
+        Some(welcome.clone())
+    }
+
+    /// Ends the welcome screen for good and shows the empty workspace.
+    pub(crate) fn finish_welcome(&mut self, cx: &mut Context<Self>) {
+        crate::settings::finish_welcome(cx);
+        self.welcome = None;
+
+        cx.notify();
+    }
+}
+
+impl Focusable for Workspace {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for Workspace {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        let (panel, line) = (colors.panel, colors.line);
+
+        self.start_orchestrator_if_needed(cx);
+        self.sync_swarm_tasks(window.is_window_active(), cx);
+        self.sync_usage_clock(window.is_window_active(), cx);
+        self.sync_pull_requests(window.is_window_active(), window, cx);
+        self.apply_pending_focus(window, cx);
+        self.apply_pending_review_focus(window, cx);
+        self.apply_pending_pr_focus(window, cx);
+        self.ensure_focus_handles(cx);
+
+        if self.view == View::Swarm {
+            self.ensure_swarm_handles(cx);
+        }
+
+        self.measure_cells(window, cx);
+        self.layout = views::compute_layout(self);
+
+        if let Some(welcome) = self.welcome_screen(window, cx) {
+            let overlay = self.overlay.as_ref().map(Overlay::element);
+
+            return self
+                .root(cx)
+                .child(welcome)
+                .children(overlay)
+                .into_any_element();
+        }
+
+        let sidebar = sidebar::render(self, window, cx);
+        let tab_bar = tab_bar::render(self, window, cx);
+        let views = views::render(self, window, cx);
+        let status_bar = status_bar::render(self, window, cx);
+        let right_panel = self
+            .visible_panel()
+            .map(|_| panels::render(self, window, cx));
+        let overlay = self.overlay.as_ref().map(Overlay::element);
+
+        let body = h_flex()
+            .flex_1()
+            .min_h_0()
+            .child(div().flex_1().min_w_0().h_full().child(views))
+            .children(right_panel.map(|panel_element| {
+                div()
+                    .w(RIGHT_PANEL_WIDTH)
+                    .flex_none()
+                    .h_full()
+                    .border_l_1()
+                    .border_color(line)
+                    .child(panel_element)
+            }));
+
+        let root = self.root(cx);
+
+        root.child(
             div()
                 .w(px(248.))
                 .flex_none()
@@ -799,6 +859,7 @@ impl Render for Workspace {
                 ),
         )
         .children(overlay)
+        .into_any_element()
     }
 }
 

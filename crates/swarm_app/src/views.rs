@@ -83,6 +83,7 @@ fn empty_state(workspace: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
         .child(Label::new("No projects").color(Color::Faint))
         .child(
             Button::new("empty-add-project", "Add project")
+                .debug_selector(|| "empty-add-project".to_owned())
                 .icon(IconName::Plus)
                 .disabled(!live)
                 .on_click(cx.listener(|_, _, window, cx| Workspace::pick_project(window, cx))),
@@ -180,9 +181,15 @@ fn tile_kind(kind: TerminalKind) -> TileKind {
     }
 }
 
-fn tile_spec(workspace: &Workspace, terminal: &Terminal, activity: Activity) -> TileSpec {
+fn tile_spec(
+    workspace: &Workspace,
+    terminal: &Terminal,
+    activity: Activity,
+    large: bool,
+) -> TileSpec {
     let mut spec = TileSpec::new(TileId(terminal.id.0), tile_kind(terminal.kind), activity);
     spec.minimized = workspace.minimized.contains(&terminal.id);
+    spec.large = large;
 
     if terminal.kind == TerminalKind::User {
         spec.fixed = workspace
@@ -206,7 +213,7 @@ pub(crate) fn tile_specs(workspace: &Workspace) -> Vec<TileSpec> {
             .orchestrator
             .and_then(|id| data.agent(id))
             .and_then(|agent| data.terminal(agent.terminal))
-            .map(|terminal| tile_spec(workspace, terminal, Activity::Working))
+            .map(|terminal| tile_spec(workspace, terminal, Activity::Working, false))
             .into_iter()
             .collect();
     }
@@ -218,18 +225,18 @@ pub(crate) fn tile_specs(workspace: &Workspace) -> Vec<TileSpec> {
         .filter_map(|id| data.agent(id))
         .filter_map(|agent| {
             let terminal = data.terminal(agent.terminal)?;
-            Some((terminal, activity_of(agent.status)))
+            Some((terminal, activity_of(agent.status), agent.tile_large))
         });
     let others = task
         .processes
         .iter()
         .chain(&task.user_terminals)
         .filter_map(|id| data.terminal(*id))
-        .map(|terminal| (terminal, process_activity(terminal)));
+        .map(|terminal| (terminal, process_activity(terminal), false));
 
     agents
         .chain(others)
-        .map(|(terminal, activity)| tile_spec(workspace, terminal, activity))
+        .map(|(terminal, activity, large)| tile_spec(workspace, terminal, activity, large))
         .collect()
 }
 
@@ -262,6 +269,26 @@ fn start_layout(area: Size<Pixels>, specs: &[TileSpec]) -> Layout {
 }
 
 impl Workspace {
+    /// Applies a worker's `tile.grow` or `tile.shrink`. A tile the user minimized ignores it
+    /// until the user restores the tile. Other agents and unknown ones change nothing.
+    pub(crate) fn tile_requested(
+        &mut self,
+        agent: swarm_protocol::AgentId,
+        large: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let minimized = &self.minimized;
+        let Some(worker) = self.data.worker_with_daemon_id_mut(agent) else {
+            return;
+        };
+        if minimized.contains(&worker.terminal) || worker.tile_large == large {
+            return;
+        }
+
+        worker.tile_large = large;
+        cx.notify();
+    }
+
     pub(crate) fn stop_process(&mut self, terminal: TerminalId, cx: &mut Context<Self>) {
         self.close_process(terminal, cx);
     }
@@ -1377,5 +1404,389 @@ mod tests {
 
         let rect = layout.rect(TileId(0));
         assert_eq!(rect, Some(Rect::new(160., 28., 880., 644.)));
+    }
+
+    mod tile_requests {
+        use std::path::PathBuf;
+
+        use swarm_protocol::{
+            AgentId as DaemonAgentId, AgentInfo, AgentRole, AgentStatus as DaemonStatus, Client,
+            Event, Request, TerminalId as DaemonTerminalId, TerminalInfo,
+            TerminalKind as DaemonKind,
+        };
+        use swarm_term::BlockedKind;
+
+        use super::*;
+        use crate::daemon::tests::{
+            agent_info, fake_daemon_replying, info, real_task_workspace, wait_until,
+        };
+
+        const ORCHESTRATOR: u64 = 1;
+        const API: u64 = 2;
+        const UI: u64 = 3;
+        /// The terminal a test attaches to make the fake daemon send request number 0.
+        const FIRST_TRIGGER: u64 = 100;
+
+        #[derive(Debug, PartialEq)]
+        enum Height {
+            Small,
+            Tall,
+            Process,
+            Other(f32),
+        }
+
+        struct Rig {
+            workspace: Entity<Workspace>,
+            client: Client,
+        }
+
+        fn worker_info(id: u64, name: &str, status: DaemonStatus) -> AgentInfo {
+            AgentInfo {
+                role: AgentRole::Worker,
+                name: name.into(),
+                ..agent_info(id, 7, status)
+            }
+        }
+
+        /// A daemon that sends `requests[n]` as a `TileRequest` when the client attaches
+        /// terminal `FIRST_TRIGGER + n`.
+        fn fake_daemon_requesting(requests: Vec<(u64, bool)>) -> PathBuf {
+            fake_daemon_replying(move |request| match request {
+                Request::Attach { id, .. } => {
+                    id.0.checked_sub(FIRST_TRIGGER)
+                        .and_then(|number| usize::try_from(number).ok())
+                        .and_then(|number| requests.get(number))
+                        .map(|&(agent, large)| Event::TileRequest {
+                            agent: DaemonAgentId(agent),
+                            large,
+                        })
+                }
+                _ => None,
+            })
+        }
+
+        /// Makes the fake daemon send request number `number`.
+        fn send_request(rig: &Rig, number: u64) {
+            let channels = rig
+                .client
+                .attach(DaemonTerminalId(FIRST_TRIGGER + number), 0)
+                .expect("send the attach");
+
+            drop(channels);
+        }
+
+        /// The task "login" with its orchestrator and two working workers, in a tall window.
+        fn rig(
+            requests: Vec<(u64, bool)>,
+            cx: &mut TestAppContext,
+        ) -> (Rig, &mut VisualTestContext) {
+            let socket = fake_daemon_requesting(requests);
+            let (workspace, cx, client) = real_task_workspace(&socket, cx);
+            let agents = [
+                agent_info(ORCHESTRATOR, 7, DaemonStatus::Working),
+                worker_info(API, "api", DaemonStatus::Working),
+                worker_info(UI, "ui", DaemonStatus::Working),
+            ];
+            for agent in &agents {
+                change_agent(&workspace, agent, cx);
+            }
+
+            cx.simulate_resize(gpui::size(px(1600.), px(1300.)));
+            redraw(cx);
+            redraw(cx);
+
+            (Rig { workspace, client }, cx)
+        }
+
+        fn change_agent(
+            workspace: &Entity<Workspace>,
+            agent: &AgentInfo,
+            cx: &mut VisualTestContext,
+        ) {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.agent_changed(agent, Some(window), cx);
+            });
+        }
+
+        fn terminal_of(workspace: &Workspace, agent: u64) -> TerminalId {
+            workspace
+                .data
+                .agent_with_daemon_id(DaemonAgentId(agent))
+                .map_or(TerminalId(u32::MAX), |agent| agent.terminal)
+        }
+
+        fn ask(rig: &Rig, agent: u64, large: bool, cx: &mut VisualTestContext) {
+            rig.workspace.update(cx, |workspace, cx| {
+                workspace.tile_requested(DaemonAgentId(agent), large, cx);
+            });
+        }
+
+        fn height_of(
+            rig: &Rig,
+            terminal: impl Fn(&Workspace) -> TerminalId,
+            cx: &mut VisualTestContext,
+        ) -> Height {
+            redraw(cx);
+
+            rig.workspace.read_with(cx, |workspace, _| {
+                let style = layout_style(workspace);
+                let height = rect_of(workspace, terminal(workspace)).size.height;
+                let tall = 2. * style.small_tile_height + style.gap;
+                let is = |expected: f32| (height - expected).abs() < 0.5;
+
+                if is(style.small_tile_height) {
+                    Height::Small
+                } else if is(tall) {
+                    Height::Tall
+                } else if is(style.process_tile_height) {
+                    Height::Process
+                } else {
+                    Height::Other(height)
+                }
+            })
+        }
+
+        fn tile(rig: &Rig, agent: u64, cx: &mut VisualTestContext) -> Height {
+            height_of(rig, |workspace| terminal_of(workspace, agent), cx)
+        }
+
+        fn asked_large(rig: &Rig, agent: u64, cx: &VisualTestContext) -> bool {
+            rig.workspace.read_with(cx, |workspace, _| {
+                workspace
+                    .data
+                    .agent_with_daemon_id(DaemonAgentId(agent))
+                    .is_some_and(|agent| agent.tile_large)
+            })
+        }
+
+        fn nobody_asked(rig: &Rig, cx: &VisualTestContext) -> bool {
+            rig.workspace.read_with(cx, |workspace, _| {
+                workspace.data.agents.iter().all(|agent| !agent.tile_large)
+            })
+        }
+
+        fn minimize(rig: &Rig, agent: u64, cx: &mut VisualTestContext) {
+            rig.workspace.update(cx, |workspace, cx| {
+                let terminal = terminal_of(workspace, agent);
+                workspace.minimize(terminal, cx);
+            });
+        }
+
+        fn restore(rig: &Rig, agent: u64, cx: &mut VisualTestContext) {
+            rig.workspace.update(cx, |workspace, cx| {
+                let terminal = terminal_of(workspace, agent);
+                workspace.restore(terminal, cx);
+            });
+        }
+
+        fn orchestrator_rect(rig: &Rig, cx: &mut VisualTestContext) -> Rect {
+            redraw(cx);
+
+            rig.workspace.read_with(cx, |workspace, _| {
+                rect_of(workspace, terminal_of(workspace, ORCHESTRATOR))
+            })
+        }
+
+        #[gpui::test]
+        fn a_grow_request_makes_the_worker_tile_large_and_a_shrink_makes_it_small_again(
+            cx: &mut TestAppContext,
+        ) {
+            let (rig, cx) = rig(Vec::new(), cx);
+            assert_eq!(tile(&rig, API, cx), Height::Small);
+
+            ask(&rig, API, true, cx);
+            let grown = (tile(&rig, API, cx), tile(&rig, UI, cx));
+            ask(&rig, API, false, cx);
+            let shrunk = tile(&rig, API, cx);
+
+            assert_eq!(grown, (Height::Tall, Height::Small));
+            assert_eq!(shrunk, Height::Small);
+        }
+
+        #[gpui::test]
+        fn a_blocked_worker_stays_large_after_a_shrink(cx: &mut TestAppContext) {
+            let (rig, cx) = rig(Vec::new(), cx);
+            let blocked = DaemonStatus::Blocked(BlockedKind::Permission);
+            change_agent(&rig.workspace, &worker_info(API, "api", blocked), cx);
+
+            let alone = tile(&rig, API, cx);
+            ask(&rig, API, false, cx);
+            let shrunk = tile(&rig, API, cx);
+            change_agent(
+                &rig.workspace,
+                &worker_info(API, "api", DaemonStatus::Working),
+                cx,
+            );
+            let working = tile(&rig, API, cx);
+
+            assert_eq!(alone, Height::Tall);
+            assert_eq!(shrunk, Height::Tall);
+            assert_eq!(working, Height::Small);
+        }
+
+        #[gpui::test]
+        fn a_minimized_worker_ignores_a_grow_until_the_user_restores_it(cx: &mut TestAppContext) {
+            let (rig, cx) = rig(Vec::new(), cx);
+            minimize(&rig, API, cx);
+
+            ask(&rig, API, true, cx);
+            restore(&rig, API, cx);
+            let ignored = tile(&rig, API, cx);
+            ask(&rig, API, true, cx);
+            let heeded = tile(&rig, API, cx);
+
+            assert_eq!(ignored, Height::Small);
+            assert_eq!(heeded, Height::Tall);
+        }
+
+        #[gpui::test]
+        fn a_minimized_worker_ignores_a_shrink_until_the_user_restores_it(cx: &mut TestAppContext) {
+            let (rig, cx) = rig(Vec::new(), cx);
+            ask(&rig, API, true, cx);
+            minimize(&rig, API, cx);
+
+            ask(&rig, API, false, cx);
+            restore(&rig, API, cx);
+            let ignored = tile(&rig, API, cx);
+            ask(&rig, API, false, cx);
+            let heeded = tile(&rig, API, cx);
+
+            assert_eq!(ignored, Height::Tall);
+            assert_eq!(heeded, Height::Small);
+        }
+
+        #[gpui::test]
+        fn a_request_for_an_unknown_agent_changes_nothing(cx: &mut TestAppContext) {
+            let (rig, cx) = rig(Vec::new(), cx);
+            let before = (tile(&rig, API, cx), tile(&rig, UI, cx));
+
+            ask(&rig, 99, true, cx);
+            let after_a_grow = (tile(&rig, API, cx), tile(&rig, UI, cx));
+            let kept_a_grow = !nobody_asked(&rig, cx);
+            ask(&rig, API, true, cx);
+            ask(&rig, 99, false, cx);
+            let after_a_shrink = (tile(&rig, API, cx), tile(&rig, UI, cx));
+
+            assert_eq!(before, (Height::Small, Height::Small));
+            assert_eq!(after_a_grow, before);
+            assert!(!kept_a_grow);
+            assert_eq!(after_a_shrink, (Height::Tall, Height::Small));
+        }
+
+        #[gpui::test]
+        fn a_process_terminal_ignores_requests(cx: &mut TestAppContext) {
+            let (rig, cx) = rig(Vec::new(), cx);
+            let process = TerminalInfo {
+                owner: Some(DaemonAgentId(API)),
+                name: Some("dev server".to_owned()),
+                ..info(30, DaemonKind::Process, "task:7")
+            };
+            rig.workspace.update_in(cx, |workspace, window, cx| {
+                workspace.terminal_changed(&process, window, cx);
+            });
+            let process_tile = |workspace: &Workspace| {
+                let first = workspace.active_task().processes.first().copied();
+
+                first.unwrap_or(TerminalId(u32::MAX))
+            };
+            let before = height_of(&rig, process_tile, cx);
+
+            ask(&rig, 30, true, cx);
+            let named_like_it = height_of(&rig, process_tile, cx);
+            ask(&rig, API, true, cx);
+            let owner_grown = height_of(&rig, process_tile, cx);
+
+            assert_eq!(before, Height::Process);
+            assert_eq!(named_like_it, Height::Process);
+            assert_eq!(owner_grown, Height::Process);
+            assert_eq!(tile(&rig, API, cx), Height::Tall);
+        }
+
+        #[gpui::test]
+        fn the_orchestrator_ignores_requests_and_keeps_its_share(cx: &mut TestAppContext) {
+            let (rig, cx) = rig(Vec::new(), cx);
+            let before = orchestrator_rect(&rig, cx);
+
+            ask(&rig, ORCHESTRATOR, true, cx);
+            let asked = orchestrator_rect(&rig, cx);
+            let nothing_kept = nobody_asked(&rig, cx);
+            ask(&rig, API, true, cx);
+            let beside_a_large_worker = orchestrator_rect(&rig, cx);
+
+            let (area, share) = rig.workspace.read_with(cx, |workspace, _| {
+                let area = workspace
+                    .terminal_area_size()
+                    .expect("the area is measured");
+
+                (area, 0.65 * (f32::from(area.width) - 20.))
+            });
+            assert_eq!(asked, before);
+            assert!(nothing_kept);
+            assert_eq!(beside_a_large_worker, before);
+            assert!((before.size.width - share).abs() < 1.);
+            assert!((before.size.height - (f32::from(area.height) - 20.)).abs() < 1.);
+        }
+
+        #[gpui::test]
+        fn a_request_arrives_through_the_daemon(cx: &mut TestAppContext) {
+            let (rig, cx) = rig(vec![(99, true), (API, true), (API, false)], cx);
+
+            send_request(&rig, 0);
+            send_request(&rig, 1);
+            let arrived = wait_until(cx, |cx| asked_large(&rig, API, cx));
+            let grown = tile(&rig, API, cx);
+            let unknown_left_alone = rig.workspace.read_with(cx, |workspace, _| {
+                workspace
+                    .data
+                    .agents
+                    .iter()
+                    .filter(|agent| agent.tile_large)
+                    .count()
+                    == 1
+            });
+            send_request(&rig, 2);
+            let withdrawn = wait_until(cx, |cx| !asked_large(&rig, API, cx));
+            let shrunk = tile(&rig, API, cx);
+
+            assert!(arrived, "the grow request never arrived");
+            assert_eq!(grown, Height::Tall);
+            assert!(unknown_left_alone);
+            assert!(withdrawn, "the shrink request never arrived");
+            assert_eq!(shrunk, Height::Small);
+        }
+
+        #[gpui::test]
+        fn a_request_through_the_daemon_skips_a_minimized_worker(cx: &mut TestAppContext) {
+            let (rig, cx) = rig(vec![(API, true), (UI, true)], cx);
+            minimize(&rig, API, cx);
+
+            send_request(&rig, 0);
+            send_request(&rig, 1);
+            let later_one = wait_until(cx, |cx| asked_large(&rig, UI, cx));
+            restore(&rig, API, cx);
+
+            assert!(later_one, "the second request never arrived");
+            assert!(!asked_large(&rig, API, cx));
+            assert_eq!(tile(&rig, API, cx), Height::Small);
+            assert_eq!(tile(&rig, UI, cx), Height::Tall);
+        }
+
+        #[gpui::test]
+        fn a_request_is_applied_with_no_window_open(cx: &mut TestAppContext) {
+            let (rig, cx) = rig(vec![(API, true)], cx);
+            cx.update(|window, _| window.remove_window());
+            cx.run_until_parked();
+            rig.workspace.update(cx, Workspace::window_closed);
+
+            send_request(&rig, 0);
+            let arrived = wait_until(cx, |cx| asked_large(&rig, API, cx));
+
+            assert!(arrived, "the request was lost while no window was open");
+            assert!(cx.windows().is_empty());
+            assert!(
+                rig.workspace
+                    .read_with(cx, |workspace, _| workspace.window.is_none())
+            );
+        }
     }
 }

@@ -210,7 +210,7 @@ impl SettingsWindow {
             Page::Prompts => self.prompts.clone().into_any_element(),
             Page::Usage => self.usage.clone().into_any_element(),
             Page::Keyboard => Self::keyboard_page(),
-            Page::General => page_title(Page::General.title()).into_any_element(),
+            Page::General => self.general_page(cx),
         }
     }
 

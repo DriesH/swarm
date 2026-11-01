@@ -454,6 +454,11 @@ impl Workspace {
         Self::forward(client.notices(), cx, |workspace, notice, window, cx| {
             workspace.notice_received(&notice, window, cx);
         });
+        Self::forward(
+            client.tile_requests(),
+            cx,
+            |workspace, (agent, large), _, cx| workspace.tile_requested(agent, large, cx),
+        );
     }
 
     fn forward<T: 'static>(
@@ -1943,6 +1948,8 @@ pub(crate) mod tests {
     use crate::palette::Overlay;
 
     static NEXT_SOCKET: AtomicU32 = AtomicU32::new(0);
+    /// The ids the fake daemon gives to the terminals it creates.
+    static NEXT_TERMINAL: AtomicU64 = AtomicU64::new(800);
 
     pub(crate) fn setup(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
         cx.update(|cx| {
@@ -2029,7 +2036,33 @@ pub(crate) mod tests {
                 id: None,
                 message: "no pull request".into(),
             }),
+            Request::SystemCheck { call } => Some(Event::SystemCheck {
+                call: *call,
+                check: ready_system_check(),
+            }),
+            Request::Create { call, .. } => Some(Event::Created {
+                call: *call,
+                id: DaemonTerminalId(NEXT_TERMINAL.fetch_add(1, Ordering::Relaxed)),
+            }),
             _ => None,
+        }
+    }
+
+    /// Every tool ready, as the daemon says it.
+    pub(crate) fn ready_system_check() -> swarm_protocol::SystemCheck {
+        let ready = |version: Option<&str>| swarm_protocol::ToolCheck {
+            state: swarm_protocol::ToolState::Ready,
+            version: version.map(str::to_owned),
+            detail: None,
+            fix: Vec::new(),
+        };
+
+        swarm_protocol::SystemCheck {
+            git: ready(Some("2.50.1")),
+            claude: ready(Some("2.1.314")),
+            codex: ready(Some("0.154.0")),
+            gh: ready(Some("2.80.0")),
+            github_account: ready(None),
         }
     }
 

@@ -6,10 +6,12 @@
 use std::ptr::NonNull;
 
 use block2::RcBlock;
+use objc2::runtime::Bool;
 use objc2_app_kit::NSSound;
-use objc2_foundation::{NSBundle, NSString};
+use objc2_foundation::{NSBundle, NSError, NSString};
 use objc2_user_notifications::{
-    UNAuthorizationStatus, UNNotificationSetting, UNNotificationSettings, UNUserNotificationCenter,
+    UNAuthorizationOptions, UNAuthorizationStatus, UNNotificationSetting, UNNotificationSettings,
+    UNUserNotificationCenter,
 };
 
 use super::{Authorization, Permission};
@@ -37,6 +39,26 @@ pub(super) fn read_permission(answer: flume::Sender<Authorization>) {
 
     UNUserNotificationCenter::currentNotificationCenter()
         .getNotificationSettingsWithCompletionHandler(&on_settings);
+}
+
+/// Shows the system's question when macOS has not asked yet, and answers with what the
+/// settings say once it is over. The same bundle rule as [`read_permission`] holds.
+pub(super) fn request_permission(answer: flume::Sender<Authorization>) {
+    if NSBundle::mainBundle().bundleIdentifier().is_none() {
+        send(&answer, Authorization::UNAVAILABLE);
+        return;
+    }
+
+    // The sound setting is part of the answer, so the settings are read again.
+    let on_answer = RcBlock::new(move |_granted: Bool, _error: *mut NSError| {
+        read_permission(answer.clone());
+    });
+
+    UNUserNotificationCenter::currentNotificationCenter()
+        .requestAuthorizationWithOptions_completionHandler(
+            UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound,
+            &on_answer,
+        );
 }
 
 fn send(answer: &flume::Sender<Authorization>, authorization: Authorization) {
@@ -110,6 +132,15 @@ mod tests {
         let (answer, answers) = flume::bounded(1);
 
         read_permission(answer);
+
+        assert_eq!(answers.try_recv(), Ok(Authorization::UNAVAILABLE));
+    }
+
+    #[test]
+    fn outside_an_app_bundle_asking_for_the_permission_is_unavailable() {
+        let (answer, answers) = flume::bounded(1);
+
+        request_permission(answer);
 
         assert_eq!(answers.try_recv(), Ok(Authorization::UNAVAILABLE));
     }

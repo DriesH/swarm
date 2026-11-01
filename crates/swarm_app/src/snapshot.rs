@@ -535,6 +535,22 @@ fn show_empty(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Worksp
     workspace.use_projects(&[], cx);
 }
 
+/// The welcome screen with sample rows: the GitHub CLI installs, and its terminal shows.
+fn show_welcome(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    // The settings have no flag yet, and the app has no project.
+    crate::settings::state(cx);
+    workspace.data = crate::model::FakeData::live();
+
+    let Some(welcome) = workspace.welcome_screen(window, cx) else {
+        log::error!("the welcome screen does not show");
+        return;
+    };
+    let check = welcome.read(cx).check().clone();
+    let output = crate::demo::install_output(cx);
+
+    check.update(cx, |check, cx| check.show_sample_output(output, window, cx));
+}
+
 fn show_unavailable(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
     workspace.use_projects(&[], cx);
     workspace.daemon_unavailable(
@@ -891,6 +907,16 @@ pub(crate) fn run(directory: PathBuf, cx: &mut App) {
                 Appearance::Dark,
                 "workspace-empty-dark.png",
                 Some(show_empty),
+            ),
+            (
+                Appearance::Light,
+                "workspace-welcome-light.png",
+                Some(show_welcome),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-welcome-dark.png",
+                Some(show_welcome),
             ),
             (
                 Appearance::Light,

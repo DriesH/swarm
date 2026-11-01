@@ -233,6 +233,8 @@ pub(crate) struct Agent {
     pub note: Option<SharedString>,
     /// Set for an agent the daemon runs.
     pub daemon: Option<DaemonAgent>,
+    /// The worker asked for a large tile with `tile.grow`. In memory only.
+    pub tile_large: bool,
 }
 
 impl Agent {
@@ -783,6 +785,7 @@ impl Builder {
             ended_at: None,
             note: None,
             daemon: None,
+            tile_large: false,
         });
 
         id
@@ -1516,6 +1519,7 @@ impl FakeData {
             ended_at: info.ended_at,
             note: None,
             daemon: Some(daemon),
+            tile_large: false,
         });
 
         if let Some(entry) = self.tasks.iter_mut().find(|entry| entry.id == task) {
@@ -1743,6 +1747,18 @@ impl FakeData {
         self.agents
             .iter()
             .find(|agent| agent.daemon.as_ref().is_some_and(|daemon| daemon.id == id))
+    }
+
+    /// The worker the daemon calls `id`. An orchestrator is not a worker.
+    pub(crate) fn worker_with_daemon_id_mut(&mut self, id: DaemonAgentId) -> Option<&mut Agent> {
+        let terminals = &self.terminals;
+
+        self.agents.iter_mut().find(|agent| {
+            agent.daemon.as_ref().is_some_and(|daemon| daemon.id == id)
+                && terminals.iter().any(|terminal| {
+                    terminal.id == agent.terminal && terminal.kind == TerminalKind::Worker
+                })
+        })
     }
 
     /// The tab of a Start orchestrator: its project's Start tab, made when missing. An
@@ -2341,6 +2357,7 @@ impl FakeData {
             ended_at: None,
             note: None,
             daemon: None,
+            tile_large: false,
         });
         self.tasks.push(Task {
             id: task,
