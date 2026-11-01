@@ -146,6 +146,8 @@ pub(crate) struct Workspace {
     pub(crate) polled_task: Option<TaskId>,
     _activation_subscription: Subscription,
     pub(crate) swarm_clock: Option<gpui::Task<()>>,
+    /// Refreshes the usage card's time text. Runs only while the card shows a time.
+    pub(crate) usage_clock: Option<gpui::Task<()>>,
     pub(crate) review: Entity<ReviewView>,
     pub(crate) changes_list: Entity<ChangesList>,
     /// The source the user picked, or the default decided when Review first opened.
@@ -215,6 +217,7 @@ impl Workspace {
         let (orchestrator_input, orchestrator_subscription) = views::orchestrator_input(cx);
         let activation_subscription = cx.observe_window_activation(window, |this, window, cx| {
             this.sync_swarm_tasks(window.is_window_active(), cx);
+            this.sync_usage_clock(window.is_window_active(), cx);
         });
 
         let inspector_subscription = cx.observe(&cx.entity(), |this, _, cx| {
@@ -287,6 +290,7 @@ impl Workspace {
             polled_task: None,
             _activation_subscription: activation_subscription,
             swarm_clock: None,
+            usage_clock: None,
             review,
             changes_list,
             review_sources: HashMap::new(),
@@ -588,6 +592,7 @@ impl Render for Workspace {
 
         self.start_orchestrator_if_needed(window, cx);
         self.sync_swarm_tasks(window.is_window_active(), cx);
+        self.sync_usage_clock(window.is_window_active(), cx);
         self.sync_pull_requests(window.is_window_active(), window, cx);
         self.apply_pending_focus(window, cx);
         self.apply_pending_review_focus(window, cx);

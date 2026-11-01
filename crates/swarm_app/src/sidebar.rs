@@ -1,6 +1,7 @@
 //! Sidebar: projects, the open task's agents and the usage card.
 
-use gpui::{App, Context, FontWeight, Pixels, Role, SharedString, Window, div, px, relative};
+use gpui::{Context, FontWeight, Pixels, Role, Window, div, px};
+use swarm_protocol::{ProviderUsage, Usage, UsageProblem, UsageWindow};
 use swarm_ui::prelude::*;
 
 use crate::actions::ToggleCommandPalette;
@@ -48,9 +49,7 @@ pub(crate) fn render(
                 .children(agent_rows(workspace, cx))
         })
         .child(div().flex_1())
-        .when(!workspace.data.usage.is_empty(), |sidebar| {
-            sidebar.child(usage_card(workspace, cx))
-        })
+        .children(usage_card(workspace))
 }
 
 fn daemon_status(workspace: &Workspace, cx: &mut Context<Workspace>) -> Option<gpui::AnyElement> {
@@ -396,57 +395,213 @@ fn agent_row(
         .into_any_element()
 }
 
-fn usage_card(workspace: &Workspace, cx: &App) -> impl IntoElement + use<> {
-    let colors = cx.theme().colors();
-    let (line, panel, soft, fg) = (colors.line, colors.panel, colors.soft, colors.fg);
-
-    let entries: Vec<_> = workspace
-        .data
-        .usage
-        .iter()
-        .map(|(name, fraction)| usage_entry(name.clone(), *fraction, soft, fg))
-        .collect();
-
-    v_flex()
-        .gap(px(9.))
-        .px(px(12.))
-        .py(px(10.))
-        .rounded(px(10.))
-        .border_1()
-        .border_color(line)
-        .bg(panel)
-        .children(entries)
+/// One row of the usage card.
+#[derive(Debug, PartialEq, Eq)]
+struct UsageRow {
+    id: &'static str,
+    /// For example "Claude · 5h", from the shortest window.
+    label: String,
+    /// The used share of the shortest window.
+    percent: Option<u8>,
+    /// Why the numbers are old or missing.
+    note: Option<String>,
+    /// Every window with its reset time, for VoiceOver.
+    spoken: String,
 }
 
-fn usage_entry(
-    name: SharedString,
-    fraction: f32,
-    track: gpui::Hsla,
-    fill: gpui::Hsla,
-) -> impl IntoElement {
-    let fraction = fraction.clamp(0., 1.);
-    let percent = format!("{:.0}%", fraction * 100.);
+fn usage_card(workspace: &Workspace) -> Option<impl IntoElement + use<>> {
+    let rows = usage_rows(&workspace.data.usage, workspace.now_ms() / 1_000);
+    if rows.is_empty() {
+        return None;
+    }
 
-    v_flex()
-        .gap(px(5.))
-        .child(
-            h_flex()
-                .child(
-                    div()
-                        .flex_1()
-                        .child(Label::new(name).size(LabelSize::Small).color(Color::Muted)),
-                )
-                .child(Label::new(percent).mono().size(LabelSize::XSmall)),
-        )
-        .child(
-            div().h(px(4.)).rounded(px(2.)).bg(track).child(
-                div()
-                    .h(px(4.))
-                    .w(relative(fraction))
-                    .rounded(px(2.))
-                    .bg(fill),
+    let meters = rows.into_iter().map(|row| {
+        let meter = UsageMeter::new(row.id, row.label)
+            .accessible_label(row.spoken)
+            .debug_selector(move || row.id.to_owned());
+        let meter = match row.percent {
+            Some(percent) => meter
+                .value(format!("{percent}%"))
+                .fraction(f32::from(percent) / 100.),
+            None => meter,
+        };
+
+        match row.note {
+            Some(note) => meter.note(note),
+            None => meter,
+        }
+    });
+
+    Some(
+        div().debug_selector(|| "usage-card".to_owned()).child(
+            Panel::new().accessible("usage", "Subscription usage").row(
+                v_flex()
+                    .gap(px(9.))
+                    .px(px(12.))
+                    .py(px(10.))
+                    .children(meters),
             ),
-        )
+        ),
+    )
+}
+
+/// The rows to show, Claude first. An agent kind with no windows and no problem to
+/// report, or one that is not installed, has no row.
+fn usage_rows(usage: &Usage, now: u64) -> Vec<UsageRow> {
+    [
+        ("usage-claude", "Claude", &usage.claude),
+        ("usage-codex", "Codex", &usage.codex),
+    ]
+    .into_iter()
+    .filter_map(|(id, name, reading)| usage_row(id, name, reading, now))
+    .collect()
+}
+
+fn usage_row(id: &'static str, name: &str, reading: &ProviderUsage, now: u64) -> Option<UsageRow> {
+    let problem = reading
+        .problem
+        .as_ref()
+        .and_then(|problem| problem_text(problem, now));
+    if reading.windows.is_empty() && problem.is_none() {
+        return None;
+    }
+
+    let first = reading.windows.first();
+    let label = match first {
+        Some(window) => format!("{name} · {}", window.label),
+        None => name.to_owned(),
+    };
+
+    let mut spoken = format!("{name} usage: ");
+    let windows: Vec<String> = reading
+        .windows
+        .iter()
+        .map(|window| spoken_window(window, now))
+        .collect();
+    spoken.push_str(&windows.join("; "));
+
+    let note = problem.map(|(shown, said)| {
+        if !windows.is_empty() {
+            spoken.push_str(". ");
+        }
+        spoken.push_str(&said);
+
+        shown
+    });
+
+    Some(UsageRow {
+        id,
+        label,
+        percent: first.map(|window| window.used_percent),
+        note,
+        spoken,
+    })
+}
+
+/// True when the card shows a time: a reset time that VoiceOver reads, or the wait of a
+/// rate limit.
+pub(crate) fn usage_shows_time(usage: &Usage) -> bool {
+    [&usage.claude, &usage.codex].into_iter().any(|reading| {
+        matches!(reading.problem, Some(UsageProblem::RateLimited { .. }))
+            || reading
+                .windows
+                .iter()
+                .any(|window| window.resets_at.is_some())
+    })
+}
+
+/// The line under a row and what VoiceOver reads for a problem. A CLI that is not
+/// installed has none.
+fn problem_text(problem: &UsageProblem, now: u64) -> Option<(String, String)> {
+    let text = match problem {
+        UsageProblem::NotInstalled => return None,
+        UsageProblem::NotLoggedIn => ("Not logged in".to_owned(), "Not logged in".to_owned()),
+        UsageProblem::Unauthorized => ("Login refused".to_owned(), "Login refused".to_owned()),
+        UsageProblem::RateLimited { retry_at } => match retry_at.saturating_sub(now) {
+            0 => ("Rate limited".to_owned(), "Rate limited".to_owned()),
+            left => (
+                format!("Rate limited · {}", Wait::new(left).short()),
+                format!("Rate limited, retry in {}", Wait::new(left).spoken()),
+            ),
+        },
+        UsageProblem::Failed(reason) => (
+            "Usage unavailable".to_owned(),
+            format!("Usage unavailable: {reason}"),
+        ),
+    };
+
+    Some(text)
+}
+
+/// For example "5 hour window 42%, resets in 2 hours".
+fn spoken_window(window: &UsageWindow, now: u64) -> String {
+    let name = window_name(&window.label);
+    let percent = window.used_percent;
+
+    match window.resets_at.map(|at| at.saturating_sub(now)) {
+        None => format!("{name} {percent}%"),
+        Some(0) => format!("{name} {percent}%, resets now"),
+        Some(left) => format!("{name} {percent}%, resets in {}", Wait::new(left).spoken()),
+    }
+}
+
+/// "5h" reads as "5 hour window". A label in another form is read as it is.
+fn window_name(label: &str) -> String {
+    for (suffix, unit) in [('m', "minute"), ('h', "hour"), ('d', "day")] {
+        let count = label
+            .strip_suffix(suffix)
+            .filter(|count| !count.is_empty() && count.bytes().all(|byte| byte.is_ascii_digit()));
+
+        if let Some(count) = count {
+            return format!("{count} {unit} window");
+        }
+    }
+
+    format!("{label} window")
+}
+
+/// Time left, rounded up: in minutes up to 90 of them, then in hours.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wait {
+    Minutes(u64),
+    Hours(u64),
+}
+
+impl Wait {
+    fn new(seconds: u64) -> Self {
+        let minutes = seconds.div_ceil(60);
+
+        if minutes > 90 {
+            Self::Hours(minutes.div_ceil(60))
+        } else {
+            Self::Minutes(minutes)
+        }
+    }
+
+    /// For the screen: "24m" or "2h".
+    fn short(self) -> String {
+        match self {
+            Self::Minutes(count) => format!("{count}m"),
+            Self::Hours(count) => format!("{count}h"),
+        }
+    }
+
+    /// For VoiceOver: "24 minutes", "2 hours" or, past two days, "3 days".
+    fn spoken(self) -> String {
+        let counted = |count: u64, unit: &str| {
+            if count == 1 {
+                format!("1 {unit}")
+            } else {
+                format!("{count} {unit}s")
+            }
+        };
+
+        match self {
+            Self::Minutes(count) => counted(count, "minute"),
+            Self::Hours(count) if count > 48 => counted(count.div_ceil(24), "day"),
+            Self::Hours(count) => counted(count, "hour"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -454,7 +609,7 @@ mod tests {
     use gpui::{TestAppContext, VisualTestContext};
 
     use super::*;
-    use crate::model::ProjectId;
+    use crate::model::{ProjectId, SAMPLE_NOW};
 
     fn setup(cx: &mut TestAppContext) -> (gpui::Entity<Workspace>, &mut VisualTestContext) {
         cx.update(swarm_ui::theme::init);
@@ -554,6 +709,337 @@ mod tests {
         assert_eq!(
             second,
             Some(("cargo test".to_owned(), "orchestrator".to_owned(), 1))
+        );
+    }
+
+    const NOW: u64 = 1_800_000_000;
+
+    fn window(label: &str, used_percent: u8, resets_at: Option<u64>) -> UsageWindow {
+        UsageWindow {
+            label: label.to_owned(),
+            used_percent,
+            resets_at,
+        }
+    }
+
+    fn reading(windows: Vec<UsageWindow>, problem: Option<UsageProblem>) -> ProviderUsage {
+        ProviderUsage {
+            windows,
+            problem,
+            ..Default::default()
+        }
+    }
+
+    fn rate_limited_in(seconds: u64) -> UsageProblem {
+        UsageProblem::RateLimited {
+            retry_at: NOW + seconds,
+        }
+    }
+
+    fn note_of(problem: &UsageProblem) -> Option<String> {
+        problem_text(problem, NOW).map(|(shown, _)| shown)
+    }
+
+    #[test]
+    fn a_rate_limit_shows_the_wait_in_minutes_then_hours() {
+        let notes: Vec<_> = [24 * 60, 5_400, 5_460, 3 * 3_600]
+            .map(|seconds| note_of(&rate_limited_in(seconds)))
+            .into();
+
+        assert_eq!(
+            notes,
+            [
+                Some("Rate limited · 24m".to_owned()),
+                Some("Rate limited · 90m".to_owned()),
+                Some("Rate limited · 2h".to_owned()),
+                Some("Rate limited · 3h".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn waits_round_up() {
+        let short: Vec<_> = [1, 60, 61, 5_400, 5_401, 7_200, 7_201]
+            .map(|seconds| Wait::new(seconds).short())
+            .into();
+        let spoken: Vec<_> = [1, 61, 7_200, 48 * 3_600, 48 * 3_600 + 1]
+            .map(|seconds| Wait::new(seconds).spoken())
+            .into();
+
+        assert_eq!(short, ["1m", "1m", "2m", "90m", "2h", "2h", "3h"]);
+        assert_eq!(
+            spoken,
+            ["1 minute", "2 minutes", "2 hours", "48 hours", "3 days"]
+        );
+    }
+
+    #[test]
+    fn a_rate_limit_that_is_over_shows_no_time() {
+        assert_eq!(
+            note_of(&UsageProblem::RateLimited { retry_at: NOW - 5 }),
+            Some("Rate limited".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_other_problems_have_short_texts() {
+        let notes: Vec<_> = [
+            UsageProblem::NotLoggedIn,
+            UsageProblem::Unauthorized,
+            UsageProblem::Failed("HTTP 500: upstream broke".to_owned()),
+            UsageProblem::NotInstalled,
+        ]
+        .iter()
+        .map(note_of)
+        .collect();
+
+        assert_eq!(
+            notes,
+            [
+                Some("Not logged in".to_owned()),
+                Some("Login refused".to_owned()),
+                Some("Usage unavailable".to_owned()),
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_read_keeps_its_reason_for_the_screen_reader_only() {
+        let problem = UsageProblem::Failed("HTTP 500: upstream broke".to_owned());
+        let usage = Usage {
+            codex: reading(Vec::new(), Some(problem)),
+            ..Default::default()
+        };
+
+        let rows = usage_rows(&usage, NOW);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].note.as_deref(), Some("Usage unavailable"));
+        assert_eq!(
+            rows[0].spoken,
+            "Codex usage: Usage unavailable: HTTP 500: upstream broke"
+        );
+    }
+
+    #[test]
+    fn the_card_has_no_rows_when_there_is_nothing_to_show() {
+        assert!(usage_rows(&Usage::default(), NOW).is_empty());
+    }
+
+    #[test]
+    fn not_installed_hides_an_agent_kind() {
+        let usage = Usage {
+            claude: reading(vec![window("5h", 42, None)], None),
+            codex: reading(Vec::new(), Some(UsageProblem::NotInstalled)),
+        };
+
+        let ids: Vec<_> = usage_rows(&usage, NOW).iter().map(|row| row.id).collect();
+
+        assert_eq!(ids, ["usage-claude"]);
+    }
+
+    #[test]
+    fn a_row_shows_the_shortest_window_and_its_percent() {
+        let usage = Usage {
+            claude: reading(vec![window("5h", 42, None), window("7d", 18, None)], None),
+            ..Default::default()
+        };
+
+        let rows = usage_rows(&usage, NOW);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, "Claude · 5h");
+        assert_eq!(rows[0].percent, Some(42));
+        assert_eq!(rows[0].note, None);
+    }
+
+    #[test]
+    fn a_problem_before_any_numbers_shows_a_row_without_a_bar() {
+        let usage = Usage {
+            codex: reading(Vec::new(), Some(UsageProblem::NotLoggedIn)),
+            ..Default::default()
+        };
+
+        let rows = usage_rows(&usage, NOW);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, "Codex");
+        assert_eq!(rows[0].percent, None);
+        assert_eq!(rows[0].note.as_deref(), Some("Not logged in"));
+    }
+
+    #[test]
+    fn a_problem_keeps_the_old_numbers_on_screen() {
+        let usage = Usage {
+            claude: reading(vec![window("5h", 42, None)], Some(rate_limited_in(24 * 60))),
+            ..Default::default()
+        };
+
+        let rows = usage_rows(&usage, NOW);
+
+        assert_eq!(rows[0].percent, Some(42));
+        assert_eq!(rows[0].note.as_deref(), Some("Rate limited · 24m"));
+    }
+
+    #[test]
+    fn the_screen_reader_label_lists_every_window_with_its_reset_time() {
+        let usage = Usage {
+            claude: reading(
+                vec![
+                    window("5h", 42, Some(NOW + 2 * 3_600)),
+                    window("7d", 18, None),
+                ],
+                None,
+            ),
+            ..Default::default()
+        };
+
+        let rows = usage_rows(&usage, NOW);
+
+        assert_eq!(
+            rows[0].spoken,
+            "Claude usage: 5 hour window 42%, resets in 2 hours; 7 day window 18%"
+        );
+    }
+
+    #[test]
+    fn the_screen_reader_label_says_what_went_wrong_after_the_windows() {
+        let usage = Usage {
+            claude: reading(
+                vec![window("5h", 42, Some(NOW + 600))],
+                Some(rate_limited_in(24 * 60)),
+            ),
+            ..Default::default()
+        };
+
+        let rows = usage_rows(&usage, NOW);
+
+        assert_eq!(
+            rows[0].spoken,
+            "Claude usage: 5 hour window 42%, resets in 10 minutes. Rate limited, retry in 24 minutes"
+        );
+    }
+
+    #[test]
+    fn windows_with_other_labels_are_read_as_they_are() {
+        assert_eq!(window_name("30d"), "30 day window");
+        assert_eq!(window_name("90m"), "90 minute window");
+        assert_eq!(window_name("weekly"), "weekly window");
+        assert_eq!(window_name("h"), "h window");
+    }
+
+    #[test]
+    fn only_a_reset_time_or_a_rate_limit_makes_the_card_depend_on_the_clock() {
+        let timed = Usage {
+            claude: reading(vec![window("5h", 42, Some(NOW))], None),
+            ..Default::default()
+        };
+        let limited = Usage {
+            codex: reading(Vec::new(), Some(rate_limited_in(60))),
+            ..Default::default()
+        };
+        let still = Usage {
+            claude: reading(
+                vec![window("5h", 42, None)],
+                Some(UsageProblem::NotLoggedIn),
+            ),
+            ..Default::default()
+        };
+
+        assert!(usage_shows_time(&timed));
+        assert!(usage_shows_time(&limited));
+        assert!(!usage_shows_time(&still));
+        assert!(!usage_shows_time(&Usage::default()));
+    }
+
+    fn redraw(cx: &mut VisualTestContext) {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+
+    fn card_rows(
+        workspace: &gpui::Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> (bool, bool, bool) {
+        workspace.update(cx, |_, cx| cx.notify());
+        redraw(cx);
+
+        (
+            cx.debug_bounds("usage-card").is_some(),
+            cx.debug_bounds("usage-claude").is_some(),
+            cx.debug_bounds("usage-codex").is_some(),
+        )
+    }
+
+    #[gpui::test]
+    fn the_sample_card_shows_both_agent_kinds(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+
+        assert_eq!(card_rows(&workspace, cx), (true, true, true));
+
+        let rows = workspace.read_with(cx, |workspace, _| {
+            usage_rows(&workspace.data.usage, SAMPLE_NOW / 1_000)
+                .into_iter()
+                .map(|row| (row.label, row.percent))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            rows,
+            [
+                ("Claude · 5h".to_owned(), Some(42)),
+                ("Codex · 5h".to_owned(), Some(18)),
+            ]
+        );
+    }
+
+    #[gpui::test]
+    fn the_card_hides_when_nothing_is_left_to_show(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.usage_changed(Usage::default(), cx);
+        });
+
+        assert_eq!(card_rows(&workspace, cx), (false, false, false));
+    }
+
+    #[gpui::test]
+    fn not_installed_hides_only_that_row_of_the_card(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+
+        workspace.update(cx, |workspace, cx| {
+            let mut usage = workspace.data.usage.clone();
+            usage.codex = reading(Vec::new(), Some(UsageProblem::NotInstalled));
+            workspace.usage_changed(usage, cx);
+        });
+
+        assert_eq!(card_rows(&workspace, cx), (true, true, false));
+    }
+
+    #[gpui::test]
+    fn an_event_replaces_the_shown_numbers(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+
+        workspace.update(cx, |workspace, cx| {
+            let usage = Usage {
+                claude: reading(vec![window("5h", 64, None)], Some(rate_limited_in(600))),
+                codex: reading(vec![window("5h", 7, None)], None),
+            };
+            workspace.usage_changed(usage, cx);
+        });
+
+        let rows = workspace.read_with(cx, |workspace, _| {
+            usage_rows(&workspace.data.usage, SAMPLE_NOW / 1_000)
+                .into_iter()
+                .map(|row| (row.percent, row.note))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            rows,
+            [
+                (Some(64), Some("Rate limited · 10m".to_owned())),
+                (Some(7), None),
+            ]
         );
     }
 }

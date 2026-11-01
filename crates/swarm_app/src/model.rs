@@ -9,8 +9,9 @@ use swarm_protocol::{
     AgentId as DaemonAgentId, AgentInfo, AgentLifecycle, AgentRole,
     AgentStatus as DaemonAgentStatus, CheckState, ChecksRun, CommentEvent, DiffStat, FileStat,
     GithubCheck, GithubCheckState, GithubStatus, LocalCheck, MessageId, MessageInfo, MessageKind,
-    PrDraft, PrLink, PrState, ProjectInfo, PullRequest, ReviewComment, ReviewSource, ReviewState,
-    Reviewer, TaskDiff, TaskInfo, TerminalId as DaemonTerminalId, TerminalInfo,
+    PrDraft, PrLink, PrState, ProjectInfo, ProviderUsage, PullRequest, ReviewComment, ReviewSource,
+    ReviewState, Reviewer, TaskDiff, TaskInfo, TerminalId as DaemonTerminalId, TerminalInfo, Usage,
+    UsageWindow,
 };
 use swarm_term::{BlockedKind, ExitStatus};
 use swarm_ui::AgentStatus;
@@ -555,7 +556,10 @@ pub(crate) struct FakeData {
     pub tasks: Vec<Task>,
     pub agents: Vec<Agent>,
     pub terminals: Vec<Terminal>,
-    pub usage: Vec<(SharedString, f32)>,
+    /// The subscription usage the daemon last reported.
+    pub usage: Usage,
+    /// Counts every change to `usage`, so an answer asked before a change can tell it is old.
+    pub usage_revision: u64,
     pub file_tree: Vec<TreeEntry>,
     /// The GitHub setup of each project, once the daemon answered.
     pub github: HashMap<ProjectId, GithubStatus>,
@@ -591,8 +595,30 @@ pub(crate) struct AgentChanges {
     pub files: Rc<[FileStat]>,
 }
 
-fn sample_usage() -> Vec<(SharedString, f32)> {
-    vec![("Claude · 5h".into(), 0.42), ("Codex · 5h".into(), 0.18)]
+fn sample_usage() -> Usage {
+    let reading = |plan: &str, five_hours: u8, seven_days: u8, resets_in_hours: u64| {
+        let resets_at = |hours: u64| Some(SAMPLE_NOW / 1_000 + hours * 3_600);
+        let window = |label: &str, used_percent, resets_at| UsageWindow {
+            label: label.to_owned(),
+            used_percent,
+            resets_at,
+        };
+
+        ProviderUsage {
+            windows: vec![
+                window("5h", five_hours, resets_at(resets_in_hours)),
+                window("7d", seven_days, resets_at(resets_in_hours + 72)),
+            ],
+            plan: Some(plan.to_owned()),
+            read_at: Some(SAMPLE_NOW / 1_000 - 60),
+            problem: None,
+        }
+    };
+
+    Usage {
+        claude: reading("max", 42, 18, 2),
+        codex: reading("plus", 18, 9, 3),
+    }
 }
 
 const PROJECT_TILES: [u32; 4] = [0x004f_46e5, 0x000d_7d70, 0x00c2_410c, 0x0015_803d];
@@ -1215,6 +1241,12 @@ impl FakeData {
     /// No projects yet. Usage and the file tree stay empty until they are real.
     pub(crate) fn live() -> Self {
         Self::default()
+    }
+
+    /// Replaces the usage with what the daemon reported.
+    pub(crate) fn set_usage(&mut self, usage: Usage) {
+        self.usage = usage;
+        self.usage_revision += 1;
     }
 
     /// Adds or updates the projects and their tasks. Known ones keep their ids.

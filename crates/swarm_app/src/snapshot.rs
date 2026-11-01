@@ -11,10 +11,10 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{AnyWindowHandle, App, AsyncApp, Context, Window};
-use swarm_protocol::{CheckState, ReviewSource};
+use swarm_protocol::{CheckState, ReviewSource, UsageProblem};
 use swarm_ui::theme::{self, Appearance};
 
-use crate::model::{AgentKind, ProjectId, TaskId, TaskStatus};
+use crate::model::{AgentKind, ProjectId, SAMPLE_NOW, TaskId, TaskStatus};
 use crate::review_model::{DiffStyle, LinePos};
 use crate::swarm_view::InspectorTab;
 use crate::workspace::{RightPanel, View, Workspace};
@@ -31,6 +31,16 @@ fn open_start(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Worksp
 
 fn open_start_empty(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
     workspace.select_project(ProjectId(3), cx);
+}
+
+/// Claude is rate limited for 24 minutes: its row keeps the old numbers and shows the wait.
+fn open_usage_rate_limited(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
+    let mut usage = workspace.data.usage.clone();
+    usage.claude.problem = Some(UsageProblem::RateLimited {
+        retry_at: SAMPLE_NOW / 1_000 + 24 * 60,
+    });
+
+    workspace.usage_changed(usage, cx);
 }
 
 /// Nine more tasks in the open project, so the tabs overflow. Returns their ids.
@@ -532,6 +542,16 @@ pub(crate) fn run(directory: PathBuf, cx: &mut App) {
         for (appearance, name, open) in [
             (Appearance::Light, "workspace-light.png", None),
             (Appearance::Dark, "workspace-dark.png", None),
+            (
+                Appearance::Light,
+                "workspace-usage-rate-limited-light.png",
+                Some(open_usage_rate_limited as OpenOverlay),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-usage-rate-limited-dark.png",
+                Some(open_usage_rate_limited),
+            ),
             (
                 Appearance::Light,
                 "workspace-many-tabs-light.png",

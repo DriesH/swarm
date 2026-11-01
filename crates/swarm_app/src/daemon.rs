@@ -15,7 +15,7 @@ use gpui::{
 use swarm_protocol::{
     AgentChange, AgentId as DaemonAgentId, AgentInfo, AgentLifecycle, Client, ClientError,
     CreateTerminal, MessageEvent, Paths, ProjectInfo, ReviewSource, TaskDiff, TaskInfo,
-    TerminalId as DaemonTerminalId, TerminalInfo, TerminalKind as DaemonKind,
+    TerminalId as DaemonTerminalId, TerminalInfo, TerminalKind as DaemonKind, Usage,
 };
 use swarm_term::{ExitStatus, TerminalChannels, TerminalInput};
 use swarm_term_view::{TerminalEvent, TerminalView, palette_for};
@@ -47,6 +47,8 @@ const CHANGES_INTERVAL: Duration = Duration::from_secs(5);
 pub(crate) const REVIEW_INTERVAL: Duration = Duration::from_secs(2);
 /// How often the open task's Live diff is asked for while the window is active.
 pub(crate) const LIVE_INTERVAL: Duration = Duration::from_secs(5);
+/// How often the usage card redoes its time text, which counts whole minutes.
+const USAGE_TICK: Duration = Duration::from_secs(30);
 /// How long an exited process terminal stays, so its exit code can be read.
 pub(crate) const PROCESS_LINGER: Duration = Duration::from_secs(3);
 
@@ -316,6 +318,7 @@ impl Workspace {
 
         self.attach_new_terminals(&client, terminals, window, cx);
         self.attach_agents(window, cx);
+        self.load_usage(client.clone(), cx);
         self.load_message_history(client, cx);
 
         cx.notify();
@@ -364,6 +367,14 @@ impl Workspace {
         Self::forward(client.pr_events(), window, cx, |workspace, event, _, cx| {
             workspace.pr_event(event, cx);
         });
+        Self::forward(
+            client.usage_events(),
+            window,
+            cx,
+            |workspace, usage, _, cx| {
+                workspace.usage_changed(usage, cx);
+            },
+        );
     }
 
     fn forward<T: 'static>(
@@ -706,6 +717,67 @@ impl Workspace {
         }
 
         cx.notify();
+    }
+
+    pub(crate) fn usage_changed(&mut self, usage: Usage, cx: &mut Context<Self>) {
+        self.data.set_usage(usage);
+        cx.notify();
+    }
+
+    /// Asks the daemon for the last known usage, off the main thread. An event that
+    /// arrives before the answer is newer, so it wins.
+    fn load_usage(&self, client: Client, cx: &mut Context<Self>) {
+        let asked_at = self.data.usage_revision;
+
+        cx.spawn(async move |this, cx| {
+            let asking = cx
+                .background_executor()
+                .spawn(async move { client.usage() });
+
+            let usage = match asking.await {
+                Ok(usage) => usage,
+                Err(error) => {
+                    log::warn!("cannot read the usage: {error}");
+                    return;
+                }
+            };
+
+            let shown = this.update(cx, |workspace, cx| {
+                if workspace.data.usage_revision == asked_at {
+                    workspace.usage_changed(usage, cx);
+                }
+            });
+
+            if let Err(error) = shown {
+                log::debug!("the window closed before the usage came: {error}");
+            }
+        })
+        .detach();
+    }
+
+    /// Redoes the usage card's time text every [`USAGE_TICK`], only while the window is
+    /// active and the card shows a time.
+    pub(crate) fn sync_usage_clock(&mut self, window_active: bool, cx: &mut Context<Self>) {
+        let wanted = window_active
+            && self.fixed_now.is_none()
+            && crate::sidebar::usage_shows_time(&self.data.usage);
+
+        if !wanted {
+            self.usage_clock = None;
+            return;
+        }
+
+        if self.usage_clock.is_none() {
+            self.usage_clock = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(USAGE_TICK).await;
+
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        return;
+                    }
+                }
+            }));
+        }
     }
 
     /// Fetches the kept messages of every task and Start orchestrator, off the main thread.
@@ -1810,6 +1882,10 @@ pub(crate) mod tests {
             Request::ListComments { call, .. } => Some(Event::Comments {
                 call: *call,
                 comments: Vec::new(),
+            }),
+            Request::Usage { call } => Some(Event::Usage {
+                call: *call,
+                usage: Usage::default(),
             }),
             Request::GithubStatus { call, .. } => Some(Event::GithubStatus {
                 call: *call,
@@ -3840,6 +3916,64 @@ pub(crate) mod tests {
         assert_eq!(polling(&workspace, cx), (false, false));
     }
 
+    fn rate_limited_claude() -> Usage {
+        let mut usage = claude_usage(42);
+        usage.claude.problem =
+            Some(swarm_protocol::UsageProblem::RateLimited { retry_at: u64::MAX });
+
+        usage
+    }
+
+    #[gpui::test]
+    fn the_usage_card_ticks_only_while_it_shows_a_time_in_an_active_window(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = setup(cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.fixed_now = None;
+            workspace.usage_changed(rate_limited_claude(), cx);
+        });
+        let renders = Rc::new(std::cell::Cell::new(0));
+        workspace.update(cx, |_, cx| {
+            let renders = Rc::clone(&renders);
+            cx.observe(&cx.entity(), move |_, _, _| renders.set(renders.get() + 1))
+                .detach();
+        });
+        let clock = |cx: &VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| workspace.usage_clock.is_some())
+        };
+
+        redraw(cx);
+        assert!(!clock(cx), "an inactive window does not tick");
+
+        cx.update(|window, _| window.activate_window());
+        redraw(cx);
+        assert!(clock(cx), "an active window with a rate limit ticks");
+
+        cx.executor().advance_clock(USAGE_TICK / 2);
+        cx.run_until_parked();
+        let early = renders.get();
+        cx.executor().advance_clock(USAGE_TICK / 2);
+        cx.run_until_parked();
+        assert_eq!((early, renders.get()), (0, 1), "one render per tick");
+
+        cx.deactivate_window();
+        cx.run_until_parked();
+        assert!(!clock(cx), "the clock stops with the window");
+
+        cx.update(|window, _| window.activate_window());
+        workspace.update(cx, |workspace, cx| {
+            workspace.usage_changed(claude_usage(42), cx);
+        });
+        redraw(cx);
+        assert!(!clock(cx), "numbers without a time need no clock");
+
+        let before = renders.get();
+        cx.executor().advance_clock(USAGE_TICK * 4);
+        cx.run_until_parked();
+        assert_eq!(renders.get(), before);
+    }
+
     #[gpui::test]
     fn the_poll_restarts_when_the_open_task_changes(cx: &mut TestAppContext) {
         let socket = fake_daemon_replying(|_| None);
@@ -4522,6 +4656,130 @@ pub(crate) mod tests {
             workspace.data.task_list(DaemonTaskId(7)).len()
         });
         assert_eq!(kept, 1);
+    }
+
+    fn claude_usage(percent: u8) -> Usage {
+        Usage {
+            claude: swarm_protocol::ProviderUsage {
+                windows: vec![swarm_protocol::UsageWindow {
+                    label: "5h".into(),
+                    used_percent: percent,
+                    resets_at: None,
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// The used share of Claude's shortest window, and whether the card has its row.
+    fn claude_card(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> (Option<u8>, bool) {
+        workspace.update(cx, |_, cx| cx.notify());
+        redraw(cx);
+
+        let percent = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .data
+                .usage
+                .claude
+                .windows
+                .first()
+                .map(|window| window.used_percent)
+        });
+
+        (percent, cx.debug_bounds("usage-claude").is_some())
+    }
+
+    #[gpui::test]
+    fn the_app_asks_for_usage_once_after_connecting_and_follows_its_changes(
+        cx: &mut TestAppContext,
+    ) {
+        let (asked, asks) = flume::unbounded();
+        let socket = fake_daemon_replying(move |request| match request {
+            Request::Usage { call } => {
+                asked.send(()).ok();
+
+                Some(Event::Usage {
+                    call,
+                    usage: claude_usage(42),
+                })
+            }
+            Request::Attach { .. } => Some(Event::UsageChanged {
+                usage: claude_usage(77),
+            }),
+            _ => None,
+        });
+        let (workspace, cx, client) = real_task_workspace(&socket, cx);
+
+        let answered = wait_until(cx, |cx| claude_card(&workspace, cx) == (Some(42), true));
+        assert!(answered, "the card shows the answer");
+
+        client
+            .attach(swarm_protocol::TerminalId(99), 0)
+            .expect("send the attach");
+        let changed = wait_until(cx, |cx| claude_card(&workspace, cx) == (Some(77), true));
+        assert!(changed, "the card follows the event");
+        assert_eq!(asks.try_iter().count(), 1, "the app asks once");
+    }
+
+    #[gpui::test]
+    fn a_reconnect_asks_for_usage_again(cx: &mut TestAppContext) {
+        let first = fake_daemon_replying(|request| match request {
+            Request::Usage { call } => Some(Event::Usage {
+                call,
+                usage: claude_usage(42),
+            }),
+            _ => None,
+        });
+        let second = fake_daemon_replying(|request| match request {
+            Request::Usage { call } => Some(Event::Usage {
+                call,
+                usage: claude_usage(55),
+            }),
+            _ => None,
+        });
+        let (workspace, cx, _client) = real_task_workspace(&first, cx);
+        let before = wait_until(cx, |cx| claude_card(&workspace, cx).0 == Some(42));
+
+        let client = Client::connect(&second).expect("connect to the second fake daemon");
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.use_daemon(client, &[], window, cx);
+        });
+        let after = wait_until(cx, |cx| claude_card(&workspace, cx).0 == Some(55));
+
+        assert!(before, "the first connection is asked");
+        assert!(after, "the second connection is asked again");
+    }
+
+    #[gpui::test]
+    fn an_event_wins_over_an_answer_that_was_asked_before_it(cx: &mut TestAppContext) {
+        let (release, gate) = flume::unbounded::<()>();
+        let socket = fake_daemon_replying(move |request| match request {
+            Request::Usage { call } => {
+                gate.recv().ok();
+
+                Some(Event::Usage {
+                    call,
+                    usage: claude_usage(42),
+                })
+            }
+            _ => None,
+        });
+        let (workspace, cx, _client) = real_task_workspace(&socket, cx);
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.usage_changed(claude_usage(77), cx);
+        });
+        release.send(()).expect("the fake daemon is waiting");
+        cx.executor().allow_parking();
+        answer_late();
+        cx.run_until_parked();
+
+        let (percent, _) = claude_card(&workspace, cx);
+        assert_eq!(percent, Some(77));
     }
 
     pub(crate) fn pending_comment(id: u64, body: &str) -> swarm_protocol::ReviewComment {
