@@ -4309,6 +4309,32 @@ pub(crate) mod tests {
         cx.run_until_parked();
     }
 
+    /// The color of the quad drawn at the bounds of `selector`. When more than one quad has
+    /// those bounds, the one drawn last, which is the one on top.
+    pub(crate) fn drawn_color(
+        selector: &'static str,
+        cx: &mut VisualTestContext,
+    ) -> Option<gpui::Hsla> {
+        let bounds = cx.debug_bounds(selector)?;
+
+        cx.update(|window, _| {
+            let wanted = bounds.scale(window.scale_factor());
+            let near = |a: gpui::ScaledPixels, b: gpui::ScaledPixels| (a.0 - b.0).abs() < 0.01;
+
+            window
+                .painted_quads()
+                .iter()
+                .rev()
+                .find(|quad| {
+                    near(quad.bounds.origin.x, wanted.origin.x)
+                        && near(quad.bounds.origin.y, wanted.origin.y)
+                        && near(quad.bounds.size.width, wanted.size.width)
+                        && near(quad.bounds.size.height, wanted.size.height)
+                })
+                .and_then(|quad| quad.background.as_solid())
+        })
+    }
+
     #[gpui::test]
     fn a_start_tab_asks_for_its_orchestrator_once_and_lets_the_daemon_pick_the_kind(
         cx: &mut TestAppContext,

@@ -547,12 +547,23 @@ fn usage_group(section: &UsageSection) -> impl IntoElement + use<> {
                 .size(LabelSize::Small)
                 .weight(FontWeight::MEDIUM),
         )
-        .children(
-            section
-                .plan
-                .clone()
-                .map(|plan| Label::new(plan).size(LabelSize::XSmall).color(Color::Faint)),
-        );
+        .children(section.plan.clone().map(|plan| {
+            let selector = format!("{id}-plan");
+
+            div()
+                .debug_selector(move || selector)
+                .child(Label::new(plan).size(LabelSize::XSmall).color(Color::Faint))
+        }))
+        .child(div().flex_1())
+        .children(section.age.as_ref().map(|(shown, _)| {
+            let selector = format!("{id}-age");
+
+            div().debug_selector(move || selector).child(
+                Label::new(shown.clone())
+                    .size(LabelSize::XSmall)
+                    .color(Color::Faint),
+            )
+        }));
 
     let problem = section.problem.as_ref().map(|(shown, spoken)| {
         let problem_id = format!("{id}-problem");
@@ -596,6 +607,7 @@ fn usage_meter(group: &SharedString, index: usize, row: &WindowRow) -> UsageMete
         .value(format!("{}%", row.percent))
         .fraction(row.fraction())
         .tone(row.tone())
+        .surface(UsageSurface::Panel)
         .accessible_label(row.spoken.clone())
         .debug_selector(move || selector)
         .when_some(row.pace(), UsageMeter::pace)
@@ -603,12 +615,13 @@ fn usage_meter(group: &SharedString, index: usize, row: &WindowRow) -> UsageMete
 
 #[cfg(test)]
 mod tests {
-    use gpui::{TestAppContext, VisualTestContext};
+    use gpui::{Hsla, TestAppContext, VisualTestContext};
 
     use swarm_protocol::{SubscriptionUsage, Usage, UsageProblem, UsageWindow};
     use swarm_ui::UsageTone;
 
     use super::*;
+    use crate::daemon::tests::drawn_color;
     use crate::model::SAMPLE_NOW;
 
     fn setup(cx: &mut TestAppContext) -> (gpui::Entity<Workspace>, &mut VisualTestContext) {
@@ -750,7 +763,7 @@ mod tests {
         ("usage-codex-1", "usage-codex-1-bar", "usage-codex-1-tick"),
     ];
 
-    /// How far along the bar the tick sits, from 0 to 1.
+    /// How far along the bar the middle of the tick sits, from 0 to 1.
     fn tick_position(
         bar: &'static str,
         tick: &'static str,
@@ -759,7 +772,7 @@ mod tests {
         let bar = cx.debug_bounds(bar)?;
         let tick = cx.debug_bounds(tick)?;
 
-        Some(f32::from(tick.origin.x - bar.origin.x) / f32::from(bar.size.width))
+        Some(f32::from(tick.center().x - bar.origin.x) / f32::from(bar.size.width))
     }
 
     fn sample_sections(
@@ -792,11 +805,7 @@ mod tests {
         assert_eq!(
             windows,
             [
-                (
-                    "Claude",
-                    Some("Max".to_owned()),
-                    "Session/Weekly".to_owned()
-                ),
+                ("Claude", None, "Session/Weekly".to_owned()),
                 (
                     "Codex",
                     Some("Plus".to_owned()),
@@ -888,6 +897,111 @@ mod tests {
         );
     }
 
+    /// The fill color of a meter, for the normal and the warn tone.
+    fn fill_colors(cx: &mut VisualTestContext) -> (Hsla, Hsla) {
+        cx.update(|_, cx| {
+            let colors = cx.theme().colors();
+
+            (colors.fg, colors.warn)
+        })
+    }
+
+    #[gpui::test]
+    fn only_the_window_that_warns_draws_a_warn_fill_and_an_alert_icon(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        card_rows(&workspace, cx);
+        let (normal, warn) = fill_colors(cx);
+
+        let fills = [
+            "usage-claude-0-fill",
+            "usage-claude-1-fill",
+            "usage-codex-0-fill",
+            "usage-codex-1-fill",
+        ]
+        .map(|selector| drawn_color(selector, cx));
+        let alerts = [
+            "usage-claude-0-alert",
+            "usage-claude-1-alert",
+            "usage-codex-0-alert",
+            "usage-codex-1-alert",
+        ]
+        .map(|selector| shown(selector, cx));
+
+        assert_eq!(
+            fills,
+            [Some(normal), Some(warn), Some(normal), Some(normal)]
+        );
+        assert_eq!(alerts, [false, true, false, false]);
+    }
+
+    #[gpui::test]
+    fn a_full_window_draws_a_warn_fill_and_an_alert_icon(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        workspace.update(cx, |workspace, cx| {
+            let mut usage = workspace.data.usage.clone();
+            usage.codex.windows[0].used_percent = 100;
+            workspace.usage_changed(usage, cx);
+        });
+        card_rows(&workspace, cx);
+        let (_, warn) = fill_colors(cx);
+
+        assert_eq!(drawn_color("usage-codex-0-fill", cx), Some(warn));
+        assert!(shown("usage-codex-0-alert", cx));
+        assert_eq!(
+            sample_sections(&workspace, cx)[1].windows[0]
+                .risk
+                .as_deref(),
+            Some("Limit reached")
+        );
+    }
+
+    #[gpui::test]
+    fn the_tick_is_cut_out_of_a_warn_fill_in_the_color_of_the_card(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        card_rows(&workspace, cx);
+        let panel = cx.update(|_, cx| cx.theme().colors().panel);
+
+        assert_eq!(drawn_color("usage-claude-1-notch", cx), Some(panel));
+        assert!(!shown("usage-claude-0-notch", cx));
+    }
+
+    #[gpui::test]
+    fn the_age_of_old_numbers_shows_next_to_the_name_of_the_kind(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        card_rows(&workspace, cx);
+
+        // Codex was read 14 minutes before the sample time, Claude one minute.
+        assert!(shown("usage-codex-age", cx));
+        assert!(!shown("usage-claude-age", cx));
+
+        workspace.update(cx, |workspace, _| {
+            workspace.fixed_now = Some(SAMPLE_NOW + 10 * 60_000);
+        });
+        card_rows(&workspace, cx);
+
+        assert!(shown("usage-claude-age", cx));
+    }
+
+    #[gpui::test]
+    fn the_plan_shows_only_when_the_agent_kind_has_one(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        card_rows(&workspace, cx);
+
+        assert!(!shown("usage-claude-plan", cx));
+        assert!(shown("usage-codex-plan", cx));
+
+        workspace.update(cx, |workspace, cx| {
+            let mut usage = workspace.data.usage.clone();
+            usage.claude.plan = Some("max".to_owned());
+            usage.codex.plan = None;
+            workspace.usage_changed(usage, cx);
+        });
+        card_rows(&workspace, cx);
+
+        assert!(shown("usage-claude-plan", cx));
+        assert!(!shown("usage-codex-plan", cx));
+    }
+
     #[gpui::test]
     fn a_window_without_a_length_has_a_bar_and_no_tick(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
@@ -960,7 +1074,7 @@ mod tests {
         assert_eq!(
             labels,
             [
-                "Claude usage, Max plan",
+                "Claude usage",
                 "Codex usage, Plus plan, updated 14 minutes ago"
             ]
         );

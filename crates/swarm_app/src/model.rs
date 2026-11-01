@@ -647,14 +647,15 @@ fn sample_usage() -> Usage {
     };
 
     // Claude's weekly window has used more than even use would by now, so it shows the
-    // warning. Codex was read a quarter of an hour ago.
+    // warning. Claude has no plan: nothing reports one. Codex was read a quarter of an hour
+    // ago.
     Usage {
         claude: SubscriptionUsage {
             windows: vec![
                 window("5h", 42, 5 * HOUR, 2 * HOUR + 6 * 60),
                 window("7d", 61, 7 * DAY, 3 * DAY + 21 * HOUR),
             ],
-            plan: Some("max".to_owned()),
+            plan: None,
             read_at: Some(now - 60),
             problem: None,
         },

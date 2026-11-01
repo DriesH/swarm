@@ -59,12 +59,18 @@ fn needs_you(data: &mut FakeData) {
     }
 }
 
-/// The last Claude read failed: its meters keep the old numbers.
+/// The last Codex read failed: its meters keep the old numbers.
 fn usage_failed(data: &mut FakeData) {
     quiet(data);
-    data.usage.claude.problem = Some(UsageProblem::Failed(
-        "the status line sent nothing".to_owned(),
+    data.usage.codex.problem = Some(UsageProblem::Failed(
+        "the app server did not answer".to_owned(),
     ));
+}
+
+/// A full window, and numbers old enough to say the limit was likely reached.
+fn usage_limits(data: &mut FakeData) {
+    quiet(data);
+    crate::snapshot::reach_limits(&mut data.usage);
 }
 
 /// The two wing frames of the buzzing bee on a strip of the menu bar, the way macOS tints a
@@ -147,11 +153,12 @@ pub(crate) fn run(directory: PathBuf, cx: &mut App) {
 
         save_bee_frames(&directory);
 
-        let variants: [(&str, Prepare, Stop); 4] = [
+        let variants: [(&str, Prepare, Stop); 5] = [
             ("popover", quiet, Stop::Button),
             ("popover-needs-you", needs_you, Stop::Button),
             ("popover-confirm", quiet, Stop::Asking),
             ("popover-failed", usage_failed, Stop::Failed),
+            ("popover-usage-limits", usage_limits, Stop::Button),
         ];
 
         for (appearance, theme_name) in [(Appearance::Light, "light"), (Appearance::Dark, "dark")] {

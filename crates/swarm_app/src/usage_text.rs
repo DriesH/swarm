@@ -4,7 +4,7 @@
 use swarm_protocol::{SubscriptionUsage, Usage, UsageProblem, UsageWindow};
 use swarm_ui::UsageTone;
 
-use crate::usage_pace::{Span, pace};
+use crate::usage_pace::{Risk, Span, risk, tick_permille};
 
 const DAY: u64 = 24 * 3_600;
 
@@ -43,7 +43,8 @@ pub(crate) struct WindowRow {
     pub percent: u8,
     /// Where even use would be by now, in thousandths of the window.
     pub pace_permille: Option<u16>,
-    /// For example "Limit in 3d 21h": the use so far reaches 100% before the reset.
+    /// For example "Limit in 3d 21h": the use so far reaches 100% before the reset. Also
+    /// "Limit likely reached" and "Limit reached".
     pub risk: Option<String>,
     /// For example "Resets in 2h 6m".
     pub resets: Option<String>,
@@ -57,7 +58,8 @@ impl WindowRow {
         f32::from(self.percent.min(100)) / 100.
     }
 
-    /// A window that is on course to hit the limit before it resets turns warn.
+    /// A window that is on course to hit the limit before it resets, or has hit it, turns
+    /// warn.
     pub(crate) fn tone(&self) -> UsageTone {
         if self.risk.is_some() {
             UsageTone::Warn
@@ -77,7 +79,7 @@ impl WindowRow {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct UsageSection {
     pub kind: UsageKind,
-    /// For example "Max".
+    /// For example "Plus". Only set when the CLI reports one.
     pub plan: Option<String>,
     /// "Updated 4m ago" and what VoiceOver reads, once the numbers are old.
     pub age: Option<(String, String)>,
@@ -87,7 +89,7 @@ pub(crate) struct UsageSection {
 }
 
 impl UsageSection {
-    /// What VoiceOver reads for the section, for example "Claude usage, Max plan".
+    /// What VoiceOver reads for the section, for example "Codex usage, Plus plan".
     pub(crate) fn label(&self) -> String {
         let plan = self.plan.as_ref().map(|plan| format!("{plan} plan"));
         let age = self.age.as_ref().map(|(_, spoken)| spoken.clone());
@@ -124,18 +126,17 @@ fn section_of(kind: UsageKind, reading: &SubscriptionUsage, now: u64) -> Option<
         windows: reading
             .windows
             .iter()
-            .map(|window| window_row(kind, window, now))
+            .map(|window| window_row(kind, window, reading.read_at, now))
             .collect(),
         problem,
     })
 }
 
-fn window_row(kind: UsageKind, window: &UsageWindow, now: u64) -> WindowRow {
-    let name = window_name(kind, window);
+fn window_row(kind: UsageKind, window: &UsageWindow, read_at: Option<u64>, now: u64) -> WindowRow {
+    let name = window_name(window);
     let percent = shown_percent(window, now);
 
-    let pace = pace(window, now);
-    let limit_in = pace.and_then(|pace| pace.limit_in).map(Span::left);
+    let risk = risk(window, percent, read_at, now).map(risk_texts);
     let resets_in = window
         .resets_at
         .filter(|at| *at > now)
@@ -147,7 +148,7 @@ fn window_row(kind: UsageKind, window: &UsageWindow, now: u64) -> WindowRow {
             kind.name(),
             name.to_lowercase()
         )),
-        limit_in.map(|span| format!("limit in {}", span.spoken())),
+        risk.as_ref().map(|(_, spoken)| spoken.clone()),
         resets_in.map(|span| format!("resets in {}", span.spoken())),
     ];
     let spoken: Vec<String> = spoken.into_iter().flatten().collect();
@@ -155,28 +156,40 @@ fn window_row(kind: UsageKind, window: &UsageWindow, now: u64) -> WindowRow {
     WindowRow {
         name,
         percent,
-        pace_permille: pace.map(|pace| pace.permille),
-        risk: limit_in.map(|span| format!("Limit in {}", span.short())),
+        pace_permille: tick_permille(window, now),
+        risk: risk.map(|(shown, _)| shown),
         resets: resets_in.map(|span| format!("Resets in {}", span.short())),
         spoken: spoken.join(", "),
     }
 }
 
-/// Claude names its two windows by their label. Codex windows come in any length, so they
-/// are named by it.
-pub(crate) fn window_name(kind: UsageKind, window: &UsageWindow) -> String {
-    let known = match kind {
-        UsageKind::Claude => match window.label.as_str() {
-            "5h" => Some("Session"),
-            "7d" => Some("Weekly"),
-            _ => None,
-        },
-        UsageKind::Codex => match window.length_secs {
-            Some(length) if (1..DAY).contains(&length) => Some("Session"),
-            Some(length) if length == 7 * DAY => Some("Weekly"),
-            Some(length) if length == 30 * DAY => Some("Monthly"),
-            _ => None,
-        },
+/// The warning and what VoiceOver reads for it.
+fn risk_texts(risk: Risk) -> (String, String) {
+    match risk {
+        Risk::LimitIn(seconds) => {
+            let span = Span::left(seconds);
+
+            (
+                format!("Limit in {}", span.short()),
+                format!("limit in {}", span.spoken()),
+            )
+        }
+        Risk::LikelyReached => (
+            "Limit likely reached".to_owned(),
+            "limit likely reached".to_owned(),
+        ),
+        Risk::Reached => ("Limit reached".to_owned(), "limit reached".to_owned()),
+    }
+}
+
+/// A window is named by its length: under a day a Session, a week Weekly, thirty days
+/// Monthly. Any other length, or none, uses the label.
+pub(crate) fn window_name(window: &UsageWindow) -> String {
+    let known = match window.length_secs {
+        Some(length) if (1..DAY).contains(&length) => Some("Session"),
+        Some(length) if length == 7 * DAY => Some("Weekly"),
+        Some(length) if length == 30 * DAY => Some("Monthly"),
+        _ => None,
     };
 
     known.map_or_else(|| format!("{} window", window.label), str::to_owned)
@@ -269,31 +282,14 @@ mod tests {
         }
     }
 
+    /// A row for a window that was read just now.
     fn claude_row(window: &UsageWindow) -> WindowRow {
-        window_row(UsageKind::Claude, window, NOW)
+        window_row(UsageKind::Claude, window, Some(NOW), NOW)
     }
 
     #[test]
-    fn claude_names_its_windows_by_label() {
-        let names: Vec<_> = ["5h", "7d", "30d", "limit"]
-            .map(|label| window_name(UsageKind::Claude, &window(label, 1, None, None)))
-            .into();
-
-        assert_eq!(names, ["Session", "Weekly", "30d window", "limit window"]);
-    }
-
-    #[test]
-    fn claude_ignores_the_length_when_it_names_a_window() {
-        let name = window_name(UsageKind::Claude, &window("5h", 1, Some(30 * DAY), None));
-
-        assert_eq!(name, "Session");
-    }
-
-    #[test]
-    fn codex_names_its_windows_by_length() {
-        let name = |label: &str, length: Option<u64>| {
-            window_name(UsageKind::Codex, &window(label, 1, length, None))
-        };
+    fn windows_are_named_by_their_length() {
+        let name = |label: &str, length: Option<u64>| window_name(&window(label, 1, length, None));
 
         assert_eq!(name("5h", Some(5 * HOUR)), "Session");
         assert_eq!(name("1m", Some(60)), "Session");
@@ -303,15 +299,21 @@ mod tests {
     }
 
     #[test]
-    fn codex_windows_of_any_other_length_use_their_label() {
-        let name = |label: &str, length: Option<u64>| {
-            window_name(UsageKind::Codex, &window(label, 1, length, None))
-        };
+    fn the_length_names_a_window_whatever_its_label_says() {
+        let name = window_name(&window("5h", 1, Some(30 * DAY), None));
+
+        assert_eq!(name, "Monthly");
+    }
+
+    #[test]
+    fn windows_of_any_other_length_or_none_use_their_label() {
+        let name = |label: &str, length: Option<u64>| window_name(&window(label, 1, length, None));
 
         assert_eq!(name("1d", Some(DAY)), "1d window");
         assert_eq!(name("3d", Some(3 * DAY)), "3d window");
         assert_eq!(name("limit", None), "limit window");
         assert_eq!(name("5h", None), "5h window");
+        assert_eq!(name("7d", None), "7d window");
         assert_eq!(name("limit", Some(0)), "limit window");
     }
 
@@ -378,7 +380,7 @@ mod tests {
     fn the_spoken_label_has_the_percent_the_risk_and_the_reset() {
         let weekly = window("7d", 61, Some(7 * DAY), Some(93 * HOUR));
         let session = window("5h", 42, Some(5 * HOUR), Some(126 * 60));
-        let plain = window("7d", 9, None, None);
+        let plain = window("7d", 9, Some(7 * DAY), None);
 
         assert_eq!(
             claude_row(&weekly).spoken,
@@ -404,6 +406,100 @@ mod tests {
         assert_eq!(
             claude_row(&older).spoken,
             "Claude weekly 61% used, limit in 12 hours 9 minutes, resets in 6 days 5 hours"
+        );
+    }
+
+    #[test]
+    fn a_full_window_warns_that_the_limit_is_reached() {
+        let session = window("5h", 100, Some(5 * HOUR), Some(HOUR));
+
+        let row = claude_row(&session);
+
+        assert_eq!(row.risk.as_deref(), Some("Limit reached"));
+        assert_eq!(row.tone(), UsageTone::Warn);
+        assert_eq!(row.resets.as_deref(), Some("Resets in 1h"));
+        assert_eq!(
+            row.spoken,
+            "Claude session 100% used, limit reached, resets in 1 hour"
+        );
+    }
+
+    #[test]
+    fn a_full_window_without_a_length_still_warns() {
+        let row = claude_row(&window("5h", 100, None, None));
+
+        assert_eq!(row.risk.as_deref(), Some("Limit reached"));
+        assert_eq!(row.pace_permille, None);
+    }
+
+    #[test]
+    fn a_window_that_was_full_and_has_reset_does_not_warn() {
+        let passed = UsageWindow {
+            resets_at: Some(NOW - 5),
+            ..window("5h", 100, Some(5 * HOUR), None)
+        };
+
+        let row = claude_row(&passed);
+
+        assert_eq!(row.risk, None);
+        assert_eq!(row.tone(), UsageTone::Normal);
+    }
+
+    #[test]
+    fn the_limit_is_worked_out_at_the_time_of_the_reading() {
+        // 168 hours long, 75 gone. 61% was read 20 hours ago, at hour 55.
+        let weekly = window("7d", 61, Some(7 * DAY), Some(93 * HOUR));
+
+        let current = window_row(UsageKind::Claude, &weekly, Some(NOW), NOW);
+        let old = window_row(UsageKind::Claude, &weekly, Some(NOW - 20 * HOUR), NOW);
+
+        assert_eq!(current.risk.as_deref(), Some("Limit in 1d 23h"));
+        assert_eq!(old.risk.as_deref(), Some("Limit in 15h 10m"));
+        assert_eq!(
+            old.spoken,
+            "Claude weekly 61% used, limit in 15 hours 10 minutes, resets in 3 days 21 hours"
+        );
+    }
+
+    #[test]
+    fn an_old_reading_that_has_likely_hit_the_limit_says_so() {
+        // 5 hours long, 4 gone. 30% was read 3 hours ago, at hour 1: 100% came at hour 3h 20m.
+        let session = window("5h", 30, Some(5 * HOUR), Some(HOUR));
+
+        let row = window_row(UsageKind::Claude, &session, Some(NOW - 3 * HOUR), NOW);
+
+        assert_eq!(row.risk.as_deref(), Some("Limit likely reached"));
+        assert_eq!(row.tone(), UsageTone::Warn);
+        assert_eq!(
+            row.spoken,
+            "Claude session 30% used, limit likely reached, resets in 1 hour"
+        );
+    }
+
+    #[test]
+    fn the_tick_follows_the_clock_not_the_reading() {
+        let session = window("5h", 30, Some(5 * HOUR), Some(HOUR));
+
+        let row = window_row(UsageKind::Claude, &session, Some(NOW - 3 * HOUR), NOW);
+
+        assert_eq!(row.pace_permille, Some(800));
+    }
+
+    #[test]
+    fn a_section_passes_the_time_of_its_reading_to_each_window() {
+        let usage = Usage {
+            codex: SubscriptionUsage {
+                read_at: Some(NOW - 3 * HOUR),
+                ..reading(None, vec![window("5h", 30, Some(5 * HOUR), Some(HOUR))])
+            },
+            ..Usage::default()
+        };
+
+        let sections = usage_sections(&usage, NOW);
+
+        assert_eq!(
+            sections[0].windows[0].risk.as_deref(),
+            Some("Limit likely reached")
         );
     }
 
@@ -450,7 +546,7 @@ mod tests {
                     Some("max"),
                     vec![
                         window("5h", 42, Some(5 * HOUR), Some(2 * HOUR)),
-                        window("7d", 18, None, None),
+                        window("7d", 18, Some(7 * DAY), None),
                     ],
                 )
             },

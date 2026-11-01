@@ -530,13 +530,18 @@ fn header(running: usize) -> impl IntoElement {
 fn usage_card(section: &UsageSection) -> gpui::AnyElement {
     Panel::new()
         .raised()
-        .row(div().p(px(CARD_PADDING)).child(usage_section(section)))
+        .row(
+            div()
+                .p(px(CARD_PADDING))
+                .child(usage_section(section, UsageSurface::Raised)),
+        )
         .into_any_element()
 }
 
 /// The name of an agent kind with its plan and the age of the numbers, a meter for each
-/// window and the problem line. Settings › Usage shows the same sections.
-pub(crate) fn usage_section(section: &UsageSection) -> gpui::AnyElement {
+/// window and the problem line. Settings › Usage shows the same sections. `surface` is what
+/// the section sits on.
+pub(crate) fn usage_section(section: &UsageSection, surface: UsageSurface) -> gpui::AnyElement {
     let id = SharedString::from(format!("popover-usage-{}", section.kind.slug()));
 
     let header = h_flex()
@@ -569,7 +574,7 @@ pub(crate) fn usage_section(section: &UsageSection) -> gpui::AnyElement {
         .windows
         .iter()
         .enumerate()
-        .map(|(index, window)| meter_of(&id, index, window));
+        .map(|(index, window)| meter_of(&id, index, window, surface));
 
     let problem = section.problem.as_ref().map(|(shown, spoken)| {
         let problem_id = format!("{id}-problem");
@@ -601,13 +606,19 @@ pub(crate) fn usage_section(section: &UsageSection) -> gpui::AnyElement {
         .into_any_element()
 }
 
-fn meter_of(section: &SharedString, index: usize, row: &WindowRow) -> UsageDetailMeter {
+fn meter_of(
+    section: &SharedString,
+    index: usize,
+    row: &WindowRow,
+    surface: UsageSurface,
+) -> UsageDetailMeter {
     let selector = format!("{section}-{index}");
 
     UsageDetailMeter::new((section.clone(), index), row.name.clone())
         .value(format!("{}% used", row.percent))
         .fraction(row.fraction())
         .tone(row.tone())
+        .surface(surface)
         .accessible_label(row.spoken.clone())
         .debug_selector(move || selector)
         .when_some(row.pace(), UsageDetailMeter::pace)
@@ -675,6 +686,7 @@ mod tests {
 
     use super::super::harness::{self, activate, popover_is_open, popover_window, setup};
     use super::*;
+    use crate::daemon::tests::drawn_color;
     use crate::daemon::tests::{
         agent_info, fake_daemon_replying, project_info, task_info, use_projects, wait_until,
     };
@@ -818,14 +830,27 @@ mod tests {
     }
 
     #[gpui::test]
-    fn each_card_shows_its_plan_and_the_age_of_old_numbers(cx: &mut TestAppContext) {
-        let (_workspace, bar, cx) = setup(cx);
+    fn a_card_shows_its_plan_only_when_it_has_one_and_the_age_of_old_numbers(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, bar, cx) = setup(cx);
         let mut popover = open(&bar, cx);
 
-        assert!(shown("popover-usage-claude-plan", &mut popover));
+        assert!(!shown("popover-usage-claude-plan", &mut popover));
         assert!(shown("popover-usage-codex-plan", &mut popover));
         assert!(!shown("popover-usage-claude-age", &mut popover));
         assert!(shown("popover-usage-codex-age", &mut popover));
+
+        workspace.update(&mut popover, |workspace, cx| {
+            let mut usage = workspace.data.usage.clone();
+            usage.claude.plan = Some("max".to_owned());
+            usage.codex.plan = None;
+            workspace.usage_changed(usage, cx);
+        });
+        draw(&mut popover);
+
+        assert!(shown("popover-usage-claude-plan", &mut popover));
+        assert!(!shown("popover-usage-codex-plan", &mut popover));
     }
 
     #[gpui::test]
@@ -861,6 +886,67 @@ mod tests {
         assert!(!shown("popover-usage-claude-0-warning", &mut popover));
         assert!(!shown("popover-usage-codex-0-warning", &mut popover));
         assert!(!shown("popover-usage-codex-1-warning", &mut popover));
+    }
+
+    #[gpui::test]
+    fn only_the_window_that_warns_draws_a_warn_fill(cx: &mut TestAppContext) {
+        let (_workspace, bar, cx) = setup(cx);
+        let mut popover = open(&bar, cx);
+        let (normal, warn) = popover.update(|_, cx| {
+            let colors = cx.theme().colors();
+
+            (colors.fg, colors.warn)
+        });
+
+        let fills = [
+            "popover-usage-claude-0-fill",
+            "popover-usage-claude-1-fill",
+            "popover-usage-codex-0-fill",
+            "popover-usage-codex-1-fill",
+        ]
+        .map(|selector| drawn_color(selector, &mut popover));
+
+        assert_eq!(
+            fills,
+            [Some(normal), Some(warn), Some(normal), Some(normal)]
+        );
+    }
+
+    #[gpui::test]
+    fn a_full_window_warns_that_the_limit_is_reached(cx: &mut TestAppContext) {
+        let (workspace, bar, cx) = setup(cx);
+        workspace.update(cx, |workspace, cx| {
+            let mut usage = workspace.data.usage.clone();
+            usage.codex.windows[0].used_percent = 100;
+            workspace.usage_changed(usage, cx);
+        });
+        let mut popover = open(&bar, cx);
+        let warn = popover.update(|_, cx| cx.theme().colors().warn);
+
+        assert!(shown("popover-usage-codex-0-warning", &mut popover));
+        assert_eq!(
+            drawn_color("popover-usage-codex-0-fill", &mut popover),
+            Some(warn)
+        );
+        assert_eq!(
+            sections(&workspace, &mut popover)[1].windows[0]
+                .risk
+                .as_deref(),
+            Some("Limit reached")
+        );
+    }
+
+    #[gpui::test]
+    fn the_tick_is_cut_out_of_a_warn_fill_in_the_color_of_the_raised_card(cx: &mut TestAppContext) {
+        let (_workspace, bar, cx) = setup(cx);
+        let mut popover = open(&bar, cx);
+        let raised = popover.update(|_, cx| cx.theme().colors().raised);
+
+        assert_eq!(
+            drawn_color("popover-usage-claude-1-notch", &mut popover),
+            Some(raised)
+        );
+        assert!(!shown("popover-usage-claude-0-notch", &mut popover));
     }
 
     #[gpui::test]
@@ -932,7 +1018,7 @@ mod tests {
             .windows
             .iter()
             .enumerate()
-            .map(|(index, window)| label_of(meter_of(&id, index, window), cx))
+            .map(|(index, window)| label_of(meter_of(&id, index, window, UsageSurface::Raised), cx))
             .collect();
 
         assert_eq!(

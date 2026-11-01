@@ -94,7 +94,13 @@ impl Render for UsagePage {
                 .iter()
                 .fold(
                     Panel::new().accessible("usage-sections", "Subscription usage"),
-                    |panel, section| panel.row(div().p(px(14.)).child(usage_section(section))),
+                    |panel, section| {
+                        panel.row(
+                            div()
+                                .p(px(14.))
+                                .child(usage_section(section, UsageSurface::Panel)),
+                        )
+                    },
                 )
                 .into_any_element()
         };
