@@ -11,7 +11,6 @@ mod messages;
 mod processes;
 mod pull_requests;
 mod recovery;
-mod system_check;
 mod tasks;
 #[cfg(test)]
 mod temp_folder;
@@ -39,12 +38,12 @@ use swarm_protocol::{Paths, check_private_dir};
 use crate::agents::{AgentConfig, Agents};
 use crate::calls::Calls;
 use crate::checks::Checks;
+use crate::connection::SystemChecks;
 use crate::hub::{Clients, Terminals};
 use crate::messages::Messages;
 use crate::processes::Processes;
 use crate::pull_requests::PullRequests;
 use crate::recovery::System;
-use crate::system_check::SystemChecks;
 use crate::usage::{Overrides, UsageService};
 
 /// What every client connection works with.

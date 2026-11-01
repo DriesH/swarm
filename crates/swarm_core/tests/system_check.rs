@@ -87,8 +87,8 @@ impl World {
             xcode_select: self.root.join("xcode-select"),
             security: self.root.join("security"),
             path: Some(self.bin().into_os_string()),
+            folders: Vec::new(),
             home: Some(self.home()),
-            codex_home: None,
             timeout: Duration::from_secs(10),
         }
     }
@@ -139,7 +139,10 @@ impl World {
     }
 }
 
-fn run_check(tools: &Tools, github: &Github) -> SystemCheck {
+/// Runs the check on tools that must not reach beyond the world.
+fn run_check(world: &World, tools: &Tools, github: &Github) -> SystemCheck {
+    assert_contained(world, tools);
+
     check(
         tools,
         &AgentCommands {
@@ -148,6 +151,25 @@ fn run_check(tools: &Tools, github: &Github) -> SystemCheck {
         },
         github,
     )
+}
+
+/// Panics when the tools can start or find a program outside the folder of the world, like
+/// the real `git` in `/opt/homebrew/bin`.
+fn assert_contained(world: &World, tools: &Tools) {
+    let reachable = tools
+        .search_folders()
+        .into_iter()
+        .chain([tools.xcode_select.clone(), tools.security.clone()])
+        .chain(tools.home.clone());
+
+    for path in reachable {
+        assert!(
+            path.starts_with(&world.root),
+            "{} is outside {}",
+            path.display(),
+            world.root.display()
+        );
+    }
 }
 
 impl Drop for World {
@@ -160,12 +182,16 @@ fn strings(words: &[&str]) -> Vec<String> {
     words.iter().map(|word| (*word).to_owned()).collect()
 }
 
+fn path_text(path: &Path) -> &str {
+    path.to_str().expect("utf-8")
+}
+
 #[test]
 fn git_is_ready_with_its_version() {
     let world = World::new("git-ready");
     world.working_tools();
 
-    let result = run_check(&world.tools(), &world.github(None, Vec::new()));
+    let result = run_check(&world, &world.tools(), &world.github(None, Vec::new()));
 
     assert_eq!(result.git.state, ToolState::Ready);
     assert_eq!(result.git.version.as_deref(), Some("2.39.5"));
@@ -182,7 +208,7 @@ fn git_is_missing_and_never_run_when_the_command_line_tools_are_not_installed() 
         "echo ran > \"$(dirname \"$0\")/git-ran\"; echo 'git version 1'",
     );
 
-    let result = run_check(&world.tools(), &world.github(None, Vec::new()));
+    let result = run_check(&world, &world.tools(), &world.github(None, Vec::new()));
 
     assert_eq!(result.git.state, ToolState::Missing);
     assert_eq!(result.git.fix, strings(&["xcode-select", "--install"]));
@@ -198,7 +224,7 @@ fn git_fails_when_it_cannot_say_its_version() {
     let world = World::new("git-broken");
     world.tool("git", "echo 'bad install' >&2; exit 3");
 
-    let result = run_check(&world.tools(), &world.github(None, Vec::new()));
+    let result = run_check(&world, &world.tools(), &world.github(None, Vec::new()));
 
     assert_eq!(result.git.state, ToolState::Failed);
     let detail = result.git.detail.expect("detail");
@@ -213,7 +239,7 @@ fn git_fails_when_xcode_select_cannot_run() {
     let mut tools = world.tools();
     tools.xcode_select = world.root.join("no-such-xcode-select");
 
-    let result = run_check(&tools, &world.github(None, Vec::new()));
+    let result = run_check(&world, &tools, &world.github(None, Vec::new()));
 
     assert_eq!(result.git.state, ToolState::Failed);
     let detail = result.git.detail.expect("detail");
@@ -229,7 +255,7 @@ fn claude_is_ready_when_the_keychain_has_its_item() {
     let world = World::new("claude-ready");
     world.working_tools();
 
-    let result = run_check(&world.tools(), &world.github(None, Vec::new()));
+    let result = run_check(&world, &world.tools(), &world.github(None, Vec::new()));
 
     assert_eq!(result.claude.state, ToolState::Ready);
     assert_eq!(result.claude.version.as_deref(), Some("2.1.126"));
@@ -247,11 +273,14 @@ fn claude_is_signed_out_when_the_keychain_item_is_not_found() {
     world.working_tools();
     world.script("security", "exit 44");
 
-    let result = run_check(&world.tools(), &world.github(None, Vec::new()));
+    let result = run_check(&world, &world.tools(), &world.github(None, Vec::new()));
 
     assert_eq!(result.claude.state, ToolState::SignedOut);
     assert_eq!(result.claude.version.as_deref(), Some("2.1.126"));
-    assert_eq!(result.claude.fix, strings(&[CLAUDE]));
+    assert_eq!(
+        result.claude.fix,
+        strings(&[path_text(&world.bin().join(CLAUDE))])
+    );
 }
 
 #[test]
@@ -260,7 +289,7 @@ fn claude_fails_when_the_keychain_check_breaks_for_another_reason() {
     world.working_tools();
     world.script("security", "echo 'keychain is locked' >&2; exit 36");
 
-    let result = run_check(&world.tools(), &world.github(None, Vec::new()));
+    let result = run_check(&world, &world.tools(), &world.github(None, Vec::new()));
 
     assert_eq!(result.claude.state, ToolState::Failed);
     assert_eq!(result.claude.version.as_deref(), Some("2.1.126"));
@@ -275,7 +304,7 @@ fn claude_is_missing_with_the_official_installer_as_its_fix() {
     let mut tools = world.tools();
     tools.path = Some(world.root.join("empty").into_os_string());
 
-    let result = run_check(&tools, &world.github(None, Vec::new()));
+    let result = run_check(&world, &tools, &world.github(None, Vec::new()));
 
     assert_eq!(result.claude.state, ToolState::Missing);
     assert_eq!(
@@ -295,7 +324,7 @@ fn claude_that_cannot_say_its_version_fails_without_a_keychain_call() {
     world.working_tools();
     world.tool(CLAUDE, "exit 1");
 
-    let result = run_check(&world.tools(), &world.github(None, Vec::new()));
+    let result = run_check(&world, &world.tools(), &world.github(None, Vec::new()));
 
     assert_eq!(result.claude.state, ToolState::Failed);
     assert!(world.calls("security").is_empty());
@@ -307,7 +336,7 @@ fn codex_is_ready_when_its_auth_file_exists() {
     world.working_tools();
     world.codex_auth();
 
-    let result = run_check(&world.tools(), &world.github(None, Vec::new()));
+    let result = run_check(&world, &world.tools(), &world.github(None, Vec::new()));
 
     assert_eq!(result.codex.state, ToolState::Ready);
     assert_eq!(result.codex.version.as_deref(), Some("0.46.0"));
@@ -320,11 +349,14 @@ fn codex_is_signed_out_without_an_auth_file() {
     world.working_tools();
     std::fs::create_dir_all(world.home().join(".codex")).expect(".codex");
 
-    let result = run_check(&world.tools(), &world.github(None, Vec::new()));
+    let result = run_check(&world, &world.tools(), &world.github(None, Vec::new()));
 
     assert_eq!(result.codex.state, ToolState::SignedOut);
     assert_eq!(result.codex.version.as_deref(), Some("0.46.0"));
-    assert_eq!(result.codex.fix, strings(&[CODEX]));
+    assert_eq!(
+        result.codex.fix,
+        strings(&[path_text(&world.bin().join(CODEX))])
+    );
 }
 
 #[test]
@@ -333,31 +365,63 @@ fn an_auth_file_that_is_a_folder_does_not_count() {
     world.working_tools();
     std::fs::create_dir_all(world.home().join(".codex/auth.json")).expect("folder");
 
-    let result = run_check(&world.tools(), &world.github(None, Vec::new()));
+    let result = run_check(&world, &world.tools(), &world.github(None, Vec::new()));
 
     assert_eq!(result.codex.state, ToolState::SignedOut);
 }
 
 #[test]
-fn codex_home_decides_where_the_auth_file_is() {
-    let world = World::new("codex-home");
+fn a_sign_in_fix_names_the_tool_where_the_folders_after_path_found_it() {
+    let world = World::new("fix-path");
     world.working_tools();
-    let elsewhere = world.root.join("elsewhere");
-    std::fs::create_dir_all(&elsewhere).expect("elsewhere");
+    world.script("security", "exit 44");
+    std::fs::create_dir_all(world.home().join(".codex")).expect(".codex");
     let mut tools = world.tools();
-    tools.codex_home = Some(elsewhere.clone());
+    tools.path = Some(world.root.join("empty").into_os_string());
+    tools.folders = vec![world.bin()];
 
-    world.codex_auth();
-    let signed_out = run_check(&tools, &world.github(None, Vec::new()));
-    std::fs::write(elsewhere.join("auth.json"), "{}").expect("auth.json");
-    let signed_in = run_check(&tools, &world.github(None, Vec::new()));
+    let result = run_check(&world, &tools, &world.github(None, Vec::new()));
 
+    assert_eq!(result.claude.state, ToolState::SignedOut);
     assert_eq!(
-        signed_out.codex.state,
-        ToolState::SignedOut,
-        "the file in ~/.codex is ignored"
+        result.claude.fix,
+        strings(&[path_text(&world.bin().join(CLAUDE))])
     );
-    assert_eq!(signed_in.codex.state, ToolState::Ready);
+    assert_eq!(result.codex.state, ToolState::SignedOut);
+    assert_eq!(
+        result.codex.fix,
+        strings(&[path_text(&world.bin().join(CODEX))])
+    );
+}
+
+#[test]
+fn a_tool_in_no_searched_folder_is_missing() {
+    let world = World::new("not-searched");
+    world.working_tools();
+    let mut tools = world.tools();
+    tools.path = Some(world.root.join("empty").into_os_string());
+
+    let result = run_check(&world, &tools, &world.github(None, Vec::new()));
+
+    assert_eq!(result.git.state, ToolState::Missing);
+    assert_eq!(result.claude.state, ToolState::Missing);
+    assert_eq!(result.codex.state, ToolState::Missing);
+    assert!(world.calls("git").is_empty());
+}
+
+#[test]
+fn the_tools_of_a_test_reach_nothing_outside_its_folder() {
+    let world = World::new("contained");
+
+    assert_contained(&world, &world.tools());
+}
+
+#[test]
+#[should_panic(expected = "is outside")]
+fn the_system_tools_reach_beyond_the_folder_of_a_test() {
+    let world = World::new("not-contained");
+
+    assert_contained(&world, &Tools::system());
 }
 
 #[test]
@@ -367,7 +431,7 @@ fn codex_without_a_home_folder_fails() {
     let mut tools = world.tools();
     tools.home = None;
 
-    let result = run_check(&tools, &world.github(None, Vec::new()));
+    let result = run_check(&world, &tools, &world.github(None, Vec::new()));
 
     assert_eq!(result.codex.state, ToolState::Failed);
     assert!(result.codex.detail.is_some());
@@ -381,7 +445,7 @@ fn a_missing_codex_installs_with_homebrew_when_homebrew_exists() {
     let mut tools = world.tools();
     tools.path = Some(world.root.join("empty").into_os_string());
 
-    let result = run_check(&tools, &world.github(None, folders));
+    let result = run_check(&world, &tools, &world.github(None, folders));
 
     assert_eq!(result.codex.state, ToolState::Missing);
     assert_eq!(
@@ -396,7 +460,7 @@ fn a_missing_codex_uses_the_official_script_without_homebrew() {
     let mut tools = world.tools();
     tools.path = Some(world.root.join("empty").into_os_string());
 
-    let result = run_check(&tools, &world.github(None, Vec::new()));
+    let result = run_check(&world, &tools, &world.github(None, Vec::new()));
 
     assert_eq!(result.codex.state, ToolState::Missing);
     assert_eq!(
@@ -415,7 +479,7 @@ fn gh_and_the_account_are_ready_when_gh_is_signed_in() {
     world.working_tools();
     let gh = world.gh("exit 0");
 
-    let result = run_check(&world.tools(), &world.github(Some(gh), Vec::new()));
+    let result = run_check(&world, &world.tools(), &world.github(Some(gh), Vec::new()));
 
     assert_eq!(result.gh.state, ToolState::Ready);
     assert_eq!(result.gh.version.as_deref(), Some("2.62.0"));
@@ -432,7 +496,11 @@ fn the_account_is_signed_out_with_the_sign_in_command() {
     world.working_tools();
     let gh = world.gh("echo 'You are not logged in' >&2; exit 1");
 
-    let result = run_check(&world.tools(), &world.github(Some(gh.clone()), Vec::new()));
+    let result = run_check(
+        &world,
+        &world.tools(),
+        &world.github(Some(gh.clone()), Vec::new()),
+    );
 
     assert_eq!(result.gh.state, ToolState::Ready);
     assert_eq!(result.github_account.state, ToolState::SignedOut);
@@ -455,7 +523,7 @@ fn a_missing_gh_installs_with_homebrew_and_leaves_the_account_missing() {
     world.working_tools();
     let (brew, folders) = world.brew();
 
-    let result = run_check(&world.tools(), &world.github(None, folders));
+    let result = run_check(&world, &world.tools(), &world.github(None, folders));
 
     assert_eq!(result.gh.state, ToolState::Missing);
     assert_eq!(
@@ -471,7 +539,7 @@ fn a_missing_gh_without_homebrew_downloads_the_release() {
     let world = World::new("gh-missing");
     world.working_tools();
 
-    let result = run_check(&world.tools(), &world.github(None, Vec::new()));
+    let result = run_check(&world, &world.tools(), &world.github(None, Vec::new()));
 
     assert_eq!(result.gh.state, ToolState::Missing);
     assert_eq!(&result.gh.fix[..2], ["/bin/sh", "-c"]);
@@ -490,7 +558,7 @@ fn a_command_that_does_not_end_fails_the_check_and_leaves_the_others_alone() {
     tools.timeout = Duration::from_secs(1);
 
     let start = Instant::now();
-    let result = run_check(&tools, &world.github(None, Vec::new()));
+    let result = run_check(&world, &tools, &world.github(None, Vec::new()));
 
     assert!(start.elapsed() < Duration::from_secs(10));
     assert_eq!(result.claude.state, ToolState::Failed);
@@ -508,7 +576,7 @@ fn a_keychain_check_that_does_not_end_fails_with_the_version_kept() {
     let mut tools = world.tools();
     tools.timeout = Duration::from_secs(1);
 
-    let result = run_check(&tools, &world.github(None, Vec::new()));
+    let result = run_check(&world, &tools, &world.github(None, Vec::new()));
 
     assert_eq!(result.claude.state, ToolState::Failed);
     assert_eq!(result.claude.version.as_deref(), Some("2.1.126"));
@@ -524,7 +592,7 @@ fn a_gh_sign_in_check_that_does_not_end_fails_the_account_only() {
     let mut tools = world.tools();
     tools.timeout = Duration::from_secs(1);
 
-    let result = run_check(&tools, &world.github(Some(gh), Vec::new()));
+    let result = run_check(&world, &tools, &world.github(Some(gh), Vec::new()));
 
     assert_eq!(result.gh.state, ToolState::Ready);
     assert_eq!(result.github_account.state, ToolState::Failed);
@@ -548,7 +616,7 @@ fn the_tools_are_checked_at_the_same_time() {
     let github = world.github(Some(gh), Vec::new());
 
     let start = Instant::now();
-    let result = run_check(&world.tools(), &github);
+    let result = run_check(&world, &world.tools(), &github);
     let elapsed = start.elapsed();
 
     assert_eq!(result.git.state, ToolState::Ready);

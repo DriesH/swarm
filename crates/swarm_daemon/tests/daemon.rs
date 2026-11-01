@@ -9852,6 +9852,11 @@ impl SystemWorld {
     }
 
     fn start(&self) -> Daemon {
+        self.start_with_codex_home(None)
+    }
+
+    /// Starts the daemon with `CODEX_HOME` set, as a user shell may have it.
+    fn start_with_codex_home(&self, codex_home: Option<&Path>) -> Daemon {
         let home = Daemon::new_home();
         std::fs::create_dir_all(&home).expect("home");
         let log = std::fs::File::options()
@@ -9860,7 +9865,8 @@ impl SystemWorld {
             .open(home.join("daemon.log"))
             .expect("log");
 
-        let child = Command::new(env!("CARGO_BIN_EXE_swarm-daemon"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_swarm-daemon"));
+        command
             .arg("--data-dir")
             .arg(&home)
             .arg("--settings")
@@ -9881,9 +9887,11 @@ impl SystemWorld {
             .env_remove("CODEX_HOME")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(log)
-            .spawn()
-            .expect("start the daemon");
+            .stderr(log);
+        if let Some(codex_home) = codex_home {
+            command.env("CODEX_HOME", codex_home);
+        }
+        let child = command.spawn().expect("start the daemon");
         let daemon = Daemon { home, child };
         daemon.wait_until_listening();
 
@@ -9967,7 +9975,11 @@ fn the_system_check_names_what_is_missing_and_checks_again_on_each_request() {
         broken,
         SystemCheck {
             git: tool(ToolState::Missing, None, &["xcode-select", "--install"]),
-            claude: tool(ToolState::SignedOut, Some("2.1.126"), &["fake-claude"]),
+            claude: tool(
+                ToolState::SignedOut,
+                Some("2.1.126"),
+                &[&world.path("bin/fake-claude")]
+            ),
             codex: tool(
                 ToolState::Missing,
                 None,
@@ -10025,6 +10037,53 @@ fn the_system_check_follows_the_agent_commands_in_the_settings() {
     let check = client.system_check();
 
     assert_eq!(check.claude, tool(ToolState::Ready, Some("9.9.9"), &[]));
+}
+
+#[test]
+fn the_system_check_looks_for_the_codex_login_in_the_home_folder_even_with_codex_home_set() {
+    let world = SystemWorld::new();
+    let elsewhere = world.dir.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).expect("elsewhere");
+    let daemon = world.start_with_codex_home(Some(&elsewhere));
+    let mut client = daemon.connect();
+    client.hello();
+
+    let check = client.system_check();
+
+    assert_eq!(check.codex, tool(ToolState::Ready, Some("0.46.0"), &[]));
+}
+
+#[test]
+fn the_sign_in_fix_names_a_tool_the_daemon_found_outside_its_path() {
+    let world = SystemWorld::new();
+    std::fs::create_dir_all(world.dir.join("home/.local/bin")).expect("local bin");
+    world.script(
+        "home/.local/bin/local-claude",
+        "echo '2.1.126 (Claude Code)'",
+    );
+    world.script("home/.local/bin/local-codex", "echo 'codex-cli 0.46.0'");
+    std::fs::write(
+        world.dir.join("settings.toml"),
+        "[agents.claude_code]\ncommand = \"local-claude\"\n\
+         [agents.codex]\ncommand = \"local-codex\"\n",
+    )
+    .expect("settings");
+    world.script("security", "exit 44");
+    std::fs::remove_file(world.dir.join("home/.codex/auth.json")).expect("auth.json");
+    let daemon = world.start();
+    let mut client = daemon.connect();
+    client.hello();
+
+    let check = client.system_check();
+
+    assert_eq!(check.claude.state, ToolState::SignedOut);
+    assert_eq!(
+        check.claude.fix,
+        [world.path("home/.local/bin/local-claude")],
+        "a fix terminal has no ~/.local/bin in its PATH to find the bare name in"
+    );
+    assert_eq!(check.codex.state, ToolState::SignedOut);
+    assert_eq!(check.codex.fix, [world.path("home/.local/bin/local-codex")]);
 }
 
 #[test]
@@ -10156,6 +10215,39 @@ fn a_worker_resizes_its_own_tile_without_a_name_or_with_its_own_id() {
     let messages = client.list_messages(task.project, Some(task.id));
     let kinds: Vec<MessageKind> = messages.iter().map(|message| message.kind).collect();
     assert_eq!(kinds, [MessageKind::Brief], "only the brief of the worker");
+}
+
+#[test]
+fn a_worker_resizes_its_own_tile_by_its_own_name_and_is_refused_any_other_name() {
+    let fixture = tile_fixture(
+        r#"  swarm spawn api --brief "work" > "$OUT/spawn.out" 2>&1"#,
+        r#"  echo "$SWARM_AGENT_NAME" > "$OUT/own-name"
+  swarm tile shrink ui > "$OUT/other.out" 2>&1
+  echo $? > "$OUT/other.code"
+  swarm tile grow api > "$OUT/grow.out" 2>&1
+  echo $? > "$OUT/grow.code""#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, _task) = start_task(&daemon, &repo);
+
+    let worker = client.wait_for_worker("api");
+
+    let first = client.wait_for_tile_request();
+
+    assert_eq!(said_by(&fixture, "own-name"), "api");
+    assert_eq!(
+        said_by(&fixture, "other.out"),
+        "swarm: only a task's orchestrator can list its workers"
+    );
+    assert_eq!(said_by(&fixture, "other.code"), "1");
+    assert_eq!(said_by(&fixture, "grow.out"), "asked for a large tile");
+    assert_eq!(said_by(&fixture, "grow.code"), "0");
+    assert_eq!(
+        first,
+        (worker.id, true),
+        "the refused request was broadcast"
+    );
 }
 
 #[test]

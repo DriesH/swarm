@@ -13,6 +13,7 @@ fn swarm() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_swarm"));
     command.env_remove("SWARM_SOCKET");
     command.env_remove("SWARM_AGENT_ID");
+    command.env_remove("SWARM_AGENT_NAME");
     command.env_remove("SWARM_TOKEN");
 
     command
@@ -672,6 +673,58 @@ fn a_worker_asks_for_its_own_tile_without_a_name() {
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0]["method"], "tile_grow");
     assert!(requests[0]["params"]["agent"].is_null());
+}
+
+#[test]
+fn a_worker_names_itself_in_a_tile_request_without_a_lookup() {
+    let (socket, daemon) = fake_daemon(
+        "tile-own-name",
+        vec![serde_json::json!({ "ok": true, "result": null })],
+    );
+    let mut command = agent_command(&socket);
+    command
+        .env("SWARM_ROLE", "worker")
+        .env("SWARM_AGENT_NAME", "api")
+        .args(["tile", "grow", "api"]);
+
+    let output = run(command, "");
+    let requests = daemon.join().expect("daemon");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(requests.len(), 1, "a worker cannot list workers");
+    assert_eq!(requests[0]["method"], "tile_grow");
+    assert_eq!(requests[0]["params"]["agent"], 3);
+}
+
+#[test]
+fn a_worker_that_names_another_worker_is_still_refused() {
+    let (socket, daemon) = fake_daemon(
+        "tile-other-name",
+        vec![serde_json::json!({
+            "ok": false,
+            "error": "only a task's orchestrator can list its workers"
+        })],
+    );
+    let mut command = agent_command(&socket);
+    command
+        .env("SWARM_ROLE", "worker")
+        .env("SWARM_AGENT_NAME", "api")
+        .args(["tile", "grow", "ui"]);
+
+    let output = run(command, "");
+    let requests = daemon.join().expect("daemon");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["method"], "agents");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr).trim(),
+        "swarm: only a task's orchestrator can list its workers"
+    );
 }
 
 #[test]

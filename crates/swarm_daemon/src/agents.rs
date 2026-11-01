@@ -1604,6 +1604,7 @@ fn harness_env(info: &AgentInfo, socket: &Path, token: &str) -> Vec<(String, Str
             socket.to_string_lossy().into_owned(),
         ),
         ("SWARM_AGENT_ID".to_owned(), info.id.0.to_string()),
+        ("SWARM_AGENT_NAME".to_owned(), info.name.clone()),
     ];
     if let Some(task) = info.task {
         env.push(("SWARM_TASK".to_owned(), task.0.to_string()));

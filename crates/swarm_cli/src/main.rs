@@ -163,7 +163,7 @@ enum PrAction {
 #[derive(Subcommand, Debug)]
 enum TileAction {
     /// Ask for a large tile. Swarm lays out the tiles and may not follow, for example when
-    /// the user pinned the tile.
+    /// the user minimized the tile.
     Grow {
         /// A worker's agent ID or name (orchestrator). Leave it out for your own tile
         /// (worker).

@@ -40,9 +40,9 @@ pub struct Tools {
     pub security: PathBuf,
     /// `PATH`, where `git`, `claude` and `codex` are looked up first.
     pub path: Option<OsString>,
+    /// Looked up after `PATH`, for a `PATH` as small as launchd's.
+    pub folders: Vec<PathBuf>,
     pub home: Option<PathBuf>,
-    /// `CODEX_HOME`, when it is set.
-    pub codex_home: Option<PathBuf>,
     /// How long one command may run.
     pub timeout: Duration,
 }
@@ -50,18 +50,23 @@ pub struct Tools {
 impl Tools {
     /// The system programs, with the folders and variables of this process.
     pub fn system() -> Self {
-        let codex_home = std::env::var_os("CODEX_HOME")
-            .filter(|folder| !folder.is_empty())
-            .map(PathBuf::from);
+        let home = std::env::var_os("HOME").map(PathBuf::from);
 
         Self {
             xcode_select: PathBuf::from("/usr/bin/xcode-select"),
             security: PathBuf::from("/usr/bin/security"),
             path: std::env::var_os("PATH"),
-            home: std::env::var_os("HOME").map(PathBuf::from),
-            codex_home,
+            folders: adapters::search_folders(None, home.as_deref()),
+            home,
             timeout: COMMAND_TIMEOUT,
         }
+    }
+
+    /// Every folder a program is looked up in, in order.
+    pub fn search_folders(&self) -> Vec<PathBuf> {
+        let from_path = self.path.iter().flat_map(std::env::split_paths);
+
+        from_path.chain(self.folders.iter().cloned()).collect()
     }
 }
 
@@ -150,7 +155,7 @@ fn check_claude(tools: &Tools, command: &str) -> ToolCheck {
 
     match claude_item_exists(tools) {
         Ok(true) => ready(Some(version)),
-        Ok(false) => signed_out(Some(version), vec![command.to_owned()]),
+        Ok(false) => signed_out(Some(version), vec![text(&claude)]),
         Err(detail) => failed(Some(version), detail),
     }
 }
@@ -193,19 +198,18 @@ fn check_codex(tools: &Tools, command: &str, github: &Github) -> ToolCheck {
 
     match codex_auth_exists(tools) {
         Ok(true) => ready(Some(version)),
-        Ok(false) => signed_out(Some(version), vec![command.to_owned()]),
+        Ok(false) => signed_out(Some(version), vec![text(&codex)]),
         Err(detail) => failed(Some(version), detail),
     }
 }
 
-/// Whether `auth.json` is in the Codex home folder.
+/// Whether `~/.codex/auth.json` exists. Agents never get `CODEX_HOME`, so it does not count.
 fn codex_auth_exists(tools: &Tools) -> Result<bool, String> {
-    let folder = tools
-        .codex_home
-        .clone()
-        .or_else(|| tools.home.as_ref().map(|home| home.join(".codex")))
+    let home = tools
+        .home
+        .as_ref()
         .ok_or_else(|| "cannot find the home folder".to_owned())?;
-    let file = folder.join("auth.json");
+    let file = home.join(".codex").join("auth.json");
 
     match std::fs::metadata(&file) {
         Ok(metadata) => Ok(metadata.is_file()),
@@ -243,7 +247,7 @@ fn check_account(github: &Github, timeout: Duration) -> ToolCheck {
 }
 
 fn find(tools: &Tools, command: &str) -> Option<PathBuf> {
-    adapters::find_command(command, tools.path.as_deref(), tools.home.as_deref())
+    adapters::find_in(command, tools.search_folders())
 }
 
 /// The version `<program> --version` prints.

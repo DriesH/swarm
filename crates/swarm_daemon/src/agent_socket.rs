@@ -320,11 +320,11 @@ mod tests {
         use crate::Services;
         use crate::agents::{AgentConfig, Agents, Place};
         use crate::checks::Checks;
+        use crate::connection::SystemChecks;
         use crate::hub::{Clients, Terminals};
         use crate::messages::Messages;
         use crate::processes::Processes;
         use crate::pull_requests::PullRequests;
-        use crate::system_check::SystemChecks;
         use crate::usage::{Overrides, UsageService};
 
         let folder = TempFolder::new("agent-socket");

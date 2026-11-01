@@ -5,20 +5,24 @@ use std::io::{BufReader, BufWriter, ErrorKind, Write};
 use std::net::Shutdown;
 use std::os::fd::AsRawFd as _;
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 
 use anyhow::Result;
+use swarm_core::github::Github;
 use swarm_core::prompts;
+use swarm_core::system_check::{self, AgentCommands, Tools};
 use swarm_protocol::{
-    CallId, CreateTerminal, Event, FrameError, MESSAGES_LISTED, Request, TaskInfo, TerminalId,
-    VERSION, read, write,
+    AgentKind, CallId, CreateTerminal, Event, FrameError, MESSAGES_LISTED, Request, SystemCheck,
+    TaskInfo, TerminalId, VERSION, read, write,
 };
 use swarm_term::TerminalInput;
 
 use crate::hub::{CREATE_HISTORY_LINES, ClientSink, Frame, Hub, QUEUE_FRAMES};
 use crate::pull_requests::{self, NewRequest};
 use crate::tasks;
+use crate::usage::configured_command;
 use crate::{Services, comments};
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -246,6 +250,40 @@ fn system_check(services: &Arc<Services>, sink: &Arc<ClientSink>, call: CallId) 
             check: services.system_check.run(),
         });
     });
+}
+
+/// The tools Swarm needs, as the daemon and its agents see them (PLAN.md, System check).
+pub(crate) struct SystemChecks {
+    tools: Tools,
+    /// The settings file that names the agent commands.
+    settings: Option<PathBuf>,
+    github: Github,
+}
+
+impl SystemChecks {
+    pub(crate) fn new(tools: Tools, settings: Option<PathBuf>, github: Github) -> Self {
+        Self {
+            tools,
+            settings,
+            github,
+        }
+    }
+
+    /// Checks every tool now. The settings are read again, so a command the user changed
+    /// counts at once.
+    fn run(&self) -> SystemCheck {
+        let claude = configured_command(self.settings.as_deref(), AgentKind::ClaudeCode);
+        let codex = configured_command(self.settings.as_deref(), AgentKind::Codex);
+
+        system_check::check(
+            &self.tools,
+            &AgentCommands {
+                claude: &claude,
+                codex: &codex,
+            },
+            &self.github,
+        )
+    }
 }
 
 /// Projects and the tasks made in them.

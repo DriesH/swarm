@@ -288,7 +288,7 @@ const TOOLS: &[Tool] = &[
     },
     Tool {
         name: "tile_grow",
-        description: "Make the tile of a worker large, so the user sees more of it. The layout decides, and it ignores the request for a tile the user pinned or resized. No agent gets a message.",
+        description: "Make the tile of a worker large, so the user sees more of it. The layout decides, and it ignores the request for a tile the user minimized. No agent gets a message.",
         audience: Audience::Only(&[Role::Orchestrator, Role::Worker]),
         schema: || {
             schema(
@@ -308,7 +308,7 @@ const TOOLS: &[Tool] = &[
     },
     Tool {
         name: "tile_shrink",
-        description: "Make the tile of a worker small again. The layout decides, and it ignores the request for a tile the user pinned or resized. No agent gets a message.",
+        description: "Make the tile of a worker small again. The layout decides, and it ignores the request for a tile the user minimized. No agent gets a message.",
         audience: Audience::Only(&[Role::Orchestrator, Role::Worker]),
         schema: || {
             schema(
@@ -1264,6 +1264,27 @@ mod tests {
                 tool["inputSchema"]["properties"]["agent"]["type"], "string",
                 "{name}"
             );
+        }
+    }
+
+    #[test]
+    fn the_tile_tools_name_only_what_the_app_can_do() {
+        let reply = server(Role::Worker)
+            .handle(&request("tools/list", json!({})))
+            .expect("reply");
+
+        for name in ["tile_grow", "tile_shrink"] {
+            let tool = reply["result"]["tools"]
+                .as_array()
+                .expect("tools")
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .expect("tile tool");
+            let description = tool["description"].as_str().expect("description");
+
+            assert!(description.contains("minimized"), "{name}: {description}");
+            assert!(!description.contains("pinned"), "{name}: {description}");
+            assert!(!description.contains("resized"), "{name}: {description}");
         }
     }
 
