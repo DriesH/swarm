@@ -381,6 +381,77 @@ fn tasks_are_listed_under_their_project() {
 }
 
 #[test]
+fn the_open_tasks_of_a_project_are_listed_oldest_first_and_closed_ones_are_not() {
+    let repo = Repo::new(CONFIG);
+    let projects = projects();
+    let project = projects.add(&repo.root).expect("add");
+    let first = projects
+        .create_task(&request(project.id, "one"))
+        .expect("first")
+        .task;
+    let second = projects
+        .create_task(&request(project.id, "two"))
+        .expect("second")
+        .task;
+    projects.close_task(second.id).expect("closed");
+    let third = projects
+        .create_task(&request(project.id, "three"))
+        .expect("third")
+        .task;
+
+    let open = projects.open_tasks(project.id).expect("open");
+
+    assert_eq!(
+        open.iter().map(|task| task.id).collect::<Vec<_>>(),
+        [first.id, third.id]
+    );
+}
+
+#[test]
+fn waiting_for_creations_returns_once_the_start_agent_being_made_is_recorded() {
+    let repo = Repo::new(CONFIG);
+    let projects = projects();
+    let project = projects.add(&repo.root).expect("add");
+    let (entered, entered_receiver) = std::sync::mpsc::channel();
+    let (release, release_receiver) = std::sync::mpsc::channel::<()>();
+    let returned = std::sync::atomic::AtomicBool::new(false);
+
+    let (projects, project) = (&projects, project.id);
+
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let made = projects.start_agent_or(project, |_, _| {
+                entered.send(()).expect("entered");
+                release_receiver.recv().expect("release");
+
+                Err(Error::Invalid("not made".to_owned()))
+            });
+            assert!(made.is_err());
+        });
+        entered_receiver.recv().expect("the creation began");
+
+        let waiter = scope.spawn(|| {
+            projects.wait_for_creations();
+            returned.store(true, Ordering::SeqCst);
+        });
+        std::thread::park_timeout(std::time::Duration::from_millis(200));
+        let returned_too_soon = returned.load(Ordering::SeqCst);
+
+        release.send(()).expect("release");
+        waiter.join().expect("waiter");
+        assert!(!returned_too_soon, "it waits for the creation");
+        assert!(returned.load(Ordering::SeqCst));
+    });
+}
+
+#[test]
+fn the_open_tasks_of_an_unknown_project_are_an_error() {
+    let result = projects().open_tasks(ProjectId(99));
+
+    assert!(matches!(result, Err(Error::UnknownProject(99))));
+}
+
+#[test]
 fn a_full_port_range_fails_before_any_checkout() {
     let repo = Repo::new(CONFIG);
     let projects = projects();

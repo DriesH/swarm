@@ -463,8 +463,9 @@ impl Agents {
         lock(&self.closing).remove(&task);
     }
 
-    /// Starts removing the project: no agent registers and no terminal of its Start tab
-    /// starts until the guard drops. None when the project is being removed already.
+    /// Starts removing the project: no agent registers or starts and no terminal of its
+    /// Start tab or tasks starts until the guard drops. None when the project is being
+    /// removed already.
     pub(crate) fn begin_remove(&self, project: ProjectId) -> Option<Removing<'_>> {
         let begun = lock(&self.removing).insert(project);
 
@@ -487,13 +488,37 @@ impl Agents {
         })
     }
 
-    /// True for the `task` key of the Start tab of a project that is being removed.
+    /// True for the `task` key of the Start tab or of a task of a project that is being
+    /// removed.
     pub(crate) fn is_removing_key(&self, key: Option<&str>) -> bool {
-        key.is_some_and(|key| {
-            lock(&self.removing)
-                .iter()
-                .any(|project| start_key(*project) == key)
-        })
+        let Some(key) = key else {
+            return false;
+        };
+        let removing: Vec<ProjectId> = lock(&self.removing).iter().copied().collect();
+        if removing.is_empty() {
+            return false;
+        }
+
+        if removing.iter().any(|project| start_key(*project) == key) {
+            return true;
+        }
+
+        let Some(task) = key
+            .strip_prefix("task:")
+            .and_then(|id| id.parse().ok())
+            .map(TaskId)
+        else {
+            return false;
+        };
+
+        match lock(&self.store).task_including_closed(task) {
+            Ok(task) => task.is_some_and(|task| removing.contains(&task.project)),
+            Err(error) => {
+                log::error!("cannot find task {}: {error}", task.0);
+
+                false
+            }
+        }
     }
 
     pub(crate) fn is_closing(&self, task: Option<TaskId>) -> bool {
@@ -661,11 +686,8 @@ impl Agents {
         place: &Place<'_>,
         plan: Plan,
     ) -> Result<AgentInfo> {
-        if self.is_closing(place.task) {
-            bail!("the task is closing");
-        }
-        if self.is_removing(place.project) {
-            bail!("the project is being removed");
+        if let Some(reason) = self.place_refusal(place) {
+            bail!(reason);
         }
         if asker.is_some_and(|asker| self.is_stopped(asker)) {
             bail!(STOPPED_BY_USER);
@@ -690,14 +712,21 @@ impl Agents {
             ports: place.ports,
         })?;
 
+        // Checked again under the lock that a stop takes after it sets its flag: a stop
+        // either finds the new entry or this sees the flag.
         let mut live = lock(&self.live);
-        if asker.is_some_and(|asker| live.get(&asker).is_none_or(|agent| agent.stopped_by_user)) {
+        let refusal = self.place_refusal(place).or_else(|| {
+            asker
+                .is_some_and(|asker| live.get(&asker).is_none_or(|agent| agent.stopped_by_user))
+                .then_some(STOPPED_BY_USER)
+        });
+        if let Some(reason) = refusal {
             drop(live);
             if let Err(error) = lock(&self.store).delete_agent(info.id) {
                 log::error!("cannot delete agent {}: {error}", info.id.0);
             }
 
-            bail!(STOPPED_BY_USER);
+            bail!(reason);
         }
 
         live.insert(
@@ -720,6 +749,17 @@ impl Agents {
         );
 
         Ok(info)
+    }
+
+    /// Why nothing new may start in the place: its task closes or its project is removed.
+    fn place_refusal(&self, place: &Place<'_>) -> Option<&'static str> {
+        if self.is_closing(place.task) {
+            Some("the task is closing")
+        } else if self.is_removing(place.project) {
+            Some("the project is being removed")
+        } else {
+            None
+        }
     }
 
     /// True when the user stopped the agent, or its process ended since. A call from
@@ -875,9 +915,12 @@ impl Agents {
     /// Starts the agent's process in the task worktree.
     pub(crate) fn start(self: &Arc<Self>, start: Start) -> Result<()> {
         let id = start.agent;
-        let task = self.info(id).and_then(|info| info.task);
-        if self.is_closing(task) {
+        let known = self.info(id);
+        if self.is_closing(known.as_ref().and_then(|info| info.task)) {
             bail!("the task is closing");
+        }
+        if known.is_some_and(|info| self.is_removing(info.project)) {
+            bail!("the project is being removed");
         }
 
         let (plan, token, session_id) = {
@@ -2962,17 +3005,45 @@ mod tests {
     }
 
     #[test]
-    fn a_project_that_is_removed_takes_no_agent_and_no_terminal_of_its_start_tab() {
+    fn a_project_that_is_removed_takes_no_agent_and_no_terminal_of_its_start_tab_or_tasks() {
+        use swarm_core::store::NewTask;
+
         let (agents, task) = agents_with_a_task();
+        let (other_project, other_task) = {
+            let store = lock(&agents.store);
+            let project = store
+                .add_project(Path::new("/other"), "other")
+                .expect("other project");
+            let task = store
+                .add_task(&NewTask {
+                    project: project.id,
+                    name: "Other",
+                    branch: "swarm/other",
+                    base: "main",
+                    pr_base: "main",
+                    worktree: Path::new("/other/.worktrees/other"),
+                    ports: &[],
+                })
+                .expect("other task");
+
+            (project, task)
+        };
         let key = start_key(task.project);
+        let task_key = task.id.terminal_key();
         assert!(!agents.is_removing_key(Some(&key)));
+        assert!(!agents.is_removing_key(Some(&task_key)));
 
         let removing = agents.begin_remove(task.project).expect("begun");
 
         assert!(agents.begin_remove(task.project).is_none(), "only once");
         assert!(agents.is_removing(task.project));
         assert!(agents.is_removing_key(Some(&key)));
-        assert!(!agents.is_removing_key(Some(&task.id.terminal_key())));
+        assert!(agents.is_removing_key(Some(&task_key)));
+        assert!(!agents.is_removing_key(Some(&other_task.id.terminal_key())));
+        assert!(!agents.is_removing_key(Some(&start_key(other_project.id))));
+        assert!(!agents.is_removing_key(Some("task:404")));
+        assert!(!agents.is_removing_key(Some("task:nope")));
+        assert!(!agents.is_removing_key(None));
         let refused = register_in(&agents, &task, None).expect_err("refused");
         assert_eq!(refused.to_string(), "the project is being removed");
 
@@ -2980,7 +3051,87 @@ mod tests {
 
         assert!(!agents.is_removing(task.project));
         assert!(!agents.is_removing_key(Some(&key)));
+        assert!(!agents.is_removing_key(Some(&task_key)));
         assert!(register_in(&agents, &task, None).is_ok());
+    }
+
+    /// Starts a registration and returns once its row is written. The caller holds the
+    /// `live` lock, so the registration waits between its row and its live entry.
+    fn registering_in(
+        agents: &Arc<Agents>,
+        task: &TaskInfo,
+    ) -> thread::JoinHandle<Result<AgentInfo>> {
+        let (shared, own) = (Arc::clone(agents), task.clone());
+        let registering = thread::spawn(move || register_in(&shared, &own, None));
+
+        while lock(&agents.store)
+            .list_agents(task.id)
+            .expect("list")
+            .is_empty()
+        {
+            thread::park_timeout(Duration::from_millis(5));
+        }
+
+        registering
+    }
+
+    #[test]
+    fn a_removal_that_begins_while_an_agent_registers_is_seen_by_the_registration() {
+        let (agents, task) = agents_with_a_task();
+        let held = lock(&agents.live);
+        let registering = registering_in(&agents, &task);
+
+        let _removing = agents.begin_remove(task.project).expect("begun");
+        drop(held);
+        let refused = registering.join().expect("thread").expect_err("refused");
+
+        assert_eq!(refused.to_string(), "the project is being removed");
+        assert!(lock(&agents.live).is_empty());
+        assert!(
+            lock(&agents.store)
+                .list_agents(task.id)
+                .expect("list")
+                .is_empty(),
+            "no row is left"
+        );
+    }
+
+    #[test]
+    fn a_close_that_begins_while_an_agent_registers_is_seen_by_the_registration() {
+        let (agents, task) = agents_with_a_task();
+        let held = lock(&agents.live);
+        let registering = registering_in(&agents, &task);
+
+        assert!(agents.begin_close(task.id));
+        drop(held);
+        let refused = registering.join().expect("thread").expect_err("refused");
+
+        assert_eq!(refused.to_string(), "the task is closing");
+        assert!(lock(&agents.live).is_empty());
+        assert!(
+            lock(&agents.store)
+                .list_agents(task.id)
+                .expect("list")
+                .is_empty(),
+            "no row is left"
+        );
+    }
+
+    #[test]
+    fn an_agent_registered_before_the_removal_does_not_start_after_it_began() {
+        let (agents, task) = agents_with_a_task();
+        let agent = register_in(&agents, &task, None).expect("register");
+        let _removing = agents.begin_remove(task.project).expect("begun");
+        let start = Start {
+            agent: agent.id,
+            task_name: task.name.clone(),
+            env: Vec::new(),
+            first_message: None,
+        };
+
+        let refused = agents.start(start).expect_err("refused");
+
+        assert_eq!(refused.to_string(), "the project is being removed");
     }
 
     #[test]

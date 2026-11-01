@@ -10,7 +10,7 @@ use anyhow::{Context as _, Result, bail};
 use swarm_core::{PreparedTask, PreparedWorker};
 use swarm_protocol::{
     AgentId, AgentInfo, AgentKind, AgentRole, CloseCheck, CreateTask, CreateTerminal, Event,
-    ProjectId, TaskId, TaskInfo, TerminalId, TerminalKind,
+    ProjectId, RemoveCheck, TaskCloseCheck, TaskId, TaskInfo, TerminalId, TerminalKind,
 };
 use swarm_term::TerminalInput;
 use swarm_term::{ExitStatus, Palette, Rgb, Size};
@@ -80,6 +80,10 @@ pub(crate) fn create(
     created_by: Option<AgentId>,
     reply: impl FnOnce(&TaskInfo),
 ) -> Result<()> {
+    if services.agents.is_removing(request.project) {
+        bail!("the project is being removed");
+    }
+
     let plan = request
         .orchestrator
         .map(|kind| services.agents.plan(kind, AgentRole::Orchestrator))
@@ -90,6 +94,13 @@ pub(crate) fn create(
         setup,
         env,
     } = services.projects.create_task_by(request, created_by)?;
+
+    // A removal that began while the task was made did not see it.
+    if services.agents.is_removing(task.project) {
+        services.projects.discard_task(&task);
+
+        bail!("the project is being removed");
+    }
 
     let agent = match plan {
         Some(plan) => {
@@ -184,6 +195,15 @@ pub(crate) fn close(services: &Services, id: TaskId, confirmed: &CloseCheck) -> 
     }
 
     result
+}
+
+/// Closes a task the user asked to close, alone or with its project. The close is refused
+/// while a push or merge of the task's pull request runs: it keeps the worktree in use.
+pub(crate) fn close_asked(services: &Services, id: TaskId, confirmed: &CloseCheck) -> Result<()> {
+    services
+        .pull_requests
+        .begin(id)
+        .and_then(|_busy| close(services, id, confirmed))
 }
 
 /// True when closing would lose something `confirmed` did not show. Running agents and
@@ -338,15 +358,58 @@ fn wait_until_ended(
     }
 }
 
-/// Forgets a project: stops its Start orchestrator and the terminals of its Start tab,
-/// then removes its rows. Files, branches and worktrees stay where they are. Refuses
-/// while a task is open.
-pub(crate) fn remove_project(services: &Services, project: ProjectId) -> Result<()> {
-    services.projects.check_removable(project)?;
+/// What removing the project would throw away: the close check of each open task.
+pub(crate) fn remove_check(services: &Services, project: ProjectId) -> Result<RemoveCheck> {
+    let tasks = services
+        .projects
+        .open_tasks(project)?
+        .into_iter()
+        .map(|task| {
+            Ok(TaskCloseCheck {
+                check: close_check(services, task.id)?,
+                task: task.id,
+                name: task.name,
+            })
+        })
+        .collect::<Result<_>>()?;
 
+    Ok(RemoveCheck { tasks })
+}
+
+/// Removes a project: closes every open task as [`close`] does, stops the Start
+/// orchestrator and the terminals of its Start tab, then removes its rows. The files in
+/// the project root stay. `confirmed` is the check the user saw. Nothing is closed when
+/// a task is open that it does not list, or when a task would lose more than it showed.
+/// A task that cannot close stops the removal; the tasks closed before it stay closed.
+pub(crate) fn remove_project(
+    services: &Services,
+    project: ProjectId,
+    confirmed: &RemoveCheck,
+) -> Result<()> {
     let Some(_removing) = services.agents.begin_remove(project) else {
         bail!("project {} is being removed already", project.0);
     };
+
+    // What began before the guard is recorded now, so the list below holds it.
+    services.projects.wait_for_creations();
+
+    let open = services.projects.open_tasks(project)?;
+    let mut to_close = Vec::new();
+    for task in &open {
+        let Some(shown) = confirmed.tasks.iter().find(|shown| shown.task == task.id) else {
+            bail!("a task opened since; check again");
+        };
+        if loses_more(&shown.check, &close_check(services, task.id)?) {
+            bail!("more would be lost than shown; check again");
+        }
+
+        to_close.push((task, &shown.check));
+    }
+
+    for (task, check) in to_close {
+        close_asked(services, task.id, check)
+            .with_context(|| format!("cannot close {}", task.name))?;
+    }
 
     if !stop_processes(services, Scope::Start(project)) {
         bail!("some terminals of the project did not end; try again");

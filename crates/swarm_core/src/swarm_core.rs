@@ -159,14 +159,26 @@ impl Projects {
         self.info(project)
     }
 
-    /// Fails when the project is unknown or has open tasks, naming them.
-    pub fn check_removable(&self, project: ProjectId) -> Result<(), Error> {
-        lock(&self.store).check_removable(project)
+    /// The open tasks of the project, oldest first. Fails when the project is unknown.
+    pub fn open_tasks(&self, project: ProjectId) -> Result<Vec<TaskInfo>, Error> {
+        let store = lock(&self.store);
+        if store.project(project)?.is_none() {
+            return Err(Error::UnknownProject(project.0));
+        }
+
+        store.list_tasks(project)
+    }
+
+    /// Returns once every task, worker and Start orchestrator that was being made has been
+    /// recorded. Whoever sets a guard that stops new ones calls it next, so what it reads
+    /// after includes all that began before the guard.
+    pub fn wait_for_creations(&self) {
+        drop(lock(&self.creating));
     }
 
     /// Forgets the project and its closed tasks. Nothing on disk changes: the files,
-    /// branches and worktrees stay. Refuses like [`Projects::check_removable`]; no task
-    /// is made while it runs.
+    /// branches and worktrees stay. Refuses while a task is open, which the caller closed
+    /// before; no task is made while it runs.
     pub fn remove(&self, project: ProjectId) -> Result<(), Error> {
         let _creating = lock(&self.creating);
 
