@@ -294,6 +294,12 @@ Small, rare and never in the way. All respect **Reduce Motion**, stay silent for
 - **⌘K "buzz"**: a few bees fly across the window once.
 - **Honey accent**: an amber accent color in Settings › Appearance.
 
+The bees in the eggs are the pixel bee (24×24, two wing frames, a crown for the queen), drawn from its grid at whole-pixel steps so it stays sharp; the menu bar keeps the line bee because macOS tints template images one color. The queen bee counts pull requests merged through Swarm (the daemon keeps the count and the time of the 100th). `swarm buzz` prints the bee in color and, when an agent runs it, the swarm's counts.
+
+### File-type icons
+
+Files and folders in the Review tree, the Changes and Files panels and the inspector's Changes tab get icons from vscode-icons (icons CC BY-SA 4.0, code MIT). Branded icons, which are product and company logos under their owners' copyright, are left out: a file whose only icon is a logo gets the generic file icon. The icons are full-color SVGs rendered as images. The attribution (source, license, what changed) sits in **Settings › General › About** and in a license file next to the icons.
+
 ### Websites
 
 - **Product website**: one page (designed on the canvas, Website page): hero with a workspace preview, three steps with app screenshots, features, harness, download.

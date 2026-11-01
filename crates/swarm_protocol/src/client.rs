@@ -20,8 +20,8 @@ use crate::{
     CreateTask, CreateTerminal, Event, FileDiff, FrameError, GH_SECS, GithubStatus, MergeMethod,
     MessageId, MessageInfo, NewComment, Notice, PUSH_SECS, Paths, PrDraft, PrPanel,
     ProjectConfigFields, ProjectId, ProjectInfo, PromptInfo, PullRequest, Request, ReviewComment,
-    ReviewSource, SystemCheck, TaskDiff, TaskId, TaskInfo, TerminalId, TerminalInfo, Usage,
-    VERSION, check_private_dir, read, write,
+    ReviewSource, SwarmStats, SystemCheck, TaskDiff, TaskId, TaskInfo, TerminalId, TerminalInfo,
+    Usage, VERSION, check_private_dir, read, write,
 };
 
 /// Local checks moved on, or the orchestrator sent a pull request draft.
@@ -130,6 +130,7 @@ struct Shared {
     usage: flume::Sender<Usage>,
     notices: flume::Sender<Notice>,
     tiles: flume::Sender<(AgentId, bool)>,
+    stats: flume::Sender<SwarmStats>,
 }
 
 impl Shared {
@@ -180,6 +181,7 @@ struct Inner {
     usage_events: flume::Receiver<Usage>,
     notices: flume::Receiver<Notice>,
     tiles: flume::Receiver<(AgentId, bool)>,
+    stats: flume::Receiver<SwarmStats>,
 }
 
 impl Drop for Inner {
@@ -276,6 +278,7 @@ impl Client {
         let (usage_sender, usage_receiver) = flume::unbounded();
         let (notice_sender, notice_receiver) = flume::unbounded();
         let (tile_sender, tile_receiver) = flume::unbounded();
+        let (stats_sender, stats_receiver) = flume::unbounded();
         let shared = Arc::new(Shared {
             routes: Mutex::new(HashMap::new()),
             waiters: Mutex::new(HashMap::new()),
@@ -292,6 +295,7 @@ impl Client {
             usage: usage_sender,
             notices: notice_sender,
             tiles: tile_sender,
+            stats: stats_sender,
         });
         let (request_sender, request_receiver) = flume::unbounded();
 
@@ -331,6 +335,7 @@ impl Client {
                 usage_events: usage_receiver,
                 notices: notice_receiver,
                 tiles: tile_receiver,
+                stats: stats_receiver,
             }),
             reply_timeout: REPLY_TIMEOUT,
         })
@@ -382,6 +387,18 @@ impl Client {
     /// large. Use one consumer.
     pub fn tile_requests(&self) -> flume::Receiver<(AgentId, bool)> {
         self.inner.tiles.clone()
+    }
+
+    /// Every `StatsChanged` the daemon sends. Use one consumer.
+    pub fn stats_events(&self) -> flume::Receiver<SwarmStats> {
+        self.inner.stats.clone()
+    }
+
+    pub fn stats(&self) -> Result<SwarmStats, ClientError> {
+        match self.call(|call| Request::Stats { call }, None)? {
+            Event::Stats { stats, .. } => Ok(stats),
+            other => Err(unexpected("Stats", &other)),
+        }
     }
 
     pub fn system_check(&self) -> Result<SystemCheck, ClientError> {
@@ -1228,6 +1245,12 @@ fn read_events(
             }
             Event::SystemCheck { call, check } => {
                 deliver(shared, call, Event::SystemCheck { call, check });
+            }
+            Event::Stats { call, stats } => deliver(shared, call, Event::Stats { call, stats }),
+            Event::StatsChanged { stats } => {
+                if shared.stats.send(stats).is_err() {
+                    log::debug!("stats event has no listener");
+                }
             }
             Event::TileRequest { agent, large } => {
                 if shared.tiles.send((agent, large)).is_err() {

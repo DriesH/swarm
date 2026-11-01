@@ -243,6 +243,7 @@ impl Calls {
             Call::AgentExit => Ok(Value::Null),
             Call::TileGrow { agent } => self.tile_request(caller, agent, true),
             Call::TileShrink { agent } => self.tile_request(caller, agent, false),
+            Call::Buzz => Err(Failure("not built yet".to_owned())),
 
             // The size is accepted and ignored: a process terminal follows its tile.
             Call::TerminalSpawn {

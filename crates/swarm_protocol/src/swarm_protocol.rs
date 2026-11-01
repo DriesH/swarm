@@ -20,7 +20,7 @@ mod client;
 pub use client::{Client, ClientError, CommentEvent, MessageEvent, PrEvent};
 
 /// Bumped on every incompatible change; the daemon refuses other versions.
-pub const VERSION: u32 = 17;
+pub const VERSION: u32 = 18;
 
 /// The most messages [`Request::ListMessages`] returns.
 pub const MESSAGES_LISTED: usize = 500;
@@ -816,6 +816,17 @@ pub struct SystemCheck {
     pub github_account: ToolCheck,
 }
 
+/// Counts for the easter eggs: `swarm buzz` and the queen bee.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SwarmStats {
+    pub running_agents: u32,
+    pub open_tasks: u32,
+    /// Pull requests merged through Swarm, ever.
+    pub merged_prs: u64,
+    /// When the 100th of them merged, in milliseconds since the Unix epoch.
+    pub hundredth_merge_at: Option<u64>,
+}
+
 /// What closing a task would throw away, so the app can ask first.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct CloseCheck {
@@ -938,6 +949,10 @@ pub enum Request {
     },
     /// Checks the tools Swarm needs again. Answered with [`Event::SystemCheck`].
     SystemCheck {
+        call: CallId,
+    },
+    /// Answered with [`Event::Stats`].
+    Stats {
         call: CallId,
     },
     /// Stops every running agent of every project, as the user's choice: an agent
@@ -1235,6 +1250,14 @@ pub enum Event {
     SystemCheck {
         call: CallId,
         check: SystemCheck,
+    },
+    Stats {
+        call: CallId,
+        stats: SwarmStats,
+    },
+    /// Sent to every client when a pull request merged through Swarm.
+    StatsChanged {
+        stats: SwarmStats,
     },
     /// Sent to every client when an agent asked for a large or a small worker tile.
     TileRequest {
