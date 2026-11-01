@@ -532,9 +532,11 @@ done"#,
         let scripts = Scripts::new();
         let codex = scripts.script(
             "codex",
-            r#"echo $$ > "$DIR/pid"
+            r#"[ "$1" = warm-up ] && exit 0
+echo $$ > "$DIR/pid"
 exec sleep 30"#,
         );
+        Scripts::warm_up(&codex);
 
         let started = Instant::now();
         let outcome = codex_usage(Some(&codex), Duration::from_millis(400));

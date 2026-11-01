@@ -5,14 +5,23 @@
 use serde_json::Value;
 use swarm_protocol::UsageWindow;
 
-use crate::{FIVE_HOURS, SEVEN_DAYS, percent, unix_seconds};
+use crate::{percent, unix_seconds};
 
 /// Windows of the status line input: the JSON key, the label and the length in seconds,
-/// shortest first.
+/// shortest first. The only place that knows these lengths.
 const STATUS_LINE_WINDOWS: [(&str, &str, u64); 2] = [
-    ("five_hour", "5h", FIVE_HOURS),
-    ("seven_day", "7d", SEVEN_DAYS),
+    ("five_hour", "5h", 5 * 60 * 60),
+    ("seven_day", "7d", 7 * 24 * 60 * 60),
 ];
+
+/// The length of a window by its label, for windows saved before lengths were kept. Only
+/// the status line windows are known.
+pub fn length_of_label(label: &str) -> Option<u64> {
+    STATUS_LINE_WINDOWS
+        .iter()
+        .find(|(_, known, _)| *known == label)
+        .map(|(_, _, length_secs)| *length_secs)
+}
 
 /// The `rate_limits` of Claude Code's status line input, shortest window first. A
 /// window without a percentage is left out.
@@ -83,6 +92,14 @@ mod tests {
             .collect();
 
         assert_eq!(lengths, [Some(18_000), Some(604_800)]);
+    }
+
+    #[test]
+    fn only_the_five_hour_and_seven_day_labels_have_a_known_length() {
+        assert_eq!(length_of_label("5h"), Some(18_000));
+        assert_eq!(length_of_label("7d"), Some(604_800));
+        assert_eq!(length_of_label("30d"), None);
+        assert_eq!(length_of_label("limit"), None);
     }
 
     #[test]

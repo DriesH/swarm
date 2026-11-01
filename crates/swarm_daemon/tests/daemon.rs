@@ -8232,6 +8232,35 @@ fn a_claude_agents_status_line_reaches_every_client() {
     );
 }
 
+/// Claude Code sends both windows, then only the weekly one, as it does once the five
+/// hour window has passed its reset.
+const STATUS_LINE_AFTER_A_RESET_AGENT: &str = r#"mkdir -p "$OUT/config"
+export CLAUDE_CONFIG_DIR="$OUT/config"
+printf '%s' '{"rate_limits":{"five_hour":{"used_percentage":23.5,"resets_at":1793383200},"seven_day":{"used_percentage":41.2,"resets_at":1793900000}}}' | "$SWARM" statusline > /dev/null
+printf '%s' '{"rate_limits":{"seven_day":{"used_percentage":45,"resets_at":1793900000}}}' | "$SWARM" statusline > /dev/null
+sleep 30"#;
+
+#[test]
+fn a_status_line_with_one_window_keeps_the_other_window_across_a_reset() {
+    let fixture = Fixture::new(STATUS_LINE_AFTER_A_RESET_AGENT);
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, _task) = start_task_of(&daemon, &repo, AgentKind::ClaudeCode);
+
+    let usage = client.wait_for_usage(|usage| {
+        usage
+            .claude
+            .windows
+            .iter()
+            .any(|window| window.label == "7d" && window.used_percent == 45)
+    });
+
+    assert_eq!(claude_windows(&usage), [("5h", 24), ("7d", 45)]);
+    assert_eq!(usage.claude.windows[0].resets_at, Some(1_793_383_200));
+    assert_eq!(usage.claude.windows[0].length_secs, Some(18_000));
+    assert_eq!(client.usage(), usage);
+}
+
 #[test]
 fn only_a_claude_agent_may_send_rate_limits() {
     let fixture = Fixture::new(r#"echo "$SWARM_TOKEN" > "$OUT/token"; sleep 30"#);
@@ -8382,7 +8411,7 @@ fn a_usage_file_from_an_older_daemon_loads_and_its_backoff_file_is_removed() {
     assert_eq!(claude_windows(&usage), [("5h", 42), ("7d", 13)]);
     assert_eq!(usage.claude.windows[0].length_secs, Some(18_000));
     assert_eq!(usage.claude.windows[1].length_secs, Some(604_800));
-    assert_eq!(usage.claude.plan.as_deref(), Some("max"));
+    assert_eq!(usage.claude.plan, None, "Claude reports no plan now");
     assert_eq!(usage.claude.read_at, Some(1_793_380_000));
     assert_eq!(usage.claude.problem, None);
     assert_eq!(usage.codex.windows[0].length_secs, Some(18_000));

@@ -39,6 +39,20 @@ impl Scripts {
         path
     }
 
+    /// Starts a script once with `warm-up` as its argument, which it must answer with
+    /// `exit 0`. The first start of a new file takes about 250 ms on macOS, and more under
+    /// load. A test with a short timeout would run out of time before the script ran.
+    pub(crate) fn warm_up(path: &Path) {
+        crate::process::spawn(
+            Command::new(path)
+                .arg("warm-up")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+        )
+        .and_then(|mut child| child.wait())
+        .expect("warm up the script");
+    }
+
     pub(crate) fn write(&self, name: &str, text: &str) {
         std::fs::write(self.dir.join(name), text).expect("file");
     }

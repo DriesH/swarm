@@ -4,6 +4,8 @@
 //! Claude's windows come only from the status line of the Claude agents Swarm runs: with
 //! none running, the last numbers stay. Codex is asked every few minutes. Polling runs
 //! only while an app is connected.
+//!
+//! Claude reports no plan: it was read from the Keychain, which Swarm no longer touches.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -14,7 +16,7 @@ use anyhow::{Context as _, Result};
 use serde_json::Value;
 use swarm_core::adapters;
 use swarm_protocol::{AgentKind, Event, SubscriptionUsage, Usage, UsageProblem, UsageWindow};
-use swarm_usage::{Outcome, Reading, codex_usage, length_of_label, write_private};
+use swarm_usage::{Outcome, codex_usage, length_of_label, write_private};
 
 use crate::agents::lock;
 use crate::hub::Clients;
@@ -27,8 +29,9 @@ const CODEX_INTERVAL: Duration = Duration::from_mins(5);
 
 const CODEX_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Status lines run often. With the same windows, `read_at` moves on at this pace only.
-const READ_AT_STEP: u64 = 60;
+/// Reset times this close, in seconds, belong to one window. The same window can report
+/// a reset time that moves by a few seconds.
+const RESET_DRIFT: u64 = 5 * 60;
 
 /// An agent sends two windows; this leaves room and stops a bad caller.
 const MAX_WINDOWS: usize = 8;
@@ -118,22 +121,12 @@ impl UsageService {
 
         let mut current = lock(&self.usage);
 
-        let claude = &current.claude;
-        let same =
-            claude.windows == windows && claude.read_at.is_some_and(|at| now < at + READ_AT_STEP);
-        if same {
+        let mut usage = current.clone();
+        if !merge_windows(&mut usage.claude.windows, windows) {
             return;
         }
+        usage.claude.read_at = Some(now);
 
-        let mut usage = current.clone();
-        apply(
-            &mut usage.claude,
-            Ok(Reading {
-                windows,
-                plan: None,
-            }),
-            now,
-        );
         self.publish(&mut current, usage);
     }
 
@@ -184,6 +177,53 @@ fn apply(subscription: &mut SubscriptionUsage, outcome: Outcome, now: u64) {
     }
 }
 
+/// Merges the windows of a status line into the stored ones, label by label. A stored
+/// window the status line lacks stays: Claude Code drops a window once it has reset.
+/// Returns whether any window got newer data.
+fn merge_windows(stored: &mut Vec<UsageWindow>, incoming: Vec<UsageWindow>) -> bool {
+    let mut newer = false;
+
+    for window in incoming {
+        let position = stored.iter().position(|known| known.label == window.label);
+
+        match position {
+            Some(index) if is_newer(&stored[index], &window) => {
+                stored[index] = window;
+                newer = true;
+            }
+            None if stored.len() < MAX_WINDOWS => {
+                stored.push(window);
+                newer = true;
+            }
+            _ => {}
+        }
+    }
+
+    // The shortest first; a window of unknown length goes last.
+    stored.sort_by_key(|window| window.length_secs.unwrap_or(u64::MAX));
+
+    newer
+}
+
+/// Whether `incoming` is newer than the `stored` window of the same label. An idle agent
+/// sends the numbers of its last reply, so a lower value never replaces a higher one
+/// of the same window. Only a later reset time makes a lower value valid.
+fn is_newer(stored: &UsageWindow, incoming: &UsageWindow) -> bool {
+    let (Some(stored_reset), Some(incoming_reset)) = (stored.resets_at, incoming.resets_at) else {
+        // Without both reset times the order is unknown: the latest to arrive wins.
+        return incoming != stored;
+    };
+
+    if incoming_reset > stored_reset.saturating_add(RESET_DRIFT) {
+        return true;
+    }
+    if incoming_reset.saturating_add(RESET_DRIFT) < stored_reset {
+        return false;
+    }
+
+    incoming.used_percent > stored.used_percent
+}
+
 /// An agent sent these, so they are cut to a sane size.
 fn clean(windows: Vec<UsageWindow>) -> Vec<UsageWindow> {
     windows
@@ -224,8 +264,10 @@ fn parse_saved(bytes: &[u8]) -> serde_json::Result<Usage> {
     }
 
     let mut usage: Usage = serde_json::from_value(saved)?;
-    // No read of Claude can fail now, so a problem it was saved with would stay for good.
+    // Nothing reads Claude's plan or fails a read of Claude now, so what an older daemon
+    // saved would stay for good.
     usage.claude.problem = None;
+    usage.claude.plan = None;
 
     Ok(usage)
 }
@@ -393,6 +435,7 @@ pub(crate) fn configured_command(settings: Option<&Path>, kind: AgentKind) -> St
 #[cfg(test)]
 mod tests {
     use swarm_protocol::read;
+    use swarm_usage::Reading;
 
     use crate::hub::{ClientSink, Frame};
     use crate::temp_folder::TempFolder;
@@ -400,6 +443,9 @@ mod tests {
     use super::*;
 
     const NOW: u64 = 1_800_000_000;
+
+    /// A reset time of the weekly window.
+    const WEEK_RESET: u64 = 1_900_000_000;
 
     /// The length comes from the label, as it does for the windows of both CLIs.
     fn window(label: &str, percent: u8, resets_at: u64) -> UsageWindow {
@@ -590,7 +636,6 @@ mod tests {
 
         assert_eq!(usage.claude.problem, None);
         assert_eq!(usage.codex.problem, None);
-        assert_eq!(usage.claude.plan.as_deref(), Some("max"));
         assert_eq!(usage.claude.read_at, Some(1_793_380_000));
         assert_eq!(usage.claude.windows.len(), 2);
         assert_eq!(usage.codex.plan.as_deref(), Some("plus"));
@@ -718,19 +763,17 @@ mod tests {
     }
 
     #[test]
-    fn the_same_windows_again_are_not_broadcast_before_the_read_time_step() {
+    fn the_same_windows_again_change_nothing() {
         let (service, received, _folder) = service_with_client("step");
         service.record_status_line(vec![window("5h", 20, 7)], NOW);
         changes(&received);
 
-        service.record_status_line(vec![window("5h", 20, 7)], NOW + 1);
-        service.record_status_line(vec![window("5h", 20, 7)], NOW + READ_AT_STEP - 1);
-        assert!(changes(&received).is_empty());
+        for later in [1, 59, 60, 3_600] {
+            service.record_status_line(vec![window("5h", 20, 7)], NOW + later);
+        }
 
-        service.record_status_line(vec![window("5h", 20, 7)], NOW + READ_AT_STEP);
-        let sent = changes(&received);
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].claude.read_at, Some(NOW + READ_AT_STEP));
+        assert!(changes(&received).is_empty());
+        assert_eq!(service.current().claude.read_at, Some(NOW));
     }
 
     #[test]
@@ -742,6 +785,152 @@ mod tests {
         service.record_status_line(vec![window("5h", 21, 7)], NOW + 1);
 
         assert_eq!(changes(&received).len(), 1);
+    }
+
+    #[test]
+    fn a_window_the_status_line_lacks_is_kept() {
+        let (service, received, _folder) = service_with_client("lacks");
+        service.record_status_line(
+            vec![window("5h", 40, 100), window("7d", 30, WEEK_RESET)],
+            NOW,
+        );
+        changes(&received);
+
+        service.record_status_line(vec![window("7d", 31, WEEK_RESET)], NOW + 10);
+
+        let claude = service.current().claude;
+        assert_eq!(
+            claude.windows,
+            [window("5h", 40, 100), window("7d", 31, WEEK_RESET)]
+        );
+        assert_eq!(claude.read_at, Some(NOW + 10));
+        assert_eq!(changes(&received).len(), 1);
+    }
+
+    #[test]
+    fn a_window_seen_for_the_first_time_is_added_shortest_first() {
+        let (service, _received, _folder) = service_with_client("added");
+        service.record_status_line(vec![window("7d", 30, WEEK_RESET)], NOW);
+
+        service.record_status_line(vec![window("5h", 40, 100)], NOW + 10);
+
+        assert_eq!(
+            service.current().claude.windows,
+            [window("5h", 40, 100), window("7d", 30, WEEK_RESET)]
+        );
+    }
+
+    #[test]
+    fn an_idle_agents_older_numbers_do_not_overwrite_newer_ones() {
+        let (service, received, _folder) = service_with_client("idle");
+        service.record_status_line(vec![window("5h", 50, 100)], NOW);
+        changes(&received);
+
+        service.record_status_line(vec![window("5h", 30, 100)], NOW + 120);
+
+        let claude = service.current().claude;
+        assert_eq!(claude.windows, [window("5h", 50, 100)]);
+        assert_eq!(claude.read_at, Some(NOW));
+        assert!(changes(&received).is_empty());
+    }
+
+    #[test]
+    fn reset_times_within_the_drift_are_one_window() {
+        let (service, _received, _folder) = service_with_client("drift");
+        service.record_status_line(vec![window("5h", 50, 1_000)], NOW);
+
+        service.record_status_line(vec![window("5h", 30, 1_000 + RESET_DRIFT)], NOW + 1);
+        assert_eq!(service.current().claude.windows, [window("5h", 50, 1_000)]);
+
+        service.record_status_line(vec![window("5h", 60, 1_000 + RESET_DRIFT)], NOW + 2);
+        assert_eq!(
+            service.current().claude.windows,
+            [window("5h", 60, 1_000 + RESET_DRIFT)]
+        );
+    }
+
+    #[test]
+    fn a_later_reset_time_is_a_new_window_and_may_take_a_lower_value() {
+        let (service, _received, _folder) = service_with_client("new-window");
+        service.record_status_line(vec![window("5h", 90, 1_000)], NOW);
+
+        service.record_status_line(vec![window("5h", 2, 1_000 + RESET_DRIFT + 1)], NOW + 5);
+
+        let claude = service.current().claude;
+        assert_eq!(claude.windows, [window("5h", 2, 1_000 + RESET_DRIFT + 1)]);
+        assert_eq!(claude.read_at, Some(NOW + 5));
+    }
+
+    #[test]
+    fn an_earlier_reset_time_is_an_old_window_and_is_ignored() {
+        let (service, received, _folder) = service_with_client("old-window");
+        service.record_status_line(vec![window("5h", 2, 1_000 + 18_000)], NOW);
+        changes(&received);
+
+        service.record_status_line(vec![window("5h", 90, 1_000)], NOW + 5);
+
+        assert_eq!(
+            service.current().claude.windows,
+            [window("5h", 2, 1_000 + 18_000)]
+        );
+        assert!(changes(&received).is_empty());
+    }
+
+    #[test]
+    fn the_read_time_moves_only_when_a_window_got_newer() {
+        let (service, _received, _folder) = service_with_client("read-time");
+        service.record_status_line(
+            vec![window("5h", 50, 100), window("7d", 40, WEEK_RESET)],
+            NOW,
+        );
+
+        service.record_status_line(
+            vec![window("5h", 30, 100), window("7d", 41, WEEK_RESET)],
+            NOW + 10,
+        );
+        let claude = service.current().claude;
+        assert_eq!(
+            claude.windows,
+            [window("5h", 50, 100), window("7d", 41, WEEK_RESET)]
+        );
+        assert_eq!(claude.read_at, Some(NOW + 10));
+
+        service.record_status_line(
+            vec![window("5h", 30, 100), window("7d", 41, WEEK_RESET)],
+            NOW + 20,
+        );
+        assert_eq!(service.current().claude.read_at, Some(NOW + 10));
+    }
+
+    #[test]
+    fn a_window_without_a_reset_time_takes_the_latest_numbers() {
+        let (service, _received, _folder) = service_with_client("no-reset");
+        let without_reset = |percent| UsageWindow {
+            resets_at: None,
+            ..window("5h", percent, 0)
+        };
+        service.record_status_line(vec![without_reset(50)], NOW);
+
+        service.record_status_line(vec![without_reset(30)], NOW + 1);
+        assert_eq!(service.current().claude.windows, [without_reset(30)]);
+
+        service.record_status_line(vec![window("5h", 20, 500)], NOW + 2);
+        assert_eq!(service.current().claude.windows, [window("5h", 20, 500)]);
+    }
+
+    #[test]
+    fn a_saved_claude_plan_is_dropped_and_a_status_line_does_not_bring_it_back() {
+        let folder = TempFolder::new("claude-plan");
+        let file = folder.path().join("usage.json");
+        std::fs::write(&file, OLD_USAGE).expect("write");
+
+        let (service, _woken) = UsageService::new(file.clone(), Arc::new(Clients::default()));
+        assert_eq!(service.current().claude.plan, None);
+        assert_eq!(service.current().codex.plan.as_deref(), Some("plus"));
+
+        service.record_status_line(vec![window("5h", 50, 1_793_383_200)], NOW);
+        assert_eq!(service.current().claude.plan, None);
+        assert_eq!(load(&file).claude.plan, None);
     }
 
     #[test]
@@ -1015,5 +1204,102 @@ mod tests {
         let codex = service.current().codex;
         assert_eq!(codex.windows, [window("5h", 12, 99)]);
         assert_eq!(codex.problem, Some(UsageProblem::NotLoggedIn));
+    }
+
+    // Swarm never reads Claude Code's sign-in token and never calls Anthropic's usage
+    // endpoint. The test in `tests/daemon.rs` traps `security` and `curl` on `PATH`; this
+    // one also catches a call by absolute path.
+
+    /// Every source file of `swarm_usage`, whole.
+    const USAGE_CRATE_SOURCES: [(&str, &str); 5] = [
+        ("claude.rs", include_str!("../../swarm_usage/src/claude.rs")),
+        ("codex.rs", include_str!("../../swarm_usage/src/codex.rs")),
+        (
+            "fixtures.rs",
+            include_str!("../../swarm_usage/src/fixtures.rs"),
+        ),
+        (
+            "process.rs",
+            include_str!("../../swarm_usage/src/process.rs"),
+        ),
+        (
+            "swarm_usage.rs",
+            include_str!("../../swarm_usage/src/swarm_usage.rs"),
+        ),
+    ];
+
+    const FORBIDDEN: [&str; 5] = [
+        "/usr/bin/curl",
+        "/usr/bin/security",
+        "\"curl\"",
+        "\"security\"",
+        "oauth",
+    ];
+
+    /// The forbidden words in the part of a source file above its tests, which may name
+    /// them. Case does not matter.
+    fn forbidden_in(name: &str, source: &str) -> Vec<String> {
+        let code = source
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or(source)
+            .to_lowercase();
+
+        FORBIDDEN
+            .iter()
+            .filter(|word| code.contains(*word))
+            .map(|word| format!("{name}: {word}"))
+            .collect()
+    }
+
+    #[test]
+    fn the_usage_sources_never_name_the_keychain_or_the_usage_endpoint_programs() {
+        let sources = USAGE_CRATE_SOURCES
+            .iter()
+            .copied()
+            .chain([("swarm_daemon usage.rs", include_str!("usage.rs"))]);
+
+        let hits: Vec<String> = sources
+            .flat_map(|(name, source)| forbidden_in(name, source))
+            .collect();
+
+        assert!(hits.is_empty(), "forbidden words in the sources: {hits:?}");
+    }
+
+    #[test]
+    fn the_source_scan_covers_every_file_of_the_usage_crate() {
+        let folder = Path::new(env!("CARGO_MANIFEST_DIR")).join("../swarm_usage/src");
+        let mut on_disk: Vec<String> = std::fs::read_dir(&folder)
+            .expect("the swarm_usage sources")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        on_disk.sort();
+
+        let scanned: Vec<&str> = USAGE_CRATE_SOURCES.iter().map(|(name, _)| *name).collect();
+
+        assert_eq!(on_disk, scanned, "add the new file to USAGE_CRATE_SOURCES");
+    }
+
+    #[test]
+    fn the_source_scan_reports_a_forbidden_word_above_the_tests_only() {
+        let source = "fn run() { Command::new(\"/usr/bin/curl\"); Command::new(\"security\"); }\n\
+                      // OAuth\n#[cfg(test)]\nmod tests { \"curl\" /usr/bin/security }";
+
+        let hits = forbidden_in("source", source);
+
+        assert_eq!(
+            hits,
+            [
+                "source: /usr/bin/curl",
+                "source: \"security\"",
+                "source: oauth"
+            ]
+        );
     }
 }
