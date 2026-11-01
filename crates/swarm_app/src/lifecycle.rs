@@ -1,8 +1,9 @@
 //! The workspace outlives its window.
 //!
 //! Closing the main window keeps the workspace and its daemon connection, so the menu bar
-//! stays live. The app then has no Dock icon. **Open Swarm** opens a new window on the same
-//! workspace and brings the Dock icon back.
+//! stays live. The app then has no Dock icon, when the status item is there to bring it
+//! back. **Open Swarm**, a Dock click and a second launch open a new window on the same
+//! workspace and bring the Dock icon back.
 
 use gpui::{ActivationPolicy, App, Entity, Global, QuitMode, WindowId};
 
@@ -12,6 +13,9 @@ struct Lifecycle {
     /// Held for the whole run, so the workspace is alive with no window.
     workspace: Entity<Workspace>,
     policy: ActivationPolicy,
+    /// How often the app came to the front. The test platform has no front to read.
+    #[cfg(test)]
+    activations: usize,
 }
 
 impl Global for Lifecycle {}
@@ -35,6 +39,8 @@ pub(crate) fn keep(workspace: Entity<Workspace>, cx: &mut App) {
     cx.set_global(Lifecycle {
         workspace,
         policy: ActivationPolicy::Regular,
+        #[cfg(test)]
+        activations: 0,
     });
     cx.on_window_closed(window_closed).detach();
 }
@@ -50,7 +56,14 @@ fn window_closed(cx: &mut App, window: WindowId) {
     }
 
     workspace.update(cx, Workspace::window_closed);
-    set_policy(ActivationPolicy::Accessory, cx);
+    leave_dock(cx);
+}
+
+/// A Dock click or a second launch of the app, while no window is open.
+pub(crate) fn reopened(cx: &mut App) {
+    if cx.has_global::<Lifecycle>() {
+        show_main_window(cx);
+    }
 }
 
 /// Brings the main window back, or focuses it when it is open.
@@ -63,7 +76,7 @@ pub(crate) fn show_main_window(cx: &mut App) {
             .is_ok()
     });
     if focused {
-        cx.activate(true);
+        activate_later(cx);
         return;
     }
 
@@ -76,11 +89,32 @@ pub(crate) fn show_main_window(cx: &mut App) {
     });
 
     match opened {
-        Ok(_) => cx.activate(true),
+        Ok(_) => activate_later(cx),
         Err(error) => {
             log::error!("could not open the main window: {error:#}");
-            set_policy(ActivationPolicy::Accessory, cx);
+            leave_dock(cx);
         }
+    }
+}
+
+/// Brings the app to the front after the current update. Activating calls back into GPUI,
+/// which a click listener must not wait for.
+fn activate_later(cx: &mut App) {
+    cx.defer(|cx| {
+        #[cfg(test)]
+        {
+            cx.global_mut::<Lifecycle>().activations += 1;
+        }
+
+        cx.activate(true);
+    });
+}
+
+/// Drops the Dock icon, when the status item is another way back. Without it the Dock icon
+/// stays: it is the only way to the window.
+fn leave_dock(cx: &mut App) {
+    if crate::menu_bar::has_status_item(cx) {
+        set_policy(ActivationPolicy::Accessory, cx);
     }
 }
 
@@ -93,6 +127,12 @@ fn set_policy(policy: ActivationPolicy, cx: &mut App) {
 #[cfg(test)]
 pub(crate) fn policy(cx: &App) -> ActivationPolicy {
     cx.global::<Lifecycle>().policy
+}
+
+/// How often the app came to the front.
+#[cfg(test)]
+pub(crate) fn activations(cx: &App) -> usize {
+    cx.global::<Lifecycle>().activations
 }
 
 #[cfg(test)]
@@ -108,11 +148,23 @@ mod tests {
     };
     use crate::menu_bar::harness;
 
-    /// The sample workspace in a window, held by the lifecycle only.
+    /// The sample workspace in a window, held by the lifecycle, with a status item in the
+    /// menu bar.
     fn kept(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
         harness::init(cx);
         let (workspace, cx) = cx.add_window_view(Workspace::with_sample);
-        cx.update(|_, cx| keep(workspace.clone(), cx));
+        harness::install(&workspace, cx);
+
+        (workspace, cx)
+    }
+
+    /// Like [`kept`], for an app whose status item could not be made.
+    fn kept_without_status_item(
+        cx: &mut TestAppContext,
+    ) -> (Entity<Workspace>, &mut VisualTestContext) {
+        harness::init(cx);
+        let (workspace, cx) = cx.add_window_view(Workspace::with_sample);
+        harness::install_without_status_item(&workspace, cx);
 
         (workspace, cx)
     }
@@ -134,11 +186,72 @@ mod tests {
         cx.run_until_parked();
     }
 
+    /// A Dock click, from outside any window, as `AppKit` sends it.
+    fn dock_click(cx: &mut VisualTestContext) {
+        let app: &TestAppContext = cx;
+
+        app.update(reopened);
+        cx.run_until_parked();
+    }
+
     /// A window for the workspace after the first one closed.
     fn second_window(cx: &VisualTestContext) -> VisualTestContext {
         let window = cx.windows().first().copied().expect("a window is open");
 
         VisualTestContext::from_window(window, cx)
+    }
+
+    /// A workspace with one user terminal attached through a fake daemon. The receiver
+    /// gets the terminal of every detach request.
+    fn with_a_terminal(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<Workspace>,
+        &mut VisualTestContext,
+        flume::Receiver<swarm_protocol::TerminalId>,
+    ) {
+        let listed = info(
+            1,
+            swarm_protocol::TerminalKind::User,
+            "swarm/terminal-renderer",
+        );
+        let (on_detach, detaches) = flume::unbounded();
+        let socket = fake_daemon_replying({
+            let listed = listed.clone();
+
+            move |request| match request {
+                Request::List { call } => Some(Event::Terminals {
+                    call,
+                    terminals: vec![listed.clone()],
+                }),
+                Request::Detach { id } => {
+                    if let Err(error) = on_detach.send(id) {
+                        log::error!("the test stopped listening for detaches: {error}");
+                    }
+
+                    None
+                }
+                _ => None,
+            }
+        });
+        let (workspace, cx) = kept(cx);
+        cx.executor().allow_parking();
+        let client = swarm_protocol::Client::connect(&socket).expect("connect to the fake daemon");
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.use_daemon(client, std::slice::from_ref(&listed), window, cx);
+        });
+
+        (workspace, cx, detaches)
+    }
+
+    fn views(workspace: &Entity<Workspace>, cx: &VisualTestContext) -> Vec<gpui::EntityId> {
+        workspace.read_with(cx, |workspace, _| {
+            workspace
+                .live_terminals
+                .values()
+                .map(|live| live.view.entity_id())
+                .collect()
+        })
     }
 
     #[gpui::test]
@@ -157,10 +270,10 @@ mod tests {
             "the workspace went with its window"
         );
         assert_eq!(policy_now(cx), ActivationPolicy::Accessory);
-        assert!(
-            weak.read_with(cx, |workspace, _| workspace.window.is_none())
-                .unwrap_or(false)
-        );
+        let window_gone = weak
+            .read_with(cx, |workspace, _| workspace.window.is_none())
+            .expect("the workspace is alive");
+        assert!(window_gone);
     }
 
     #[gpui::test]
@@ -169,7 +282,9 @@ mod tests {
         let other = cx.add_window(|_, _| gpui::Empty);
 
         cx.update(|_, cx| {
-            other.update(cx, |_, window, _| window.remove_window()).ok();
+            other
+                .update(cx, |_, window, _| window.remove_window())
+                .expect("the other window is open");
         });
         cx.run_until_parked();
 
@@ -188,7 +303,7 @@ mod tests {
         let root = windows
             .first()
             .and_then(AnyWindowHandle::downcast::<Workspace>)
-            .and_then(|window| window.entity(cx).ok());
+            .map(|window| window.entity(cx).expect("the window has its root"));
         assert_eq!(windows.len(), 1);
         assert_eq!(
             root.map(|root| root.entity_id()),
@@ -297,50 +412,153 @@ mod tests {
 
     #[gpui::test]
     fn the_new_window_makes_the_terminal_views_again(cx: &mut TestAppContext) {
-        let listed = info(
-            1,
-            swarm_protocol::TerminalKind::User,
-            "swarm/terminal-renderer",
-        );
-        let socket = fake_daemon_replying({
-            let listed = listed.clone();
-
-            move |request| match request {
-                Request::List { call } => Some(Event::Terminals {
-                    call,
-                    terminals: vec![listed.clone()],
-                }),
-                _ => None,
-            }
-        });
-        let (workspace, cx) = kept(cx);
-        cx.executor().allow_parking();
-        let client = swarm_protocol::Client::connect(&socket).expect("connect to the fake daemon");
-        workspace.update_in(cx, |workspace, window, cx| {
-            workspace.use_daemon(client, std::slice::from_ref(&listed), window, cx);
-        });
-        let view = |cx: &VisualTestContext| {
-            workspace.read_with(cx, |workspace, _| {
-                workspace
-                    .live_terminals
-                    .values()
-                    .map(|live| live.view.entity_id())
-                    .collect::<Vec<_>>()
-            })
-        };
-        let before = view(cx);
+        let (workspace, cx, _detaches) = with_a_terminal(cx);
+        let before = views(&workspace, cx);
         close_window(cx);
 
         open_swarm(cx);
         let mut window = second_window(cx);
         let remade = wait_until(&mut window, |cx| {
-            let now = view(cx);
+            let now = views(&workspace, cx);
 
             now.len() == 1 && now != before
         });
 
         assert_eq!(before.len(), 1);
         assert!(remade, "the views of the closed window are still in use");
+    }
+
+    #[gpui::test]
+    fn the_new_window_focuses_the_terminal_view_it_makes_again(cx: &mut TestAppContext) {
+        let (workspace, cx, _detaches) = with_a_terminal(cx);
+        let terminal = workspace.read_with(cx, |workspace, _| {
+            *workspace.live_terminals.keys().next().expect("a tile")
+        });
+        workspace.update(cx, |workspace, cx| workspace.claim_focus(terminal, cx));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let before = views(&workspace, cx);
+        close_window(cx);
+
+        open_swarm(cx);
+        let mut window = second_window(cx);
+        window.update(|window, cx| window.draw(cx).clear(cx));
+        let remade = wait_until(&mut window, |cx| {
+            let now = views(&workspace, cx);
+
+            now.len() == 1 && now != before
+        });
+        window.update(|window, cx| window.draw(cx).clear(cx));
+        let focused = window.update(|window, cx| {
+            workspace
+                .read(cx)
+                .live_terminals
+                .get(&terminal)
+                .is_some_and(|live| live.view.focus_handle(cx).is_focused(window))
+        });
+
+        assert!(remade);
+        assert!(focused, "the keys go nowhere in the new window");
+    }
+
+    #[gpui::test]
+    fn closing_the_window_detaches_the_terminal_views(cx: &mut TestAppContext) {
+        let (workspace, cx, detaches) = with_a_terminal(cx);
+        let quiet = detaches.is_empty();
+
+        close_window(cx);
+        let heard = wait_until(cx, |_| !detaches.is_empty());
+
+        assert!(quiet);
+        assert!(heard, "the old views still read the terminal");
+        assert_eq!(
+            detaches.try_iter().collect::<Vec<_>>(),
+            [swarm_protocol::TerminalId(1)]
+        );
+        assert_eq!(
+            views(&workspace, cx).len(),
+            1,
+            "the tile stays for the next window"
+        );
+    }
+
+    #[gpui::test]
+    fn without_a_status_item_the_dock_icon_stays_when_the_window_closes(cx: &mut TestAppContext) {
+        let (workspace, cx) = kept_without_status_item(cx);
+
+        close_window(cx);
+
+        assert_eq!(policy_now(cx), ActivationPolicy::Regular);
+        assert!(workspace.read_with(cx, |workspace, _| workspace.window.is_none()));
+    }
+
+    #[gpui::test]
+    fn a_dock_click_opens_the_main_window_again(cx: &mut TestAppContext) {
+        let (workspace, cx) = kept_without_status_item(cx);
+        close_window(cx);
+
+        dock_click(cx);
+
+        assert_eq!(cx.windows().len(), 1);
+        assert_eq!(policy_now(cx), ActivationPolicy::Regular);
+        assert!(workspace.read_with(cx, |workspace, _| workspace.window.is_some()));
+    }
+
+    #[gpui::test]
+    fn a_dock_click_with_the_window_open_opens_no_second_window(cx: &mut TestAppContext) {
+        let (_workspace, cx) = kept(cx);
+
+        dock_click(cx);
+
+        assert_eq!(cx.windows().len(), 1);
+    }
+
+    #[gpui::test]
+    fn a_dock_click_before_the_lifecycle_started_does_nothing(cx: &mut TestAppContext) {
+        harness::init(cx);
+
+        cx.update(reopened);
+
+        assert!(cx.windows().is_empty());
+    }
+
+    #[gpui::test]
+    fn the_app_comes_to_the_front_after_the_update_that_opened_the_window(cx: &mut TestAppContext) {
+        let (_workspace, cx) = kept(cx);
+        close_window(cx);
+        let app: &TestAppContext = cx;
+
+        let (during, after) = {
+            let during = app.update(|cx| {
+                show_main_window(cx);
+
+                activations(cx)
+            });
+
+            (during, app.read(activations))
+        };
+
+        assert_eq!(
+            during, 0,
+            "activating inside the update calls back into GPUI"
+        );
+        assert_eq!(after, 1);
+    }
+
+    #[gpui::test]
+    fn the_app_comes_to_the_front_after_the_update_that_focused_the_window(
+        cx: &mut TestAppContext,
+    ) {
+        let (_workspace, cx) = kept(cx);
+        let app: &TestAppContext = cx;
+
+        let during = app.update(|cx| {
+            show_main_window(cx);
+
+            activations(cx)
+        });
+
+        assert_eq!(during, 0);
+        assert_eq!(app.read(activations), 1);
     }
 
     #[gpui::test]

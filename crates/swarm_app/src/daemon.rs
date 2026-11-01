@@ -351,6 +351,7 @@ impl Workspace {
             let updated = Self::update_with_window(&this, cx, |workspace, window, cx| {
                 if let Some(window) = window {
                     workspace.sync_terminals(&client, &terminals, window, cx);
+                    workspace.refocus_terminal(cx);
                 }
             });
 
@@ -359,6 +360,19 @@ impl Workspace {
             }
         })
         .detach();
+    }
+
+    /// Stops the daemon's output to the views of a closed window, so nothing parses it
+    /// while no window shows it. The terminals keep running, and a new window attaches
+    /// again.
+    pub(crate) fn detach_terminals(&self) {
+        let Some(client) = &self.daemon else {
+            return;
+        };
+
+        for live in self.live_terminals.values() {
+            client.detach(live.daemon_id);
+        }
     }
 
     /// Syncs the tiles with the daemon's terminals: reattaches tiles whose terminal

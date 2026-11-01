@@ -105,7 +105,10 @@ fn open_main_window(cx: &mut App) {
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    gpui_platform::application().run(|cx: &mut App| {
+    let application = gpui_platform::application();
+    application.on_reopen(lifecycle::reopened);
+
+    application.run(|cx: &mut App| {
         swarm_ui::init(cx);
         actions::bind_keys(cx);
 

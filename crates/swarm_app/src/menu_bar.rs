@@ -34,6 +34,10 @@ const REOPEN_GUARD: Duration = Duration::from_millis(300);
 /// Space between the popover and the corner, when the status item has no position.
 const CORNER_GAP: f32 = 8.;
 
+/// How often the look is worked out again. A usage window that resets changes the percent
+/// with no news from the daemon.
+const LOOK_INTERVAL: Duration = Duration::from_secs(60);
+
 /// What the menu bar needs from the status item.
 pub(crate) trait StatusItem {
     fn show(&self, look: &Look);
@@ -117,7 +121,22 @@ fn start(
     })
     .detach();
 
+    cx.spawn(async move |cx| {
+        loop {
+            cx.background_executor().timer(LOOK_INTERVAL).await;
+            cx.update(refresh);
+        }
+    })
+    .detach();
+
     refresh(cx);
+}
+
+/// True when the status item is in the menu bar. Without it the app must keep its Dock
+/// icon, or it would have no way back to its window.
+pub(crate) fn has_status_item(cx: &App) -> bool {
+    cx.try_global::<MenuBar>()
+        .is_some_and(|menu| menu.status.is_some())
 }
 
 fn summary(cx: &App) -> Summary {
@@ -308,6 +327,20 @@ pub(crate) mod harness {
         Bar { item, clicks }
     }
 
+    /// Starts the menu bar and the lifecycle as they run when `AppKit` refused to make the
+    /// status item.
+    pub(crate) fn install_without_status_item(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) {
+        let (_clicks, receiver) = flume::unbounded();
+
+        cx.update(|_, cx| {
+            lifecycle::keep(workspace.clone(), cx);
+            start(workspace.clone(), None, receiver, cx);
+        });
+    }
+
     /// The sample workspace in a window, with the menu bar on it.
     pub(crate) fn setup(
         cx: &mut TestAppContext,
@@ -341,9 +374,11 @@ pub(crate) mod harness {
 #[expect(clippy::float_cmp, reason = "the sizes are whole numbers")]
 mod tests {
     use gpui::TestAppContext;
+    use swarm_protocol::{SubscriptionUsage, Usage, UsageWindow};
 
     use super::harness::{activate, popover_is_open, popover_window, setup};
     use super::*;
+    use crate::model::SAMPLE_NOW;
 
     fn seconds_ago(seconds: u64) -> Instant {
         let now = Instant::now();
@@ -401,7 +436,7 @@ mod tests {
         let first = bar.last_look();
 
         workspace.update(cx, |workspace, cx| {
-            workspace.usage_changed(swarm_protocol::Usage::default(), cx);
+            workspace.usage_changed(Usage::default(), cx);
         });
 
         assert_eq!(first, Some(Look::new(Some(42), true)));
@@ -420,10 +455,57 @@ mod tests {
     }
 
     #[gpui::test]
-    fn the_real_status_item_is_never_made_in_tests(_cx: &mut TestAppContext) {
-        let (clicks, _receiver) = flume::unbounded();
+    fn a_usage_window_that_resets_changes_the_percent_without_news_from_the_daemon(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, bar, cx) = setup(cx);
+        let resets = SAMPLE_NOW / 1_000 + 90;
+        workspace.update(cx, |workspace, cx| {
+            for task in &mut workspace.data.tasks {
+                task.status = crate::model::TaskStatus::Idle;
+            }
+            workspace.usage_changed(
+                Usage {
+                    claude: SubscriptionUsage {
+                        windows: vec![UsageWindow {
+                            label: "5h".to_owned(),
+                            used_percent: 42,
+                            resets_at: Some(resets),
+                        }],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                cx,
+            );
+        });
+        let before = bar.last_look();
+        let shown = bar.item.looks.borrow().len();
 
-        assert!(create_status_item(clicks).is_none());
+        // The clock passes the reset, and nothing tells the workspace.
+        workspace.update(cx, |workspace, _| {
+            workspace.fixed_now = Some(SAMPLE_NOW + 120_000);
+        });
+        cx.run_until_parked();
+        let unchanged = bar.last_look();
+        cx.executor().advance_clock(LOOK_INTERVAL);
+        cx.run_until_parked();
+
+        assert_eq!(before, Some(Look::new(Some(42), false)));
+        assert_eq!(unchanged, before, "the look changed before the timer fired");
+        assert_eq!(bar.last_look(), Some(Look::new(Some(0), false)));
+        assert_eq!(bar.item.looks.borrow().len(), shown + 1);
+    }
+
+    #[gpui::test]
+    fn the_timer_leaves_the_status_item_alone_when_the_look_is_the_same(cx: &mut TestAppContext) {
+        let (_workspace, bar, cx) = setup(cx);
+        let shown = bar.item.looks.borrow().len();
+
+        cx.executor().advance_clock(LOOK_INTERVAL * 3);
+        cx.run_until_parked();
+
+        assert_eq!(bar.item.looks.borrow().len(), shown);
     }
 
     #[gpui::test]

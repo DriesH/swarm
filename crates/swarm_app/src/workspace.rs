@@ -362,6 +362,15 @@ impl Workspace {
         self.sync_swarm_tasks(false, cx);
         self.sync_usage_clock(false, cx);
         self.rest_pull_requests();
+        self.detach_terminals();
+
+        cx.notify();
+    }
+
+    /// Focuses the focused terminal again. A new window makes its views after the first
+    /// frame, so the first focus went to a view that is gone.
+    pub(crate) fn refocus_terminal(&mut self, cx: &mut Context<Self>) {
+        self.pending_focus = self.focused_terminal;
 
         cx.notify();
     }

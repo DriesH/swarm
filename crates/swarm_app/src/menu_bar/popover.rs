@@ -119,6 +119,7 @@ enum Wanted {
     First,
     StopAll,
     Cancel,
+    OpenSwarm,
 }
 
 struct Handles {
@@ -204,9 +205,14 @@ impl Popover {
     }
 
     /// Moves focus where `wanted` says. The first control is the first task that needs the
-    /// user, else Stop all when it can be used, else Open Swarm.
+    /// user, else Stop all when it can be used, else Open Swarm. A control that is disabled
+    /// or gone cannot keep the focus: it goes to Open Swarm.
     fn apply_focus(&mut self, summary: &Summary, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(wanted) = self.wanted.take() else {
+        let wanted = self.wanted.take().or_else(|| {
+            self.focus_is_stranded(summary, window)
+                .then_some(Wanted::OpenSwarm)
+        });
+        let Some(wanted) = wanted else {
             return;
         };
 
@@ -215,10 +221,26 @@ impl Popover {
             Wanted::Cancel => self.handles.cancel.clone(),
             Wanted::First if !summary.needs_you.is_empty() => self.handles.needs_you[0].clone(),
             Wanted::First | Wanted::StopAll if can_stop => self.handles.stop_all.clone(),
-            Wanted::First | Wanted::StopAll => self.handles.open_swarm.clone(),
+            Wanted::First | Wanted::StopAll | Wanted::OpenSwarm => self.handles.open_swarm.clone(),
         };
 
         window.focus(&handle, cx);
+    }
+
+    /// True when the focused control is disabled or not on screen.
+    fn focus_is_stranded(&self, summary: &Summary, window: &Window) -> bool {
+        let handles = &self.handles;
+        let mut stranded: Vec<&FocusHandle> = Vec::new();
+
+        if self.stop != StopState::Idle || summary.running == 0 {
+            stranded.push(&handles.stop_all);
+        }
+        if matches!(self.stop, StopState::Idle | StopState::Stopping) {
+            stranded.extend([&handles.cancel, &handles.confirm]);
+        }
+        stranded.extend(handles.needs_you.iter().skip(summary.needs_you.len()));
+
+        stranded.into_iter().any(|handle| handle.is_focused(window))
     }
 
     fn ask(&mut self, cx: &mut Context<Self>) {
@@ -937,7 +959,9 @@ mod tests {
         let (stopped, stops) = flume::unbounded();
         let socket = fake_daemon_replying(move |request| match request {
             Request::StopAgents { call } => {
-                stopped.send(()).ok();
+                if let Err(error) = stopped.send(()) {
+                    log::error!("the test stopped counting the stops: {error}");
+                }
 
                 Some(answer(call))
             }
@@ -1145,9 +1169,16 @@ mod tests {
     fn open_swarm_focuses_the_main_window_and_closes_the_popover(cx: &mut TestAppContext) {
         let (_workspace, bar, cx) = setup(cx);
         let mut popover = open(&bar, cx);
+        let behind = cx.update(|window, _| window.is_window_active());
+        let activations = cx.update(|_, cx| lifecycle::activations(cx));
 
         click("popover-open-swarm", &mut popover);
 
+        let in_front = cx.update(|window, _| window.is_window_active());
+        assert!(!behind, "the popover has the key window");
+        assert!(in_front, "the main window did not become the key window");
+        let activated = cx.update(|_, cx| lifecycle::activations(cx)) - activations;
+        assert_eq!(activated, 1, "the app was not brought to the front once");
         assert!(!popover_is_open(cx));
         assert_eq!(cx.windows().len(), 1);
     }
@@ -1167,13 +1198,130 @@ mod tests {
         assert_eq!(cx.windows().len(), 1);
     }
 
+    /// Puts the Stop all control in `state`, as the work it starts would.
+    fn set_stop(state: StopState, cx: &mut VisualTestContext) {
+        let handle = cx
+            .read_global(|menu: &super::super::MenuBar, _| menu.popover)
+            .expect("the popover is open");
+
+        handle
+            .update(cx, |popover, _, cx| {
+                popover.stop = state;
+                cx.notify();
+            })
+            .expect("update the popover");
+    }
+
+    /// What the daemon sends once every agent ended.
+    fn end_agents(workspace: &Entity<Workspace>, count: u64, cx: &mut VisualTestContext) {
+        workspace.update_in(cx, |workspace, window, cx| {
+            for id in 1..=count {
+                let mut info = agent_info(id, 7, DaemonAgentStatus::Idle);
+                info.role = AgentRole::Worker;
+                info.name = format!("worker-{id}");
+                info.lifecycle = swarm_protocol::AgentLifecycle::Stopped;
+
+                workspace.agent_changed(&info, Some(window), cx);
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn while_the_agents_stop_the_disabled_buttons_hand_focus_to_open_swarm(
+        cx: &mut TestAppContext,
+    ) {
+        let (socket, _stops) = stopping_daemon(|call| Event::Done { call });
+        let (_workspace, bar, cx) = three_running(&socket, cx);
+        let mut popover = open(&bar, cx);
+        press("popover-stop-all", &mut popover);
+        popover.simulate_keystrokes("tab");
+        let on_stop = focused(&mut popover);
+
+        set_stop(StopState::Stopping, &mut popover);
+        draw(&mut popover);
+
+        assert_eq!(on_stop.as_deref(), Some("confirm"));
+        assert_eq!(focused(&mut popover).as_deref(), Some("open-swarm"));
+    }
+
+    #[gpui::test]
+    fn after_a_stop_that_ended_every_agent_focus_leaves_the_disabled_stop_all(
+        cx: &mut TestAppContext,
+    ) {
+        let (socket, _stops) = stopping_daemon(|call| Event::Done { call });
+        let (workspace, bar, cx) = three_running(&socket, cx);
+        let mut popover = open(&bar, cx);
+        press("popover-stop-all", &mut popover);
+        press("popover-stop-confirm", &mut popover);
+        let finished = wait_until(&mut popover, |cx| {
+            draw(cx);
+            shown("popover-stop-all", cx)
+        });
+        let after_the_answer = focused(&mut popover);
+
+        end_agents(&workspace, 3, cx);
+        draw(&mut popover);
+
+        assert!(finished);
+        assert_eq!(after_the_answer.as_deref(), Some("stop-all"));
+        assert_eq!(focused(&mut popover).as_deref(), Some("open-swarm"));
+    }
+
+    #[gpui::test]
+    fn when_every_agent_ends_during_the_question_focus_goes_to_open_swarm(cx: &mut TestAppContext) {
+        let (socket, _stops) = stopping_daemon(|call| Event::Done { call });
+        let (workspace, bar, cx) = three_running(&socket, cx);
+        let mut popover = open(&bar, cx);
+        press("popover-stop-all", &mut popover);
+        let asking = focused(&mut popover);
+
+        end_agents(&workspace, 3, cx);
+        draw(&mut popover);
+
+        assert_eq!(asking.as_deref(), Some("cancel"));
+        assert!(shown("popover-stop-all", &mut popover));
+        assert!(!shown("popover-stop-confirm", &mut popover));
+        assert_eq!(focused(&mut popover).as_deref(), Some("open-swarm"));
+    }
+
+    #[gpui::test]
+    fn when_the_last_task_that_needs_you_goes_away_focus_goes_to_open_swarm(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, bar, cx) = setup(cx);
+        let mut popover = open(&bar, cx);
+        let first = focused(&mut popover);
+
+        quiet(&workspace, cx);
+        draw(&mut popover);
+
+        assert_eq!(first.as_deref(), Some("needs-you-0"));
+        assert!(!shown("popover-needs-you-0", &mut popover));
+        assert_eq!(focused(&mut popover).as_deref(), Some("open-swarm"));
+    }
+
+    #[gpui::test]
+    fn a_control_that_stays_keeps_the_focus(cx: &mut TestAppContext) {
+        let (workspace, bar, cx) = setup(cx);
+        let mut popover = open(&bar, cx);
+        popover.simulate_keystrokes("tab");
+        popover.simulate_keystrokes("tab");
+        let before = focused(&mut popover);
+
+        workspace.update(cx, |_, cx| cx.notify());
+        draw(&mut popover);
+
+        assert_eq!(before.as_deref(), Some("stop-all"));
+        assert_eq!(focused(&mut popover).as_deref(), Some("stop-all"));
+    }
+
     #[gpui::test]
     fn quit_quits_the_app(cx: &mut TestAppContext) {
         let (_workspace, bar, cx) = setup(cx);
         let (quit, quits) = flume::unbounded();
         cx.update(|_, cx| {
             cx.on_action(move |_: &Quit, _| {
-                quit.send(()).ok();
+                quit.send(()).expect("the test counts the quits");
             });
         });
         let mut popover = open(&bar, cx);
