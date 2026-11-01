@@ -559,6 +559,100 @@ fn show_unavailable(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<
     );
 }
 
+/// Every egg setting back to the default, so a shot depends only on what it sets.
+fn plain_eggs(cx: &mut Context<Workspace>) {
+    crate::settings::change_appearance(
+        |appearance| *appearance = swarm_settings::AppearanceSettings::default(),
+        cx,
+    );
+    theme::set_accent(theme::Accent::Blue, cx);
+    cx.set_reduce_motion(false);
+}
+
+/// The honeycomb of the empty state: the app has no project.
+fn open_egg_no_projects(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
+    plain_eggs(cx);
+    workspace.use_projects(&[], cx);
+}
+
+/// A project with no task: its Start view sits on the honeycomb.
+fn open_egg_start_view(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    plain_eggs(cx);
+    open_start_empty(workspace, window, cx);
+}
+
+/// The Swarm view with the honeycomb the Appearance page offers.
+fn open_egg_swarm_honeycomb(
+    workspace: &mut Workspace,
+    _: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    plain_eggs(cx);
+    crate::settings::change_appearance(|appearance| appearance.swarm_view_honeycomb = true, cx);
+    workspace.set_view(View::Swarm, cx);
+}
+
+/// The Swarm view with the dots, after the eggs went off.
+fn open_egg_swarm_dots(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
+    plain_eggs(cx);
+    crate::settings::change_appearance(
+        |appearance| {
+            appearance.swarm_view_honeycomb = true;
+            appearance.easter_eggs = false;
+        },
+        cx,
+    );
+    workspace.set_view(View::Swarm, cx);
+}
+
+/// "Honey's ready" with its honeycomb filled, as it looks under Reduce Motion.
+fn open_egg_toast(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
+    plain_eggs(cx);
+    cx.set_reduce_motion(true);
+    workspace.show_toast_for_snapshot("terminal-renderer", cx);
+}
+
+/// The same toast with the eggs off: no honeycomb.
+fn open_egg_toast_without_eggs(
+    workspace: &mut Workspace,
+    _: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    plain_eggs(cx);
+    crate::settings::change_appearance(|appearance| appearance.easter_eggs = false, cx);
+    cx.set_reduce_motion(true);
+    workspace.show_toast_for_snapshot("terminal-renderer", cx);
+}
+
+/// The Start orchestrator with its crown, an hour after the 100th merge.
+fn open_egg_queen(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    plain_eggs(cx);
+    open_start(workspace, window, cx);
+    workspace.eggs.stats = swarm_protocol::SwarmStats {
+        running_agents: 4,
+        open_tasks: 3,
+        merged_prs: 100,
+        hundredth_merge_at: Some(SAMPLE_NOW - 3_600_000),
+    };
+}
+
+/// The bees of the buzz, caught in the air.
+fn open_egg_buzz(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
+    plain_eggs(cx);
+    workspace.freeze_flight_for_snapshot(0.42, cx);
+}
+
+/// The Honey accent on the open workspace.
+fn open_egg_honey_accent(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
+    plain_eggs(cx);
+    theme::set_accent(theme::Accent::Honey, cx);
+    workspace.set_view(View::Swarm, cx);
+}
+
 const SETTLE: Duration = Duration::from_millis(700);
 
 #[expect(
@@ -942,6 +1036,80 @@ pub(crate) fn run(directory: PathBuf, cx: &mut App) {
                 Appearance::Dark,
                 "workspace-font-16-dark.png",
                 Some(open_font_16),
+            ),
+            (
+                Appearance::Light,
+                "egg-no-projects-light.png",
+                Some(open_egg_no_projects),
+            ),
+            (
+                Appearance::Dark,
+                "egg-no-projects-dark.png",
+                Some(open_egg_no_projects),
+            ),
+            (
+                Appearance::Light,
+                "egg-start-view-light.png",
+                Some(open_egg_start_view),
+            ),
+            (
+                Appearance::Dark,
+                "egg-start-view-dark.png",
+                Some(open_egg_start_view),
+            ),
+            (
+                Appearance::Light,
+                "egg-swarm-honeycomb-light.png",
+                Some(open_egg_swarm_honeycomb),
+            ),
+            (
+                Appearance::Dark,
+                "egg-swarm-honeycomb-dark.png",
+                Some(open_egg_swarm_honeycomb),
+            ),
+            (
+                Appearance::Light,
+                "egg-swarm-dots-eggs-off-light.png",
+                Some(open_egg_swarm_dots),
+            ),
+            (
+                Appearance::Dark,
+                "egg-swarm-dots-eggs-off-dark.png",
+                Some(open_egg_swarm_dots),
+            ),
+            (
+                Appearance::Light,
+                "egg-toast-light.png",
+                Some(open_egg_toast),
+            ),
+            (Appearance::Dark, "egg-toast-dark.png", Some(open_egg_toast)),
+            (
+                Appearance::Light,
+                "egg-toast-eggs-off-light.png",
+                Some(open_egg_toast_without_eggs),
+            ),
+            (
+                Appearance::Dark,
+                "egg-toast-eggs-off-dark.png",
+                Some(open_egg_toast_without_eggs),
+            ),
+            (
+                Appearance::Light,
+                "egg-queen-light.png",
+                Some(open_egg_queen),
+            ),
+            (Appearance::Dark, "egg-queen-dark.png", Some(open_egg_queen)),
+            (Appearance::Light, "egg-buzz-light.png", Some(open_egg_buzz)),
+            (Appearance::Dark, "egg-buzz-dark.png", Some(open_egg_buzz)),
+            (
+                Appearance::Light,
+                "egg-honey-accent-light.png",
+                Some(open_egg_honey_accent),
+            ),
+            (
+                Appearance::Dark,
+                "egg-honey-accent-dark.png",
+                Some(open_egg_honey_accent),
             ),
         ] {
             if filter

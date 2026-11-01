@@ -3,16 +3,16 @@
 use std::path::Path;
 
 use gpui::{AnyElement, ElementId, Entity, FontWeight, Role, SharedString, Stateful, div, px};
-use swarm_settings::{AgentKindSetting, ProjectMode};
+use swarm_settings::{AccentSetting, AgentKindSetting, ProjectMode};
 use swarm_ui::prelude::*;
 use swarm_ui::styles::focus_ring;
-use swarm_ui::theme::{self, Appearance};
+use swarm_ui::theme::{self, Accent, Appearance};
 
 use super::open_file;
 use super::project::{List, Load, ProjectSettings};
 use super::{
     AGENTS, DELIVERY, IDLE_OPTIONS, NOTIFY_WHEN, PROJECT_MODES, PROJECT_NOTIFICATIONS, Page,
-    SettingsState, SettingsWindow, delivery, delivery_mut, mode_index, notify_when,
+    SettingsState, SettingsWindow, accent_of, delivery, delivery_mut, mode_index, notify_when,
     notify_when_mut,
 };
 use crate::notifications::{self, Permission};
@@ -22,6 +22,35 @@ type State = Entity<SettingsState>;
 pub(super) fn apply_appearance(index: usize, cx: &mut App) {
     if let Some(appearance) = Appearance::ALL.get(index) {
         theme::set_appearance(*appearance, cx);
+    }
+}
+
+fn accent_index(accent: AccentSetting) -> usize {
+    match accent {
+        AccentSetting::Blue => 0,
+        AccentSetting::Honey => 1,
+    }
+}
+
+fn accent_setting(index: usize) -> AccentSetting {
+    match index {
+        1 => AccentSetting::Honey,
+        _ => AccentSetting::Blue,
+    }
+}
+
+/// Saves the accent and applies it at once, like the theme control does.
+pub(super) fn apply_accent(state: &State) -> impl Fn(usize, &mut Window, &mut App) + 'static {
+    let state = state.clone();
+
+    move |index, _, cx| {
+        let accent = accent_setting(index);
+
+        state.update(cx, |state, cx| {
+            state.settings.appearance.accent = accent;
+            cx.notify();
+        });
+        theme::set_accent(accent_of(accent), cx);
     }
 }
 
@@ -204,7 +233,7 @@ impl SettingsWindow {
         match self.page {
             Page::Agents => self.agents_page(cx),
             Page::Notifications => self.notifications_page(cx),
-            Page::Appearance => Self::appearance_page(cx),
+            Page::Appearance => self.appearance_page(cx),
             Page::Project(index) => self.project_page(index, cx),
             Page::Terminals => self.terminals_page(cx),
             Page::Prompts => self.prompts.clone().into_any_element(),
@@ -447,7 +476,10 @@ impl SettingsWindow {
             .into_any_element()
     }
 
-    fn appearance_page(cx: &Context<Self>) -> AnyElement {
+    fn appearance_page(&self, cx: &Context<Self>) -> AnyElement {
+        let state = &self.state;
+        let settings = state.read(cx).settings.appearance;
+
         let selected = Appearance::ALL
             .iter()
             .position(|appearance| *appearance == theme::appearance(cx))
@@ -458,8 +490,37 @@ impl SettingsWindow {
             "Theme",
             Appearance::ALL.map(Appearance::label),
         )
+        .debug_selector(|| "theme".to_owned())
         .selected(selected)
         .on_select(|index, _, cx| apply_appearance(index, cx));
+
+        let accent = SegmentedControl::new("accent", "Accent", Accent::ALL.map(Accent::label))
+            .debug_selector(|| "accent".to_owned())
+            .selected(accent_index(settings.accent))
+            .on_select(apply_accent(state));
+
+        let eggs = Panel::new()
+            .row(
+                PanelRow::new("Easter eggs").end_slot(
+                    Switch::new("easter-eggs", "Easter eggs")
+                        .debug_selector(|| "easter-eggs".to_owned())
+                        .toggle_state(settings.easter_eggs)
+                        .on_toggle(toggle(state, |state, on| {
+                            state.settings.appearance.easter_eggs = on;
+                        })),
+                ),
+            )
+            .row(
+                PanelRow::new("Honeycomb behind the Swarm view").end_slot(
+                    Switch::new("swarm-view-honeycomb", "Honeycomb behind the Swarm view")
+                        .debug_selector(|| "swarm-view-honeycomb".to_owned())
+                        .toggle_state(settings.swarm_view_honeycomb && settings.easter_eggs)
+                        .disabled(!settings.easter_eggs)
+                        .on_toggle(toggle(state, |state, on| {
+                            state.settings.appearance.swarm_view_honeycomb = on;
+                        })),
+                ),
+            );
 
         v_flex()
             .gap(px(26.))
@@ -468,6 +529,11 @@ impl SettingsWindow {
                 "Theme",
                 Panel::new().row(PanelRow::new("Theme").end_slot(control)),
             ))
+            .child(section(
+                "Accent",
+                Panel::new().row(PanelRow::new("Accent").end_slot(accent)),
+            ))
+            .child(section("Easter eggs", eggs))
             .into_any_element()
     }
 

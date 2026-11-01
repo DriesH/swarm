@@ -323,6 +323,7 @@ impl Workspace {
         }
 
         self.load_usage(client.clone(), cx);
+        self.load_stats(client.clone(), cx);
         self.load_message_history(client, cx);
 
         cx.notify();
@@ -451,6 +452,9 @@ impl Workspace {
         });
         Self::forward(client.usage_events(), cx, |workspace, usage, _, cx| {
             workspace.usage_changed(usage, cx);
+        });
+        Self::forward(client.stats_events(), cx, |workspace, stats, _, cx| {
+            workspace.stats_changed(stats, cx);
         });
         Self::forward(client.notices(), cx, |workspace, notice, window, cx| {
             workspace.notice_received(&notice, window, cx);
@@ -2000,6 +2004,10 @@ pub(crate) mod tests {
             Request::Usage { call } => Some(Event::Usage {
                 call: *call,
                 usage: Usage::default(),
+            }),
+            Request::Stats { call } => Some(Event::Stats {
+                call: *call,
+                stats: swarm_protocol::SwarmStats::default(),
             }),
             Request::GithubStatus { call, .. } => Some(Event::GithubStatus {
                 call: *call,

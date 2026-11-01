@@ -67,6 +67,76 @@ fn rate_limited(data: &mut FakeData) {
     });
 }
 
+/// The two wing frames of the buzzing bee on a strip of the menu bar, the way macOS tints a
+/// template image: black on the light bar, white on the dark one. Saved as `egg-menu-bee-*.png`.
+fn save_bee_frames(directory: &Path) {
+    use super::icon::bee_png;
+    use super::summary::BeeFrame;
+
+    const ZOOM: u32 = 4;
+    const GAP: u32 = 24;
+
+    for (name, bar, ink) in [
+        ("light", [236_u8, 236, 240], 0_u8),
+        ("dark", [30, 30, 34], 255),
+    ] {
+        let frames: Vec<image::RgbaImage> = [BeeFrame::Open, BeeFrame::Flat]
+            .into_iter()
+            .filter_map(|frame| {
+                let png = bee_png(false, frame).ok()?;
+
+                image::load_from_memory(&png).ok().map(|bee| {
+                    image::imageops::resize(
+                        &bee.to_rgba8(),
+                        bee.width() * ZOOM,
+                        bee.height() * ZOOM,
+                        image::imageops::FilterType::Triangle,
+                    )
+                })
+            })
+            .collect();
+
+        let Some(first) = frames.first() else {
+            log::error!("cannot draw the bee frames");
+            return;
+        };
+        let (width, height) = (first.width(), first.height());
+        let count = u32::try_from(frames.len()).unwrap_or(1);
+        let mut strip = image::RgbaImage::from_pixel(
+            GAP + count * (width + GAP),
+            height + 2 * GAP,
+            image::Rgba([bar[0], bar[1], bar[2], 255]),
+        );
+
+        for (index, frame) in (0..).zip(&frames) {
+            let left = GAP + index * (width + GAP);
+
+            for (x, y, pixel) in frame.enumerate_pixels() {
+                let alpha = f32::from(pixel.0[3]) / 255.;
+                let target = strip.get_pixel_mut(left + x, GAP + y);
+
+                for channel in 0..3 {
+                    let base = f32::from(target.0[channel]);
+                    let blended = base + (f32::from(ink) - base) * alpha;
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        reason = "a blend of two bytes stays between 0 and 255"
+                    )]
+                    let byte = blended.round() as u8;
+                    target.0[channel] = byte;
+                }
+            }
+        }
+
+        let path = directory.join(format!("egg-menu-bee-{name}.png"));
+        match strip.save(&path) {
+            Ok(()) => log::info!("saved {}", path.display()),
+            Err(error) => log::error!("cannot save {}: {error}", path.display()),
+        }
+    }
+}
+
 pub(crate) fn run(directory: PathBuf, cx: &mut App) {
     cx.spawn(async move |cx: &mut AsyncApp| {
         if let Err(error) = std::fs::create_dir_all(&directory) {
@@ -74,6 +144,8 @@ pub(crate) fn run(directory: PathBuf, cx: &mut App) {
             cx.update(|cx| cx.quit());
             return;
         }
+
+        save_bee_frames(&directory);
 
         let variants: [(&str, Prepare, Stop); 4] = [
             ("popover", quiet, Stop::Button),

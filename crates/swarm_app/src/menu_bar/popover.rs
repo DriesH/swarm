@@ -153,6 +153,7 @@ impl Popover {
         let mut subscriptions = vec![
             cx.observe(&workspace, |_, _, cx| cx.notify()),
             theme::follow_system_appearance(window, cx),
+            swarm_ui::motion::follow_reduce_motion(window, cx),
         ];
 
         if closes_itself {

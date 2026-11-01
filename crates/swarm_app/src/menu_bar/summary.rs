@@ -2,9 +2,29 @@
 //! data in and out, so all of it runs without `AppKit` or a window.
 
 use swarm_protocol::{SubscriptionUsage, Usage};
+use swarm_ui::AgentStatus;
 
 use crate::model::{Agent, FakeData, TaskId, TaskStatus};
 use crate::usage_text::{problem_text, resets_note, shown_percent, spoken_window};
+
+/// Which of the bee's two wing frames the status item shows. Flipping between them is the
+/// buzz.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum BeeFrame {
+    /// The wings spread: the bee at rest.
+    #[default]
+    Open,
+    Flat,
+}
+
+impl BeeFrame {
+    pub(crate) fn flipped(self) -> Self {
+        match self {
+            Self::Open => Self::Flat,
+            Self::Flat => Self::Open,
+        }
+    }
+}
 
 /// How the status item looks: the text next to the bee, the bee with or without the dot,
 /// and what VoiceOver says.
@@ -13,6 +33,8 @@ pub(crate) struct Look {
     pub title: Option<String>,
     pub dot: bool,
     pub label: String,
+    /// The wing frame. It never changes what VoiceOver says.
+    pub frame: BeeFrame,
 }
 
 impl Look {
@@ -28,7 +50,13 @@ impl Look {
             title: percent.map(|percent| format!(" {percent}%")),
             dot: needs_you,
             label,
+            frame: BeeFrame::Open,
         }
+    }
+
+    pub(crate) fn with_frame(mut self, frame: BeeFrame) -> Self {
+        self.frame = frame;
+        self
     }
 }
 
@@ -86,6 +114,8 @@ pub(crate) struct Summary {
     /// The fullest window of any agent kind: the one that stops the user first.
     pub percent: Option<u8>,
     pub running: usize,
+    /// Running agents that are at work: the bee buzzes while there is one.
+    pub working: usize,
     pub needs_you: Vec<NeedsYou>,
     pub usage: Vec<UsageSection>,
 }
@@ -99,6 +129,11 @@ impl Summary {
                 .agents
                 .iter()
                 .filter(|agent| agent.is_running())
+                .count(),
+            working: data
+                .agents
+                .iter()
+                .filter(|agent| agent.is_running() && agent.status == AgentStatus::Working)
                 .count(),
             needs_you: needs_you(data),
             usage: usage_sections(&data.usage, now),
@@ -355,7 +390,7 @@ mod tests {
                 .find(|agent| agent.task == *id && agent.daemon.is_none())
         });
         if let Some(agent) = blocked {
-            agent.status = swarm_ui::AgentStatus::Blocked;
+            agent.status = AgentStatus::Blocked;
             agent.note = Some("Allow cargo test?".into());
         }
         if let Some(task) = data.tasks.first_mut() {
@@ -387,7 +422,7 @@ mod tests {
 
         let first = data.agents.first_mut();
         if let Some(agent) = first {
-            agent.status = swarm_ui::AgentStatus::Done;
+            agent.status = AgentStatus::Done;
         }
         let after = Summary::of(&data, NOW).running;
 

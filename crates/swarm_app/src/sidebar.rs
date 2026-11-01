@@ -364,6 +364,8 @@ fn agent_row(
         AgentKind::Codex => (IconName::Codex, "Codex"),
     };
 
+    let queen = workspace.is_queen(agent, cx);
+
     ListRow::new(("agent", agent.id.0 as usize), agent.name.clone())
         .accessible_label(format!(
             "{}, {kind}, {}",
@@ -374,7 +376,20 @@ fn agent_row(
         .indent(indent)
         .toggle_state(workspace.focused_terminal == Some(terminal))
         .start_slot(Icon::new(icon).size(IconSize::Large))
-        .end_slot(StatusDot::new(agent.status))
+        .end_slot(
+            h_flex()
+                .gap(px(6.))
+                .when(queen, |end| {
+                    end.child(
+                        div().debug_selector(|| "queen-bee".to_owned()).child(
+                            PixelBee::new(("queen-bee", agent.id.0 as usize))
+                                .scale(1)
+                                .crown(true),
+                        ),
+                    )
+                })
+                .child(StatusDot::new(agent.status)),
+        )
         .on_click(cx.listener(move |workspace, _, _, cx| {
             workspace.focus_terminal(terminal, cx);
         }))

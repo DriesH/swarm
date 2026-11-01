@@ -1,11 +1,71 @@
-//! Settings › General: the system check.
+//! Settings › General: the system check and the About section.
 
 use gpui::{AnyElement, FontWeight, Role, div, px};
 use swarm_ui::prelude::*;
 
 use super::SettingsWindow;
-use super::pages::page_title;
+use super::pages::{page_title, plain_row, section};
 use crate::system_check::SystemCheckView;
+
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+const ICONS_CREDIT: &str = "File icons: vscode-icons, CC BY-SA 4.0";
+const ICONS_REPOSITORY: &str = "https://github.com/vscode-icons/vscode-icons";
+const ICONS_LICENSE: &str = "https://creativecommons.org/licenses/by-sa/4.0/";
+
+/// The id, the label, the VoiceOver label and the address of each link of the icon credit.
+const ICON_LINKS: [(&str, &str, &str, &str); 2] = [
+    (
+        "icons-repository",
+        "Repository",
+        "Repository, vscode-icons on GitHub",
+        ICONS_REPOSITORY,
+    ),
+    (
+        "icons-license",
+        "License",
+        "License, CC BY-SA 4.0",
+        ICONS_LICENSE,
+    ),
+];
+
+/// A button that opens `url` in the system browser.
+fn link(
+    id: &'static str,
+    label: &'static str,
+    accessible: &'static str,
+    url: &'static str,
+) -> Button {
+    Button::new(id, label)
+        .variant(ButtonVariant::Ghost)
+        .icon(IconName::ExternalLink)
+        .accessible_label(accessible)
+        .debug_selector(|| id.to_owned())
+        .on_click(move |_, _, cx| cx.open_url(url))
+}
+
+fn about() -> impl IntoElement {
+    let version = PanelRow::new("Version").end_slot(
+        div()
+            .debug_selector(|| "about-version".to_owned())
+            .child(Label::new(APP_VERSION).mono().size(LabelSize::Small)),
+    );
+
+    let icons = plain_row()
+        .child(
+            div()
+                .flex_1()
+                .debug_selector(|| "about-file-icons".to_owned())
+                .child(Label::new(ICONS_CREDIT)),
+        )
+        .children(
+            ICON_LINKS
+                .into_iter()
+                .map(|(id, label, accessible, url)| link(id, label, accessible, url)),
+        );
+
+    section("About", Panel::new().row(version).row(icons))
+}
 
 impl SettingsWindow {
     pub(super) fn general_page(&self, _cx: &Context<Self>) -> AnyElement {
@@ -38,6 +98,7 @@ impl SettingsWindow {
             .gap(px(26.))
             .child(page_title("General"))
             .child(system)
+            .child(about())
             .into_any_element()
     }
 }
@@ -47,10 +108,14 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use gpui::{Modifiers, TestAppContext, VisualTestContext, WindowHandle, px, size};
+    use gpui::{
+        KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, TestAppContext, VisualTestContext,
+        WindowHandle, px, size,
+    };
     use swarm_protocol::{Client, Event, Request, ToolState};
 
     use super::super::{Page, SettingsWindow};
+    use super::{APP_VERSION, ICON_LINKS, ICONS_CREDIT, link};
     use crate::actions::OpenSettings;
     use crate::daemon::tests::{fake_daemon_replying, redraw, setup, wait_until};
     use crate::system_check::Tool;
@@ -172,5 +237,111 @@ mod tests {
             (4, 6),
             "Codex is missing, and macOS has no answer here"
         );
+    }
+
+    fn click_on(selector: &'static str, settings: &mut VisualTestContext) {
+        let center = settings
+            .debug_bounds(selector)
+            .map(|bounds| bounds.center());
+
+        assert!(center.is_some(), "{selector} is not on screen");
+        if let Some(center) = center {
+            settings.simulate_click(center, Modifiers::none());
+        }
+    }
+
+    /// GPUI turns Enter on a focused button into a click when the key goes up.
+    fn press_enter(settings: &mut VisualTestContext) {
+        let keystroke = Keystroke::parse("enter").expect("enter is a key");
+
+        settings.simulate_event(KeyDownEvent {
+            keystroke: keystroke.clone(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        settings.simulate_event(KeyUpEvent { keystroke });
+    }
+
+    #[gpui::test]
+    fn the_about_section_shows_the_version_and_the_icon_credit(cx: &mut TestAppContext) {
+        let (_workspace, main) = setup(cx);
+        main.dispatch_action(OpenSettings);
+        let window = settings_window(main);
+        let mut settings = open_general(window, main);
+        redraw(&mut settings);
+
+        let mut shown = |selector| settings.debug_bounds(selector).is_some();
+
+        assert!(shown("about-version"));
+        assert!(shown("about-file-icons"));
+        assert!(shown("icons-repository"));
+        assert!(shown("icons-license"));
+        assert_eq!(APP_VERSION, env!("CARGO_PKG_VERSION"));
+        assert_eq!(ICONS_CREDIT, "File icons: vscode-icons, CC BY-SA 4.0");
+    }
+
+    #[gpui::test]
+    fn the_about_links_open_the_repository_and_the_license_in_the_browser(cx: &mut TestAppContext) {
+        let (_workspace, main) = setup(cx);
+        main.dispatch_action(OpenSettings);
+        let window = settings_window(main);
+        let mut settings = open_general(window, main);
+        redraw(&mut settings);
+
+        click_on("icons-repository", &mut settings);
+        let repository = settings.opened_url();
+        click_on("icons-license", &mut settings);
+        let license = settings.opened_url();
+
+        assert_eq!(
+            repository.as_deref(),
+            Some("https://github.com/vscode-icons/vscode-icons")
+        );
+        assert_eq!(
+            license.as_deref(),
+            Some("https://creativecommons.org/licenses/by-sa/4.0/")
+        );
+    }
+
+    #[gpui::test]
+    fn the_about_links_can_be_reached_and_pressed_with_the_keyboard(cx: &mut TestAppContext) {
+        let (_workspace, main) = setup(cx);
+        main.dispatch_action(OpenSettings);
+        let window = settings_window(main);
+        let mut settings = open_general(window, main);
+        redraw(&mut settings);
+
+        click_on("icons-repository", &mut settings);
+        settings.simulate_keystrokes("tab");
+        press_enter(&mut settings);
+
+        assert_eq!(
+            settings.opened_url().as_deref(),
+            Some("https://creativecommons.org/licenses/by-sa/4.0/")
+        );
+    }
+
+    #[gpui::test]
+    fn the_about_links_are_labelled_buttons(cx: &mut TestAppContext) {
+        use gpui::accesskit::{Node, Role as AccessRole};
+        use gpui::{Element as _, IntoElement as _, RenderOnce as _};
+
+        let (_workspace, main) = setup(cx);
+
+        for (id, label, accessible, url) in ICON_LINKS {
+            let (role, name) = main.update(|window, cx| {
+                let element = link(id, label, accessible, url)
+                    .render(window, cx)
+                    .into_element();
+                let mut node = Node::new(AccessRole::Unknown);
+                element.write_a11y_info(&mut node);
+
+                (element.a11y_role(), node.label().map(str::to_owned))
+            });
+
+            assert_eq!(role, Some(AccessRole::Button), "{id}");
+            assert_eq!(name.as_deref(), Some(accessible), "{id}");
+            assert!(accessible.starts_with(label), "{id}");
+        }
     }
 }

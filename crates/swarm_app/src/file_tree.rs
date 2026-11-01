@@ -8,6 +8,7 @@ use std::path::{Component, Path};
 
 use gpui::SharedString;
 use swarm_protocol::FileDiff;
+use swarm_ui::file_icons::FileIconName;
 
 use crate::review_model::{AgentLabel, FileKey};
 
@@ -40,6 +41,17 @@ pub(crate) struct Entry {
     pub position_in_set: usize,
     /// How many rows have the same parent.
     pub size_of_set: usize,
+}
+
+impl Entry {
+    /// The icon of the row: a folder icon from the last folder of its name, open or closed,
+    /// or a file icon from the file name.
+    pub(crate) fn file_icon(&self) -> FileIconName {
+        match self.kind {
+            EntryKind::Folder { open } => FileIconName::for_folder(&self.name, open),
+            EntryKind::File { .. } => FileIconName::for_file(&self.name),
+        }
+    }
 }
 
 /// What the cursor of a tree stands on. It names a row by its content, so it survives a
@@ -707,5 +719,52 @@ mod tests {
 
         let (_, collapsed) = arrows(&files, &["a"]);
         assert_eq!(collapsed(0, Key::Left), Move::Stay);
+    }
+
+    #[test]
+    fn folders_get_a_folder_icon_by_their_last_name_and_state() {
+        let files = [
+            file("/w", "crates/swarm_term/src/grid.rs", None),
+            file("/w", "docs/PLAN.md", None),
+            file("/w", "tests/a.rs", None),
+        ];
+
+        let open = tree(&files, &[]);
+        let closed = tree(&files, &["crates/swarm_term/src", "docs"]);
+
+        assert_eq!(outline(&open)[0], "0 crates/swarm_term/src/");
+        assert_eq!(open[0].file_icon(), FileIconName::FolderSrcOpen);
+        assert_eq!(open[2].file_icon(), FileIconName::FolderDocsOpen);
+        assert_eq!(open[4].file_icon(), FileIconName::FolderTestOpen);
+        assert_eq!(closed[0].file_icon(), FileIconName::FolderSrc);
+        assert_eq!(closed[1].file_icon(), FileIconName::FolderDocs);
+        assert_eq!(closed[2].file_icon(), FileIconName::FolderTestOpen);
+    }
+
+    #[test]
+    fn files_get_a_file_icon_by_their_name() {
+        let files = [
+            file("/w", "Cargo.toml", None),
+            file("/w", "README.md", None),
+            file("/w", "src/main.rs", None),
+            file("/w", "Cargo.lock", None),
+        ];
+
+        let entries = tree(&files, &[]);
+        let icons: Vec<_> = entries
+            .iter()
+            .map(|entry| (&*entry.name, entry.file_icon()))
+            .collect();
+
+        assert_eq!(
+            icons,
+            [
+                ("src", FileIconName::FolderSrcOpen),
+                ("main.rs", FileIconName::File),
+                ("Cargo.lock", FileIconName::File),
+                ("Cargo.toml", FileIconName::Toml),
+                ("README.md", FileIconName::Readme),
+            ]
+        );
     }
 }

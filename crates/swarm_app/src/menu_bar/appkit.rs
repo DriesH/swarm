@@ -17,6 +17,7 @@ use objc2_app_kit::{
 use objc2_foundation::{NSData, NSRect, NSSize, NSString};
 
 use super::place::{Anchor, Frame, Screen};
+use super::summary::BeeFrame;
 use super::{Look, StatusItem, icon};
 
 define_class!(
@@ -49,11 +50,40 @@ impl ClickTarget {
 
 struct AppKitStatusItem {
     item: Retained<NSStatusItem>,
-    plain: Retained<NSImage>,
-    with_dot: Retained<NSImage>,
+    /// The template images: with and without the dot, in both wing frames.
+    images: Images,
     /// The button's target is weak, so it is kept alive here.
     _target: Retained<ClickTarget>,
     mtm: MainThreadMarker,
+}
+
+struct Images {
+    plain: Retained<NSImage>,
+    with_dot: Retained<NSImage>,
+    flat: Retained<NSImage>,
+    flat_with_dot: Retained<NSImage>,
+}
+
+impl Images {
+    fn new() -> Result<Self> {
+        let image = |with_dot, frame| template_image(&icon::bee_png(with_dot, frame)?);
+
+        Ok(Self {
+            plain: image(false, BeeFrame::Open)?,
+            with_dot: image(true, BeeFrame::Open)?,
+            flat: image(false, BeeFrame::Flat)?,
+            flat_with_dot: image(true, BeeFrame::Flat)?,
+        })
+    }
+
+    fn of(&self, look: &Look) -> &Retained<NSImage> {
+        match (look.dot, look.frame) {
+            (false, BeeFrame::Open) => &self.plain,
+            (true, BeeFrame::Open) => &self.with_dot,
+            (false, BeeFrame::Flat) => &self.flat,
+            (true, BeeFrame::Flat) => &self.flat_with_dot,
+        }
+    }
 }
 
 /// Puts the bee in the menu bar. `None` when `AppKit` refuses; the app then runs without it.
@@ -72,12 +102,11 @@ pub(super) fn create(clicks: flume::Sender<()>) -> Option<Rc<dyn StatusItem>> {
 impl AppKitStatusItem {
     fn new(mtm: MainThreadMarker, clicks: flume::Sender<()>) -> Result<Self> {
         let item = NSStatusBar::systemStatusBar().statusItemWithLength(NSVariableStatusItemLength);
-        let plain = template_image(&icon::bee_png(false)?)?;
-        let with_dot = template_image(&icon::bee_png(true)?)?;
+        let images = Images::new()?;
         let target = ClickTarget::new(mtm, clicks);
 
         let button = item.button(mtm).context("the status item has no button")?;
-        button.setImage(Some(&plain));
+        button.setImage(Some(&images.plain));
         button.setImagePosition(NSCellImagePosition::ImageLeft);
         button.setAccessibilityLabel(Some(&NSString::from_str("Swarm")));
 
@@ -89,8 +118,7 @@ impl AppKitStatusItem {
 
         Ok(Self {
             item,
-            plain,
-            with_dot,
+            images,
             _target: target,
             mtm,
         })
@@ -106,11 +134,7 @@ impl StatusItem for AppKitStatusItem {
         button.setTitle(&NSString::from_str(
             look.title.as_deref().unwrap_or_default(),
         ));
-        button.setImage(Some(if look.dot {
-            &self.with_dot
-        } else {
-            &self.plain
-        }));
+        button.setImage(Some(self.images.of(look)));
         button.setAccessibilityLabel(Some(&NSString::from_str(&look.label)));
     }
 

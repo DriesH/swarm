@@ -1278,7 +1278,21 @@ fn graph(workspace: &Workspace, data: &SwarmData, cx: &mut Context<Workspace>) -
         .min_h_0()
         .bg(colors.term)
         .overflow_hidden()
-        .child(workspace.dot_grid.clone().cached(full_size().absolute()))
+        .child(if crate::settings::swarm_view_honeycomb(cx) {
+            div()
+                .debug_selector(|| "swarm-honeycomb".to_owned())
+                .absolute()
+                .size_full()
+                .child(workspace.honeycomb.clone().cached(full_size()))
+                .into_any_element()
+        } else {
+            div()
+                .debug_selector(|| "swarm-dots".to_owned())
+                .absolute()
+                .size_full()
+                .child(workspace.dot_grid.clone().cached(full_size()))
+                .into_any_element()
+        })
         .child(
             div()
                 .id("graph-scroll")
@@ -1891,9 +1905,9 @@ fn file_row(
                     workspace.view_file_diff(agent, path.clone(), cx);
                 }))
                 .child(
-                    Icon::new(IconName::File)
-                        .size(IconSize::Custom(px(14.)))
-                        .color(Color::Faint),
+                    FileIcon::file(&name)
+                        .size(IconSize::Large)
+                        .debug_selector(|| format!("changed-file-icon-{index}")),
                 )
                 .child(Label::new(name).weight(FontWeight::MEDIUM))
                 .child(
@@ -3605,6 +3619,26 @@ mod tests {
         assert_eq!(view, View::Review);
         assert_eq!(agent, Some(pty_io));
         assert_eq!(file, Some(PathBuf::from("crates/swarm-term/src/pty.rs")));
+    }
+
+    #[gpui::test]
+    fn the_inspector_changes_tab_shows_a_file_icon_on_each_file(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        show_agent(&workspace, "pty-io", cx);
+        click("inspector-tab-1", cx);
+
+        let row = cx.debug_bounds("changed-file-0");
+        let icon = cx.debug_bounds("changed-file-icon-0");
+
+        assert!(row.is_some(), "the file row is not on screen");
+        assert_eq!(
+            icon.map(|icon| icon.size),
+            Some(gpui::size(px(16.), px(16.)))
+        );
+        assert_eq!(
+            icon.map(|icon| icon.center().y),
+            row.map(|row| row.center().y)
+        );
     }
 
     #[gpui::test]

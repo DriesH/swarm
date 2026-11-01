@@ -41,6 +41,7 @@ pub(crate) enum Command {
     CommentOnLine,
     CloseTask,
     CreatePullRequest,
+    Buzz,
     Task(TaskId),
     Agent(TerminalId),
 }
@@ -88,6 +89,8 @@ pub(crate) struct Row {
     detail: Detail,
     keys: Vec<&'static str>,
     command: Command,
+    /// Shows only when the query is the row's whole label.
+    secret: bool,
 }
 
 impl Row {
@@ -99,7 +102,13 @@ impl Row {
             detail: Detail::None,
             keys: Vec::new(),
             command,
+            secret: false,
         }
+    }
+
+    fn secret(mut self) -> Self {
+        self.secret = true;
+        self
     }
 
     #[cfg(test)]
@@ -286,13 +295,22 @@ pub(crate) fn rows(data: &FakeData, project: ProjectId, task: TaskId, view: View
     rows
 }
 
-/// Indexes of the rows whose label contains `query`, ignoring case.
+/// Indexes of the rows whose label contains `query`, ignoring case. A secret row shows only
+/// when the query is its whole label.
 fn filter(rows: &[Row], query: &str) -> Vec<usize> {
     let query = query.trim().to_lowercase();
 
     rows.iter()
         .enumerate()
-        .filter(|(_, row)| row.label.to_lowercase().contains(&query))
+        .filter(|(_, row)| {
+            let label = row.label.to_lowercase();
+
+            if row.secret {
+                label == query
+            } else {
+                label.contains(&query)
+            }
+        })
         .map(|(index, _)| index)
         .collect()
 }
@@ -343,7 +361,7 @@ impl Palette {
         });
 
         Self {
-            visible: (0..rows.len()).collect(),
+            visible: filter(&rows, ""),
             rows,
             highlighted: 0,
             input,
@@ -664,7 +682,11 @@ impl Workspace {
             return;
         }
 
-        let rows = rows(&self.data, self.active_project, self.active_task, self.view);
+        let mut rows = rows(&self.data, self.active_project, self.active_task, self.view);
+        if crate::settings::easter_eggs(cx) {
+            rows.push(Row::new(Group::Swarm, IconName::Bee, "Buzz", Command::Buzz).secret());
+        }
+
         let view = cx.new(|cx| Palette::new(rows, window, cx));
         let subscription =
             cx.subscribe_in(&view, window, |this, _, event, window, cx| match event {
@@ -708,6 +730,7 @@ impl Workspace {
             Command::CommentOnLine => self.review.update(cx, ReviewView::comment_on_line),
             Command::CloseTask => self.open_close_task(self.active_task, window, cx),
             Command::CreatePullRequest => window.dispatch_action(Box::new(CreatePullRequest), cx),
+            Command::Buzz => self.start_buzz(cx),
         }
     }
 }
@@ -860,6 +883,76 @@ mod tests {
             palette_labels(&workspace, cx),
             Some(vec!["Review changes".to_owned()])
         );
+    }
+
+    fn flight_is_up(workspace: &Entity<Workspace>, cx: &VisualTestContext) -> bool {
+        workspace.read_with(cx, |workspace, _| workspace.eggs.flight.is_some())
+    }
+
+    #[gpui::test]
+    fn typing_buzz_offers_the_buzz_item_and_nothing_else_does(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+
+        cx.simulate_keystrokes("cmd-k");
+        let at_first = palette_labels(&workspace, cx).unwrap_or_default();
+        cx.simulate_input("buz");
+        let partial = palette_labels(&workspace, cx).unwrap_or_default();
+        cx.simulate_input("z");
+        let typed = palette_labels(&workspace, cx);
+
+        assert!(!at_first.iter().any(|label| label == "Buzz"));
+        assert!(partial.is_empty());
+        assert_eq!(typed, Some(vec!["Buzz".to_owned()]));
+    }
+
+    #[gpui::test]
+    fn running_buzz_sends_the_bees_across_once_and_they_go_away(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        assert!(!flight_is_up(&workspace, cx));
+
+        cx.simulate_keystrokes("cmd-k");
+        cx.simulate_input("buzz");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        assert!(
+            palette_labels(&workspace, cx).is_none(),
+            "the palette closes"
+        );
+        assert!(flight_is_up(&workspace, cx));
+
+        cx.executor().advance_clock(swarm_ui::FLIGHT_DURATION / 2);
+        cx.run_until_parked();
+        assert!(flight_is_up(&workspace, cx), "still in the air");
+
+        cx.executor().advance_clock(swarm_ui::FLIGHT_DURATION);
+        cx.run_until_parked();
+        assert!(!flight_is_up(&workspace, cx), "the bees are gone");
+    }
+
+    #[gpui::test]
+    fn buzz_is_not_offered_with_the_easter_eggs_off(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        cx.update(|_, cx| crate::settings::change_appearance(|a| a.easter_eggs = false, cx));
+
+        cx.simulate_keystrokes("cmd-k");
+        cx.simulate_input("buzz");
+
+        assert_eq!(palette_labels(&workspace, cx), Some(Vec::new()));
+        assert!(!flight_is_up(&workspace, cx));
+    }
+
+    #[gpui::test]
+    fn no_bee_flies_under_reduce_motion(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        cx.update(|_, cx| cx.set_reduce_motion(true));
+
+        cx.simulate_keystrokes("cmd-k");
+        cx.simulate_input("buzz");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        assert!(!flight_is_up(&workspace, cx));
     }
 
     #[gpui::test]

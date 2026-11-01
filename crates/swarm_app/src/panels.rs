@@ -325,6 +325,7 @@ impl ChangesList {
                 .level(entry.level)
                 .position_in_set(entry.position_in_set, entry.size_of_set)
                 .folder(open)
+                .file_icon(entry.file_icon())
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                     this.focus_handle.focus(window, cx);
                     this.set_folder_open(index, !open, cx);
@@ -355,6 +356,7 @@ impl ChangesList {
                 TreeRow::new(("change", index), entry.name.clone())
                     .debug_selector(|| format!("change-file-{file}"))
                     .accessible_label(summary)
+                    .file_icon(entry.file_icon())
                     .level(entry.level)
                     .position_in_set(entry.position_in_set, entry.size_of_set)
                     .end_slot(end)
@@ -522,7 +524,15 @@ fn files(workspace: &Workspace, window: &mut Window, cx: &mut Context<Workspace>
             }
         };
 
+        let file_icon = if is_dir {
+            FileIconName::for_folder(&name, entry.expanded)
+        } else {
+            FileIconName::for_file(&name)
+        };
+
         let row = TreeRow::new(("file", index), name)
+            .debug_selector(|| format!("files-row-{index}"))
+            .file_icon(file_icon)
             .level(usize::from(entry.depth))
             .label_color(name_color)
             .toggle_state(is_selected)

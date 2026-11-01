@@ -3,6 +3,7 @@
 mod actions;
 mod close_task;
 mod daemon;
+mod eggs;
 mod file_tree;
 mod lifecycle;
 mod markdown;

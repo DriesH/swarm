@@ -339,6 +339,8 @@ impl Workspace {
         window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
+        self.show_honey_toast(notice, cx);
+
         if !cx.has_global::<Notifier>() {
             return;
         }
@@ -431,7 +433,7 @@ impl Workspace {
 
     /// Opens what a notification is about: Review for "ready for review", else the
     /// terminals with the agent that sent it focused.
-    fn open_notice(&mut self, notice: &Notice, cx: &mut Context<Self>) {
+    pub(crate) fn open_notice(&mut self, notice: &Notice, cx: &mut Context<Self>) {
         let project = self.data.project_with_daemon_id(notice.project);
         let task = match notice.task {
             Some(task) => self.data.task_with_daemon_id(task),
