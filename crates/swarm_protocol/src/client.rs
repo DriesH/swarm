@@ -18,9 +18,9 @@ use swarm_term::{TerminalChannels, TerminalInput, TerminalOutput};
 use crate::{
     AgentChange, AgentId, AgentInfo, AgentKind, CallId, ChecksRun, CloseCheck, CommentId,
     CreateTask, CreateTerminal, Event, FileDiff, FrameError, GH_SECS, GithubStatus, MergeMethod,
-    MessageId, MessageInfo, NewComment, PUSH_SECS, Paths, PrDraft, PrPanel, ProjectId, ProjectInfo,
-    PullRequest, Request, ReviewComment, ReviewSource, TaskDiff, TaskId, TaskInfo, TerminalId,
-    TerminalInfo, Usage, VERSION, check_private_dir, read, write,
+    MessageId, MessageInfo, NewComment, Notice, PUSH_SECS, Paths, PrDraft, PrPanel, ProjectId,
+    ProjectInfo, PullRequest, Request, ReviewComment, ReviewSource, TaskDiff, TaskId, TaskInfo,
+    TerminalId, TerminalInfo, Usage, VERSION, check_private_dir, read, write,
 };
 
 /// Local checks moved on, or the orchestrator sent a pull request draft.
@@ -127,6 +127,7 @@ struct Shared {
     comments: flume::Sender<CommentEvent>,
     pull_requests: flume::Sender<PrEvent>,
     usage: flume::Sender<Usage>,
+    notices: flume::Sender<Notice>,
 }
 
 impl Shared {
@@ -175,6 +176,7 @@ struct Inner {
     comment_events: flume::Receiver<CommentEvent>,
     pr_events: flume::Receiver<PrEvent>,
     usage_events: flume::Receiver<Usage>,
+    notices: flume::Receiver<Notice>,
 }
 
 impl Drop for Inner {
@@ -269,6 +271,7 @@ impl Client {
         let (comment_sender, comment_receiver) = flume::unbounded();
         let (pr_sender, pr_receiver) = flume::unbounded();
         let (usage_sender, usage_receiver) = flume::unbounded();
+        let (notice_sender, notice_receiver) = flume::unbounded();
         let shared = Arc::new(Shared {
             routes: Mutex::new(HashMap::new()),
             waiters: Mutex::new(HashMap::new()),
@@ -283,6 +286,7 @@ impl Client {
             comments: comment_sender,
             pull_requests: pr_sender,
             usage: usage_sender,
+            notices: notice_sender,
         });
         let (request_sender, request_receiver) = flume::unbounded();
 
@@ -320,6 +324,7 @@ impl Client {
                 comment_events: comment_receiver,
                 pr_events: pr_receiver,
                 usage_events: usage_receiver,
+                notices: notice_receiver,
             }),
             reply_timeout: REPLY_TIMEOUT,
         })
@@ -360,6 +365,11 @@ impl Client {
     /// Every `UsageChanged` the daemon sends. Use one consumer.
     pub fn usage_events(&self) -> flume::Receiver<Usage> {
         self.inner.usage_events.clone()
+    }
+
+    /// Every `Notice` the daemon sends. Use one consumer.
+    pub fn notices(&self) -> flume::Receiver<Notice> {
+        self.inner.notices.clone()
     }
 
     /// The last known subscription usage; changes arrive through
@@ -1122,6 +1132,11 @@ fn read_events(
             Event::UsageChanged { usage } => {
                 if shared.usage.send(usage).is_err() {
                     log::debug!("usage event has no listener");
+                }
+            }
+            Event::Notice { notice } => {
+                if shared.notices.send(notice).is_err() {
+                    log::debug!("notice has no listener");
                 }
             }
         }

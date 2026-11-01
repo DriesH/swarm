@@ -248,6 +248,10 @@ Native macOS notifications through GPUI's `show_system_notification`. Only the o
 - Settings: each trigger on or off, per-project overrides, sound.
 - Needs a real `.app` bundle: GPUI disables notifications under `cargo run`.
 - No inline reply in v1: GPUI supports action buttons, not text input.
+- The daemon decides when: it broadcasts a notice (kind, task, agent, short text). The app decides whether and how: settings, the focused task, sound, Dock bounce. So the menu bar and a closed window get the same notices.
+- Prompt notices come from any agent of the task. Ready for review fires once when the orchestrator turns idle while the task has workers and none of them works, is blocked or is starting; it fires again only after a worker worked again. Something broke is a `StopFailure` hook or an agent process that ends with an error, never a stop the user or `swarm exit` asked for.
+- Settings live in `settings.toml` under `[notifications]`: each trigger, sound, Dock bounce for urgent ones (needs a decision, prompt), mute while viewing the task, the menu bar dot, and per project **All**, **Errors only** (something broke) or **Off**.
+- **Send test notification** posts one right away. The permission row reads the real authorization and offers **Open System Settings** when it is denied.
 
 ### System check
 
