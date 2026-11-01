@@ -155,9 +155,16 @@ fn claude(spec: &LaunchSpec<'_>) -> Launch {
         .iter()
         .map(|event| ((*event).to_owned(), handler.clone()))
         .collect();
+    // The status line runs through a shell, so the path is quoted as Codex hooks are.
+    let status_line = json!({
+        "type": "command",
+        "command": format!("{} statusline", shell_quote(&text(spec.swarm))),
+        "padding": 0,
+    });
     let mut settings = json!({
         "hooks": hooks,
         "permissions": { "allow": claude_allowed() },
+        "statusLine": status_line,
     });
     if spec.skip_permissions {
         // Else Claude Code asks once before it enters bypass mode.
@@ -493,6 +500,47 @@ mod tests {
         assert_eq!(
             settings["hooks"].as_object().map(serde_json::Map::len),
             Some(CLAUDE_EVENTS.len())
+        );
+    }
+
+    #[test]
+    fn claude_settings_send_the_status_line_through_swarm() {
+        let launch = build(&spec(AgentKind::ClaudeCode));
+
+        let settings: serde_json::Value =
+            serde_json::from_str(&launch.files[0].contents).expect("json");
+
+        assert_eq!(
+            settings["statusLine"],
+            json!({"type": "command", "command": "'/bin/swarm' statusline", "padding": 0})
+        );
+    }
+
+    #[test]
+    fn a_swarm_path_with_a_quote_is_shell_quoted_in_the_status_line() {
+        let mut quoted = spec(AgentKind::ClaudeCode);
+        quoted.swarm = Path::new("/it's/swarm");
+
+        let launch = build(&quoted);
+
+        let settings: serde_json::Value =
+            serde_json::from_str(&launch.files[0].contents).expect("json");
+        assert_eq!(
+            settings["statusLine"]["command"],
+            "'/it'\\''s/swarm' statusline"
+        );
+    }
+
+    #[test]
+    fn codex_gets_no_status_line() {
+        let launch = build(&spec(AgentKind::Codex));
+
+        assert!(launch.files.is_empty());
+        assert!(
+            !launch
+                .argv
+                .iter()
+                .any(|argument| argument.contains("statusline"))
         );
     }
 

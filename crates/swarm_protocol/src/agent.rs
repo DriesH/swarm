@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::{
     AgentId, AgentKind, AgentLifecycle, AgentRole, GridSize, MessageId, MessageKind, TaskId,
-    TerminalId,
+    TerminalId, UsageWindow,
 };
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -76,6 +76,8 @@ pub enum Call {
     /// asked for. Refused unless the user approved the task as it is now. The app shows
     /// the draft in its pull request panel. Returns nothing.
     PrDraft { title: String, body: String },
+    /// Claude Code agent: the rate limits from its status line input. Returns nothing.
+    RateLimits { windows: Vec<UsageWindow> },
 
     /// Start orchestrator: makes a task (branch, task worktree, tab, setup) and starts
     /// its orchestrator with `brief` as the first message. Returns [`TaskSummary`].

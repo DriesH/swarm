@@ -17,7 +17,8 @@ use swarm_protocol::{
     AgentChange, AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, CallId,
     CloseCheck, CommentId, CommentState, CreateTask, CreateTerminal, DiffStat, Event, FileDiff,
     FileStat, Fold, MessageInfo, MessageKind, ProjectId, ProjectInfo, Request, ReviewSource,
-    TaskDiff, TaskId, TaskInfo, TerminalId, TerminalInfo, TerminalKind, VERSION, read, write,
+    TaskDiff, TaskId, TaskInfo, TerminalId, TerminalInfo, TerminalKind, Usage, UsageProblem,
+    VERSION, read, write,
 };
 use swarm_term::{
     BlockedKind, ExitStatus, Palette, ProgramState, Rgb, Row, Size, TerminalInput, TerminalOutput,
@@ -48,7 +49,17 @@ impl Daemon {
         Self::spawn_with(home, None, None)
     }
 
+    /// The usage poller is off: it would run the real `codex`, `security` and `curl`.
     fn spawn_with(home: PathBuf, settings: Option<&Path>, gh: Option<&Path>) -> Self {
+        Self::spawn_usage(home, settings, gh, &["--no-usage-polling".into()])
+    }
+
+    fn spawn_usage(
+        home: PathBuf,
+        settings: Option<&Path>,
+        gh: Option<&Path>,
+        usage: &[std::ffi::OsString],
+    ) -> Self {
         std::fs::create_dir_all(&home).expect("home");
         let log = std::fs::File::options()
             .create(true)
@@ -64,6 +75,7 @@ impl Daemon {
         if let Some(gh) = gh {
             command.arg("--gh").arg(gh);
         }
+        command.args(usage);
 
         let child = command
             .env("RUST_LOG", "info")
@@ -103,6 +115,14 @@ impl Daemon {
         daemon
     }
 
+    /// A daemon whose usage poller runs the given fake commands.
+    fn start_with_usage(usage: &[std::ffi::OsString]) -> Self {
+        let daemon = Self::spawn_usage(Self::new_home(), None, None, usage);
+        daemon.wait_until_listening();
+
+        daemon
+    }
+
     /// A daemon that uses `gh` as it is, wherever it is.
     fn start_with_gh(gh: &Path) -> Self {
         let daemon = Self::spawn_with(Self::new_home(), None, Some(gh));
@@ -125,6 +145,7 @@ impl Daemon {
             .arg(&home)
             .arg("--gh")
             .arg(gh)
+            .arg("--no-usage-polling")
             .env("RUST_LOG", "info")
             .env(name, value)
             .stdin(Stdio::null())
@@ -604,6 +625,23 @@ fn a_client_inside_a_terminal_is_refused() {
     client.wait_for_matching_row(|row| row.ends_with("peer refused"));
 }
 
+/// A script that starts the real daemon with its usage poller off, for tests where the
+/// client starts the daemon: the poller would run the real `codex`, `security` and `curl`.
+fn daemon_without_usage_polling(home: &Path) -> PathBuf {
+    let script = home.join("daemon-no-usage.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nexec '{}' \"$@\" --no-usage-polling\n",
+            env!("CARGO_BIN_EXE_swarm-daemon")
+        ),
+    )
+    .expect("script");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("mode");
+
+    script
+}
+
 #[test]
 fn a_daemon_started_by_the_client_stops_on_sigterm() {
     let home = Daemon::new_home();
@@ -613,7 +651,7 @@ fn a_daemon_started_by_the_client_stops_on_sigterm() {
         .expect("home");
 
     let paths = swarm_protocol::Paths::in_dir(home.clone());
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_swarm-daemon"));
+    let binary = daemon_without_usage_polling(&home);
     let client = swarm_protocol::Client::connect_or_spawn(&paths, &binary).expect("connect");
     let pid = i32::try_from(client.daemon_pid()).expect("pid");
     drop(client);
@@ -943,7 +981,7 @@ fn a_daemon_started_from_a_thread_that_blocks_signals_stops_on_sigterm() {
         .expect("home");
 
     let paths = swarm_protocol::Paths::in_dir(home.clone());
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_swarm-daemon"));
+    let binary = daemon_without_usage_polling(&home);
 
     // GPUI runs background work on GCD threads, which block every signal.
     let pid = thread::spawn(move || {
@@ -7268,4 +7306,414 @@ fn agents_get_swarms_bin_folder_and_the_folder_of_gh_on_their_path() {
         Path::new(env!("CARGO_BIN_EXE_swarm-daemon")).with_file_name(""),
         "the swarm binary comes first"
     );
+}
+
+// Subscription usage.
+
+impl Client {
+    fn usage(&mut self) -> Usage {
+        self.send(&Request::Usage { call: CALL });
+
+        self.wait_for(|event| match event {
+            Event::Usage { call: CALL, usage } => Some(usage.clone()),
+            _ => None,
+        })
+    }
+
+    /// Reads events until a `UsageChanged` satisfies `pick`.
+    fn wait_for_usage(&mut self, pick: impl Fn(&Usage) -> bool) -> Usage {
+        self.wait_for(|event| match event {
+            Event::UsageChanged { usage } if pick(usage) => Some(usage.clone()),
+            _ => None,
+        })
+    }
+}
+
+/// Fake `codex`, `security`, `curl` and `claude` for the usage poller. Each script
+/// counts its starts in `<name>-calls`. Nothing here reaches the real programs.
+struct UsageFakes {
+    dir: PathBuf,
+}
+
+const CODEX_ANSWER: &str = r#"{"id":2,"result":{"rateLimits":{"planType":"plus","primary":{"usedPercent":12,"windowDurationMins":300,"resetsAt":1793383200},"secondary":{"usedPercent":40,"windowDurationMins":10080,"resetsAt":1793900000}}}}"#;
+
+const CLAUDE_TOKEN: &str = "sk-ant-oat01-daemon-test-secret";
+
+impl UsageFakes {
+    fn new() -> Self {
+        let number = NEXT_HOME.fetch_add(1, Ordering::Relaxed);
+        let dir = PathBuf::from(format!("/tmp/swd-us-{}-{number}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("fake folder");
+        let fakes = Self { dir };
+
+        fakes.write("answer", &format!("{CODEX_ANSWER}\n"));
+        fakes.script(
+            "codex",
+            r#"[ "$1" = app-server ] || exit 2
+while IFS= read -r line; do
+  case "$line" in *account/rateLimits/read*) cat "$DIR/answer";; esac
+done"#,
+        );
+        fakes.script(
+            "security",
+            r#"cat "$DIR/credentials" 2>/dev/null
+exit "$(cat "$DIR/security-exit" 2>/dev/null || echo 44)""#,
+        );
+        fakes.script(
+            "curl",
+            r#"echo "$@" > "$DIR/curl-args"
+cat > "$DIR/curl-config"
+cat "$DIR/response""#,
+        );
+        fakes.script("claude", "exit 0");
+
+        fakes
+    }
+
+    /// The Keychain holds a token and the endpoint answers with a 5-hour window.
+    fn log_in_to_claude(&self) {
+        let far = 4_000_000_000_u64 * 1000;
+        self.write(
+            "credentials",
+            &format!(
+                r#"{{"claudeAiOauth":{{"accessToken":"{CLAUDE_TOKEN}","expiresAt":{far}.0,"subscriptionType":"max"}}}}"#
+            ),
+        );
+        self.write("security-exit", "0");
+        self.write(
+            "response",
+            "HTTP/2 200 \r\n\r\n{\"five_hour\":{\"utilization\":42,\"resets_at\":\"2026-10-30T18:00:00Z\"}}",
+        );
+    }
+
+    fn write(&self, name: &str, text: &str) {
+        std::fs::write(self.dir.join(name), text).expect("file");
+    }
+
+    fn read(&self, name: &str) -> String {
+        std::fs::read_to_string(self.dir.join(name)).unwrap_or_default()
+    }
+
+    fn script(&self, name: &str, body: &str) {
+        let path = self.dir.join(name);
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nDIR='{}'\necho started >> \"$DIR/{name}-calls\"\n{body}\n",
+                self.dir.display()
+            ),
+        )
+        .expect("script");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("mode");
+    }
+
+    fn calls(&self, name: &str) -> usize {
+        self.read(&format!("{name}-calls")).lines().count()
+    }
+
+    /// Waits until the script was started `count` times.
+    fn wait_for_calls(&self, name: &str, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while self.calls(name) < count {
+            assert!(
+                Instant::now() < deadline,
+                "{name} started {} times, not {count}",
+                self.calls(name)
+            );
+            thread::park_timeout(Duration::from_millis(20));
+        }
+    }
+
+    /// The daemon arguments that point the poller at these fakes.
+    fn args(&self, tick_ms: u64, codex_interval_ms: u64) -> Vec<std::ffi::OsString> {
+        let program = |name: &str| self.dir.join(name).into_os_string();
+
+        vec![
+            "--usage-codex".into(),
+            program("codex"),
+            "--usage-security".into(),
+            program("security"),
+            "--usage-curl".into(),
+            program("curl"),
+            "--usage-claude".into(),
+            program("claude"),
+            "--usage-tick-ms".into(),
+            tick_ms.to_string().into(),
+            "--usage-codex-interval-ms".into(),
+            codex_interval_ms.to_string().into(),
+        ]
+    }
+}
+
+impl Drop for UsageFakes {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.dir).ok();
+    }
+}
+
+fn claude_windows(usage: &Usage) -> Vec<(&str, u8)> {
+    usage
+        .claude
+        .windows
+        .iter()
+        .map(|window| (window.label.as_str(), window.used_percent))
+        .collect()
+}
+
+/// A fake Claude agent that sends one status line input through the real `swarm
+/// statusline`, with a user status line of its own in a fake config folder.
+const STATUS_LINE_AGENT: &str = r#"mkdir -p "$OUT/config"
+echo '{"statusLine":{"type":"command","command":"echo user-line"}}' > "$OUT/config/settings.json"
+export CLAUDE_CONFIG_DIR="$OUT/config"
+printf '%s' '{"rate_limits":{"five_hour":{"used_percentage":23.5,"resets_at":1793383200},"seven_day":{"used_percentage":41.2,"resets_at":1793900000}}}' | "$SWARM" statusline > "$OUT/statusline-out"
+echo "$SWARM_TOKEN" > "$OUT/token"
+sleep 30"#;
+
+#[test]
+fn a_new_daemon_has_no_usage() {
+    let daemon = Daemon::start();
+    let mut client = daemon.connect();
+    client.hello();
+
+    assert_eq!(client.usage(), Usage::default());
+}
+
+#[test]
+fn usage_is_answered_from_the_saved_state_after_a_restart() {
+    let fakes = UsageFakes::new();
+    let mut daemon = Daemon::start_with_usage(&fakes.args(50, 3_600_000));
+    let mut client = daemon.connect();
+    client.hello();
+    let before = client.wait_for_usage(|usage| {
+        !usage.codex.windows.is_empty() && usage.claude.problem == Some(UsageProblem::NotLoggedIn)
+    });
+    drop(client);
+
+    daemon.crash();
+    let restarted = Daemon::start_in(daemon.home.clone());
+    let mut client = restarted.connect();
+    client.hello();
+
+    assert_eq!(client.usage(), before);
+    assert_eq!(before.codex.plan.as_deref(), Some("plus"));
+    let mode = std::fs::metadata(daemon.home.join("usage.json"))
+        .expect("usage file")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+}
+
+#[test]
+fn a_claude_agents_status_line_reaches_every_client() {
+    let fixture = Fixture::new(STATUS_LINE_AGENT);
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut watcher = daemon.connect();
+    watcher.hello();
+    let (mut client, _task) = start_task_of(&daemon, &repo, AgentKind::ClaudeCode);
+
+    let seen_by_watcher = watcher.wait_for_usage(|usage| !usage.claude.windows.is_empty());
+    let seen_by_client = client.wait_for_usage(|usage| !usage.claude.windows.is_empty());
+
+    assert_eq!(claude_windows(&seen_by_watcher), [("5h", 24), ("7d", 41)]);
+    assert_eq!(seen_by_watcher, seen_by_client);
+    assert_eq!(
+        seen_by_watcher.claude.windows[0].resets_at,
+        Some(1_793_383_200)
+    );
+    assert!(seen_by_watcher.claude.read_at.is_some());
+    assert_eq!(client.usage(), seen_by_watcher);
+    assert_eq!(
+        fixture.read_when_written("statusline-out"),
+        "user-line\n",
+        "the user's own status line still prints"
+    );
+}
+
+#[test]
+fn only_a_claude_agent_may_send_rate_limits() {
+    let fixture = Fixture::new(r#"echo "$SWARM_TOKEN" > "$OUT/token"; sleep 30"#);
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, task) = start_task_of(&daemon, &repo, AgentKind::Codex);
+    let AgentId(codex) = task.agents[0].id;
+    let token = fixture.read_when_written("token");
+    let windows = |percent: u8| {
+        format!(r#"{{"windows":[{{"label":"5h","used_percent":{percent},"resets_at":null}}]}}"#)
+    };
+
+    let refused = agent_request(
+        &daemon,
+        format!(
+            r#"{{"method":"rate_limits","agent":{codex},"token":"{}","params":{}}}"#,
+            token.trim(),
+            windows(99)
+        )
+        .as_bytes(),
+    );
+
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert_eq!(client.usage(), Usage::default());
+}
+
+#[test]
+fn the_poller_reads_codex_only_while_an_app_is_connected() {
+    let fakes = UsageFakes::new();
+    let daemon = Daemon::start_with_usage(&fakes.args(50, 3_600_000));
+
+    thread::park_timeout(Duration::from_millis(700));
+    assert_eq!(fakes.calls("codex"), 0, "nobody is connected");
+    assert_eq!(fakes.calls("security"), 0, "nobody is connected");
+
+    let mut first = daemon.connect();
+    first.hello();
+    let usage = first.wait_for_usage(|usage| !usage.codex.windows.is_empty());
+    assert_eq!(
+        fakes.calls("codex"),
+        1,
+        "the first app starts a read at once"
+    );
+    assert_eq!(usage.codex.plan.as_deref(), Some("plus"));
+    assert_eq!(usage.codex.windows.len(), 2);
+    assert_eq!(usage.codex.windows[0].label, "5h");
+    assert_eq!(usage.codex.windows[0].used_percent, 12);
+    assert_eq!(usage.codex.windows[1].label, "7d");
+    assert_eq!(usage.codex.problem, None);
+
+    let mut second = daemon.connect();
+    second.hello();
+    thread::park_timeout(Duration::from_millis(700));
+    assert_eq!(
+        fakes.calls("codex"),
+        1,
+        "a second app does not start a read"
+    );
+
+    drop(first);
+    drop(second);
+    thread::park_timeout(Duration::from_millis(700));
+    let mut third = daemon.connect();
+    third.hello();
+
+    fakes.wait_for_calls("codex", 2);
+}
+
+#[test]
+fn the_first_app_starts_a_read_without_waiting_for_the_next_tick() {
+    let fakes = UsageFakes::new();
+    let daemon = Daemon::start_with_usage(&fakes.args(3_600_000, 3_600_000));
+    thread::park_timeout(Duration::from_millis(300));
+    assert_eq!(fakes.calls("codex"), 0);
+    let mut client = daemon.connect();
+    client.hello();
+
+    let usage = client.wait_for_usage(|usage| !usage.codex.windows.is_empty());
+
+    assert_eq!(usage.codex.windows.len(), 2);
+}
+
+#[test]
+fn codex_is_read_again_after_its_interval() {
+    let fakes = UsageFakes::new();
+    let daemon = Daemon::start_with_usage(&fakes.args(30, 200));
+    let mut client = daemon.connect();
+    client.hello();
+
+    fakes.wait_for_calls("codex", 3);
+}
+
+#[test]
+fn codex_usage_keeps_its_windows_when_a_read_fails() {
+    let fakes = UsageFakes::new();
+    let daemon = Daemon::start_with_usage(&fakes.args(30, 300));
+    let mut client = daemon.connect();
+    client.hello();
+    client.wait_for_usage(|usage| !usage.codex.windows.is_empty());
+
+    fakes.write(
+        "answer",
+        "{\"id\":2,\"error\":{\"message\":\"codex account authentication required\"}}\n",
+    );
+    let after = client.wait_for_usage(|usage| usage.codex.problem.is_some());
+
+    assert_eq!(after.codex.problem, Some(UsageProblem::NotLoggedIn));
+    assert_eq!(after.codex.windows.len(), 2, "the last good windows stay");
+}
+
+#[test]
+fn the_endpoint_fills_claude_when_no_status_line_came() {
+    let fakes = UsageFakes::new();
+    fakes.log_in_to_claude();
+    let daemon = Daemon::start_with_usage(&fakes.args(50, 3_600_000));
+    let mut client = daemon.connect();
+    client.hello();
+
+    let usage = client.wait_for_usage(|usage| !usage.claude.windows.is_empty());
+
+    assert_eq!(claude_windows(&usage), [("5h", 42)]);
+    assert_eq!(usage.claude.plan.as_deref(), Some("max"));
+    assert_eq!(fakes.calls("curl"), 1);
+    assert!(fakes.read("curl-config").contains(CLAUDE_TOKEN));
+    assert!(!fakes.read("curl-args").contains(CLAUDE_TOKEN));
+    let log = std::fs::read_to_string(daemon.home.join("daemon.log")).unwrap_or_default();
+    assert!(!log.contains(CLAUDE_TOKEN), "the token reached the log");
+    assert!(
+        !std::fs::read_to_string(daemon.home.join("usage.json"))
+            .expect("usage file")
+            .contains(CLAUDE_TOKEN)
+    );
+}
+
+#[test]
+fn a_claude_that_is_not_logged_in_is_reported() {
+    let fakes = UsageFakes::new();
+    let daemon = Daemon::start_with_usage(&fakes.args(50, 3_600_000));
+    let mut client = daemon.connect();
+    client.hello();
+
+    let usage = client.wait_for_usage(|usage| usage.claude.problem.is_some());
+
+    assert_eq!(usage.claude.problem, Some(UsageProblem::NotLoggedIn));
+    assert_eq!(fakes.calls("curl"), 0);
+}
+
+#[test]
+fn a_rate_limited_endpoint_is_reported_and_the_wait_is_saved() {
+    let fakes = UsageFakes::new();
+    fakes.log_in_to_claude();
+    fakes.write(
+        "response",
+        "HTTP/2 429 \r\nretry-after: 1200\r\n\r\n{\"error\":{\"type\":\"rate_limit_error\"}}",
+    );
+    let mut daemon = Daemon::start_with_usage(&fakes.args(50, 3_600_000));
+    let mut client = daemon.connect();
+    client.hello();
+
+    let usage = client.wait_for_usage(|usage| usage.claude.problem.is_some());
+    drop(client);
+
+    let Some(UsageProblem::RateLimited { retry_at }) = usage.claude.problem else {
+        panic!("expected a rate limit, got {:?}", usage.claude.problem);
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time")
+        .as_secs();
+    assert!(
+        (now + 1100..=now + 1300).contains(&retry_at),
+        "{retry_at} at {now}"
+    );
+    assert!(daemon.home.join("claude-usage-backoff.json").is_file());
+
+    // A restarted daemon with an app does not ask the endpoint again.
+    daemon.crash();
+    let restarted =
+        Daemon::spawn_usage(daemon.home.clone(), None, None, &fakes.args(50, 3_600_000));
+    restarted.wait_until_listening();
+    let mut client = restarted.connect();
+    client.hello();
+    fakes.wait_for_calls("codex", 2);
+    thread::park_timeout(Duration::from_millis(300));
+
+    assert_eq!(fakes.calls("curl"), 1);
 }

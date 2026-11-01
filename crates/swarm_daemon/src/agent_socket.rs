@@ -276,6 +276,7 @@ mod tests {
     use swarm_protocol::{AgentId, MessageKind, ProjectId};
 
     use crate::messages::Messages;
+    use crate::temp_folder::TempFolder;
 
     use super::*;
 
@@ -307,7 +308,7 @@ mod tests {
         assert!(log.should_warn(1, start + WARN_INTERVAL));
     }
     /// Everything the socket needs, with one registered orchestrator.
-    fn calls_with_an_agent() -> (Arc<Calls>, u64, String, Arc<Messages>) {
+    fn calls_with_an_agent() -> (Arc<Calls>, u64, String, Arc<Messages>, TempFolder) {
         use std::sync::Mutex;
 
         use swarm_core::Projects;
@@ -322,7 +323,9 @@ mod tests {
         use crate::messages::Messages;
         use crate::processes::Processes;
         use crate::pull_requests::PullRequests;
+        use crate::usage::{Overrides, UsageService};
 
+        let folder = TempFolder::new("agent-socket");
         let store = Store::open_in_memory().expect("store");
         let project = store
             .add_project(Path::new("/repo"), "repo")
@@ -344,7 +347,7 @@ mod tests {
         let messages = Messages::new(Arc::clone(&store), Arc::clone(&clients));
         let agents = Agents::new(
             AgentConfig {
-                data_dir: std::env::temp_dir(),
+                data_dir: folder.path().to_owned(),
                 socket: PathBuf::from("/tmp/none.sock"),
                 settings: None,
                 swarm: PathBuf::from("/tmp/swarm"),
@@ -380,6 +383,16 @@ mod tests {
                 Arc::clone(&agents),
             ),
             pull_requests: PullRequests::new(github, None),
+            usage: UsageService::start(
+                folder.path(),
+                None,
+                Arc::clone(&clients),
+                Overrides {
+                    no_polling: true,
+                    ..Overrides::default()
+                },
+            )
+            .expect("usage"),
             terminals,
             projects,
             agents,
@@ -388,7 +401,13 @@ mod tests {
             store,
         });
 
-        (Arc::new(Calls::new(services)), agent.id.0, token, messages)
+        (
+            Arc::new(Calls::new(services)),
+            agent.id.0,
+            token,
+            messages,
+            folder,
+        )
     }
 
     fn ask(stream: &mut UnixStream, reader: &mut BufReader<UnixStream>, line: &str) -> Value {
@@ -401,7 +420,7 @@ mod tests {
 
     #[test]
     fn a_wait_longer_than_the_idle_time_is_not_cut_off() {
-        let (calls, agent, token, _) = calls_with_an_agent();
+        let (calls, agent, token, _, _folder) = calls_with_an_agent();
         let (server_end, mut client) = UnixStream::pair().expect("pair");
         let serving = thread::spawn(move || {
             connection(
@@ -432,7 +451,7 @@ mod tests {
 
     #[test]
     fn a_client_that_hangs_up_mid_wait_loses_no_message() {
-        let (calls, agent, token, messages) = calls_with_an_agent();
+        let (calls, agent, token, messages, _folder) = calls_with_an_agent();
         let (server_end, mut client) = UnixStream::pair().expect("pair");
         let serving = thread::spawn(move || {
             connection(
@@ -472,7 +491,7 @@ mod tests {
 
     #[test]
     fn a_message_is_delivered_only_after_the_reply_was_written() {
-        let (calls, agent, token, messages) = calls_with_an_agent();
+        let (calls, agent, token, messages, _folder) = calls_with_an_agent();
         messages
             .post(&NewMessage {
                 project: ProjectId(1),
@@ -510,7 +529,7 @@ mod tests {
 
     #[test]
     fn waits_beyond_the_cap_are_refused_but_short_calls_are_not() {
-        let (calls, agent, token, _) = calls_with_an_agent();
+        let (calls, agent, token, _, _folder) = calls_with_an_agent();
         let held = calls.hold_waits_for_test(MAX_WAITS);
         let wait = format!(
             r#"{{"agent":{agent},"token":"{token}","method":"wait","params":{{"timeout_secs":1}}}}"#
@@ -558,7 +577,7 @@ mod tests {
 
     #[test]
     fn a_request_with_a_wrong_token_is_refused() {
-        let (calls, agent, _token, _) = calls_with_an_agent();
+        let (calls, agent, _token, _, _folder) = calls_with_an_agent();
         let (reply, _) = answer(
             &calls,
             &RefusalLog::default(),
@@ -572,7 +591,7 @@ mod tests {
 
     #[test]
     fn a_garbled_request_is_not_valid() {
-        let (calls, _, _, _) = calls_with_an_agent();
+        let (calls, _, _, _, _folder) = calls_with_an_agent();
 
         let (reply, _) = answer(&calls, &RefusalLog::default(), "{nope", &|| false);
 

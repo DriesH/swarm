@@ -26,6 +26,7 @@ mod tile_frame;
 mod tooltip;
 mod tray_chip;
 mod tree_row;
+mod usage_meter;
 
 pub use button::*;
 pub use check_row::*;
@@ -55,6 +56,7 @@ pub use tile_frame::*;
 pub use tooltip::*;
 pub use tray_chip::*;
 pub use tree_row::*;
+pub use usage_meter::*;
 
 use crate::component::ComponentEntry;
 
@@ -87,6 +89,7 @@ pub fn all_components() -> Vec<ComponentEntry> {
         ComponentEntry::of::<TrayChip>(),
         ComponentEntry::of::<TrayMore>(),
         ComponentEntry::of::<Panel>(),
+        ComponentEntry::of::<UsageMeter>(),
         ComponentEntry::of::<ProjectTile>(),
         ComponentEntry::of::<TileFrame>(),
         ComponentEntry::of::<Dialog>(),

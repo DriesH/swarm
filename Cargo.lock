@@ -5251,6 +5251,7 @@ dependencies = [
  "serde",
  "serde_json",
  "swarm_protocol",
+ "swarm_usage",
 ]
 
 [[package]]
@@ -5286,6 +5287,7 @@ dependencies = [
  "swarm_settings",
  "swarm_term",
  "swarm_term_vt",
+ "swarm_usage",
 ]
 
 [[package]]
@@ -5359,6 +5361,19 @@ dependencies = [
  "log",
  "objc2-app-kit 0.3.2",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "swarm_usage"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "log",
+ "serde",
+ "serde_json",
+ "sha2",
+ "swarm_protocol",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

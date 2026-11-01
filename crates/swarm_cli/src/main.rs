@@ -7,6 +7,7 @@ mod commands;
 mod hook;
 mod mcp;
 mod session;
+mod statusline;
 
 use std::io::Write as _;
 use std::process::ExitCode;
@@ -127,6 +128,9 @@ enum Action {
     Mcp,
     /// Forward an agent hook event (JSON on stdin) to Swarm.
     Hook,
+    /// Claude Code's status line: send its rate limits (JSON on stdin) to Swarm, then
+    /// run your own status line.
+    Statusline,
 }
 
 #[derive(Subcommand, Debug)]
@@ -265,7 +269,7 @@ impl KindArg {
 
 impl Action {
     /// The command to run, with texts read from `stdin` where they ask for it. `None`
-    /// for `mcp` and `hook`, which are not commands.
+    /// for `mcp`, `hook` and `statusline`, which are not commands.
     fn command(self, stdin: &mut impl std::io::Read) -> Result<Option<Command>, String> {
         let command = match self {
             Self::Spawn {
@@ -318,7 +322,7 @@ impl Action {
             Self::Task { action } => action.command(stdin)?,
             Self::Exit => Command::Exit,
             Self::Terminal { action } => action.command(),
-            Self::Mcp | Self::Hook => return Ok(None),
+            Self::Mcp | Self::Hook | Self::Statusline => return Ok(None),
         };
 
         Ok(Some(command))
@@ -436,6 +440,13 @@ fn main() -> ExitCode {
     // A hook must never fail, whatever it is given.
     if arguments.get(1).map(String::as_str) == Some("hook") {
         hook::run();
+
+        return ExitCode::SUCCESS;
+    }
+
+    // The same for the status line: it must print only the user's own line.
+    if arguments.get(1).map(String::as_str) == Some("statusline") {
+        statusline::run();
 
         return ExitCode::SUCCESS;
     }
@@ -923,8 +934,8 @@ mod tests {
     }
 
     #[test]
-    fn mcp_and_hook_are_not_commands() {
-        for name in ["mcp", "hook"] {
+    fn mcp_hook_and_statusline_are_not_commands() {
+        for name in ["mcp", "hook", "statusline"] {
             let action = parse(&[name]).expect("parse").command;
 
             assert!(action.command(&mut std::io::empty()).expect("ok").is_none());
