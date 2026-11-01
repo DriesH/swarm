@@ -1,11 +1,12 @@
 //! User settings in `~/.config/swarm/settings.toml`. People edit the file by hand or in
 //! the app's Settings window; the daemon reads it when it starts an agent.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use swarm_protocol::{AgentKind, AgentRole};
+use swarm_protocol::{AgentKind, AgentRole, NoticeKind};
 use toml_edit::{DocumentMut, Item, Table, Value};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
@@ -13,6 +14,93 @@ use toml_edit::{DocumentMut, Item, Table, Value};
 pub struct Settings {
     pub agents: AgentSettings,
     pub terminals: TerminalSettings,
+    pub notifications: NotificationSettings,
+}
+
+/// Which notices become system notifications, and how they are delivered.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each one is a switch in the settings file"
+)]
+pub struct NotificationSettings {
+    /// The orchestrator asked for a decision.
+    pub needs_decision: bool,
+    /// An agent shows a permission or question prompt.
+    pub prompt: bool,
+    /// Every worker is done and the orchestrator is idle.
+    pub ready_for_review: bool,
+    /// An agent failed or ended with an error.
+    pub broke: bool,
+    /// Plays a sound with a notification.
+    pub sound: bool,
+    /// Bounces the Dock icon for urgent notices.
+    pub dock_bounce: bool,
+    /// Posts nothing while the user looks at the task.
+    pub mute_while_viewing: bool,
+    /// Shows the dot on the menu bar icon while a task needs the user.
+    pub menu_bar_dot: bool,
+    /// The mode of each project, keyed by the path of its repository. A project that is
+    /// not listed is [`ProjectMode::All`].
+    pub projects: BTreeMap<String, ProjectMode>,
+}
+
+impl Default for NotificationSettings {
+    fn default() -> Self {
+        Self {
+            needs_decision: true,
+            prompt: true,
+            ready_for_review: true,
+            broke: true,
+            sound: false,
+            dock_bounce: true,
+            mute_while_viewing: true,
+            menu_bar_dot: true,
+            projects: BTreeMap::new(),
+        }
+    }
+}
+
+impl NotificationSettings {
+    /// The trigger switch of this kind of notice.
+    pub fn triggers(&self, kind: NoticeKind) -> bool {
+        match kind {
+            NoticeKind::NeedsDecision => self.needs_decision,
+            NoticeKind::Prompt => self.prompt,
+            NoticeKind::ReadyForReview => self.ready_for_review,
+            NoticeKind::Broke => self.broke,
+        }
+    }
+
+    pub fn mode(&self, project: &Path) -> ProjectMode {
+        self.projects
+            .get(project.to_string_lossy().as_ref())
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// The default mode is not stored: the project's entry goes away.
+    pub fn set_mode(&mut self, project: &Path, mode: ProjectMode) {
+        let key = project.to_string_lossy().into_owned();
+
+        if mode == ProjectMode::default() {
+            self.projects.remove(&key);
+        } else {
+            self.projects.insert(key, mode);
+        }
+    }
+}
+
+/// What a project may notify about.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectMode {
+    #[default]
+    All,
+    /// Only when something broke.
+    ErrorsOnly,
+    Off,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -250,6 +338,11 @@ pub fn save(path: &Path, settings: &Settings) -> Result<(), SettingsError> {
         Value::from(settings.terminals.allow_worker_typing),
     );
 
+    set_notifications(
+        table_mut(document.as_table_mut(), "notifications"),
+        &settings.notifications,
+    );
+
     if let Some(folder) = path.parent() {
         std::fs::create_dir_all(folder).map_err(io_error)?;
     }
@@ -258,6 +351,45 @@ pub fn save(path: &Path, settings: &Settings) -> Result<(), SettingsError> {
 
     std::fs::write(&temporary, document.to_string()).map_err(io_error)?;
     std::fs::rename(&temporary, path).map_err(io_error)
+}
+
+fn set_notifications(table: &mut Table, notifications: &NotificationSettings) {
+    for (key, on) in [
+        ("needs_decision", notifications.needs_decision),
+        ("prompt", notifications.prompt),
+        ("ready_for_review", notifications.ready_for_review),
+        ("broke", notifications.broke),
+        ("sound", notifications.sound),
+        ("dock_bounce", notifications.dock_bounce),
+        ("mute_while_viewing", notifications.mute_while_viewing),
+        ("menu_bar_dot", notifications.menu_bar_dot),
+    ] {
+        set_value(table, key, Value::from(on));
+    }
+
+    if notifications.projects.is_empty() {
+        table.remove("projects");
+        return;
+    }
+
+    let projects = table_mut(table, "projects");
+    let stale: Vec<String> = projects
+        .iter()
+        .map(|(key, _)| key.to_owned())
+        .filter(|key| !notifications.projects.contains_key(key))
+        .collect();
+    for key in stale {
+        projects.remove(&key);
+    }
+
+    for (path, mode) in &notifications.projects {
+        let name = match mode {
+            ProjectMode::All => "all",
+            ProjectMode::ErrorsOnly => "errors_only",
+            ProjectMode::Off => "off",
+        };
+        set_value(projects, path, Value::from(name));
+    }
 }
 
 fn set_cli(table: &mut Table, cli: &CliSettings) {
@@ -405,6 +537,160 @@ mod tests {
         assert_eq!(cli.orchestrator_model, "gpt-reserve");
         assert_eq!(cli.worker_model, "gpt-6-sol");
         assert_eq!(settings.agents.claude_code, CliSettings::claude_code());
+    }
+
+    fn temp_folder(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("swarm-settings-{name}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn notifications_default_to_the_plan() {
+        let settings: Settings = toml::from_str("").unwrap();
+
+        let notifications = settings.notifications;
+        assert!(notifications.needs_decision);
+        assert!(notifications.prompt);
+        assert!(notifications.ready_for_review);
+        assert!(notifications.broke);
+        assert!(!notifications.sound);
+        assert!(notifications.dock_bounce);
+        assert!(notifications.mute_while_viewing);
+        assert!(notifications.menu_bar_dot);
+        assert!(notifications.projects.is_empty());
+    }
+
+    #[test]
+    fn an_old_file_without_a_notifications_section_still_loads() {
+        let folder = temp_folder("old-file");
+        let path = folder.join("settings.toml");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            &path,
+            "[agents]\nskip_permissions = true\n\n[terminals]\nallow_worker_typing = false\n",
+        )
+        .unwrap();
+
+        let loaded = load(&path).unwrap();
+        std::fs::remove_dir_all(&folder).unwrap();
+
+        assert_eq!(loaded.notifications, NotificationSettings::default());
+        assert!(loaded.agents.skip_permissions);
+    }
+
+    #[test]
+    fn a_partial_notifications_section_keeps_the_other_defaults() {
+        let settings: Settings =
+            toml::from_str("[notifications]\nsound = true\nprompt = false\n").unwrap();
+
+        let notifications = settings.notifications;
+        assert!(notifications.sound);
+        assert!(!notifications.prompt);
+        assert!(notifications.needs_decision);
+        assert!(notifications.menu_bar_dot);
+    }
+
+    #[test]
+    fn each_trigger_reads_its_own_switch() {
+        let notifications = NotificationSettings {
+            needs_decision: false,
+            ready_for_review: false,
+            ..NotificationSettings::default()
+        };
+
+        assert!(!notifications.triggers(NoticeKind::NeedsDecision));
+        assert!(notifications.triggers(NoticeKind::Prompt));
+        assert!(!notifications.triggers(NoticeKind::ReadyForReview));
+        assert!(notifications.triggers(NoticeKind::Broke));
+    }
+
+    #[test]
+    fn notifications_round_trip_through_a_file() {
+        let folder = temp_folder("notifications");
+        let path = folder.join("settings.toml");
+        let mut settings = Settings::default();
+        settings.notifications.sound = true;
+        settings.notifications.broke = false;
+        settings.notifications.menu_bar_dot = false;
+        settings
+            .notifications
+            .set_mode(Path::new("/work/swarm"), ProjectMode::ErrorsOnly);
+        settings
+            .notifications
+            .set_mode(Path::new("/work/with space"), ProjectMode::Off);
+
+        save(&path, &settings).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let loaded = load(&path).unwrap();
+        std::fs::remove_dir_all(&folder).unwrap();
+
+        assert!(text.contains("[notifications]"));
+        assert!(text.contains("\"/work/swarm\" = \"errors_only\""));
+        assert!(text.contains("\"/work/with space\" = \"off\""));
+        assert_eq!(loaded, settings);
+    }
+
+    #[test]
+    fn saving_an_old_file_adds_the_section_and_keeps_the_rest() {
+        let folder = temp_folder("old-save");
+        let path = folder.join("settings.toml");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(&path, "# mine\n[agents]\nskip_permissions = true\n").unwrap();
+        let mut settings = load(&path).unwrap();
+        settings.notifications.dock_bounce = false;
+
+        save(&path, &settings).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let loaded = load(&path).unwrap();
+        std::fs::remove_dir_all(&folder).unwrap();
+
+        assert!(text.starts_with("# mine\n"));
+        assert!(text.contains("dock_bounce = false"));
+        assert!(!loaded.notifications.dock_bounce);
+        assert_eq!(loaded, settings);
+    }
+
+    #[test]
+    fn the_mode_of_an_unlisted_project_is_all() {
+        let notifications = NotificationSettings::default();
+
+        assert_eq!(
+            notifications.mode(Path::new("/work/none")),
+            ProjectMode::All
+        );
+    }
+
+    #[test]
+    fn choosing_all_again_removes_the_project_from_the_file() {
+        let folder = temp_folder("mode-all");
+        let path = folder.join("settings.toml");
+        let mut settings = Settings::default();
+        let project = Path::new("/work/swarm");
+        settings.notifications.set_mode(project, ProjectMode::Off);
+        settings
+            .notifications
+            .set_mode(Path::new("/work/other"), ProjectMode::ErrorsOnly);
+        save(&path, &settings).unwrap();
+
+        settings.notifications.set_mode(project, ProjectMode::All);
+        save(&path, &settings).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let loaded = load(&path).unwrap();
+        std::fs::remove_dir_all(&folder).unwrap();
+
+        assert!(!text.contains("/work/swarm"));
+        assert_eq!(loaded.notifications.mode(project), ProjectMode::All);
+        assert_eq!(
+            loaded.notifications.mode(Path::new("/work/other")),
+            ProjectMode::ErrorsOnly
+        );
+    }
+
+    #[test]
+    fn a_mode_that_is_not_known_is_a_parse_error() {
+        let result: Result<Settings, _> =
+            toml::from_str("[notifications.projects]\n\"/work/swarm\" = \"loud\"\n");
+
+        assert!(result.is_err());
     }
 
     #[test]
