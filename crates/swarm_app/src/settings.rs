@@ -30,6 +30,7 @@ use self::prompts_page::PromptsPage;
 use self::usage_page::UsagePage;
 use crate::model::{FakeData, Project};
 use crate::notifications::{self, Permission};
+use crate::remove_project::RemoveProjectDialog;
 use crate::system_check::SystemCheckView;
 use crate::window_drag::drag_region;
 use crate::workspace::Workspace;
@@ -378,6 +379,13 @@ pub(crate) struct SettingsWindow {
     page_focus: FocusHandle,
     page_scroll: ScrollHandle,
     subscriptions: Vec<Subscription>,
+    /// The dialog that asks before a project goes, while it shows.
+    remove_dialog: Option<RemoveDialog>,
+}
+
+struct RemoveDialog {
+    view: Entity<RemoveProjectDialog>,
+    _subscription: Subscription,
 }
 
 fn field(
@@ -581,6 +589,7 @@ impl SettingsWindow {
             page_focus: cx.focus_handle().tab_stop(true),
             page_scroll: ScrollHandle::new(),
             subscriptions,
+            remove_dialog: None,
         };
 
         for index in 0..projects.len() {
@@ -821,6 +830,7 @@ impl Render for SettingsWindow {
             div()
                 .id("settings")
                 .key_context(ROOT_CONTEXT)
+                .relative()
                 .size_full()
                 .bg(ground)
                 .text_color(fg)
@@ -900,6 +910,11 @@ impl Render for SettingsWindow {
                                 ),
                         ),
                 ),
+        )
+        .children(
+            self.remove_dialog
+                .as_ref()
+                .map(|dialog| dialog.view.clone()),
         )
     }
 }
@@ -1196,19 +1211,35 @@ fn open_window(
 
 /// Opens the settings window, or focuses it when it is already open. `projects` are the
 /// workspace's: the window lists them. The workspace holds the daemon connection and the
-/// open tasks the Projects pages use.
+/// open tasks the Projects pages use. `page` is the page to show, also when the window was
+/// open already.
 pub(crate) fn open(
     path: Option<PathBuf>,
     projects: Vec<Project>,
     workspace: WeakEntity<Workspace>,
-    _window: &mut Window,
+    page: Option<Page>,
     cx: &mut App,
 ) {
     link_workspace(workspace, cx);
 
-    if let Err(error) = open_window(path, Some(projects), cx) {
-        log::error!("could not open the settings window: {error:#}");
-    }
+    let handle = match open_window(path, Some(projects), cx) {
+        Ok(handle) => handle,
+        Err(error) => {
+            log::error!("could not open the settings window: {error:#}");
+            return;
+        }
+    };
+
+    let Some(page) = page else {
+        return;
+    };
+
+    // The page asks the workspace, which is updating when it is the one that opens settings.
+    cx.defer(move |cx| {
+        if let Err(error) = handle.update(cx, |settings, _, cx| settings.select_page(page, cx)) {
+            log::debug!("the settings window closed before it showed {page:?}: {error}");
+        }
+    });
 }
 
 fn link_workspace(workspace: WeakEntity<Workspace>, cx: &mut App) {
@@ -1227,6 +1258,40 @@ pub(crate) fn checks_changed(run: &swarm_protocol::ChecksRun, cx: &mut App) {
     };
 
     state.update(cx, |state, cx| state.record_run(run, cx));
+}
+
+/// The page the open settings window shows.
+#[cfg(test)]
+pub(crate) fn shown_page(cx: &App) -> Option<Page> {
+    let window = cx.try_global::<Registry>()?.window?;
+
+    window.read(cx).ok().map(|settings| settings.page)
+}
+
+/// The workspace removed a project: its page, its inputs and its nav row go, and the window
+/// leaves the page if it showed it. It waits for the current update to end, as the removal
+/// may come from a dialog of the settings window itself.
+pub(crate) fn project_removed(project: crate::model::ProjectId, cx: &mut App) {
+    cx.defer(move |cx| {
+        let Some((state, window)) = cx
+            .try_global::<Registry>()
+            .map(|registry| (registry.state.clone(), registry.window))
+        else {
+            return;
+        };
+
+        let Some(index) = state.update(cx, |state, cx| state.remove_project(project, cx)) else {
+            return;
+        };
+
+        if let Some(window) = window
+            && let Err(error) = window.update(cx, |settings, window, cx| {
+                settings.drop_project(index, window, cx);
+            })
+        {
+            log::debug!("the settings closed before the project went: {error}");
+        }
+    });
 }
 
 /// The pages to save, with the window size and the answer the sample delivery gives to

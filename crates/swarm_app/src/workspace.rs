@@ -12,9 +12,9 @@ use swarm_ui::fonts::UI_FONT;
 use swarm_ui::prelude::*;
 
 use crate::actions::{
-    CreatePullRequest, FocusAgent, NewTask, NewTerminal, OpenSettings, PlanWithOrchestrator,
-    SetUpGithub, ShowReview, ShowSwarm, ShowTerminals, ToggleChanges, ToggleCommandPalette,
-    ToggleFiles,
+    About, AddProject, CloseTask, CreatePullRequest, FocusAgent, NewTask, NewTerminal,
+    OpenSettings, PlanWithOrchestrator, SetUpGithub, ShowReview, ShowSwarm, ShowTerminals,
+    ToggleChanges, ToggleCommandPalette, ToggleFiles, ToggleSidebar,
 };
 use crate::daemon::DiffPoll;
 use crate::daemon::{DaemonLaunch, LiveTerminal};
@@ -25,6 +25,7 @@ use crate::palette::Overlay;
 use crate::panels::ChangesList;
 use crate::pull_request::PullRequests;
 use crate::review_view::ReviewView;
+use crate::settings::Page;
 use crate::swarm_view::{
     Clicked, DotGrid, INSPECTOR_WIDTH, InspectorTab, MessageThread, TerminalPreview,
 };
@@ -83,11 +84,14 @@ pub(crate) struct Workspace {
     pub active_task: TaskId,
     pub view: View,
     pub right_panel: Option<RightPanel>,
+    pub(crate) sidebar_visible: bool,
     pub minimized: HashSet<TerminalId>,
     pub focused_terminal: Option<TerminalId>,
     focus_handle: FocusHandle,
     pending_focus: Option<TerminalId>,
     pub(crate) terminal_focus: HashMap<TerminalId, FocusHandle>,
+    /// The focus of each project row in the sidebar.
+    pub(crate) project_focus: HashMap<ProjectId, FocusHandle>,
     pub(crate) overlay: Option<Overlay>,
     pub(crate) terminal_area: Option<Bounds<Pixels>>,
     /// True when the right panel was shown as `terminal_area` was measured.
@@ -246,10 +250,7 @@ impl Workspace {
             this.sync_changes_list(cx);
         });
         let workspace = cx.weak_entity();
-        let review = cx.new({
-            let workspace = workspace.clone();
-            |cx| ReviewView::new(workspace, cx)
-        });
+        let review = cx.new(|cx| ReviewView::new(workspace.clone(), cx));
         let changes_list = cx.new(|cx| ChangesList::new(workspace, cx));
         let preview = cx.new(|_| TerminalPreview::new());
         let preview_subscription = cx.subscribe(&preview, |this, _, _: &Clicked, cx| {
@@ -263,11 +264,13 @@ impl Workspace {
             active_task,
             view: View::Terminals,
             right_panel: Some(RightPanel::Changes),
+            sidebar_visible: true,
             minimized: HashSet::new(),
             focused_terminal,
             focus_handle,
             pending_focus: None,
             terminal_focus: HashMap::new(),
+            project_focus: HashMap::new(),
             overlay: None,
             terminal_area: None,
             terminal_area_had_panel: false,
@@ -490,6 +493,24 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Shows the sidebar, or hides it when it shows.
+    pub(crate) fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_visible = !self.sidebar_visible;
+
+        cx.notify();
+    }
+
+    /// Opens the settings window, or focuses it. `page` is the page to show.
+    pub(crate) fn open_settings(&self, page: Option<Page>, cx: &mut Context<Self>) {
+        crate::settings::open(
+            self.settings_path.clone(),
+            self.data.projects.clone(),
+            cx.weak_entity(),
+            page,
+            cx,
+        );
+    }
+
     /// Opens the panel, or closes it when it is already open.
     pub(crate) fn toggle_panel(&mut self, panel: RightPanel, cx: &mut Context<Self>) {
         if panel == RightPanel::Changes && self.view == View::Review {
@@ -536,6 +557,15 @@ impl Workspace {
             .entry(terminal)
             .or_insert_with(|| cx.focus_handle().tab_stop(true))
             .clone()
+    }
+
+    /// Makes the focus handle of each project row. They are tab stops, like the rows.
+    fn ensure_project_focus(&mut self, cx: &mut Context<Self>) {
+        for project in &self.data.projects {
+            self.project_focus
+                .entry(project.id)
+                .or_insert_with(|| cx.focus_handle().tab_stop(true));
+        }
     }
 
     fn ensure_focus_handles(&mut self, cx: &mut Context<Self>) {
@@ -711,14 +741,20 @@ impl Workspace {
                 .on_action(cx.listener(|this, _: &NewTerminal, window, cx| {
                     this.new_user_terminal(window, cx);
                 }))
-                .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
-                    crate::settings::open(
-                        this.settings_path.clone(),
-                        this.data.projects.clone(),
-                        cx.weak_entity(),
-                        window,
-                        cx,
-                    );
+                .on_action(cx.listener(|_, _: &AddProject, window, cx| {
+                    Self::pick_project(window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &CloseTask, window, cx| {
+                    this.open_close_task(this.active_task, window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
+                    this.toggle_sidebar(cx);
+                }))
+                .on_action(cx.listener(|this, _: &OpenSettings, _, cx| {
+                    this.open_settings(None, cx);
+                }))
+                .on_action(cx.listener(|this, _: &About, _, cx| {
+                    this.open_settings(Some(Page::General), cx);
                 }))
                 .on_action(cx.listener(|this, _: &ToggleCommandPalette, window, cx| {
                     this.toggle_palette(window, cx);
@@ -799,6 +835,7 @@ impl Render for Workspace {
         self.apply_pending_review_focus(window, cx);
         self.apply_pending_pr_focus(window, cx);
         self.ensure_focus_handles(cx);
+        self.ensure_project_focus(cx);
 
         if self.view == View::Swarm {
             self.ensure_swarm_handles(cx);
@@ -817,7 +854,9 @@ impl Render for Workspace {
                 .into_any_element();
         }
 
-        let sidebar = sidebar::render(self, window, cx);
+        let sidebar = self
+            .sidebar_visible
+            .then(|| sidebar::render(self, window, cx));
         let tab_bar = tab_bar::render(self, window, cx);
         let views = views::render(self, window, cx);
         let status_bar = status_bar::render(self, window, cx);
@@ -842,7 +881,7 @@ impl Render for Workspace {
 
         let root = self.root(cx);
 
-        root.child(
+        root.children(sidebar.map(|sidebar| {
             div()
                 .w(px(248.))
                 .flex_none()
@@ -850,14 +889,14 @@ impl Render for Workspace {
                 .pt(HEADER_CENTER - sidebar::WINDOW_ROW_HEIGHT / 2.)
                 .px(px(8.))
                 .pb(px(10.))
-                .child(sidebar),
-        )
+                .child(sidebar)
+        }))
         .child(
             v_flex()
                 .flex_1()
                 .min_w_0()
                 .m(px(PANEL_MARGIN))
-                .ml_0()
+                .when(self.sidebar_visible, Styled::ml_0)
                 .bg(panel)
                 .border_1()
                 .border_color(line)

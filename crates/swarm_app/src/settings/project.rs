@@ -2,16 +2,17 @@
 
 use std::path::PathBuf;
 
-use gpui::{App, Context, Entity, Focusable as _, SharedString, Subscription, Window};
+use gpui::{App, Context, Entity, Focusable as _, SharedString, Subscription, WeakEntity, Window};
 use swarm_protocol::{
     ChecksRun, Client, ClientError, ProjectConfigFields, ProjectId as DaemonProjectId, PromptInfo,
     TaskId as DaemonTaskId,
 };
 use swarm_ui::prelude::*;
 
-use super::{NOT_CONNECTED, Page, SAVE_DELAY, SettingsState, SettingsWindow, field};
+use super::{NOT_CONNECTED, Page, RemoveDialog, SAVE_DELAY, SettingsState, SettingsWindow, field};
 use crate::model::{Project, ProjectId, sample_checks_run};
 use crate::pull_request::run_is_over;
+use crate::remove_project::{RemoveProjectDialog, RemoveProjectEvent};
 use crate::review_comments::refusal;
 
 pub(super) const DEFAULT_BRANCH: &str = "Default branch";
@@ -532,6 +533,23 @@ impl SettingsState {
         }
     }
 
+    /// Drops the entry of a removed project, with the save it waited for. Returns where it was.
+    pub(super) fn remove_project(
+        &mut self,
+        id: ProjectId,
+        cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let index = self.index_of(id)?;
+
+        self.projects.remove(index);
+        if index < self.saves.len() {
+            self.saves.remove(index);
+        }
+        cx.notify();
+
+        Some(index)
+    }
+
     fn index_of(&self, id: ProjectId) -> Option<usize> {
         self.projects
             .iter()
@@ -972,6 +990,12 @@ impl SettingsWindow {
     }
 
     pub(super) fn load_project(&mut self, index: usize, cx: &mut Context<Self>) {
+        let id = self
+            .state
+            .read(cx)
+            .projects
+            .get(index)
+            .map(|entry| entry.project.id);
         let request = self
             .state
             .update(cx, |state, cx| state.begin_load(index, cx));
@@ -985,7 +1009,7 @@ impl SettingsWindow {
 
         cx.spawn(async move |this, cx| {
             let loaded = reading.await;
-            let shown = this.update(cx, |this, cx| this.finish_load(index, loaded, cx));
+            let shown = this.update(cx, |this, cx| this.finish_load(id, loaded, cx));
 
             if let Err(error) = shown {
                 log::debug!("the settings closed before the project was read: {error}");
@@ -994,7 +1018,11 @@ impl SettingsWindow {
         .detach();
     }
 
-    fn finish_load(&mut self, index: usize, loaded: Loaded, cx: &mut Context<Self>) {
+    /// Takes the answer for the project, wherever it sits in the list by now.
+    fn finish_load(&mut self, id: Option<ProjectId>, loaded: Loaded, cx: &mut Context<Self>) {
+        let Some(index) = id.and_then(|id| self.state.read(cx).index_of(id)) else {
+            return;
+        };
         let applied = self
             .state
             .update(cx, |state, cx| state.finish_load(index, loaded, cx));
@@ -1002,6 +1030,84 @@ impl SettingsWindow {
         if applied {
             self.sync_inputs(index, cx);
         }
+    }
+
+    /// Opens the dialog that asks before the project of page `index` goes.
+    pub(super) fn open_remove_project(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let state = self.state.read(cx);
+        let project = state.projects.get(index).map(|entry| entry.project.id);
+        let workspace = state.workspace.as_ref().and_then(WeakEntity::upgrade);
+
+        let (Some(project), Some(workspace)) = (project, workspace) else {
+            log::warn!("the settings have no workspace to remove the project from");
+            return;
+        };
+        let Some((name, open_tasks)) = workspace.read(cx).remove_project_facts(project) else {
+            return;
+        };
+
+        let view = cx.new(|cx| RemoveProjectDialog::new(project, name, open_tasks, window, cx));
+        let workspace = workspace.downgrade();
+        let subscription =
+            cx.subscribe_in(
+                &view,
+                window,
+                move |this, view, event, window, cx| match event {
+                    RemoveProjectEvent::Dismissed => this.close_remove_project(window, cx),
+                    RemoveProjectEvent::Confirmed => {
+                        let dialog = view.clone();
+
+                        crate::sidebar::update_workspace(&workspace, cx, move |workspace, cx| {
+                            workspace.confirm_remove_project(dialog, cx);
+                        });
+                    }
+                },
+            );
+
+        self.remove_dialog = Some(RemoveDialog {
+            view,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    fn close_remove_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.remove_dialog = None;
+        self.focus_nav(window, cx);
+        cx.notify();
+    }
+
+    /// The project is gone: drops its inputs and its nav row, and leaves its page.
+    pub(super) fn drop_project(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if index < self.inputs.projects.len() {
+            self.inputs.projects.remove(index);
+        }
+
+        let row = Page::SECTIONS.len() + index;
+        if row < self.nav_focus.len() {
+            self.nav_focus.remove(row);
+        }
+
+        match self.page {
+            Page::Project(shown) if shown == index => self.select_page(Page::Agents, cx),
+            Page::Project(shown) if shown > index => self.page = Page::Project(shown - 1),
+            _ => {}
+        }
+
+        if window.is_window_active() {
+            self.focus_nav(window, cx);
+        }
+        cx.notify();
     }
 
     pub(super) fn project_inputs(
@@ -2651,5 +2757,120 @@ mod tests {
         assert_eq!(sent[0].checks, ["make test", "make lint", "make fmt"]);
         assert_eq!(sent[1].copy, ["CLAUDE.local.md"]);
         assert_eq!(sent[1].teardown, "make clean");
+    }
+
+    fn two_projects(cx: &mut TestAppContext) -> (Rig, Requests) {
+        let (socket, seen) = daemon(project_reply);
+        let rig = rig(&socket, Vec::new(), vec![task_info(8, 6, "signup")], cx);
+
+        (rig, seen)
+    }
+
+    #[gpui::test]
+    fn the_remove_button_at_the_bottom_of_the_page_opens_the_dialog(cx: &mut TestAppContext) {
+        let (mut rig, _) = two_projects(cx);
+        rig.show(0);
+        assert!(!rig.is_on_screen("remove-project-confirm"));
+
+        rig.click("remove-project");
+
+        assert!(rig.is_on_screen("remove-project-confirm"));
+        assert!(rig.is_on_screen("remove-project-cancel"));
+        let asked = rig
+            .window
+            .read_with(&rig.cx, |settings, cx| {
+                settings
+                    .remove_dialog
+                    .as_ref()
+                    .map(|dialog| dialog.view.read(cx).project)
+            })
+            .expect("the settings window is open");
+        assert_eq!(asked, Some(ProjectId(0)));
+    }
+
+    #[gpui::test]
+    fn the_dialog_of_a_project_with_tasks_has_a_note_and_no_remove(cx: &mut TestAppContext) {
+        let (mut rig, _) = two_projects(cx);
+        rig.show(1);
+
+        rig.click("remove-project");
+
+        assert!(rig.is_on_screen("remove-project-note"));
+        assert!(!rig.is_on_screen("remove-project-confirm"));
+    }
+
+    #[gpui::test]
+    fn removing_the_project_of_the_page_switches_to_another_page(cx: &mut TestAppContext) {
+        let (mut rig, seen) = two_projects(cx);
+        rig.show(0);
+        rig.click("remove-project");
+
+        rig.click("remove-project-confirm");
+        let gone = wait_until(&mut rig.cx, |cx| {
+            redraw(cx);
+            cx.debug_bounds("remove-project-confirm").is_none()
+        });
+
+        assert!(gone, "the dialog stayed open");
+        assert_eq!(
+            count(&seen, |request| matches!(
+                request,
+                Request::RemoveProject { .. }
+            )),
+            1
+        );
+        let (page, inputs, nav, names) = rig
+            .window
+            .read_with(&rig.cx, |settings, cx| {
+                let names: Vec<String> = settings
+                    .state
+                    .read(cx)
+                    .projects
+                    .iter()
+                    .map(|entry| entry.project.name.to_string())
+                    .collect();
+
+                (
+                    settings.page,
+                    settings.inputs.projects.len(),
+                    settings.nav_focus.len(),
+                    names,
+                )
+            })
+            .expect("the settings window is open");
+        assert_eq!(page, Page::Agents);
+        assert_eq!(inputs, 1);
+        assert_eq!(nav, Page::SECTIONS.len() + 1);
+        assert_eq!(names, ["other"]);
+    }
+
+    #[gpui::test]
+    fn removing_a_project_above_the_page_keeps_the_page_on_its_project(cx: &mut TestAppContext) {
+        let (mut rig, _) = two_projects(cx);
+        rig.show(1);
+
+        rig.workspace.update(&mut rig.cx, |workspace, cx| {
+            workspace.project_removed(ProjectId(0), cx);
+        });
+        redraw(&mut rig.cx);
+
+        let (page, shown) = rig
+            .window
+            .read_with(&rig.cx, |settings, cx| {
+                let shown = match settings.page {
+                    Page::Project(index) => settings
+                        .state
+                        .read(cx)
+                        .projects
+                        .get(index)
+                        .map(|entry| entry.project.name.to_string()),
+                    _ => None,
+                };
+
+                (settings.page, shown)
+            })
+            .expect("the settings window is open");
+        assert_eq!(page, Page::Project(0));
+        assert_eq!(shown.as_deref(), Some("other"));
     }
 }

@@ -17,6 +17,10 @@ const VIEWS: [(View, &str); 3] = [
 /// The least room left for dragging the window by the header when tabs fill it.
 const MIN_DRAG_WIDTH: gpui::Pixels = px(32.);
 
+/// Room the header leaves for the traffic lights when the sidebar, which sits next to them,
+/// is hidden.
+const TRAFFIC_LIGHTS_CLEARANCE: gpui::Pixels = px(72.);
+
 pub(crate) fn render(
     workspace: &Workspace,
     window: &mut Window,
@@ -26,6 +30,9 @@ pub(crate) fn render(
         return h_flex()
             .size_full()
             .px(px(10.))
+            .when(!workspace.sidebar_visible, |bar| {
+                bar.pl(TRAFFIC_LIGHTS_CLEARANCE)
+            })
             .child(drag_region("tab-bar-drag", window, cx).flex_1().h_full())
             .into_any_element();
     }
@@ -40,6 +47,9 @@ pub(crate) fn render(
     h_flex()
         .size_full()
         .px(px(10.))
+        .when(!workspace.sidebar_visible, |bar| {
+            bar.pl(TRAFFIC_LIGHTS_CLEARANCE)
+        })
         .gap(px(4.))
         .child(task_tabs(workspace, cx))
         .child(

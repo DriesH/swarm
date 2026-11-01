@@ -2039,6 +2039,7 @@ pub(crate) mod tests {
             Request::DraftPr { call, .. }
             | Request::StopAgents { call }
             | Request::SaveProjectConfig { call, .. }
+            | Request::RemoveProject { call, .. }
             | Request::RunChecks { call, .. } => Some(Event::Done { call: *call }),
             Request::PrStatus { call, .. } => Some(Event::Error {
                 call: Some(*call),

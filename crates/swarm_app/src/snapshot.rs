@@ -33,6 +33,40 @@ fn open_start_empty(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<
     workspace.select_project(ProjectId(3), cx);
 }
 
+/// The menu of the "website" row, opened as the keyboard does: the row has focus and
+/// Shift-F10 is pressed. The projects get folders, so Open in Finder is on.
+fn open_project_menu(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    for project in &mut workspace.data.projects {
+        project.root = Some(Path::new("/Users/sam/personal").join(&*project.name));
+    }
+
+    let Some(row) = workspace.project_focus.get(&ProjectId(1)).cloned() else {
+        log::error!("the project row has no focus handle");
+        return;
+    };
+
+    window.focus(&row, cx);
+    window.dispatch_action(Box::new(swarm_ui::ShowContextMenu), cx);
+}
+
+/// The Remove dialog of a project that has open tasks.
+fn open_remove_project_with_tasks(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    workspace.open_remove_project(ProjectId(0), window, cx);
+}
+
+/// The Remove dialog of a project with no open task.
+fn open_remove_project(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    workspace.open_remove_project(ProjectId(3), window, cx);
+}
+
 /// Claude is rate limited for 24 minutes: its row keeps the old numbers and shows the wait.
 fn open_usage_rate_limited(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
     let mut usage = workspace.data.usage.clone();
@@ -821,6 +855,36 @@ pub(crate) fn run(directory: PathBuf, cx: &mut App) {
                 Appearance::Dark,
                 "workspace-new-task-dark.png",
                 Some(Workspace::open_new_task),
+            ),
+            (
+                Appearance::Light,
+                "workspace-project-menu-light.png",
+                Some(open_project_menu),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-project-menu-dark.png",
+                Some(open_project_menu),
+            ),
+            (
+                Appearance::Light,
+                "workspace-remove-project-light.png",
+                Some(open_remove_project),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-remove-project-dark.png",
+                Some(open_remove_project),
+            ),
+            (
+                Appearance::Light,
+                "workspace-remove-project-tasks-light.png",
+                Some(open_remove_project_with_tasks),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-remove-project-tasks-dark.png",
+                Some(open_remove_project_with_tasks),
             ),
             (
                 Appearance::Light,

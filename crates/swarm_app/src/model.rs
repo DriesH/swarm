@@ -1899,6 +1899,27 @@ impl FakeData {
         gone
     }
 
+    /// The names of the project's open tasks, in tab order. A Start or Plan tab is not one.
+    pub(crate) fn open_task_names(&self, project: ProjectId) -> Vec<SharedString> {
+        self.tasks_of(project)
+            .filter(|task| !task.is_start)
+            .map(|task| task.name.clone())
+            .collect()
+    }
+
+    /// Drops the project and what only it held. Remove its tabs first.
+    pub(crate) fn forget_project(&mut self, project: ProjectId) {
+        let daemon = self.project(project).and_then(|entry| entry.daemon);
+
+        self.projects.retain(|entry| entry.id != project);
+        self.github.remove(&project);
+
+        if let Some(daemon) = daemon {
+            self.messages_revision += 1;
+            self.messages.retain(|(owner, _), _| *owner != daemon);
+        }
+    }
+
     /// Keeps a message, up to the last [`MESSAGES_PER_TASK`] of its task, in id order.
     /// A copy of a kept message only fills in `delivered_at`.
     pub(crate) fn record_message(&mut self, info: &MessageInfo) {

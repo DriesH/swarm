@@ -618,6 +618,16 @@ impl SettingsWindow {
                     .debug_selector(|| "project-prompts".to_owned())
                     .child(section("Prompts", prompts))
             }))
+            .child(
+                h_flex().child(
+                    Button::new(("remove-project", index), "Remove project\u{2026}")
+                        .variant(ButtonVariant::SecondaryDestructive)
+                        .debug_selector(|| "remove-project".to_owned())
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_remove_project(index, window, cx);
+                        })),
+                ),
+            )
             .into_any_element()
     }
 
