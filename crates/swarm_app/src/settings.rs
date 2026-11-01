@@ -28,12 +28,13 @@ use swarm_ui::{ROOT_CONTEXT, SelectNext, SelectPrevious, TextFieldSize, scroll_f
 
 use self::prompts_page::PromptsPage;
 use self::usage_page::UsagePage;
-use crate::model::{FakeData, Project};
+use crate::model::{FakeData, Project, ProjectId};
 use crate::notifications::{self, Permission};
 use crate::remove_project::RemoveProjectDialog;
 use crate::system_check::SystemCheckView;
 use crate::window_drag::drag_region;
 use crate::workspace::Workspace;
+pub(crate) use pages::tilde;
 use project::{ProjectInputs, ProjectSave, ProjectSettings};
 
 actions!(swarm_app, [CloseSettings]);
@@ -305,7 +306,7 @@ pub(crate) enum Page {
     Appearance,
     Usage,
     Keyboard,
-    Project(usize),
+    Project(ProjectId),
 }
 
 impl Page {
@@ -332,24 +333,6 @@ impl Page {
             Self::Keyboard => "Keyboard",
             Self::Project(_) => "Project",
         }
-    }
-
-    /// Position in the nav: sections first, then projects.
-    fn nav_index(self) -> usize {
-        match self {
-            Self::Project(index) => Self::SECTIONS.len() + index,
-            section => Self::SECTIONS
-                .iter()
-                .position(|candidate| *candidate == section)
-                .unwrap_or(0),
-        }
-    }
-
-    fn from_nav_index(index: usize) -> Self {
-        Self::SECTIONS
-            .get(index)
-            .copied()
-            .unwrap_or_else(|| Self::Project(index - Self::SECTIONS.len()))
     }
 }
 
@@ -381,6 +364,8 @@ pub(crate) struct SettingsWindow {
     subscriptions: Vec<Subscription>,
     /// The dialog that asks before a project goes, while it shows.
     remove_dialog: Option<RemoveDialog>,
+    /// The Remove project button of the open page, where focus returns after the dialog.
+    remove_focus: FocusHandle,
 }
 
 struct RemoveDialog {
@@ -590,6 +575,7 @@ impl SettingsWindow {
             page_scroll: ScrollHandle::new(),
             subscriptions,
             remove_dialog: None,
+            remove_focus: cx.focus_handle().tab_stop(true),
         };
 
         for index in 0..projects.len() {
@@ -690,17 +676,45 @@ impl SettingsWindow {
         .detach();
     }
 
+    /// Position of the page in the nav: sections first, then projects.
+    fn nav_index(&self, page: Page, cx: &App) -> usize {
+        match page {
+            Page::Project(project) => {
+                Page::SECTIONS.len() + self.state.read(cx).index_of(project).unwrap_or(0)
+            }
+            section => Page::SECTIONS
+                .iter()
+                .position(|candidate| *candidate == section)
+                .unwrap_or(0),
+        }
+    }
+
+    fn page_at(&self, index: usize, cx: &App) -> Page {
+        if let Some(section) = Page::SECTIONS.get(index) {
+            return *section;
+        }
+
+        self.state
+            .read(cx)
+            .projects
+            .get(index - Page::SECTIONS.len())
+            .map_or(Page::Agents, |entry| Page::Project(entry.project.id))
+    }
+
     fn focus_nav(&self, window: &mut Window, cx: &mut App) {
-        if let Some(handle) = self.nav_focus.get(self.page.nav_index()) {
+        if let Some(handle) = self.nav_focus.get(self.nav_index(self.page, cx)) {
             window.focus(handle, cx);
         }
     }
 
     fn move_selection(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
         let last = self.nav_focus.len().saturating_sub(1);
-        let next = self.page.nav_index().saturating_add_signed(step).min(last);
+        let next = self
+            .nav_index(self.page, cx)
+            .saturating_add_signed(step)
+            .min(last);
 
-        self.page = Page::from_nav_index(next);
+        self.page = self.page_at(next, cx);
         self.page_scroll.set_offset(point(px(0.), px(0.)));
         self.refresh_permission(cx);
         self.refresh_system_check(cx);
@@ -711,20 +725,22 @@ impl SettingsWindow {
     }
 
     fn nav_row(&self, index: usize, cx: &Context<Self>) -> impl IntoElement + use<> {
-        let page = Page::from_nav_index(index);
+        let page = self.page_at(index, cx);
         let projects = self.state.read(cx).projects.clone();
 
         let (label, tile) = match page {
-            Page::Project(project) => match projects.get(project) {
-                Some(settings) => (
-                    settings.project.name.clone(),
-                    Some(
-                        ProjectTile::new(settings.project.letter, settings.project.tile_color)
-                            .size(px(16.)),
+            Page::Project(project) => {
+                match projects.iter().find(|entry| entry.project.id == project) {
+                    Some(settings) => (
+                        settings.project.name.clone(),
+                        Some(
+                            ProjectTile::new(settings.project.letter, settings.project.tile_color)
+                                .size(px(16.)),
+                        ),
                     ),
-                ),
-                None => (SharedString::default(), None),
-            },
+                    None => (SharedString::default(), None),
+                }
+            }
             section => (SharedString::from(section.title()), None),
         };
 
@@ -1192,7 +1208,13 @@ fn open_window(
         .and_then(|registry| registry.window);
     if let Some(handle) = open
         && handle
-            .update(cx, |_, window, _| window.activate_window())
+            .update(cx, |settings, window, cx| {
+                window.activate_window();
+
+                if let Some(projects) = &projects {
+                    settings.add_projects(projects, cx);
+                }
+            })
             .is_ok()
     {
         return Ok(handle);
@@ -1271,7 +1293,7 @@ pub(crate) fn shown_page(cx: &App) -> Option<Page> {
 /// The workspace removed a project: its page, its inputs and its nav row go, and the window
 /// leaves the page if it showed it. It waits for the current update to end, as the removal
 /// may come from a dialog of the settings window itself.
-pub(crate) fn project_removed(project: crate::model::ProjectId, cx: &mut App) {
+pub(crate) fn project_removed(project: ProjectId, cx: &mut App) {
     cx.defer(move |cx| {
         let Some((state, window)) = cx
             .try_global::<Registry>()
@@ -1286,7 +1308,7 @@ pub(crate) fn project_removed(project: crate::model::ProjectId, cx: &mut App) {
 
         if let Some(window) = window
             && let Err(error) = window.update(cx, |settings, window, cx| {
-                settings.drop_project(index, window, cx);
+                settings.drop_project(project, index, window, cx);
             })
         {
             log::debug!("the settings closed before the project went: {error}");
@@ -1323,7 +1345,7 @@ const SNAPSHOT_PAGES: [(Page, &str, Size<Pixels>, Permission); 12] = [
         Permission::Allowed,
     ),
     (
-        Page::Project(0),
+        Page::Project(ProjectId(0)),
         "project",
         size(px(1280.), px(1180.)),
         Permission::Allowed,
@@ -1553,7 +1575,7 @@ mod tests {
 
         window
             .update(cx, |settings, _, cx| {
-                settings.select_page(Page::Project(1), cx);
+                settings.select_page(Page::Project(ProjectId(1)), cx);
             })
             .expect("window is open");
         let project = window
@@ -1561,7 +1583,7 @@ mod tests {
             .expect("window is open");
 
         assert_eq!(section, Page::Notifications);
-        assert_eq!(project, Page::Project(1));
+        assert_eq!(project, Page::Project(ProjectId(1)));
     }
 
     // The test platform panics in `start_window_move`, so a panic means a move began.
@@ -1841,7 +1863,7 @@ mod tests {
 
     fn project_at(name: &'static str, root: &str) -> Project {
         Project {
-            id: crate::model::ProjectId(0),
+            id: ProjectId(0),
             name: name.into(),
             letter: 'D',
             tile_color: gpui::rgb(0x0058_90e0).into(),

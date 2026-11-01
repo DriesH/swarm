@@ -533,6 +533,25 @@ impl SettingsState {
         }
     }
 
+    /// Lists the projects of the workspace as they are now. A project not listed yet gets an
+    /// entry at the end; the others keep theirs. Returns where the new entries are.
+    pub(super) fn add_projects(&mut self, projects: &[Project]) -> Vec<usize> {
+        let mut added = Vec::new();
+
+        for project in projects {
+            if let Some(entry) = self.project_mut(project.id) {
+                entry.project = project.clone();
+                continue;
+            }
+
+            added.push(self.projects.len());
+            self.projects.push(ProjectSettings::new(project.clone()));
+            self.saves.push(ProjectSave::default());
+        }
+
+        added
+    }
+
     /// Drops the entry of a removed project, with the save it waited for. Returns where it was.
     pub(super) fn remove_project(
         &mut self,
@@ -542,18 +561,26 @@ impl SettingsState {
         let index = self.index_of(id)?;
 
         self.projects.remove(index);
+
         if index < self.saves.len() {
             self.saves.remove(index);
         }
+
         cx.notify();
 
         Some(index)
     }
 
-    fn index_of(&self, id: ProjectId) -> Option<usize> {
+    pub(super) fn index_of(&self, id: ProjectId) -> Option<usize> {
         self.projects
             .iter()
             .position(|entry| entry.project.id == id)
+    }
+
+    fn project_mut(&mut self, id: ProjectId) -> Option<&mut ProjectSettings> {
+        self.projects
+            .iter_mut()
+            .find(|entry| entry.project.id == id)
     }
 
     /// The daemon connection, while it holds.
@@ -984,9 +1011,34 @@ impl SettingsState {
 impl SettingsWindow {
     /// Reads the config of the project the page shows.
     pub(super) fn open_project(&mut self, cx: &mut Context<Self>) {
-        if let Page::Project(index) = self.page {
+        let Page::Project(id) = self.page else {
+            return;
+        };
+
+        if let Some(index) = self.state.read(cx).index_of(id) {
             self.load_project(index, cx);
         }
+    }
+
+    /// Lists the projects of the workspace. A new one gets its nav row and its inputs.
+    pub(super) fn add_projects(&mut self, projects: &[Project], cx: &mut Context<Self>) {
+        let added = self.state.update(cx, |state, cx| {
+            let added = state.add_projects(projects);
+            cx.notify();
+
+            added
+        });
+
+        for index in added {
+            self.nav_focus.push(cx.focus_handle().tab_stop(true));
+
+            if let Some(inputs) = self.project_inputs(index, cx) {
+                self.inputs.projects.push(inputs);
+                self.sync_inputs(index, cx);
+            }
+        }
+
+        cx.notify();
     }
 
     pub(super) fn load_project(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -1047,11 +1099,13 @@ impl SettingsWindow {
             log::warn!("the settings have no workspace to remove the project from");
             return;
         };
-        let Some((name, open_tasks)) = workspace.read(cx).remove_project_facts(project) else {
+        let Some((name, root)) = workspace.read(cx).remove_project_facts(project) else {
             return;
         };
 
-        let view = cx.new(|cx| RemoveProjectDialog::new(project, name, open_tasks, window, cx));
+        let view = cx.new(|cx| RemoveProjectDialog::new(project, name, root, window, cx));
+        let checked = view.clone();
+        let asked = workspace.clone();
         let workspace = workspace.downgrade();
         let subscription =
             cx.subscribe_in(
@@ -1074,17 +1128,29 @@ impl SettingsWindow {
             _subscription: subscription,
         });
         cx.notify();
+
+        asked.update(cx, |workspace, cx| {
+            workspace.check_remove_project(&checked, cx);
+        });
     }
 
+    /// Closes the dialog. Focus goes back to the Remove project button that opened it.
     fn close_remove_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.remove_dialog = None;
-        self.focus_nav(window, cx);
+
+        if matches!(self.page, Page::Project(_)) {
+            window.focus(&self.remove_focus, cx);
+        } else {
+            self.focus_nav(window, cx);
+        }
+
         cx.notify();
     }
 
     /// The project is gone: drops its inputs and its nav row, and leaves its page.
     pub(super) fn drop_project(
         &mut self,
+        project: ProjectId,
         index: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1098,10 +1164,8 @@ impl SettingsWindow {
             self.nav_focus.remove(row);
         }
 
-        match self.page {
-            Page::Project(shown) if shown == index => self.select_page(Page::Agents, cx),
-            Page::Project(shown) if shown > index => self.page = Page::Project(shown - 1),
-            _ => {}
+        if self.page == Page::Project(project) {
+            self.select_page(Page::Agents, cx);
         }
 
         if window.is_window_active() {
@@ -1116,6 +1180,7 @@ impl SettingsWindow {
         cx: &mut Context<Self>,
     ) -> Option<ProjectInputs> {
         let project = self.state.read(cx).projects.get(index)?.clone();
+        let id = project.project.id;
         let state = self.state.clone();
 
         let worktree_folder = field("Worktree folder", &project.worktree_folder, true, cx);
@@ -1124,7 +1189,7 @@ impl SettingsWindow {
             &worktree_folder,
             &state,
             move |state, text| {
-                if let Some(project) = state.projects.get_mut(index) {
+                if let Some(project) = state.project_mut(id) {
                     project.worktree_folder = text;
                 }
             },
@@ -1137,7 +1202,7 @@ impl SettingsWindow {
             &port_range,
             &state,
             move |state, text| {
-                if let Some(project) = state.projects.get_mut(index) {
+                if let Some(project) = state.project_mut(id) {
                     project.port_range = text;
                 }
             },
@@ -1151,7 +1216,7 @@ impl SettingsWindow {
             &ports_per_worktree,
             &state,
             move |state, text| {
-                if let Some(project) = state.projects.get_mut(index) {
+                if let Some(project) = state.project_mut(id) {
                     project.ports_per_worktree = text;
                 }
             },
@@ -1172,7 +1237,7 @@ impl SettingsWindow {
                 if let TextInputEvent::Changed(text) = event {
                     let text = text.to_string();
                     this.state.update(cx, |state, cx| {
-                        if let Some(project) = state.projects.get_mut(index) {
+                        if let Some(project) = state.project_mut(id) {
                             project.setup_script = text;
                             cx.notify();
                         }
@@ -1181,8 +1246,8 @@ impl SettingsWindow {
             },
         ));
 
-        let copy = Self::list_inputs(index, List::Copy, &project.copy_files, cx);
-        let checks = Self::list_inputs(index, List::Checks, &project.checks, cx);
+        let copy = Self::list_inputs(id, List::Copy, &project.copy_files, cx);
+        let checks = Self::list_inputs(id, List::Checks, &project.checks, cx);
 
         Some(ProjectInputs {
             worktree_folder,
@@ -1195,7 +1260,7 @@ impl SettingsWindow {
     }
 
     fn list_inputs(
-        project: usize,
+        project: ProjectId,
         list: List,
         items: &[String],
         cx: &mut Context<Self>,
@@ -1207,8 +1272,10 @@ impl SettingsWindow {
             .collect()
     }
 
+    /// The row's subscription finds its project by id when the text changes, as the
+    /// project may have moved in the list since the row was made.
     fn list_input(
-        project: usize,
+        project: ProjectId,
         list: List,
         index: usize,
         text: &str,
@@ -1220,8 +1287,11 @@ impl SettingsWindow {
             let TextInputEvent::Changed(text) = event else {
                 return;
             };
+            let Some(position) = this.state.read(cx).index_of(project) else {
+                return;
+            };
 
-            let index = this.inputs.projects.get(project).and_then(|inputs| {
+            let index = this.inputs.projects.get(position).and_then(|inputs| {
                 inputs
                     .list(list)
                     .iter()
@@ -1231,7 +1301,7 @@ impl SettingsWindow {
             if let Some(index) = index {
                 let text = text.to_string();
                 this.state.update(cx, |state, cx| {
-                    state.set_item(project, list, index, text, cx);
+                    state.set_item(position, list, index, text, cx);
                 });
             }
         });
@@ -1262,12 +1332,21 @@ impl SettingsWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(id) = self
+            .state
+            .read(cx)
+            .projects
+            .get(project)
+            .map(|entry| entry.project.id)
+        else {
+            return;
+        };
         let next = self
             .inputs
             .projects
             .get(project)
             .map_or(0, |inputs| inputs.list(list).len());
-        let row = Self::list_input(project, list, next, "", cx);
+        let row = Self::list_input(id, list, next, "", cx);
         let focus = row.input.read(cx).focus_handle(cx);
 
         if let Some(inputs) = self.inputs.projects.get_mut(project) {
@@ -1352,6 +1431,15 @@ impl SettingsWindow {
         let Some(inputs) = self.inputs.projects.get(project) else {
             return;
         };
+        let Some(id) = self
+            .state
+            .read(cx)
+            .projects
+            .get(project)
+            .map(|entry| entry.project.id)
+        else {
+            return;
+        };
 
         let shown: Vec<String> = inputs
             .list(list)
@@ -1360,7 +1448,7 @@ impl SettingsWindow {
             .collect();
 
         if shown != items {
-            let rebuilt = Self::list_inputs(project, list, items, cx);
+            let rebuilt = Self::list_inputs(id, list, items, cx);
 
             if let Some(inputs) = self.inputs.projects.get_mut(project) {
                 *inputs.list_mut(list) = rebuilt;
@@ -1446,6 +1534,20 @@ mod tests {
             .iter()
             .filter_map(|request| match request {
                 Request::SaveProjectConfig { base, .. } => Some(base.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The project and the fields of each save.
+    fn saved_to(seen: &Requests) -> Vec<(DaemonProjectId, ProjectConfigFields)> {
+        seen.lock()
+            .expect("lock the requests")
+            .iter()
+            .filter_map(|request| match request {
+                Request::SaveProjectConfig {
+                    project, fields, ..
+                } => Some((*project, fields.clone())),
                 _ => None,
             })
             .collect()
@@ -1599,11 +1701,22 @@ mod tests {
     }
 
     impl Rig {
+        /// The page of the project at place `index` in the list.
+        fn page_of(&self, index: usize) -> Page {
+            let id = self
+                .state
+                .read_with(&self.cx, |state, _| state.projects[index].project.id);
+
+            Page::Project(id)
+        }
+
         /// Opens the page of project number `index`.
         fn show(&mut self, index: usize) {
+            let page = self.page_of(index);
+
             self.window
                 .update(&mut self.cx, |settings, _, cx| {
-                    settings.select_page(Page::Project(index), cx);
+                    settings.select_page(page, cx);
                 })
                 .expect("the settings window is open");
             redraw(&mut self.cx);
@@ -1611,9 +1724,11 @@ mod tests {
 
         /// Opens the page and draws it, before the daemon can answer.
         fn show_without_waiting(&mut self, index: usize) {
+            let page = self.page_of(index);
+
             self.window
                 .update(&mut self.cx, |settings, _, cx| {
-                    settings.select_page(Page::Project(index), cx);
+                    settings.select_page(page, cx);
                 })
                 .expect("the settings window is open");
             self.cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -2766,6 +2881,26 @@ mod tests {
         (rig, seen)
     }
 
+    /// Opens the dialog from the button of the page and waits for its check.
+    fn open_remove_dialog(rig: &mut Rig) {
+        rig.click("remove-project");
+        let window = rig.window;
+
+        let ready = wait_until(&mut rig.cx, |cx| {
+            redraw(cx);
+
+            window
+                .read_with(cx, |settings, cx| {
+                    settings
+                        .remove_dialog
+                        .as_ref()
+                        .is_some_and(|dialog| dialog.view.read(cx).confirmed().is_some())
+                })
+                .unwrap_or(false)
+        });
+        assert!(ready, "the check never came");
+    }
+
     #[gpui::test]
     fn the_remove_button_at_the_bottom_of_the_page_opens_the_dialog(cx: &mut TestAppContext) {
         let (mut rig, _) = two_projects(cx);
@@ -2789,21 +2924,45 @@ mod tests {
     }
 
     #[gpui::test]
-    fn the_dialog_of_a_project_with_tasks_has_a_note_and_no_remove(cx: &mut TestAppContext) {
-        let (mut rig, _) = two_projects(cx);
+    fn the_dialog_of_a_project_with_tasks_lists_them_and_keeps_remove(cx: &mut TestAppContext) {
+        let (socket, _seen) = daemon(|request| match request {
+            Request::CheckRemoveProject { call, .. } => Some(Event::RemoveCheck {
+                call: *call,
+                check: swarm_protocol::RemoveCheck {
+                    tasks: vec![swarm_protocol::TaskCloseCheck {
+                        task: DaemonTaskId(8),
+                        name: "signup".to_owned(),
+                        check: swarm_protocol::CloseCheck::default(),
+                    }],
+                },
+            }),
+            other => project_reply(other),
+        });
+        let mut rig = rig(&socket, Vec::new(), vec![task_info(8, 6, "signup")], cx);
         rig.show(1);
 
-        rig.click("remove-project");
+        open_remove_dialog(&mut rig);
 
-        assert!(rig.is_on_screen("remove-project-note"));
-        assert!(!rig.is_on_screen("remove-project-confirm"));
+        let lines = rig
+            .window
+            .read_with(&rig.cx, |settings, cx| {
+                settings
+                    .remove_dialog
+                    .as_ref()
+                    .map(|dialog| dialog.view.read(cx).lines())
+            })
+            .expect("the settings window is open")
+            .unwrap_or_default();
+        let texts: Vec<_> = lines.iter().map(|(text, _)| text.as_str()).collect();
+        assert_eq!(texts, ["Closes 1 task: signup"]);
+        assert!(rig.is_on_screen("remove-project-confirm"));
     }
 
     #[gpui::test]
     fn removing_the_project_of_the_page_switches_to_another_page(cx: &mut TestAppContext) {
         let (mut rig, seen) = two_projects(cx);
         rig.show(0);
-        rig.click("remove-project");
+        open_remove_dialog(&mut rig);
 
         rig.click("remove-project-confirm");
         let gone = wait_until(&mut rig.cx, |cx| {
@@ -2845,24 +3004,52 @@ mod tests {
     }
 
     #[gpui::test]
-    fn removing_a_project_above_the_page_keeps_the_page_on_its_project(cx: &mut TestAppContext) {
+    fn cancel_gives_focus_back_to_the_remove_project_button(cx: &mut TestAppContext) {
         let (mut rig, _) = two_projects(cx);
+        rig.show(0);
+        open_remove_dialog(&mut rig);
+
+        rig.click("remove-project-cancel");
+
+        let focus = rig
+            .window
+            .read_with(&rig.cx, |settings, _| settings.remove_focus.clone())
+            .expect("the settings window is open");
+        let on_button = rig.cx.update(|window, _| focus.is_focused(window));
+        assert!(!rig.is_on_screen("remove-project-confirm"));
+        assert!(on_button, "focus did not return to Remove project");
+    }
+
+    #[gpui::test]
+    fn removing_a_project_above_the_page_keeps_the_page_on_its_project(cx: &mut TestAppContext) {
+        let (mut rig, seen) = two_projects(cx);
         rig.show(1);
+        let state = rig.state.clone();
+        let loaded = wait_until(&mut rig.cx, |cx| {
+            redraw(cx);
+
+            state.read_with(cx, |state, _| state.projects[1].load == Load::Ready)
+        });
+        assert!(loaded);
 
         rig.workspace.update(&mut rig.cx, |workspace, cx| {
             workspace.project_removed(ProjectId(0), cx);
         });
         redraw(&mut rig.cx);
+        rig.edit_folder(".moved");
+        rig.pause(Duration::from_millis(300));
+        let saved = rig.wait_for_requests(&seen, |seen| save_count(seen) == 1);
 
         let (page, shown) = rig
             .window
             .read_with(&rig.cx, |settings, cx| {
                 let shown = match settings.page {
-                    Page::Project(index) => settings
+                    Page::Project(id) => settings
                         .state
                         .read(cx)
                         .projects
-                        .get(index)
+                        .iter()
+                        .find(|entry| entry.project.id == id)
                         .map(|entry| entry.project.name.to_string()),
                     _ => None,
                 };
@@ -2870,7 +3057,108 @@ mod tests {
                 (settings.page, shown)
             })
             .expect("the settings window is open");
-        assert_eq!(page, Page::Project(0));
+        assert_eq!(page, Page::Project(ProjectId(1)));
         assert_eq!(shown.as_deref(), Some("other"));
+        assert!(saved, "the edit was not saved");
+        let sent: Vec<_> = saved_to(&seen)
+            .into_iter()
+            .map(|(project, fields)| (project, fields.worktree_folder))
+            .collect();
+        assert_eq!(sent, [(DaemonProjectId(6), ".moved".to_owned())]);
+    }
+
+    /// Three projects with the page of the second one loaded, and the first one removed.
+    fn after_the_first_of_three_went(cx: &mut TestAppContext) -> (Rig, Requests) {
+        let (socket, seen) = daemon(project_reply);
+        let workspace = connected_workspace(&socket, cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.use_projects(
+                &[
+                    project_info(5, "first", Vec::new()),
+                    project_info(6, "second", Vec::new()),
+                    project_info(7, "third", Vec::new()),
+                ],
+                cx,
+            );
+        });
+        let mut rig = settings_window(workspace, cx);
+        rig.show(1);
+        let state = rig.state.clone();
+        let loaded = wait_until(&mut rig.cx, |cx| {
+            redraw(cx);
+
+            state.read_with(cx, |state, _| state.projects[1].load == Load::Ready)
+        });
+        assert!(loaded);
+
+        rig.workspace.update(&mut rig.cx, |workspace, cx| {
+            workspace.project_removed(ProjectId(0), cx);
+        });
+        redraw(&mut rig.cx);
+
+        (rig, seen)
+    }
+
+    #[gpui::test]
+    fn an_edit_after_a_removal_goes_to_its_own_project_and_not_the_next_one(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut rig, seen) = after_the_first_of_three_went(cx);
+
+        rig.edit_folder(".second");
+        rig.pause(Duration::from_millis(300));
+        let saved = rig.wait_for_requests(&seen, |seen| save_count(seen) == 1);
+
+        let folders = rig.state.read_with(&rig.cx, |state, _| {
+            state
+                .projects
+                .iter()
+                .map(|entry| entry.worktree_folder.clone())
+                .collect::<Vec<_>>()
+        });
+        let sent: Vec<_> = saved_to(&seen)
+            .into_iter()
+            .map(|(project, fields)| (project, fields.worktree_folder))
+            .collect();
+        assert!(saved, "the edit was not saved");
+        assert_eq!(sent, [(DaemonProjectId(6), ".second".to_owned())]);
+        assert_eq!(
+            folders,
+            [".second", ""],
+            "the edit reached the third project"
+        );
+    }
+
+    #[gpui::test]
+    fn a_check_typed_after_a_removal_goes_to_its_own_project_and_not_the_next_one(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut rig, seen) = after_the_first_of_three_went(cx);
+        let check = rig.input(|inputs| inputs.checks[0].input.clone());
+
+        rig.type_into(&check, "make fmt");
+        rig.pause(Duration::from_millis(300));
+        let saved = rig.wait_for_requests(&seen, |seen| save_count(seen) == 1);
+
+        let checks = rig.state.read_with(&rig.cx, |state, _| {
+            state
+                .projects
+                .iter()
+                .map(|entry| entry.checks.clone())
+                .collect::<Vec<_>>()
+        });
+        let sent: Vec<_> = saved_to(&seen)
+            .into_iter()
+            .map(|(project, fields)| (project, fields.checks))
+            .collect();
+        assert!(saved, "the edit was not saved");
+        assert_eq!(
+            sent,
+            [(
+                DaemonProjectId(6),
+                vec!["make fmt".to_owned(), "make lint".to_owned()]
+            )]
+        );
+        assert!(checks[1].is_empty(), "the edit reached the third project");
     }
 }

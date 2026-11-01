@@ -948,16 +948,51 @@ mod tests {
         assert!(windows[0].downcast::<SettingsWindow>().is_some());
     }
 
+    gpui::actions!(swarm_app_test, [Unhandled]);
+
     #[gpui::test]
     fn an_action_the_main_window_cannot_handle_is_dropped_and_does_not_loop(
         cx: &mut TestAppContext,
     ) {
         let (workspace, cx) = app(cx);
+        cx.update(|_, cx| forward::<Unhandled>(cx));
+        redraw(cx);
+        let handled = cx.update(|window, cx| window.is_action_available(&Unhandled, cx));
+
+        cx.update(|_, cx| cx.dispatch_action(&Unhandled));
+        cx.run_until_parked();
+
+        assert!(!handled, "the main window handles the action");
+        assert!(workspace.read_with(cx, |workspace, _| workspace.sidebar_visible));
+        assert_eq!(cx.windows().len(), 1);
+    }
+
+    #[gpui::test]
+    fn a_blurred_window_gets_focus_back_so_the_menu_still_works(cx: &mut TestAppContext) {
+        let (workspace, cx) = app(cx);
         cx.update(gpui::Window::blur);
+        redraw(cx);
         redraw(cx);
 
         choose("View", "Toggle Sidebar", cx);
 
+        assert!(!workspace.read_with(cx, |workspace, _| workspace.sidebar_visible));
+    }
+
+    #[gpui::test]
+    fn the_view_menu_brings_the_sidebar_back_after_its_button_hid_it(cx: &mut TestAppContext) {
+        let (workspace, cx) = app(cx);
+        let button = cx
+            .debug_bounds("toggle-sidebar")
+            .expect("the sidebar button is on screen");
+        cx.simulate_click(button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        redraw(cx);
+        let hidden = !workspace.read_with(cx, |workspace, _| workspace.sidebar_visible);
+
+        choose("View", "Toggle Sidebar", cx);
+
+        assert!(hidden);
         assert!(workspace.read_with(cx, |workspace, _| workspace.sidebar_visible));
     }
 

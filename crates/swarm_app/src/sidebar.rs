@@ -31,6 +31,7 @@ pub(crate) fn render(
 
     v_flex()
         .id("sidebar")
+        .track_focus(&workspace.sidebar_focus)
         .role(Role::Navigation)
         .aria_label("Projects and agents")
         .size_full()
@@ -249,7 +250,7 @@ fn project_row(
     project_menu(id, project, row, cx)
 }
 
-/// The row with its context menu: Open in Finder, Project settings and Remove project.
+/// The row with its context menu: Show in Finder, Project settings and Remove project.
 fn project_menu(
     id: ProjectId,
     project: &Project,
@@ -269,7 +270,7 @@ fn project_menu(
 
             menu.width(px(200.))
                 .item(
-                    MenuItem::new("open-in-finder", "Open in Finder")
+                    MenuItem::new("show-in-finder", "Show in Finder")
                         .icon(IconName::Folder)
                         .disabled(folder.is_none())
                         .on_select(move |_, cx| {
@@ -316,10 +317,8 @@ impl Workspace {
     pub(crate) fn open_project_settings(&self, project: ProjectId, cx: &mut Context<Self>) {
         let page = self
             .data
-            .projects
-            .iter()
-            .position(|entry| entry.id == project)
-            .map(Page::Project);
+            .project(project)
+            .map(|entry| Page::Project(entry.id));
 
         self.open_settings(page, cx);
     }
@@ -1170,7 +1169,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn open_in_finder_reveals_the_folder_of_the_project(cx: &mut TestAppContext) {
+    fn show_in_finder_reveals_the_folder_of_the_project(cx: &mut TestAppContext) {
         let (_, cx) = menu_setup(cx);
         let revealed: Rc<RefCell<Vec<PathBuf>>> = Rc::default();
         cx.update(|_, cx| {
@@ -1190,7 +1189,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn open_in_finder_is_off_for_a_project_without_a_folder(cx: &mut TestAppContext) {
+    fn show_in_finder_is_off_for_a_project_without_a_folder(cx: &mut TestAppContext) {
         let (workspace, cx) = menu_setup(cx);
         workspace.update(cx, |workspace, _| {
             if let Some(project) = workspace.data.projects.get_mut(1) {
@@ -1210,7 +1209,7 @@ mod tests {
         open_menu(cx);
         let menu = bounds_of("project-menu-1-menu", cx);
 
-        // Border and padding take 6 px; Open in Finder is the first item, 34 px high.
+        // Border and padding take 6 px; Show in Finder is the first item, 34 px high.
         cx.simulate_click(
             menu.origin + point(px(40.), px(6. + 17.)),
             gpui::Modifiers::none(),
@@ -1231,9 +1230,53 @@ mod tests {
 
         assert_eq!(
             cx.update(|_, cx| crate::settings::shown_page(cx)),
-            Some(Page::Project(1))
+            Some(Page::Project(ProjectId(1)))
         );
         assert!(!menu_is_open(cx));
+    }
+
+    #[gpui::test]
+    fn project_settings_of_a_project_added_while_settings_is_open_shows_its_page(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = menu_setup(cx);
+        workspace.update(cx, |workspace, cx| workspace.open_settings(None, cx));
+        settle(cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.data.projects.push(Project {
+                id: ProjectId(4),
+                name: "added".into(),
+                letter: 'A',
+                tile_color: gpui::rgb(0x0058_90e0).into(),
+                base_branch: "main".into(),
+                daemon: None,
+                root: Some(PathBuf::from("/tmp/added")),
+                config_error: None,
+            });
+            cx.notify();
+        });
+        settle(cx);
+
+        let pointer = bounds_of("project-row-4", cx).center();
+        right_click(pointer, cx);
+        cx.simulate_keystrokes("down enter");
+        settle(cx);
+
+        assert_eq!(
+            cx.update(|_, cx| crate::settings::shown_page(cx)),
+            Some(Page::Project(ProjectId(4)))
+        );
+        let window = cx
+            .windows()
+            .into_iter()
+            .find_map(|window| window.downcast::<crate::settings::SettingsWindow>())
+            .expect("the settings window is open");
+        let mut settings = VisualTestContext::from_window(window.into(), cx);
+        settle(&mut settings);
+        assert!(
+            settings.debug_bounds("remove-project").is_some(),
+            "the page of the new project is empty"
+        );
     }
 
     #[gpui::test]

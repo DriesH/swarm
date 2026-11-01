@@ -261,6 +261,7 @@ impl Workspace {
     pub(crate) fn use_projects(&mut self, projects: &[ProjectInfo], cx: &mut Context<Self>) {
         if self.source == DataSource::Live {
             self.data.sync_projects(projects);
+            self.drop_unlisted_projects(projects, cx);
             self.close_ended_start_tabs(projects, cx);
             cx.notify();
             return;
@@ -287,6 +288,26 @@ impl Workspace {
         }
 
         cx.notify();
+    }
+
+    /// Drops the projects the daemon no longer lists, as when it removed one after the app
+    /// stopped waiting for the answer. Their tabs and terminals go with them.
+    fn drop_unlisted_projects(&mut self, projects: &[ProjectInfo], cx: &mut Context<Self>) {
+        let gone: Vec<ProjectId> = self
+            .data
+            .projects
+            .iter()
+            .filter(|project| {
+                project
+                    .daemon
+                    .is_some_and(|daemon| projects.iter().all(|info| info.id != daemon))
+            })
+            .map(|project| project.id)
+            .collect();
+
+        for project in gone {
+            self.project_removed(project, cx);
+        }
     }
 
     /// Takes a fresh daemon connection with the window the workspace shows in.
@@ -2035,6 +2056,10 @@ pub(crate) mod tests {
             Request::Prompts { call, .. } => Some(Event::Prompts {
                 call: *call,
                 prompts: Vec::new(),
+            }),
+            Request::CheckRemoveProject { call, .. } => Some(Event::RemoveCheck {
+                call: *call,
+                check: swarm_protocol::RemoveCheck::default(),
             }),
             Request::DraftPr { call, .. }
             | Request::StopAgents { call }
@@ -3890,7 +3915,7 @@ pub(crate) mod tests {
         clippy::disallowed_methods,
         reason = "the fake daemon answers on its own thread"
     )]
-    fn answer_late() {
+    pub(crate) fn answer_late() {
         std::thread::sleep(Duration::from_millis(500));
     }
 

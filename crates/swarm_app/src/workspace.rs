@@ -85,6 +85,8 @@ pub(crate) struct Workspace {
     pub view: View,
     pub right_panel: Option<RightPanel>,
     pub(crate) sidebar_visible: bool,
+    /// Tracks focus inside the sidebar, so hiding it can take focus back.
+    pub(crate) sidebar_focus: FocusHandle,
     pub minimized: HashSet<TerminalId>,
     pub focused_terminal: Option<TerminalId>,
     focus_handle: FocusHandle,
@@ -160,6 +162,7 @@ pub(crate) struct Workspace {
     _activation_subscription: Subscription,
     /// Reads Reduce Motion again each time the window becomes active.
     _motion_subscription: Subscription,
+    _focus_lost_subscription: Subscription,
     pub(crate) swarm_clock: Option<gpui::Task<()>>,
     /// Refreshes the usage card's time text. Runs only while the card shows a time.
     pub(crate) usage_clock: Option<gpui::Task<()>>,
@@ -265,6 +268,7 @@ impl Workspace {
             view: View::Terminals,
             right_panel: Some(RightPanel::Changes),
             sidebar_visible: true,
+            sidebar_focus: cx.focus_handle(),
             minimized: HashSet::new(),
             focused_terminal,
             focus_handle,
@@ -316,6 +320,7 @@ impl Workspace {
             polled_task: None,
             _activation_subscription: activation_subscription,
             _motion_subscription: motion_subscription,
+            _focus_lost_subscription: Self::restore_focus_when_lost(window, cx),
             swarm_clock: None,
             usage_clock: None,
             review,
@@ -347,6 +352,22 @@ impl Workspace {
         workspace
     }
 
+    /// Gives focus back when it is lost: to the sidebar when the focused element of it went,
+    /// and to the workspace when nothing has focus at all. Without it, Tab and the shortcuts
+    /// would do nothing. A focus that waits for its element to show, as in a dialog or in
+    /// Review, is left alone.
+    fn restore_focus_when_lost(window: &mut Window, cx: &mut Context<Self>) -> Subscription {
+        cx.on_focus_lost(window, |this, window, cx| {
+            let target = match window.focus_lost_restore_target(cx) {
+                Some(parent) if parent == this.sidebar_focus => parent,
+                _ if window.focused(cx).is_none() => this.focus_handle.clone(),
+                _ => return,
+            };
+
+            window.focus(&target, cx);
+        })
+    }
+
     fn observe_activation(window: &mut Window, cx: &mut Context<Self>) -> Subscription {
         cx.observe_window_activation(window, |this, window, cx| {
             #[cfg(test)]
@@ -373,6 +394,7 @@ impl Workspace {
         self.window = Some(window.window_handle());
         self._activation_subscription = Self::observe_activation(window, cx);
         self._motion_subscription = swarm_ui::motion::follow_reduce_motion(window, cx);
+        self._focus_lost_subscription = Self::restore_focus_when_lost(window, cx);
         self.pending_focus = self.focused_terminal;
         window.focus(&self.focus_handle, cx);
         self.reattach_terminals(cx);
@@ -493,8 +515,13 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Shows the sidebar, or hides it when it shows.
-    pub(crate) fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+    /// Shows the sidebar, or hides it when it shows. Focus inside a hidden sidebar goes to the
+    /// workspace.
+    pub(crate) fn toggle_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sidebar_visible && self.sidebar_focus.contains_focused(window, cx) {
+            window.focus(&self.focus_handle, cx);
+        }
+
         self.sidebar_visible = !self.sidebar_visible;
 
         cx.notify();
@@ -747,8 +774,8 @@ impl Workspace {
                 .on_action(cx.listener(|this, _: &CloseTask, window, cx| {
                     this.open_close_task(this.active_task, window, cx);
                 }))
-                .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
-                    this.toggle_sidebar(cx);
+                .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| {
+                    this.toggle_sidebar(window, cx);
                 }))
                 .on_action(cx.listener(|this, _: &OpenSettings, _, cx| {
                     this.open_settings(None, cx);
@@ -1218,5 +1245,61 @@ mod tests {
         let panel = workspace.read_with(cx, |workspace, _| workspace.visible_panel());
 
         assert_eq!(panel, Some(RightPanel::PullRequest));
+    }
+
+    fn nothing_has_focus(cx: &mut VisualTestContext) -> bool {
+        cx.update(|window, cx| window.focused(cx).is_none())
+    }
+
+    #[gpui::test]
+    fn after_the_toggle_button_hides_the_sidebar_the_keys_and_actions_still_work(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = setup(cx);
+        redraw(cx);
+        let button = cx
+            .debug_bounds("toggle-sidebar")
+            .expect("the sidebar button is on screen");
+
+        cx.simulate_click(button.center(), gpui::Modifiers::none());
+        redraw(cx);
+        let hidden = workspace.read_with(cx, |workspace, _| !workspace.sidebar_visible);
+        let focus_lost = nothing_has_focus(cx);
+
+        cx.simulate_keystrokes("cmd-k");
+        redraw(cx);
+        let palette = workspace.read_with(cx, |workspace, _| workspace.overlay.is_some());
+        cx.simulate_keystrokes("escape");
+        cx.dispatch_action(ToggleSidebar);
+        redraw(cx);
+
+        assert!(hidden);
+        assert!(!focus_lost, "nothing has focus after the sidebar went");
+        assert!(palette, "Cmd-K does nothing");
+        assert!(workspace.read_with(cx, |workspace, _| workspace.sidebar_visible));
+    }
+
+    #[gpui::test]
+    fn focus_goes_to_the_workspace_when_the_focused_row_leaves_the_window(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        redraw(cx);
+        let row = workspace
+            .read_with(cx, |workspace, _| {
+                workspace.project_focus.get(&ProjectId(3)).cloned()
+            })
+            .expect("the project has a row");
+        cx.update(|window, cx| window.focus(&row, cx));
+        redraw(cx);
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.project_removed(ProjectId(3), cx);
+        });
+        redraw(cx);
+        redraw(cx);
+
+        cx.simulate_keystrokes("cmd-k");
+        redraw(cx);
+        let palette = workspace.read_with(cx, |workspace, _| workspace.overlay.is_some());
+        assert!(palette, "Cmd-K does nothing after the focused row went");
     }
 }
