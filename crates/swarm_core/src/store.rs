@@ -165,6 +165,9 @@ const MIGRATIONS: &[&str] = &[
         task INTEGER NOT NULL UNIQUE,
         merged_at INTEGER NOT NULL
     )",
+    // The pull request the user asked Swarm to merge. A queued merge lands later; only a
+    // pull request with this mark counts as merged through Swarm.
+    "ALTER TABLE tasks ADD COLUMN merge_requested_pr INTEGER",
 ];
 
 /// The hundredth merge is the one that makes the queen bee.
@@ -1301,6 +1304,27 @@ impl Store {
         )?;
 
         u32::try_from(count).map_err(|_| Error::Invalid(format!("task count {count} is invalid")))
+    }
+
+    /// Records that the user asked Swarm to merge pull request `number` of the task.
+    pub fn request_merge(&self, task: TaskId, number: u64) -> Result<(), Error> {
+        self.connection.execute(
+            "UPDATE tasks SET merge_requested_pr = ?1 WHERE id = ?2",
+            params![to_row(number)?, to_row(task.0)?],
+        )?;
+
+        Ok(())
+    }
+
+    /// Whether the user asked Swarm to merge pull request `number` of the task.
+    pub fn merge_requested(&self, task: TaskId, number: u64) -> Result<bool, Error> {
+        let found: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE id = ?1 AND merge_requested_pr = ?2",
+            params![to_row(task.0)?, to_row(number)?],
+            |row| row.get(0),
+        )?;
+
+        Ok(found > 0)
     }
 
     /// Records that the task's pull request merged through Swarm. Returns false when the
@@ -2837,6 +2861,67 @@ mod tests {
         assert!(store.record_merge(TaskId(8)).expect("other"));
 
         assert_eq!(store.merge_count().expect("count"), 2);
+    }
+
+    /// The migration that adds `merge_requested_pr` is the eighteenth.
+    const MERGE_REQUEST_MIGRATION: usize = 17;
+
+    #[test]
+    fn a_database_from_before_merge_requests_has_none() {
+        assert!(MIGRATIONS[MERGE_REQUEST_MIGRATION].contains("merge_requested_pr"));
+        let connection = Connection::open_in_memory().expect("connection");
+        for migration in &MIGRATIONS[..MERGE_REQUEST_MIGRATION] {
+            connection.execute_batch(migration).expect("old schema");
+        }
+        connection
+            .pragma_update(
+                None,
+                "user_version",
+                i64::try_from(MERGE_REQUEST_MIGRATION).expect("count"),
+            )
+            .expect("version");
+        connection
+            .execute_batch(
+                "INSERT INTO projects (path, name, added_at) VALUES ('/repo', 'repo', 1);
+                 INSERT INTO tasks (project, name, branch, base, worktree, ports, created_at)
+                     VALUES (1, 'old', 'swarm/old', 'main', '/repo/.worktrees/old', '', 1)",
+            )
+            .expect("old rows");
+
+        let store = Store::migrated(connection).expect("migrated");
+
+        assert!(!store.merge_requested(TaskId(1), 1).expect("requested"));
+        store.request_merge(TaskId(1), 1).expect("request");
+        assert!(store.merge_requested(TaskId(1), 1).expect("requested"));
+    }
+
+    #[test]
+    fn a_merge_request_belongs_to_one_pull_request_of_one_task() {
+        let (store, task) = store_with_task();
+        let project = store.list_projects().expect("projects")[0].id;
+        let other = store.add_task(&new_task(project, &[])).expect("other").id;
+        assert!(!store.merge_requested(task, 42).expect("before"));
+
+        store.request_merge(task, 42).expect("request");
+
+        assert!(store.merge_requested(task, 42).expect("same"));
+        assert!(
+            !store
+                .merge_requested(task, 43)
+                .expect("another pull request")
+        );
+        assert!(!store.merge_requested(other, 42).expect("another task"));
+    }
+
+    #[test]
+    fn a_merge_request_for_a_new_pull_request_replaces_the_old_one() {
+        let (store, task) = store_with_task();
+        store.request_merge(task, 42).expect("first");
+
+        store.request_merge(task, 43).expect("second");
+
+        assert!(!store.merge_requested(task, 42).expect("old"));
+        assert!(store.merge_requested(task, 43).expect("new"));
     }
 
     #[test]

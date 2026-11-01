@@ -5162,6 +5162,12 @@ impl FakeGh {
         std::fs::write(self.dir.join(format!("exit.{key}")), "1").expect("exit");
     }
 
+    /// The call works again after a `fail`.
+    fn recover(&self, key: &str) {
+        std::fs::remove_file(self.dir.join(format!("err.{key}"))).expect("err");
+        std::fs::remove_file(self.dir.join(format!("exit.{key}"))).expect("exit");
+    }
+
     /// GitHub's head of the pull request: a merge that names another commit fails.
     fn pull_request_head(&self, commit: &str) {
         std::fs::write(self.dir.join("head.pr"), commit).expect("head");
@@ -10537,10 +10543,9 @@ sleep 30"#,
 
     assert_eq!(fixture.read_when_written("buzz.code").trim(), "0");
     let printed = fixture.read_when_written("buzz.out");
-    assert!(printed.contains("\x1b[38;2;"), "{printed:?}");
-    assert!(
-        printed.ends_with("1 task \u{b7} 1 agent running\n13 PRs merged\n"),
-        "{printed:?}"
+    assert_eq!(
+        printed, "1 task \u{b7} 1 agent running\n13 PRs merged\n",
+        "a file gets the counts and no bee"
     );
 }
 
@@ -10584,6 +10589,139 @@ fn a_merge_that_fails_or_only_queues_is_not_counted_or_announced() {
 
     assert_eq!(stats.merged_prs, 1);
     assert_eq!(announced, [stats]);
+}
+
+#[test]
+fn a_queued_merge_is_counted_when_a_later_status_read_shows_it_merged() {
+    let mut env = env_with_pull_request(false);
+    let mut watcher = env.daemon.connect();
+    watcher.hello();
+    env.view("OPEN");
+    env.merge().expect("queued");
+    assert_eq!(watcher.stats_and_announcements().0.merged_prs, 0);
+
+    env.view("MERGED");
+    let pull_request = env.client.pr_status(env.task.id).expect("status");
+
+    assert_eq!(pull_request.state, swarm_protocol::PrState::Merged);
+    let (stats, announced) = watcher.stats_and_announcements();
+    assert_eq!(stats.merged_prs, 1);
+    assert_eq!(announced, [stats]);
+}
+
+#[test]
+fn a_queued_merge_is_counted_when_a_push_finds_it_merged() {
+    let mut env = env_with_pull_request(false);
+    env.view("OPEN");
+    env.merge().expect("queued");
+    env.commit_and_approve("late.txt");
+    env.view("MERGED");
+
+    let refused = env.update(false).expect_err("merged already");
+
+    assert_eq!(refused, "pull request #42 is merged already");
+    assert_eq!(env.client.stats().merged_prs, 1);
+}
+
+#[test]
+fn a_queued_merge_is_counted_when_creating_a_pull_request_finds_it_merged() {
+    let mut env = env_with_pull_request(false);
+    env.view("OPEN");
+    env.merge().expect("queued");
+    env.view("MERGED");
+
+    let refused = env.create().expect_err("merged already");
+
+    assert_eq!(refused, "pull request #42 is merged already");
+    assert_eq!(env.client.stats().merged_prs, 1);
+}
+
+#[test]
+fn a_merge_whose_follow_up_read_failed_is_counted_by_the_next_status() {
+    let mut env = env_with_pull_request(false);
+    env.view("MERGED");
+    env.gh.fail("pr-view", "network is down");
+
+    let failed = env.merge().expect_err("the read failed");
+
+    assert!(
+        failed.contains("gh merged, but Swarm could not read the pull request"),
+        "{failed}"
+    );
+    assert_eq!(env.client.stats().merged_prs, 0);
+
+    env.gh.recover("pr-view");
+    env.client.pr_status(env.task.id).expect("status");
+
+    assert_eq!(env.client.stats().merged_prs, 1);
+}
+
+#[test]
+fn a_merge_is_counted_once_however_often_it_is_seen() {
+    let mut env = env_with_pull_request(false);
+    let mut watcher = env.daemon.connect();
+    watcher.hello();
+    env.view("OPEN");
+    env.merge().expect("queued");
+    env.view("MERGED");
+
+    env.client.pr_status(env.task.id).expect("first read");
+    env.client.pr_status(env.task.id).expect("second read");
+    env.merge().expect("a retry of the merge");
+    env.client.pr_status(env.task.id).expect("third read");
+
+    let (stats, announced) = watcher.stats_and_announcements();
+    assert_eq!(stats.merged_prs, 1);
+    assert_eq!(announced, [stats], "announced once");
+}
+
+#[test]
+fn a_pull_request_merged_outside_swarm_is_not_counted() {
+    let mut env = env_with_pull_request(false);
+    let mut watcher = env.daemon.connect();
+    watcher.hello();
+    env.view("MERGED");
+
+    let pull_request = env.client.pr_status(env.task.id).expect("status");
+
+    assert_eq!(pull_request.state, swarm_protocol::PrState::Merged);
+    let (stats, announced) = watcher.stats_and_announcements();
+    assert_eq!(stats.merged_prs, 0);
+    assert!(announced.is_empty(), "{announced:?}");
+    assert!(env.gh.calls_of(&["pr", "merge"]).is_empty());
+}
+
+#[test]
+fn a_merge_request_for_a_closed_pull_request_does_not_count_the_next_one() {
+    let mut env = env_with_pull_request(false);
+    env.view("OPEN");
+    env.merge().expect("queued");
+    env.view("CLOSED");
+    env.gh
+        .answer("pr-create", "https://github.com/acme/widgets/pull/43\n");
+    env.create().expect("a closed pull request is replaced");
+
+    env.gh.answer("pr-view", &view_json(43, "MERGED"));
+    env.client.pr_status(env.task.id).expect("status");
+
+    assert_eq!(env.client.stats().merged_prs, 0);
+}
+
+#[test]
+fn a_queued_merge_is_counted_after_a_daemon_restart() {
+    let mut env = env_with_pull_request(false);
+    env.view("OPEN");
+    env.merge().expect("queued");
+
+    env.daemon.crash();
+    let restarted = Daemon::spawn_with(env.daemon.home.clone(), None, Some(&env.gh.path()));
+    restarted.wait_until_listening();
+    let mut client = restarted.connect();
+    client.hello();
+    env.view("MERGED");
+    client.pr_status(env.task.id).expect("status");
+
+    assert_eq!(client.stats().merged_prs, 1);
 }
 
 #[test]

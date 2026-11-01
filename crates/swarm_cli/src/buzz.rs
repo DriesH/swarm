@@ -1,7 +1,8 @@
-//! `swarm buzz`: a hidden command that prints the pixel bee in color. Inside an agent it
-//! also prints the swarm's counts. It never fails and always exits 0.
+//! `swarm buzz`: a hidden command that prints the pixel bee in color on a terminal. Inside
+//! an agent it also prints the swarm's counts. It never fails and always exits 0.
 
-use std::io::Write as _;
+use std::ffi::OsStr;
+use std::io::{IsTerminal as _, Write as _};
 use std::time::Duration;
 
 use swarm_protocol::SwarmStats;
@@ -18,18 +19,32 @@ const RESET: &str = "\x1b[0m";
 pub(crate) fn run() {
     let mut stdout = std::io::stdout();
 
-    // A closed stdout is the caller's business, not a failure of ours.
-    stdout
-        .write_all(bee().as_bytes())
-        .and_then(|()| stdout.flush())
-        .ok();
+    let color = wants_color(
+        stdout.is_terminal(),
+        std::env::var_os("NO_COLOR").as_deref(),
+        std::env::var_os("TERM").as_deref(),
+    );
+    if color {
+        print(&mut stdout, &bee());
+    }
 
     if let Some(stats) = swarm_stats() {
-        stdout
-            .write_all(counts_text(&stats).as_bytes())
-            .and_then(|()| stdout.flush())
-            .ok();
+        print(&mut stdout, &counts_text(&stats));
     }
+}
+
+/// Color only goes to a terminal that can show it. An empty `NO_COLOR` counts as unset
+/// (no-color.org).
+fn wants_color(is_terminal: bool, no_color: Option<&OsStr>, term: Option<&OsStr>) -> bool {
+    is_terminal && no_color.is_none_or(OsStr::is_empty) && term != Some(OsStr::new("dumb"))
+}
+
+/// A closed stdout is the caller's business, not a failure of ours.
+fn print(stdout: &mut std::io::Stdout, text: &str) {
+    stdout
+        .write_all(text.as_bytes())
+        .and_then(|()| stdout.flush())
+        .ok();
 }
 
 /// `None` outside an agent, and when the daemon does not answer.
@@ -178,6 +193,47 @@ mod tests {
         }
 
         shown
+    }
+
+    fn os(text: &str) -> &OsStr {
+        OsStr::new(text)
+    }
+
+    #[test]
+    fn a_terminal_that_shows_color_gets_the_bee() {
+        assert!(wants_color(true, None, Some(os("xterm-256color"))));
+        assert!(wants_color(true, None, None));
+    }
+
+    #[test]
+    fn output_that_is_not_a_terminal_gets_no_color() {
+        assert!(!wants_color(false, None, Some(os("xterm-256color"))));
+        assert!(!wants_color(false, None, None));
+    }
+
+    #[test]
+    fn no_color_turns_the_bee_off() {
+        assert!(!wants_color(
+            true,
+            Some(os("1")),
+            Some(os("xterm-256color"))
+        ));
+        assert!(!wants_color(
+            true,
+            Some(os("0")),
+            Some(os("xterm-256color"))
+        ));
+    }
+
+    #[test]
+    fn an_empty_no_color_counts_as_unset() {
+        assert!(wants_color(true, Some(os("")), Some(os("xterm-256color"))));
+    }
+
+    #[test]
+    fn a_dumb_terminal_gets_no_color() {
+        assert!(!wants_color(true, None, Some(os("dumb"))));
+        assert!(wants_color(true, None, Some(os("dumber"))));
     }
 
     #[test]

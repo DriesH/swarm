@@ -1414,36 +1414,27 @@ fn buzz_stats(tasks: u64, agents: u64, merged: u64) -> serde_json::Value {
     })
 }
 
-/// The lines of `swarm buzz` that are not the bee.
-fn lines_under_the_bee(output: &Output) -> Vec<String> {
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .skip(12)
-        .map(str::to_owned)
-        .collect()
-}
+const BUZZ_COUNTS: &str = "3 tasks \u{b7} 7 agents running\n14 PRs merged\n";
 
-fn assert_only_the_bee(output: &Output) {
-    let text = String::from_utf8_lossy(&output.stdout);
-
-    assert_eq!(output.status.code(), Some(0), "{text}");
-    assert_eq!(text.lines().count(), 12, "{text}");
-    assert!(text.contains("\x1b[38;2;"), "{text}");
+/// Stdout is a pipe in these tests, so `swarm buzz` prints no bee and no escape code.
+fn assert_prints_nothing(output: &Output) {
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
     assert!(output.stderr.is_empty(), "{:?}", output.stderr);
 }
 
 #[test]
-fn buzz_outside_an_agent_prints_only_the_bee_and_exits_zero() {
+fn buzz_outside_an_agent_prints_nothing_and_exits_zero() {
     let mut command = swarm();
     command.arg("buzz");
 
     let output = run(command, "");
 
-    assert_only_the_bee(&output);
+    assert_prints_nothing(&output);
 }
 
 #[test]
-fn buzz_inside_an_agent_prints_the_counts_under_the_bee() {
+fn buzz_inside_an_agent_prints_only_the_counts_when_output_is_not_a_terminal() {
     let (socket, daemon) = fake_daemon("buzz", vec![buzz_stats(3, 7, 14)]);
     let mut command = agent_command(&socket);
     command.arg("buzz");
@@ -1453,15 +1444,31 @@ fn buzz_inside_an_agent_prints_the_counts_under_the_bee() {
 
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("\x1b[38;2;"));
-    assert_eq!(
-        lines_under_the_bee(&output),
-        ["3 tasks \u{b7} 7 agents running", "14 PRs merged"]
-    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), BUZZ_COUNTS);
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0]["method"], "buzz");
     assert_eq!(requests[0]["agent"], 3);
     assert_eq!(requests[0]["token"], "tok");
+}
+
+#[test]
+fn buzz_prints_no_escape_code_when_output_is_not_a_terminal() {
+    let (socket, daemon) = fake_daemon("buzz-plain", vec![buzz_stats(3, 7, 14)]);
+    let mut command = agent_command(&socket);
+    command
+        .arg("buzz")
+        .env_remove("NO_COLOR")
+        .env("TERM", "xterm-256color");
+
+    let output = run(command, "");
+    daemon.join().expect("daemon");
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(!text.contains('\x1b'), "{text:?}");
+    assert!(
+        !text.contains('\u{2580}') && !text.contains('\u{2584}'),
+        "{text:?}"
+    );
 }
 
 #[test]
@@ -1474,23 +1481,23 @@ fn buzz_uses_the_singular_for_one() {
     daemon.join().expect("daemon");
 
     assert_eq!(
-        lines_under_the_bee(&output),
-        ["1 task \u{b7} 1 agent running", "1 PR merged"]
+        String::from_utf8_lossy(&output.stdout),
+        "1 task \u{b7} 1 agent running\n1 PR merged\n"
     );
 }
 
 #[test]
-fn buzz_with_a_socket_that_is_not_there_prints_the_bee_and_exits_zero() {
+fn buzz_with_a_socket_that_is_not_there_prints_nothing_and_exits_zero() {
     let mut command = agent_command(std::path::Path::new("/tmp/swc-does-not-exist.sock"));
     command.arg("buzz");
 
     let output = run(command, "");
 
-    assert_only_the_bee(&output);
+    assert_prints_nothing(&output);
 }
 
 #[test]
-fn buzz_with_a_refusing_daemon_prints_the_bee_and_exits_zero() {
+fn buzz_with_a_refusing_daemon_prints_nothing_and_exits_zero() {
     let (socket, daemon) = fake_daemon(
         "buzz-refused",
         vec![serde_json::json!({ "ok": false, "error": "no" })],
@@ -1501,11 +1508,11 @@ fn buzz_with_a_refusing_daemon_prints_the_bee_and_exits_zero() {
     let output = run(command, "");
     daemon.join().expect("daemon");
 
-    assert_only_the_bee(&output);
+    assert_prints_nothing(&output);
 }
 
 #[test]
-fn buzz_with_an_answer_it_cannot_read_prints_the_bee_and_exits_zero() {
+fn buzz_with_an_answer_it_cannot_read_prints_nothing_and_exits_zero() {
     let (socket, daemon) = fake_daemon(
         "buzz-garbled",
         vec![serde_json::json!({ "ok": true, "result": "many" })],
@@ -1516,7 +1523,7 @@ fn buzz_with_an_answer_it_cannot_read_prints_the_bee_and_exits_zero() {
     let output = run(command, "");
     daemon.join().expect("daemon");
 
-    assert_only_the_bee(&output);
+    assert_prints_nothing(&output);
 }
 
 #[test]
@@ -1526,7 +1533,89 @@ fn buzz_exits_zero_whatever_follows_it() {
 
     let output = run(command, "");
 
-    assert_only_the_bee(&output);
+    assert_prints_nothing(&output);
+}
+
+/// `command` with a pseudo-terminal as its stdout, through the system `script`. The
+/// terminal turns each `\n` into `\r\n` and `script` adds a few bytes before the output.
+#[cfg(target_os = "macos")]
+fn on_a_terminal(command: &Command) -> Command {
+    let mut wrapped = Command::new("/usr/bin/script");
+    wrapped
+        .args(["-q", "/dev/null"])
+        .arg(command.get_program())
+        .args(command.get_args());
+    for (name, value) in command.get_envs() {
+        match value {
+            Some(value) => wrapped.env(name, value),
+            None => wrapped.env_remove(name),
+        };
+    }
+
+    wrapped
+}
+
+/// `swarm buzz` as an agent, with a daemon that answers with the buzz counts.
+#[cfg(target_os = "macos")]
+fn buzz_on_a_terminal(name: &str, environment: &[(&str, &str)]) -> Output {
+    let (socket, daemon) = fake_daemon(name, vec![buzz_stats(3, 7, 14)]);
+    let mut command = agent_command(&socket);
+    command
+        .arg("buzz")
+        .env_remove("NO_COLOR")
+        .env("TERM", "xterm-256color");
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+
+    let output = run(on_a_terminal(&command), "");
+    daemon.join().expect("daemon");
+
+    output
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn buzz_on_a_terminal_prints_the_bee_in_color_and_the_counts() {
+    let output = buzz_on_a_terminal("buzz-terminal", &[]);
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{text:?}");
+    assert!(text.contains("\x1b[38;2;252;201;53m"), "{text:?}");
+    assert!(
+        text.ends_with("3 tasks \u{b7} 7 agents running\r\n14 PRs merged\r\n"),
+        "{text:?}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn buzz_on_a_terminal_prints_no_bee_when_no_color_is_set() {
+    let output = buzz_on_a_terminal("buzz-no-color", &[("NO_COLOR", "1")]);
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{text:?}");
+    assert!(!text.contains('\x1b'), "{text:?}");
+    assert!(!text.contains('\u{2580}'), "{text:?}");
+    assert!(
+        text.ends_with("3 tasks \u{b7} 7 agents running\r\n14 PRs merged\r\n"),
+        "{text:?}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn buzz_on_a_dumb_terminal_prints_no_bee() {
+    let output = buzz_on_a_terminal("buzz-dumb", &[("TERM", "dumb")]);
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{text:?}");
+    assert!(!text.contains('\x1b'), "{text:?}");
+    assert!(!text.contains('\u{2580}'), "{text:?}");
+    assert!(
+        text.ends_with("3 tasks \u{b7} 7 agents running\r\n14 PRs merged\r\n"),
+        "{text:?}"
+    );
 }
 
 #[test]

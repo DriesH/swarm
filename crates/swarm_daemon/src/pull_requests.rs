@@ -198,7 +198,9 @@ pub(crate) fn create(services: &Services, id: TaskId, request: &NewRequest) -> R
     };
 
     if let Some(link) = &task.pull_request {
-        match github.pull_request(&target, link.number)?.state {
+        let state = github.pull_request(&target, link.number)?.state;
+        count_requested_merge(services, id, link.number, state);
+        match state {
             PrState::Closed => {}
             PrState::Open => bail!(
                 "open pull request #{} exists; push changes instead",
@@ -290,6 +292,8 @@ pub(crate) fn update(services: &Services, id: TaskId, skip_checks: bool) -> Resu
         },
         number,
     )?;
+    count_requested_merge(services, id, number, current.state);
+
     match current.state {
         PrState::Open => {}
         PrState::Merged => bail!("pull request #{number} is merged already"),
@@ -424,13 +428,32 @@ fn open_pull_request(services: &Services, id: TaskId) -> Result<(TaskInfo, u64, 
 pub(crate) fn status(services: &Services, id: TaskId) -> Result<PullRequest> {
     let (task, number, repository) = open_pull_request(services, id)?;
 
-    Ok(services.pull_requests.github.pull_request(
+    let pull_request = services.pull_requests.github.pull_request(
         &Target {
             worktree: &task.worktree,
             repository: &repository,
         },
         number,
-    )?)
+    )?;
+    count_requested_merge(services, id, number, pull_request.state);
+
+    Ok(pull_request)
+}
+
+/// Counts the merge when a state read shows the pull request merged and the user asked
+/// Swarm to merge it. A queued merge lands later, and the read after `gh` can fail; any
+/// later read finds it. A pull request merged on GitHub without a request is not ours.
+fn count_requested_merge(services: &Services, id: TaskId, number: u64, state: PrState) {
+    if state != PrState::Merged {
+        return;
+    }
+
+    let requested = lock(&services.store).merge_requested(id, number);
+    match requested {
+        Ok(true) => stats::record_merge(services, id),
+        Ok(false) => {}
+        Err(error) => log::warn!("cannot read the merge request of task {}: {error}", id.0),
+    }
 }
 
 pub(crate) fn mark_ready(services: &Services, id: TaskId) -> Result<()> {
@@ -484,20 +507,23 @@ pub(crate) fn merge(services: &Services, id: TaskId, method: MergeMethod) -> Res
     };
     let github = &services.pull_requests.github;
 
+    // Before `gh` runs: it can merge and still fail, and a queued merge lands later.
+    lock(&services.store)
+        .request_merge(id, number)
+        .context("Swarm could not record the merge request")?;
     github.merge(&target, number, method, &head)?;
 
-    let merged = github
+    let state = github
         .pull_request(&target, number)
         .context("gh merged, but Swarm could not read the pull request")?
-        .state
-        == PrState::Merged;
-    if !merged {
+        .state;
+    count_requested_merge(services, id, number, state);
+
+    if state != PrState::Merged {
         broadcast_task(services, id)?;
 
         return Ok(());
     }
-
-    stats::record_merge(services, id);
 
     if let Err(error) = git::delete_remote_branch(&task.worktree, &task.branch, DELETE_TIMEOUT) {
         log::warn!("cannot delete the remote branch {}: {error}", task.branch);
