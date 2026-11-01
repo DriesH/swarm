@@ -5318,6 +5318,7 @@ dependencies = [
 name = "swarm_settings"
 version = "0.1.0"
 dependencies = [
+ "log",
  "serde",
  "swarm_protocol",
  "thiserror 2.0.21",

@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use serde::de::{DeserializeOwned, Deserializer};
 use serde::{Deserialize, Serialize};
 use swarm_protocol::{AgentKind, AgentRole, NoticeKind};
 use toml_edit::{DocumentMut, Item, Table, Value};
@@ -17,9 +18,10 @@ pub struct Settings {
     pub notifications: NotificationSettings,
 }
 
-/// Which notices become system notifications, and how they are delivered.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(default)]
+/// Which notices become system notifications, and how they are delivered. Reading never
+/// fails: a value that is not valid falls back to its default, and a line in the log
+/// says so. A typo here must not stop the daemon from starting agents.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 #[expect(
     clippy::struct_excessive_bools,
     reason = "each one is a switch in the settings file"
@@ -62,7 +64,38 @@ impl Default for NotificationSettings {
     }
 }
 
+impl<'de> Deserialize<'de> for NotificationSettings {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        toml::Value::deserialize(deserializer).map(Self::from_value)
+    }
+}
+
 impl NotificationSettings {
+    fn from_value(value: toml::Value) -> Self {
+        let toml::Value::Table(mut table) = value else {
+            log::warn!("[notifications] is not a table, so it uses the defaults");
+
+            return Self::default();
+        };
+        let defaults = Self::default();
+
+        Self {
+            needs_decision: take_or(&mut table, "needs_decision", defaults.needs_decision),
+            prompt: take_or(&mut table, "prompt", defaults.prompt),
+            ready_for_review: take_or(&mut table, "ready_for_review", defaults.ready_for_review),
+            broke: take_or(&mut table, "broke", defaults.broke),
+            sound: take_or(&mut table, "sound", defaults.sound),
+            dock_bounce: take_or(&mut table, "dock_bounce", defaults.dock_bounce),
+            mute_while_viewing: take_or(
+                &mut table,
+                "mute_while_viewing",
+                defaults.mute_while_viewing,
+            ),
+            menu_bar_dot: take_or(&mut table, "menu_bar_dot", defaults.menu_bar_dot),
+            projects: take_projects(&mut table),
+        }
+    }
+
     /// The trigger switch of this kind of notice.
     pub fn triggers(&self, kind: NoticeKind) -> bool {
         match kind {
@@ -90,6 +123,44 @@ impl NotificationSettings {
             self.projects.insert(key, mode);
         }
     }
+}
+
+/// The value under `key`, or `default` when it is missing or not valid.
+fn take_or<T: DeserializeOwned>(table: &mut toml::Table, key: &str, default: T) -> T {
+    let Some(value) = table.remove(key) else {
+        return default;
+    };
+
+    T::deserialize(value).unwrap_or_else(|error| {
+        log::warn!("notifications.{key} is not valid, so it uses the default: {error}");
+
+        default
+    })
+}
+
+/// The projects with a mode that is valid. A project whose mode is not valid is left out,
+/// which makes it [`ProjectMode::All`].
+fn take_projects(table: &mut toml::Table) -> BTreeMap<String, ProjectMode> {
+    let Some(value) = table.remove("projects") else {
+        return BTreeMap::new();
+    };
+    let toml::Value::Table(entries) = value else {
+        log::warn!("notifications.projects is not a table, so it uses the default");
+
+        return BTreeMap::new();
+    };
+
+    entries
+        .into_iter()
+        .filter_map(|(path, mode)| match ProjectMode::deserialize(mode) {
+            Ok(mode) => Some((path, mode)),
+            Err(error) => {
+                log::warn!("notifications.projects has no valid mode for {path}: {error}");
+
+                None
+            }
+        })
+        .collect()
 }
 
 /// What a project may notify about.
@@ -686,11 +757,63 @@ mod tests {
     }
 
     #[test]
-    fn a_mode_that_is_not_known_is_a_parse_error() {
-        let result: Result<Settings, _> =
-            toml::from_str("[notifications.projects]\n\"/work/swarm\" = \"loud\"\n");
+    fn a_bad_value_in_the_notifications_section_falls_back_and_the_rest_still_loads() {
+        let folder = temp_folder("bad-notifications");
+        let path = folder.join("settings.toml");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            &path,
+            "[agents]\norchestrator = \"codex\"\n\n[notifications]\nsound = \"yes\"\n\
+             broke = \"no\"\nprompt = false\n\n[notifications.projects]\n\
+             \"/repo\" = \"errors-only\"\n\"/work/swarm\" = \"off\"\n",
+        )
+        .unwrap();
 
-        assert!(result.is_err());
+        let loaded = load(&path).unwrap();
+        std::fs::remove_dir_all(&folder).unwrap();
+
+        assert_eq!(loaded.agents.orchestrator, AgentKindSetting::Codex);
+        assert!(!loaded.notifications.sound, "the default of sound");
+        assert!(loaded.notifications.broke, "the default of broke");
+        assert!(!loaded.notifications.prompt, "a valid value stays");
+        assert_eq!(
+            loaded.notifications.mode(Path::new("/repo")),
+            ProjectMode::All
+        );
+        assert_eq!(
+            loaded.notifications.mode(Path::new("/work/swarm")),
+            ProjectMode::Off
+        );
+    }
+
+    #[test]
+    fn a_notifications_section_of_the_wrong_shape_gives_the_defaults() {
+        for text in [
+            "notifications = 5\n",
+            "notifications = \"loud\"\n",
+            "[notifications]\nprojects = 3\n",
+        ] {
+            let settings: Settings = toml::from_str(text).unwrap();
+
+            assert_eq!(
+                settings.notifications,
+                NotificationSettings::default(),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bad_value_outside_the_notifications_section_still_fails() {
+        for text in [
+            "[agents]\norchestrator = \"gemini\"\n",
+            "[agents]\nskip_permissions = \"yes\"\n",
+            "[terminals]\nallow_worker_typing = \"yes\"\n",
+        ] {
+            let result: Result<Settings, _> = toml::from_str(text);
+
+            assert!(result.is_err(), "{text}");
+        }
     }
 
     #[test]
