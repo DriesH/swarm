@@ -4660,7 +4660,7 @@ pub(crate) mod tests {
 
     fn claude_usage(percent: u8) -> Usage {
         Usage {
-            claude: swarm_protocol::ProviderUsage {
+            claude: swarm_protocol::SubscriptionUsage {
                 windows: vec![swarm_protocol::UsageWindow {
                     label: "5h".into(),
                     used_percent: percent,

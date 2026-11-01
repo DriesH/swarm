@@ -9,9 +9,9 @@ use swarm_protocol::{
     AgentId as DaemonAgentId, AgentInfo, AgentLifecycle, AgentRole,
     AgentStatus as DaemonAgentStatus, CheckState, ChecksRun, CommentEvent, DiffStat, FileStat,
     GithubCheck, GithubCheckState, GithubStatus, LocalCheck, MessageId, MessageInfo, MessageKind,
-    PrDraft, PrLink, PrState, ProjectInfo, ProviderUsage, PullRequest, ReviewComment, ReviewSource,
-    ReviewState, Reviewer, TaskDiff, TaskInfo, TerminalId as DaemonTerminalId, TerminalInfo, Usage,
-    UsageWindow,
+    PrDraft, PrLink, PrState, ProjectInfo, PullRequest, ReviewComment, ReviewSource, ReviewState,
+    Reviewer, SubscriptionUsage, TaskDiff, TaskInfo, TerminalId as DaemonTerminalId, TerminalInfo,
+    Usage, UsageWindow,
 };
 use swarm_term::{BlockedKind, ExitStatus};
 use swarm_ui::AgentStatus;
@@ -604,7 +604,7 @@ fn sample_usage() -> Usage {
             resets_at,
         };
 
-        ProviderUsage {
+        SubscriptionUsage {
             windows: vec![
                 window("5h", five_hours, resets_at(resets_in_hours)),
                 window("7d", seven_days, resets_at(resets_in_hours + 72)),

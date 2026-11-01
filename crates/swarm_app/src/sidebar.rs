@@ -1,7 +1,7 @@
 //! Sidebar: projects, the open task's agents and the usage card.
 
 use gpui::{Context, FontWeight, Pixels, Role, Window, div, px};
-use swarm_protocol::{ProviderUsage, Usage, UsageProblem, UsageWindow};
+use swarm_protocol::{SubscriptionUsage, Usage, UsageProblem, UsageWindow};
 use swarm_ui::prelude::*;
 
 use crate::actions::ToggleCommandPalette;
@@ -457,7 +457,12 @@ fn usage_rows(usage: &Usage, now: u64) -> Vec<UsageRow> {
     .collect()
 }
 
-fn usage_row(id: &'static str, name: &str, reading: &ProviderUsage, now: u64) -> Option<UsageRow> {
+fn usage_row(
+    id: &'static str,
+    name: &str,
+    reading: &SubscriptionUsage,
+    now: u64,
+) -> Option<UsageRow> {
     let problem = reading
         .problem
         .as_ref()
@@ -492,7 +497,7 @@ fn usage_row(id: &'static str, name: &str, reading: &ProviderUsage, now: u64) ->
     Some(UsageRow {
         id,
         label,
-        percent: first.map(|window| window.used_percent),
+        percent: first.map(|window| shown_percent(window, now)),
         note,
         spoken,
     })
@@ -533,15 +538,27 @@ fn problem_text(problem: &UsageProblem, now: u64) -> Option<(String, String)> {
     Some(text)
 }
 
-/// For example "5 hour window 42%, resets in 2 hours".
+/// A window whose reset time has passed starts again at 0%, whatever was last read.
+fn shown_percent(window: &UsageWindow, now: u64) -> u8 {
+    if window.resets_at.is_some_and(|at| at <= now) {
+        0
+    } else {
+        window.used_percent
+    }
+}
+
+/// For example "5 hour window 42%, resets in 2 hours". A window that has reset has no
+/// reset note.
 fn spoken_window(window: &UsageWindow, now: u64) -> String {
     let name = window_name(&window.label);
-    let percent = window.used_percent;
+    let percent = shown_percent(window, now);
 
-    match window.resets_at.map(|at| at.saturating_sub(now)) {
-        None => format!("{name} {percent}%"),
-        Some(0) => format!("{name} {percent}%, resets now"),
-        Some(left) => format!("{name} {percent}%, resets in {}", Wait::new(left).spoken()),
+    match window.resets_at {
+        Some(at) if at > now => format!(
+            "{name} {percent}%, resets in {}",
+            Wait::new(at - now).spoken()
+        ),
+        _ => format!("{name} {percent}%"),
     }
 }
 
@@ -722,8 +739,8 @@ mod tests {
         }
     }
 
-    fn reading(windows: Vec<UsageWindow>, problem: Option<UsageProblem>) -> ProviderUsage {
-        ProviderUsage {
+    fn reading(windows: Vec<UsageWindow>, problem: Option<UsageProblem>) -> SubscriptionUsage {
+        SubscriptionUsage {
             windows,
             problem,
             ..Default::default()
@@ -918,6 +935,50 @@ mod tests {
         assert_eq!(
             rows[0].spoken,
             "Claude usage: 5 hour window 42%, resets in 10 minutes. Rate limited, retry in 24 minutes"
+        );
+    }
+
+    #[test]
+    fn a_window_that_has_reset_shows_zero_and_no_reset_note() {
+        let usage = Usage {
+            claude: reading(
+                vec![
+                    window("5h", 42, Some(NOW - 1)),
+                    window("7d", 18, Some(NOW + 3_600)),
+                ],
+                None,
+            ),
+            codex: reading(vec![window("5h", 90, Some(NOW))], None),
+        };
+
+        let rows = usage_rows(&usage, NOW);
+
+        assert_eq!(rows[0].percent, Some(0));
+        assert_eq!(
+            rows[0].spoken,
+            "Claude usage: 5 hour window 0%; 7 day window 18%, resets in 60 minutes"
+        );
+        assert_eq!(
+            rows[1].percent,
+            Some(0),
+            "a reset at this very second counts"
+        );
+        assert_eq!(rows[1].spoken, "Codex usage: 5 hour window 0%");
+    }
+
+    #[test]
+    fn a_window_that_has_not_reset_keeps_its_percent() {
+        let usage = Usage {
+            claude: reading(vec![window("5h", 42, Some(NOW + 1))], None),
+            ..Default::default()
+        };
+
+        let rows = usage_rows(&usage, NOW);
+
+        assert_eq!(rows[0].percent, Some(42));
+        assert_eq!(
+            rows[0].spoken,
+            "Claude usage: 5 hour window 42%, resets in 1 minute"
         );
     }
 

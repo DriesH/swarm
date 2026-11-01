@@ -701,10 +701,10 @@ pub enum UsageProblem {
 
 /// The usage of one CLI's subscription. A failed read keeps the last good windows.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
-pub struct ProviderUsage {
+pub struct SubscriptionUsage {
     /// Shortest window first.
     pub windows: Vec<UsageWindow>,
-    /// The plan name the provider reports, like `max` or `plus`.
+    /// The plan name of the subscription, like `max` or `plus`.
     pub plan: Option<String>,
     /// When `windows` was read, in Unix seconds. `None` before the first read.
     pub read_at: Option<u64>,
@@ -713,8 +713,8 @@ pub struct ProviderUsage {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct Usage {
-    pub claude: ProviderUsage,
-    pub codex: ProviderUsage,
+    pub claude: SubscriptionUsage,
+    pub codex: SubscriptionUsage,
 }
 
 /// What closing a task would throw away, so the app can ask first.
