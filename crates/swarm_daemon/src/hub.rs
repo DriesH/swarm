@@ -207,6 +207,10 @@ impl Clients {
         lock(&self.sinks).retain(|sink| sink.id() != client);
     }
 
+    pub(crate) fn count(&self) -> usize {
+        lock(&self.sinks).len()
+    }
+
     /// Sends the event to every client; clients that are gone or too slow are dropped.
     pub(crate) fn broadcast(&self, event: &Event) {
         let Some(frame) = encode_event(event) else {

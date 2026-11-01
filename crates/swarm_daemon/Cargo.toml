@@ -24,6 +24,7 @@ swarm_protocol.workspace = true
 swarm_settings.workspace = true
 swarm_term.workspace = true
 swarm_term_vt.workspace = true
+swarm_usage.workspace = true
 
 [dev-dependencies]
 rusqlite.workspace = true

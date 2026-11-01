@@ -18,7 +18,7 @@ use swarm_protocol::agent::{
 };
 use swarm_protocol::{
     AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, CreateTask, Event,
-    MessageKind, PrDraft, TaskId, TaskInfo, TerminalId,
+    MessageKind, PrDraft, TaskId, TaskInfo, TerminalId, UsageWindow,
 };
 
 use crate::Services;
@@ -238,8 +238,9 @@ impl Calls {
 
                 self.task_wait(caller, &ids, until, timeout_secs, gone)
             }
+            Call::RateLimits { windows } => self.rate_limits(caller, windows),
             // `handle` answers it before it gets here.
-            Call::AgentExit | Call::RateLimits { .. } => Ok(Value::Null),
+            Call::AgentExit => Ok(Value::Null),
 
             // The size is accepted and ignored: a process terminal follows its tile.
             Call::TerminalSpawn {
@@ -722,6 +723,16 @@ impl Calls {
                 body: body.to_owned(),
             },
         );
+
+        Ok(Value::Null)
+    }
+
+    fn rate_limits(&self, caller: &AgentInfo, windows: Vec<UsageWindow>) -> Outcome {
+        if caller.kind != AgentKind::ClaudeCode {
+            return refuse("only Claude Code agents send rate limits");
+        }
+
+        self.services.usage.status_line(windows);
 
         Ok(Value::Null)
     }

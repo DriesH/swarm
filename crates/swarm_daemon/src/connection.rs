@@ -55,6 +55,7 @@ pub(crate) fn serve(services: &Arc<Services>, client: u64, mut stream: UnixStrea
 
     if handshake(&sink, &mut reader, &mut buffer) {
         services.clients.add(&sink);
+        services.usage.client_connected();
 
         loop {
             match read::<Request>(&mut reader, &mut buffer) {
@@ -193,7 +194,7 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
         Request::Usage { call } => {
             sink.send_event(&Event::Usage {
                 call,
-                usage: swarm_protocol::Usage::default(),
+                usage: services.usage.current(),
             });
         }
         request @ (Request::TaskDiff { .. }

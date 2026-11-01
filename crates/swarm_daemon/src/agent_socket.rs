@@ -322,6 +322,7 @@ mod tests {
         use crate::messages::Messages;
         use crate::processes::Processes;
         use crate::pull_requests::PullRequests;
+        use crate::usage::{Overrides, UsageService};
 
         let store = Store::open_in_memory().expect("store");
         let project = store
@@ -380,6 +381,15 @@ mod tests {
                 Arc::clone(&agents),
             ),
             pull_requests: PullRequests::new(github, None),
+            usage: UsageService::start(
+                &std::env::temp_dir(),
+                Arc::clone(&clients),
+                Overrides {
+                    no_polling: true,
+                    ..Overrides::default()
+                },
+            )
+            .expect("usage"),
             terminals,
             projects,
             agents,

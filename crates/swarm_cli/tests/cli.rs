@@ -831,3 +831,246 @@ fn the_mcp_server_exits_when_stdin_closes_during_a_wait() {
     daemon.join().expect("the daemon saw the connection close");
     std::fs::remove_dir_all(dir).ok();
 }
+
+/// A Claude Code config folder with the given `settings.json`.
+fn claude_config(name: &str, settings: &str) -> PathBuf {
+    let dir = temp_dir(name);
+    std::fs::write(dir.join("settings.json"), settings).expect("settings");
+
+    dir
+}
+
+fn status_line_settings(command: &str) -> String {
+    serde_json::json!({"statusLine": {"type": "command", "command": command, "padding": 0}})
+        .to_string()
+}
+
+fn run_status_line(mut command: Command, input: &[u8]) -> Output {
+    let mut child = command
+        .arg("statusline")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start swarm");
+    let mut stdin = child.stdin.take().expect("stdin");
+    // The command may stop reading early when the input is too big.
+    stdin.write_all(input).ok();
+    drop(stdin);
+
+    child.wait_with_output().expect("wait")
+}
+
+const RATE_LIMITS_INPUT: &str = r#"{"model":{"id":"opus"},"rate_limits":{"five_hour":{"used_percentage":23.5,"resets_at":1793383200},"seven_day":{"used_percentage":41.2,"resets_at":1793900000}}}"#;
+
+#[test]
+fn the_status_line_chains_to_the_users_command_and_prints_its_output() {
+    let config = claude_config("chain", &status_line_settings("cat; printf ' | mine'"));
+    let mut command = swarm();
+    command.env("CLAUDE_CONFIG_DIR", &config);
+
+    let output = run_status_line(command, RATE_LIMITS_INPUT.as_bytes());
+    std::fs::remove_dir_all(&config).expect("cleanup");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("{RATE_LIMITS_INPUT} | mine"),
+        "the user's command gets the same input"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn the_status_line_reads_the_home_folder_without_a_config_dir() {
+    let home = temp_dir("home");
+    std::fs::create_dir_all(home.join(".claude")).expect("folder");
+    std::fs::write(
+        home.join(".claude/settings.json"),
+        status_line_settings("echo from-home"),
+    )
+    .expect("settings");
+    let mut command = swarm();
+    command.env_remove("CLAUDE_CONFIG_DIR").env("HOME", &home);
+
+    let output = run_status_line(command, b"{}");
+    std::fs::remove_dir_all(&home).expect("cleanup");
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "from-home\n");
+}
+
+#[test]
+fn the_status_line_prints_nothing_without_a_user_status_line() {
+    let config = claude_config("none", r#"{"model":"opus"}"#);
+    let mut command = swarm();
+    command.env("CLAUDE_CONFIG_DIR", &config);
+
+    let output = run_status_line(command, RATE_LIMITS_INPUT.as_bytes());
+    std::fs::remove_dir_all(&config).expect("cleanup");
+
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn the_status_line_does_not_run_swarm_statusline_as_the_users_command() {
+    let swarm_path = env!("CARGO_BIN_EXE_swarm");
+    for (name, command) in [
+        ("direct", format!("'{swarm_path}' statusline")),
+        (
+            "wrapped",
+            format!("sh -c '\"{swarm_path}\" statusline; echo wrapped'"),
+        ),
+    ] {
+        let config = claude_config(name, &status_line_settings(&command));
+        let mut run = swarm();
+        run.env("CLAUDE_CONFIG_DIR", &config);
+
+        let started = std::time::Instant::now();
+        let output = run_status_line(run, b"{}");
+        std::fs::remove_dir_all(&config).expect("cleanup");
+
+        assert!(output.status.success(), "{name}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{name}"
+        );
+        // The wrapper prints its own `echo`; the inner Swarm must print nothing.
+        let expected = if name == "wrapped" { "wrapped\n" } else { "" };
+        assert_eq!(String::from_utf8_lossy(&output.stdout), expected, "{name}");
+    }
+}
+
+#[test]
+fn a_slow_user_command_is_cut_off_and_still_exits_zero() {
+    let config = claude_config("slow", &status_line_settings("echo early; exec sleep 30"));
+    let mut command = swarm();
+    command.env("CLAUDE_CONFIG_DIR", &config);
+
+    let started = std::time::Instant::now();
+    let output = run_status_line(command, b"{}");
+    std::fs::remove_dir_all(&config).expect("cleanup");
+
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(started.elapsed() < std::time::Duration::from_secs(8));
+}
+
+#[test]
+fn input_over_256_kib_is_dropped_silently() {
+    let config = claude_config("big", &status_line_settings("echo mine"));
+    let mut command = swarm();
+    command.env("CLAUDE_CONFIG_DIR", &config);
+    let input = vec![b' '; (256 << 10) + 1];
+
+    let output = run_status_line(command, &input);
+    std::fs::remove_dir_all(&config).expect("cleanup");
+
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn input_that_is_not_json_still_reaches_the_users_command() {
+    let config = claude_config("garbage", &status_line_settings("cat"));
+    let mut command = swarm();
+    command.env("CLAUDE_CONFIG_DIR", &config);
+
+    let output = run_status_line(command, b"not json");
+    std::fs::remove_dir_all(&config).expect("cleanup");
+
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"not json");
+}
+
+#[test]
+fn the_status_line_sends_the_rate_limits_to_the_daemon() {
+    let dir = temp_dir("limits");
+    let socket = dir.join("agent.sock");
+    let listener = UnixListener::bind(&socket).expect("bind");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().expect("clone"))
+            .read_line(&mut line)
+            .expect("line");
+        stream.write_all(b"{\"ok\":true}\n").expect("answer");
+
+        line
+    });
+    let config = claude_config("limits-config", &status_line_settings("echo mine"));
+    let mut command = swarm();
+    command
+        .env("CLAUDE_CONFIG_DIR", &config)
+        .env("SWARM_SOCKET", &socket)
+        .env("SWARM_AGENT_ID", "7")
+        .env("SWARM_TOKEN", "secret");
+
+    let output = run_status_line(command, RATE_LIMITS_INPUT.as_bytes());
+    let line = server.join().expect("server");
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+    std::fs::remove_dir_all(&config).expect("cleanup");
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "mine\n");
+    let request: serde_json::Value = serde_json::from_str(&line).expect("json");
+    assert_eq!(request["method"], "rate_limits");
+    assert_eq!(request["agent"], 7);
+    assert_eq!(request["token"], "secret");
+    assert_eq!(
+        request["params"]["windows"],
+        serde_json::json!([
+            {"label": "5h", "used_percent": 24, "resets_at": 1_793_383_200_u64},
+            {"label": "7d", "used_percent": 41, "resets_at": 1_793_900_000_u64},
+        ])
+    );
+}
+
+#[test]
+fn the_status_line_sends_nothing_without_rate_limits() {
+    let dir = temp_dir("no-limits");
+    let socket = dir.join("agent.sock");
+    let listener = UnixListener::bind(&socket).expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let mut command = swarm();
+    command
+        .env("CLAUDE_CONFIG_DIR", "/nonexistent")
+        .env("SWARM_SOCKET", &socket)
+        .env("SWARM_AGENT_ID", "7")
+        .env("SWARM_TOKEN", "secret");
+
+    let output = run_status_line(command, br#"{"model":{"id":"opus"}}"#);
+    let connection = listener.accept();
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+
+    assert!(output.status.success());
+    let error = connection.expect_err("nobody should have connected");
+    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+}
+
+#[test]
+fn the_status_line_survives_a_daemon_that_is_not_there() {
+    let config = claude_config("no-daemon", &status_line_settings("echo mine"));
+    let mut command = swarm();
+    command
+        .env("CLAUDE_CONFIG_DIR", &config)
+        .env("SWARM_SOCKET", "/tmp/swc-does-not-exist.sock")
+        .env("SWARM_AGENT_ID", "7")
+        .env("SWARM_TOKEN", "secret");
+
+    let output = run_status_line(command, RATE_LIMITS_INPUT.as_bytes());
+    std::fs::remove_dir_all(&config).expect("cleanup");
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "mine\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn help_lists_the_statusline_command() {
+    let output = swarm().arg("--help").output().expect("run");
+
+    assert!(String::from_utf8_lossy(&output.stdout).contains("statusline"));
+}

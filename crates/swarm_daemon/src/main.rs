@@ -12,6 +12,7 @@ mod processes;
 mod pull_requests;
 mod recovery;
 mod tasks;
+mod usage;
 
 use std::fs::{DirBuilder, File, Permissions};
 use std::io::Read as _;
@@ -39,6 +40,7 @@ use crate::messages::Messages;
 use crate::processes::Processes;
 use crate::pull_requests::PullRequests;
 use crate::recovery::System;
+use crate::usage::{Overrides, UsageService};
 
 /// What every client connection works with.
 pub(crate) struct Services {
@@ -50,6 +52,7 @@ pub(crate) struct Services {
     pub(crate) processes: Arc<Processes>,
     pub(crate) checks: Arc<Checks>,
     pub(crate) pull_requests: PullRequests,
+    pub(crate) usage: Arc<UsageService>,
     pub(crate) store: Arc<Mutex<Store>>,
 }
 
@@ -59,6 +62,8 @@ struct Arguments {
     settings: Option<PathBuf>,
     /// A `gh` to use as it is, without looking for one (tests).
     gh: Option<PathBuf>,
+    /// Commands and timings for the usage poller (tests).
+    usage: Overrides,
 }
 
 /// How long terminals get to exit on SIGTERM before the daemon leaves anyway.
@@ -198,6 +203,8 @@ fn run() -> Result<()> {
         Arc::clone(&agents),
     );
 
+    let usage = UsageService::start(&paths.data, Arc::clone(&clients), arguments.usage)?;
+
     let services = Arc::new(Services {
         terminals,
         projects,
@@ -207,6 +214,7 @@ fn run() -> Result<()> {
         processes,
         checks,
         pull_requests: PullRequests::new(github, config_dir),
+        usage,
         store,
     });
 
@@ -221,30 +229,54 @@ fn run() -> Result<()> {
 }
 
 /// `--data-dir <folder>`, `--settings <file>` and `--gh <file>`, all optional.
+///
+/// These only exist for tests: `--usage-security`, `--usage-curl`, `--usage-codex` and
+/// `--usage-claude` (programs to use as they are), `--usage-tick-ms` and
+/// `--usage-codex-interval-ms` (timings), and `--no-usage-polling`.
 fn arguments() -> Result<Arguments> {
     let mut input = std::env::args_os().skip(1);
     let mut parsed = Arguments {
         data_dir: None,
         settings: None,
         gh: None,
+        usage: Overrides::default(),
     };
 
     while let Some(argument) = input.next() {
-        if argument == "--data-dir" {
-            let dir = input.next().context("--data-dir needs a folder")?;
-            parsed.data_dir = Some(PathBuf::from(dir));
-        } else if argument == "--settings" {
-            let file = input.next().context("--settings needs a file")?;
-            parsed.settings = Some(PathBuf::from(file));
-        } else if argument == "--gh" {
-            let file = input.next().context("--gh needs a file")?;
-            parsed.gh = Some(PathBuf::from(file));
-        } else {
-            anyhow::bail!("unknown argument {}", argument.to_string_lossy());
+        let name = argument.to_string_lossy().into_owned();
+        let mut value = || {
+            input
+                .next()
+                .with_context(|| format!("{name} needs a value"))
+        };
+
+        match name.as_str() {
+            "--data-dir" => parsed.data_dir = Some(PathBuf::from(value()?)),
+            "--settings" => parsed.settings = Some(PathBuf::from(value()?)),
+            "--gh" => parsed.gh = Some(PathBuf::from(value()?)),
+            "--usage-security" => parsed.usage.security = Some(PathBuf::from(value()?)),
+            "--usage-curl" => parsed.usage.curl = Some(PathBuf::from(value()?)),
+            "--usage-codex" => parsed.usage.codex = Some(PathBuf::from(value()?)),
+            "--usage-claude" => parsed.usage.claude = Some(PathBuf::from(value()?)),
+            "--usage-tick-ms" => parsed.usage.tick = Some(milliseconds(&name, &value()?)?),
+            "--usage-codex-interval-ms" => {
+                parsed.usage.codex_interval = Some(milliseconds(&name, &value()?)?);
+            }
+            "--no-usage-polling" => parsed.usage.no_polling = true,
+            _ => anyhow::bail!("unknown argument {name}"),
         }
     }
 
     Ok(parsed)
+}
+
+fn milliseconds(name: &str, value: &std::ffi::OsStr) -> Result<Duration> {
+    let value = value.to_string_lossy();
+    let count: u64 = value
+        .parse()
+        .with_context(|| format!("{name} needs a number of milliseconds, not {value}"))?;
+
+    Ok(Duration::from_millis(count))
 }
 
 /// `None` when another process holds the lock.
