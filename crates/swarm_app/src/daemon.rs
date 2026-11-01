@@ -9,8 +9,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    AppContext as _, Context, Entity, Focusable as _, PathPromptOptions, SharedString, Size,
-    Subscription, Window, px,
+    AppContext as _, AsyncApp, Context, Entity, Focusable as _, PathPromptOptions, SharedString,
+    Size, Subscription, WeakEntity, Window, px,
 };
 use swarm_protocol::{
     AgentChange, AgentId as DaemonAgentId, AgentInfo, AgentLifecycle, Client, ClientError,
@@ -114,23 +114,41 @@ impl LiveTerminal {
 type Connected = (Client, Vec<TerminalInfo>, Vec<ProjectInfo>);
 
 impl Workspace {
+    /// Runs `apply` with the window the workspace shows in, or with none while it has
+    /// none. The daemon connection outlives the window, so its work cannot need one.
+    fn update_with_window<R>(
+        this: &WeakEntity<Self>,
+        cx: &mut AsyncApp,
+        apply: impl FnOnce(&mut Self, Option<&mut Window>, &mut Context<Self>) -> R,
+    ) -> anyhow::Result<R> {
+        let window = this.read_with(cx, |workspace, _| workspace.window)?;
+
+        let Some(window) = window else {
+            return this.update(cx, |workspace, cx| apply(workspace, None, cx));
+        };
+
+        cx.update_window(window, |_, window, cx| {
+            this.update(cx, |workspace, cx| apply(workspace, Some(window), cx))
+        })?
+    }
+
     /// Connects on a background thread, starting the daemon when needed.
-    pub(crate) fn connect_daemon(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn connect_daemon(&mut self, cx: &mut Context<Self>) {
         match DaemonLaunch::detect() {
-            Ok(launch) => self.start_connect(launch, window, cx),
+            Ok(launch) => self.start_connect(launch, cx),
             Err(reason) => self.daemon_unavailable(reason, cx),
         }
     }
 
     /// Runs the connect again after it failed.
-    pub(crate) fn retry_daemon(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn retry_daemon(&mut self, cx: &mut Context<Self>) {
         if !matches!(self.source, DataSource::Unavailable { .. }) {
             return;
         }
 
         match self.daemon_launch.clone() {
-            Some(launch) => self.start_connect(launch, window, cx),
-            None => self.connect_daemon(window, cx),
+            Some(launch) => self.start_connect(launch, cx),
+            None => self.connect_daemon(cx),
         }
     }
 
@@ -142,40 +160,40 @@ impl Workspace {
         cx.notify();
     }
 
-    fn start_connect(&mut self, launch: DaemonLaunch, window: &mut Window, cx: &mut Context<Self>) {
+    fn start_connect(&mut self, launch: DaemonLaunch, cx: &mut Context<Self>) {
         self.daemon_launch = Some(launch.clone());
         self.source = DataSource::Connecting;
         cx.notify();
 
         let connecting = cx.background_spawn(async move { connect(&launch) });
 
-        cx.spawn_in(window, async move |this, cx| {
+        cx.spawn(async move |this, cx| {
             let result = connecting.await;
 
-            let used = this.update_in(cx, |workspace, window, cx| match result {
+            let used = Self::update_with_window(&this, cx, |workspace, window, cx| match result {
                 Ok((client, terminals, projects)) => {
                     workspace.use_projects(&projects, cx);
-                    workspace.use_daemon(client, &terminals, window, cx);
-                    Self::watch_daemon(window, cx);
+                    workspace.connect_client(client, &terminals, window, cx);
+                    Self::watch_daemon(cx);
                 }
                 Err(error) => workspace.daemon_unavailable(error.to_string(), cx),
             });
 
             if let Err(error) = used {
-                log::debug!("the window closed before the daemon answered: {error}");
+                log::debug!("the workspace is gone before the daemon answered: {error}");
             }
         })
         .detach();
     }
 
     /// Starts a reconnect as soon as the connection is found dead.
-    fn watch_daemon(window: &mut Window, cx: &mut Context<Self>) {
-        cx.spawn_in(window, async move |this, cx| {
+    fn watch_daemon(cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(WATCH_INTERVAL).await;
 
-                let checked = this.update_in(cx, |workspace, window, cx| {
-                    workspace.reconnect_daemon(window, cx);
+                let checked = this.update(cx, |workspace, cx| {
+                    workspace.reconnect_daemon(cx);
                 });
 
                 if checked.is_err() {
@@ -187,7 +205,7 @@ impl Workspace {
     }
 
     /// Tries again with a growing wait until the daemon answers, then reattaches.
-    pub(crate) fn reconnect_daemon(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn reconnect_daemon(&mut self, cx: &mut Context<Self>) {
         if self.reconnecting || self.daemon.as_ref().is_none_or(Client::is_connected) {
             return;
         }
@@ -200,7 +218,7 @@ impl Workspace {
         log::warn!("the daemon connection is lost, reconnecting");
         self.reconnecting = true;
 
-        cx.spawn_in(window, async move |this, cx| {
+        cx.spawn(async move |this, cx| {
             for attempt in 0.. {
                 cx.background_executor()
                     .timer(reconnect_delay(attempt))
@@ -222,14 +240,14 @@ impl Workspace {
                     }
                 };
 
-                let used = this.update_in(cx, |workspace, window, cx| {
+                let used = Self::update_with_window(&this, cx, |workspace, window, cx| {
                     workspace.reconnecting = false;
                     workspace.use_projects(&projects, cx);
-                    workspace.use_daemon(client, &terminals, window, cx);
+                    workspace.connect_client(client, &terminals, window, cx);
                 });
 
                 if let Err(error) = used {
-                    log::debug!("the window closed while reconnecting: {error}");
+                    log::debug!("the workspace is gone while reconnecting: {error}");
                 }
 
                 return;
@@ -271,9 +289,8 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Syncs the tiles with a fresh daemon connection: reattaches tiles whose terminal
-    /// still exists, removes the others, and adds tiles for new terminals of known
-    /// tasks.
+    /// Takes a fresh daemon connection with the window the workspace shows in.
+    #[cfg(test)]
     pub(crate) fn use_daemon(
         &mut self,
         client: Client,
@@ -281,9 +298,79 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.connect_client(client, terminals, Some(window), cx);
+    }
+
+    /// Takes a fresh daemon connection. Without a window only the data is taken: the
+    /// tiles follow when a window opens.
+    fn connect_client(
+        &mut self,
+        client: Client,
+        terminals: &[TerminalInfo],
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
         self.daemon = Some(client.clone());
         self.forget_comment_listing();
-        Self::watch_events(&client, window, cx);
+        Self::watch_events(&client, cx);
+
+        if let Some(window) = window {
+            self.sync_terminals(&client, terminals, window, cx);
+        } else {
+            self.drop_agent_terminals();
+            self.apply_pending_agents(None, cx);
+        }
+
+        self.load_usage(client.clone(), cx);
+        self.load_message_history(client, cx);
+
+        cx.notify();
+    }
+
+    /// Makes the terminal views again for a new window: the old ones were made for a window
+    /// that is gone. The daemon's list says which terminals still exist.
+    pub(crate) fn reattach_terminals(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.daemon.clone().filter(Client::is_connected) else {
+            return;
+        };
+
+        let listing = cx.background_spawn({
+            let client = client.clone();
+            async move { client.list() }
+        });
+
+        cx.spawn(async move |this, cx| {
+            let terminals = match listing.await {
+                Ok(terminals) => terminals,
+                Err(error) => {
+                    log::warn!("cannot list terminals for the new window: {error}");
+                    return;
+                }
+            };
+
+            let updated = Self::update_with_window(&this, cx, |workspace, window, cx| {
+                if let Some(window) = window {
+                    workspace.sync_terminals(&client, &terminals, window, cx);
+                }
+            });
+
+            if let Err(error) = updated {
+                log::debug!("the window closed before the terminals were listed: {error}");
+            }
+        })
+        .detach();
+    }
+
+    /// Syncs the tiles with the daemon's terminals: reattaches tiles whose terminal
+    /// still exists, removes the others, and adds tiles for new terminals of known
+    /// tasks.
+    pub(crate) fn sync_terminals(
+        &mut self,
+        client: &Client,
+        terminals: &[TerminalInfo],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.drop_agent_terminals();
 
         let listed: HashSet<DaemonTerminalId> = terminals
@@ -316,76 +403,50 @@ impl Workspace {
             }
         }
 
-        self.attach_new_terminals(&client, terminals, window, cx);
+        self.attach_new_terminals(client, terminals, window, cx);
         self.attach_agents(window, cx);
-        self.load_usage(client.clone(), cx);
-        self.load_message_history(client, cx);
-
-        cx.notify();
     }
 
-    /// Hands the daemon's broadcasts to the workspace, until the connection ends.
-    fn watch_events(client: &Client, window: &mut Window, cx: &mut Context<Self>) {
-        Self::forward(
-            client.agent_events(),
-            window,
-            cx,
-            |workspace, agent, window, cx| {
-                workspace.agent_changed(&agent, window, cx);
-            },
-        );
-        Self::forward(
-            client.task_events(),
-            window,
-            cx,
-            |workspace, task, window, cx| {
-                workspace.task_changed(&task, window, cx);
-            },
-        );
-        Self::forward(
-            client.terminal_events(),
-            window,
-            cx,
-            |workspace, terminal, window, cx| workspace.terminal_changed(&terminal, window, cx),
-        );
-        Self::forward(
-            client.message_events(),
-            window,
-            cx,
-            |workspace, event, _, cx| {
-                workspace.message_event(event, cx);
-            },
-        );
-        Self::forward(
-            client.comment_events(),
-            window,
-            cx,
-            |workspace, event, _, cx| {
-                workspace.comment_event(&event, cx);
-            },
-        );
-        Self::forward(client.pr_events(), window, cx, |workspace, event, _, cx| {
-            workspace.pr_event(event, cx);
+    /// Hands the daemon's broadcasts to the workspace, until the connection ends. They
+    /// keep coming while no window is open, so the menu bar stays current.
+    fn watch_events(client: &Client, cx: &mut Context<Self>) {
+        Self::forward(client.agent_events(), cx, |workspace, agent, window, cx| {
+            workspace.agent_changed(&agent, window, cx);
+        });
+        Self::forward(client.task_events(), cx, |workspace, task, window, cx| {
+            workspace.task_changed(&task, window, cx);
         });
         Self::forward(
-            client.usage_events(),
-            window,
+            client.terminal_events(),
             cx,
-            |workspace, usage, _, cx| {
-                workspace.usage_changed(usage, cx);
+            |workspace, terminal, window, cx| {
+                if let Some(window) = window {
+                    workspace.terminal_changed(&terminal, window, cx);
+                }
             },
         );
+        Self::forward(client.message_events(), cx, |workspace, event, _, cx| {
+            workspace.message_event(event, cx);
+        });
+        Self::forward(client.comment_events(), cx, |workspace, event, _, cx| {
+            workspace.comment_event(&event, cx);
+        });
+        Self::forward(client.pr_events(), cx, |workspace, event, _, cx| {
+            workspace.pr_event(event, cx);
+        });
+        Self::forward(client.usage_events(), cx, |workspace, usage, _, cx| {
+            workspace.usage_changed(usage, cx);
+        });
     }
 
     fn forward<T: 'static>(
         events: flume::Receiver<T>,
-        window: &mut Window,
         cx: &mut Context<Self>,
-        apply: impl Fn(&mut Self, T, &mut Window, &mut Context<Self>) + 'static,
+        apply: impl Fn(&mut Self, T, Option<&mut Window>, &mut Context<Self>) + 'static,
     ) {
-        cx.spawn_in(window, async move |this, cx| {
+        cx.spawn(async move |this, cx| {
             while let Ok(event) = events.recv_async().await {
-                let updated = this.update_in(cx, |workspace, window, cx| {
+                let updated = Self::update_with_window(&this, cx, |workspace, window, cx| {
                     apply(workspace, event, window, cx);
                 });
 
@@ -402,7 +463,7 @@ impl Workspace {
     pub(crate) fn agent_changed(
         &mut self,
         info: &AgentInfo,
-        window: &mut Window,
+        window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
         let Some((_, terminal)) = self.data.sync_agent(info) else {
@@ -420,7 +481,9 @@ impl Workspace {
         };
 
         self.pending_agents.remove(&info.id);
-        self.sync_agent_terminal(terminal, window, cx);
+        if let Some(window) = window {
+            self.sync_agent_terminal(terminal, window, cx);
+        }
 
         if info.task.is_none() {
             self.start_agent_changed(info, terminal, cx);
@@ -526,11 +589,7 @@ impl Workspace {
 
     /// Asks the daemon for the project's Start orchestrator once, when its Start tab
     /// shows and none runs. The daemon picks the kind from the settings.
-    pub(crate) fn start_orchestrator_if_needed(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn start_orchestrator_if_needed(&mut self, cx: &mut Context<Self>) {
         let task = self.active_task();
         if !task.is_start {
             return;
@@ -553,16 +612,17 @@ impl Workspace {
         let starting =
             cx.background_spawn(async move { client.start_orchestrator(daemon_project, None) });
 
-        cx.spawn_in(window, async move |this, cx| {
+        cx.spawn(async move |this, cx| {
             let result = starting.await;
 
-            let updated = this.update_in(cx, |workspace, window, cx| match result {
-                Ok(agent) => workspace.agent_changed(&agent, window, cx),
-                Err(error) => workspace.report_sidebar_error(error.to_string(), cx),
-            });
+            let updated =
+                Self::update_with_window(&this, cx, |workspace, window, cx| match result {
+                    Ok(agent) => workspace.agent_changed(&agent, window, cx),
+                    Err(error) => workspace.report_sidebar_error(error.to_string(), cx),
+                });
 
             if let Err(error) = updated {
-                log::debug!("the window closed before the orchestrator started: {error}");
+                log::debug!("the workspace is gone before the orchestrator started: {error}");
             }
         })
         .detach();
@@ -572,7 +632,7 @@ impl Workspace {
     pub(crate) fn task_changed(
         &mut self,
         info: &TaskInfo,
-        window: &mut Window,
+        mut window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
         if info.closed {
@@ -588,10 +648,13 @@ impl Workspace {
         let known = self.data.has_daemon_task(info.id);
         let task = self.data.sync_task(project, info);
 
-        self.attach_agents(window, cx);
+        match window.as_deref_mut() {
+            Some(window) => self.attach_agents(window, cx),
+            None => self.apply_pending_agents(None, cx),
+        }
         self.show_setup_exit(task, cx);
 
-        if !known {
+        if !known && let Some(window) = window {
             self.attach_listed_terminals(window, cx);
         }
 
@@ -599,7 +662,12 @@ impl Workspace {
     }
 
     /// The daemon closed a task: drops its tab, its terminals and what Review kept.
-    fn task_closed(&mut self, info: &TaskInfo, window: &mut Window, cx: &mut Context<Self>) {
+    fn task_closed(
+        &mut self,
+        info: &TaskInfo,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(task) = self
             .data
             .tasks
@@ -615,7 +683,10 @@ impl Workspace {
         };
 
         if self.close_dialog_is_for(task, cx) {
-            self.close_overlay(window, cx);
+            match window {
+                Some(window) => self.close_overlay(window, cx),
+                None => self.overlay = None,
+            }
         }
 
         self.remove_closed_task(task, cx);
@@ -1113,11 +1184,11 @@ impl Workspace {
         }
     }
 
-    fn apply_pending_agents(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn apply_pending_agents(&mut self, mut window: Option<&mut Window>, cx: &mut Context<Self>) {
         let pending = std::mem::take(&mut self.pending_agents);
 
         for info in pending.values() {
-            self.agent_changed(info, window, cx);
+            self.agent_changed(info, window.as_deref_mut(), cx);
         }
     }
 
@@ -1171,7 +1242,7 @@ impl Workspace {
     }
 
     fn attach_agents(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.apply_pending_agents(window, cx);
+        self.apply_pending_agents(Some(&mut *window), cx);
 
         let terminals: Vec<TerminalId> = self
             .data
@@ -1775,7 +1846,7 @@ impl Workspace {
             }
             TerminalEvent::Disconnected => {
                 self.disconnected.insert(terminal);
-                self.reconnect_daemon(window, cx);
+                self.reconnect_daemon(cx);
                 cx.notify();
             }
             TerminalEvent::TitleChanged(title) => {
@@ -1905,7 +1976,9 @@ pub(crate) mod tests {
                     draft: None,
                 },
             }),
-            Request::DraftPr { call, .. } => Some(Event::Done { call: *call }),
+            Request::DraftPr { call, .. } | Request::StopAgents { call } => {
+                Some(Event::Done { call: *call })
+            }
             Request::PrStatus { call, .. } => Some(Event::Error {
                 call: Some(*call),
                 id: None,
@@ -2153,8 +2226,8 @@ pub(crate) mod tests {
     fn a_failed_connect_makes_the_daemon_unavailable_with_the_reason(cx: &mut TestAppContext) {
         let (workspace, cx) = setup_real(cx);
 
-        workspace.update_in(cx, |workspace, window, cx| {
-            workspace.start_connect(unreachable_launch(), window, cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.start_connect(unreachable_launch(), cx);
         });
         cx.run_until_parked();
 
@@ -2168,10 +2241,10 @@ pub(crate) mod tests {
     #[gpui::test]
     fn retry_starts_a_new_connect(cx: &mut TestAppContext) {
         let (workspace, cx) = setup_real(cx);
-        workspace.update_in(cx, |workspace, window, cx| {
+        workspace.update(cx, |workspace, cx| {
             workspace.daemon_launch = Some(unreachable_launch());
             workspace.daemon_unavailable("no daemon".to_owned(), cx);
-            workspace.retry_daemon(window, cx);
+            workspace.retry_daemon(cx);
         });
 
         let during = source_of(&workspace, cx);
@@ -2568,7 +2641,7 @@ pub(crate) mod tests {
 
     fn change_agent(workspace: &Entity<Workspace>, info: &AgentInfo, cx: &mut VisualTestContext) {
         workspace.update_in(cx, |workspace, window, cx| {
-            workspace.agent_changed(info, window, cx);
+            workspace.agent_changed(info, Some(window), cx);
         });
     }
 
@@ -3642,7 +3715,7 @@ pub(crate) mod tests {
         };
 
         workspace.update_in(cx, |workspace, window, cx| {
-            workspace.task_changed(&made, window, cx);
+            workspace.task_changed(&made, Some(window), cx);
         });
         let renamed = TaskInfo {
             name: "sign-up".into(),
@@ -3650,7 +3723,7 @@ pub(crate) mod tests {
             ..made
         };
         workspace.update_in(cx, |workspace, window, cx| {
-            workspace.task_changed(&renamed, window, cx);
+            workspace.task_changed(&renamed, Some(window), cx);
         });
 
         let (names, active) = workspace.read_with(cx, |workspace, _| {
@@ -4280,7 +4353,7 @@ pub(crate) mod tests {
         let made_by_it = label(&workspace, cx);
 
         workspace.update_in(cx, |workspace, window, cx| {
-            workspace.task_changed(&task_info(9, 5, "by hand"), window, cx);
+            workspace.task_changed(&task_info(9, 5, "by hand"), Some(window), cx);
         });
 
         assert_eq!(made_by_it, "Start");
@@ -5068,7 +5141,7 @@ pub(crate) mod tests {
         let mut gone = task_info(7, 5, "login");
         gone.closed = true;
         workspace.update_in(cx, |workspace, window, cx| {
-            workspace.task_changed(&gone, window, cx);
+            workspace.task_changed(&gone, Some(window), cx);
         });
         cx.run_until_parked();
 
@@ -5089,7 +5162,7 @@ pub(crate) mod tests {
         let (workspace, cx, _client) = real_task_workspace(&fake_daemon(), cx);
         let second = task_info(8, 5, "signup");
         workspace.update_in(cx, |workspace, window, cx| {
-            workspace.task_changed(&second, window, cx);
+            workspace.task_changed(&second, Some(window), cx);
         });
         let (first, other) = workspace.read_with(cx, |workspace, _| {
             let ids: Vec<_> = workspace.data.tasks.iter().map(|task| task.id).collect();
@@ -5100,7 +5173,7 @@ pub(crate) mod tests {
         let mut gone = task_info(7, 5, "login");
         gone.closed = true;
         workspace.update_in(cx, |workspace, window, cx| {
-            workspace.task_changed(&gone, window, cx);
+            workspace.task_changed(&gone, Some(window), cx);
         });
 
         let active = workspace.read_with(cx, |workspace, _| workspace.active_task);
@@ -5223,7 +5296,7 @@ pub(crate) mod tests {
         let mut gone = task_info(7, 5, "login");
         gone.closed = true;
         workspace.update_in(cx, |workspace, window, cx| {
-            workspace.task_changed(&gone, window, cx);
+            workspace.task_changed(&gone, Some(window), cx);
         });
         cx.run_until_parked();
 

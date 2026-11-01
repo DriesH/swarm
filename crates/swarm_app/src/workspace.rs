@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use gpui::{
-    AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable, Pixels, SharedString, Size,
-    Subscription, Window, div, px,
+    AnyWindowHandle, AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable, Pixels,
+    SharedString, Size, Subscription, Window, div, px,
 };
 use swarm_protocol::{Client, ReviewSource};
 use swarm_ui::fonts::UI_FONT;
@@ -74,6 +74,9 @@ pub(crate) enum DataSource {
     reason = "independent flags, not one state"
 )]
 pub(crate) struct Workspace {
+    /// The window that shows the workspace. `None` while it is closed: the workspace and its
+    /// daemon connection live on, and a new window takes it over.
+    pub(crate) window: Option<AnyWindowHandle>,
     pub data: FakeData,
     pub active_project: ProjectId,
     pub active_task: TaskId,
@@ -173,6 +176,9 @@ pub(crate) struct Workspace {
     /// How often the visible Review source and the open task's Live diff are asked for.
     pub(crate) diff_intervals: (std::time::Duration, std::time::Duration),
     pub(crate) pull_requests: PullRequests,
+    /// How often the window told the workspace it was activated or deactivated.
+    #[cfg(test)]
+    pub(crate) activation_changes: usize,
 }
 
 impl Workspace {
@@ -215,10 +221,7 @@ impl Workspace {
         window.focus(&focus_handle, cx);
 
         let (orchestrator_input, orchestrator_subscription) = views::orchestrator_input(cx);
-        let activation_subscription = cx.observe_window_activation(window, |this, window, cx| {
-            this.sync_swarm_tasks(window.is_window_active(), cx);
-            this.sync_usage_clock(window.is_window_active(), cx);
-        });
+        let activation_subscription = Self::observe_activation(window, cx);
 
         let inspector_subscription = cx.observe(&cx.entity(), |this, _, cx| {
             this.sync_inspector(cx);
@@ -237,6 +240,7 @@ impl Workspace {
         });
 
         let mut workspace = Self {
+            window: Some(window.window_handle()),
             data,
             active_project,
             active_task,
@@ -307,11 +311,59 @@ impl Workspace {
             pr_poll: None,
             diff_intervals: (crate::daemon::REVIEW_INTERVAL, crate::daemon::LIVE_INTERVAL),
             pull_requests: PullRequests::default(),
+            #[cfg(test)]
+            activation_changes: 0,
         };
         workspace.sync_inspector(cx);
         workspace.sync_changes_list(cx);
 
         workspace
+    }
+
+    fn observe_activation(window: &mut Window, cx: &mut Context<Self>) -> Subscription {
+        cx.observe_window_activation(window, |this, window, cx| {
+            #[cfg(test)]
+            {
+                this.activation_changes += 1;
+            }
+
+            this.sync_swarm_tasks(window.is_window_active(), cx);
+            this.sync_usage_clock(window.is_window_active(), cx);
+        })
+    }
+
+    /// A new window takes over the workspace. Everything tied to the old window is made again:
+    /// the activation observer, the focus and the terminal views.
+    #[expect(
+        clippy::used_underscore_binding,
+        reason = "assigning drops the observer of the closed window"
+    )]
+    pub(crate) fn attach_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.window = Some(window.window_handle());
+        self._activation_subscription = Self::observe_activation(window, cx);
+        self.pending_focus = self.focused_terminal;
+        window.focus(&self.focus_handle, cx);
+        self.reattach_terminals(cx);
+
+        cx.notify();
+    }
+
+    /// The window closed. The workspace keeps its data and its daemon connection, but drops
+    /// what only made sense in that window: open dialogs, measurements and the polls that
+    /// need an active window.
+    pub(crate) fn window_closed(&mut self, cx: &mut Context<Self>) {
+        self.window = None;
+        self.overlay = None;
+        self.resizing = None;
+        self.inspector_dragging = false;
+        self.terminal_area = None;
+        self.tray_width = None;
+        self.swarm_view_width = None;
+        self.sync_swarm_tasks(false, cx);
+        self.sync_usage_clock(false, cx);
+        self.rest_pull_requests();
+
+        cx.notify();
     }
 
     /// True when no project is shown, so the main area shows the empty state.
@@ -590,7 +642,7 @@ impl Render for Workspace {
         let colors = cx.theme().colors();
         let (ground, panel, line, fg) = (colors.ground, colors.panel, colors.line, colors.fg);
 
-        self.start_orchestrator_if_needed(window, cx);
+        self.start_orchestrator_if_needed(cx);
         self.sync_swarm_tasks(window.is_window_active(), cx);
         self.sync_usage_clock(window.is_window_active(), cx);
         self.sync_pull_requests(window.is_window_active(), window, cx);
