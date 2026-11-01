@@ -8565,7 +8565,7 @@ esac"#,
 }
 
 #[test]
-fn ready_for_review_waits_for_every_worker_and_fires_once() {
+fn ready_for_review_fires_once_when_the_last_worker_finishes_after_the_orchestrator_rests() {
     let fixture = review_fixture();
     let repo = repo_for_merges();
     let daemon = Daemon::start_with_settings(&fixture.settings());
@@ -8585,16 +8585,6 @@ fn ready_for_review_waits_for_every_worker_and_fires_once() {
     );
 
     fixture.open_gate("worker-finish-1");
-    assert!(
-        client
-            .notices_until(is_worker_with(AgentStatus::Done))
-            .is_empty()
-    );
-    assert!(
-        client.notices_after_a_pause().is_empty(),
-        "the orchestrator did not turn idle"
-    );
-    fixture.open_gate("go-b");
     let notice = client.next_notice();
 
     assert_notice(
@@ -8604,8 +8594,12 @@ fn ready_for_review_waits_for_every_worker_and_fires_once() {
         orchestrator,
         "Agent task",
     );
+    fixture.open_gate("go-b");
     fixture.read_when_written("rested-b");
-    assert!(client.notices_after_a_pause().is_empty());
+    assert!(
+        client.notices_after_a_pause().is_empty(),
+        "the orchestrator resting again is not news"
+    );
 
     fixture.open_gate("go-c");
     fixture.read_when_written("rested-c");
@@ -8633,7 +8627,6 @@ fn ready_for_review_fires_again_after_a_worker_worked_and_ended_again() {
     client.notices_until(is_worker_with(AgentStatus::Working));
     fixture.open_gate("worker-finish-2");
     client.notices_until(is_worker_with(AgentStatus::Done));
-    fixture.open_gate("go-b");
     let second = client.next_notice();
 
     assert_notice(
@@ -8644,6 +8637,8 @@ fn ready_for_review_fires_again_after_a_worker_worked_and_ended_again() {
         "Agent task",
     );
     assert!(second.at >= first.at);
+    fixture.open_gate("go-b");
+    fixture.read_when_written("rested-b");
     assert!(client.notices_after_a_pause().is_empty());
 }
 
@@ -8735,6 +8730,45 @@ exit 3",
         &task,
         task.agents[0].id,
         "Exited with code 3",
+    );
+}
+
+#[test]
+fn an_error_followed_by_an_error_code_is_one_broke_notice() {
+    let (_fixture, _repo, _daemon, mut client, task) = lone_orchestrator(
+        r#"working
+errored_with "usage limit reached"
+exit 1"#,
+    );
+
+    let notices = client.notices_after(ended);
+
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_notice(
+        &notices[0],
+        NoticeKind::Broke,
+        &task,
+        task.agents[0].id,
+        "usage limit reached",
+    );
+}
+
+#[test]
+fn a_stop_failure_hook_followed_by_an_error_code_is_one_broke_notice() {
+    let (_fixture, _repo, _daemon, mut client, task) = lone_orchestrator(
+        r#"hook '{"hook_event_name":"StopFailure","error":"rate_limit"}'
+exit 1"#,
+    );
+
+    let notices = client.notices_after(ended);
+
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_notice(
+        &notices[0],
+        NoticeKind::Broke,
+        &task,
+        task.agents[0].id,
+        "rate_limit",
     );
 }
 
@@ -8968,6 +9002,7 @@ sleep 30"#,
     );
 }
 
+// The stop ends the agent that never started, so the failed start finds nothing to report.
 #[test]
 fn a_user_stop_while_the_agent_starts_gives_no_broke() {
     let fixture = notice_fixture("sleep 30");
@@ -8991,8 +9026,10 @@ fn a_user_stop_while_the_agent_starts_gives_no_broke() {
     assert!(client.notices_after_a_pause().is_empty());
 }
 
+// The stop ends the agent that waits for its setup, so the failed setup finds nothing to
+// report. `fail` meets a live agent only when the whole daemon stops, as the next test does.
 #[test]
-fn a_user_stop_while_the_setup_runs_gives_no_broke_when_the_setup_fails() {
+fn a_user_stop_while_the_setup_runs_gives_no_broke() {
     let fixture = notice_fixture("sleep 30");
     let repo = Repo::new("[worktrees]\nsetup = \"sleep 1; exit 3\"\n");
     let daemon = Daemon::start_with_settings(&fixture.settings());
@@ -9002,6 +9039,19 @@ fn a_user_stop_while_the_setup_runs_gives_no_broke_when_the_setup_fails() {
     thread::park_timeout(Duration::from_millis(2000));
 
     assert!(client.notices_after_a_pause().is_empty());
+}
+
+#[test]
+fn a_daemon_that_stops_while_the_setup_runs_gives_no_broke() {
+    let fixture = notice_fixture("sleep 30");
+    let repo = Repo::new("[worktrees]\nsetup = \"touch setup-ran; sleep 30\"\n");
+    let mut daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, task) = add_project_and_task(&daemon, &repo, true);
+    wait_until(|| task.worktree.join("setup-ran").exists());
+
+    assert!(daemon.stops_on_sigterm(), "the daemon ignored SIGTERM");
+
+    assert!(client.notices_until_closed().is_empty());
 }
 
 #[test]

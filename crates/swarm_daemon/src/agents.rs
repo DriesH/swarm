@@ -351,17 +351,30 @@ pub(crate) struct Agents {
 struct ReviewWatch {
     /// The orchestrator is idle or done.
     resting: bool,
+    /// The orchestrator began to rest while it asked the user for a decision.
+    asked: bool,
     /// The notice went out and no worker has worked since.
     sent: bool,
 }
 
 impl ReviewWatch {
-    /// Returns true when the orchestrator just began to rest.
-    fn orchestrator_rests(&mut self, rests: bool) -> bool {
-        let began = rests && !self.resting;
-        self.resting = rests;
+    /// An orchestrator that asked for a decision is not ready: it is asked again the
+    /// next time it begins to rest.
+    fn orchestrator_changed(&mut self, rests: bool, asking: bool) {
+        if rests && !self.resting {
+            self.asked = asking;
+        }
+        if !rests {
+            self.asked = false;
+        }
 
-        began
+        self.resting = rests;
+    }
+
+    /// The orchestrator rests and the user has not heard yet, so only a worker can still
+    /// hold the notice back.
+    fn may_be_ready(&self) -> bool {
+        self.resting && !self.asked && !self.sent
     }
 
     /// A worker works, so the next time the swarm rests is news again.
@@ -992,6 +1005,8 @@ impl Agents {
             let text = format!("Failed to start: {message}");
             self.send_notice(NoticeKind::Broke, &agent.info, text);
         }
+
+        self.follow_review(&agent);
     }
 
     /// The orchestrator hears that one of its workers failed to start or ended.
@@ -1301,6 +1316,7 @@ impl Agents {
 
         self.messages.clear_queued(id);
 
+        let failure_told = agent.merge.failure_told();
         agent.merge.process_exited(exit);
         agent.info.terminal = None;
         agent.info.lifecycle =
@@ -1318,10 +1334,13 @@ impl Agents {
         }
 
         if let Some(reason) = exit_failure(exit)
+            && !failure_told
             && !self.is_ending(&agent)
         {
             self.send_notice(NoticeKind::Broke, &agent.info, reason);
         }
+
+        self.follow_review(&agent);
 
         for observer in lock(&self.on_end).iter() {
             observer(id, agent.stopped_by_user);
@@ -1370,6 +1389,11 @@ impl Agents {
             self.send_notice(NoticeKind::Broke, &agent.info, reason);
         }
 
+        self.follow_review(agent);
+    }
+
+    /// Follows the swarm of the agent's task, to tell when it is ready for review.
+    fn follow_review(&self, agent: &Live) {
         let Some(task) = agent.info.task else {
             return;
         };
@@ -1378,43 +1402,64 @@ impl Agents {
             AgentRole::Worker if agent.merge.status() == AgentStatus::Working => {
                 lock(&self.reviews).entry(task).or_default().worker_worked();
             }
+            AgentRole::Worker if !self.is_halted(agent) => self.send_review_if_ready(task),
             AgentRole::Orchestrator => self.check_review(agent, task),
             AgentRole::Worker | AgentRole::StartOrchestrator => {}
         }
     }
 
-    /// Sends "ready for review" when the orchestrator just went idle with every worker
-    /// done, once per round of work. An orchestrator that asked for a decision is not
-    /// ready: it is asked again the next time it rests.
+    /// Follows the orchestrator of the task.
     fn check_review(&self, orchestrator: &Live, task: TaskId) {
-        let rests = orchestrator.merge.is_resting()
-            && orchestrator.info.lifecycle == AgentLifecycle::Running;
-
-        let mut reviews = lock(&self.reviews);
-        let watch = reviews.entry(task).or_default();
-        if !watch.orchestrator_rests(rests) || watch.sent || orchestrator.merge.has_notice() {
+        if self.is_ending(orchestrator) {
             return;
         }
 
-        let Some(name) = self.name_when_workers_are_done(task) else {
+        let rests = orchestrator.merge.is_resting()
+            && orchestrator.info.lifecycle == AgentLifecycle::Running;
+
+        lock(&self.reviews)
+            .entry(task)
+            .or_default()
+            .orchestrator_changed(rests, orchestrator.merge.has_notice());
+
+        self.send_review_if_ready(task);
+    }
+
+    /// Sends "ready for review" when the orchestrator rests and every worker is done,
+    /// once per round of work. It happens when the last of the two happens, so a worker
+    /// that finishes after the orchestrator rested counts too.
+    fn send_review_if_ready(&self, task: TaskId) {
+        let mut reviews = lock(&self.reviews);
+        let Some(watch) = reviews.get_mut(&task).filter(|watch| watch.may_be_ready()) else {
+            return;
+        };
+
+        let Some((orchestrator, name)) = self.orchestrator_when_workers_are_done(task) else {
             return;
         };
 
         watch.sent = true;
         drop(reviews);
 
-        self.send_notice(NoticeKind::ReadyForReview, &orchestrator.info, name);
+        self.send_notice(NoticeKind::ReadyForReview, &orchestrator, name);
     }
 
-    /// The task's name when it has workers and none of them is busy.
-    fn name_when_workers_are_done(&self, task: TaskId) -> Option<String> {
+    /// The running orchestrator and the task's name, when the task has workers and none
+    /// of them is busy.
+    fn orchestrator_when_workers_are_done(&self, task: TaskId) -> Option<(AgentInfo, String)> {
         let store = lock(&self.store);
         let found = store
             .list_agents(task)
-            .and_then(|agents| Ok((workers_done(&agents), store.task(task)?)));
+            .and_then(|agents| Ok((agents, store.task(task)?)));
 
         match found {
-            Ok((true, Some(task))) => Some(task.name),
+            Ok((agents, Some(task))) if workers_done(&agents) => agents
+                .into_iter()
+                .find(|agent| {
+                    agent.role == AgentRole::Orchestrator
+                        && agent.lifecycle == AgentLifecycle::Running
+                })
+                .map(|orchestrator| (orchestrator, task.name)),
             Ok(_) => None,
             Err(error) => {
                 log::error!("cannot check whether task {} is ready: {error}", task.0);
@@ -1426,8 +1471,12 @@ impl Agents {
 
     /// The agent ends on purpose or with the daemon, so a signal or a failure is no news.
     fn is_ending(&self, agent: &Live) -> bool {
-        agent.stop_requested
-            || agent.stopped_by_user
+        agent.stop_requested || self.is_halted(agent)
+    }
+
+    /// The user, a close or the daemon stops the agent, not the agent itself.
+    fn is_halted(&self, agent: &Live) -> bool {
+        agent.stopped_by_user
             || self
                 .shutting_down
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -2166,14 +2215,32 @@ mod tests {
     }
 
     #[test]
-    fn the_orchestrator_beginning_to_rest_is_a_change_once() {
+    fn a_watch_is_ready_only_while_the_orchestrator_rests_and_nothing_was_sent() {
+        let mut watch = ReviewWatch::default();
+        assert!(!watch.may_be_ready());
+
+        watch.orchestrator_changed(true, false);
+        assert!(watch.may_be_ready());
+
+        watch.sent = true;
+        assert!(!watch.may_be_ready());
+
+        watch.sent = false;
+        watch.orchestrator_changed(false, false);
+        assert!(!watch.may_be_ready());
+    }
+
+    #[test]
+    fn an_orchestrator_that_began_to_rest_with_a_question_stays_not_ready_until_it_works() {
         let mut watch = ReviewWatch::default();
 
-        assert!(!watch.orchestrator_rests(false));
-        assert!(watch.orchestrator_rests(true));
-        assert!(!watch.orchestrator_rests(true));
-        assert!(!watch.orchestrator_rests(false));
-        assert!(watch.orchestrator_rests(true));
+        watch.orchestrator_changed(true, true);
+        watch.orchestrator_changed(true, false);
+        assert!(!watch.may_be_ready());
+
+        watch.orchestrator_changed(false, false);
+        watch.orchestrator_changed(true, false);
+        assert!(watch.may_be_ready());
     }
 
     #[test]
@@ -2537,5 +2604,258 @@ mod tests {
         report(&agents, agent.id, ProgramState::Error, Some("closing"));
 
         assert!(notices(&frames).is_empty());
+    }
+
+    fn crash(agents: &Arc<Agents>, id: AgentId, code: u32) {
+        agents.exited(id, Some(&ExitStatus::Code(code)));
+    }
+
+    #[test]
+    fn a_plain_crash_is_one_broke_notice() {
+        let (agents, task, frames) = agents_with_a_client();
+        let agent = register_in(&agents, &task, None).expect("register");
+        report(&agents, agent.id, ProgramState::Working, None);
+
+        crash(&agents, agent.id, 1);
+
+        let notices = notices(&frames);
+        assert_eq!(texts(&notices), [(NoticeKind::Broke, "Exited with code 1")]);
+        assert_eq!(notices[0].agent, agent.id);
+    }
+
+    #[test]
+    fn an_error_spell_that_ends_in_a_crash_is_one_broke_notice() {
+        let (agents, task, frames) = agents_with_a_client();
+
+        let osc_agent = register_in(&agents, &task, None).expect("register");
+        report(&agents, osc_agent.id, ProgramState::Working, None);
+        report(
+            &agents,
+            osc_agent.id,
+            ProgramState::Error,
+            Some("usage limit reached"),
+        );
+        crash(&agents, osc_agent.id, 1);
+        assert_eq!(
+            texts(&notices(&frames)),
+            [(NoticeKind::Broke, "usage limit reached")]
+        );
+
+        let hook_agent = register_in(&agents, &task, None).expect("register");
+        report(&agents, hook_agent.id, ProgramState::Working, None);
+        stop_failure(&agents, hook_agent.id, "rate_limit");
+        agents.exited(
+            hook_agent.id,
+            Some(&ExitStatus::Signal("Terminated".to_owned())),
+        );
+        assert_eq!(
+            texts(&notices(&frames)),
+            [(NoticeKind::Broke, "rate_limit")]
+        );
+    }
+
+    #[test]
+    fn a_crash_after_an_error_spell_ended_is_a_new_broke_notice() {
+        let (agents, task, frames) = agents_with_a_client();
+        let agent = register_in(&agents, &task, None).expect("register");
+        report(&agents, agent.id, ProgramState::Error, Some("first"));
+
+        report(&agents, agent.id, ProgramState::Working, None);
+        crash(&agents, agent.id, 1);
+
+        assert_eq!(
+            texts(&notices(&frames)),
+            [
+                (NoticeKind::Broke, "first"),
+                (NoticeKind::Broke, "Exited with code 1")
+            ]
+        );
+    }
+
+    fn register_worker(agents: &Agents, task: &TaskInfo) -> AgentInfo {
+        let plan = Plan {
+            kind: AgentKind::ClaudeCode,
+            role: AgentRole::Worker,
+            model: "model".to_owned(),
+            command: "agent".to_owned(),
+            skip_permissions: false,
+        };
+
+        agents
+            .register_asked_by(None, &Place::of_task(task), plan)
+            .expect("register")
+    }
+
+    /// An orchestrator and a worker whose processes run.
+    fn a_swarm(agents: &Agents, task: &TaskInfo) -> (AgentInfo, AgentInfo) {
+        let orchestrator = register_in(agents, task, None).expect("register");
+        let worker = register_worker(agents, task);
+
+        for id in [orchestrator.id, worker.id] {
+            agents.update(id, |live| {
+                live.info.lifecycle = AgentLifecycle::Running;
+
+                true
+            });
+        }
+
+        (orchestrator, worker)
+    }
+
+    fn ready_texts(notices: &[Notice]) -> Vec<(NoticeKind, &str)> {
+        texts(notices)
+            .into_iter()
+            .filter(|(kind, _)| *kind == NoticeKind::ReadyForReview)
+            .collect()
+    }
+
+    #[test]
+    fn a_worker_that_finishes_after_the_orchestrator_rests_gives_ready_for_review() {
+        let (agents, task, frames) = agents_with_a_client();
+        let (orchestrator, worker) = a_swarm(&agents, &task);
+        report(&agents, worker.id, ProgramState::Working, None);
+        report(&agents, orchestrator.id, ProgramState::Idle, None);
+        assert!(notices(&frames).is_empty(), "the worker is busy");
+
+        report(&agents, worker.id, ProgramState::Done, None);
+
+        let sent = notices(&frames);
+        assert_eq!(texts(&sent), [(NoticeKind::ReadyForReview, "Task")]);
+        assert_eq!(sent[0].agent, orchestrator.id);
+
+        report(&agents, worker.id, ProgramState::Idle, None);
+        report(&agents, orchestrator.id, ProgramState::Done, None);
+        assert!(notices(&frames).is_empty(), "once per round of work");
+    }
+
+    #[test]
+    fn a_worker_that_ends_after_the_orchestrator_rests_gives_ready_for_review() {
+        let (agents, task, frames) = agents_with_a_client();
+        let (orchestrator, worker) = a_swarm(&agents, &task);
+        report(&agents, worker.id, ProgramState::Working, None);
+        report(&agents, orchestrator.id, ProgramState::Idle, None);
+        assert!(notices(&frames).is_empty(), "the worker is busy");
+
+        crash(&agents, worker.id, 0);
+
+        assert_eq!(
+            ready_texts(&notices(&frames)),
+            [(NoticeKind::ReadyForReview, "Task")]
+        );
+    }
+
+    #[test]
+    fn a_worker_that_leaves_a_prompt_after_the_orchestrator_rests_gives_ready_for_review() {
+        let (agents, task, frames) = agents_with_a_client();
+        let (orchestrator, worker) = a_swarm(&agents, &task);
+        report(
+            &agents,
+            worker.id,
+            ProgramState::Blocked(swarm_term::BlockedKind::Permission),
+            Some("approve Write"),
+        );
+        report(&agents, orchestrator.id, ProgramState::Idle, None);
+        notices(&frames);
+
+        report(&agents, worker.id, ProgramState::Idle, None);
+
+        assert_eq!(
+            texts(&notices(&frames)),
+            [(NoticeKind::ReadyForReview, "Task")]
+        );
+    }
+
+    #[test]
+    fn the_last_of_the_orchestrator_and_the_workers_to_rest_gives_one_ready_for_review() {
+        let (agents, task, frames) = agents_with_a_client();
+        let (orchestrator, worker) = a_swarm(&agents, &task);
+        report(&agents, worker.id, ProgramState::Working, None);
+        report(&agents, orchestrator.id, ProgramState::Working, None);
+        report(&agents, worker.id, ProgramState::Done, None);
+        assert!(notices(&frames).is_empty(), "the orchestrator is busy");
+
+        report(&agents, orchestrator.id, ProgramState::Idle, None);
+        report(&agents, orchestrator.id, ProgramState::Done, None);
+
+        assert_eq!(
+            texts(&notices(&frames)),
+            [(NoticeKind::ReadyForReview, "Task")]
+        );
+    }
+
+    #[test]
+    fn an_orchestrator_that_asked_for_a_decision_is_not_ready_until_it_rests_again() {
+        let (agents, task, frames) = agents_with_a_client();
+        let (orchestrator, worker) = a_swarm(&agents, &task);
+        report(&agents, worker.id, ProgramState::Working, None);
+        report(&agents, orchestrator.id, ProgramState::Working, None);
+        agents.notify(orchestrator.id, "pick one");
+        report(&agents, orchestrator.id, ProgramState::Idle, None);
+
+        report(&agents, worker.id, ProgramState::Done, None);
+        assert_eq!(
+            texts(&notices(&frames)),
+            [(NoticeKind::NeedsDecision, "pick one")]
+        );
+
+        report(&agents, orchestrator.id, ProgramState::Working, None);
+        report(&agents, orchestrator.id, ProgramState::Idle, None);
+        assert_eq!(
+            texts(&notices(&frames)),
+            [(NoticeKind::ReadyForReview, "Task")]
+        );
+    }
+
+    #[test]
+    fn a_worker_that_finishes_after_the_orchestrator_ended_gives_no_ready_for_review() {
+        let (agents, task, frames) = agents_with_a_client();
+        let (orchestrator, worker) = a_swarm(&agents, &task);
+        report(&agents, worker.id, ProgramState::Working, None);
+        report(&agents, orchestrator.id, ProgramState::Idle, None);
+        agents.exit(orchestrator.id);
+        crash(&agents, orchestrator.id, 0);
+        notices(&frames);
+
+        report(&agents, worker.id, ProgramState::Done, None);
+
+        assert!(ready_texts(&notices(&frames)).is_empty());
+    }
+
+    #[test]
+    fn a_status_change_during_a_close_gives_no_ready_for_review() {
+        let (agents, task, frames) = agents_with_a_client();
+        let (orchestrator, worker) = a_swarm(&agents, &task);
+        report(&agents, worker.id, ProgramState::Done, None);
+        assert!(agents.begin_close(task.id));
+
+        report(&agents, orchestrator.id, ProgramState::Idle, None);
+
+        assert!(notices(&frames).is_empty());
+    }
+
+    #[test]
+    fn a_worker_that_ends_because_the_user_or_the_daemon_stopped_it_gives_no_ready_for_review() {
+        type Ending = (&'static str, fn(&Agents, AgentId));
+        let endings: [Ending; 2] = [
+            ("the user stopped it", |agents, worker| {
+                lock(&agents.live)
+                    .get_mut(&worker)
+                    .expect("live")
+                    .stopped_by_user = true;
+            }),
+            ("the daemon stops", |agents, _| agents.begin_shutdown()),
+        ];
+
+        for (name, end) in endings {
+            let (agents, task, frames) = agents_with_a_client();
+            let (orchestrator, worker) = a_swarm(&agents, &task);
+            report(&agents, worker.id, ProgramState::Working, None);
+            report(&agents, orchestrator.id, ProgramState::Idle, None);
+            end(&agents, worker.id);
+
+            crash(&agents, worker.id, 0);
+
+            assert!(ready_texts(&notices(&frames)).is_empty(), "{name}");
+        }
     }
 }

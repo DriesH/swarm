@@ -132,6 +132,12 @@ impl StatusMerge {
         Some(message.unwrap_or(FAILURE_FALLBACK).to_owned())
     }
 
+    /// The agent is in an error spell and `take_failure` already told about it, so the
+    /// process exit that follows is not news. Reads the agent's own status, not a notice.
+    pub fn failure_told(&self) -> bool {
+        self.status == AgentStatus::Error && !self.news_due
+    }
+
     fn visible(&self) -> (AgentStatus, Option<String>) {
         (self.status(), self.message().map(str::to_owned))
     }
@@ -1106,6 +1112,24 @@ mod tests {
         assert_eq!(merge.take_failure().as_deref(), Some("overloaded_error"));
         merge.program_status(&osc_error(Some("overloaded")));
         assert_eq!(merge.take_failure(), None);
+    }
+
+    #[test]
+    fn a_failure_is_told_once_it_was_taken_and_while_the_agent_stays_in_error() {
+        let mut merge = StatusMerge::default();
+        assert!(!merge.failure_told());
+
+        merge.program_status(&osc_error(Some("overloaded")));
+        assert!(!merge.failure_told(), "not taken yet");
+
+        merge.take_failure();
+        assert!(merge.failure_told());
+
+        merge.notify("look here");
+        assert!(merge.failure_told(), "a notice does not hide the error");
+
+        merge.program_status(&osc(ProgramState::Working));
+        assert!(!merge.failure_told());
     }
 
     #[test]
