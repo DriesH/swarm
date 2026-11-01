@@ -8218,6 +8218,8 @@ const NOTICE_HELPERS: &str = r#"
 finished() { printf '\033]7501;state=done\007'; }
 blocked() { printf '\033]7501;state=blocked:kind=%s\007' "$1"; }
 blocked_with() { printf '\033]7501;state=blocked:kind=%s:msg=%s\007' "$1" "$(printf '%s' "$2" | base64)"; }
+errored() { printf '\033]7501;state=error\007'; }
+errored_with() { printf '\033]7501;state=error:msg=%s\007' "$(printf '%s' "$1" | base64)"; }
 hook() { printf '%s' "$1" | "$SWARM" hook; }
 gate() { until [ -e "$OUT/$1" ]; do sleep 0.1; done; }
 mark() { echo ok > "$OUT/$1"; }
@@ -8872,4 +8874,269 @@ sleep 30"#,
     let agent = &client.projects()[0].tasks[0].agents[0];
     assert_eq!(agent.id, task.agents[0].id);
     assert_eq!(agent.status, AgentStatus::Unknown);
+}
+
+fn errored_agent(agent: &AgentInfo) -> bool {
+    agent.status == AgentStatus::Error
+}
+
+/// A daemon whose agent folder cannot be made, so no agent process can start.
+fn daemon_that_cannot_start_agents(fixture: &Fixture) -> Daemon {
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    std::fs::write(daemon.home.join("agents"), "").expect("block the agent folder");
+
+    daemon
+}
+
+fn add_project_and_task(daemon: &Daemon, repo: &Repo, run_setup: bool) -> (Client, TaskInfo) {
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let task = client.create_task(orchestrator_task(project.id, run_setup));
+
+    (client, task)
+}
+
+#[test]
+fn an_agent_whose_setup_failed_is_a_broke_notice() {
+    let fixture = notice_fixture("sleep 30");
+    let repo = Repo::new("[worktrees]\nsetup = \"exit 3\"\n");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, task) = add_project_and_task(&daemon, &repo, true);
+
+    let notices = client.notices_after(errored_agent);
+
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_notice(
+        &notices[0],
+        NoticeKind::Broke,
+        &task,
+        task.agents[0].id,
+        "Failed to start: Setup failed",
+    );
+}
+
+#[test]
+fn an_agent_whose_process_cannot_start_is_a_broke_notice() {
+    let fixture = notice_fixture("sleep 30");
+    let repo = repo_for_merges();
+    let daemon = daemon_that_cannot_start_agents(&fixture);
+    let (mut client, task) = add_project_and_task(&daemon, &repo, false);
+
+    let notices = client.notices_after(errored_agent);
+
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_notice(
+        &notices[0],
+        NoticeKind::Broke,
+        &task,
+        task.agents[0].id,
+        "Failed to start: Cannot start",
+    );
+}
+
+#[test]
+fn a_worker_that_fails_to_start_is_a_broke_notice_that_names_the_worker() {
+    let fixture = notice_fixture(
+        r#"idle
+IFS= read -r line
+working
+swarm spawn api --kind codex --own-worktree "same files" --brief "never starts" > "$OUT/spawn.out" 2>&1
+sleep 30"#,
+    );
+    let repo = ported_repo("5170-5199", "setup = \"exit 3\"\n");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, task) = start_task(&daemon, &repo);
+
+    let notices = client.notices_after(|agent| {
+        agent.role == AgentRole::Worker && agent.status == AgentStatus::Error
+    });
+
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    let worker = client.projects()[0].tasks[0]
+        .agents
+        .iter()
+        .find(|agent| agent.role == AgentRole::Worker)
+        .expect("worker")
+        .id;
+    assert_notice(
+        &notices[0],
+        NoticeKind::Broke,
+        &task,
+        worker,
+        "Failed to start: Setup failed",
+    );
+}
+
+#[test]
+fn a_user_stop_while_the_agent_starts_gives_no_broke() {
+    let fixture = notice_fixture("sleep 30");
+    let repo = Repo::new("");
+    let daemon = daemon_that_cannot_start_agents(&fixture);
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let mut held = HeldPrompt::new(&repo);
+    let task = client.create_task(orchestrator_task(project.id, false));
+    let agent = task.agents[0].id;
+    held.wait_until_read();
+
+    client.stop_agents(&[agent]);
+    held.release();
+
+    wait_until(|| {
+        std::fs::read_to_string(daemon.home.join("daemon.log"))
+            .is_ok_and(|log| log.contains(&format!("cannot start agent {}", agent.0)))
+    });
+    assert!(client.notices_after_a_pause().is_empty());
+}
+
+#[test]
+fn a_user_stop_while_the_setup_runs_gives_no_broke_when_the_setup_fails() {
+    let fixture = notice_fixture("sleep 30");
+    let repo = Repo::new("[worktrees]\nsetup = \"sleep 1; exit 3\"\n");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, task) = add_project_and_task(&daemon, &repo, true);
+    client.stop_agents(&[task.agents[0].id]);
+
+    thread::park_timeout(Duration::from_millis(2000));
+
+    assert!(client.notices_after_a_pause().is_empty());
+}
+
+#[test]
+fn an_osc_error_from_codex_is_one_broke_notice_with_the_status_text() {
+    let fixture = notice_fixture(
+        r#"working
+errored_with "usage limit reached"
+errored_with "usage limit reached"
+exit 0"#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let mut request = orchestrator_task(project.id, false);
+    request.orchestrator = Some(AgentKind::Codex);
+    let task = client.create_task(request);
+
+    let notices = client.notices_after(ended);
+
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_notice(
+        &notices[0],
+        NoticeKind::Broke,
+        &task,
+        task.agents[0].id,
+        "usage limit reached",
+    );
+}
+
+#[test]
+fn an_osc_error_without_text_is_a_broke_notice_with_a_short_reason() {
+    let (_fixture, _repo, _daemon, mut client, task) = lone_orchestrator(
+        r"working
+errored
+exit 0",
+    );
+
+    let notices = client.notices_after(ended);
+
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_notice(
+        &notices[0],
+        NoticeKind::Broke,
+        &task,
+        task.agents[0].id,
+        "Failed",
+    );
+}
+
+#[test]
+fn an_osc_error_followed_by_a_stop_failure_hook_is_one_broke_notice() {
+    let (fixture, _repo, _daemon, mut client, task) = lone_orchestrator(
+        r#"working
+errored_with "usage limit reached"
+gate go
+hook '{"hook_event_name":"StopFailure","error":"rate_limit"}'
+exit 0"#,
+    );
+    let mut notices = client.notices_until(errored_agent);
+
+    fixture.open_gate("go");
+    notices.extend(client.notices_after(ended));
+
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_notice(
+        &notices[0],
+        NoticeKind::Broke,
+        &task,
+        task.agents[0].id,
+        "usage limit reached",
+    );
+}
+
+#[test]
+fn a_stop_failure_hook_followed_by_an_osc_error_is_one_broke_notice() {
+    let (fixture, _repo, _daemon, mut client, task) = lone_orchestrator(
+        r#"hook '{"hook_event_name":"StopFailure","error":"rate_limit"}'
+gate go
+errored_with "usage limit reached"
+exit 0"#,
+    );
+    let mut notices = client.notices_until(errored_agent);
+
+    fixture.open_gate("go");
+    notices.extend(client.notices_after(ended));
+
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_notice(
+        &notices[0],
+        NoticeKind::Broke,
+        &task,
+        task.agents[0].id,
+        "rate_limit",
+    );
+}
+
+#[test]
+fn an_error_after_the_agent_worked_again_is_a_second_broke_notice() {
+    let (_fixture, _repo, _daemon, mut client, _task) = lone_orchestrator(
+        r#"working
+errored_with "first"
+working
+errored_with "second"
+exit 0"#,
+    );
+
+    let notices = client.notices_after(ended);
+
+    assert_eq!(
+        kinds_and_texts(&notices),
+        [(NoticeKind::Broke, "first"), (NoticeKind::Broke, "second")]
+    );
+}
+
+#[test]
+fn a_stop_failure_hook_after_the_agent_worked_again_is_a_second_broke_notice() {
+    let (fixture, _repo, _daemon, mut client, _task) = lone_orchestrator(
+        r#"hook '{"hook_event_name":"StopFailure","error":"first"}'
+gate working
+working
+gate second
+hook '{"hook_event_name":"StopFailure","error":"second"}'
+exit 0"#,
+    );
+    let mut notices = client.notices_until(errored_agent);
+
+    fixture.open_gate("working");
+    notices.extend(client.notices_until(|agent| agent.status == AgentStatus::Working));
+    fixture.open_gate("second");
+    notices.extend(client.notices_after(ended));
+
+    assert_eq!(
+        kinds_and_texts(&notices),
+        [(NoticeKind::Broke, "first"), (NoticeKind::Broke, "second")]
+    );
 }

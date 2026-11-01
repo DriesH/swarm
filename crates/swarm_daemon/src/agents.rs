@@ -970,7 +970,8 @@ impl Agents {
         })
     }
 
-    /// Ends an agent that never ran, or never will.
+    /// Ends an agent that never ran, or never will, and tells every client it broke
+    /// unless it ended on purpose.
     pub(crate) fn fail(self: &Arc<Self>, id: AgentId, message: &str) {
         let Some(mut agent) = lock(&self.live).remove(&id) else {
             return;
@@ -985,6 +986,11 @@ impl Agents {
 
         if !self.is_closing(agent.info.task) {
             self.tell_worker_stopped(&agent.info, &format!("failed: {message}"));
+        }
+
+        if !self.is_ending(&agent) {
+            let text = format!("Failed to start: {message}");
+            self.send_notice(NoticeKind::Broke, &agent.info, text);
         }
     }
 
@@ -1058,11 +1064,6 @@ impl Agents {
             self.publish(agent);
         }
         self.send_notices(agent);
-        if let Some(reason) = outcome.failure
-            && !self.is_ending(agent)
-        {
-            self.send_notice(NoticeKind::Broke, &agent.info, reason);
-        }
         drop(live);
 
         if outcome.stopped || outcome.changed {
@@ -1363,6 +1364,12 @@ impl Agents {
             self.send_notice(NoticeKind::Prompt, &agent.info, text);
         }
 
+        if let Some(reason) = agent.merge.take_failure()
+            && !self.is_ending(agent)
+        {
+            self.send_notice(NoticeKind::Broke, &agent.info, reason);
+        }
+
         let Some(task) = agent.info.task else {
             return;
         };
@@ -1630,6 +1637,11 @@ pub(crate) fn row_text(row: &Row) -> String {
 
 #[cfg(test)]
 mod tests {
+    use swarm_protocol::read;
+    use swarm_term::ProgramStatus;
+
+    use crate::hub::{ClientSink, Frame};
+
     use super::*;
 
     const SHORT: Duration = Duration::from_millis(40);
@@ -1721,7 +1733,7 @@ mod tests {
 
     fn live(kind: AgentKind, state: ProgramState) -> Live {
         let mut merge = StatusMerge::default();
-        merge.program_status(&swarm_term::ProgramStatus {
+        merge.program_status(&ProgramStatus {
             state,
             message: None,
         });
@@ -1832,7 +1844,7 @@ mod tests {
         agent.merge.notify("look here");
         assert!(!agent.takes_messages(Instant::now()));
 
-        agent.merge.program_status(&swarm_term::ProgramStatus {
+        agent.merge.program_status(&ProgramStatus {
             state: ProgramState::Working,
             message: None,
         });
@@ -2197,6 +2209,14 @@ mod tests {
     }
 
     fn agents_with_a_task() -> (Arc<Agents>, TaskInfo) {
+        let (agents, task, _frames) = agents_with_a_client();
+
+        (agents, task)
+    }
+
+    /// Like [`agents_with_a_task`], with a connected client; `frames` holds what the
+    /// client was sent.
+    fn agents_with_a_client() -> (Arc<Agents>, TaskInfo, flume::Receiver<Frame>) {
         use swarm_core::store::NewTask;
 
         let store = Store::open_in_memory().expect("store");
@@ -2216,6 +2236,8 @@ mod tests {
             .expect("task");
         let store = Arc::new(Mutex::new(store));
         let clients = Arc::new(Clients::default());
+        let (sender, frames) = flume::unbounded();
+        clients.add(&Arc::new(ClientSink::new(1, sender, None)));
         let terminals = Terminals::new(Arc::clone(&store));
         let messages = Messages::new(Arc::clone(&store), Arc::clone(&clients));
 
@@ -2233,7 +2255,7 @@ mod tests {
             messages,
         );
 
-        (agents, task)
+        (agents, task, frames)
     }
 
     fn register_in(agents: &Agents, task: &TaskInfo, asker: Option<AgentId>) -> Result<AgentInfo> {
@@ -2346,5 +2368,174 @@ mod tests {
 
         assert!(another.is_ok());
         assert_eq!(lock(&agents.live).len(), 2);
+    }
+
+    fn notices(frames: &flume::Receiver<Frame>) -> Vec<Notice> {
+        frames
+            .try_iter()
+            .filter_map(|frame| {
+                match read::<Event>(&mut &frame[..], &mut Vec::new()).expect("event") {
+                    Event::Notice { notice } => Some(notice),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    fn texts(notices: &[Notice]) -> Vec<(NoticeKind, &str)> {
+        notices
+            .iter()
+            .map(|notice| (notice.kind, notice.text.as_str()))
+            .collect()
+    }
+
+    fn report(agents: &Arc<Agents>, id: AgentId, state: ProgramState, message: Option<&str>) {
+        let status = ProgramStatus {
+            state,
+            message: message.map(str::to_owned),
+        };
+
+        agents.output(id, &TerminalOutput::ProgramStatus(status));
+    }
+
+    fn stop_failure(agents: &Arc<Agents>, id: AgentId, error: &str) {
+        agents.hook(
+            id,
+            &serde_json::json!({"hook_event_name": "StopFailure", "error": error}),
+        );
+    }
+
+    #[test]
+    fn an_agent_that_fails_to_start_is_one_broke_notice() {
+        let (agents, task, frames) = agents_with_a_client();
+        let agent = register_in(&agents, &task, None).expect("register");
+
+        agents.fail(agent.id, "Command not found");
+
+        let notices = notices(&frames);
+        assert_eq!(
+            texts(&notices),
+            [(NoticeKind::Broke, "Failed to start: Command not found")]
+        );
+        assert_eq!(notices[0].agent, agent.id);
+        assert_eq!(notices[0].task, Some(task.id));
+        assert_eq!(notices[0].project, task.project);
+    }
+
+    #[test]
+    fn an_agent_that_failed_already_fails_to_start_only_once() {
+        let (agents, task, frames) = agents_with_a_client();
+        let agent = register_in(&agents, &task, None).expect("register");
+
+        agents.fail(agent.id, "Cannot start");
+        agents.fail(agent.id, "Cannot start");
+
+        assert_eq!(notices(&frames).len(), 1);
+    }
+
+    #[test]
+    fn a_start_failure_that_ended_on_purpose_is_no_broke() {
+        type Ending = (&'static str, fn(&Agents, &TaskInfo, AgentId));
+        let endings: [Ending; 4] = [
+            ("the user stopped it", |agents, _, id| {
+                lock(&agents.live)
+                    .get_mut(&id)
+                    .expect("live")
+                    .stopped_by_user = true;
+            }),
+            ("a stop was requested", |agents, _, id| {
+                lock(&agents.live)
+                    .get_mut(&id)
+                    .expect("live")
+                    .stop_requested = true;
+            }),
+            ("the task is closing", |agents, task, _| {
+                assert!(agents.begin_close(task.id));
+            }),
+            ("the daemon stops", |agents, _, _| agents.begin_shutdown()),
+        ];
+
+        for (name, end) in endings {
+            let (agents, task, frames) = agents_with_a_client();
+            let agent = register_in(&agents, &task, None).expect("register");
+            end(&agents, &task, agent.id);
+
+            agents.fail(agent.id, "Cannot start");
+
+            assert!(notices(&frames).is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn an_osc_error_is_a_broke_notice_with_the_status_text() {
+        let (agents, task, frames) = agents_with_a_client();
+        let agent = register_in(&agents, &task, None).expect("register");
+
+        report(
+            &agents,
+            agent.id,
+            ProgramState::Error,
+            Some("usage limit reached"),
+        );
+
+        let notices = notices(&frames);
+        assert_eq!(
+            texts(&notices),
+            [(NoticeKind::Broke, "usage limit reached")]
+        );
+        assert_eq!(notices[0].agent, agent.id);
+        assert_eq!(notices[0].task, Some(task.id));
+    }
+
+    #[test]
+    fn an_osc_error_without_text_is_a_broke_notice_with_a_short_reason() {
+        let (agents, task, frames) = agents_with_a_client();
+        let agent = register_in(&agents, &task, None).expect("register");
+
+        report(&agents, agent.id, ProgramState::Error, None);
+
+        assert_eq!(texts(&notices(&frames)), [(NoticeKind::Broke, "Failed")]);
+    }
+
+    #[test]
+    fn an_osc_error_is_one_broke_notice_per_error_spell() {
+        let (agents, task, frames) = agents_with_a_client();
+        let agent = register_in(&agents, &task, None).expect("register");
+
+        report(&agents, agent.id, ProgramState::Error, Some("first"));
+        report(&agents, agent.id, ProgramState::Error, Some("first"));
+        report(&agents, agent.id, ProgramState::Error, Some("changed"));
+        assert_eq!(texts(&notices(&frames)), [(NoticeKind::Broke, "first")]);
+
+        report(&agents, agent.id, ProgramState::Working, None);
+        report(&agents, agent.id, ProgramState::Error, Some("second"));
+        assert_eq!(texts(&notices(&frames)), [(NoticeKind::Broke, "second")]);
+    }
+
+    #[test]
+    fn an_osc_error_and_a_stop_failure_hook_are_one_broke_notice_in_either_order() {
+        let (agents, task, frames) = agents_with_a_client();
+        let agent = register_in(&agents, &task, None).expect("register");
+        report(&agents, agent.id, ProgramState::Working, None);
+
+        report(&agents, agent.id, ProgramState::Error, Some("from osc"));
+        stop_failure(&agents, agent.id, "from hook");
+        assert_eq!(texts(&notices(&frames)), [(NoticeKind::Broke, "from osc")]);
+
+        report(&agents, agent.id, ProgramState::Working, None);
+        stop_failure(&agents, agent.id, "from hook");
+        report(&agents, agent.id, ProgramState::Error, Some("from osc"));
+        assert_eq!(texts(&notices(&frames)), [(NoticeKind::Broke, "from hook")]);
+    }
+
+    #[test]
+    fn an_osc_error_of_an_agent_that_ends_on_purpose_is_no_broke() {
+        let (agents, task, frames) = agents_with_a_client();
+        let agent = register_in(&agents, &task, None).expect("register");
+        assert!(agents.begin_close(task.id));
+
+        report(&agents, agent.id, ProgramState::Error, Some("closing"));
+
+        assert!(notices(&frames).is_empty());
     }
 }

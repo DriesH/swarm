@@ -13,7 +13,7 @@ use swarm_term::{BlockedKind, ExitStatus, ProgramState, ProgramStatus};
 /// The message shown when the folder trust dialog waits for an answer.
 pub const TRUST_MESSAGE: &str = "Trust this folder";
 
-/// The notice text of a hook that failed without saying why.
+/// The notice text of a failure that did not say why.
 const FAILURE_FALLBACK: &str = "Failed";
 
 /// What a hook changed.
@@ -26,8 +26,6 @@ pub struct HookOutcome {
     pub session_started: bool,
     /// The event was `Stop`: the agent finished its turn.
     pub stopped: bool,
-    /// The event was `StopFailure`: why the turn failed.
-    pub failure: Option<String>,
 }
 
 /// One agent's status. Before the first OSC 7501 report the hooks drive it. After that
@@ -41,8 +39,9 @@ pub struct StatusMerge {
     hook_seen: bool,
     /// Set by `notify`: the agent shows as blocked with this text over `status`.
     notice: Option<String>,
-    /// `status` became blocked and `take_prompt` has not told yet.
-    prompt_due: bool,
+    /// `status` became blocked or an error, and `take_prompt` or `take_failure` has not
+    /// told yet.
+    news_due: bool,
 }
 
 impl Default for StatusMerge {
@@ -53,7 +52,7 @@ impl Default for StatusMerge {
             osc_seen: false,
             hook_seen: false,
             notice: None,
-            prompt_due: false,
+            news_due: false,
         }
     }
 }
@@ -105,7 +104,7 @@ impl StatusMerge {
         let AgentStatus::Blocked(kind) = self.status else {
             return None;
         };
-        if !std::mem::take(&mut self.prompt_due) {
+        if !std::mem::take(&mut self.news_due) {
             return None;
         }
 
@@ -115,6 +114,22 @@ impl StatusMerge {
             .filter(|message| !message.is_empty());
 
         Some(message.map_or_else(|| prompt_reason(kind).to_owned(), str::to_owned))
+    }
+
+    /// The text of the failure the agent just reported. Returns it once per error spell,
+    /// whether OSC 7501 or a `StopFailure` hook reported it first: the other one is not
+    /// news. A new spell starts after the agent left the error state.
+    pub fn take_failure(&mut self) -> Option<String> {
+        if self.status != AgentStatus::Error || !std::mem::take(&mut self.news_due) {
+            return None;
+        }
+
+        let message = self
+            .message
+            .as_deref()
+            .filter(|message| !message.is_empty());
+
+        Some(message.unwrap_or(FAILURE_FALLBACK).to_owned())
     }
 
     fn visible(&self) -> (AgentStatus, Option<String>) {
@@ -177,14 +192,6 @@ impl StatusMerge {
             session_id,
             session_started: name == "SessionStart",
             stopped: name == "Stop",
-            failure: (name == "StopFailure").then(|| {
-                event
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .filter(|reason| !reason.is_empty())
-                    .unwrap_or(FAILURE_FALLBACK)
-                    .to_owned()
-            }),
         }
     }
 
@@ -230,11 +237,14 @@ impl StatusMerge {
     fn set(&mut self, status: AgentStatus, message: Option<String>) -> bool {
         let before = self.visible();
         let was_blocked = matches!(self.status, AgentStatus::Blocked(_));
+        let was_error = self.status == AgentStatus::Error;
         self.status = status;
         self.message = message;
 
         let blocked = matches!(status, AgentStatus::Blocked(_));
-        self.prompt_due = blocked && (self.prompt_due || !was_blocked);
+        let failed = status == AgentStatus::Error;
+        let entered = (blocked && !was_blocked) || (failed && !was_error);
+        self.news_due = (blocked || failed) && (self.news_due || entered);
 
         before != self.visible()
     }
@@ -980,24 +990,39 @@ mod tests {
         assert!(!merge.is_resting());
     }
 
+    fn osc_error(message: Option<&str>) -> ProgramStatus {
+        ProgramStatus {
+            state: ProgramState::Error,
+            message: message.map(str::to_owned),
+        }
+    }
+
+    fn stop_failure(merge: &mut StatusMerge, error: &str) {
+        hook(
+            merge,
+            &json!({"hook_event_name": "StopFailure", "error": error}),
+        );
+    }
+
     #[test]
-    fn a_stop_failure_hook_carries_its_reason() {
+    fn a_stop_failure_hook_is_a_failure_with_its_reason() {
         let mut merge = StatusMerge::default();
 
-        let outcome = hook(
-            &mut merge,
-            &json!({"hook_event_name": "StopFailure", "error": "rate_limit"}),
-        );
-        assert_eq!(outcome.failure.as_deref(), Some("rate_limit"));
+        stop_failure(&mut merge, "rate_limit");
 
-        let outcome = hook(&mut merge, &json!({"hook_event_name": "StopFailure"}));
-        assert_eq!(outcome.failure.as_deref(), Some("Failed"));
+        assert_eq!(merge.take_failure().as_deref(), Some("rate_limit"));
+        assert_eq!(merge.take_failure(), None);
+    }
 
-        let outcome = hook(
-            &mut merge,
-            &json!({"hook_event_name": "StopFailure", "error": ""}),
-        );
-        assert_eq!(outcome.failure.as_deref(), Some("Failed"));
+    #[test]
+    fn a_stop_failure_hook_without_a_reason_gets_a_short_one() {
+        let mut merge = StatusMerge::default();
+        hook(&mut merge, &json!({"hook_event_name": "StopFailure"}));
+        assert_eq!(merge.take_failure().as_deref(), Some("Failed"));
+
+        let mut merge = StatusMerge::default();
+        stop_failure(&mut merge, "");
+        assert_eq!(merge.take_failure().as_deref(), Some("Failed"));
     }
 
     #[test]
@@ -1005,10 +1030,166 @@ mod tests {
         let mut merge = StatusMerge::default();
 
         for name in ["SessionStart", "Stop", "PermissionRequest", "Notification"] {
-            let outcome = hook(&mut merge, &json!({"hook_event_name": name}));
+            hook(&mut merge, &json!({"hook_event_name": name}));
 
-            assert_eq!(outcome.failure, None, "{name}");
+            assert_eq!(merge.take_failure(), None, "{name}");
         }
+    }
+
+    #[test]
+    fn an_osc_error_is_a_failure_with_the_status_text() {
+        let mut merge = StatusMerge::default();
+
+        merge.program_status(&osc_error(Some("usage limit reached")));
+
+        assert_eq!(merge.take_failure().as_deref(), Some("usage limit reached"));
+        assert_eq!(merge.take_failure(), None);
+    }
+
+    #[test]
+    fn an_osc_error_without_text_gets_a_short_reason() {
+        for message in [None, Some("")] {
+            let mut merge = StatusMerge::default();
+
+            merge.program_status(&osc_error(message));
+
+            assert_eq!(
+                merge.take_failure().as_deref(),
+                Some("Failed"),
+                "{message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_other_osc_state_is_a_failure() {
+        for state in [
+            ProgramState::Idle,
+            ProgramState::Working,
+            ProgramState::Done,
+            ProgramState::Blocked(BlockedKind::Permission),
+            ProgramState::Clear,
+        ] {
+            let mut merge = StatusMerge::default();
+
+            merge.program_status(&osc(state));
+
+            assert_eq!(merge.take_failure(), None, "{state:?}");
+        }
+    }
+
+    #[test]
+    fn a_repeat_or_a_new_text_inside_one_error_spell_is_not_a_new_failure() {
+        let mut merge = StatusMerge::default();
+        merge.program_status(&osc_error(Some("usage limit reached")));
+        merge.take_failure();
+
+        merge.program_status(&osc_error(Some("usage limit reached")));
+        assert_eq!(merge.take_failure(), None);
+
+        merge.program_status(&osc_error(Some("another text")));
+        assert_eq!(merge.take_failure(), None);
+    }
+
+    #[test]
+    fn an_osc_error_and_a_stop_failure_in_either_order_are_one_failure() {
+        let mut merge = StatusMerge::default();
+        merge.program_status(&osc(ProgramState::Working));
+        merge.program_status(&osc_error(Some("overloaded")));
+        assert_eq!(merge.take_failure().as_deref(), Some("overloaded"));
+        stop_failure(&mut merge, "overloaded_error");
+        assert_eq!(merge.take_failure(), None);
+
+        let mut merge = StatusMerge::default();
+        merge.program_status(&osc(ProgramState::Working));
+        stop_failure(&mut merge, "overloaded_error");
+        assert_eq!(merge.take_failure().as_deref(), Some("overloaded_error"));
+        merge.program_status(&osc_error(Some("overloaded")));
+        assert_eq!(merge.take_failure(), None);
+    }
+
+    #[test]
+    fn two_reports_of_one_spell_are_one_failure_even_when_none_was_taken_between() {
+        let mut merge = StatusMerge::default();
+        merge.program_status(&osc(ProgramState::Working));
+
+        merge.program_status(&osc_error(Some("overloaded")));
+        stop_failure(&mut merge, "overloaded_error");
+
+        assert!(merge.take_failure().is_some());
+        assert_eq!(merge.take_failure(), None);
+    }
+
+    #[test]
+    fn an_error_after_the_agent_left_the_error_state_is_a_new_failure() {
+        for between in [
+            ProgramState::Working,
+            ProgramState::Idle,
+            ProgramState::Done,
+            ProgramState::Clear,
+        ] {
+            let mut merge = StatusMerge::default();
+            merge.program_status(&osc_error(Some("first")));
+            assert_eq!(merge.take_failure().as_deref(), Some("first"));
+
+            merge.program_status(&osc(between));
+            assert_eq!(merge.take_failure(), None, "{between:?}");
+            merge.program_status(&osc_error(Some("second")));
+
+            assert_eq!(
+                merge.take_failure().as_deref(),
+                Some("second"),
+                "{between:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stop_failure_after_the_agent_worked_again_is_a_new_failure() {
+        let mut merge = StatusMerge::default();
+        merge.program_status(&osc_error(Some("first")));
+        merge.take_failure();
+
+        merge.program_status(&osc(ProgramState::Working));
+        stop_failure(&mut merge, "second");
+
+        assert_eq!(merge.take_failure().as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn a_prompt_and_a_failure_that_follow_each_other_are_each_told_once() {
+        let mut merge = StatusMerge::default();
+
+        merge.program_status(&blocked(BlockedKind::Permission, None));
+        assert_eq!(merge.take_failure(), None);
+        assert!(merge.take_prompt().is_some());
+
+        merge.program_status(&osc_error(Some("broke")));
+        assert_eq!(merge.take_prompt(), None);
+        assert_eq!(merge.take_failure().as_deref(), Some("broke"));
+
+        merge.program_status(&blocked(BlockedKind::Question, None));
+        assert_eq!(merge.take_failure(), None);
+        assert!(merge.take_prompt().is_some());
+    }
+
+    #[test]
+    fn a_failure_right_after_a_prompt_that_nobody_took_is_still_told() {
+        let mut merge = StatusMerge::default();
+        merge.program_status(&blocked(BlockedKind::Permission, None));
+
+        merge.program_status(&osc_error(Some("broke")));
+
+        assert_eq!(merge.take_failure().as_deref(), Some("broke"));
+    }
+
+    #[test]
+    fn an_error_that_ended_before_it_was_taken_is_gone() {
+        let mut merge = StatusMerge::default();
+        merge.program_status(&osc_error(Some("first")));
+        merge.program_status(&osc(ProgramState::Working));
+
+        assert_eq!(merge.take_failure(), None);
     }
 
     #[test]
