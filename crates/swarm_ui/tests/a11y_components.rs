@@ -168,7 +168,7 @@ fn a_button_hint_is_read_after_the_label() {
 }
 
 #[test]
-fn a_usage_meter_is_one_labelled_group() {
+fn a_usage_meter_is_one_labelled_meter() {
     with_window(|window, cx| {
         let plain = a11y_info(
             UsageMeter::new("plain", "Session")
@@ -179,12 +179,17 @@ fn a_usage_meter_is_one_labelled_group() {
             cx,
         );
 
-        assert_eq!(plain.role, Some(Role::Group));
+        assert_eq!(plain.role, Some(Role::Meter));
         assert_eq!(plain.node.label(), Some("Session, 42%"));
+        assert_eq!(plain.node.numeric_value(), Some(42.));
+        assert_eq!(plain.node.min_numeric_value(), Some(0.));
+        assert_eq!(plain.node.max_numeric_value(), Some(100.));
 
         let without_value = a11y_info(UsageMeter::new("none", "Weekly"), window, cx);
 
         assert_eq!(without_value.node.label(), Some("Weekly"));
+        assert_eq!(without_value.role, Some(Role::Group));
+        assert_eq!(without_value.node.numeric_value(), None);
 
         let spoken = a11y_info(
             UsageMeter::new("spoken", "Weekly")
@@ -207,7 +212,7 @@ fn a_usage_meter_is_one_labelled_group() {
 }
 
 #[test]
-fn a_detailed_usage_meter_is_one_labelled_group() {
+fn a_detailed_usage_meter_is_one_labelled_meter() {
     with_window(|window, cx| {
         let plain = a11y_info(
             UsageDetailMeter::new("plain", "Weekly")
@@ -220,11 +225,23 @@ fn a_detailed_usage_meter_is_one_labelled_group() {
             cx,
         );
 
-        assert_eq!(plain.role, Some(Role::Group));
+        assert_eq!(plain.role, Some(Role::Meter));
         assert_eq!(
             plain.node.label(),
             Some("Weekly, 61% used, Limit in 3d 21h, Resets in 6d 11h")
         );
+        assert_eq!(plain.node.numeric_value(), Some(61.));
+        assert_eq!(plain.node.min_numeric_value(), Some(0.));
+        assert_eq!(plain.node.max_numeric_value(), Some(100.));
+
+        let without_bar = a11y_info(
+            UsageDetailMeter::new("none", "Weekly").value("61% used"),
+            window,
+            cx,
+        );
+
+        assert_eq!(without_bar.role, Some(Role::Group));
+        assert_eq!(without_bar.node.numeric_value(), None);
 
         let spoken = a11y_info(
             UsageDetailMeter::new("spoken", "Weekly")

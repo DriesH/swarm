@@ -814,6 +814,20 @@ mod tests {
                 check(&mut failures, &theme, GRAPHIC_AA, glyph, &surfaces);
             }
 
+            // The pace tick cuts the usage fill in the color of the card under the meter.
+            for card in [("panel", colors.panel), ("raised", colors.raised)] {
+                check(
+                    &mut failures,
+                    &theme,
+                    GRAPHIC_AA,
+                    card,
+                    &[
+                        ("usage fill fg", colors.fg),
+                        ("usage fill warn", colors.warn),
+                    ],
+                );
+            }
+
             // The check mark in a checked box: the ground on the accent.
             check(
                 &mut failures,
