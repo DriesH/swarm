@@ -36,6 +36,10 @@ pub(crate) struct Entry {
     pub agent: Option<SharedString>,
     /// The folder row this row sits under.
     pub parent: Option<usize>,
+    /// The 1-based place among the rows with the same parent, for a screen reader.
+    pub position_in_set: usize,
+    /// How many rows have the same parent.
+    pub size_of_set: usize,
 }
 
 /// What the cursor of a tree stands on. It names a row by its content, so it survives a
@@ -120,7 +124,22 @@ impl Build<'_> {
         let mut dirs: Vec<&(String, Dir)> = dir.dirs.iter().collect();
         dirs.sort_by(|(a, _), (b, _)| compare_names(a, b));
 
+        let all_files = self.files;
+        let mut files: Vec<(usize, &FileDiff)> = dir
+            .files
+            .iter()
+            .filter_map(|index| all_files.get(*index).map(|file| (*index, file)))
+            .collect();
+        files.sort_by(|(a_index, a), (b_index, b)| {
+            compare_names(&file_name(a), &file_name(b)).then(a_index.cmp(b_index))
+        });
+
+        let size_of_set = dirs.len() + files.len();
+        let mut position_in_set = 0;
+
         for (name, child) in dirs {
+            position_in_set += 1;
+
             let mut label = name.clone();
             let mut path = join(folder, name);
             let mut node = child;
@@ -143,6 +162,8 @@ impl Build<'_> {
                 folder: path.clone().into(),
                 agent: None,
                 parent,
+                position_in_set,
+                size_of_set,
             });
 
             if open {
@@ -150,16 +171,9 @@ impl Build<'_> {
             }
         }
 
-        let mut files: Vec<(usize, &FileDiff)> = dir
-            .files
-            .iter()
-            .filter_map(|index| self.files.get(*index).map(|file| (*index, file)))
-            .collect();
-        files.sort_by(|(a_index, a), (b_index, b)| {
-            compare_names(&file_name(a), &file_name(b)).then(a_index.cmp(b_index))
-        });
-
         for (index, file) in files {
+            position_in_set += 1;
+
             let agent = self
                 .repeated
                 .contains(file.path.as_path())
@@ -172,6 +186,8 @@ impl Build<'_> {
                 folder: folder.to_owned().into(),
                 agent,
                 parent,
+                position_in_set,
+                size_of_set,
             });
         }
     }
@@ -397,6 +413,49 @@ mod tests {
                 format!("{} {}{slash}", entry.level, entry.name)
             })
             .collect()
+    }
+
+    #[test]
+    fn each_row_knows_its_place_among_the_rows_of_its_folder() {
+        let files = [
+            file("/w", "z.rs", None),
+            file("/w", "src/b.rs", None),
+            file("/w", "docs/a.md", None),
+            file("/w", "src/c.rs", None),
+            file("/w", "a.rs", None),
+        ];
+
+        let entries = tree(&files, &[]);
+
+        let places: Vec<_> = entries
+            .iter()
+            .map(|entry| (&*entry.name, entry.position_in_set, entry.size_of_set))
+            .collect();
+        assert_eq!(
+            places,
+            [
+                ("docs", 1, 4),
+                ("a.md", 1, 1),
+                ("src", 2, 4),
+                ("b.rs", 1, 2),
+                ("c.rs", 2, 2),
+                ("a.rs", 3, 4),
+                ("z.rs", 4, 4),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_closed_folder_still_counts_in_its_set() {
+        let files = [file("/w", "src/b.rs", None), file("/w", "a.rs", None)];
+
+        let entries = tree(&files, &["src"]);
+
+        let places: Vec<_> = entries
+            .iter()
+            .map(|entry| (&*entry.name, entry.position_in_set, entry.size_of_set))
+            .collect();
+        assert_eq!(places, [("src", 1, 2), ("a.rs", 2, 2)]);
     }
 
     #[test]

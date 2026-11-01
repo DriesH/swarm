@@ -157,20 +157,42 @@ struct Lines {
 #[derive(Clone, Debug, Default)]
 struct Loaded {
     lines: Option<Lines>,
+    /// The digest the file had when the last request for its lines went out.
+    asked: u64,
     loading: bool,
     error: Option<SharedString>,
 }
 
+/// What the app does next, once the daemon answered a request for the lines of a file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AfterLoad {
+    Nothing,
+    /// The diff moved on while the request ran. The file is marked as loading for its new
+    /// digest, and the caller asks again.
+    LoadAgain,
+    /// The answer does not fit the stored diff. The load is marked as failed, and the
+    /// caller asks the daemon for the whole diff again.
+    FreshDiff,
+}
+
 /// The lines of folded files the user asked for. A new diff of the daemon comes without
 /// them, so they are kept here and put back while the digest of the file still matches.
+/// Lines of another digest are never shown.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct LoadedFiles {
     files: HashMap<LoadKey, Loaded>,
 }
 
+fn file_of<'a>(diff: &'a TaskDiff, key: &LoadKey) -> Option<&'a FileDiff> {
+    diff.files
+        .iter()
+        .find(|file| file.worktree == key.2 && file.path == key.3)
+}
+
 impl LoadedFiles {
-    /// Marks the file as loading. False when it is loading already.
-    pub(crate) fn begin(&mut self, key: &LoadKey) -> bool {
+    /// Marks the file as loading, for the `digest` it has now. False when it is loading
+    /// already.
+    pub(crate) fn begin(&mut self, key: &LoadKey, digest: u64) -> bool {
         let loaded = self.files.entry(key.clone()).or_default();
 
         if loaded.loading {
@@ -179,49 +201,112 @@ impl LoadedFiles {
 
         loaded.loading = true;
         loaded.error = None;
+        loaded.asked = digest;
 
         true
     }
 
-    /// Keeps the lines of the daemon's answer.
-    pub(crate) fn keep(&mut self, key: &LoadKey, file: &FileDiff) {
-        self.files.insert(
-            key.clone(),
-            Loaded {
-                lines: Some(Lines {
-                    digest: file.digest,
-                    hunks: file.hunks.clone(),
-                    truncated: file.truncated,
-                }),
-                loading: false,
-                error: None,
-            },
-        );
+    /// Settles a load with the daemon's answer, and merges the lines into `diff`. The lines
+    /// go in only when the stored file is still folded and has the digest of the answer.
+    /// A load of a task that closed in the meantime changes nothing.
+    pub(crate) fn finish(
+        &mut self,
+        key: &LoadKey,
+        answer: Result<Option<FileDiff>, SharedString>,
+        diff: Option<&mut Rc<TaskDiff>>,
+    ) -> AfterLoad {
+        let Some(asked) = self.files.get(key).map(|loaded| loaded.asked) else {
+            return AfterLoad::Nothing;
+        };
+
+        let current = diff
+            .as_deref()
+            .and_then(|diff| file_of(diff, key))
+            .filter(|file| file.fold.is_some())
+            .map(|file| file.digest);
+        let (Some(digest), Some(diff)) = (current, diff) else {
+            self.files.remove(key);
+
+            return AfterLoad::Nothing;
+        };
+
+        if digest != asked {
+            if let Some(loaded) = self.files.get_mut(key) {
+                loaded.asked = digest;
+            }
+
+            return AfterLoad::LoadAgain;
+        }
+
+        match answer {
+            Ok(Some(file)) if file.digest == digest => {
+                self.files.insert(
+                    key.clone(),
+                    Loaded {
+                        lines: Some(Lines {
+                            digest,
+                            hunks: file.hunks,
+                            truncated: file.truncated,
+                        }),
+                        asked,
+                        loading: false,
+                        error: None,
+                    },
+                );
+                self.merge(key, Rc::make_mut(diff));
+
+                AfterLoad::Nothing
+            }
+            Ok(Some(_)) => {
+                self.fail(key, "Changed while loading".into());
+
+                AfterLoad::FreshDiff
+            }
+            Ok(None) => {
+                self.fail(key, "No longer in the diff".into());
+
+                AfterLoad::FreshDiff
+            }
+            Err(message) => {
+                self.fail(key, message);
+
+                AfterLoad::Nothing
+            }
+        }
     }
 
-    /// Ends a load that failed. Lines kept earlier stay.
-    pub(crate) fn fail(&mut self, key: &LoadKey, message: SharedString) {
-        let loaded = self.files.entry(key.clone()).or_default();
-
-        loaded.loading = false;
-        loaded.error = Some(message);
-    }
-
-    pub(crate) fn forget(&mut self, key: &LoadKey) {
-        self.files.remove(key);
+    /// Ends a load that failed. Lines kept earlier stay, but they are shown only for the
+    /// digest they belong to.
+    fn fail(&mut self, key: &LoadKey, message: SharedString) {
+        if let Some(loaded) = self.files.get_mut(key) {
+            loaded.loading = false;
+            loaded.error = Some(message);
+        }
     }
 
     pub(crate) fn forget_task(&mut self, task: TaskId) {
         self.files.retain(|key, _| key.0 != task);
     }
 
-    /// The state of every file of one task and source the user asked for.
-    pub(crate) fn loads(&self, task: TaskId, source: ReviewSource) -> FileLoads {
-        self.files
+    /// The state of every folded file of `diff` the user asked for.
+    pub(crate) fn loads(&self, diff: &TaskDiff) -> FileLoads {
+        diff.files
             .iter()
-            .filter(|(key, _)| key.0 == task && key.1 == source)
-            .filter_map(|(key, loaded)| {
-                let load = if loaded.lines.is_some() {
+            .filter(|file| file.fold.is_some())
+            .filter_map(|file| {
+                let key = (
+                    diff.task,
+                    diff.source,
+                    file.worktree.clone(),
+                    file.path.clone(),
+                );
+                let loaded = self.files.get(&key)?;
+                let current = loaded
+                    .lines
+                    .as_ref()
+                    .is_some_and(|lines| lines.digest == file.digest);
+
+                let load = if current {
                     FileLoad::Loaded
                 } else if loaded.loading {
                     FileLoad::Loading
@@ -229,14 +314,14 @@ impl LoadedFiles {
                     FileLoad::Failed(loaded.error.clone()?)
                 };
 
-                Some(((key.2.clone(), key.3.clone()), load))
+                Some(((key.2, key.3), load))
             })
             .collect()
     }
 
     /// Puts the kept lines into the folded files of a diff that just came in, and forgets
-    /// files the diff no longer folds. Lines of a file whose digest changed go in too, so
-    /// the card does not flicker while [`LoadedFiles::stale`] files load again.
+    /// files the diff no longer folds. A file with another digest than its lines stays
+    /// without lines, see [`LoadedFiles::begin_stale`].
     pub(crate) fn restore(&mut self, diff: &mut TaskDiff) {
         let (task, source) = (diff.task, diff.source);
         let folded: HashSet<(&Path, &Path)> = diff
@@ -260,6 +345,7 @@ impl LoadedFiles {
                 .files
                 .get(&key)
                 .and_then(|loaded| loaded.lines.as_ref())
+                .filter(|lines| lines.digest == file.digest)
             {
                 file.hunks.clone_from(&lines.hunks);
                 file.truncated = lines.truncated;
@@ -267,52 +353,49 @@ impl LoadedFiles {
         }
     }
 
-    /// Puts the kept lines of one file into the diff. The file keeps its fold.
-    pub(crate) fn merge(&self, key: &LoadKey, diff: &mut TaskDiff) {
+    /// Puts the kept lines of one file into the diff. The file keeps its fold. Lines of
+    /// another digest than the file has stay out.
+    fn merge(&self, key: &LoadKey, diff: &mut TaskDiff) {
         let Some(lines) = self.files.get(key).and_then(|loaded| loaded.lines.as_ref()) else {
             return;
         };
 
-        if let Some(file) = diff
-            .files
-            .iter_mut()
-            .find(|file| file.worktree == key.2 && file.path == key.3)
-        {
+        let file = diff.files.iter_mut().find(|file| {
+            file.worktree == key.2
+                && file.path == key.3
+                && file.fold.is_some()
+                && file.digest == lines.digest
+        });
+
+        if let Some(file) = file {
             file.hunks.clone_from(&lines.hunks);
             file.truncated = lines.truncated;
         }
     }
 
-    /// The loaded files of a diff whose digest is no longer the one their lines belong to,
-    /// and that are not loading.
-    pub(crate) fn stale(&self, diff: &TaskDiff) -> Vec<LoadKey> {
-        diff.files
-            .iter()
-            .filter(|file| file.fold.is_some())
-            .map(|file| {
-                (
-                    diff.task,
-                    diff.source,
-                    file.worktree.clone(),
-                    file.path.clone(),
-                )
-            })
-            .filter(|key| {
-                let file = diff
-                    .files
-                    .iter()
-                    .find(|file| file.worktree == key.2 && file.path == key.3);
+    /// Marks the folded files of a diff as loading when the user asked for them and their
+    /// digest is not the one of the last request. Returns the files to ask for.
+    pub(crate) fn begin_stale(&mut self, diff: &TaskDiff) -> Vec<LoadKey> {
+        let mut started = Vec::new();
 
-                self.files.get(key).is_some_and(|loaded| {
-                    !loaded.loading
-                        && loaded
-                            .lines
-                            .as_ref()
-                            .zip(file)
-                            .is_some_and(|(lines, file)| lines.digest != file.digest)
-                })
-            })
-            .collect()
+        for file in diff.files.iter().filter(|file| file.fold.is_some()) {
+            let key = (
+                diff.task,
+                diff.source,
+                file.worktree.clone(),
+                file.path.clone(),
+            );
+            let stale = self
+                .files
+                .get(&key)
+                .is_some_and(|loaded| !loaded.loading && loaded.asked != file.digest);
+
+            if stale && self.begin(&key, file.digest) {
+                started.push(key);
+            }
+        }
+
+        started
     }
 }
 
@@ -2195,72 +2278,289 @@ mod tests {
         diff(vec![folded])
     }
 
+    fn file_key() -> FileKey {
+        (PathBuf::from("/wt"), PathBuf::from("Cargo.lock"))
+    }
+
+    fn stored(path: &str, digest: u64) -> Rc<TaskDiff> {
+        Rc::new(folded_diff(path, digest))
+    }
+
+    fn texts(diff: &TaskDiff) -> Vec<&str> {
+        diff.files[0]
+            .hunks
+            .iter()
+            .flat_map(|hunk| hunk.lines.iter().map(|line| line.text.as_str()))
+            .collect()
+    }
+
+    /// A load of `Cargo.lock` that the daemon answered with `answer`.
+    fn settle(
+        loaded: &mut LoadedFiles,
+        stored: &mut Rc<TaskDiff>,
+        answer: Result<Option<FileDiff>, SharedString>,
+    ) -> AfterLoad {
+        loaded.finish(&key("Cargo.lock"), answer, Some(stored))
+    }
+
+    /// A new diff of the daemon arrives with another digest for the file.
+    fn poll(loaded: &mut LoadedFiles, stored: &mut Rc<TaskDiff>, digest: u64) {
+        let mut next = folded_diff("Cargo.lock", digest);
+
+        loaded.restore(&mut next);
+        *stored = Rc::new(next);
+    }
+
     #[test]
     fn loaded_lines_come_back_into_a_new_diff_with_the_same_digest() {
         let mut loaded = LoadedFiles::default();
         let key = key("Cargo.lock");
-        assert!(loaded.begin(&key));
-        loaded.keep(&key, &lines_for("Cargo.lock", 5, "kept"));
+        let mut kept = stored("Cargo.lock", 5);
+        assert!(loaded.begin(&key, 5));
+        let next = settle(
+            &mut loaded,
+            &mut kept,
+            Ok(Some(lines_for("Cargo.lock", 5, "kept"))),
+        );
 
         let mut again = folded_diff("Cargo.lock", 5);
         loaded.restore(&mut again);
 
-        assert_eq!(again.files[0].hunks[0].lines[0].text, "kept");
+        assert_eq!(next, AfterLoad::Nothing);
+        assert_eq!(texts(&kept), ["kept"]);
+        assert_eq!(texts(&again), ["kept"]);
         assert_eq!(again.files[0].fold, Some(Fold::Lock));
-        assert!(loaded.stale(&again).is_empty());
+        assert!(loaded.begin_stale(&again).is_empty());
+        assert_eq!(
+            loaded.loads(&again).get(&file_key()),
+            Some(&FileLoad::Loaded)
+        );
     }
 
     #[test]
-    fn a_new_digest_keeps_the_old_lines_and_asks_for_new_ones() {
+    fn a_new_digest_never_shows_the_old_lines_and_asks_for_new_ones() {
         let mut loaded = LoadedFiles::default();
         let key = key("Cargo.lock");
-        loaded.begin(&key);
-        loaded.keep(&key, &lines_for("Cargo.lock", 5, "old"));
+        let mut kept = stored("Cargo.lock", 5);
+        loaded.begin(&key, 5);
+        settle(
+            &mut loaded,
+            &mut kept,
+            Ok(Some(lines_for("Cargo.lock", 5, "old"))),
+        );
 
-        let mut changed = folded_diff("Cargo.lock", 6);
-        loaded.restore(&mut changed);
+        poll(&mut loaded, &mut kept, 6);
+        assert!(
+            texts(&kept).is_empty(),
+            "the old lines went into the new file"
+        );
+        assert_eq!(loaded.loads(&kept).get(&file_key()), None);
 
-        assert_eq!(changed.files[0].hunks[0].lines[0].text, "old");
-        assert_eq!(loaded.stale(&changed), std::slice::from_ref(&key));
+        assert_eq!(loaded.begin_stale(&kept), std::slice::from_ref(&key));
+        assert!(
+            loaded.begin_stale(&kept).is_empty(),
+            "it is loading already"
+        );
+        assert!(!loaded.begin(&key, 6), "a second load of the same file");
+        assert_eq!(
+            loaded.loads(&kept).get(&file_key()),
+            Some(&FileLoad::Loading)
+        );
+    }
 
-        assert!(loaded.begin(&key));
-        assert!(loaded.stale(&changed).is_empty(), "it is loading already");
-        assert!(!loaded.begin(&key), "a second load of the same file");
+    #[test]
+    fn a_failed_reload_shows_its_error_and_never_the_old_lines() {
+        let mut loaded = LoadedFiles::default();
+        let key = key("Cargo.lock");
+        let mut kept = stored("Cargo.lock", 5);
+        loaded.begin(&key, 5);
+        settle(
+            &mut loaded,
+            &mut kept,
+            Ok(Some(lines_for("Cargo.lock", 5, "old"))),
+        );
+        poll(&mut loaded, &mut kept, 6);
+        loaded.begin(&key, 6);
+
+        let next = settle(&mut loaded, &mut kept, Err("no daemon".into()));
+
+        assert_eq!(next, AfterLoad::Nothing);
+        assert_eq!(
+            loaded.loads(&kept).get(&file_key()),
+            Some(&FileLoad::Failed("no daemon".into()))
+        );
+        assert!(texts(&kept).is_empty());
+        assert!(
+            loaded.begin_stale(&kept).is_empty(),
+            "no new try for the same digest"
+        );
+        poll(&mut loaded, &mut kept, 7);
+        assert_eq!(
+            loaded.begin_stale(&kept),
+            [key],
+            "a new digest is a new try"
+        );
+    }
+
+    #[test]
+    fn a_failed_load_stays_failed_until_the_next_try() {
+        let mut loaded = LoadedFiles::default();
+        let key = key("Cargo.lock");
+        let mut kept = stored("Cargo.lock", 5);
+        loaded.begin(&key, 5);
+        settle(&mut loaded, &mut kept, Err("no daemon".into()));
+        let failed = loaded.loads(&kept);
+
+        loaded.begin(&key, 5);
+        let retrying = loaded.loads(&kept);
+
+        assert_eq!(
+            failed.get(&file_key()),
+            Some(&FileLoad::Failed("no daemon".into()))
+        );
+        assert_eq!(retrying.get(&file_key()), Some(&FileLoad::Loading));
     }
 
     #[test]
     fn a_file_the_diff_no_longer_folds_is_forgotten() {
         let mut loaded = LoadedFiles::default();
         let key = key("Cargo.lock");
-        loaded.begin(&key);
-        loaded.keep(&key, &lines_for("Cargo.lock", 5, "kept"));
+        let mut kept = stored("Cargo.lock", 5);
+        loaded.begin(&key, 5);
+        settle(
+            &mut loaded,
+            &mut kept,
+            Ok(Some(lines_for("Cargo.lock", 5, "kept"))),
+        );
 
         let mut gone = diff(Vec::new());
         loaded.restore(&mut gone);
 
-        assert!(loaded.loads(TaskId(1), ReviewSource::Merged).is_empty());
+        assert!(loaded.loads(&folded_diff("Cargo.lock", 5)).is_empty());
     }
 
     #[test]
-    fn a_failed_load_keeps_the_button_and_the_lines_of_an_earlier_load() {
+    fn an_answer_for_an_older_digest_is_dropped_and_the_file_loads_again() {
         let mut loaded = LoadedFiles::default();
         let key = key("Cargo.lock");
-        loaded.begin(&key);
-        loaded.fail(&key, "no daemon".into());
+        let mut kept = stored("Cargo.lock", 1);
+        loaded.begin(&key, 1);
+        poll(&mut loaded, &mut kept, 2);
 
-        let failed = loaded.loads(TaskId(1), ReviewSource::Merged);
-        loaded.begin(&key);
-        loaded.keep(&key, &lines_for("Cargo.lock", 5, "kept"));
-        loaded.begin(&key);
-        loaded.fail(&key, "no daemon".into());
-        let kept = loaded.loads(TaskId(1), ReviewSource::Merged);
-
-        let file_key = (PathBuf::from("/wt"), PathBuf::from("Cargo.lock"));
-        assert_eq!(
-            failed.get(&file_key),
-            Some(&FileLoad::Failed("no daemon".into()))
+        let late = settle(
+            &mut loaded,
+            &mut kept,
+            Ok(Some(lines_for("Cargo.lock", 1, "old"))),
         );
-        assert_eq!(kept.get(&file_key), Some(&FileLoad::Loaded));
+
+        assert_eq!(late, AfterLoad::LoadAgain);
+        assert!(
+            texts(&kept).is_empty(),
+            "the old answer landed in the new card"
+        );
+        assert_eq!(
+            loaded.loads(&kept).get(&file_key()),
+            Some(&FileLoad::Loading)
+        );
+        assert!(!loaded.begin(&key, 2), "the new load is running already");
+
+        let fresh = settle(
+            &mut loaded,
+            &mut kept,
+            Ok(Some(lines_for("Cargo.lock", 2, "new"))),
+        );
+
+        assert_eq!(fresh, AfterLoad::Nothing);
+        assert_eq!(texts(&kept), ["new"]);
+        assert_eq!(
+            loaded.loads(&kept).get(&file_key()),
+            Some(&FileLoad::Loaded)
+        );
+    }
+
+    #[test]
+    fn an_answer_for_a_file_that_is_not_folded_any_more_is_dropped() {
+        let mut loaded = LoadedFiles::default();
+        let key = key("Cargo.lock");
+        let mut plain = folded_diff("Cargo.lock", 1);
+        plain.files[0].fold = None;
+        let mut kept = Rc::new(plain);
+        loaded.begin(&key, 1);
+
+        let next = settle(
+            &mut loaded,
+            &mut kept,
+            Ok(Some(lines_for("Cargo.lock", 1, "old"))),
+        );
+
+        assert_eq!(next, AfterLoad::Nothing);
+        assert!(texts(&kept).is_empty());
+        assert!(loaded.loads(&stored("Cargo.lock", 1)).is_empty());
+    }
+
+    #[test]
+    fn a_file_the_daemon_does_not_have_fails_the_load_and_leaves_the_diff_alone() {
+        let mut loaded = LoadedFiles::default();
+        let key = key("Cargo.lock");
+        let mut kept = stored("Cargo.lock", 5);
+        let before = (*kept).clone();
+        loaded.begin(&key, 5);
+
+        let next = settle(&mut loaded, &mut kept, Ok(None));
+
+        assert_eq!(next, AfterLoad::FreshDiff);
+        assert_eq!(*kept, before, "the stored diff was edited");
+        assert_eq!(
+            loaded.loads(&kept).get(&file_key()),
+            Some(&FileLoad::Failed("No longer in the diff".into()))
+        );
+    }
+
+    #[test]
+    fn an_answer_with_another_digest_than_the_asked_one_asks_for_a_fresh_diff() {
+        let mut loaded = LoadedFiles::default();
+        let key = key("Cargo.lock");
+        let mut kept = stored("Cargo.lock", 5);
+        loaded.begin(&key, 5);
+
+        let next = settle(
+            &mut loaded,
+            &mut kept,
+            Ok(Some(lines_for("Cargo.lock", 7, "newer"))),
+        );
+
+        assert_eq!(next, AfterLoad::FreshDiff);
+        assert!(texts(&kept).is_empty());
+        assert_eq!(
+            loaded.loads(&kept).get(&file_key()),
+            Some(&FileLoad::Failed("Changed while loading".into()))
+        );
+    }
+
+    #[test]
+    fn a_load_that_ends_after_its_task_closed_changes_nothing() {
+        let answers: [Result<Option<FileDiff>, SharedString>; 3] = [
+            Ok(Some(lines_for("Cargo.lock", 5, "late"))),
+            Ok(None),
+            Err("late".into()),
+        ];
+
+        for answer in answers {
+            let mut loaded = LoadedFiles::default();
+            let key = key("Cargo.lock");
+            let mut kept = stored("Cargo.lock", 5);
+            loaded.begin(&key, 5);
+            loaded.forget_task(TaskId(1));
+
+            let next = settle(&mut loaded, &mut kept, answer);
+
+            assert_eq!(next, AfterLoad::Nothing);
+            assert!(
+                loaded.loads(&kept).is_empty(),
+                "an entry came back for a closed task"
+            );
+            assert!(loaded.begin_stale(&kept).is_empty());
+        }
     }
 
     fn comment(id: u64, side: DiffSide, line: u32, state: CommentState) -> ReviewComment {

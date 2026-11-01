@@ -163,10 +163,22 @@ impl ChangesList {
         self.tree = file_tree::build(&diff.files, &visible, &self.agents, &closed).into();
     }
 
+    /// The row of the cursor. A tree whose cursor was never moved starts on its first row.
     fn cursor_row(&self) -> Option<usize> {
         let diff = self.diff.as_ref()?;
+        let moved = self
+            .cursor
+            .as_ref()
+            .and_then(|mark| file_tree::row_of(&self.tree, &diff.files, mark));
 
-        file_tree::row_of(&self.tree, &diff.files, self.cursor.as_ref()?)
+        moved.or_else(|| (!self.tree.is_empty()).then_some(0))
+    }
+
+    /// The row that shows as selected. A cursor nobody moved shows only while the tree has
+    /// focus.
+    fn shown_cursor(&self, focused: bool) -> Option<usize> {
+        self.cursor_row()
+            .filter(|_| focused || self.cursor.is_some())
     }
 
     fn put_cursor(&mut self, row: usize, cx: &mut Context<Self>) {
@@ -287,8 +299,9 @@ impl ChangesList {
         let Some(diff) = self.diff.clone() else {
             return Vec::new();
         };
-        let cursor = self.cursor_row();
-        let ring = self.focus_handle.is_focused(window) && window.last_input_was_keyboard();
+        let focused = self.focus_handle.is_focused(window);
+        let cursor = self.shown_cursor(focused);
+        let ring = focused && window.last_input_was_keyboard();
 
         range
             .filter_map(|index| tree.get(index).map(|entry| (index, entry)))
@@ -310,6 +323,7 @@ impl ChangesList {
             EntryKind::Folder { open } => TreeRow::new(("change", index), entry.name.clone())
                 .debug_selector(|| format!("change-folder-{index}"))
                 .level(entry.level)
+                .position_in_set(entry.position_in_set, entry.size_of_set)
                 .folder(open)
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                     this.focus_handle.focus(window, cx);
@@ -342,6 +356,7 @@ impl ChangesList {
                     .debug_selector(|| format!("change-file-{file}"))
                     .accessible_label(summary)
                     .level(entry.level)
+                    .position_in_set(entry.position_in_set, entry.size_of_set)
                     .end_slot(end)
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                         this.focus_handle.focus(window, cx);
@@ -354,14 +369,19 @@ impl ChangesList {
     }
 
     #[cfg(test)]
-    pub(crate) fn tree_row(&self, index: usize, cx: &mut Context<Self>) -> Option<TreeRow> {
+    pub(crate) fn tree_row(
+        &self,
+        index: usize,
+        focused: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<TreeRow> {
         let (entry, diff) = (self.tree.get(index)?, self.diff.clone()?);
 
         Self::row(
             index,
             entry,
             &diff,
-            (self.cursor_row() == Some(index), false),
+            (self.shown_cursor(focused) == Some(index), false),
             cx,
         )
     }

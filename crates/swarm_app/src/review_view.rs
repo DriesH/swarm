@@ -30,9 +30,9 @@ use crate::model::{AgentKind, TaskId};
 use crate::pull_request::PrOffer;
 use crate::review_comments::refusal;
 use crate::review_model::{
-    AgentLabel, BodyRows, DiffStyle, FileInfo, FileKey, FileLoad, FileLoads, LinePos, LoadKey,
-    Marks, Note, Row, Side, Thread, build_rows, count_comments, file_infos, is_folded, plural,
-    sample_lines, thousands, visible_files, worktree_count,
+    AfterLoad, AgentLabel, BodyRows, DiffStyle, FileInfo, FileKey, FileLoad, FileLoads, LinePos,
+    LoadKey, Marks, Note, Row, Side, Thread, build_rows, count_comments, file_infos, is_folded,
+    plural, sample_lines, thousands, visible_files, worktree_count,
 };
 use crate::workspace::{View, Workspace};
 
@@ -489,13 +489,31 @@ impl ReviewView {
 
     /// Selects the file and shows it at the top of the body.
     fn select(&mut self, file: usize) {
+        if self.mark_selected(file) {
+            self.scroll_to_file(file);
+        }
+    }
+
+    /// Makes the file the selected one and puts the tree cursor on it, without scrolling.
+    /// False when the view holds no such file.
+    fn mark_selected(&mut self, file: usize) -> bool {
         let (Some(task), Some(info)) = (self.task(), self.infos.get(file)) else {
-            return;
+            return false;
         };
 
         self.selected.insert(task, info.key.clone());
         self.tree_cursor.insert(task, Mark::File(info.key.clone()));
-        self.scroll_to_file(file);
+
+        true
+    }
+
+    /// Keeps the keyboard where it was when a folded file starts to load: the Show diff
+    /// button goes away, so focus moves to the body and the file stays the selected one.
+    fn stay_on_file(&mut self, file: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.mark_selected(file);
+        self.scroll_nav_to_cursor();
+        window.focus(&self.body_focus, cx);
+        cx.notify();
     }
 
     fn scroll_to_file(&self, file: usize) {
@@ -1061,6 +1079,7 @@ impl ReviewView {
         TreeRow::new(("review-nav-row", position), entry.name.clone())
             .debug_selector(|| format!("review-nav-folder-{position}"))
             .level(entry.level)
+            .position_in_set(entry.position_in_set, entry.size_of_set)
             .folder(open)
             .toggle_state(selected)
             .ring(selected && ring)
@@ -1148,6 +1167,7 @@ impl ReviewView {
                 .debug_selector(|| format!("review-nav-file-{file}"))
                 .accessible_label(label)
                 .level(entry.level)
+                .position_in_set(entry.position_in_set, entry.size_of_set)
                 .label_color(if viewed { Color::Muted } else { Color::Default })
                 .toggle_state(selected)
                 .ring(selected && ring)
@@ -1481,6 +1501,7 @@ impl ReviewView {
         };
         let show = folded.then(|| {
             let workspace = self.workspace.clone();
+            let show_view = view.clone();
             let (worktree, path) = (data.worktree.clone(), data.path.clone());
 
             Button::new(
@@ -1494,8 +1515,12 @@ impl ReviewView {
             })
             .debug_selector(|| format!("review-show-diff-{file}"))
             .disabled(loading)
-            .on_click(move |_, _, cx| {
+            .on_click(move |event, window, cx| {
                 let (worktree, path) = (worktree.clone(), path.clone());
+
+                if matches!(event, ClickEvent::Keyboard(_)) {
+                    show_view.update(cx, |this, cx| this.stay_on_file(file, window, cx));
+                }
 
                 update_workspace(&workspace, cx, |workspace, cx| {
                     workspace.show_file_diff(worktree, path, cx);
@@ -2219,7 +2244,13 @@ impl Workspace {
                 worktree: self.review_worktree.clone(),
             }),
             comments: self.data.task_comments(task),
-            loads: Rc::new(self.data.loaded.loads(id, source)),
+            loads: Rc::new(
+                self.data
+                    .diffs
+                    .get(&(id, source))
+                    .map(|diff| self.data.loaded.loads(diff))
+                    .unwrap_or_default(),
+            ),
             requesting: self.review_requesting.contains(&task),
             fixed_now: self.fixed_now,
         };
@@ -2303,21 +2334,29 @@ impl Workspace {
             return;
         };
         let source = self.review_source(task);
-        let folded = self.data.diffs.get(&(id, source)).is_some_and(|diff| {
-            diff.files
-                .iter()
-                .any(|file| file.worktree == worktree && file.path == path && file.fold.is_some())
-        });
+        let digest = self
+            .data
+            .diffs
+            .get(&(id, source))
+            .and_then(|diff| {
+                diff.files
+                    .iter()
+                    .find(|file| file.worktree == worktree && file.path == path)
+            })
+            .filter(|file| file.fold.is_some())
+            .map(|file| file.digest);
         let key = (id, source, worktree, path);
 
-        if folded && self.data.loaded.begin(&key) {
+        if let Some(digest) = digest
+            && self.data.loaded.begin(&key, digest)
+        {
             self.request_file_lines(key, cx);
             cx.notify();
         }
     }
 
-    /// Asks for the lines of a file, and keeps the answer when it comes. Marks the file as
-    /// loading first, see [`LoadedFiles::begin`].
+    /// Asks for the lines of a file, and keeps the answer when it comes. The file is marked
+    /// as loading first, see [`LoadedFiles::begin`].
     ///
     /// [`LoadedFiles::begin`]: crate::review_model::LoadedFiles::begin
     pub(crate) fn request_file_lines(&mut self, key: LoadKey, cx: &mut Context<Self>) {
@@ -2337,7 +2376,8 @@ impl Workspace {
                 Err("Not connected".into())
             };
 
-            self.data.finish_load(&key, answer);
+            let next = self.data.finish_load(&key, answer);
+            self.continue_load(&key, next, cx);
 
             return;
         };
@@ -2356,7 +2396,8 @@ impl Workspace {
                     refusal(&error)
                 });
 
-                workspace.data.finish_load(&key, answer);
+                let next = workspace.data.finish_load(&key, answer);
+                workspace.continue_load(&key, next, cx);
                 cx.notify();
             });
 
@@ -2367,6 +2408,15 @@ impl Workspace {
         .detach();
     }
 
+    /// Does what an answer to a load asks for next.
+    fn continue_load(&mut self, key: &LoadKey, next: AfterLoad, cx: &mut Context<Self>) {
+        match next {
+            AfterLoad::Nothing => {}
+            AfterLoad::LoadAgain => self.request_file_lines(key.clone(), cx),
+            AfterLoad::FreshDiff => self.refresh_diff(key.0, key.1, cx),
+        }
+    }
+
     /// Loads the files the user opened again when their digest changed.
     pub(crate) fn reload_changed_files(
         &mut self,
@@ -2374,17 +2424,15 @@ impl Workspace {
         source: ReviewSource,
         cx: &mut Context<Self>,
     ) {
-        let stale = self
+        let started = self
             .data
             .diffs
             .get(&(task, source))
-            .map(|diff| self.data.loaded.stale(diff))
+            .map(|diff| self.data.loaded.begin_stale(diff))
             .unwrap_or_default();
 
-        for key in stale {
-            if self.data.loaded.begin(&key) {
-                self.request_file_lines(key, cx);
-            }
+        for key in started {
+            self.request_file_lines(key, cx);
         }
     }
 
@@ -2427,7 +2475,7 @@ pub(crate) fn short(message: &str) -> SharedString {
 
 #[cfg(test)]
 mod tests {
-    use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext};
+    use gpui::{Entity, Modifiers, MouseButton, TestAppContext, VisualTestContext};
     use swarm_protocol::{DiffHunk, DiffLine, Fold};
 
     use super::*;
@@ -2547,6 +2595,15 @@ mod tests {
         })
     }
 
+    /// The 1-based place of a row among the rows with the same parent, and their number.
+    fn set_of(entries: &[Entry], index: usize) -> (Option<usize>, Option<usize>) {
+        let parent = entries[index].parent;
+        let siblings =
+            |range: &[Entry]| range.iter().filter(|entry| entry.parent == parent).count();
+
+        (Some(siblings(&entries[..=index])), Some(siblings(entries)))
+    }
+
     fn node_of(
         row: Option<TreeRow>,
         cx: &mut VisualTestContext,
@@ -2625,12 +2682,18 @@ mod tests {
         });
 
         assert!(rows.len() > 8);
+        let entries: Vec<Entry> = rows.iter().map(|(entry, _)| entry.clone()).collect();
 
         for (index, (entry, row)) in rows.into_iter().enumerate() {
             let (role, node) = node_of(row, cx);
 
             assert_eq!(role, Some(Role::TreeItem), "row {index}");
             assert_eq!(node.level(), Some(entry.level + 1), "row {index}");
+            assert_eq!(
+                (node.position_in_set(), node.size_of_set()),
+                set_of(&entries, index),
+                "row {index}"
+            );
             assert_eq!(node.is_selected(), Some(index == 2), "row {index}");
             match entry.kind {
                 EntryKind::Folder { open } => {
@@ -3182,16 +3245,27 @@ mod tests {
 
         let rows = list.update(cx, |list, cx| {
             (0..list.tree_rows().len())
-                .map(|index| (list.tree_rows()[index].clone(), list.tree_row(index, cx)))
+                .map(|index| {
+                    (
+                        list.tree_rows()[index].clone(),
+                        list.tree_row(index, false, cx),
+                    )
+                })
                 .collect::<Vec<_>>()
         });
 
         assert!(rows.len() > 8);
+        let entries: Vec<Entry> = rows.iter().map(|(entry, _)| entry.clone()).collect();
         for (index, (entry, row)) in rows.into_iter().enumerate() {
             let (role, node) = node_of(row, cx);
 
             assert_eq!(role, Some(Role::TreeItem));
             assert_eq!(node.level(), Some(entry.level + 1));
+            assert_eq!(
+                (node.position_in_set(), node.size_of_set()),
+                set_of(&entries, index),
+                "row {index}"
+            );
             assert_eq!(node.is_selected(), Some(index == 1));
             assert_eq!(
                 node.is_expanded(),
@@ -3201,6 +3275,39 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[gpui::test]
+    fn the_changes_tree_stands_on_its_first_row_when_it_gets_focus_without_a_cursor(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = setup(cx);
+        redraw(cx);
+        let list = workspace.read_with(cx, |workspace, _| workspace.changes_list.clone());
+        let handle = list.read_with(cx, |list, _| list.tree_focus().clone());
+        let first_row = |cx: &mut VisualTestContext| {
+            let focused = cx.update(|window, _| handle.is_focused(window));
+            let row = list.update(cx, |list, cx| list.tree_row(0, focused, cx));
+
+            node_of(row, cx).1.is_selected()
+        };
+        let unfocused = first_row(cx);
+
+        cx.update(|window, cx| window.focus(&handle, cx));
+        redraw(cx);
+        let focused = first_row(cx);
+        let at = list.read_with(cx, |list, _| list.cursor_at());
+        cx.simulate_keystrokes("down");
+        let after_down = list.read_with(cx, |list, _| list.cursor_at());
+
+        assert_eq!(
+            unfocused,
+            Some(false),
+            "a tree nobody touched shows a selection"
+        );
+        assert_eq!(focused, Some(true));
+        assert_eq!(at, Some(0));
+        assert_eq!(after_down, Some(1), "the first arrow skipped the first row");
     }
 
     #[gpui::test]
@@ -3231,7 +3338,6 @@ mod tests {
         redraw(cx);
         let open = changes_outline(&list, cx);
 
-        cx.simulate_keystrokes("down");
         let first = list.read_with(cx, |list, _| list.cursor_at());
         cx.simulate_keystrokes("left");
         let closed = changes_outline(&list, cx);
@@ -3387,6 +3493,54 @@ mod tests {
 
         assert_eq!((first, second, back), (Some(0), Some(1), Some(0)));
         assert!(viewed, "v did not mark the folded file");
+    }
+
+    /// A key press that also lets go, which is what turns Enter on a button into a click.
+    fn press_enter(cx: &mut VisualTestContext) {
+        cx.simulate_keystrokes("enter");
+
+        if let Ok(keystroke) = gpui::Keystroke::parse("enter") {
+            cx.simulate_event(gpui::KeyUpEvent { keystroke });
+        }
+    }
+
+    #[gpui::test]
+    fn enter_on_show_diff_keeps_the_keyboard_in_the_body_on_that_file(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = open_merged(&workspace, cx);
+        review.update(cx, |review, cx| review.select_file(2, cx));
+        redraw(cx);
+        review.update(cx, |review, cx| {
+            review.scroll_to_file(0);
+            cx.notify();
+        });
+        redraw(cx);
+        let center = cx
+            .debug_bounds("review-show-diff-0")
+            .map(|bounds| bounds.center());
+        assert!(center.is_some(), "the button is not on screen");
+        cx.simulate_mouse_down(
+            center.unwrap_or_default(),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        redraw(cx);
+        let before = review.read_with(cx, |review, _| review.selected_file());
+
+        press_enter(cx);
+        redraw(cx);
+        let loaded = card_rows(&review, 0, cx).len() > 100;
+        let in_body = review.read_with(cx, |review, _| review.body_focus().clone());
+        let focused = cx.update(|window, _| in_body.is_focused(window));
+        let selected = review.read_with(cx, |review, _| review.selected_file());
+        cx.simulate_keystrokes("j");
+        let next = review.read_with(cx, |review, _| review.selected_file());
+
+        assert_eq!(before, Some(2));
+        assert!(loaded, "Enter did not load the file");
+        assert!(focused, "focus did not go to the body");
+        assert_eq!(selected, Some(0), "the selection left the file");
+        assert_eq!(next, Some(1), "j did not move on from the file");
     }
 
     #[gpui::test]

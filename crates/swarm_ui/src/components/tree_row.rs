@@ -32,6 +32,7 @@ pub struct TreeRow {
     icon: Option<IconName>,
     label_color: Color,
     selected: bool,
+    position_in_set: Option<(usize, usize)>,
     focusable: bool,
     ring: bool,
     end: Option<AnyElement>,
@@ -50,6 +51,7 @@ impl TreeRow {
             icon: None,
             label_color: Color::Default,
             selected: false,
+            position_in_set: None,
             focusable: false,
             ring: false,
             end: None,
@@ -91,6 +93,13 @@ impl TreeRow {
     /// "main.rs, 12 additions, 3 deletions". Defaults to the label.
     pub fn accessible_label(mut self, label: impl Into<SharedString>) -> Self {
         self.accessible_label = Some(label.into());
+        self
+    }
+
+    /// Where the row stands among its siblings, for VoiceOver: its 1-based position, and
+    /// how many rows share its parent.
+    pub fn position_in_set(mut self, position: usize, size: usize) -> Self {
+        self.position_in_set = Some((position, size));
         self
     }
 
@@ -176,6 +185,9 @@ impl RenderOnce for TreeRow {
             .role(Role::TreeItem)
             .aria_label(self.accessible_label.unwrap_or_else(|| self.label.clone()))
             .aria_level(self.level + 1)
+            .when_some(self.position_in_set, |row, (position, size)| {
+                row.aria_position_in_set(position).aria_size_of_set(size)
+            })
             .when_some(self.folder, StatefulInteractiveElement::aria_expanded)
             .aria_selected(self.selected)
             .when(self.selected && !self.focusable, |row| {

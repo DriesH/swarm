@@ -1542,44 +1542,18 @@ impl FakeData {
         true
     }
 
-    /// Keeps the answer to a request for the lines of one folded file. A file the diff no
-    /// longer holds is dropped from it, with its share of the totals.
+    /// Keeps the answer to a request for the lines of one folded file, see
+    /// [`LoadedFiles::finish`]. The stored diff is never edited except to merge the lines.
+    ///
+    /// [`LoadedFiles::finish`]: crate::review_model::LoadedFiles::finish
     pub(crate) fn finish_load(
         &mut self,
         key: &crate::review_model::LoadKey,
         answer: Result<Option<swarm_protocol::FileDiff>, SharedString>,
-    ) {
-        let diff = (key.0, key.1);
+    ) -> crate::review_model::AfterLoad {
+        let stored = self.diffs.get_mut(&(key.0, key.1));
 
-        match answer {
-            Ok(Some(file)) => {
-                self.loaded.keep(key, &file);
-
-                if let Some(stored) = self.diffs.get_mut(&diff) {
-                    self.loaded.merge(key, Rc::make_mut(stored));
-                }
-            }
-            Ok(None) => {
-                self.loaded.forget(key);
-
-                let position = self.diffs.get(&diff).and_then(|stored| {
-                    stored
-                        .files
-                        .iter()
-                        .position(|file| file.worktree == key.2 && file.path == key.3)
-                });
-
-                if let (Some(position), Some(stored)) = (position, self.diffs.get_mut(&diff)) {
-                    let stored = Rc::make_mut(stored);
-                    let gone = stored.files.remove(position);
-
-                    stored.stat.files = stored.stat.files.saturating_sub(1);
-                    stored.stat.additions = stored.stat.additions.saturating_sub(gone.additions);
-                    stored.stat.deletions = stored.stat.deletions.saturating_sub(gone.deletions);
-                }
-            }
-            Err(message) => self.loaded.fail(key, message),
-        }
+        self.loaded.finish(key, answer, stored)
     }
 
     /// The fingerprint of the Merged diff the app has loaded for a tab.

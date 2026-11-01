@@ -338,6 +338,23 @@ fn tree_row_is_a_tree_item_with_level_and_state() {
 }
 
 #[test]
+fn tree_row_reports_its_place_among_its_siblings() {
+    with_window(|window, cx| {
+        let placed = a11y_info(
+            TreeRow::new("file", "main.rs").position_in_set(2, 5),
+            window,
+            cx,
+        );
+        let alone = a11y_info(TreeRow::new("other", "lib.rs"), window, cx);
+
+        assert_eq!(placed.node.position_in_set(), Some(2));
+        assert_eq!(placed.node.size_of_set(), Some(5));
+        assert_eq!(alone.node.position_in_set(), None);
+        assert_eq!(alone.node.size_of_set(), None);
+    });
+}
+
+#[test]
 fn button_accessible_label_replaces_the_visible_one_in_its_name() {
     with_window(|window, cx| {
         let info = a11y_info(
