@@ -18,9 +18,10 @@ use swarm_term::{TerminalChannels, TerminalInput, TerminalOutput};
 use crate::{
     AgentChange, AgentId, AgentInfo, AgentKind, CallId, ChecksRun, CloseCheck, CommentId,
     CreateTask, CreateTerminal, Event, FileDiff, FrameError, GH_SECS, GithubStatus, MergeMethod,
-    MessageId, MessageInfo, NewComment, Notice, PUSH_SECS, Paths, PrDraft, PrPanel, ProjectId,
-    ProjectInfo, PullRequest, Request, ReviewComment, ReviewSource, TaskDiff, TaskId, TaskInfo,
-    TerminalId, TerminalInfo, Usage, VERSION, check_private_dir, read, write,
+    MessageId, MessageInfo, NewComment, Notice, PUSH_SECS, Paths, PrDraft, PrPanel,
+    ProjectConfigFields, ProjectId, ProjectInfo, PromptInfo, PullRequest, Request, ReviewComment,
+    ReviewSource, TaskDiff, TaskId, TaskInfo, TerminalId, TerminalInfo, Usage, VERSION,
+    check_private_dir, read, write,
 };
 
 /// Local checks moved on, or the orchestrator sent a pull request draft.
@@ -634,6 +635,55 @@ impl Client {
         }
     }
 
+    pub fn project_config(
+        &self,
+        project: ProjectId,
+    ) -> Result<(ProjectConfigFields, Option<String>), ClientError> {
+        match self.call(|call| Request::ProjectConfig { call, project }, None)? {
+            Event::ProjectConfig { fields, error, .. } => Ok((fields, error)),
+            other => Err(unexpected("ProjectConfig", &other)),
+        }
+    }
+
+    pub fn save_project_config(
+        &self,
+        project: ProjectId,
+        fields: ProjectConfigFields,
+    ) -> Result<(), ClientError> {
+        self.done(
+            |call| Request::SaveProjectConfig {
+                call,
+                project,
+                fields,
+            },
+            "SaveProjectConfig",
+            self.reply_timeout,
+        )
+    }
+
+    pub fn prompts(&self, project: Option<ProjectId>) -> Result<Vec<PromptInfo>, ClientError> {
+        match self.call(|call| Request::Prompts { call, project }, None)? {
+            Event::Prompts { prompts, .. } => Ok(prompts),
+            other => Err(unexpected("Prompts", &other)),
+        }
+    }
+
+    /// The path of the user's copy, made from the built-in prompt when it was missing.
+    pub fn customize_prompt(&self, name: String) -> Result<PathBuf, ClientError> {
+        match self.call(|call| Request::CustomizePrompt { call, name }, None)? {
+            Event::PromptFile { path, .. } => Ok(path),
+            other => Err(unexpected("PromptFile", &other)),
+        }
+    }
+
+    pub fn reset_prompt(&self, name: String) -> Result<(), ClientError> {
+        self.done(
+            |call| Request::ResetPrompt { call, name },
+            "ResetPrompt",
+            self.reply_timeout,
+        )
+    }
+
     /// Starts the local checks; progress arrives through [`Client::pr_events`].
     pub fn run_checks(&self, task: TaskId) -> Result<(), ClientError> {
         let timeout = self.reply_timeout.max(GIT_TIMEOUT);
@@ -1093,6 +1143,25 @@ fn read_events(
             }
             Event::GithubStatus { call, status } => {
                 deliver(shared, call, Event::GithubStatus { call, status });
+            }
+            Event::ProjectConfig {
+                call,
+                fields,
+                error,
+            } => deliver(
+                shared,
+                call,
+                Event::ProjectConfig {
+                    call,
+                    fields,
+                    error,
+                },
+            ),
+            Event::Prompts { call, prompts } => {
+                deliver(shared, call, Event::Prompts { call, prompts });
+            }
+            Event::PromptFile { call, path } => {
+                deliver(shared, call, Event::PromptFile { call, path });
             }
             Event::Branches { call, branches } => {
                 deliver(shared, call, Event::Branches { call, branches });

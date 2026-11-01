@@ -201,6 +201,13 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
             services.agents.stop_all();
             sink.send_event(&Event::Done { call });
         }
+        Request::ProjectConfig { call, .. }
+        | Request::SaveProjectConfig { call, .. }
+        | Request::Prompts { call, .. }
+        | Request::CustomizePrompt { call, .. }
+        | Request::ResetPrompt { call, .. } => {
+            send_error(sink, call, &"not built yet");
+        }
         request @ (Request::TaskDiff { .. }
         | Request::FileHunks { .. }
         | Request::ApproveTask { .. }
