@@ -27,9 +27,11 @@ swarm_term.workspace = true
 swarm_term_view.workspace = true
 swarm_ui.workspace = true
 
-# The status item: AppKit through objc2, the same versions gpui_macos builds. The icon is
-# the bee SVG drawn by the resvg that gpui already builds.
+# The status item and the notification checks: AppKit and UserNotifications through objc2,
+# the same versions gpui_macos builds. The icon is the bee SVG drawn by the resvg that gpui
+# already builds.
 [target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
 objc2 = "0.6"
 objc2-app-kit = { workspace = true, features = [
     "block2",
@@ -44,6 +46,7 @@ objc2-app-kit = { workspace = true, features = [
     "NSImageRep",
     "NSResponder",
     "NSScreen",
+    "NSSound",
     "NSStatusBar",
     "NSStatusBarButton",
     "NSStatusItem",
@@ -53,11 +56,18 @@ objc2-app-kit = { workspace = true, features = [
 objc2-foundation = { version = "0.3.2", default-features = false, features = [
     "std",
     "NSArray",
+    "NSBundle",
     "NSData",
     "NSDictionary",
     "NSGeometry",
     "NSString",
     "NSValue",
+] }
+objc2-user-notifications = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "block2",
+    "UNNotificationSettings",
+    "UNUserNotificationCenter",
 ] }
 resvg = { version = "0.46", default-features = false }
 

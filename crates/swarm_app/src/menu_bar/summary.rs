@@ -105,8 +105,9 @@ impl Summary {
         }
     }
 
-    pub(crate) fn look(&self) -> Look {
-        Look::new(self.percent, !self.needs_you.is_empty())
+    /// `dot_allowed` is the menu bar dot setting: off, the icon never shows the dot.
+    pub(crate) fn look(&self, dot_allowed: bool) -> Look {
+        Look::new(self.percent, dot_allowed && !self.needs_you.is_empty())
     }
 }
 
@@ -328,9 +329,10 @@ mod tests {
         let waiting = Summary::of(&data, NOW);
 
         assert!(quiet.needs_you.is_empty());
-        assert!(!quiet.look().dot);
+        assert!(!quiet.look(true).dot);
         assert_eq!(waiting.needs_you.len(), 1);
-        assert!(waiting.look().dot);
+        assert!(waiting.look(true).dot);
+        assert!(!waiting.look(false).dot);
     }
 
     #[test]

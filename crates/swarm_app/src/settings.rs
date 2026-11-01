@@ -2,7 +2,7 @@
 
 mod pages;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gpui::{
@@ -10,13 +10,14 @@ use gpui::{
     Size, Subscription, TitlebarOptions, Window, WindowBounds, WindowHandle, WindowOptions,
     actions, div, px, size,
 };
-use swarm_settings::{CliSettings, Settings};
+use swarm_settings::{CliSettings, NotificationSettings, ProjectMode, Settings};
 use swarm_ui::fonts::UI_FONT;
 use swarm_ui::prelude::*;
 use swarm_ui::theme;
 use swarm_ui::{ROOT_CONTEXT, SelectNext, SelectPrevious, TextFieldSize};
 
 use crate::model::{FakeData, Project};
+use crate::notifications::{self, Permission};
 use crate::window_drag::drag_region;
 
 actions!(swarm_app, [CloseSettings]);
@@ -63,6 +64,54 @@ pub(crate) const DELIVERY: [&str; 4] = [
     "Dot on menu bar icon",
 ];
 pub(crate) const PROJECT_NOTIFICATIONS: [&str; 3] = ["All", "Errors only", "Off"];
+const PROJECT_MODES: [ProjectMode; 3] =
+    [ProjectMode::All, ProjectMode::ErrorsOnly, ProjectMode::Off];
+
+/// The position of `mode` in [`PROJECT_NOTIFICATIONS`].
+pub(crate) fn mode_index(mode: ProjectMode) -> usize {
+    PROJECT_MODES
+        .iter()
+        .position(|candidate| *candidate == mode)
+        .unwrap_or(0)
+}
+
+/// The trigger switch at `index` of [`NOTIFY_WHEN`].
+pub(crate) fn notify_when(notifications: &NotificationSettings, index: usize) -> bool {
+    match index {
+        0 => notifications.needs_decision,
+        1 => notifications.prompt,
+        2 => notifications.ready_for_review,
+        _ => notifications.broke,
+    }
+}
+
+fn notify_when_mut(notifications: &mut NotificationSettings, index: usize) -> &mut bool {
+    match index {
+        0 => &mut notifications.needs_decision,
+        1 => &mut notifications.prompt,
+        2 => &mut notifications.ready_for_review,
+        _ => &mut notifications.broke,
+    }
+}
+
+/// The delivery switch at `index` of [`DELIVERY`].
+pub(crate) fn delivery(notifications: &NotificationSettings, index: usize) -> bool {
+    match index {
+        0 => notifications.sound,
+        1 => notifications.dock_bounce,
+        2 => notifications.mute_while_viewing,
+        _ => notifications.menu_bar_dot,
+    }
+}
+
+fn delivery_mut(notifications: &mut NotificationSettings, index: usize) -> &mut bool {
+    match index {
+        0 => &mut notifications.sound,
+        1 => &mut notifications.dock_bounce,
+        2 => &mut notifications.mute_while_viewing,
+        _ => &mut notifications.menu_bar_dot,
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct ProjectSettings {
@@ -76,7 +125,34 @@ pub(crate) struct ProjectSettings {
     pub copy_files: Vec<String>,
     pub checks: Vec<String>,
     pub checks_required: bool,
-    pub notifications: usize,
+}
+
+impl ProjectSettings {
+    /// The project with sample values for the settings that are not real yet.
+    fn placeholder(project: Project) -> Self {
+        let mut base_branches = vec![project.base_branch.to_string()];
+        if project.base_branch != "main" {
+            base_branches.push("main".to_owned());
+        }
+
+        Self {
+            project,
+            base_branches,
+            base_branch: 0,
+            worktree_folder: ".worktrees".to_owned(),
+            port_range: "5170–5199".to_owned(),
+            ports_per_worktree: "3".to_owned(),
+            setup_script:
+                "cargo fetch\npnpm --dir docs install --frozen-lockfile\ncp .env.example .env"
+                    .to_owned(),
+            copy_files: vec![".env".to_owned(), "CLAUDE.local.md".to_owned()],
+            checks: vec![
+                "cargo test --workspace".to_owned(),
+                "cargo clippy --workspace".to_owned(),
+            ],
+            checks_required: true,
+        }
+    }
 }
 
 /// The agent settings of CLI number `index`, in the order of [`AGENTS`].
@@ -96,8 +172,8 @@ fn cli_mut(agents: &mut swarm_settings::AgentSettings, index: usize) -> &mut Cli
     }
 }
 
-/// Settings shared by every page. The agent and terminal settings live in `settings.toml`;
-/// the rest is in memory only for now.
+/// Settings shared by every page. The agent, terminal and notification settings live in
+/// `settings.toml`; the rest is in memory only for now.
 pub(crate) struct SettingsState {
     pub settings: Settings,
     path: Option<PathBuf>,
@@ -111,9 +187,9 @@ pub(crate) struct SettingsState {
     pub idle_stop: usize,
     pub max_agents_per_task: String,
     pub max_agents_total: String,
-    pub notify_when: [bool; 4],
-    pub delivery: [bool; 4],
     pub projects: Vec<ProjectSettings>,
+    /// What macOS lets the app do, once it answered.
+    pub permission: Option<Permission>,
 }
 
 impl SettingsState {
@@ -123,29 +199,10 @@ impl SettingsState {
         let projects = FakeData::sample()
             .projects
             .into_iter()
-            .enumerate()
-            .map(|(index, project)| {
-                let mut base_branches = vec![project.base_branch.to_string()];
-                if project.base_branch != "main" {
-                    base_branches.push("main".to_owned());
-                }
+            .map(|mut project| {
+                project.root = Some(Path::new("/Users/sam/personal").join(&*project.name));
 
-                ProjectSettings {
-                    project,
-                    base_branches,
-                    base_branch: 0,
-                    worktree_folder: ".worktrees".to_owned(),
-                    port_range: "5170–5199".to_owned(),
-                    ports_per_worktree: "3".to_owned(),
-                    setup_script: "cargo fetch\npnpm --dir docs install --frozen-lockfile\ncp .env.example .env".to_owned(),
-                    copy_files: vec![".env".to_owned(), "CLAUDE.local.md".to_owned()],
-                    checks: vec![
-                        "cargo test --workspace".to_owned(),
-                        "cargo clippy --workspace".to_owned(),
-                    ],
-                    checks_required: true,
-                    notifications: index.min(2),
-                }
+                ProjectSettings::placeholder(project)
             })
             .collect();
 
@@ -159,10 +216,32 @@ impl SettingsState {
             idle_stop: 1,
             max_agents_per_task: "6".to_owned(),
             max_agents_total: "16".to_owned(),
-            notify_when: [true; 4],
-            delivery: [false, true, true, true],
             projects,
+            permission: None,
         }
+    }
+
+    /// A mode other than All on the second and third project, for snapshots.
+    #[cfg(feature = "snapshot")]
+    fn sample_modes(&mut self, _cx: &mut Context<Self>) {
+        for (index, mode) in [(1, ProjectMode::ErrorsOnly), (2, ProjectMode::Off)] {
+            let root = self
+                .projects
+                .get(index)
+                .and_then(|entry| entry.project.root.clone());
+
+            if let Some(root) = root {
+                self.settings.notifications.set_mode(&root, mode);
+            }
+        }
+    }
+
+    /// Lists the projects of the workspace. Their other settings are not real yet.
+    fn use_projects(&mut self, projects: Vec<Project>) {
+        self.projects = projects
+            .into_iter()
+            .map(ProjectSettings::placeholder)
+            .collect();
     }
 
     /// Reads the settings file again. A file that cannot be read keeps the current values
@@ -458,6 +537,12 @@ impl SettingsWindow {
                 cx.notify();
             }),
             theme::follow_system_appearance(window, cx),
+            cx.observe_window_activation(window, |this, window, cx| {
+                // The user may come back from System Settings with a new answer.
+                if window.is_window_active() {
+                    this.refresh_permission(cx);
+                }
+            }),
         ];
 
         let agents = state.read(cx).settings.agents.clone();
@@ -541,6 +626,7 @@ impl SettingsWindow {
         }
 
         this.focus_nav(window, cx);
+        this.refresh_permission(cx);
 
         this
     }
@@ -691,7 +777,37 @@ impl SettingsWindow {
 
     pub(crate) fn select_page(&mut self, page: Page, cx: &mut Context<Self>) {
         self.page = page;
+        self.refresh_permission(cx);
         cx.notify();
+    }
+
+    /// Asks macOS what the app may do, while the Notifications page shows. The answer
+    /// comes back through a channel, as macOS answers on its own thread.
+    fn refresh_permission(&self, cx: &mut Context<Self>) {
+        if self.page != Page::Notifications {
+            return;
+        }
+
+        let answers = notifications::check_permission(cx);
+        let state = self.state.clone();
+
+        cx.spawn(async move |this, cx| {
+            let Ok(permission) = answers.recv_async().await else {
+                return;
+            };
+
+            let shown = this.update(cx, |_, cx| {
+                state.update(cx, |state, cx| {
+                    state.permission = Some(permission);
+                    cx.notify();
+                });
+            });
+
+            if let Err(error) = shown {
+                log::debug!("the settings closed before the permission came: {error}");
+            }
+        })
+        .detach();
     }
 
     fn focus_nav(&self, window: &mut Window, cx: &mut App) {
@@ -705,6 +821,7 @@ impl SettingsWindow {
         let next = self.page.nav_index().saturating_add_signed(step).min(last);
 
         self.page = Page::from_nav_index(next);
+        self.refresh_permission(cx);
         self.focus_nav(window, cx);
         cx.notify();
     }
@@ -893,6 +1010,19 @@ pub(crate) fn load(path: Option<PathBuf>, cx: &mut App) {
     state.update(cx, SettingsState::reload);
 }
 
+/// The notification settings. They stay the defaults until the settings load.
+pub(crate) fn notifications(cx: &App) -> NotificationSettings {
+    cx.try_global::<Registry>()
+        .map_or_else(NotificationSettings::default, |registry| {
+            registry.state.read(cx).settings.notifications.clone()
+        })
+}
+
+/// The shared settings state, for what must follow a change in the settings.
+pub(crate) fn state(cx: &mut App) -> Entity<SettingsState> {
+    shared_state(None, cx)
+}
+
 /// Whether the user may type into worker terminals. It stays on until the settings turn it off.
 pub(crate) fn allow_worker_typing(cx: &App) -> bool {
     cx.try_global::<Registry>().is_none_or(|registry| {
@@ -911,6 +1041,17 @@ pub(crate) fn set_allow_worker_typing(allowed: bool, cx: &mut App) {
 
     state.update(cx, |state, _| {
         state.settings.terminals.allow_worker_typing = allowed;
+    });
+}
+
+/// Changes the notification settings the way the page does.
+#[cfg(test)]
+pub(crate) fn change_notifications(edit: impl FnOnce(&mut NotificationSettings), cx: &mut App) {
+    let state = shared_state(None, cx);
+
+    state.update(cx, |state, cx| {
+        edit(&mut state.settings.notifications);
+        cx.notify();
     });
 }
 
@@ -955,6 +1096,7 @@ fn create_window(
 
 fn open_window(
     path: Option<PathBuf>,
+    projects: Option<Vec<Project>>,
     cx: &mut App,
 ) -> anyhow::Result<WindowHandle<SettingsWindow>> {
     bind_keys(cx);
@@ -972,6 +1114,9 @@ fn open_window(
     }
 
     state.update(cx, SettingsState::reload);
+    if let Some(projects) = projects {
+        state.update(cx, |state, _| state.use_projects(projects));
+    }
 
     let handle = create_window(state, Page::Agents, WINDOW_SIZE, cx)?;
     cx.global_mut::<Registry>().window = Some(handle);
@@ -979,30 +1124,57 @@ fn open_window(
     Ok(handle)
 }
 
-/// Opens the settings window, or focuses it when it is already open.
-pub(crate) fn open(path: Option<PathBuf>, _window: &mut Window, cx: &mut App) {
-    if let Err(error) = open_window(path, cx) {
+/// Opens the settings window, or focuses it when it is already open. `projects` are the
+/// workspace's: the window lists them.
+pub(crate) fn open(
+    path: Option<PathBuf>,
+    projects: Vec<Project>,
+    _window: &mut Window,
+    cx: &mut App,
+) {
+    if let Err(error) = open_window(path, Some(projects), cx) {
         log::error!("could not open the settings window: {error:#}");
     }
 }
 
 #[cfg(feature = "snapshot")]
 pub(crate) fn snapshot(directory: PathBuf, cx: &mut App) {
+    use std::rc::Rc;
     use std::time::Duration;
 
     use gpui::{AnyWindowHandle, AsyncApp};
     use swarm_ui::theme::Appearance;
 
+    use crate::notifications::SampleDelivery;
+
     const SETTLE: Duration = Duration::from_millis(700);
 
+    // The permission is the answer the sample delivery gives to every page.
     let pages = [
-        (Page::Agents, "agents", size(px(1280.), px(900.))),
+        (
+            Page::Agents,
+            "agents",
+            size(px(1280.), px(900.)),
+            Permission::Allowed,
+        ),
         (
             Page::Notifications,
             "notifications",
-            size(px(1280.), px(800.)),
+            size(px(1280.), px(1000.)),
+            Permission::NotAllowed,
         ),
-        (Page::Project(0), "project", size(px(1280.), px(1180.))),
+        (
+            Page::Notifications,
+            "notifications-allowed",
+            size(px(1280.), px(1000.)),
+            Permission::Allowed,
+        ),
+        (
+            Page::Project(0),
+            "project",
+            size(px(1280.), px(1180.)),
+            Permission::Allowed,
+        ),
     ];
 
     cx.spawn(async move |cx: &mut AsyncApp| {
@@ -1015,11 +1187,17 @@ pub(crate) fn snapshot(directory: PathBuf, cx: &mut App) {
         for (appearance, suffix) in [(Appearance::Light, "light"), (Appearance::Dark, "dark")] {
             cx.update(|cx| theme::set_appearance(appearance, cx));
 
-            for (page, name, window_size) in pages {
+            for (page, name, window_size, permission) in pages {
                 let path = directory.join(format!("settings-{name}-{suffix}.png"));
 
                 let opened = cx.update(|cx| {
+                    notifications::use_delivery(Rc::new(SampleDelivery(permission)), cx);
+
                     let state = cx.new(|_| SettingsState::sample(None));
+                    state.update(cx, SettingsState::sample_modes);
+                    // Set before the first frame: the answer of the delivery comes later.
+                    state.update(cx, |state, _| state.permission = Some(permission));
+
                     create_window(state, page, window_size, cx)
                 });
                 let window: AnyWindowHandle = match opened {
@@ -1060,9 +1238,13 @@ pub(crate) fn snapshot(directory: PathBuf, cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
     use gpui::{Focusable, TestAppContext};
 
     use super::*;
+    use crate::notifications::Delivery;
+    use crate::notifications::harness::Recorder;
 
     fn setup(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -1072,7 +1254,8 @@ mod tests {
     }
 
     fn open_settings(cx: &mut TestAppContext) -> WindowHandle<SettingsWindow> {
-        cx.update(|cx| open_window(None, cx)).expect("window opens")
+        cx.update(|cx| open_window(None, None, cx))
+            .expect("window opens")
     }
 
     #[gpui::test]
@@ -1131,10 +1314,10 @@ mod tests {
         std::env::temp_dir().join(format!("swarm-settings-{name}-{}.toml", std::process::id()))
     }
 
-    fn open_with(path: &std::path::Path, cx: &mut TestAppContext) -> Entity<SettingsState> {
+    fn open_with(path: &Path, cx: &mut TestAppContext) -> Entity<SettingsState> {
         setup(cx);
         let window = cx
-            .update(|cx| open_window(Some(path.to_path_buf()), cx))
+            .update(|cx| open_window(Some(path.to_path_buf()), None, cx))
             .expect("window opens");
 
         window
@@ -1285,6 +1468,249 @@ mod tests {
             state.settings.agents.codex.command.clone()
         });
         assert_eq!(command, "codex-dev");
+    }
+
+    fn notifications_page(
+        path: &Path,
+        projects: Option<Vec<Project>>,
+        permission: Permission,
+        cx: &mut TestAppContext,
+    ) -> (Entity<SettingsState>, Rc<Recorder>, gpui::VisualTestContext) {
+        cx.update(swarm_ui::init);
+        setup(cx);
+        let recorder = Recorder::new(permission);
+        let delivery: Rc<dyn Delivery> = Rc::clone(&recorder) as Rc<dyn Delivery>;
+        cx.update(|cx| notifications::use_delivery(delivery, cx));
+        let window = cx
+            .update(|cx| open_window(Some(path.to_path_buf()), projects, cx))
+            .expect("window opens");
+        window
+            .update(cx, |settings, _, cx| {
+                settings.select_page(Page::Notifications, cx);
+            })
+            .expect("window is open");
+        let state = window
+            .read_with(cx, |settings, _| settings.state.clone())
+            .expect("window is open");
+
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(size(px(1280.), px(2400.)));
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+
+        (state, recorder, visual)
+    }
+
+    fn click(selector: &'static str, visual: &mut gpui::VisualTestContext) {
+        let bounds = visual
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} is not on screen"));
+
+        visual.simulate_click(bounds.center(), gpui::Modifiers::none());
+        visual.run_until_parked();
+    }
+
+    fn save_pause(cx: &mut gpui::VisualTestContext) {
+        cx.executor().advance_clock(SAVE_DELAY);
+        cx.run_until_parked();
+    }
+
+    fn project_at(name: &'static str, root: &str) -> Project {
+        Project {
+            id: crate::model::ProjectId(0),
+            name: name.into(),
+            letter: 'D',
+            tile_color: gpui::rgb(0x0058_90e0).into(),
+            base_branch: "main".into(),
+            daemon: None,
+            root: Some(PathBuf::from(root)),
+            config_error: None,
+        }
+    }
+
+    #[gpui::test]
+    fn a_trigger_switch_on_the_page_is_saved(cx: &mut TestAppContext) {
+        let path = temp_path("notify-when");
+        let (_state, _recorder, mut visual) =
+            notifications_page(&path, None, Permission::Allowed, cx);
+
+        click("notify-when-1", &mut visual);
+        click("notify-when-3", &mut visual);
+        save_pause(&mut visual);
+
+        let saved = swarm_settings::load(&path).expect("read the settings");
+        std::fs::remove_file(&path).ok();
+        assert!(!saved.notifications.prompt);
+        assert!(!saved.notifications.broke);
+        assert!(saved.notifications.needs_decision);
+        assert!(saved.notifications.ready_for_review);
+    }
+
+    #[gpui::test]
+    fn a_delivery_switch_on_the_page_is_saved(cx: &mut TestAppContext) {
+        let path = temp_path("delivery");
+        let (_state, _recorder, mut visual) =
+            notifications_page(&path, None, Permission::Allowed, cx);
+
+        for index in ["delivery-0", "delivery-1", "delivery-2", "delivery-3"] {
+            click(index, &mut visual);
+        }
+        save_pause(&mut visual);
+
+        let saved = swarm_settings::load(&path).expect("read the settings");
+        std::fs::remove_file(&path).ok();
+        assert!(saved.notifications.sound);
+        assert!(!saved.notifications.dock_bounce);
+        assert!(!saved.notifications.mute_while_viewing);
+        assert!(!saved.notifications.menu_bar_dot);
+    }
+
+    #[gpui::test]
+    fn the_page_shows_the_saved_notification_settings(cx: &mut TestAppContext) {
+        let path = temp_path("shows-saved");
+        let mut saved = Settings::default();
+        saved.notifications.sound = true;
+        saved.notifications.ready_for_review = false;
+        swarm_settings::save(&path, &saved).expect("write the settings");
+
+        let (state, _recorder, _visual) = notifications_page(&path, None, Permission::Allowed, cx);
+
+        let loaded = state.read_with(cx, |state, _| state.settings.notifications.clone());
+        std::fs::remove_file(&path).ok();
+        assert_eq!(loaded, saved.notifications);
+    }
+
+    #[gpui::test]
+    fn the_project_mode_picker_is_saved_under_the_project_path(cx: &mut TestAppContext) {
+        let path = temp_path("project-mode");
+        let projects = vec![
+            project_at("alpha", "/work/alpha"),
+            project_at("beta", "/work/beta"),
+        ];
+        let (state, _recorder, mut visual) =
+            notifications_page(&path, Some(projects), Permission::Allowed, cx);
+
+        click("project-notifications-1", &mut visual);
+        visual.simulate_keystrokes("down down enter");
+        save_pause(&mut visual);
+
+        let saved = swarm_settings::load(&path).expect("read the settings");
+        let text = std::fs::read_to_string(&path).expect("read the file");
+        let names = state.read_with(&visual, |state, _| {
+            state
+                .projects
+                .iter()
+                .map(|entry| entry.project.name.to_string())
+                .collect::<Vec<_>>()
+        });
+        std::fs::remove_file(&path).ok();
+        assert_eq!(names, ["alpha", "beta"]);
+        assert_eq!(
+            saved.notifications.mode(Path::new("/work/beta")),
+            ProjectMode::Off
+        );
+        assert_eq!(
+            saved.notifications.mode(Path::new("/work/alpha")),
+            ProjectMode::All
+        );
+        assert!(text.contains("\"/work/beta\" = \"off\""));
+    }
+
+    #[gpui::test]
+    fn the_picker_shows_the_saved_mode_of_a_project(cx: &mut TestAppContext) {
+        let path = temp_path("project-mode-shown");
+        let mut saved = Settings::default();
+        saved
+            .notifications
+            .set_mode(Path::new("/work/alpha"), ProjectMode::ErrorsOnly);
+        swarm_settings::save(&path, &saved).expect("write the settings");
+        let projects = vec![project_at("alpha", "/work/alpha")];
+        let (state, _recorder, mut visual) =
+            notifications_page(&path, Some(projects), Permission::Allowed, cx);
+
+        click("project-notifications-0", &mut visual);
+        visual.simulate_keystrokes("down enter");
+        save_pause(&mut visual);
+
+        let again = swarm_settings::load(&path).expect("read the settings");
+        let mode = state.read_with(&visual, |state, _| {
+            state.settings.notifications.mode(Path::new("/work/alpha"))
+        });
+        std::fs::remove_file(&path).ok();
+        // The menu opened on the saved mode, so the next row is Off.
+        assert_eq!(mode, ProjectMode::Off);
+        assert_eq!(
+            again.notifications.mode(Path::new("/work/alpha")),
+            ProjectMode::Off
+        );
+    }
+
+    #[gpui::test]
+    fn the_permission_row_offers_system_settings_only_when_denied(cx: &mut TestAppContext) {
+        for (permission, offered) in [
+            (Permission::Allowed, false),
+            (Permission::NotAllowed, true),
+            (Permission::NotAsked, false),
+            (Permission::Unavailable, false),
+        ] {
+            let path = temp_path("permission");
+            let (state, _recorder, mut visual) = notifications_page(&path, None, permission, cx);
+
+            let shown = state.read_with(&visual, |state, _| state.permission);
+            let button = visual.debug_bounds("open-system-settings").is_some();
+            visual.update(|window, _| window.remove_window());
+            visual.run_until_parked();
+            std::fs::remove_file(&path).ok();
+
+            assert_eq!(shown, Some(permission));
+            assert_eq!(button, offered, "{permission:?}");
+        }
+    }
+
+    #[gpui::test]
+    fn open_system_settings_opens_the_notifications_pane(cx: &mut TestAppContext) {
+        let path = temp_path("open-pane");
+        let (_state, _recorder, mut visual) =
+            notifications_page(&path, None, Permission::NotAllowed, cx);
+
+        click("open-system-settings", &mut visual);
+
+        let url = visual.opened_url();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(
+            url.as_deref(),
+            Some("x-apple.systempreferences:com.apple.Notifications-Settings.extension")
+        );
+    }
+
+    #[gpui::test]
+    fn the_permission_is_read_again_when_the_user_comes_back(cx: &mut TestAppContext) {
+        let path = temp_path("permission-again");
+        let (state, recorder, mut visual) =
+            notifications_page(&path, None, Permission::NotAllowed, cx);
+        let before = state.read_with(&visual, |state, _| state.permission);
+
+        recorder.permission.set(Permission::Allowed);
+        visual.deactivate_window();
+        visual.update(|window, _| window.activate_window());
+        visual.run_until_parked();
+
+        let after = state.read_with(&visual, |state, _| state.permission);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(before, Some(Permission::NotAllowed));
+        assert_eq!(after, Some(Permission::Allowed));
+    }
+
+    #[gpui::test]
+    fn the_test_button_posts_one_notification_at_once(cx: &mut TestAppContext) {
+        let path = temp_path("test-button");
+        let (_state, recorder, mut visual) =
+            notifications_page(&path, None, Permission::Allowed, cx);
+
+        click("test-notification", &mut visual);
+
+        std::fs::remove_file(&path).ok();
+        assert_eq!(recorder.tags(), ["test"]);
     }
 
     #[gpui::test]

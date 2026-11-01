@@ -451,6 +451,9 @@ impl Workspace {
         Self::forward(client.usage_events(), cx, |workspace, usage, _, cx| {
             workspace.usage_changed(usage, cx);
         });
+        Self::forward(client.notices(), cx, |workspace, notice, window, cx| {
+            workspace.notice_received(&notice, window, cx);
+        });
     }
 
     fn forward<T: 'static>(
@@ -2002,7 +2005,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn start_agent(id: u64, project: u64, status: DaemonAgentStatus) -> AgentInfo {
+    pub(crate) fn start_agent(id: u64, project: u64, status: DaemonAgentStatus) -> AgentInfo {
         AgentInfo {
             task: None,
             role: swarm_protocol::AgentRole::StartOrchestrator,
@@ -2135,6 +2138,29 @@ pub(crate) mod tests {
         });
 
         socket
+    }
+
+    /// A daemon that sends `notices[n]` when the client attaches terminal `n`. The daemon
+    /// speaks only when asked, so a test asks with [`send_notice`].
+    pub(crate) fn fake_daemon_sending(notices: Vec<swarm_protocol::Notice>) -> PathBuf {
+        fake_daemon_replying(move |request| match request {
+            Request::Attach { id, .. } => usize::try_from(id.0)
+                .ok()
+                .and_then(|index| notices.get(index))
+                .map(|notice| Event::Notice {
+                    notice: notice.clone(),
+                }),
+            _ => None,
+        })
+    }
+
+    /// Makes a [`fake_daemon_sending`] daemon send its notice number `index`.
+    pub(crate) fn send_notice(client: &Client, index: u64) {
+        let channels = client
+            .attach(DaemonTerminalId(index), 0)
+            .expect("send the attach");
+
+        drop(channels);
     }
 
     pub(crate) fn task_info(id: u64, project: u64, name: &str) -> TaskInfo {
