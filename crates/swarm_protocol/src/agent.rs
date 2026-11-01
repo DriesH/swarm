@@ -66,6 +66,11 @@ pub enum Call {
     /// Orchestrator: merges a worker's branch into the task branch in the task
     /// worktree. Returns [`Merged`].
     Merge { worker: AgentId },
+    /// Orchestrator: makes one of its workers' tiles large; worker: its own (`None`).
+    /// Changes the layout only, never sends a message. Returns nothing.
+    TileGrow { agent: Option<AgentId> },
+    /// Like [`Call::TileGrow`], but makes the tile small again.
+    TileShrink { agent: Option<AgentId> },
     /// Orchestrator: asks the user for attention with a short reason.
     Notify { text: String },
     /// Orchestrator: lists its workers. Returns `Vec<`[`AgentSummary`]`>`.

@@ -273,6 +273,9 @@ Swarm depends on tools it does not ship. It checks them on first launch (welcome
 | Notifications | macOS authorization status | Ask for permission |
 
 - Never install silently: every fix is a button, and installs run in a visible user terminal (agents can't see it, ADR 0006).
+- The daemon runs the checks, so they see the tools the agents get. Git is checked with `xcode-select -p` first, because `/usr/bin/git` without the Command Line Tools opens Apple's install dialog; the fix is `xcode-select --install`.
+- Fixes, from the official docs: Claude Code installs with `curl -fsSL https://claude.ai/install.sh | bash`; Codex with `brew install --cask codex` when Homebrew exists, else `curl -fsSL https://chatgpt.com/codex/install.sh | sh`. Both sign in by running the CLI once (`claude`, `codex`). Signed in means the `Claude Code-credentials` Keychain item exists (checked without reading the secret), and `~/.codex/auth.json` exists.
+- The welcome screen shows once, on the first launch: the system check, **Skip for now** and **Open a project**. A fix runs in a terminal under its row, and the row checks again when that terminal ends. **Settings › General** shows the same check.
 - Missing optional tools disable only their features: no `gh` means Review and Approve work, and **Create PR** becomes **Set up GitHub**.
 - PR features show only when `origin` is on GitHub. GitLab (`glab`) later.
 - Agents get the same `gh` on their `PATH`.

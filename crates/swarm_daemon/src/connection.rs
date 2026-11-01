@@ -192,6 +192,9 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
                 sink.send_event(&Event::AgentChanges { call, changes });
             });
         }
+        Request::SystemCheck { call } => {
+            send_error(sink, call, &"not built yet");
+        }
         Request::Usage { call } => {
             sink.send_event(&Event::Usage {
                 call,

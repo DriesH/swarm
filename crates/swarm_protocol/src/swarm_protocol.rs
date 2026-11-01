@@ -20,7 +20,7 @@ mod client;
 pub use client::{Client, ClientError, CommentEvent, MessageEvent, PrEvent};
 
 /// Bumped on every incompatible change; the daemon refuses other versions.
-pub const VERSION: u32 = 16;
+pub const VERSION: u32 = 17;
 
 /// The most messages [`Request::ListMessages`] returns.
 pub const MESSAGES_LISTED: usize = 500;
@@ -784,6 +784,38 @@ pub struct PromptInfo {
     pub project_path: Option<PathBuf>,
 }
 
+/// How one tool of the system check stands.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolState {
+    Ready,
+    Missing,
+    /// Installed, but not signed in.
+    SignedOut,
+    /// The check itself failed; `detail` says why.
+    Failed,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ToolCheck {
+    pub state: ToolState,
+    pub version: Option<String>,
+    /// A short reason, like the error of a failed check.
+    pub detail: Option<String>,
+    /// The command that fixes it, run in a user terminal. Empty when nothing can run.
+    pub fix: Vec<String>,
+}
+
+/// The tools Swarm needs and does not ship, as the daemon finds them.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SystemCheck {
+    pub git: ToolCheck,
+    pub claude: ToolCheck,
+    pub codex: ToolCheck,
+    pub gh: ToolCheck,
+    /// `gh` signed in to github.com.
+    pub github_account: ToolCheck,
+}
+
 /// What closing a task would throw away, so the app can ask first.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct CloseCheck {
@@ -902,6 +934,10 @@ pub enum Request {
     },
     /// The last known subscription usage. Answered with [`Event::Usage`].
     Usage {
+        call: CallId,
+    },
+    /// Checks the tools Swarm needs again. Answered with [`Event::SystemCheck`].
+    SystemCheck {
         call: CallId,
     },
     /// Stops every running agent of every project, as the user's choice: an agent
@@ -1195,6 +1231,15 @@ pub enum Event {
     /// Sent to every client when the usage of a subscription changed.
     UsageChanged {
         usage: Usage,
+    },
+    SystemCheck {
+        call: CallId,
+        check: SystemCheck,
+    },
+    /// Sent to every client when an agent asked for a large or a small worker tile.
+    TileRequest {
+        agent: AgentId,
+        large: bool,
     },
     /// Sent to every client when something needs the user.
     Notice {

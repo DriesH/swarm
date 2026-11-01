@@ -241,6 +241,9 @@ impl Calls {
             Call::RateLimits { windows } => self.rate_limits(caller, windows),
             // `handle` answers it before it gets here.
             Call::AgentExit => Ok(Value::Null),
+            Call::TileGrow { .. } | Call::TileShrink { .. } => {
+                Err(Failure("not built yet".to_owned()))
+            }
 
             // The size is accepted and ignored: a process terminal follows its tile.
             Call::TerminalSpawn {
