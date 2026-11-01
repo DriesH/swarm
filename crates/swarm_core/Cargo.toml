@@ -21,3 +21,4 @@ swarm_protocol.workspace = true
 swarm_term.workspace = true
 thiserror.workspace = true
 toml.workspace = true
+toml_edit.workspace = true

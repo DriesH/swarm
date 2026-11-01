@@ -1,9 +1,9 @@
 //! The pure parts of making a task: names, ports and copying files.
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use crate::Error;
-use crate::config::PortRange;
+use crate::config::{self, PortRange};
 
 const MAX_SLUG_CHARS: usize = 50;
 
@@ -133,18 +133,13 @@ pub(crate) fn create_folder_inside(base: &Path, folder: &Path) -> Result<PathBuf
 
 /// Returns false when the source does not exist.
 fn copy_file(root: &Path, worktree: &Path, entry: &str) -> Result<bool, Error> {
-    let relative = Path::new(entry);
-    let inside = !entry.is_empty()
-        && relative
-            .components()
-            .all(|component| matches!(component, Component::Normal(_)));
-    if !inside {
+    if !config::is_inside_repository(entry) {
         return Err(Error::Invalid(
             "the path is not inside the project".to_owned(),
         ));
     }
 
-    let source = root.join(relative);
+    let source = root.join(entry);
     let copy_error = |source_error| Error::Io {
         action: format!("copy {entry}"),
         source: source_error,
@@ -165,7 +160,7 @@ fn copy_file(root: &Path, worktree: &Path, entry: &str) -> Result<bool, Error> {
         return Err(Error::Invalid("only files can be copied".to_owned()));
     }
 
-    let destination: PathBuf = worktree.join(relative);
+    let destination: PathBuf = worktree.join(entry);
     if let Some(parent) = destination.parent() {
         create_folder_inside(worktree, parent)?;
     }

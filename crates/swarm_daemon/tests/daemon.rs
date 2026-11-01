@@ -17,9 +17,9 @@ use swarm_core::store::{Status, Store, unix_millis};
 use swarm_protocol::{
     AgentChange, AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, CallId,
     CloseCheck, CommentId, CommentState, CreateTask, CreateTerminal, DiffStat, Event, FileDiff,
-    FileStat, Fold, MessageInfo, MessageKind, Notice, NoticeKind, ProjectId, ProjectInfo, Request,
-    ReviewSource, TaskDiff, TaskId, TaskInfo, TerminalId, TerminalInfo, TerminalKind, Usage,
-    UsageProblem, VERSION, read, write,
+    FileStat, Fold, MessageInfo, MessageKind, Notice, NoticeKind, ProjectConfigFields, ProjectId,
+    ProjectInfo, PromptInfo, PromptLayer, Request, ReviewSource, TaskDiff, TaskId, TaskInfo,
+    TerminalId, TerminalInfo, TerminalKind, Usage, UsageProblem, VERSION, read, write,
 };
 use swarm_term::{
     BlockedKind, ExitStatus, Palette, ProgramState, Rgb, Row, Size, TerminalInput, TerminalOutput,
@@ -9188,5 +9188,533 @@ exit 0"#,
     assert_eq!(
         kinds_and_texts(&notices),
         [(NoticeKind::Broke, "first"), (NoticeKind::Broke, "second")]
+    );
+}
+
+/// A fake `~/.config/swarm`, so no test reads or writes the real one.
+struct ConfigDir {
+    dir: PathBuf,
+}
+
+impl ConfigDir {
+    fn new() -> Self {
+        let number = NEXT_HOME.fetch_add(1, Ordering::Relaxed);
+        let dir = PathBuf::from(format!("/tmp/swd-cfg-{}-{number}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("config folder");
+
+        Self { dir }
+    }
+
+    fn settings(&self) -> PathBuf {
+        self.dir.join("settings.toml")
+    }
+
+    fn prompt(&self, name: &str) -> PathBuf {
+        self.dir.join("prompts").join(format!("{name}.md"))
+    }
+
+    fn write_prompt(&self, name: &str, text: &str) {
+        std::fs::create_dir_all(self.dir.join("prompts")).expect("prompts folder");
+        std::fs::write(self.prompt(name), text).expect("prompt");
+    }
+
+    fn daemon(&self) -> Daemon {
+        let daemon = Daemon::spawn_with(Daemon::new_home(), Some(&self.settings()), None);
+        daemon.wait_until_listening();
+
+        daemon
+    }
+}
+
+impl Drop for ConfigDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.dir).ok();
+    }
+}
+
+impl Client {
+    fn project_config(
+        &mut self,
+        project: ProjectId,
+    ) -> Result<(ProjectConfigFields, Option<String>), String> {
+        self.send(&Request::ProjectConfig {
+            call: CALL,
+            project,
+        });
+
+        self.wait_for(|event| match event {
+            Event::ProjectConfig {
+                call: CALL,
+                fields,
+                error,
+            } => Some(Ok((fields.clone(), error.clone()))),
+            Event::Error {
+                call: Some(CALL),
+                message,
+                ..
+            } => Some(Err(message.clone())),
+            _ => None,
+        })
+    }
+
+    fn save_project_config(
+        &mut self,
+        project: ProjectId,
+        fields: &ProjectConfigFields,
+    ) -> Result<(), String> {
+        self.until_done(&Request::SaveProjectConfig {
+            call: CALL,
+            project,
+            fields: fields.clone(),
+        })
+        .map(|_| ())
+    }
+
+    /// Reads the fields, lets `edit` change them, and saves them all, like the app.
+    fn edit_project_config(
+        &mut self,
+        project: ProjectId,
+        edit: impl FnOnce(&mut ProjectConfigFields),
+    ) -> Result<(), String> {
+        let (mut fields, error) = self.project_config(project).expect("config");
+        assert_eq!(error, None);
+        edit(&mut fields);
+
+        self.save_project_config(project, &fields)
+    }
+
+    fn prompts(&mut self, project: Option<ProjectId>) -> Result<Vec<PromptInfo>, String> {
+        self.send(&Request::Prompts {
+            call: CALL,
+            project,
+        });
+
+        self.wait_for(|event| match event {
+            Event::Prompts {
+                call: CALL,
+                prompts,
+            } => Some(Ok(prompts.clone())),
+            Event::Error {
+                call: Some(CALL),
+                message,
+                ..
+            } => Some(Err(message.clone())),
+            _ => None,
+        })
+    }
+
+    fn prompt(&mut self, project: Option<ProjectId>, name: &str) -> PromptInfo {
+        self.prompts(project)
+            .expect("prompts")
+            .into_iter()
+            .find(|prompt| prompt.name == name)
+            .expect("the prompt is listed")
+    }
+
+    fn customize_prompt(&mut self, name: &str) -> Result<PathBuf, String> {
+        self.send(&Request::CustomizePrompt {
+            call: CALL,
+            name: name.to_owned(),
+        });
+
+        self.wait_for(|event| match event {
+            Event::PromptFile { call: CALL, path } => Some(Ok(path.clone())),
+            Event::Error {
+                call: Some(CALL),
+                message,
+                ..
+            } => Some(Err(message.clone())),
+            _ => None,
+        })
+    }
+
+    fn reset_prompt(&mut self, name: &str) -> Result<(), String> {
+        self.until_done(&Request::ResetPrompt {
+            call: CALL,
+            name: name.to_owned(),
+        })
+        .map(|_| ())
+    }
+}
+
+/// A daemon with a fake config folder, and a client with a project in `repo`.
+fn settings_session(repo: &Repo) -> (ConfigDir, Daemon, Client, ProjectId) {
+    let config = ConfigDir::new();
+    let daemon = config.daemon();
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root).id;
+
+    (config, daemon, client, project)
+}
+
+type ConfigEdit = fn(&mut ProjectConfigFields);
+
+fn config_file(repo: &Repo) -> PathBuf {
+    repo.root.join(".swarm/config.toml")
+}
+
+fn config_text(repo: &Repo) -> String {
+    std::fs::read_to_string(config_file(repo)).expect("config file")
+}
+
+fn default_fields() -> ProjectConfigFields {
+    ProjectConfigFields {
+        worktree_folder: ".worktrees".to_owned(),
+        ..ProjectConfigFields::default()
+    }
+}
+
+fn every_field_set() -> ProjectConfigFields {
+    ProjectConfigFields {
+        base_branch: Some("develop".to_owned()),
+        worktree_folder: ".trees/tasks".to_owned(),
+        port_range: "6000-6099".to_owned(),
+        ports_per_worktree: 4,
+        copy: vec![".env".to_owned(), "config/local.toml".to_owned()],
+        setup: "cargo fetch\npnpm install\n".to_owned(),
+        teardown: "docker compose down".to_owned(),
+        checks: vec!["cargo test".to_owned(), "cargo fmt --check".to_owned()],
+        checks_required: true,
+    }
+}
+
+const COMMENTED_CONFIG: &str = r#"# Swarm settings for this repo
+
+[worktrees] # where tasks live
+base_branch = "main"
+folder   =   ".worktrees"   # keep it out of the way
+future_key = 42
+copy = [
+    ".env",   # secrets
+    "CLAUDE.local.md",
+]
+setup = "cargo fetch"
+
+# my own tool
+[tools.fmt]
+enabled = true
+
+[checks]
+before_pr = ["cargo test"]
+required = false # flip when stable
+"#;
+
+#[test]
+fn a_project_without_a_config_file_reads_as_the_defaults() {
+    let repo = Repo::new("");
+    std::fs::remove_dir_all(repo.root.join(".swarm")).expect("remove the config folder");
+    let (_config, _daemon, mut client, project) = settings_session(&repo);
+
+    let read = client.project_config(project);
+
+    assert_eq!(read, Ok((default_fields(), None)));
+}
+
+#[test]
+fn the_project_config_is_read_from_the_file_as_it_is_now() {
+    let repo = Repo::new(COMMENTED_CONFIG);
+    let (_config, _daemon, mut client, project) = settings_session(&repo);
+
+    let (first, error) = client.project_config(project).expect("config");
+    std::fs::write(
+        config_file(&repo),
+        "[worktrees]\nfolder = \".elsewhere\"\nports = { range = \"5170-5199\", per_worktree = 3 }\n",
+    )
+    .expect("edit by hand");
+    let (second, _) = client.project_config(project).expect("config");
+
+    assert_eq!(error, None);
+    assert_eq!(first.base_branch.as_deref(), Some("main"));
+    assert_eq!(first.copy, [".env", "CLAUDE.local.md"]);
+    assert_eq!(first.setup, "cargo fetch");
+    assert_eq!(first.checks, ["cargo test"]);
+    assert!(!first.checks_required);
+    assert_eq!(second.worktree_folder, ".elsewhere");
+    assert_eq!(second.port_range, "5170-5199");
+    assert_eq!(second.ports_per_worktree, 3);
+    assert_eq!(second.base_branch, None);
+}
+
+#[test]
+fn every_project_config_field_survives_a_save_over_the_socket() {
+    let repo = Repo::new("");
+    let (_config, _daemon, mut client, project) = settings_session(&repo);
+
+    client
+        .save_project_config(project, &every_field_set())
+        .expect("save");
+    let read = client.project_config(project);
+
+    assert_eq!(read, Ok((every_field_set(), None)));
+    assert_eq!(
+        config_text(&repo),
+        r#"[worktrees]
+base_branch = "develop"
+folder = ".trees/tasks"
+ports = { range = "6000-6099", per_worktree = 4 }
+copy = [".env", "config/local.toml"]
+setup = """
+cargo fetch
+pnpm install
+"""
+teardown = "docker compose down"
+
+[checks]
+before_pr = ["cargo test", "cargo fmt --check"]
+required = true
+"#
+    );
+}
+
+#[test]
+fn a_save_changes_only_the_changed_field_and_keeps_comments_and_unknown_keys() {
+    let repo = Repo::new(COMMENTED_CONFIG);
+    let (_config, _daemon, mut client, project) = settings_session(&repo);
+
+    client
+        .edit_project_config(project, |fields| fields.checks_required = true)
+        .expect("save");
+
+    assert_eq!(
+        config_text(&repo),
+        COMMENTED_CONFIG.replace(
+            "required = false # flip when stable",
+            "required = true # flip when stable"
+        )
+    );
+}
+
+#[test]
+fn a_save_makes_the_config_folder_and_file_and_does_not_add_defaults() {
+    let repo = Repo::new("");
+    std::fs::remove_dir_all(repo.root.join(".swarm")).expect("remove the config folder");
+    let (_config, _daemon, mut client, project) = settings_session(&repo);
+
+    client
+        .edit_project_config(project, |_| {})
+        .expect("save the defaults");
+    let made_nothing = !repo.root.join(".swarm").exists();
+    client
+        .edit_project_config(project, |fields| fields.teardown = "echo bye".to_owned())
+        .expect("save");
+
+    assert!(made_nothing, "saving the defaults makes no file");
+    assert_eq!(config_text(&repo), "[worktrees]\nteardown = \"echo bye\"\n");
+}
+
+#[test]
+fn clearing_the_port_range_removes_the_ports_and_keeps_the_rest() {
+    let repo = Repo::new(
+        "# ports below\n[worktrees]\nfolder = \".trees\"\nports = { range = \"5170-5199\", per_worktree = 3 }\ncopy = [\".env\"]\n",
+    );
+    let (_config, _daemon, mut client, project) = settings_session(&repo);
+
+    client
+        .edit_project_config(project, |fields| {
+            fields.port_range = String::new();
+            fields.ports_per_worktree = 0;
+        })
+        .expect("save");
+    let (fields, _) = client.project_config(project).expect("config");
+
+    assert_eq!(
+        config_text(&repo),
+        "# ports below\n[worktrees]\nfolder = \".trees\"\ncopy = [\".env\"]\n"
+    );
+    assert_eq!(fields.port_range, "");
+    assert_eq!(fields.ports_per_worktree, 0);
+}
+
+#[test]
+fn a_save_with_an_invalid_field_is_refused_with_a_message_naming_the_field() {
+    let repo = Repo::new(COMMENTED_CONFIG);
+    let (_config, _daemon, mut client, project) = settings_session(&repo);
+    let cases: [(&str, ConfigEdit); 7] = [
+        ("worktrees.folder", |fields| {
+            fields.worktree_folder = "../outside".to_owned();
+        }),
+        ("ports.range", |fields| {
+            fields.port_range = "5199-5170".to_owned();
+            fields.ports_per_worktree = 1;
+        }),
+        ("ports.per_worktree", |fields| {
+            fields.port_range = "5170-5171".to_owned();
+            fields.ports_per_worktree = 3;
+        }),
+        ("ports.per_worktree", |fields| {
+            fields.port_range = "5170-5179".to_owned();
+            fields.ports_per_worktree = 0;
+        }),
+        ("worktrees.copy", |fields| {
+            fields.copy = vec!["../secret".to_owned()];
+        }),
+        ("worktrees.copy", |fields| {
+            fields.copy = vec!["/etc/hosts".to_owned()];
+        }),
+        ("checks.before_pr", |fields| {
+            fields.checks = vec!["cargo test".to_owned(), " ".to_owned()];
+        }),
+    ];
+
+    for (field, edit) in cases {
+        let message = client
+            .edit_project_config(project, edit)
+            .expect_err("the save is refused");
+
+        assert!(message.contains(field), "{field}: {message}");
+    }
+
+    assert_eq!(config_text(&repo), COMMENTED_CONFIG);
+}
+
+#[test]
+fn a_config_file_that_does_not_parse_is_reported_and_never_overwritten() {
+    let broken = "[worktrees\nfolder = ";
+    let repo = Repo::new(broken);
+    let (_config, _daemon, mut client, project) = settings_session(&repo);
+
+    let (fields, error) = client.project_config(project).expect("config");
+    let refused = client
+        .save_project_config(project, &every_field_set())
+        .expect_err("the save is refused");
+
+    assert_eq!(fields, default_fields());
+    assert!(error.is_some_and(|message| !message.is_empty()));
+    assert!(refused.contains("config.toml"), "{refused}");
+    assert_eq!(config_text(&repo), broken);
+}
+
+#[test]
+fn project_config_requests_for_an_unknown_project_are_errors() {
+    let repo = Repo::new("");
+    let (_config, _daemon, mut client, _project) = settings_session(&repo);
+    let unknown = ProjectId(9999);
+
+    let read = client.project_config(unknown);
+    let saved = client.save_project_config(unknown, &every_field_set());
+    let prompts = client.prompts(Some(unknown));
+
+    assert!(read.is_err());
+    assert!(saved.is_err());
+    assert!(prompts.is_err());
+    assert_eq!(config_text(&repo), "");
+}
+
+#[test]
+fn outside_any_project_every_prompt_is_built_in_and_its_user_path_is_in_the_config_folder() {
+    let repo = Repo::new("");
+    let (config, _daemon, mut client, _project) = settings_session(&repo);
+
+    let prompts = client.prompts(None).expect("prompts");
+
+    let names: Vec<_> = prompts.iter().map(|prompt| prompt.name.as_str()).collect();
+    assert_eq!(names, ["orchestrator", "worker", "start", "pr"]);
+    for prompt in &prompts {
+        assert_eq!(prompt.layer, PromptLayer::BuiltIn, "{}", prompt.name);
+        assert_eq!(prompt.user_path, config.prompt(&prompt.name));
+        assert_eq!(prompt.project_path, None);
+    }
+}
+
+#[test]
+fn a_project_copy_is_the_layer_of_that_project_only() {
+    let repo = Repo::new("");
+    std::fs::create_dir_all(repo.root.join(".swarm/prompts")).expect("folder");
+    std::fs::write(repo.root.join(".swarm/prompts/worker.md"), "Project worker").expect("prompt");
+    let (config, _daemon, mut client, project) = settings_session(&repo);
+    config.write_prompt("worker", "User worker");
+    config.write_prompt("pr", "User pr");
+
+    let in_project = client.prompts(Some(project)).expect("prompts");
+    let outside = client.prompts(None).expect("prompts");
+
+    let find = |prompts: &[PromptInfo], name: &str| {
+        prompts
+            .iter()
+            .find(|prompt| prompt.name == name)
+            .cloned()
+            .expect("the prompt is listed")
+    };
+    let worker = find(&in_project, "worker");
+    assert_eq!(worker.layer, PromptLayer::Project);
+    assert_eq!(
+        worker.project_path,
+        Some(repo.root.join(".swarm/prompts/worker.md"))
+    );
+    assert_eq!(worker.user_path, config.prompt("worker"));
+    assert_eq!(find(&in_project, "pr").layer, PromptLayer::User);
+    assert_eq!(find(&in_project, "start").layer, PromptLayer::BuiltIn);
+    assert_eq!(find(&outside, "worker").layer, PromptLayer::User);
+    assert_eq!(find(&outside, "worker").project_path, None);
+}
+
+#[test]
+fn customizing_a_prompt_copies_the_built_in_text_and_keeps_an_existing_copy() {
+    let repo = Repo::new("");
+    let (config, _daemon, mut client, _project) = settings_session(&repo);
+
+    let path = client.customize_prompt("worker").expect("customize");
+    let first = std::fs::read_to_string(&path).expect("copy");
+    std::fs::write(&path, "My own worker text").expect("edit");
+    let again = client.customize_prompt("worker").expect("customize again");
+
+    assert_eq!(path, config.prompt("worker"));
+    assert_eq!(first, include_str!("../../swarm_core/prompts/worker.md"));
+    assert_eq!(again, path);
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("copy"),
+        "My own worker text"
+    );
+    assert_eq!(client.prompt(None, "worker").layer, PromptLayer::User);
+}
+
+#[test]
+fn resetting_a_prompt_removes_the_copy_and_the_built_in_layer_applies_again() {
+    let repo = Repo::new("");
+    let (config, _daemon, mut client, _project) = settings_session(&repo);
+    client.customize_prompt("worker").expect("customize");
+    client.customize_prompt("pr").expect("customize");
+
+    client.reset_prompt("worker").expect("reset");
+    client.reset_prompt("worker").expect("reset without a copy");
+
+    assert!(!config.prompt("worker").exists());
+    assert!(config.prompt("pr").exists());
+    assert_eq!(client.prompt(None, "worker").layer, PromptLayer::BuiltIn);
+    assert_eq!(client.prompt(None, "pr").layer, PromptLayer::User);
+}
+
+#[test]
+fn an_unknown_prompt_name_is_refused_and_writes_nothing() {
+    let repo = Repo::new("");
+    let (config, _daemon, mut client, _project) = settings_session(&repo);
+
+    for name in ["review", "", "worker.md", "../worker"] {
+        assert!(client.customize_prompt(name).is_err(), "customize {name:?}");
+        assert!(client.reset_prompt(name).is_err(), "reset {name:?}");
+    }
+
+    assert!(!config.dir.join("prompts").exists());
+}
+
+#[test]
+fn customizing_and_resetting_never_touch_the_prompts_of_a_project() {
+    let repo = Repo::new("");
+    std::fs::create_dir_all(repo.root.join(".swarm/prompts")).expect("folder");
+    let project_copy = repo.root.join(".swarm/prompts/worker.md");
+    std::fs::write(&project_copy, "Project worker").expect("prompt");
+    let (_config, _daemon, mut client, project) = settings_session(&repo);
+
+    client.customize_prompt("worker").expect("customize");
+    client.reset_prompt("worker").expect("reset");
+
+    assert_eq!(
+        std::fs::read_to_string(project_copy).expect("project copy"),
+        "Project worker"
+    );
+    assert_eq!(
+        client.prompt(Some(project), "worker").layer,
+        PromptLayer::Project
     );
 }

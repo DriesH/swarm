@@ -5,9 +5,12 @@
 //! `.swarm/prompts/` in the project.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use swarm_protocol::{AgentId, AgentKind, AgentRole, TaskId};
+use swarm_protocol::{AgentId, AgentKind, AgentRole, PromptInfo, PromptLayer, TaskId};
+
+use crate::Error;
+use crate::config;
 
 const ORCHESTRATOR: &str = include_str!("../prompts/orchestrator.md");
 const WORKER: &str = include_str!("../prompts/worker.md");
@@ -24,6 +27,9 @@ pub enum PromptFile {
 }
 
 impl PromptFile {
+    /// Every prompt, in the order Settings lists them.
+    pub const ALL: [Self; 4] = [Self::Orchestrator, Self::Worker, Self::Start, Self::Pr];
+
     pub fn for_role(role: AgentRole) -> Self {
         match role {
             AgentRole::Orchestrator => Self::Orchestrator,
@@ -39,6 +45,18 @@ impl PromptFile {
             Self::Start => "start.md",
             Self::Pr => "pr.md",
         }
+    }
+
+    /// The file name without `.md`.
+    pub fn name(self) -> &'static str {
+        self.file_name().trim_end_matches(".md")
+    }
+
+    fn from_name(name: &str) -> Result<Self, Error> {
+        Self::ALL
+            .into_iter()
+            .find(|file| file.name() == name)
+            .ok_or_else(|| Error::Invalid(format!("there is no prompt named {name:?}")))
     }
 
     fn built_in(self) -> &'static str {
@@ -175,19 +193,117 @@ pub fn layered(file: PromptFile, config_dir: Option<&Path>, project_root: &Path)
     let mut body = file.built_in().trim().to_owned();
 
     let layers = [
-        config_dir.map(|dir| dir.join("prompts").join(file.file_name())),
-        Some(project_root.join(".swarm/prompts").join(file.file_name())),
+        user_folder(config_dir).map(|folder| folder.join(file.file_name())),
+        Some(project_file(project_root, file)),
     ];
     for path in layers.into_iter().flatten() {
-        match std::fs::read_to_string(&path) {
-            Ok(text) if !text.trim().is_empty() => text.trim().clone_into(&mut body),
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => log::warn!("cannot read the prompt {}: {error}", path.display()),
+        if let Some(text) = layer_text(&path) {
+            body = text;
         }
     }
 
     body
+}
+
+/// Every prompt with the layer its agents get. Without a project, that is the layer
+/// outside any project.
+pub fn list(
+    config_dir: Option<&Path>,
+    project_root: Option<&Path>,
+) -> Result<Vec<PromptInfo>, Error> {
+    let folder = required_user_folder(config_dir)?;
+
+    let prompts = PromptFile::ALL
+        .into_iter()
+        .map(|file| {
+            let user_path = folder.join(file.file_name());
+            let project_path = project_root
+                .map(|root| project_file(root, file))
+                .filter(|path| path.is_file());
+
+            let layer = if project_path.as_deref().and_then(layer_text).is_some() {
+                PromptLayer::Project
+            } else if layer_text(&user_path).is_some() {
+                PromptLayer::User
+            } else {
+                PromptLayer::BuiltIn
+            };
+
+            PromptInfo {
+                name: file.name().to_owned(),
+                layer,
+                user_path,
+                project_path,
+            }
+        })
+        .collect();
+
+    Ok(prompts)
+}
+
+/// Writes the built-in text to the user's folder, unless a copy is already there.
+/// Returns the path of the copy.
+pub fn customize(name: &str, config_dir: Option<&Path>) -> Result<PathBuf, Error> {
+    let file = PromptFile::from_name(name)?;
+    let path = required_user_folder(config_dir)?.join(file.file_name());
+
+    match std::fs::metadata(&path) {
+        Ok(found) if found.is_file() => return Ok(path),
+        Ok(_) => return Err(Error::Invalid(format!("{} is not a file", path.display()))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(Error::Io {
+                action: format!("read {}", path.display()),
+                source,
+            });
+        }
+    }
+
+    config::write_atomic(&path, file.built_in())?;
+
+    Ok(path)
+}
+
+/// Removes the user's copy, so the built-in text applies again. A missing copy is fine.
+pub fn reset(name: &str, config_dir: Option<&Path>) -> Result<(), Error> {
+    let file = PromptFile::from_name(name)?;
+    let path = required_user_folder(config_dir)?.join(file.file_name());
+
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(Error::Io {
+            action: format!("remove {}", path.display()),
+            source,
+        }),
+    }
+}
+
+fn user_folder(config_dir: Option<&Path>) -> Option<PathBuf> {
+    config_dir.map(|dir| dir.join("prompts"))
+}
+
+fn required_user_folder(config_dir: Option<&Path>) -> Result<PathBuf, Error> {
+    user_folder(config_dir)
+        .ok_or_else(|| Error::Invalid("cannot find the folder of the user's prompts".to_owned()))
+}
+
+fn project_file(project_root: &Path, file: PromptFile) -> PathBuf {
+    project_root.join(".swarm/prompts").join(file.file_name())
+}
+
+/// The trimmed text of a layer file, or none when it is missing or blank.
+fn layer_text(path: &Path) -> Option<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) if !text.trim().is_empty() => Some(text.trim().to_owned()),
+        Ok(_) => None,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => {
+            log::warn!("cannot read the prompt {}: {error}", path.display());
+
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -583,5 +699,248 @@ mod tests {
         assert!(sandboxed.contains("cannot reach Swarm"));
         assert!(skipping.contains("Run these commands in your shell"));
         assert!(claude.contains("Run these commands in your shell"));
+    }
+
+    fn project_prompts(folders: &Folders) -> PathBuf {
+        folders.project().join(".swarm")
+    }
+
+    fn layer_of(prompts: &[PromptInfo], name: &str) -> PromptLayer {
+        prompts
+            .iter()
+            .find(|prompt| prompt.name == name)
+            .expect("prompt")
+            .layer
+    }
+
+    #[test]
+    fn every_built_in_prompt_is_listed_by_its_file_name() {
+        let folders = Folders::new("list-names");
+
+        let prompts = list(Some(&folders.config()), None).expect("list");
+
+        let names: Vec<_> = prompts.iter().map(|prompt| prompt.name.as_str()).collect();
+        assert_eq!(names, ["orchestrator", "worker", "start", "pr"]);
+        for file in PromptFile::ALL {
+            assert_eq!(format!("{}.md", file.name()), file.file_name());
+        }
+    }
+
+    #[test]
+    fn outside_any_project_the_built_in_layer_applies_and_the_user_path_is_known() {
+        let folders = Folders::new("list-none");
+
+        let prompts = list(Some(&folders.config()), None).expect("list");
+
+        for prompt in &prompts {
+            assert_eq!(prompt.layer, PromptLayer::BuiltIn, "{}", prompt.name);
+            assert_eq!(prompt.project_path, None);
+            assert_eq!(
+                prompt.user_path,
+                folders
+                    .config()
+                    .join("prompts")
+                    .join(format!("{}.md", prompt.name))
+            );
+        }
+    }
+
+    #[test]
+    fn a_user_copy_is_the_user_layer_and_only_for_its_own_prompt() {
+        let folders = Folders::new("list-user");
+        Folders::write(&folders.config(), "worker.md", "User worker text");
+
+        let prompts = list(Some(&folders.config()), None).expect("list");
+
+        assert_eq!(layer_of(&prompts, "worker"), PromptLayer::User);
+        assert_eq!(layer_of(&prompts, "orchestrator"), PromptLayer::BuiltIn);
+        assert_eq!(layer_of(&prompts, "pr"), PromptLayer::BuiltIn);
+    }
+
+    #[test]
+    fn a_project_copy_wins_over_the_user_copy_and_shows_its_path() {
+        let folders = Folders::new("list-project");
+        Folders::write(&folders.config(), "worker.md", "User worker text");
+        Folders::write(&folders.config(), "pr.md", "User pr text");
+        Folders::write(
+            &project_prompts(&folders),
+            "worker.md",
+            "Project worker text",
+        );
+
+        let prompts = list(Some(&folders.config()), Some(&folders.project())).expect("list");
+
+        let worker = prompts.iter().find(|prompt| prompt.name == "worker");
+        assert_eq!(
+            worker.map(|prompt| prompt.project_path.clone()),
+            Some(Some(folders.project().join(".swarm/prompts/worker.md")))
+        );
+        assert_eq!(layer_of(&prompts, "worker"), PromptLayer::Project);
+        assert_eq!(layer_of(&prompts, "pr"), PromptLayer::User);
+        assert_eq!(layer_of(&prompts, "start"), PromptLayer::BuiltIn);
+    }
+
+    #[test]
+    fn a_project_copy_does_not_count_outside_the_project() {
+        let folders = Folders::new("list-outside");
+        Folders::write(
+            &project_prompts(&folders),
+            "worker.md",
+            "Project worker text",
+        );
+
+        let prompts = list(Some(&folders.config()), None).expect("list");
+
+        assert_eq!(layer_of(&prompts, "worker"), PromptLayer::BuiltIn);
+    }
+
+    #[test]
+    fn a_blank_project_copy_is_listed_but_the_layer_below_applies() {
+        let folders = Folders::new("list-blank");
+        Folders::write(&folders.config(), "worker.md", "User worker text");
+        Folders::write(&project_prompts(&folders), "worker.md", " \n");
+
+        let prompts = list(Some(&folders.config()), Some(&folders.project())).expect("list");
+
+        let worker = prompts
+            .iter()
+            .find(|prompt| prompt.name == "worker")
+            .expect("worker");
+        assert!(worker.project_path.is_some());
+        assert_eq!(worker.layer, PromptLayer::User);
+    }
+
+    #[test]
+    fn the_listed_layer_is_the_layer_the_agents_get() {
+        let folders = Folders::new("list-agrees");
+        Folders::write(&folders.config(), "worker.md", "User worker text");
+        Folders::write(&folders.config(), "pr.md", "User pr text");
+        Folders::write(&project_prompts(&folders), "pr.md", "Project pr text");
+        Folders::write(&project_prompts(&folders), "start.md", "  ");
+
+        let prompts = list(Some(&folders.config()), Some(&folders.project())).expect("list");
+
+        for (file, layer, expected) in [
+            (
+                PromptFile::Orchestrator,
+                PromptLayer::BuiltIn,
+                ORCHESTRATOR.trim(),
+            ),
+            (PromptFile::Worker, PromptLayer::User, "User worker text"),
+            (PromptFile::Start, PromptLayer::BuiltIn, START.trim()),
+            (PromptFile::Pr, PromptLayer::Project, "Project pr text"),
+        ] {
+            let text = layered(file, Some(&folders.config()), &folders.project());
+
+            assert_eq!(layer_of(&prompts, file.name()), layer, "{}", file.name());
+            assert_eq!(text, expected, "{}", file.name());
+        }
+    }
+
+    #[test]
+    fn listing_needs_a_config_folder() {
+        assert!(matches!(list(None, None), Err(Error::Invalid(_))));
+    }
+
+    #[test]
+    fn customizing_writes_the_built_in_text_to_the_user_folder() {
+        let folders = Folders::new("customize");
+
+        let path = customize("worker", Some(&folders.config())).expect("customize");
+
+        assert_eq!(path, folders.config().join("prompts/worker.md"));
+        assert_eq!(std::fs::read_to_string(&path).expect("copy"), WORKER);
+        let prompts = list(Some(&folders.config()), None).expect("list");
+        assert_eq!(layer_of(&prompts, "worker"), PromptLayer::User);
+    }
+
+    #[test]
+    fn customizing_never_overwrites_a_copy_that_is_there() {
+        let folders = Folders::new("customize-twice");
+        Folders::write(&folders.config(), "worker.md", "My own worker text");
+
+        let path = customize("worker", Some(&folders.config())).expect("customize");
+
+        assert_eq!(path, folders.config().join("prompts/worker.md"));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("copy"),
+            "My own worker text"
+        );
+    }
+
+    #[test]
+    fn customizing_leaves_no_temporary_file_in_the_user_folder() {
+        let folders = Folders::new("customize-temp");
+
+        customize("pr", Some(&folders.config())).expect("customize");
+
+        let names: Vec<_> = std::fs::read_dir(folders.config().join("prompts"))
+            .expect("folder")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(names, ["pr.md"]);
+    }
+
+    #[test]
+    fn resetting_removes_the_user_copy_and_the_built_in_layer_applies_again() {
+        let folders = Folders::new("reset");
+        Folders::write(&folders.config(), "worker.md", "User worker text");
+        Folders::write(&folders.config(), "pr.md", "User pr text");
+
+        reset("worker", Some(&folders.config())).expect("reset");
+
+        assert!(!folders.config().join("prompts/worker.md").exists());
+        assert!(folders.config().join("prompts/pr.md").exists());
+        let prompts = list(Some(&folders.config()), None).expect("list");
+        assert_eq!(layer_of(&prompts, "worker"), PromptLayer::BuiltIn);
+        assert_eq!(layer_of(&prompts, "pr"), PromptLayer::User);
+    }
+
+    #[test]
+    fn resetting_a_prompt_without_a_copy_is_fine() {
+        let folders = Folders::new("reset-missing");
+
+        reset("worker", Some(&folders.config())).expect("reset");
+        reset("worker", Some(&folders.config())).expect("reset again");
+    }
+
+    #[test]
+    fn an_unknown_prompt_name_is_refused() {
+        let folders = Folders::new("unknown");
+        let config = folders.config();
+
+        for name in ["review", "", "Worker", "worker.md", "../worker", "a/b"] {
+            assert!(
+                matches!(customize(name, Some(&config)), Err(Error::Invalid(_))),
+                "customize {name:?}"
+            );
+            assert!(
+                matches!(reset(name, Some(&config)), Err(Error::Invalid(_))),
+                "reset {name:?}"
+            );
+        }
+        assert!(!config.exists(), "a refusal writes nothing");
+    }
+
+    #[test]
+    fn customizing_and_resetting_never_touch_the_project_prompts() {
+        let folders = Folders::new("project-untouched");
+        let project = project_prompts(&folders);
+        Folders::write(&project, "worker.md", "Project worker text");
+        let file = folders.project().join(".swarm/prompts/worker.md");
+
+        customize("worker", Some(&folders.config())).expect("customize");
+        reset("worker", Some(&folders.config())).expect("reset");
+
+        assert_eq!(
+            std::fs::read_to_string(file).expect("project copy"),
+            "Project worker text"
+        );
+    }
+
+    #[test]
+    fn without_a_config_folder_customizing_and_resetting_fail() {
+        assert!(matches!(customize("worker", None), Err(Error::Invalid(_))));
+        assert!(matches!(reset("worker", None), Err(Error::Invalid(_))));
     }
 }
