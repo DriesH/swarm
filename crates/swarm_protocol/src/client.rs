@@ -467,6 +467,14 @@ impl Client {
         }
     }
 
+    pub fn remove_project(&self, project: ProjectId) -> Result<(), ClientError> {
+        self.done(
+            |call| Request::RemoveProject { call, project },
+            "RemoveProject",
+            self.reply_timeout,
+        )
+    }
+
     pub fn create_task(&self, task: CreateTask) -> Result<TaskInfo, ClientError> {
         let timeout = self.reply_timeout.max(CREATE_TASK_TIMEOUT);
         let reply =

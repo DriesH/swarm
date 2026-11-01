@@ -20,7 +20,7 @@ mod client;
 pub use client::{Client, ClientError, CommentEvent, MessageEvent, PrEvent};
 
 /// Bumped on every incompatible change; the daemon refuses other versions.
-pub const VERSION: u32 = 18;
+pub const VERSION: u32 = 19;
 
 /// The most messages [`Request::ListMessages`] returns.
 pub const MESSAGES_LISTED: usize = 500;
@@ -886,6 +886,13 @@ pub enum Request {
     AddProject {
         call: CallId,
         path: PathBuf,
+    },
+    /// Forgets the project: stops its Start orchestrator and removes it from the store.
+    /// Its files, branches and worktrees stay on disk. Refused while it has open tasks.
+    /// Answered with [`Event::Done`].
+    RemoveProject {
+        call: CallId,
+        project: ProjectId,
     },
     /// Creates the task branch and task worktree, copies files, reserves ports and
     /// starts the setup script in a process terminal. Answered with [`Event::TaskCreated`].

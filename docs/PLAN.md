@@ -96,6 +96,9 @@ Harness calls for the Start orchestrator:
 - **Right panel**: Files (file tree of the task worktree, changed files marked), Changes (changed files grouped by worker, with a **Review** button), or Pull request.
 - **Terminal tiles**: separate cards with 10 px gaps and rounded corners. Focus is a 2 px accent border, "needs attention" a 2 px amber border; both are drawn above the tile and never move the layout. Only the orchestrator tile has an input box.
 - **Status bar**: the tray chips and **+ Terminal** on the left; branch, agent count, process count, user terminal count (each with an icon), "permissions skipped" and ⌘K on the right.
+- **Context menus**: a right-click (or Control-click, or ⇧F10 on a focused row) opens a menu at the pointer, built from the same menu component as the header menus. A project row offers **Open in Finder**, **Project settings** and **Remove project…**.
+- **Remove project**: Swarm forgets the project and stops its Start orchestrator; files, branches and worktrees stay on disk. It is allowed only when the project has no open tasks; otherwise the dialog names the tasks to close first. The same action sits on the project's settings page.
+- **Menu bar**: **Swarm** (About Swarm, Settings… ⌘,, Hide, Hide Others, Show All, Quit ⌘Q), **File** (New Task ⌘T, New Terminal, Add Project…, Close Task), **Edit** (Undo, Redo, Cut, Copy, Paste, Select All), **View** (Terminals, Swarm, Review, Toggle Sidebar, Files, Changes, Command Palette ⌘K, Enter Full Screen), **Window** (Minimize ⌘M, Zoom, Bring All to Front, and the open windows), **Help** (Swarm Help, which opens the docs website). Every item is an action that also has its shortcut, so the menu and the keymap stay one list.
 
 ### Command palette
 
