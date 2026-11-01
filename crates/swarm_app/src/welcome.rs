@@ -14,7 +14,8 @@ use crate::workspace::Workspace;
 const COLUMN_WIDTH: f32 = 520.;
 /// The height of the strip at the top that moves the window.
 const DRAG_HEIGHT: f32 = 36.;
-const BEE_DEGREES: f32 = -20.;
+/// Logical pixels for each sprite pixel of the welcome bee, which makes it 26 pixels wide.
+const BEE_SCALE: u8 = 1;
 
 pub(crate) struct Welcome {
     workspace: WeakEntity<Workspace>,
@@ -124,6 +125,16 @@ impl Welcome {
     }
 }
 
+/// A small pixel bee beside the column. A decoration: no role and no label.
+fn welcome_bee() -> gpui::Div {
+    div()
+        .debug_selector(|| "welcome-bee".to_owned())
+        .absolute()
+        .left(px(-56.))
+        .bottom(px(64.))
+        .child(PixelBee::new("welcome-bee").scale(BEE_SCALE))
+}
+
 impl Render for Welcome {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
@@ -175,21 +186,7 @@ impl Render for Welcome {
             .child(Self::header())
             .child(self.check.clone())
             .child(buttons)
-            .when(eggs, |column| {
-                column.child(
-                    div()
-                        .debug_selector(|| "welcome-bee".to_owned())
-                        .absolute()
-                        .left(px(-56.))
-                        .bottom(px(64.))
-                        .child(
-                            Icon::new(IconName::Bee)
-                                .size(IconSize::Custom(px(22.)))
-                                .color(Color::Faint)
-                                .rotate(BEE_DEGREES),
-                        ),
-                )
-            });
+            .when(eggs, |column| column.child(welcome_bee()));
 
         div()
             .id("welcome")
@@ -319,6 +316,26 @@ mod tests {
         assert_eq!(with_eggs, (true, true));
         assert_eq!(still, (true, true), "both are still pictures");
         assert_eq!(without, (false, false));
+    }
+
+    #[gpui::test]
+    fn the_welcome_bee_is_the_pixel_bee_and_a_decoration(cx: &mut TestAppContext) {
+        use gpui::Element as _;
+
+        let fixture = welcome_fixture(report_with(&[]), Permission::Allowed, cx);
+
+        let drawn = fixture
+            .cx
+            .debug_bounds("welcome-bee")
+            .map(|bounds| bounds.size);
+        let wrapper = welcome_bee();
+        let mut node = gpui::accesskit::Node::new(Role::Unknown);
+        wrapper.write_a11y_info(&mut node);
+
+        let side = PixelBee::side(BEE_SCALE);
+        assert_eq!(drawn, Some(gpui::size(side, side)));
+        assert_eq!(wrapper.a11y_role(), None);
+        assert_eq!(node.label(), None);
     }
 
     #[gpui::test]

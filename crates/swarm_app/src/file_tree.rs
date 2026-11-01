@@ -762,7 +762,7 @@ mod tests {
                 ("src", FileIconName::FolderSrcOpen),
                 ("main.rs", FileIconName::File),
                 ("Cargo.lock", FileIconName::File),
-                ("Cargo.toml", FileIconName::Toml),
+                ("Cargo.toml", FileIconName::Config),
                 ("README.md", FileIconName::Readme),
             ]
         );

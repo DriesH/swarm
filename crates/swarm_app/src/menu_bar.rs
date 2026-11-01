@@ -206,6 +206,9 @@ fn set_buzzing(buzzing: bool, cx: &mut App) {
 
 /// One flap. `refresh` ends the flapping when the agents stopped or motion is reduced.
 fn flap(cx: &mut App) {
+    // The setting can change while no window is active, so no window told us.
+    swarm_ui::motion::sync_reduce_motion(cx);
+
     let menu = cx.global_mut::<MenuBar>();
     menu.frame = menu.frame.flipped();
 
@@ -599,14 +602,58 @@ mod tests {
         assert!(frames(&bar).iter().all(|frame| *frame == BeeFrame::Open));
     }
 
+    thread_local! {
+        static SYSTEM_REDUCE_MOTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    fn system_reduce_motion() -> bool {
+        SYSTEM_REDUCE_MOTION.with(std::cell::Cell::get)
+    }
+
+    /// Stands in for System Settings. A change reaches the app only when it reads the
+    /// setting again.
+    fn set_system_reduce_motion(reduced: bool, cx: &mut gpui::VisualTestContext) {
+        SYSTEM_REDUCE_MOTION.with(|cell| cell.set(reduced));
+        cx.update(|_, cx| {
+            cx.set_global(swarm_ui::motion::ReduceMotionSource(system_reduce_motion));
+        });
+    }
+
     #[gpui::test]
     fn the_bee_is_still_under_reduce_motion(cx: &mut TestAppContext) {
         let (_, bar, cx) = setup(cx);
-        cx.update(|_, cx| cx.set_reduce_motion(true));
+        set_system_reduce_motion(true, cx);
 
         flap_for(6, cx);
 
         assert!(frames(&bar).iter().all(|frame| *frame == BeeFrame::Open));
+    }
+
+    #[gpui::test]
+    fn the_bee_stops_within_a_tick_when_reduce_motion_turns_on_with_no_window_active(
+        cx: &mut TestAppContext,
+    ) {
+        let (_, bar, cx) = setup(cx);
+        set_system_reduce_motion(false, cx);
+        flap_for(2, cx);
+        assert!(
+            frames(&bar).contains(&BeeFrame::Flat),
+            "the bee flaps first"
+        );
+
+        set_system_reduce_motion(true, cx);
+        flap_for(1, cx);
+        let looks = bar.item.looks.borrow().len();
+
+        assert_eq!(bar.last_look().map(|look| look.frame), Some(BeeFrame::Open));
+
+        flap_for(6, cx);
+
+        assert_eq!(
+            bar.item.looks.borrow().len(),
+            looks,
+            "no flicker after the tick"
+        );
     }
 
     #[gpui::test]

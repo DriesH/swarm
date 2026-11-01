@@ -12,6 +12,7 @@ const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const ICONS_CREDIT: &str = "File icons: vscode-icons, CC BY-SA 4.0";
 const ICONS_REPOSITORY: &str = "https://github.com/vscode-icons/vscode-icons";
 const ICONS_LICENSE: &str = "https://creativecommons.org/licenses/by-sa/4.0/";
+const ICONS_CHANGES: &str = "Files unchanged, 2 logos left out";
 
 /// The id, the label, the VoiceOver label and the address of each link of the icon credit.
 const ICON_LINKS: [(&str, &str, &str, &str); 2] = [
@@ -64,7 +65,13 @@ fn about() -> impl IntoElement {
                 .map(|(id, label, accessible, url)| link(id, label, accessible, url)),
         );
 
-    section("About", Panel::new().row(version).row(icons))
+    let changes = PanelRow::new("File icon changes").end_slot(
+        div()
+            .debug_selector(|| "about-icon-changes".to_owned())
+            .child(Label::new(ICONS_CHANGES).size(LabelSize::Small)),
+    );
+
+    section("About", Panel::new().row(version).row(icons).row(changes))
 }
 
 impl SettingsWindow {
@@ -115,7 +122,7 @@ mod tests {
     use swarm_protocol::{Client, Event, Request, ToolState};
 
     use super::super::{Page, SettingsWindow};
-    use super::{APP_VERSION, ICON_LINKS, ICONS_CREDIT, link};
+    use super::{APP_VERSION, ICON_LINKS, ICONS_CHANGES, ICONS_CREDIT, link};
     use crate::actions::OpenSettings;
     use crate::daemon::tests::{fake_daemon_replying, redraw, setup, wait_until};
     use crate::system_check::Tool;
@@ -274,10 +281,12 @@ mod tests {
 
         assert!(shown("about-version"));
         assert!(shown("about-file-icons"));
+        assert!(shown("about-icon-changes"));
         assert!(shown("icons-repository"));
         assert!(shown("icons-license"));
         assert_eq!(APP_VERSION, env!("CARGO_PKG_VERSION"));
         assert_eq!(ICONS_CREDIT, "File icons: vscode-icons, CC BY-SA 4.0");
+        assert_eq!(ICONS_CHANGES, "Files unchanged, 2 logos left out");
     }
 
     #[gpui::test]

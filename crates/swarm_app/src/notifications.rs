@@ -336,10 +336,10 @@ impl Workspace {
     pub(crate) fn notice_received(
         &mut self,
         notice: &Notice,
-        window: Option<&mut Window>,
+        mut window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
-        self.show_honey_toast(notice, cx);
+        self.show_honey_toast(notice, window.as_deref_mut(), cx);
 
         if !cx.has_global::<Notifier>() {
             return;

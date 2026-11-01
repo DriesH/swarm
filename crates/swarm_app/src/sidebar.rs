@@ -358,6 +358,16 @@ fn agent_row(
     indent: usize,
     cx: &mut Context<Workspace>,
 ) -> gpui::AnyElement {
+    agent_list_row(workspace, agent, indent, cx).into_any_element()
+}
+
+/// The row of an agent in the sidebar.
+pub(crate) fn agent_list_row(
+    workspace: &Workspace,
+    agent: &Agent,
+    indent: usize,
+    cx: &mut Context<Workspace>,
+) -> ListRow {
     let terminal = agent.terminal;
     let (icon, kind) = match agent.kind {
         AgentKind::ClaudeCode => (IconName::ClaudeCode, "Claude Code"),
@@ -379,21 +389,21 @@ fn agent_row(
         .end_slot(
             h_flex()
                 .gap(px(6.))
-                .when(queen, |end| {
-                    end.child(
-                        div().debug_selector(|| "queen-bee".to_owned()).child(
-                            PixelBee::new(("queen-bee", agent.id.0 as usize))
-                                .scale(1)
-                                .crown(true),
-                        ),
-                    )
-                })
+                .when(queen, |end| end.child(queen_crown(agent)))
                 .child(StatusDot::new(agent.status)),
         )
         .on_click(cx.listener(move |workspace, _, _, cx| {
             workspace.focus_terminal(terminal, cx);
         }))
-        .into_any_element()
+}
+
+/// The queen's crown. A decoration: it has no role and no label, so VoiceOver skips it.
+pub(crate) fn queen_crown(agent: &Agent) -> gpui::Div {
+    div().debug_selector(|| "queen-bee".to_owned()).child(
+        PixelBee::new(("queen-bee", agent.id.0 as usize))
+            .scale(1)
+            .crown(true),
+    )
 }
 
 /// One row of the usage card.

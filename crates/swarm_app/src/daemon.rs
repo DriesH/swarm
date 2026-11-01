@@ -116,7 +116,7 @@ type Connected = (Client, Vec<TerminalInfo>, Vec<ProjectInfo>);
 impl Workspace {
     /// Runs `apply` with the window the workspace shows in, or with none while it has
     /// none. The daemon connection outlives the window, so its work cannot need one.
-    fn update_with_window<R>(
+    pub(crate) fn update_with_window<R>(
         this: &WeakEntity<Self>,
         cx: &mut AsyncApp,
         apply: impl FnOnce(&mut Self, Option<&mut Window>, &mut Context<Self>) -> R,

@@ -7,8 +7,8 @@
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, Context, Focusable as _, SharedString, Task,
-    WeakEntity, div, px,
+    Animation, AnimationExt as _, AnyElement, Context, FocusHandle, Focusable as _, SharedString,
+    Task, WeakEntity, Window, div, px,
 };
 use swarm_protocol::{Client, Notice, NoticeKind, SwarmStats};
 use swarm_settings::ProjectMode;
@@ -22,8 +22,12 @@ use crate::workspace::Workspace;
 /// The Start orchestrator wears the crown this long after the 100th merge.
 pub(crate) const QUEEN_FOR: Duration = Duration::from_hours(24);
 
-/// The toast goes away by itself after this long.
+/// The toast goes away by itself after this long. The time stands still while the pointer or
+/// the keyboard focus is on the toast.
 pub(crate) const TOAST_FOR: Duration = Duration::from_secs(20);
+
+/// How often the countdown of the toast looks at the pointer and the focus.
+const TOAST_TICK: Duration = Duration::from_millis(250);
 
 /// Space between the toast and the window edge.
 const TOAST_RIGHT: f32 = 24.;
@@ -36,6 +40,10 @@ pub(crate) struct HoneyToast {
     pub task: SharedString,
     /// Counts up, so the honeycomb fills again for each toast.
     serial: usize,
+    /// Tracks the focus in the whole toast.
+    focus: FocusHandle,
+    /// True while the pointer is on the toast.
+    hovered: bool,
     _timeout: Task<()>,
 }
 
@@ -57,6 +65,8 @@ pub(crate) struct Eggs {
     pub toast: Option<HoneyToast>,
     pub flight: Option<Flight>,
     serial: usize,
+    /// Redraws the sidebar when the queen's day ends.
+    queen_expiry: Option<Task<()>>,
 }
 
 /// True when the 100th merged pull request was less than [`QUEEN_FOR`] ago. `now` is in
@@ -82,7 +92,7 @@ impl Workspace {
             at: 0,
         };
 
-        self.place_toast(&notice, SharedString::from(task.to_owned()), cx);
+        self.place_toast(&notice, SharedString::from(task.to_owned()), None, cx);
     }
 
     /// Puts the bees of the buzz at `progress` of their flight and keeps them there.
@@ -142,7 +152,35 @@ impl Workspace {
     pub(crate) fn stats_changed(&mut self, stats: SwarmStats, cx: &mut Context<Self>) {
         self.eggs.stats = stats;
         self.eggs.stats_revision += 1;
+        self.watch_queen_expiry(cx);
         cx.notify();
+    }
+
+    /// Redraws once the crown's day is over. Nothing else redraws the sidebar then.
+    pub(crate) fn watch_queen_expiry(&mut self, cx: &mut Context<Self>) {
+        self.eggs.queen_expiry = None;
+
+        let Some(merged) = self.eggs.stats.hundredth_merge_at else {
+            return;
+        };
+
+        let queen_for = u64::try_from(QUEEN_FOR.as_millis()).unwrap_or(u64::MAX);
+        let left = merged
+            .saturating_add(queen_for)
+            .saturating_sub(self.now_ms());
+        if left == 0 {
+            return;
+        }
+
+        self.eggs.queen_expiry = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(left))
+                .await;
+
+            if let Err(error) = this.update(cx, |_, cx| cx.notify()) {
+                log::debug!("the workspace closed before the crown ended: {error}");
+            }
+        }));
     }
 
     /// True for the Start orchestrator while the queen egg shows: the eggs are on and the
@@ -158,7 +196,12 @@ impl Workspace {
 
     /// Shows the toast for a notice that says a task is ready for review, when the notice is
     /// about the open project and the notification settings want it.
-    pub(crate) fn show_honey_toast(&mut self, notice: &Notice, cx: &mut Context<Self>) {
+    pub(crate) fn show_honey_toast(
+        &mut self,
+        notice: &Notice,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
         if notice.kind != NoticeKind::ReadyForReview {
             return;
         }
@@ -187,10 +230,19 @@ impl Workspace {
 
         let name = task.name.clone();
 
-        self.place_toast(notice, name, cx);
+        self.place_toast(notice, name, window, cx);
     }
 
-    fn place_toast(&mut self, notice: &Notice, task: SharedString, cx: &mut Context<Self>) {
+    /// Puts a toast up. A toast that was up goes away, and so does the focus in it.
+    fn place_toast(
+        &mut self,
+        notice: &Notice,
+        task: SharedString,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        self.leave_toast(window, cx);
+
         self.eggs.serial += 1;
         let serial = self.eggs.serial;
 
@@ -198,24 +250,76 @@ impl Workspace {
             notice: notice.clone(),
             task,
             serial,
-            _timeout: cx.spawn(async move |this, cx| {
-                cx.background_executor().timer(TOAST_FOR).await;
-
-                let dismissed = this.update(cx, |workspace, cx| {
-                    if workspace.eggs.toast.as_ref().map(|toast| toast.serial) == Some(serial) {
-                        workspace.dismiss_toast(cx);
-                    }
-                });
-
-                if let Err(error) = dismissed {
-                    log::debug!("the workspace closed before the toast timed out: {error}");
-                }
-            }),
+            focus: cx.focus_handle(),
+            hovered: false,
+            _timeout: Self::count_down_toast(serial, cx),
         });
         cx.notify();
     }
 
-    pub(crate) fn dismiss_toast(&mut self, cx: &mut Context<Self>) {
+    /// Waits [`TOAST_FOR`] for the toast, not counting the time the pointer or the focus is on
+    /// it, and then takes it down.
+    fn count_down_toast(serial: usize, cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |this, cx| {
+            let mut left = TOAST_FOR;
+
+            while !left.is_zero() {
+                cx.background_executor().timer(TOAST_TICK).await;
+
+                let held = Self::update_with_window(&this, cx, |workspace, window, cx| {
+                    workspace.toast_is_held(serial, window, cx)
+                })
+                .unwrap_or_else(|error| {
+                    log::debug!("cannot tell if the toast is held: {error}");
+                    false
+                });
+
+                if !held {
+                    left = left.saturating_sub(TOAST_TICK);
+                }
+            }
+
+            let dismissed = Self::update_with_window(&this, cx, |workspace, window, cx| {
+                if workspace.eggs.toast.as_ref().map(|toast| toast.serial) == Some(serial) {
+                    workspace.dismiss_toast(window, cx);
+                }
+            });
+
+            if let Err(error) = dismissed {
+                log::debug!("the workspace closed before the toast timed out: {error}");
+            }
+        })
+    }
+
+    /// True while the pointer or the keyboard focus is on the toast with this serial.
+    fn toast_is_held(&self, serial: usize, window: Option<&mut Window>, cx: &App) -> bool {
+        let Some(toast) = self
+            .eggs
+            .toast
+            .as_ref()
+            .filter(|toast| toast.serial == serial)
+        else {
+            return false;
+        };
+
+        toast.hovered || window.is_some_and(|window| toast.focus.contains_focused(window, cx))
+    }
+
+    /// Gives the focus to the workspace when it is in the toast that goes away. Without this
+    /// it falls to the window, and Tab starts from the top.
+    fn leave_toast(&self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        let (Some(toast), Some(window)) = (&self.eggs.toast, window) else {
+            return;
+        };
+
+        if toast.focus.contains_focused(window, cx) {
+            window.focus(&self.focus_handle(cx), cx);
+        }
+    }
+
+    pub(crate) fn dismiss_toast(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        self.leave_toast(window, cx);
+
         if self.eggs.toast.take().is_some() {
             cx.notify();
         }
@@ -307,6 +411,8 @@ impl Workspace {
     fn toast_element(&self, toast: &HoneyToast, cx: &mut Context<Self>) -> AnyElement {
         let workspace = cx.weak_entity();
         let dismissed = workspace.clone();
+        let hover_target = workspace.clone();
+        let serial = toast.serial;
         // The button that had focus goes away with the toast, and Tab needs a focus to start from.
         let review_focus = self.focus_handle(cx);
         let dismiss_focus = review_focus.clone();
@@ -318,6 +424,23 @@ impl Workspace {
             "Ready for review",
         )
         .debug_selector(|| "honey-toast".to_owned())
+        .track_focus(&toast.focus)
+        .on_hover(move |hovered, _, cx| {
+            update(
+                &hover_target,
+                move |workspace, _| {
+                    if let Some(toast) = workspace
+                        .eggs
+                        .toast
+                        .as_mut()
+                        .filter(|toast| toast.serial == serial)
+                    {
+                        toast.hovered = hovered;
+                    }
+                },
+                cx,
+            );
+        })
         .when(decorated, |element| {
             element.leading(
                 div()
@@ -331,7 +454,11 @@ impl Workspace {
         })
         .on_dismiss(move |window, cx| {
             window.focus(&dismiss_focus, cx);
-            update(&dismissed, Workspace::dismiss_toast, cx);
+            update(
+                &dismissed,
+                |workspace, cx| workspace.dismiss_toast(None, cx),
+                cx,
+            );
         });
 
         div()
@@ -571,6 +698,164 @@ mod tests {
         assert_eq!(task.as_deref(), Some("signup"));
     }
 
+    fn focus_is_on_the_workspace(
+        workspace: &gpui::Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> bool {
+        let focus = workspace.read_with(cx, gpui::Focusable::focus_handle);
+
+        cx.update(|window, _| focus.is_focused(window))
+    }
+
+    fn focus_is_in_the_toast(
+        workspace: &gpui::Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> bool {
+        let toast = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .eggs
+                .toast
+                .as_ref()
+                .map(|toast| toast.focus.clone())
+        });
+
+        toast.is_some_and(|focus| cx.update(|window, cx| focus.contains_focused(window, cx)))
+    }
+
+    /// Presses Tab until the keyboard focus is in the toast, the last stop in the window.
+    fn tab_into_the_toast(workspace: &gpui::Entity<Workspace>, cx: &mut VisualTestContext) {
+        for _ in 0..100 {
+            if focus_is_in_the_toast(workspace, cx) {
+                return;
+            }
+
+            cx.simulate_keystrokes("tab");
+        }
+
+        panic!("Tab never reached the toast");
+    }
+
+    fn pass(time: Duration, cx: &mut VisualTestContext) {
+        cx.executor().advance_clock(time);
+        cx.run_until_parked();
+    }
+
+    fn point_at_the_toast(cx: &mut VisualTestContext) {
+        let toast = cx.debug_bounds("honey-toast").expect("the toast is up");
+
+        cx.simulate_mouse_move(toast.center(), None, gpui::Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    fn point_away_from_the_toast(cx: &mut VisualTestContext) {
+        cx.simulate_mouse_move(gpui::point(px(5.), px(5.)), None, gpui::Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn a_second_toast_takes_the_focus_to_the_workspace_when_it_was_in_the_first(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = open_projects(cx);
+        receive(
+            &workspace,
+            &notice(NoticeKind::ReadyForReview, 5, Some(7)),
+            cx,
+        );
+        tab_into_the_toast(&workspace, cx);
+        assert!(!focus_is_on_the_workspace(&workspace, cx));
+
+        receive(
+            &workspace,
+            &notice(NoticeKind::ReadyForReview, 5, Some(8)),
+            cx,
+        );
+
+        assert!(toast_is_up(cx));
+        assert!(focus_is_on_the_workspace(&workspace, cx));
+    }
+
+    #[gpui::test]
+    fn a_toast_that_goes_away_takes_the_focus_to_the_workspace(cx: &mut TestAppContext) {
+        let (workspace, cx) = open_projects(cx);
+        receive(
+            &workspace,
+            &notice(NoticeKind::ReadyForReview, 5, Some(8)),
+            cx,
+        );
+        tab_into_the_toast(&workspace, cx);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.dismiss_toast(Some(window), cx);
+        });
+        cx.run_until_parked();
+
+        assert!(!toast_is_up(cx));
+        assert!(focus_is_on_the_workspace(&workspace, cx));
+    }
+
+    #[gpui::test]
+    fn the_toast_waits_while_the_pointer_is_on_it(cx: &mut TestAppContext) {
+        let (workspace, cx) = open_projects(cx);
+        receive(
+            &workspace,
+            &notice(NoticeKind::ReadyForReview, 5, Some(8)),
+            cx,
+        );
+        point_at_the_toast(cx);
+
+        pass(TOAST_FOR * 3, cx);
+        assert!(toast_is_up(cx), "the toast left with the pointer on it");
+
+        point_away_from_the_toast(cx);
+        pass(TOAST_FOR, cx);
+
+        assert!(!toast_is_up(cx), "the toast stayed with the pointer gone");
+    }
+
+    #[gpui::test]
+    fn the_toast_waits_while_the_keyboard_focus_is_in_it(cx: &mut TestAppContext) {
+        let (workspace, cx) = open_projects(cx);
+        receive(
+            &workspace,
+            &notice(NoticeKind::ReadyForReview, 5, Some(8)),
+            cx,
+        );
+        tab_into_the_toast(&workspace, cx);
+
+        pass(TOAST_FOR * 3, cx);
+        assert!(toast_is_up(cx), "the toast left with the focus in it");
+        assert!(focus_is_in_the_toast(&workspace, cx));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            window.focus(&workspace.focus_handle(cx), cx);
+        });
+        pass(TOAST_FOR, cx);
+
+        assert!(!toast_is_up(cx), "the toast stayed with the focus gone");
+    }
+
+    #[gpui::test]
+    fn the_countdown_goes_on_where_it_stopped(cx: &mut TestAppContext) {
+        let (workspace, cx) = open_projects(cx);
+        receive(
+            &workspace,
+            &notice(NoticeKind::ReadyForReview, 5, Some(8)),
+            cx,
+        );
+
+        pass(Duration::from_secs(15), cx);
+        point_at_the_toast(cx);
+        pass(Duration::from_secs(60), cx);
+        point_away_from_the_toast(cx);
+        pass(Duration::from_millis(4_500), cx);
+        assert!(toast_is_up(cx), "5 seconds were left, 4.5 have passed");
+
+        pass(Duration::from_secs(1), cx);
+
+        assert!(!toast_is_up(cx));
+    }
+
     #[gpui::test]
     fn the_toast_has_a_honeycomb_with_the_eggs_on_and_none_with_them_off(cx: &mut TestAppContext) {
         let (workspace, cx) = open_projects(cx);
@@ -771,18 +1056,77 @@ mod tests {
         assert!(!queen_crown_shows(cx));
     }
 
+    /// The accessibility role and label of an element, which the test window does not build
+    /// into a tree.
+    fn a11y_of<E: Element>(element: &E) -> (Option<gpui::accesskit::Role>, Option<String>) {
+        let mut node = gpui::accesskit::Node::new(
+            element
+                .a11y_role()
+                .unwrap_or(gpui::accesskit::Role::Unknown),
+        );
+        element.write_a11y_info(&mut node);
+
+        (element.a11y_role(), node.label().map(str::to_owned))
+    }
+
     #[gpui::test]
     fn the_crown_stays_silent_for_voiceover(cx: &mut TestAppContext) {
+        use gpui::RenderOnce as _;
+
         let (workspace, cx) = on_the_start_task(cx);
         the_hundredth_merge_was(&workspace, 1, cx);
-
-        let label =
-            |cx: &mut VisualTestContext| cx.update(|window, _| window.debug_a11y_tree_json());
-        let with_crown = label(cx);
-
         assert!(queen_crown_shows(cx));
-        let text = with_crown.unwrap_or_default().to_lowercase();
-        assert!(!text.contains("queen") && !text.contains("crown"), "{text}");
+
+        let queen = workspace
+            .read_with(cx, |workspace, cx| {
+                workspace
+                    .data
+                    .agents
+                    .iter()
+                    .find(|agent| workspace.is_queen(agent, cx))
+                    .cloned()
+            })
+            .expect("the Start orchestrator wears the crown");
+        let row = workspace.update(cx, |workspace, cx| {
+            crate::sidebar::agent_list_row(workspace, &queen, 0, cx)
+        });
+
+        let (wrapper, bee, row) = cx.update(|window, cx| {
+            let bee = PixelBee::new("crown").scale(1).crown(true);
+
+            (
+                a11y_of(&crate::sidebar::queen_crown(&queen)),
+                a11y_of(&bee.render(window, cx).into_element()),
+                a11y_of(&row.render(window, cx).into_element()),
+            )
+        });
+
+        assert_eq!(wrapper, (None, None), "the crown wrapper");
+        assert_eq!(bee, (None, None), "the crown sprite");
+        let label = row.1.expect("the row has a label").to_lowercase();
+        assert!(
+            !label.contains("queen") && !label.contains("crown"),
+            "{label}"
+        );
+    }
+
+    #[gpui::test]
+    fn the_crown_goes_when_its_day_ends_even_if_nothing_else_redraws(cx: &mut TestAppContext) {
+        let (workspace, cx) = on_the_start_task(cx);
+        the_hundredth_merge_was(&workspace, 23, cx);
+        assert!(queen_crown_shows(cx));
+
+        // The clock passes the end of the day, and nothing tells the workspace.
+        workspace.update(cx, |workspace, _| {
+            workspace.fixed_now = Some(SAMPLE_NOW + 2 * HOUR);
+        });
+        cx.run_until_parked();
+        assert!(queen_crown_shows(cx), "nothing has redrawn yet");
+
+        cx.executor().advance_clock(Duration::from_millis(HOUR));
+        cx.run_until_parked();
+
+        assert!(!queen_crown_shows(cx));
     }
 
     #[gpui::test]
