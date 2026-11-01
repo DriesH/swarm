@@ -131,3 +131,23 @@ _Avoid_: Alert, toast
 **Daemon**:
 The background process that keeps agents running when the app is closed.
 _Avoid_: Server, service, backend
+
+**Usage window**:
+A span of time in which a subscription allows a limited amount of use. Swarm shows how much of it is used and when it resets. Its length gives its name: Session, Weekly or Monthly.
+_Avoid_: Quota, rate limit, allowance
+
+**Session**:
+The usage window shorter than a day, for example the 5-hour window of Claude Code. It is not a Task and not an Agent.
+_Avoid_: 5h window, block
+
+**Weekly**:
+The usage window that lasts seven days.
+_Avoid_: 7d window, week limit
+
+**Monthly**:
+The usage window that lasts thirty days.
+_Avoid_: 30d window, month limit
+
+**Pace**:
+Where even use would be by now in a usage window: the share of the window that has passed. The usage bar marks it. A window warns when use at its average rate would reach 100% before the window resets.
+_Avoid_: Burn rate, trend
