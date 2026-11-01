@@ -104,6 +104,7 @@ fn generated_attributes(
     // Triples of path, attribute and value, each ended by a NUL.
     let mut tokens = printed.split(|byte| *byte == 0);
     let mut attributes = HashMap::new();
+
     while let (Some(path), Some(_), Some(value)) = (tokens.next(), tokens.next(), tokens.next()) {
         match value {
             b"set" | b"true" => attributes.insert(path.to_vec(), true),

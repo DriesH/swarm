@@ -602,9 +602,14 @@ impl Projects {
         self.diff_at(id, source, None)
     }
 
-    /// One file of the task diff with its lines, also when it is folded. It has the
-    /// agent, digest and counts it has in [`Projects::task_diff`], and the caps of a
-    /// diff apply to it alone. `None` when the diff of `worktree` does not hold `path`.
+    /// One file of the task diff with its lines, also when it is folded. It has the agent,
+    /// digest and counts of [`Projects::task_diff`], and the caps of a diff apply to it
+    /// alone. The exception is an untracked file that the full diff left out, because it
+    /// came after the cap on untracked files or after the byte budget ran out: this read
+    /// takes it in full, so its digest, counts and fold can differ.
+    ///
+    /// `path` is the lossy [`FileDiff::path`]. `None` when the diff of `worktree` does not
+    /// hold it, or when more than one changed path has that lossy form.
     pub fn file_hunks(
         &self,
         id: TaskId,

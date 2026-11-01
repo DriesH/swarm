@@ -128,6 +128,7 @@ where
         })
     });
     let output = child.wait_with_output().map_err(io_error)?;
+
     if let Some(feeder) = feeder
         && feeder.join().is_err()
     {
@@ -968,6 +969,7 @@ pub fn worktree_diff(
 
 /// One file of what [`worktree_diff`] reads, with its lines also when it is folded; its
 /// `fold` stays set. `None` when the diff does not hold the path. Reads only that path.
+/// `path` may be the lossy form of a name that is not UTF-8, see [`raw_path_of`].
 pub fn worktree_file(
     worktree: &Path,
     base: &str,
@@ -976,7 +978,10 @@ pub fn worktree_file(
     path: &Path,
     budget: &mut DiffBudget,
 ) -> Result<Option<ChangedFile>, Error> {
-    let Some(only) = diff_path(path) else {
+    let Some(requested) = diff_path(path) else {
+        return Ok(None);
+    };
+    let Some(only) = raw_path_of(worktree, (base, tip), scope, requested)? else {
         return Ok(None);
     };
 
@@ -1000,6 +1005,57 @@ fn diff_path(path: &Path) -> Option<Vec<u8>> {
     let bytes = path.as_os_str().as_bytes();
 
     (plain && !bytes.is_empty() && !bytes.contains(&0)).then(|| bytes.to_vec())
+}
+
+/// The bytes of the changed path that `requested` names. A diff lists a name that is not
+/// UTF-8 with replacement characters, so those bytes are looked up among the changed paths.
+/// `None` when no changed path has that form, or when more than one has.
+fn raw_path_of(
+    worktree: &Path,
+    revisions: (&str, &str),
+    scope: DiffScope,
+    requested: Vec<u8>,
+) -> Result<Option<Vec<u8>>, Error> {
+    const REPLACEMENT: &[u8] = "\u{fffd}".as_bytes();
+
+    // Any other name is its own lossy form.
+    if !requested
+        .windows(REPLACEMENT.len())
+        .any(|part| part == REPLACEMENT)
+    {
+        return Ok(Some(requested));
+    }
+
+    let mut same_form = changed_paths(worktree, revisions, scope)?
+        .into_iter()
+        .filter(|raw| String::from_utf8_lossy(raw).as_bytes() == requested.as_slice());
+    let found = same_form.next();
+
+    Ok(found.filter(|_| same_form.next().is_none()))
+}
+
+/// Every path a read of the diff lists, as git prints it. Reads no lines.
+fn changed_paths(
+    worktree: &Path,
+    revisions: (&str, &str),
+    scope: DiffScope,
+) -> Result<Vec<Vec<u8>>, Error> {
+    let numstat = diff_command(worktree, revisions, scope, None, &["--numstat", "-z"])?;
+    let entries = numstat_entries(&numstat)
+        .ok_or_else(|| Error::Invalid("git printed a line count that cannot be read".to_owned()))?;
+    let mut paths: Vec<Vec<u8>> = entries
+        .into_iter()
+        .map(|entry| entry.path.to_vec())
+        .collect();
+
+    if scope == DiffScope::WorkingTree {
+        paths.extend(untracked_paths(worktree, None)?);
+    }
+
+    paths.sort_unstable();
+    paths.dedup();
+
+    Ok(paths)
 }
 
 /// Reads again once when the worktree changed while git ran.
@@ -1080,6 +1136,7 @@ fn read_worktree_diff(
         });
         items.extend(untracked.into_iter().map(|path| Item::Untracked { path }));
     }
+
     // A path pattern can match a whole folder.
     if let Some(only) = only {
         items.retain(|item| item.path() == only);
@@ -1220,23 +1277,48 @@ fn untracked_paths(worktree: &Path, only: Option<&[u8]>) -> Result<HashSet<Vec<u
         .collect())
 }
 
-/// Pairs the NUL-separated numstat with the patch blocks, which come in the same order.
-/// Git quotes unusual paths in patch headers, so the numstat gives the exact path.
-fn tracked_items(counts: &[u8], diff: &[u8]) -> Option<Vec<Item>> {
+/// One entry of a NUL-separated numstat, as the bytes git printed.
+struct NumstatEntry<'a> {
+    added: &'a [u8],
+    deleted: &'a [u8],
+    path: &'a [u8],
+}
+
+/// The entries of a NUL-separated numstat. `None` when an entry has fewer parts.
+fn numstat_entries(counts: &[u8]) -> Option<Vec<NumstatEntry<'_>>> {
     let mut entries = Vec::new();
+
     for entry in counts
         .split(|byte| *byte == 0)
         .filter(|entry| !entry.is_empty())
     {
         let mut parts = entry.splitn(3, |byte| *byte == b'\t');
-        let (Some(gained), Some(lost), Some(path)) = (parts.next(), parts.next(), parts.next())
+        let (Some(added), Some(deleted), Some(path)) = (parts.next(), parts.next(), parts.next())
         else {
             return None;
         };
 
-        let added = (gained != b"-").then(|| parse_count(gained));
-        entries.push((path.to_vec(), added, parse_count(lost)));
+        entries.push(NumstatEntry {
+            added,
+            deleted,
+            path,
+        });
     }
+
+    Some(entries)
+}
+
+/// Pairs the NUL-separated numstat with the patch blocks, which come in the same order.
+/// Git quotes unusual paths in patch headers, so the numstat gives the exact path.
+fn tracked_items(counts: &[u8], diff: &[u8]) -> Option<Vec<Item>> {
+    let entries: Vec<(Vec<u8>, Option<u32>, u32)> = numstat_entries(counts)?
+        .into_iter()
+        .map(|entry| {
+            let added = (entry.added != b"-").then(|| parse_count(entry.added));
+
+            (entry.path.to_vec(), added, parse_count(entry.deleted))
+        })
+        .collect();
 
     // (header line, range) of each block; blocks of one path share their header.
     let mut blocks: Vec<(&[u8], std::ops::Range<usize>)> = Vec::new();

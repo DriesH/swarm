@@ -4100,7 +4100,7 @@ fn file_hunks_loads_the_lines_of_a_folded_file() {
 }
 
 #[test]
-fn loading_a_file_never_waits_for_a_diff_refresh() {
+fn three_file_loads_at_once_do_not_refuse_each_other() {
     let repo = Repo::new("");
     let daemon = Daemon::start();
     let (mut client, task) = reviewed_task(&daemon, &repo);

@@ -1662,6 +1662,103 @@ fn file_hunks_reads_a_path_literally() {
     }
 }
 
+/// Commits files at paths that need not be UTF-8. The disk of some machines refuses such
+/// names, so the commit is built in the index.
+fn commit_raw_paths(setup: &Setup, files: &[(&[u8], &str)]) {
+    use std::ffi::{OsStr, OsString};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let folder = &setup.task.worktree;
+
+    for (path, content) in files {
+        setup.write("seed.txt", content);
+        let blob = git_in(folder, &["hash-object", "-w", "seed.txt"]);
+
+        let mut entry = OsString::from(format!("100644,{blob},"));
+        entry.push(OsStr::from_bytes(path));
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(folder)
+            .args(["update-index", "--add", "--cacheinfo"])
+            .arg(entry)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    std::fs::remove_file(folder.join("seed.txt")).expect("seed");
+    git_in(folder, &["commit", "-q", "-m", "raw paths"]);
+}
+
+#[test]
+fn file_hunks_loads_a_folded_file_whose_path_is_not_utf8() {
+    let setup = setup("");
+    commit_raw_paths(
+        &setup,
+        &[
+            (b"dir\xff/Cargo.lock", &numbered(600)),
+            ("name\u{fffd}.txt".as_bytes(), "kept\n"),
+        ],
+    );
+
+    let diff = setup.merged();
+    let folded = file(&diff, "dir\u{fffd}/Cargo.lock");
+    assert_eq!(folded.fold, Some(Fold::Lock));
+    assert!(folded.hunks.is_empty());
+
+    let loaded = file_hunks(
+        &setup,
+        ReviewSource::Merged,
+        &setup.task.worktree,
+        "dir\u{fffd}/Cargo.lock",
+    )
+    .expect("the folded file loads");
+    assert_eq!(lines(&loaded).len(), 600);
+    assert_eq!(loaded.fold, Some(Fold::Lock));
+    assert_eq!(loaded.digest, folded.digest);
+
+    let plain = file_hunks(
+        &setup,
+        ReviewSource::Merged,
+        &setup.task.worktree,
+        "name\u{fffd}.txt",
+    )
+    .expect("a name with a real replacement character loads");
+    assert_eq!(lines(&plain), [(DiffLineKind::Added, "kept")]);
+}
+
+#[test]
+fn file_hunks_answers_none_when_two_paths_have_the_same_lossy_form() {
+    let setup = setup("");
+    commit_raw_paths(
+        &setup,
+        &[
+            (b"dir\xff/Cargo.lock", &numbered(600)),
+            (b"dir\xfe/Cargo.lock", &numbered(700)),
+        ],
+    );
+
+    let diff = setup.merged();
+    let twins = diff
+        .files
+        .iter()
+        .filter(|file| file.path == Path::new("dir\u{fffd}/Cargo.lock"))
+        .count();
+    let loaded = file_hunks(
+        &setup,
+        ReviewSource::Merged,
+        &setup.task.worktree,
+        "dir\u{fffd}/Cargo.lock",
+    );
+
+    assert_eq!(twins, 2);
+    assert!(loaded.is_none(), "{loaded:?}");
+}
+
 #[test]
 fn file_hunks_loads_an_untracked_lock_file_and_a_deleted_one() {
     let base = numbered(600);
