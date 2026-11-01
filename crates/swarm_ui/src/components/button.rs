@@ -3,6 +3,7 @@ use gpui::{
     SharedString, Toggled, Window, div, px,
 };
 
+use super::status::spinner;
 use super::tooltip::Tooltip;
 use crate::component::{Component, example, example_group};
 use crate::contrast::composite;
@@ -145,6 +146,7 @@ pub struct Button {
     debug_selector: Option<String>,
     focus_handle: Option<FocusHandle>,
     disabled: bool,
+    loading: bool,
     on_click: Option<ClickHandler>,
 }
 
@@ -164,6 +166,7 @@ impl Button {
             debug_selector: None,
             focus_handle: None,
             disabled: false,
+            loading: false,
             on_click: None,
         }
     }
@@ -213,6 +216,13 @@ impl Button {
     /// Name for `VisualTestContext::debug_bounds`. Only recorded in test builds.
     pub fn debug_selector(mut self, selector: impl FnOnce() -> String) -> Self {
         self.debug_selector = Some(selector());
+        self
+    }
+
+    /// Shows a spinner in place of the icon and ignores clicks, in full color. It keeps
+    /// focus, so focus does not drop while the work runs. Pass a label such as "Removing…".
+    pub fn loading(mut self, loading: bool) -> Self {
+        self.loading = loading;
         self
     }
 
@@ -311,12 +321,18 @@ impl RenderOnce for Button {
             .bg(colors.background)
             .text_color(colors.text)
             .whitespace_nowrap()
-            .when_some(self.icon, |button, icon| {
-                button.child(
-                    Icon::new(icon)
-                        .size(size.icon())
-                        .color(Color::Custom(colors.text)),
-                )
+            .map(|button| {
+                if self.loading {
+                    button.child(spinner(size.icon().pixels(), colors.text))
+                } else {
+                    button.when_some(self.icon, |button, icon| {
+                        button.child(
+                            Icon::new(icon)
+                                .size(size.icon())
+                                .color(Color::Custom(colors.text)),
+                        )
+                    })
+                }
             })
             .child(
                 Label::new(self.label)
@@ -330,6 +346,20 @@ impl RenderOnce for Button {
             .map(|button| {
                 if self.disabled {
                     button.opacity(0.5).cursor_default()
+                } else if self.loading {
+                    button
+                        .map(|button| match &self.focus_handle {
+                            Some(handle) => button.track_focus(handle),
+                            None => button.focusable().tab_stop(true),
+                        })
+                        .cursor_default()
+                        .focus_visible(|style| {
+                            if filled {
+                                filled_focus_ring(style, accent, ground)
+                            } else {
+                                focus_ring(style, accent)
+                            }
+                        })
                 } else {
                     button
                         .map(|button| match &self.focus_handle {
@@ -451,10 +481,18 @@ impl Component for Button {
             ))
             .child(example_group(
                 "Disabled",
-                [example(
-                    "Secondary",
-                    Button::new("disabled", "Run checks now").disabled(true),
-                )],
+                [
+                    example(
+                        "Secondary",
+                        Button::new("disabled", "Run checks now").disabled(true),
+                    ),
+                    example(
+                        "Loading",
+                        Button::new("loading", "Removing…")
+                            .variant(ButtonVariant::Destructive)
+                            .loading(true),
+                    ),
+                ],
             ))
             .child(example_group(
                 "Narrow container",
@@ -467,5 +505,58 @@ impl Component for Button {
                 )],
             ))
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use gpui::{Context, Modifiers, Render, TestAppContext};
+
+    use super::*;
+
+    struct Harness {
+        loading: bool,
+        clicks: Rc<Cell<u32>>,
+    }
+
+    impl Render for Harness {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let clicks = Rc::clone(&self.clicks);
+
+            div().size_full().child(
+                Button::new("remove", "Remove")
+                    .variant(ButtonVariant::Destructive)
+                    .loading(self.loading)
+                    .debug_selector(|| "remove".to_owned())
+                    .on_click(move |_, _, _| clicks.set(clicks.get() + 1)),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn a_loading_button_ignores_clicks_until_it_is_done(cx: &mut TestAppContext) {
+        cx.update(crate::theme::init);
+        let clicks = Rc::new(Cell::new(0));
+        let shared = Rc::clone(&clicks);
+        let (harness, cx) = cx.add_window_view(move |_, _| Harness {
+            loading: true,
+            clicks: shared,
+        });
+        cx.run_until_parked();
+
+        let center = cx.debug_bounds("remove").expect("on screen").center();
+        cx.simulate_click(center, Modifiers::none());
+        assert_eq!(clicks.get(), 0);
+
+        harness.update(cx, |harness, cx| {
+            harness.loading = false;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_click(center, Modifiers::none());
+        assert_eq!(clicks.get(), 1);
     }
 }

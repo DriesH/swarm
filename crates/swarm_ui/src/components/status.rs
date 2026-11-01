@@ -158,22 +158,27 @@ fn arc_svg(size: f32, stroke: f32) -> String {
 
 const STROKE: f32 = 1.5;
 
+/// A spinning three-quarter ring. It stands still when Reduce Motion is on.
+pub(crate) fn spinner(size: Pixels, color: Hsla) -> AnyElement {
+    svg()
+        .data(arc_svg(f32::from(size), STROKE).as_bytes())
+        .size(size)
+        .flex_none()
+        .text_color(color)
+        .with_animation(
+            "spin",
+            Animation::new(Duration::from_millis(900)).repeat(),
+            |mark, delta| mark.with_transformation(Transformation::rotate(percentage(delta))),
+        )
+        .into_any_element()
+}
+
 fn status_mark(status: AgentStatus, size: Pixels, cx: &App) -> AnyElement {
     let color = status.color(cx);
     let size_f32 = f32::from(size);
 
     match status {
-        AgentStatus::Working => svg()
-            .data(arc_svg(size_f32, STROKE).as_bytes())
-            .size(size)
-            .flex_none()
-            .text_color(color)
-            .with_animation(
-                "spin",
-                Animation::new(Duration::from_millis(900)).repeat(),
-                |mark, delta| mark.with_transformation(Transformation::rotate(percentage(delta))),
-            )
-            .into_any_element(),
+        AgentStatus::Working => spinner(size, color),
         AgentStatus::Blocked | AgentStatus::Done | AgentStatus::Error => svg()
             .data(circle_svg(size_f32, STROKE, true).as_bytes())
             .size(size)
