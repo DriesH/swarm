@@ -238,19 +238,20 @@ Native macOS notifications through GPUI's `show_system_notification`. Only the o
 |---|---|
 | Needs a decision | `swarm notify` from the orchestrator |
 | Permission or question prompt | Claude Code `Notification` hook: `permission_prompt`, `elicitation_dialog`, `agent_needs_input` |
-| Ready for review | orchestrator reports all workers done |
+| Ready for review | the orchestrator rests and no worker is busy |
 | Something broke | `StopFailure` hook, or an agent process exits |
 
 - Skip the notification when the app is focused on that task.
 - One notification per task: the task ID is the tag, so a new one replaces the old one.
-- Clicking opens the task: "needs you" opens the Terminals view with the orchestrator focused, "ready for review" opens the Review view.
+- Clicking opens the task: "needs you" opens the Terminals view with the agent the notice came from focused, "ready for review" opens the Review view. A notice for a task the app no longer shows only brings the window back.
 - The same signal shows as a dot on the menu bar icon, the "Needs you" pill in the sidebar, and a dock bounce for urgent cases.
 - Settings: each trigger on or off, per-project overrides, sound.
 - Needs a real `.app` bundle: GPUI disables notifications under `cargo run`.
 - No inline reply in v1: GPUI supports action buttons, not text input.
 - The daemon decides when: it broadcasts a notice (kind, task, agent, short text). The app decides whether and how: settings, the focused task, sound, Dock bounce. So the menu bar and a closed window get the same notices.
-- Prompt notices come from any agent of the task. Ready for review fires once when the orchestrator turns idle while the task has workers and none of them works, is blocked or is starting; it fires again only after a worker worked again. Something broke is a `StopFailure` hook, an OSC 7501 error (Codex has no such hook), an agent that fails to start, or an agent process that ends with an error, never a stop the user or `swarm exit` asked for. One error spell gives one notice.
-- Settings live in `settings.toml` under `[notifications]`: each trigger, sound, Dock bounce for urgent ones (needs a decision, prompt), mute while viewing the task, the menu bar dot, and per project **All**, **Errors only** (something broke) or **Off**.
+- Prompt notices come from any agent of the task. Ready for review fires once when the orchestrator rests and no worker is busy (working, blocked or starting), whichever happens last; it fires again only after a worker worked again. Something broke is a `StopFailure` hook, an OSC 7501 error (Codex has no such hook), an agent that fails to start, or an agent process that ends with an error, never a stop the user or `swarm exit` asked for. One error spell gives one notice.
+- Settings live in `settings.toml` under `[notifications]`: each trigger, sound, Dock bounce for urgent ones (needs a decision, prompt), mute while viewing the task, the menu bar dot, and per project **All**, **Errors only** (something broke) or **Off**. A value there that is not valid falls back to its default, so a typo never stops agents from starting.
+- The sound plays only when macOS shows the notification: the permission is allowed and the app's own sound setting in System Settings is on. The app reads both at start, when it becomes active and when the Settings page opens.
 - **Send test notification** posts one right away. The permission row reads the real authorization and offers **Open System Settings** when it is denied.
 
 ### System check
