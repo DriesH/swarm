@@ -1,4 +1,5 @@
-//! Accessibility checks for Button, Kbd, Dropdown, `PopoverMenu`, the tray chips and `UsageMeter`.
+//! Accessibility checks for Button, Kbd, Stepper, Dropdown, `PopoverMenu`, the tray chips and
+//! `UsageMeter`.
 
 use gpui::accesskit::{Node, Role, Toggled};
 use gpui::{
@@ -176,6 +177,20 @@ fn kbd_is_a_label_with_a_spoken_name() {
 
         assert_eq!(info.role, Some(Role::Label));
         assert_eq!(info.node.label(), Some("Command Shift R"));
+    });
+}
+
+#[test]
+fn a_stepper_is_a_labelled_group_with_named_buttons() {
+    with_window(|window, cx| {
+        let info = a11y_info(
+            Stepper::new("size", "Font size", 13, 11, 20).unit("pt"),
+            window,
+            cx,
+        );
+
+        assert_eq!(info.role, Some(Role::Group));
+        assert_eq!(info.node.label(), Some("Font size"));
     });
 }
 

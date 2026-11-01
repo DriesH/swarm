@@ -2,7 +2,7 @@
 //! the terminal crates.
 
 use gpui::{AnyElement, App, Context, Entity, SharedString, Window, div, px, size};
-use swarm_term_view::TerminalView;
+use swarm_term_view::{DEFAULT_FONT_SIZE, TerminalView};
 use swarm_term_vt::{DEFAULT_SCROLLBACK_BYTES, LocalTerminal, SpawnOptions};
 use swarm_ui::component::{Component, example_group};
 use swarm_ui::prelude::*;
@@ -53,7 +53,7 @@ impl PreviewState {
             px(TILE_WIDTH - CHROME_WIDTH),
             px(TILE_HEIGHT - CHROME_HEIGHT),
         );
-        let grid = TerminalView::size_for(body, window, cx);
+        let grid = TerminalView::size_for(body, DEFAULT_FONT_SIZE, window, cx);
 
         let (terminal_channels, emulator_channels) = swarm_term::channels();
         let options = SpawnOptions {
