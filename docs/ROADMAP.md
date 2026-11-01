@@ -11,7 +11,7 @@ Each phase ends with a pull request into `main`. A phase is done when every box 
 | 4 | Agents and harness | In progress |
 | 5 | Swarm view | In progress |
 | 6 | Review and pull requests | In progress |
-| 7 | Menu bar, usage and notifications | Not started |
+| 7 | Menu bar, usage and notifications | In progress |
 | 8 | Polish and first release | Not started |
 | 9 | After first release | Not started |
 

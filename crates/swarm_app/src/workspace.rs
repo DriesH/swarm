@@ -329,6 +329,10 @@ impl Workspace {
 
             this.sync_swarm_tasks(window.is_window_active(), cx);
             this.sync_usage_clock(window.is_window_active(), cx);
+
+            if window.is_window_active() {
+                crate::notifications::refresh_authorization(cx);
+            }
         })
     }
 
@@ -729,7 +733,12 @@ impl Render for Workspace {
                     this.new_user_terminal(window, cx);
                 }))
                 .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
-                    crate::settings::open(this.settings_path.clone(), window, cx);
+                    crate::settings::open(
+                        this.settings_path.clone(),
+                        this.data.projects.clone(),
+                        window,
+                        cx,
+                    );
                 }))
                 .on_action(cx.listener(|this, _: &ToggleCommandPalette, window, cx| {
                     this.toggle_palette(window, cx);

@@ -20,7 +20,7 @@ mod client;
 pub use client::{Client, ClientError, CommentEvent, MessageEvent, PrEvent};
 
 /// Bumped on every incompatible change; the daemon refuses other versions.
-pub const VERSION: u32 = 14;
+pub const VERSION: u32 = 15;
 
 /// The most messages [`Request::ListMessages`] returns.
 pub const MESSAGES_LISTED: usize = 500;
@@ -717,6 +717,33 @@ pub struct Usage {
     pub codex: SubscriptionUsage,
 }
 
+/// Why the user should look at a task now.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NoticeKind {
+    /// The task orchestrator asked for a decision with `swarm notify`.
+    NeedsDecision,
+    /// An agent shows a permission or question prompt.
+    Prompt,
+    /// Every worker of the task is done and the orchestrator is idle.
+    ReadyForReview,
+    /// An agent failed or its process ended with an error.
+    Broke,
+}
+
+/// A moment the app may turn into a system notification.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Notice {
+    pub kind: NoticeKind,
+    pub project: ProjectId,
+    /// `None` for a Start orchestrator.
+    pub task: Option<TaskId>,
+    pub agent: AgentId,
+    /// Short, like the prompt's question or the orchestrator's reason.
+    pub text: String,
+    /// Milliseconds since the Unix epoch.
+    pub at: u64,
+}
+
 /// What closing a task would throw away, so the app can ask first.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct CloseCheck {
@@ -1093,6 +1120,10 @@ pub enum Event {
     /// Sent to every client when the usage of a subscription changed.
     UsageChanged {
         usage: Usage,
+    },
+    /// Sent to every client when something needs the user.
+    Notice {
+        notice: Notice,
     },
     GithubStatus {
         call: CallId,

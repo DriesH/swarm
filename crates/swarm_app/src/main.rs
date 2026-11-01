@@ -9,6 +9,7 @@ mod markdown;
 mod menu_bar;
 mod model;
 mod new_task;
+mod notifications;
 mod palette;
 mod panels;
 mod pull_request;

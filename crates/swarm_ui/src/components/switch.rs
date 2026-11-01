@@ -16,6 +16,7 @@ pub struct Switch {
     label: SharedString,
     on: bool,
     disabled: bool,
+    debug_selector: Option<String>,
     on_toggle: Option<ToggleHandler>,
 }
 
@@ -26,8 +27,15 @@ impl Switch {
             label: label.into(),
             on: false,
             disabled: false,
+            debug_selector: None,
             on_toggle: None,
         }
+    }
+
+    /// Name for `VisualTestContext::debug_bounds`. Only recorded in test builds.
+    pub fn debug_selector(mut self, selector: impl FnOnce() -> String) -> Self {
+        self.debug_selector = Some(selector());
+        self
     }
 
     /// Called with the new state when the user flips the switch.
@@ -69,6 +77,9 @@ impl RenderOnce for Switch {
             .role(Role::Switch)
             .aria_label(self.label)
             .aria_toggled(if on { Toggled::True } else { Toggled::False })
+            .when_some(self.debug_selector, |switch, selector| {
+                switch.debug_selector(move || selector)
+            })
             .relative()
             .flex_none()
             .w(px(32.))

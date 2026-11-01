@@ -11,6 +11,7 @@ path = "src/swarm_settings.rs"
 workspace = true
 
 [dependencies]
+log.workspace = true
 serde.workspace = true
 swarm_protocol.workspace = true
 thiserror.workspace = true

@@ -111,6 +111,8 @@ fn start(
     });
 
     cx.observe(&workspace, |_, cx| refresh(cx)).detach();
+    let settings = crate::settings::state(cx);
+    cx.observe(&settings, |_, cx| refresh(cx)).detach();
     cx.on_window_closed(window_closed).detach();
 
     // AppKit calls back on its own terms; the click goes through a channel to this task.
@@ -147,7 +149,8 @@ fn summary(cx: &App) -> Summary {
 
 /// Shows the status item's new look, when it changed.
 fn refresh(cx: &mut App) {
-    let look = summary(cx).look();
+    let dot_allowed = crate::settings::notifications(cx).menu_bar_dot;
+    let look = summary(cx).look(dot_allowed);
     let menu = cx.global_mut::<MenuBar>();
     if menu.shown.as_ref() == Some(&look) {
         return;
@@ -428,6 +431,26 @@ mod tests {
 
         assert_eq!(look, Some(Look::new(Some(42), false)));
         assert_eq!(look.and_then(|look| look.title).as_deref(), Some(" 42%"));
+    }
+
+    #[gpui::test]
+    fn with_the_dot_setting_off_the_status_item_never_shows_the_dot(cx: &mut TestAppContext) {
+        let (workspace, bar, cx) = setup(cx);
+        let with_dot = bar.last_look();
+
+        cx.update(|_, cx| crate::settings::change_notifications(|n| n.menu_bar_dot = false, cx));
+        let turned_off = bar.last_look();
+        workspace.update(cx, |workspace, cx| {
+            workspace.usage_changed(Usage::default(), cx);
+        });
+        let after_news = bar.last_look();
+
+        cx.update(|_, cx| crate::settings::change_notifications(|n| n.menu_bar_dot = true, cx));
+
+        assert_eq!(with_dot, Some(Look::new(Some(42), true)));
+        assert_eq!(turned_off, Some(Look::new(Some(42), false)));
+        assert_eq!(after_news, Some(Look::new(None, false)));
+        assert_eq!(bar.last_look(), Some(Look::new(None, true)));
     }
 
     #[gpui::test]

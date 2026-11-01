@@ -120,6 +120,10 @@ _Avoid_: God mode terminal, private terminal
 The strip of chips in the status bar where tiles go when they don't fit on screen. Chips that don't fit the bar sit behind a "+N" chip that opens a menu.
 _Avoid_: Dock, minimized bar
 
+**Notice**:
+A moment that needs the user: a decision, a blocked agent, work ready for review or a failure. The app may show it as a system notification.
+_Avoid_: Alert, toast
+
 **Daemon**:
 The background process that keeps agents running when the app is closed.
 _Avoid_: Server, service, backend

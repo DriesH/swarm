@@ -1,15 +1,17 @@
 //! One render function per settings page.
 
 use gpui::{AnyElement, ElementId, Entity, FontWeight, Role, SharedString, Stateful, div, px};
-use swarm_settings::AgentKindSetting;
+use swarm_settings::{AgentKindSetting, ProjectMode};
 use swarm_ui::prelude::*;
 use swarm_ui::styles::focus_ring;
 use swarm_ui::theme::{self, Appearance};
 
 use super::{
-    AGENTS, DELIVERY, IDLE_OPTIONS, NOTIFY_WHEN, PROJECT_NOTIFICATIONS, Page, SettingsState,
-    SettingsWindow,
+    AGENTS, DELIVERY, IDLE_OPTIONS, NOTIFY_WHEN, PROJECT_MODES, PROJECT_NOTIFICATIONS, Page,
+    SettingsState, SettingsWindow, delivery, delivery_mut, mode_index, notify_when,
+    notify_when_mut,
 };
+use crate::notifications::{self, Permission};
 
 type State = Entity<SettingsState>;
 
@@ -277,32 +279,40 @@ impl SettingsWindow {
     fn notifications_page(&self, cx: &Context<Self>) -> AnyElement {
         let state = &self.state;
         let settings = state.read(cx);
+        let notifications = &settings.settings.notifications;
 
         let when = NOTIFY_WHEN
             .iter()
             .enumerate()
             .fold(Panel::new(), |panel, (index, label)| {
-                panel.row(switch_row(
-                    state,
-                    ("notify-when", index),
-                    label,
-                    settings.notify_when[index],
-                    move |state, on| state.notify_when[index] = on,
-                ))
+                panel.row(
+                    PanelRow::new(*label).end_slot(
+                        Switch::new(("notify-when", index), *label)
+                            .toggle_state(notify_when(notifications, index))
+                            .debug_selector(|| format!("notify-when-{index}"))
+                            .on_toggle(toggle(state, move |state, on| {
+                                *notify_when_mut(&mut state.settings.notifications, index) = on;
+                            })),
+                    ),
+                )
             });
 
-        let delivery = DELIVERY
-            .iter()
-            .enumerate()
-            .fold(Panel::new(), |panel, (index, label)| {
-                panel.row(switch_row(
-                    state,
-                    ("delivery", index),
-                    label,
-                    settings.delivery[index],
-                    move |state, on| state.delivery[index] = on,
-                ))
-            });
+        let delivery_panel =
+            DELIVERY
+                .iter()
+                .enumerate()
+                .fold(Panel::new(), |panel, (index, label)| {
+                    panel.row(
+                        PanelRow::new(*label).end_slot(
+                            Switch::new(("delivery", index), *label)
+                                .toggle_state(delivery(notifications, index))
+                                .debug_selector(|| format!("delivery-{index}"))
+                                .on_toggle(toggle(state, move |state, on| {
+                                    *delivery_mut(&mut state.settings.notifications, index) = on;
+                                })),
+                        ),
+                    )
+                });
 
         let projects =
             settings
@@ -311,6 +321,24 @@ impl SettingsWindow {
                 .enumerate()
                 .fold(Panel::new(), |panel, (index, entry)| {
                     let name = entry.project.name.clone();
+                    let root = entry.project.root.clone();
+                    let mode = root
+                        .as_deref()
+                        .map_or(ProjectMode::All, |root| notifications.mode(root));
+
+                    let picker = Dropdown::new(
+                        ("project-notifications", index),
+                        name.clone(),
+                        options(&PROJECT_NOTIFICATIONS),
+                        mode_index(mode),
+                    )
+                    .debug_selector(|| format!("project-notifications-{index}"))
+                    .disabled(root.is_none())
+                    .on_change(choose(state, move |state, value| {
+                        if let (Some(root), Some(mode)) = (&root, PROJECT_MODES.get(value)) {
+                            state.settings.notifications.set_mode(root, *mode);
+                        }
+                    }));
 
                     let row = plain_row()
                         .child(ProjectTile::new(
@@ -320,51 +348,61 @@ impl SettingsWindow {
                         .child(
                             div()
                                 .flex_1()
-                                .child(Label::new(name.clone()).weight(FontWeight::MEDIUM)),
+                                .child(Label::new(name).weight(FontWeight::MEDIUM)),
                         )
-                        .child(
-                            h_flex().h(px(28.)).child(
-                                Dropdown::new(
-                                    ("project-notifications", index),
-                                    name,
-                                    options(&PROJECT_NOTIFICATIONS),
-                                    entry.notifications,
-                                )
-                                .on_change(choose(
-                                    state,
-                                    move |state, value| {
-                                        if let Some(project) = state.projects.get_mut(index) {
-                                            project.notifications = value;
-                                        }
-                                    },
-                                )),
-                            ),
-                        );
+                        .child(h_flex().h(px(28.)).child(picker));
 
                     panel.row(row)
                 });
 
-        let header = h_flex()
-            .gap_3()
-            .child(div().flex_1().child(page_title("Notifications")))
-            .child(
-                Label::new("macOS permission")
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
-            .child(StatusPill::new(AgentStatus::Done).label("Allowed"));
+        let permission = settings.permission;
+        let denied = permission == Some(Permission::NotAllowed);
+        let status = permission.map(|permission| {
+            let tone = match permission {
+                Permission::Allowed => AgentStatus::Done,
+                Permission::NotAllowed => AgentStatus::Error,
+                Permission::NotAsked => AgentStatus::Idle,
+                Permission::Unavailable => AgentStatus::Unknown,
+            };
+
+            StatusPill::new(tone).label(permission.label())
+        });
+
+        let permission_row = PanelRow::new("macOS permission").end_slot(
+            h_flex().gap_2().children(status).when(denied, |row| {
+                row.child(
+                    Button::new("open-system-settings", "Open System Settings")
+                        .debug_selector(|| "open-system-settings".to_owned())
+                        .on_click(|_, _, cx| notifications::open_system_settings(cx)),
+                )
+            }),
+        );
+
+        let error = settings.save_error.clone().map(|message| {
+            div()
+                .id("settings-save-error")
+                .role(Role::Alert)
+                .aria_label(message.clone())
+                .text_size(px(12.))
+                .text_color(Color::Del.hsla(cx))
+                .child(message)
+        });
 
         v_flex()
             .gap(px(28.))
-            .child(header)
+            .child(page_title("Notifications"))
+            .children(error)
+            .child(section("Permission", Panel::new().row(permission_row)))
             .child(section("Notify me when", when))
-            .child(section("Delivery", delivery))
+            .child(section("Delivery", delivery_panel))
             .child(section("Projects", projects))
-            .child(h_flex().child(
-                Button::new("test-notification", "Send test notification").on_click(|_, _, _| {
-                    log::info!("Test notification is not built yet");
-                }),
-            ))
+            .child(
+                h_flex().child(
+                    Button::new("test-notification", "Send test notification")
+                        .debug_selector(|| "test-notification".to_owned())
+                        .on_click(|_, _, cx| notifications::send_test(cx)),
+                ),
+            )
             .into_any_element()
     }
 
