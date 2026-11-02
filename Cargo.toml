@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/app_icon",
     "crates/gallery",
     "crates/swarm_app",
     "crates/swarm_cli",
