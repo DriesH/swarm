@@ -21,8 +21,6 @@ mod tests;
 
 /// How long the draft waits after the last edit before it is saved.
 const SAVE_DELAY: Duration = Duration::from_secs(1);
-/// The widest the editor column grows.
-const MAX_WIDTH: f32 = 760.;
 /// The corner radius of the text box, as in a bordered text field.
 const BOX_RADIUS: f32 = 8.;
 /// The space between the box and the text, as in a bordered text field.
@@ -632,24 +630,15 @@ impl Render for PlanEditor {
             .child(orchestrator)
             .child(send);
 
+        // The workspace sizes the editor: its column, down to the band of terminals under it.
         v_flex()
             .id("plan-editor")
             .debug_selector(|| "plan-editor".to_owned())
             .size_full()
-            .items_center()
-            .px(px(24.))
-            .py(px(20.))
-            .child(
-                v_flex()
-                    .w_full()
-                    .max_w(px(MAX_WIDTH))
-                    .flex_1()
-                    .min_h_0()
-                    .gap(px(12.))
-                    .child(text_box)
-                    .children(error)
-                    .child(footer),
-            )
+            .gap(px(12.))
+            .child(text_box)
+            .children(error)
+            .child(footer)
     }
 }
 

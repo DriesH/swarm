@@ -1,9 +1,9 @@
 //! The main area: terminals, swarm and review views.
 
 use gpui::{
-    AnyElement, AppContext as _, Bounds, Context, Entity, FontWeight, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, Pixels, Role, SharedString, Size, Subscription, Window, div,
-    px,
+    AnyElement, AppContext as _, Bounds, Context, Div, Entity, FontWeight, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Role, SharedString, Size, Stateful,
+    Subscription, Window, div, px,
 };
 use swarm_layout::{Activity, Layout, LayoutStyle, Rect, TileId, TileKind, TileSpec};
 use swarm_term_view::TerminalView;
@@ -34,8 +34,6 @@ const FIRST_FRAME_AREA: Size<Pixels> = Size {
     width: px(1030.),
     height: px(790.),
 };
-const START_MAX_WIDTH: f32 = 880.;
-const START_PADDING: (f32, f32) = (24., 28.);
 const DEFAULT_USER_SIZE: Size<Pixels> = Size {
     width: px(650.),
     height: px(470.),
@@ -218,19 +216,25 @@ fn tile_spec(
 }
 
 /// The open task's tiles in layout order: orchestrator, workers, processes, user terminals.
-/// A Start task has only its orchestrator.
+/// A Start task has no workers: its orchestrator, then the processes and user terminals.
 pub(crate) fn tile_specs(workspace: &Workspace) -> Vec<TileSpec> {
     let data = &workspace.data;
     let task = workspace.active_task();
 
     if task.is_start {
-        return task
+        let orchestrator = task
             .orchestrator
             .and_then(|id| data.agent(id))
             .and_then(|agent| data.terminal(agent.terminal))
-            .map(|terminal| tile_spec(workspace, terminal, Activity::Working, false))
-            .into_iter()
-            .collect();
+            .map(|terminal| tile_spec(workspace, terminal, Activity::Working, false));
+        let others = task
+            .processes
+            .iter()
+            .chain(&task.user_terminals)
+            .filter_map(|id| data.terminal(*id))
+            .map(|terminal| tile_spec(workspace, terminal, process_activity(terminal), false));
+
+        return orchestrator.into_iter().chain(others).collect();
     }
 
     let agents = task
@@ -261,26 +265,172 @@ pub(crate) fn compute_layout(workspace: &Workspace) -> Layout {
     let specs = tile_specs(workspace);
 
     if workspace.active_task().is_start {
-        return start_layout(area, &specs);
+        let recent: Vec<TileId> = workspace
+            .recent_focus
+            .iter()
+            .map(|terminal| TileId(terminal.0))
+            .collect();
+
+        return start_layout(&specs, &start_regions(workspace, &specs), &recent);
     }
 
     swarm_layout::layout(to_rect(area), &specs, &layout_style(workspace))
 }
 
-/// One centered tile, at most 880px wide and as tall as the area allows.
-fn start_layout(area: Size<Pixels>, specs: &[TileSpec]) -> Layout {
-    let (pad_x, pad_y) = START_PADDING;
-    let width = (f32::from(area.width) - 2. * pad_x).clamp(0., START_MAX_WIDTH);
-    let height = (f32::from(area.height) - 2. * pad_y).max(0.);
-    let x = (f32::from(area.width) - width) / 2.;
+/// What fills the main area of a Start tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StartMain {
+    /// The plan editor, until the Start orchestrator runs.
+    Editor,
+    /// The tile of the running Start orchestrator.
+    Terminal,
+}
 
-    Layout {
-        placed: specs
-            .iter()
-            .map(|spec| (spec.id, Rect::new(x, pad_y, width, height)))
-            .collect(),
-        tray: Vec::new(),
+impl StartMain {
+    /// The widest the column grows.
+    fn max_width(self) -> f32 {
+        match self {
+            Self::Editor => 760.,
+            Self::Terminal => 880.,
+        }
     }
+
+    /// The space between the area and the column, across and down.
+    fn padding(self) -> (f32, f32) {
+        match self {
+            Self::Editor => (24., 20.),
+            Self::Terminal => (24., 28.),
+        }
+    }
+}
+
+/// Where a Start tab puts the main area and the terminals under it. The layout and the plan
+/// editor both read it, so the editor never runs under the tiles.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct StartRegions {
+    /// The plan editor, or the tile of the Start orchestrator.
+    pub(crate) main: Rect,
+    /// The tiles that fit in the band under the main area, left to right. Empty when no
+    /// other tile is shown: the main area then takes the whole column.
+    pub(crate) band: Vec<Rect>,
+}
+
+impl StartRegions {
+    /// One centered column. `waiting` is the number of other tiles that want a place in the
+    /// band. The band is as tall as a small tile, and a tile in it is never narrower than
+    /// the layout's smallest tile. The tiles that do not fit are left out, and so is the
+    /// whole band when the main area would get less than the smallest tile's height.
+    pub(crate) fn new(
+        area: Size<Pixels>,
+        main: StartMain,
+        waiting: usize,
+        style: &LayoutStyle,
+    ) -> Self {
+        let (pad_x, pad_y) = main.padding();
+        let width = (f32::from(area.width) - 2. * pad_x).clamp(0., main.max_width());
+        let height = (f32::from(area.height) - 2. * pad_y).max(0.);
+        let x = (f32::from(area.width) - width) / 2.;
+
+        let shown = u16::try_from(waiting)
+            .unwrap_or(u16::MAX)
+            .min(slots_in(width, style));
+        let band_top = pad_y + height - style.small_tile_height;
+        let main_height = band_top - style.gap - pad_y;
+        if shown == 0 || main_height < style.min_tile.height {
+            return Self {
+                main: Rect::new(x, pad_y, width, height),
+                band: Vec::new(),
+            };
+        }
+
+        let band_height = style.small_tile_height;
+        let tile_width = (width - f32::from(shown - 1) * style.gap) / f32::from(shown);
+
+        Self {
+            main: Rect::new(x, pad_y, width, main_height),
+            band: (0..shown)
+                .map(|index| {
+                    let left = x + f32::from(index) * (tile_width + style.gap);
+
+                    Rect::new(left, band_top, tile_width, band_height)
+                })
+                .collect(),
+        }
+    }
+}
+
+/// How many tiles of the smallest width fit side by side in `width`.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the count is clamped to the range of u16"
+)]
+fn slots_in(width: f32, style: &LayoutStyle) -> u16 {
+    let slots = ((width + style.gap) / (style.min_tile.width + style.gap)).floor();
+
+    slots.clamp(0., f32::from(u16::MAX)) as u16
+}
+
+/// The regions of the open Start tab. The plan editor shows until the Start orchestrator
+/// runs. The tiles in the tray do not take a place in the band.
+pub(crate) fn start_regions(workspace: &Workspace, specs: &[TileSpec]) -> StartRegions {
+    let area = workspace.terminal_area_size().unwrap_or(FIRST_FRAME_AREA);
+    let main = if workspace.data.start_runs(workspace.active_task().project) {
+        StartMain::Terminal
+    } else {
+        StartMain::Editor
+    };
+    let waiting = specs
+        .iter()
+        .filter(|spec| spec.kind != TileKind::Orchestrator && !spec.minimized)
+        .count();
+
+    StartRegions::new(area, main, waiting, &layout_style(workspace))
+}
+
+/// The orchestrator's tile in the main area, and the other tiles in the band. A tile that
+/// is minimized or does not fit in the band goes to the tray.
+///
+/// The band places user terminals before processes, and within a kind the tile that had the
+/// focus last (`recent` lists them, the latest first). The tiles it places keep their order.
+fn start_layout(specs: &[TileSpec], regions: &StartRegions, recent: &[TileId]) -> Layout {
+    let mut wanting: Vec<&TileSpec> = specs
+        .iter()
+        .filter(|spec| spec.kind != TileKind::Orchestrator && !spec.minimized)
+        .collect();
+    // The sort is stable: tiles that never had the focus keep their order.
+    wanting.sort_by_key(|spec| {
+        (
+            spec.kind != TileKind::User,
+            recent
+                .iter()
+                .position(|id| *id == spec.id)
+                .unwrap_or(usize::MAX),
+        )
+    });
+    let in_band: Vec<TileId> = wanting
+        .iter()
+        .take(regions.band.len())
+        .map(|spec| spec.id)
+        .collect();
+
+    let mut slots = regions.band.iter().copied();
+    let mut layout = Layout::default();
+
+    for spec in specs {
+        let rect = match spec.kind {
+            TileKind::Orchestrator => Some(regions.main),
+            _ if in_band.contains(&spec.id) => slots.next(),
+            _ => None,
+        };
+
+        match rect {
+            Some(rect) => layout.placed.push((spec.id, rect)),
+            None => layout.tray.push(spec.id),
+        }
+    }
+
+    layout
 }
 
 impl Workspace {
@@ -331,6 +481,7 @@ impl Workspace {
         self.disconnected.remove(&terminal);
         self.terminal_focus.remove(&terminal);
         self.minimized.remove(&terminal);
+        self.forget_recent_focus(terminal);
         if self.focused_terminal == Some(terminal) {
             self.focused_terminal = None;
         }
@@ -383,6 +534,7 @@ impl Workspace {
         let terminal = self.data.add_user_terminal(task);
         self.user_sizes.insert(terminal, self.planned_user_size());
         self.focused_terminal = Some(terminal);
+        self.note_recent_focus(terminal);
 
         cx.notify();
     }
@@ -404,11 +556,13 @@ impl Workspace {
         }
 
         self.github_terminal_closed(terminal, cx);
+        self.drop_close_terminal_dialog(terminal, cx);
         self.data.close_user_terminal(task, terminal);
         self.disconnected.remove(&terminal);
         self.terminal_focus.remove(&terminal);
         self.user_sizes.remove(&terminal);
         self.minimized.remove(&terminal);
+        self.forget_recent_focus(terminal);
         if self.focused_terminal == Some(terminal) {
             self.focused_terminal = None;
         }
@@ -534,7 +688,17 @@ impl Workspace {
 fn terminals(workspace: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement + use<> {
     let area = cx.entity();
     let term = cx.theme().colors().term;
-    let editor = workspace.shown_plan_editor();
+    let editor = workspace.shown_plan_editor().map(|editor| {
+        let main = start_regions(workspace, &tile_specs(workspace)).main;
+
+        div()
+            .absolute()
+            .left(px(main.origin.x))
+            .top(px(main.origin.y))
+            .w(px(main.size.width))
+            .h(px(main.size.height))
+            .child(editor)
+    });
     let on_terminal = workspace.active_task().is_start && editor.is_none();
     let tiles: Vec<AnyElement> = workspace
         .layout
@@ -571,14 +735,7 @@ fn terminals(workspace: &Workspace, cx: &mut Context<Workspace>) -> impl IntoEle
         .when(on_terminal && crate::settings::easter_eggs(cx), |area| {
             area.child(honeycomb_behind(workspace))
         })
-        .children(editor.map(|editor| {
-            div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full()
-                .child(editor)
-        }))
+        .children(editor)
         .children(tiles)
 }
 
@@ -605,8 +762,9 @@ fn tile(
     let resizing = workspace
         .resizing
         .filter(|resizing| resizing.terminal == id);
-    let handle =
-        (terminal.kind == TerminalKind::User).then(|| resize_handle(id, resizing.is_some(), cx));
+    // A Start tab keeps its terminals at the height of the band: a handle would fight it.
+    let handle = (terminal.kind == TerminalKind::User && !workspace.active_task().is_start)
+        .then(|| resize_handle(id, resizing.is_some(), cx));
     let badge = resizing.map(|_| size_badge(size, workspace.cell_size, cx));
 
     Some(
@@ -789,42 +947,42 @@ fn live_process_frame(
     }
 }
 
+/// What the mark on a user terminal's tile says, and what a screen reader starts with.
+const MINE: &str = "Mine";
+
+/// The mark after the name in the header of a user terminal's tile: the user icon and "Mine".
+fn mine_mark(id: TerminalId) -> Stateful<Div> {
+    h_flex()
+        .id(("mine", id.0))
+        .debug_selector(move || format!("tile-mine-{}", id.0))
+        .role(Role::Group)
+        .aria_label(format!("{MINE}, agents have no access"))
+        .gap(px(5.))
+        .child(
+            Icon::new(IconName::User)
+                .size(IconSize::Custom(px(13.)))
+                .color(Color::Muted),
+        )
+        .child(
+            Label::new(MINE)
+                .size(LabelSize::XSmall)
+                .weight(FontWeight::MEDIUM),
+        )
+}
+
 fn user_frame(
     workspace: &Workspace,
     terminal: &Terminal,
     cx: &mut Context<Workspace>,
 ) -> TileFrame {
     let id = terminal.id;
-    let colors = cx.theme().colors();
-    let active = colors.active;
     let focused = workspace.focused_terminal == Some(id);
 
-    let you = h_flex()
-        .gap(px(6.))
-        .child(
-            div()
-                .px(px(6.))
-                .py(px(1.))
-                .rounded(px(5.))
-                .bg(active)
-                .child(
-                    Label::new("You")
-                        .size(LabelSize::XSmall)
-                        .weight(FontWeight::MEDIUM),
-                ),
-        )
-        .child(
-            Icon::new(IconName::Lock)
-                .size(IconSize::Custom(px(13.)))
-                .color(Color::Muted)
-                .accessible(("lock", id.0), "Agents have no access"),
-        );
-
-    let mut frame = TileFrame::new(("tile", id.0), IconName::User, terminal.title.clone())
+    let mut frame = TileFrame::new(("tile", id.0), IconName::Terminal, terminal.title.clone())
         .accessible_label(format!("Your terminal, {}", terminal.title))
         .ring(TileRing::Fg)
         .focused(focused)
-        .name_suffix(you);
+        .name_suffix(mine_mark(id));
 
     let live = workspace.live_terminals.get(&id);
 
@@ -852,11 +1010,15 @@ fn user_frame(
     }
 
     let frame = frame.action(
-        IconButton::new(("close", id.0), IconName::Close, "Close your terminal").on_click(
-            cx.listener(move |workspace, _, _, cx| {
-                workspace.close_user_terminal(id, cx);
-            }),
-        ),
+        IconButton::new(
+            ("close", id.0),
+            IconName::Close,
+            format!("Close {}", terminal.title),
+        )
+        .debug_selector(move || format!("tile-close-terminal-{}", id.0))
+        .on_click(cx.listener(move |workspace, _, window, cx| {
+            workspace.request_close_terminal(id, window, cx);
+        })),
     );
 
     match live {
@@ -871,6 +1033,7 @@ fn resize_handle(id: TerminalId, dragging: bool, cx: &mut Context<Workspace>) ->
 
     div()
         .id(("resize", id.0))
+        .debug_selector(move || format!("resize-{}", id.0))
         .role(Role::Splitter)
         .aria_label("Resize your terminal")
         .focusable()
@@ -933,6 +1096,9 @@ mod tests {
     use super::*;
     use crate::actions::{self, NewTerminal, PlanWithOrchestrator};
     use crate::model::{AgentId, TaskId};
+
+    /// The first terminal the app adds to the sample data.
+    const USER_TERMINAL: u32 = 14;
 
     fn setup(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
         cx.update(|cx| {
@@ -1429,11 +1595,579 @@ mod tests {
             height: px(700.),
         };
         let spec = TileSpec::new(TileId(0), TileKind::Orchestrator, Activity::Working);
+        let regions = StartRegions::new(area, StartMain::Terminal, 0, &LayoutStyle::default());
 
-        let layout = start_layout(area, &[spec]);
+        let layout = start_layout(&[spec], &regions, &[]);
 
         let rect = layout.rect(TileId(0));
         assert_eq!(rect, Some(Rect::new(160., 28., 880., 644.)));
+    }
+
+    fn start_style() -> LayoutStyle {
+        LayoutStyle {
+            small_tile_height: 276.,
+            ..LayoutStyle::default()
+        }
+    }
+
+    fn area_of(width: f32, height: f32) -> Size<Pixels> {
+        Size {
+            width: px(width),
+            height: px(height),
+        }
+    }
+
+    fn orchestrator_spec() -> TileSpec {
+        TileSpec::new(TileId(0), TileKind::Orchestrator, Activity::Working)
+    }
+
+    fn user_spec(id: u32) -> TileSpec {
+        TileSpec::new(TileId(id), TileKind::User, Activity::Running)
+    }
+
+    #[test]
+    fn without_other_tiles_the_editor_and_the_start_tile_keep_their_columns() {
+        let area = area_of(1200., 700.);
+
+        let editor = StartRegions::new(area, StartMain::Editor, 0, &start_style());
+        let terminal = StartRegions::new(area, StartMain::Terminal, 0, &start_style());
+
+        assert_eq!(editor.main, Rect::new(220., 20., 760., 660.));
+        assert_eq!(terminal.main, Rect::new(160., 28., 880., 644.));
+        assert!(editor.band.is_empty());
+        assert!(terminal.band.is_empty());
+    }
+
+    #[test]
+    fn the_band_takes_the_bottom_of_the_column_at_the_small_tile_height() {
+        let regions =
+            StartRegions::new(area_of(1200., 900.), StartMain::Terminal, 1, &start_style());
+
+        let band = regions.band.first().copied().expect("one tile in the band");
+
+        assert_eq!(band, Rect::new(160., 596., 880., 276.));
+        assert_eq!(regions.main, Rect::new(160., 28., 880., 558.));
+        assert!((regions.main.bottom() + start_style().gap - band.origin.y).abs() < 0.01);
+    }
+
+    #[test]
+    fn the_editor_column_gets_the_same_band() {
+        let regions = StartRegions::new(area_of(1200., 900.), StartMain::Editor, 1, &start_style());
+
+        let band = regions.band.first().copied().expect("one tile in the band");
+
+        assert_eq!(band, Rect::new(220., 604., 760., 276.));
+        assert_eq!(regions.main, Rect::new(220., 20., 760., 574.));
+    }
+
+    #[test]
+    fn the_tiles_share_the_width_of_the_band_side_by_side() {
+        let regions =
+            StartRegions::new(area_of(1200., 900.), StartMain::Terminal, 2, &start_style());
+
+        let lefts: Vec<f32> = regions.band.iter().map(|rect| rect.origin.x).collect();
+        let widths: Vec<f32> = regions.band.iter().map(|rect| rect.size.width).collect();
+
+        assert_eq!(lefts, [160., 605.]);
+        assert_eq!(widths, [435., 435.]);
+    }
+
+    #[test]
+    fn a_tile_in_the_band_is_never_narrower_than_the_smallest_tile() {
+        let style = start_style();
+
+        let regions = StartRegions::new(area_of(700., 900.), StartMain::Terminal, 5, &style);
+
+        assert_eq!(regions.band.len(), 2);
+        assert!(
+            regions
+                .band
+                .iter()
+                .all(|rect| rect.size.width >= style.min_tile.width)
+        );
+    }
+
+    #[test]
+    fn a_column_too_narrow_for_one_tile_has_no_band() {
+        let regions =
+            StartRegions::new(area_of(300., 900.), StartMain::Terminal, 2, &start_style());
+
+        assert!(regions.band.is_empty());
+        assert_eq!(regions.main, Rect::new(24., 28., 252., 844.));
+    }
+
+    #[test]
+    fn a_short_area_sends_the_band_tiles_to_the_tray_and_keeps_the_main_area() {
+        let regions =
+            StartRegions::new(area_of(1200., 450.), StartMain::Terminal, 1, &start_style());
+        let specs = [orchestrator_spec(), user_spec(1)];
+
+        let layout = start_layout(&specs, &regions, &[]);
+
+        assert!(regions.band.is_empty());
+        assert_eq!(
+            layout.rect(TileId(0)),
+            Some(Rect::new(160., 28., 880., 394.))
+        );
+        assert_eq!(layout.tray, [TileId(1)]);
+    }
+
+    #[test]
+    fn the_band_stays_while_the_main_area_keeps_the_height_of_the_smallest_tile() {
+        let style = start_style();
+
+        let regions = StartRegions::new(area_of(1200., 502.), StartMain::Terminal, 1, &style);
+
+        assert_eq!(regions.band.len(), 1);
+        assert!((regions.main.size.height - style.min_tile.height).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn the_band_goes_when_the_main_area_would_get_less_than_the_smallest_tile() {
+        let regions =
+            StartRegions::new(area_of(1200., 501.), StartMain::Terminal, 1, &start_style());
+
+        assert!(regions.band.is_empty());
+    }
+
+    #[test]
+    fn the_tiles_that_do_not_fit_in_the_band_go_to_the_tray() {
+        let specs = [
+            orchestrator_spec(),
+            user_spec(1),
+            user_spec(2),
+            user_spec(3),
+            user_spec(4),
+            user_spec(5),
+        ];
+        let regions =
+            StartRegions::new(area_of(700., 900.), StartMain::Terminal, 5, &start_style());
+
+        let layout = start_layout(&specs, &regions, &[]);
+
+        let placed: Vec<TileId> = layout.placed.iter().map(|(id, _)| *id).collect();
+        assert_eq!(placed, [TileId(0), TileId(1), TileId(2)]);
+        assert_eq!(layout.tray, [TileId(3), TileId(4), TileId(5)]);
+    }
+
+    #[test]
+    fn a_minimized_tile_goes_to_the_tray_and_leaves_its_place_to_the_next() {
+        let mut minimized = user_spec(1);
+        minimized.minimized = true;
+        let specs = [orchestrator_spec(), minimized, user_spec(2)];
+        let regions =
+            StartRegions::new(area_of(1200., 900.), StartMain::Terminal, 1, &start_style());
+
+        let layout = start_layout(&specs, &regions, &[]);
+
+        assert_eq!(layout.tray, [TileId(1)]);
+        assert_eq!(layout.rect(TileId(2)), regions.band.first().copied());
+        assert_eq!(layout.rect(TileId(0)), Some(regions.main));
+    }
+
+    fn process_spec(id: u32) -> TileSpec {
+        TileSpec::new(TileId(id), TileKind::Process, Activity::Running)
+    }
+
+    #[test]
+    fn a_user_terminal_beats_a_process_for_a_place_in_the_band() {
+        let specs = [orchestrator_spec(), process_spec(1), user_spec(2)];
+        let regions =
+            StartRegions::new(area_of(560., 900.), StartMain::Terminal, 2, &start_style());
+
+        let layout = start_layout(&specs, &regions, &[]);
+
+        assert_eq!(regions.band.len(), 1);
+        assert_eq!(layout.rect(TileId(2)), regions.band.first().copied());
+        assert_eq!(layout.tray, [TileId(1)]);
+    }
+
+    #[test]
+    fn the_user_terminal_that_had_the_focus_last_gets_a_place_in_the_band() {
+        let specs = [
+            orchestrator_spec(),
+            user_spec(1),
+            user_spec(2),
+            user_spec(3),
+        ];
+        let regions =
+            StartRegions::new(area_of(700., 900.), StartMain::Terminal, 3, &start_style());
+
+        let layout = start_layout(&specs, &regions, &[TileId(3)]);
+
+        assert_eq!(regions.band.len(), 2);
+        assert_eq!(layout.tray, [TileId(2)]);
+    }
+
+    #[test]
+    fn the_least_recent_user_terminal_goes_to_the_tray_first() {
+        let specs = [
+            orchestrator_spec(),
+            user_spec(1),
+            user_spec(2),
+            user_spec(3),
+        ];
+        let regions =
+            StartRegions::new(area_of(700., 900.), StartMain::Terminal, 3, &start_style());
+
+        let layout = start_layout(&specs, &regions, &[TileId(2), TileId(3), TileId(1)]);
+
+        assert_eq!(layout.tray, [TileId(1)]);
+    }
+
+    #[test]
+    fn the_tiles_in_the_band_keep_their_order_when_the_focus_moves() {
+        let specs = [orchestrator_spec(), user_spec(1), user_spec(2)];
+        let regions =
+            StartRegions::new(area_of(700., 900.), StartMain::Terminal, 2, &start_style());
+
+        let layout = start_layout(&specs, &regions, &[TileId(2), TileId(1)]);
+
+        assert_eq!(layout.rect(TileId(1)), regions.band.first().copied());
+        assert_eq!(layout.rect(TileId(2)), regions.band.get(1).copied());
+    }
+
+    /// A user terminal on the Start tab of the project without tasks.
+    fn start_with_terminals(
+        count: usize,
+        cx: &mut TestAppContext,
+    ) -> (Entity<Workspace>, &mut VisualTestContext) {
+        let (workspace, cx) = setup(cx);
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.select_project(crate::model::ProjectId(3), cx);
+        });
+        for _ in 0..count {
+            cx.dispatch_action(NewTerminal);
+        }
+        redraw(cx);
+
+        (workspace, cx)
+    }
+
+    fn user_terminals(workspace: &Entity<Workspace>, cx: &VisualTestContext) -> Vec<TerminalId> {
+        workspace.read_with(cx, |workspace, _| {
+            workspace.active_task().user_terminals.clone()
+        })
+    }
+
+    /// The rect of a tile in window coordinates, and the terminal area it sits in.
+    fn on_screen(
+        workspace: &Entity<Workspace>,
+        terminal: TerminalId,
+        cx: &VisualTestContext,
+    ) -> (Rect, Rect) {
+        workspace.read_with(cx, |workspace, _| {
+            let area = workspace.terminal_area.expect("the area is measured");
+            let (x, y) = (f32::from(area.origin.x), f32::from(area.origin.y));
+            let shift = |rect: Rect| {
+                Rect::new(
+                    rect.origin.x + x,
+                    rect.origin.y + y,
+                    rect.size.width,
+                    rect.size.height,
+                )
+            };
+            let tile = workspace
+                .layout
+                .rect(TileId(terminal.0))
+                .expect("the tile is placed");
+            let area = Rect::new(
+                x,
+                y,
+                f32::from(area.size.width),
+                f32::from(area.size.height),
+            );
+
+            (shift(tile), area)
+        })
+    }
+
+    fn bounds_rect(selector: &'static str, cx: &mut VisualTestContext) -> Rect {
+        let bounds = cx.debug_bounds(selector).expect("the element is on screen");
+
+        Rect::new(
+            f32::from(bounds.origin.x),
+            f32::from(bounds.origin.y),
+            f32::from(bounds.size.width),
+            f32::from(bounds.size.height),
+        )
+    }
+
+    #[gpui::test]
+    fn a_user_terminal_on_the_start_tab_shows_under_the_plan_editor(cx: &mut TestAppContext) {
+        let (workspace, cx) = start_with_terminals(1, cx);
+        let terminal = user_terminals(&workspace, cx)[0];
+
+        let (tile, area) = on_screen(&workspace, terminal, cx);
+
+        let editor = bounds_rect("plan-editor", cx);
+        assert!(tile.size.width > 0. && tile.size.height > 0.);
+        assert!(
+            tile.origin.y >= editor.bottom(),
+            "{tile:?} under {editor:?}"
+        );
+        assert!(
+            tile.bottom() <= area.bottom() + 0.01,
+            "{tile:?} in {area:?}"
+        );
+        assert!(editor.size.height > 0.);
+    }
+
+    #[gpui::test]
+    fn the_tile_of_a_user_terminal_on_the_start_tab_is_drawn(cx: &mut TestAppContext) {
+        let (workspace, cx) = start_with_terminals(1, cx);
+        let terminal = user_terminals(&workspace, cx)[0];
+
+        assert_eq!(terminal, TerminalId(USER_TERMINAL));
+        assert!(cx.debug_bounds("tile-slot-14").is_some());
+    }
+
+    /// Opens a running Start orchestrator on the project without tasks.
+    fn run_start(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) {
+        workspace.update(cx, |workspace, cx| {
+            let task = workspace.data.add_running_start(crate::model::ProjectId(3));
+            workspace.select_task(task, cx);
+        });
+    }
+
+    #[gpui::test]
+    fn a_user_terminal_under_a_running_start_orchestrator_does_not_overlap_it(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = setup(cx);
+        run_start(&workspace, cx);
+        workspace.update_in(cx, Workspace::new_user_terminal);
+        redraw(cx);
+        let terminal = user_terminals(&workspace, cx)[0];
+        let orchestrator = workspace.read_with(cx, |workspace, _| {
+            let id = workspace.active_task().orchestrator;
+            id.and_then(|id| workspace.data.agent(id))
+                .map_or(TerminalId(u32::MAX), |agent| agent.terminal)
+        });
+
+        let (tile, area) = on_screen(&workspace, terminal, cx);
+        let (main, _) = on_screen(&workspace, orchestrator, cx);
+
+        assert!(tile.size.width > 0. && tile.size.height > 0.);
+        assert!(main.size.height > 0.);
+        assert!(tile.origin.y >= main.bottom(), "{tile:?} under {main:?}");
+        assert!(tile.bottom() <= area.bottom() + 0.01);
+    }
+
+    #[gpui::test]
+    fn without_other_tiles_the_plan_editor_keeps_its_column(cx: &mut TestAppContext) {
+        let (workspace, cx) = start_with_terminals(0, cx);
+
+        let editor = bounds_rect("plan-editor", cx);
+
+        let (width, height) = workspace.read_with(cx, |workspace, _| {
+            let area = workspace
+                .terminal_area_size()
+                .expect("the area is measured");
+
+            (f32::from(area.width), f32::from(area.height))
+        });
+        assert!((editor.size.width - (width - 48.).min(760.)).abs() < 0.5);
+        assert!((editor.size.height - (height - 40.)).abs() < 0.5);
+    }
+
+    #[gpui::test]
+    fn without_other_tiles_the_start_tile_keeps_its_column(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        run_start(&workspace, cx);
+        redraw(cx);
+
+        let (placed, width, height) = workspace.read_with(cx, |workspace, _| {
+            let area = workspace
+                .terminal_area_size()
+                .expect("the area is measured");
+
+            (
+                workspace.layout.placed.clone(),
+                f32::from(area.width),
+                f32::from(area.height),
+            )
+        });
+
+        assert_eq!(placed.len(), 1);
+        let (_, rect) = placed[0];
+        assert!((rect.size.width - (width - 48.).min(880.)).abs() < 0.5);
+        assert!((rect.size.height - (height - 56.)).abs() < 0.5);
+    }
+
+    #[gpui::test]
+    fn too_many_terminals_on_the_start_tab_go_to_the_tray(cx: &mut TestAppContext) {
+        let (workspace, cx) = start_with_terminals(4, cx);
+
+        let (placed, tray, capacity) = workspace.read_with(cx, |workspace, _| {
+            let specs = tile_specs(workspace);
+
+            (
+                workspace.layout.placed.len(),
+                workspace.layout.tray.len(),
+                start_regions(workspace, &specs).band.len(),
+            )
+        });
+
+        assert!(tray > 0, "all four terminals fit the band");
+        assert_eq!(placed, capacity);
+        assert_eq!(placed + tray, 4);
+    }
+
+    /// A Start tab with one terminal more than its band holds. Returns them, oldest first.
+    fn start_over_capacity(
+        cx: &mut TestAppContext,
+    ) -> (Entity<Workspace>, &mut VisualTestContext, Vec<TerminalId>) {
+        let (workspace, cx) = start_with_terminals(0, cx);
+        let capacity = workspace.read_with(cx, |workspace, _| {
+            let area = workspace
+                .terminal_area_size()
+                .expect("the area is measured");
+            let style = layout_style(workspace);
+
+            StartRegions::new(area, StartMain::Editor, usize::MAX, &style)
+                .band
+                .len()
+        });
+
+        for _ in 0..=capacity {
+            cx.dispatch_action(NewTerminal);
+        }
+        redraw(cx);
+        let terminals = user_terminals(&workspace, cx);
+
+        (workspace, cx, terminals)
+    }
+
+    fn places(
+        workspace: &Entity<Workspace>,
+        terminal: TerminalId,
+        cx: &VisualTestContext,
+    ) -> (bool, bool) {
+        workspace.read_with(cx, |workspace, _| {
+            (is_placed(workspace, terminal), in_tray(workspace, terminal))
+        })
+    }
+
+    #[gpui::test]
+    fn the_newest_terminal_on_the_start_tab_is_placed_and_the_oldest_goes_to_the_tray(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx, terminals) = start_over_capacity(cx);
+        let (oldest, newest) = (terminals[0], terminals[terminals.len() - 1]);
+
+        assert_eq!(places(&workspace, newest, cx), (true, false));
+        assert_eq!(places(&workspace, oldest, cx), (false, true));
+    }
+
+    #[gpui::test]
+    fn a_click_on_the_sidebar_row_of_a_tray_terminal_places_it_and_the_least_recent_leaves(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx, terminals) = start_over_capacity(cx);
+        let (oldest, next) = (terminals[0], terminals[1]);
+        let row = cx
+            .debug_bounds("user-row-14")
+            .expect("the row is on screen");
+
+        assert_eq!(oldest, TerminalId(USER_TERMINAL));
+        cx.simulate_click(
+            row.origin + gpui::point(px(20.), px(14.)),
+            gpui::Modifiers::none(),
+        );
+        redraw(cx);
+
+        assert_eq!(places(&workspace, oldest, cx), (true, false));
+        assert_eq!(places(&workspace, next, cx), (false, true));
+    }
+
+    #[gpui::test]
+    fn picking_the_chip_of_a_tray_terminal_places_it_and_the_least_recent_leaves(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx, terminals) = start_over_capacity(cx);
+        let (oldest, next) = (terminals[0], terminals[1]);
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.restore(oldest, cx);
+            workspace.focus_terminal(oldest, cx);
+        });
+        redraw(cx);
+
+        assert_eq!(places(&workspace, oldest, cx), (true, false));
+        assert_eq!(places(&workspace, next, cx), (false, true));
+    }
+
+    #[gpui::test]
+    fn a_closed_terminal_leaves_the_list_of_the_terminals_that_had_the_focus(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx, terminals) = start_over_capacity(cx);
+        let newest = terminals[terminals.len() - 1];
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.close_user_terminal(newest, cx);
+        });
+
+        assert!(workspace.read_with(cx, |workspace, _| !workspace.recent_focus.contains(&newest)));
+    }
+
+    #[gpui::test]
+    fn a_user_terminal_on_the_start_tab_keeps_the_band_height_and_has_no_resize_handle(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = start_with_terminals(1, cx);
+        let terminal = user_terminals(&workspace, cx)[0];
+        workspace.update(cx, |workspace, cx| {
+            workspace.resize_user_terminal(terminal, area_of(500., 400.), cx);
+        });
+        redraw(cx);
+
+        let (height, small) = workspace.read_with(cx, |workspace, _| {
+            let rect = workspace.layout.rect(TileId(terminal.0));
+
+            (
+                rect.map(|rect| rect.size.height),
+                layout_style(workspace).small_tile_height,
+            )
+        });
+
+        assert!((height.expect("the tile is placed") - small).abs() < 0.5);
+        assert!(cx.debug_bounds("resize-14").is_none());
+    }
+
+    #[gpui::test]
+    fn the_mine_mark_is_a_group_that_says_agents_have_no_access(cx: &mut TestAppContext) {
+        use gpui::Element as _;
+        use gpui::accesskit::{Node, Role as AccessRole};
+
+        cx.update(swarm_ui::theme::init);
+
+        let element = mine_mark(TerminalId(1)).into_element();
+        let mut node = Node::new(AccessRole::Unknown);
+        element.write_a11y_info(&mut node);
+
+        assert_eq!(element.a11y_role(), Some(AccessRole::Group));
+        assert_eq!(node.label(), Some("Mine, agents have no access"));
+    }
+
+    #[gpui::test]
+    fn a_user_terminal_tile_shows_the_mine_mark(cx: &mut TestAppContext) {
+        let (_, cx) = setup(cx);
+        cx.dispatch_action(NewTerminal);
+        redraw(cx);
+
+        assert!(cx.debug_bounds("tile-mine-14").is_some());
+    }
+
+    #[gpui::test]
+    fn a_user_terminal_on_a_task_keeps_its_resize_handle(cx: &mut TestAppContext) {
+        let (_, cx) = setup(cx);
+        cx.dispatch_action(NewTerminal);
+        redraw(cx);
+
+        assert!(cx.debug_bounds("resize-14").is_some());
     }
 
     mod tile_requests {

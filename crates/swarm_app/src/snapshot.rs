@@ -10,19 +10,15 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
-use gpui::{AnyWindowHandle, App, AsyncApp, Context, SharedString, Window};
+use gpui::{AnyWindowHandle, App, AsyncApp, Context, Window};
 use swarm_protocol::{
     CheckState, CloseCheck, RemoveCheck, ReviewSource, TaskCloseCheck, TaskId as DaemonTaskId,
     Usage, UsageProblem,
 };
-use swarm_ui::prelude::Color;
 use swarm_ui::theme::{self, Appearance};
 
 use crate::close_task::CheckState as DialogCheck;
-use crate::model::{
-    AgentKind, DaemonAgent, FakeLine, PLAN_TASK, ProjectId, SAMPLE_NOW, START_TASK, TaskId,
-    TaskStatus,
-};
+use crate::model::{AgentKind, ProjectId, SAMPLE_NOW, TaskId, TaskStatus};
 use crate::palette::Overlay;
 use crate::plan_editor::PlanEditor;
 use crate::remove_project::RemoveProjectDialog;
@@ -34,6 +30,47 @@ type OpenOverlay = fn(&mut Workspace, &mut Window, &mut Context<Workspace>);
 
 fn open_island(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
     workspace.new_user_terminal(window, cx);
+}
+
+/// The Close terminal dialog of a user terminal that runs.
+fn open_close_terminal(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    workspace.new_user_terminal(window, cx);
+
+    let terminal = workspace.active_task().user_terminals.last().copied();
+    if let Some(terminal) = terminal {
+        workspace.request_close_terminal(terminal, window, cx);
+    }
+}
+
+/// The Start tab with the plan editor and user terminals in the band under it, one more
+/// than the band holds.
+fn open_start_terminal(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    open_start_empty(workspace, window, cx);
+
+    for _ in 0..3 {
+        workspace.new_user_terminal(window, cx);
+    }
+}
+
+/// The Start tab with a running Start orchestrator and user terminals under it.
+fn open_running_start_terminal(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    open_running_start(workspace, ProjectId(3), cx);
+
+    for _ in 0..2 {
+        workspace.new_user_terminal(window, cx);
+    }
 }
 
 fn open_start(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
@@ -70,47 +107,7 @@ fn open_start_error(workspace: &mut Workspace, window: &mut Window, cx: &mut Con
 /// The project's Start tab with its orchestrator running, as the daemon reports it. The
 /// tab shows the terminal and not the plan editor.
 fn open_running_start(workspace: &mut Workspace, project: ProjectId, cx: &mut Context<Workspace>) {
-    let name = if workspace.data.tasks_of(project).next().is_some() {
-        PLAN_TASK
-    } else {
-        START_TASK
-    };
-    let lines = vec![FakeLine {
-        text: "\u{203a} ready".into(),
-        color: Color::Muted,
-    }];
-    let task = workspace
-        .data
-        .add_task(project, name, AgentKind::ClaudeCode, lines);
-
-    if let Some(entry) = workspace
-        .data
-        .tasks
-        .iter_mut()
-        .find(|entry| entry.id == task)
-    {
-        entry.is_start = true;
-        entry.branch = SharedString::default();
-    }
-    if let Some(agent) = workspace
-        .data
-        .agents
-        .iter_mut()
-        .find(|agent| agent.task == task)
-    {
-        agent.daemon = Some(DaemonAgent {
-            id: swarm_protocol::AgentId(100),
-            project: swarm_protocol::ProjectId(0),
-            task: None,
-            terminal: None,
-            status: swarm_protocol::AgentStatus::Idle,
-            message: None,
-            lifecycle: swarm_protocol::AgentLifecycle::Running,
-            revision: 1,
-            worktree: PathBuf::new(),
-            branch: "main".into(),
-        });
-    }
+    let task = workspace.data.add_running_start(project);
 
     workspace.select_task(task, cx);
 }
@@ -942,6 +939,36 @@ pub(crate) fn run(directory: PathBuf, cx: &mut App) {
                 Appearance::Dark,
                 "workspace-island-dark.png",
                 Some(open_island),
+            ),
+            (
+                Appearance::Light,
+                "workspace-close-terminal-light.png",
+                Some(open_close_terminal),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-close-terminal-dark.png",
+                Some(open_close_terminal),
+            ),
+            (
+                Appearance::Light,
+                "workspace-start-terminal-light.png",
+                Some(open_start_terminal),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-start-terminal-dark.png",
+                Some(open_start_terminal),
+            ),
+            (
+                Appearance::Light,
+                "workspace-start-running-terminal-light.png",
+                Some(open_running_start_terminal),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-start-running-terminal-dark.png",
+                Some(open_running_start_terminal),
             ),
             (
                 Appearance::Light,

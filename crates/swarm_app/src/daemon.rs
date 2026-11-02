@@ -9,8 +9,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    AppContext as _, AsyncApp, Context, Entity, Focusable as _, PathPromptOptions, SharedString,
-    Size, Subscription, WeakEntity, Window, px,
+    App, AppContext as _, AsyncApp, Context, Entity, Focusable as _, PathPromptOptions,
+    SharedString, Size, Subscription, WeakEntity, Window, px,
 };
 use swarm_protocol::{
     AgentChange, AgentId as DaemonAgentId, AgentInfo, AgentLifecycle, Client, ClientError,
@@ -280,6 +280,7 @@ impl Workspace {
         self.removing_projects.clear();
         self.plan_editors.clear();
         self.previous_tabs.clear();
+        self.recent_focus.clear();
         self.focused_terminal = None;
         self.data.sync_projects(projects);
 
@@ -570,7 +571,8 @@ impl Workspace {
 
     /// Closes a project's Start tab after its orchestrator exited. Focus moves to the
     /// lowest task the orchestrator made, else to the tab used before. A project with
-    /// no other tab keeps an empty Start tab.
+    /// no other tab keeps an empty Start tab, and so does a tab with user terminals: it
+    /// then shows the plan editor and keeps the terminals.
     pub(crate) fn close_start_tab(
         &mut self,
         project: swarm_protocol::ProjectId,
@@ -591,21 +593,28 @@ impl Workspace {
         let made = self.data.first_task_made_by(project, agent);
         let before = self.previous_tabs.get(&project).copied();
         let others = self.data.tasks_of(project).any(|task| task.id != tab);
+        let has_terminals = self
+            .data
+            .task(tab)
+            .is_some_and(|task| !task.user_terminals.is_empty());
 
-        let gone = if others {
+        let gone = if others && !has_terminals {
             self.data.remove_task(tab)
         } else {
             self.data.remove_agents_of(tab)
         };
         for terminal in gone {
-            self.forget_terminal(terminal);
+            self.forget_terminal(terminal, cx);
         }
 
         if was_active && others {
-            let remaining = |task: &TaskId| self.data.task(*task).is_some();
-            let next = made
-                .or(before.filter(remaining))
-                .or_else(|| self.data.tasks_of(project).next().map(|task| task.id));
+            let remaining = |task: &TaskId| *task != tab && self.data.task(*task).is_some();
+            let next = made.or(before.filter(remaining)).or_else(|| {
+                self.data
+                    .tasks_of(project)
+                    .map(|task| task.id)
+                    .find(|task| *task != tab)
+            });
 
             if let Some(next) = next {
                 self.select_task(next, cx);
@@ -715,7 +724,7 @@ impl Workspace {
         let was_open = self.active_task == task;
 
         for terminal in self.data.remove_task(task) {
-            self.forget_terminal(terminal);
+            self.forget_terminal(terminal, cx);
         }
 
         self.review_sources.remove(&task);
@@ -1185,10 +1194,12 @@ impl Workspace {
     }
 
     /// Forgets a tile's live view and everything that points at it.
-    fn forget_terminal(&mut self, terminal: TerminalId) {
+    fn forget_terminal(&mut self, terminal: TerminalId, cx: &App) {
         self.drop_live_terminal(terminal);
+        self.drop_close_terminal_dialog(terminal, cx);
         self.user_sizes.remove(&terminal);
         self.minimized.remove(&terminal);
+        self.forget_recent_focus(terminal);
 
         if self.focused_terminal == Some(terminal) {
             self.focused_terminal = None;
@@ -4486,6 +4497,90 @@ pub(crate) mod tests {
         assert!(on_start);
         assert_eq!(starts, 0);
         assert_eq!(active_name(&workspace, cx), "first");
+    }
+
+    /// Adds a user terminal to the open tab and returns it.
+    fn add_user_terminal(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> TerminalId {
+        workspace.update(cx, |workspace, cx| {
+            let task = workspace.active_task;
+            cx.notify();
+
+            workspace.data.add_user_terminal(task)
+        })
+    }
+
+    fn start_tab(workspace: &Entity<Workspace>, cx: &VisualTestContext) -> Option<Vec<TerminalId>> {
+        workspace.read_with(cx, |workspace, _| {
+            let tab = workspace.data.start_task(workspace.active_project)?;
+
+            Some(workspace.data.task(tab)?.user_terminals.clone())
+        })
+    }
+
+    #[gpui::test]
+    fn the_start_tab_stays_with_its_user_terminals_when_its_orchestrator_exits(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx, _requests) = start_workspace(vec![task_info(7, 5, "one")], cx);
+        running_start(&workspace, cx);
+        workspace.update(cx, Workspace::open_start_task);
+        let terminal = add_user_terminal(&workspace, cx);
+
+        stop_start(&workspace, cx);
+
+        assert_eq!(start_tab(&workspace, cx), Some(vec![terminal]));
+        assert!(!workspace.read_with(cx, |workspace, _| {
+            workspace.data.start_runs(workspace.active_project)
+        }));
+    }
+
+    #[gpui::test]
+    fn a_kept_start_tab_shows_the_plan_editor_and_draws_its_user_terminal(cx: &mut TestAppContext) {
+        let (workspace, cx, _requests) = start_workspace(vec![task_info(7, 5, "one")], cx);
+        running_start(&workspace, cx);
+        workspace.update(cx, Workspace::open_start_task);
+        let terminal = add_user_terminal(&workspace, cx);
+        stop_start(&workspace, cx);
+
+        workspace.update(cx, Workspace::open_start_task);
+        redraw(cx);
+
+        let (editor, placed) = workspace.read_with(cx, |workspace, _| {
+            (
+                workspace.shown_plan_editor().is_some(),
+                workspace
+                    .layout
+                    .rect(swarm_layout::TileId(terminal.0))
+                    .is_some(),
+            )
+        });
+        assert!(editor);
+        assert!(placed);
+    }
+
+    #[gpui::test]
+    fn focus_still_leaves_a_kept_start_tab_for_the_tab_used_before(cx: &mut TestAppContext) {
+        let (workspace, cx, _requests) = start_workspace(vec![task_info(7, 5, "one")], cx);
+        running_start(&workspace, cx);
+        workspace.update(cx, Workspace::open_start_task);
+        add_user_terminal(&workspace, cx);
+
+        stop_start(&workspace, cx);
+
+        assert_eq!(active_name(&workspace, cx), "one");
+    }
+
+    #[gpui::test]
+    fn without_a_user_terminal_the_start_tab_closes_when_its_orchestrator_exits(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx, _requests) = start_workspace(vec![task_info(7, 5, "one")], cx);
+        running_start(&workspace, cx);
+        workspace.update(cx, Workspace::open_start_task);
+
+        stop_start(&workspace, cx);
+
+        assert_eq!(start_tab(&workspace, cx), None);
     }
 
     #[gpui::test]

@@ -3,6 +3,7 @@
 mod actions;
 mod app_menus;
 mod close_task;
+mod close_terminal;
 mod daemon;
 mod eggs;
 mod file_tree;

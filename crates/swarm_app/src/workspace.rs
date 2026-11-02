@@ -40,6 +40,8 @@ pub(crate) const RIGHT_PANEL_WIDTH: Pixels = px(320.);
 const PANEL_MARGIN: f32 = 8.;
 /// The header's height, with its bottom border.
 const HEADER_HEIGHT: f32 = 47.;
+/// How many terminals `Workspace::recent_focus` remembers.
+const RECENT_FOCUS: usize = 32;
 
 /// Distance from the window top to the middle of the header's content (the panel border
 /// and the header's bottom border do not count). The traffic lights, the sidebar's window
@@ -90,6 +92,9 @@ pub(crate) struct Workspace {
     pub(crate) sidebar_focus: FocusHandle,
     pub minimized: HashSet<TerminalId>,
     pub focused_terminal: Option<TerminalId>,
+    /// The terminals that took the focus last, the latest first. A Start tab uses it to
+    /// decide which tiles get a place in its band.
+    pub(crate) recent_focus: Vec<TerminalId>,
     focus_handle: FocusHandle,
     pending_focus: Option<TerminalId>,
     pub(crate) terminal_focus: HashMap<TerminalId, FocusHandle>,
@@ -280,6 +285,7 @@ impl Workspace {
             sidebar_focus: cx.focus_handle(),
             minimized: HashSet::new(),
             focused_terminal,
+            recent_focus: Vec::new(),
             focus_handle,
             pending_focus: None,
             terminal_focus: HashMap::new(),
@@ -582,7 +588,20 @@ impl Workspace {
     pub(crate) fn claim_focus(&mut self, terminal: TerminalId, cx: &mut Context<Self>) {
         self.focused_terminal = Some(terminal);
         self.pending_focus = Some(terminal);
+        self.note_recent_focus(terminal);
         cx.notify();
+    }
+
+    /// Puts the terminal first in the list of the terminals that had the focus.
+    pub(crate) fn note_recent_focus(&mut self, terminal: TerminalId) {
+        self.recent_focus.retain(|other| *other != terminal);
+        self.recent_focus.insert(0, terminal);
+        self.recent_focus.truncate(RECENT_FOCUS);
+    }
+
+    /// A closed terminal has no place in the list of the terminals that had the focus.
+    pub(crate) fn forget_recent_focus(&mut self, terminal: TerminalId) {
+        self.recent_focus.retain(|other| *other != terminal);
     }
 
     /// The handle that takes keyboard focus for a tile. Made on first use.
