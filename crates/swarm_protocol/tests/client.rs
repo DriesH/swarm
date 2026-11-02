@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use swarm_protocol::{
     AgentChange, AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, Client,
     ClientError, CreateTask, CreateTerminal, DiffStat, Event, FileStat, GridSize, MessageEvent,
-    MessageId, MessageInfo, MessageKind, ProjectId, ProjectInfo, Request, TaskId, TaskInfo,
-    TerminalId, TerminalInfo, TerminalKind, VERSION, read, write,
+    MessageId, MessageInfo, MessageKind, PlanDraft, ProjectId, ProjectInfo, Request, TaskId,
+    TaskInfo, TerminalId, TerminalInfo, TerminalKind, VERSION, read, write,
 };
 use swarm_term::{Palette, Rgb, Size, TerminalInput, TerminalOutput};
 
@@ -683,11 +683,15 @@ fn start_orchestrator_sends_the_request_and_returns_the_agent() {
             call,
             project,
             kind,
+            plan,
         }) = fake.request()
         else {
             panic!("expected a StartOrchestrator request");
         };
-        assert_eq!((project, kind), (ProjectId(2), Some(AgentKind::Codex)));
+        assert_eq!(
+            (project, kind, plan),
+            (ProjectId(2), Some(AgentKind::Codex), None)
+        );
         fake.send(&Event::AgentStarted {
             call,
             agent: agent_info(AgentStatus::Unknown),
@@ -697,7 +701,30 @@ fn start_orchestrator_sends_the_request_and_returns_the_agent() {
     let client = Client::connect(&socket).expect("connect");
 
     let agent = client
-        .start_orchestrator(ProjectId(2), Some(AgentKind::Codex))
+        .start_orchestrator(ProjectId(2), Some(AgentKind::Codex), None)
+        .expect("start orchestrator");
+
+    assert_eq!(agent, agent_info(AgentStatus::Unknown));
+}
+
+#[test]
+fn start_orchestrator_sends_the_plan() {
+    let socket = serve(|fake| {
+        fake.handshake(VERSION);
+        let Some(Request::StartOrchestrator { call, plan, .. }) = fake.request() else {
+            panic!("expected a StartOrchestrator request");
+        };
+        assert_eq!(plan.as_deref(), Some("## What\n\nlogin"));
+        fake.send(&Event::AgentStarted {
+            call,
+            agent: agent_info(AgentStatus::Unknown),
+        });
+        fake.drain();
+    });
+    let client = Client::connect(&socket).expect("connect");
+
+    let agent = client
+        .start_orchestrator(ProjectId(2), None, Some("## What\n\nlogin".into()))
         .expect("start orchestrator");
 
     assert_eq!(agent, agent_info(AgentStatus::Unknown));
@@ -719,9 +746,94 @@ fn start_orchestrator_reports_a_daemon_error() {
     });
     let client = Client::connect(&socket).expect("connect");
 
-    let result = client.start_orchestrator(ProjectId(9), None);
+    let result = client.start_orchestrator(ProjectId(9), None, None);
 
     assert!(matches!(result, Err(ClientError::Daemon(message)) if message == "no such project"));
+}
+
+#[test]
+fn plan_draft_returns_the_draft_and_template() {
+    let draft = PlanDraft {
+        text: Some("## What\n\nlogin".into()),
+        template: "## What\n".into(),
+    };
+    let reply = draft.clone();
+    let socket = serve(move |fake| {
+        fake.handshake(VERSION);
+        let Some(Request::PlanDraft { call, project }) = fake.request() else {
+            panic!("expected a PlanDraft request");
+        };
+        assert_eq!(project, ProjectId(2));
+        fake.send(&Event::PlanDraft { call, draft: reply });
+        fake.drain();
+    });
+    let client = Client::connect(&socket).expect("connect");
+
+    let found = client.plan_draft(ProjectId(2)).expect("plan draft");
+
+    assert_eq!(found, draft);
+}
+
+#[test]
+fn plan_draft_reports_a_daemon_error() {
+    let socket = serve(|fake| {
+        fake.handshake(VERSION);
+        let Some(Request::PlanDraft { call, .. }) = fake.request() else {
+            panic!("expected a PlanDraft request");
+        };
+        fake.send(&Event::Error {
+            call: Some(call),
+            id: None,
+            message: "no such project".into(),
+        });
+        fake.drain();
+    });
+    let client = Client::connect(&socket).expect("connect");
+
+    let result = client.plan_draft(ProjectId(9));
+
+    assert!(matches!(result, Err(ClientError::Daemon(message)) if message == "no such project"));
+}
+
+#[test]
+fn save_plan_draft_sends_the_text_and_waits_for_done() {
+    let socket = serve(|fake| {
+        fake.handshake(VERSION);
+        let Some(Request::SavePlanDraft {
+            call,
+            project,
+            text,
+        }) = fake.request()
+        else {
+            panic!("expected a SavePlanDraft request");
+        };
+        assert_eq!((project, text), (ProjectId(2), Some("draft".to_owned())));
+        fake.send(&Event::Done { call });
+        fake.drain();
+    });
+    let client = Client::connect(&socket).expect("connect");
+
+    let result = client.save_plan_draft(ProjectId(2), Some("draft".into()));
+
+    assert!(result.is_ok());
+}
+
+#[test]
+fn save_plan_draft_without_text_clears_the_draft() {
+    let socket = serve(|fake| {
+        fake.handshake(VERSION);
+        let Some(Request::SavePlanDraft { call, text, .. }) = fake.request() else {
+            panic!("expected a SavePlanDraft request");
+        };
+        assert_eq!(text, None);
+        fake.send(&Event::Done { call });
+        fake.drain();
+    });
+    let client = Client::connect(&socket).expect("connect");
+
+    let result = client.save_plan_draft(ProjectId(2), None);
+
+    assert!(result.is_ok());
 }
 
 #[test]

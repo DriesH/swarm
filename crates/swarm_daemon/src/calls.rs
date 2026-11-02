@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::Value;
-use swarm_core::store::{MAX_MESSAGE_BYTES, NewMessage};
+use swarm_core::store::NewMessage;
 use swarm_core::{WorkerCheckout, git, github};
 use swarm_protocol::agent::{
     AgentRequest, AgentSummary, Call, Committed, Merged, Reply, Sent, TaskSummary, TaskUntil,
@@ -24,7 +24,7 @@ use swarm_protocol::{
 use crate::Services;
 use crate::agent_socket::{MAX_WAITS, Slot, Throttle};
 use crate::agents::{Place, Refused, STOPPED_BY_USER, lock};
-use crate::messages::Claim;
+use crate::messages::{Claim, check_size};
 use crate::processes::Spawn;
 use crate::{pull_requests, stats, tasks};
 
@@ -54,18 +54,6 @@ fn refuse<T>(message: impl Into<String>) -> Result<T, Failure> {
 }
 
 type Outcome = Result<Value, Failure>;
-
-fn check_size(text: &str) -> Result<(), Failure> {
-    if text.len() <= MAX_MESSAGE_BYTES {
-        return Ok(());
-    }
-
-    refuse(format!(
-        "message is {} KiB; the limit is {} KiB: shorten it or write it to a file and send the path",
-        text.len().div_ceil(1024),
-        MAX_MESSAGE_BYTES >> 10,
-    ))
-}
 
 /// What an orchestrator asked for in `spawn`, apart from the name.
 struct Worker {
@@ -894,21 +882,6 @@ mod tests {
             pull_request: None,
             close_after_merge: false,
         }
-    }
-
-    #[test]
-    fn a_message_over_64_kib_is_refused_with_a_way_out() {
-        let at_limit = "x".repeat(MAX_MESSAGE_BYTES);
-        let over = "x".repeat(MAX_MESSAGE_BYTES + 1);
-
-        assert!(check_size(&at_limit).is_ok());
-        let Err(Failure(message)) = check_size(&over) else {
-            panic!("a message over the limit was accepted");
-        };
-        assert_eq!(
-            message,
-            "message is 65 KiB; the limit is 64 KiB: shorten it or write it to a file and send the path"
-        );
     }
 
     #[test]

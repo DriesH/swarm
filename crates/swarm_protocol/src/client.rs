@@ -18,7 +18,7 @@ use swarm_term::{TerminalChannels, TerminalInput, TerminalOutput};
 use crate::{
     AgentChange, AgentId, AgentInfo, AgentKind, CallId, ChecksRun, CloseCheck, CommentId,
     CreateTask, CreateTerminal, Event, FileDiff, FrameError, GH_SECS, GithubStatus, MergeMethod,
-    MessageId, MessageInfo, NewComment, Notice, PUSH_SECS, Paths, PrDraft, PrPanel,
+    MessageId, MessageInfo, NewComment, Notice, PUSH_SECS, Paths, PlanDraft, PrDraft, PrPanel,
     ProjectConfigFields, ProjectId, ProjectInfo, PromptInfo, PullRequest, RemoveCheck, Request,
     ReviewComment, ReviewSource, SwarmStats, SystemCheck, TaskDiff, TaskId, TaskInfo, TerminalId,
     TerminalInfo, Usage, VERSION, check_private_dir, read, write,
@@ -512,17 +512,21 @@ impl Client {
     }
 
     /// Starts the project's Start orchestrator, or returns the one that runs. `kind`
-    /// `None` uses the default from the daemon's settings.
+    /// `None` uses the default from the daemon's settings. With a `plan`, the daemon
+    /// sends it as the first message and clears the plan draft; it refuses a plan while
+    /// a Start orchestrator already runs.
     pub fn start_orchestrator(
         &self,
         project: ProjectId,
         kind: Option<AgentKind>,
+        plan: Option<String>,
     ) -> Result<AgentInfo, ClientError> {
         let reply = self.call(
             |call| Request::StartOrchestrator {
                 call,
                 project,
                 kind,
+                plan,
             },
             None,
         )?;
@@ -531,6 +535,30 @@ impl Client {
             Event::AgentStarted { agent, .. } => Ok(agent),
             other => Err(unexpected("StartOrchestrator", &other)),
         }
+    }
+
+    /// The project's saved plan draft and its plan template.
+    pub fn plan_draft(&self, project: ProjectId) -> Result<PlanDraft, ClientError> {
+        match self.call(|call| Request::PlanDraft { call, project }, None)? {
+            Event::PlanDraft { draft, .. } => Ok(draft),
+            other => Err(unexpected("PlanDraft", &other)),
+        }
+    }
+
+    /// Stores the project's plan draft; `None` clears it.
+    pub fn save_plan_draft(
+        &self,
+        project: ProjectId,
+        text: Option<String>,
+    ) -> Result<(), ClientError> {
+        let timeout = self.reply_timeout;
+        let request = |call| Request::SavePlanDraft {
+            call,
+            project,
+            text,
+        };
+
+        self.done(request, "SavePlanDraft", timeout)
     }
 
     /// The newest messages of a task, or of the project's Start orchestrator when `task`
@@ -1203,6 +1231,9 @@ fn read_events(
             }
             Event::RemoveCheck { call, check } => {
                 deliver(shared, call, Event::RemoveCheck { call, check });
+            }
+            Event::PlanDraft { call, draft } => {
+                deliver(shared, call, Event::PlanDraft { call, draft });
             }
             Event::Done { call } => deliver(shared, call, Event::Done { call }),
             Event::Comments { call, comments } => {
