@@ -129,15 +129,16 @@ pub(super) fn save_error(state: &SettingsState, cx: &App) -> Option<impl IntoEle
     })
 }
 
-fn switch_row(
+pub(super) fn switch_row(
     state: &State,
-    id: impl Into<ElementId>,
+    id: &'static str,
     label: &'static str,
     on: bool,
     apply: impl Fn(&mut SettingsState, bool) + 'static,
 ) -> PanelRow {
     PanelRow::new(label).end_slot(
         Switch::new(id, label)
+            .debug_selector(|| id.to_owned())
             .toggle_state(on)
             .on_toggle(toggle(state, apply)),
     )

@@ -288,6 +288,18 @@ impl SettingsState {
         cx.notify();
     }
 
+    /// "Do not show this again" on the Close terminal dialog. Saved at once: the dialog is
+    /// gone before a pause in editing ends, and no settings window needs to be open.
+    fn stop_confirming_close(&mut self, cx: &mut Context<Self>) {
+        self.settings.terminals.confirm_close = false;
+        self.save(cx);
+        if let Some(error) = &self.save_error {
+            log::warn!("cannot save the choice not to ask before closing a terminal: {error}");
+        }
+        self.queued = self.settings.clone();
+        cx.notify();
+    }
+
     pub(crate) fn orchestrator_index(&self) -> usize {
         match self.settings.agents.orchestrator {
             swarm_settings::AgentKindSetting::ClaudeCode => 0,
@@ -1097,6 +1109,20 @@ pub(crate) fn allow_worker_typing(cx: &App) -> bool {
     })
 }
 
+/// Whether closing a user terminal with a running program asks first. It stays on until the
+/// settings turn it off. Read each time the question would open, so a change counts at once.
+pub(crate) fn confirm_terminal_close(cx: &App) -> bool {
+    cx.try_global::<Registry>()
+        .is_none_or(|registry| registry.state.read(cx).settings.terminals.confirm_close)
+}
+
+/// Turns the question off and saves that.
+pub(crate) fn stop_confirming_terminal_close(cx: &mut App) {
+    let state = shared_state(None, cx);
+
+    state.update(cx, SettingsState::stop_confirming_close);
+}
+
 /// Draws the workspace again when the terminal font size in the settings changes. That is
 /// how a new size reaches every terminal view: the workspace measures the cell again.
 pub(crate) fn follow_font_size(workspace: Entity<Workspace>, cx: &mut App) {
@@ -1740,6 +1766,43 @@ mod tests {
         assert!(before);
         assert!(!after);
         assert!(!saved.terminals.allow_worker_typing);
+    }
+
+    #[gpui::test]
+    fn closing_a_terminal_asks_until_the_settings_say_otherwise(cx: &mut TestAppContext) {
+        let path = temp_path("confirm-close");
+        let state = open_with(&path, cx);
+        let before = cx.update(|cx| confirm_terminal_close(cx));
+
+        state.update(cx, |state, cx| {
+            state.settings.terminals.confirm_close = false;
+            cx.notify();
+        });
+        let off = cx.update(|cx| confirm_terminal_close(cx));
+        state.update(cx, |state, cx| {
+            state.settings.terminals.confirm_close = true;
+            cx.notify();
+        });
+        let on_again = cx.update(|cx| confirm_terminal_close(cx));
+        std::fs::remove_file(&path).ok();
+
+        assert!(before);
+        assert!(!off);
+        assert!(on_again);
+    }
+
+    #[gpui::test]
+    fn do_not_show_again_is_saved_at_once_without_a_settings_window(cx: &mut TestAppContext) {
+        let path = temp_path("stop-confirming");
+        cx.update(|cx| load(Some(path.clone()), cx));
+
+        cx.update(stop_confirming_terminal_close);
+        let saved = swarm_settings::load(&path).expect("read the settings");
+        let asks = cx.update(|cx| confirm_terminal_close(cx));
+        std::fs::remove_file(&path).ok();
+
+        assert!(!saved.terminals.confirm_close);
+        assert!(!asks);
     }
 
     #[gpui::test]

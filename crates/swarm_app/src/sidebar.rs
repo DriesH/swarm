@@ -424,6 +424,7 @@ fn process_row(
     };
 
     ListRow::new(("process", id.0 as usize), terminal.title.clone())
+        .debug_selector(move || format!("process-row-{}", id.0))
         .accessible_label(accessible)
         .compact(true)
         .indent(indent)
@@ -447,15 +448,34 @@ fn user_row(
 ) -> gpui::AnyElement {
     let id = terminal.id;
 
+    let end = h_flex()
+        .gap(px(4.))
+        .child(Icon::new(IconName::User).color(Color::Faint))
+        .child(
+            IconButton::new(
+                ("close-user-terminal", id.0 as usize),
+                IconName::Close,
+                format!("Close {}", terminal.title),
+            )
+            .debug_selector(move || format!("sidebar-close-terminal-{}", id.0))
+            .on_click(cx.listener(move |workspace, _, window, cx| {
+                // The row under the button must not select the terminal as well.
+                cx.stop_propagation();
+                workspace.request_close_terminal(id, window, cx);
+            })),
+        );
+
     ListRow::new(("user-terminal", id.0 as usize), terminal.title.clone())
+        .debug_selector(move || format!("user-row-{}", id.0))
         .accessible_label(format!("{}, your terminal", terminal.title))
         .compact(true)
         .toggle_state(workspace.focused_terminal == Some(id))
         .start_slot(
-            Icon::new(IconName::User)
+            Icon::new(IconName::Terminal)
                 .size(IconSize::Large)
                 .color(Color::Muted),
         )
+        .end_slot(end)
         .on_click(cx.listener(move |workspace, _, _, cx| {
             workspace.focus_terminal(id, cx);
         }))
@@ -694,6 +714,94 @@ mod tests {
             .map(|(name, indent)| ((*name).to_owned(), *indent))
             .collect();
         assert_eq!(outline, expected);
+    }
+
+    /// A user terminal in the open task, with the focus on the orchestrator.
+    fn with_user_terminal(
+        workspace: &gpui::Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> crate::model::TerminalId {
+        workspace.update_in(cx, Workspace::new_user_terminal);
+
+        let (user, orchestrator) = workspace.read_with(cx, |workspace, _| {
+            let task = workspace.active_task();
+            let orchestrator = task
+                .orchestrator
+                .and_then(|id| workspace.data.agent(id))
+                .map(|agent| agent.terminal);
+
+            (task.user_terminals.last().copied(), orchestrator)
+        });
+        let (user, orchestrator) = (
+            user.expect("a user terminal"),
+            orchestrator.expect("an orchestrator"),
+        );
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.focus_terminal(orchestrator, cx);
+        });
+        redraw(cx);
+
+        user
+    }
+
+    fn click_at(selector: &'static str, offset: Point<Pixels>, cx: &mut VisualTestContext) {
+        let bounds = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} is not on screen"));
+
+        cx.simulate_click(bounds.origin + offset, gpui::Modifiers::none());
+        redraw(cx);
+    }
+
+    fn has_close_dialog(workspace: &gpui::Entity<Workspace>, cx: &VisualTestContext) -> bool {
+        workspace.read_with(cx, |workspace, _| {
+            matches!(workspace.overlay, Some(Overlay::CloseTerminal { .. }))
+        })
+    }
+
+    #[gpui::test]
+    fn the_user_terminal_row_has_a_close_button_that_asks_and_does_not_select_the_row(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = setup(cx);
+        let user = with_user_terminal(&workspace, cx);
+        let focused = workspace.read_with(cx, |workspace, _| workspace.focused_terminal);
+
+        assert_eq!(user, crate::model::TerminalId(14));
+        click_at("sidebar-close-terminal-14", point(px(12.), px(12.)), cx);
+
+        assert!(has_close_dialog(&workspace, cx));
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.focused_terminal),
+            focused
+        );
+    }
+
+    #[gpui::test]
+    fn clicking_the_user_terminal_row_selects_it_and_opens_no_dialog(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let user = with_user_terminal(&workspace, cx);
+
+        click_at("user-row-14", point(px(20.), px(14.)), cx);
+
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.focused_terminal),
+            Some(user)
+        );
+        assert!(!has_close_dialog(&workspace, cx));
+    }
+
+    #[gpui::test]
+    fn a_process_row_has_no_close_button(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let process = workspace.read_with(cx, |workspace, _| {
+            workspace.active_task().processes.first().copied()
+        });
+
+        assert_eq!(process, Some(crate::model::TerminalId(5)));
+        assert!(cx.debug_bounds("process-row-5").is_some());
+        assert!(cx.debug_bounds("sidebar-close-terminal-5").is_none());
     }
 
     #[gpui::test]

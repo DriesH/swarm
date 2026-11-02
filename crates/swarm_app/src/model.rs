@@ -2324,6 +2324,43 @@ impl FakeData {
         task
     }
 
+    /// The project's Start tab with its orchestrator running, as the daemon reports it. The
+    /// tab shows the terminal and not the plan editor.
+    #[cfg(any(test, feature = "snapshot"))]
+    pub(crate) fn add_running_start(&mut self, project: ProjectId) -> TaskId {
+        let name = if self.tasks_of(project).next().is_some() {
+            PLAN_TASK
+        } else {
+            START_TASK
+        };
+        let lines = vec![FakeLine {
+            text: "\u{203a} ready".into(),
+            color: Color::Muted,
+        }];
+        let task = self.add_task(project, name, AgentKind::ClaudeCode, lines);
+
+        if let Some(entry) = self.tasks.iter_mut().find(|entry| entry.id == task) {
+            entry.is_start = true;
+            entry.branch = SharedString::default();
+        }
+        if let Some(agent) = self.agents.iter_mut().find(|agent| agent.task == task) {
+            agent.daemon = Some(DaemonAgent {
+                id: DaemonAgentId(100),
+                project: swarm_protocol::ProjectId(0),
+                task: None,
+                terminal: None,
+                status: DaemonAgentStatus::Idle,
+                message: None,
+                lifecycle: AgentLifecycle::Running,
+                revision: 1,
+                worktree: PathBuf::new(),
+                branch: "main".into(),
+            });
+        }
+
+        task
+    }
+
     /// Adds a task with no agent yet, for a Start tab that shows the plan editor until its
     /// orchestrator starts.
     fn add_empty_task(&mut self, project: ProjectId, name: &str) -> TaskId {

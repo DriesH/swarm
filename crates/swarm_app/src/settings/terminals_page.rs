@@ -1,17 +1,26 @@
-//! Settings › Terminals: the font size of every terminal.
+//! Settings › Terminals: the font size of every terminal and the question before one closes.
 
 use gpui::{AnyElement, px};
 use swarm_settings::{FONT_SIZE_DEFAULT, FONT_SIZE_MAX, FONT_SIZE_MIN};
 use swarm_ui::prelude::*;
 
 use super::SettingsWindow;
-use super::pages::{page_title, save_error, section};
+use super::pages::{page_title, save_error, section, switch_row};
 
 impl SettingsWindow {
     pub(super) fn terminals_page(&self, cx: &Context<Self>) -> AnyElement {
         let state = self.state.clone();
         let settings = state.read(cx);
         let points = settings.settings.terminals.font_size;
+        let confirm_close = settings.settings.terminals.confirm_close;
+
+        let closing = Panel::new().row(switch_row(
+            &state,
+            "confirm-close",
+            "Ask before closing a terminal",
+            confirm_close,
+            |state, on| state.settings.terminals.confirm_close = on,
+        ));
 
         let stepper = Stepper::new(
             "font-size",
@@ -39,6 +48,7 @@ impl SettingsWindow {
             .child(page_title("Terminals"))
             .children(error)
             .child(section("Font", font))
+            .child(section("Closing", closing))
             .into_any_element()
     }
 }
@@ -160,11 +170,11 @@ mod tests {
         swarm_settings::save(&path, &saved).expect("write the settings");
         let mut visual = terminals_page_at(&path, cx);
 
-        click("font-size-increase", &mut visual);
-        let top = stepper_value(cx);
         tab_into_page(&mut visual, cx);
         visual.simulate_keystrokes("up");
         let top_by_key = stepper_value(cx);
+        click("font-size-increase", &mut visual);
+        let top = stepper_value(cx);
         visual.simulate_keystrokes("home down");
         let bottom_by_key = stepper_value(cx);
         click("font-size-decrease", &mut visual);
@@ -205,6 +215,40 @@ mod tests {
         let after = swarm_settings::load(&path).expect("read the settings");
         std::fs::remove_file(&path).ok();
         assert_eq!(after.terminals.font_size, 16);
+    }
+
+    #[gpui::test]
+    fn the_switch_turns_the_close_question_off_and_on_again(cx: &mut TestAppContext) {
+        let path = temp_path("confirm-close");
+        let mut visual = terminals_page_at(&path, cx);
+
+        click("confirm-close", &mut visual);
+        save_pause(&mut visual);
+        let off = swarm_settings::load(&path).expect("read the settings");
+        click("confirm-close", &mut visual);
+        save_pause(&mut visual);
+        let on = swarm_settings::load(&path).expect("read the settings");
+
+        std::fs::remove_file(&path).ok();
+        assert!(!off.terminals.confirm_close);
+        assert!(on.terminals.confirm_close);
+    }
+
+    #[gpui::test]
+    fn the_switch_starts_at_the_saved_choice_and_turning_it_on_asks_again(cx: &mut TestAppContext) {
+        let path = temp_path("confirm-close-saved");
+        let mut saved = swarm_settings::Settings::default();
+        saved.terminals.confirm_close = false;
+        swarm_settings::save(&path, &saved).expect("write the settings");
+        let mut visual = terminals_page_at(&path, cx);
+        let before = cx.update(|cx| crate::settings::confirm_terminal_close(cx));
+
+        click("confirm-close", &mut visual);
+        let after = cx.update(|cx| crate::settings::confirm_terminal_close(cx));
+
+        std::fs::remove_file(&path).ok();
+        assert!(!before);
+        assert!(after);
     }
 
     /// A live terminal on each kind of tile of the open task: the orchestrator, a worker, a

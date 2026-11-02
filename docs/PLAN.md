@@ -66,13 +66,15 @@ Every agent terminal gets `SWARM_SOCKET`, `SWARM_AGENT_ID`, `SWARM_AGENT_NAME`, 
 2. Swarm starts the **Start orchestrator**, a Claude Code (or Codex) session in the project root on the base branch, with the plan as its first message, and clears the draft. The tab now shows its terminal, so the user can answer its questions. The Start orchestrator counts the features in the plan. A feature is one change a user can see or use that can be built and reviewed on its own. With more than one feature, or when it is unsure, it lists them in its terminal and talks with the user until they agree on the list.
 3. It makes exactly one task per agreed feature. A task is focused on one feature.
 4. For each task it calls `task.create`: Swarm makes the task worktree and branch, runs the setup script, opens a tab and starts that task's orchestrator with the Start orchestrator's brief as its first message. The brief keeps the user's own requirements and definition of done for that task.
-5. When every orchestrator confirms its brief, the Start orchestrator exits and the Start tab closes. Focus moves to the first task tab.
+5. When every orchestrator confirms its brief, the Start orchestrator exits and the Start tab closes (unless it holds user terminals). Focus moves to the first task tab.
 
 **When the Start tab shows.**
 
 - A project with no active tasks opens on the Start tab.
 - A project with active tasks opens on the tab used last. There is no Start tab.
-- The Start tab closes itself once every task orchestrator has confirmed its brief. If the request is unclear, the Start orchestrator asks first and the tab stays open until it is done.
+- **User terminals on the Start tab.** **+ Terminal** works on a Start or Plan tab. The other tiles (user terminals, and process terminals if there are any) sit in a band under the main area, which is the plan editor or the Start orchestrator's tile. The band is as tall as a small tile and as wide as the main area's column. Its tiles share the width side by side and are never narrower than the smallest tile; the ones that do not fit go to the tray. The main area ends above the band. Without other tiles it takes the whole column. A user terminal keeps the band height there and has no resize handle.
+- The Start tab closes itself once every task orchestrator has confirmed its brief. If the request is unclear, the Start orchestrator asks first and the tab stays open until it is done. A Start tab with user terminals stays open after its orchestrator exits, and shows the plan editor again, until the user closes those terminals.
+- On the Start tab, the band places the terminal the user opened or focused last first. Placed tiles keep their order.
 
 **Starting new work later.** The **+** in the tab bar opens a menu with two choices:
 
@@ -90,7 +92,7 @@ Harness calls for the Start orchestrator:
 
 ### Workspace layout
 
-- **Sidebar**: projects (with "Needs you" and busy markers and a tab count), then the agents, processes and user terminals of the open tab.
+- **Sidebar**: projects (with "Needs you" and busy markers and a tab count), then the agents, processes and user terminals of the open tab. A user terminal row shows the Terminal icon, a dimmed User icon and a close button.
 - **Tabs**: one tab per task, at the top of the window, plus the Start or Plan tab while its orchestrator runs. That tab has no worktree, so it shows no branch, Files or Changes. A tab shows the task name and its status ring. Tabs keep their width while there is room, then shrink to a minimum (the name is cut with an ellipsis) and then scroll sideways; a button with the task count then lists every task. The header controls on the right never move. Each task runs in its own task worktree; workers share it unless they have their own worktree, and worker worktrees are not tabs. **+** opens the New tab menu.
 - **Header, right side**: view switch **Terminals | Swarm | Review**, then panel toggles **Files**, **Changes +N −N** and, after approval, **Pull request** (later the live PR state, e.g. **#42 · checks running**).
 - **Right panel**: Files (file tree of the task worktree, changed files marked), Changes (changed files grouped by worker, with a **Review** button), or Pull request.
@@ -128,7 +130,7 @@ App settings: **General** (system check), **Agents** (per CLI: command, version,
 Per project, under **Projects**: everything in `.swarm/config.toml` (worktrees, setup script, files to copy, ports, checks before PR).
 
 - **Projects** reads and writes `.swarm/config.toml` through the daemon, which owns the file format. A save sends the fields as the page loaded them and the fields as edited; the daemon re-reads the file and writes only the fields that differ between the two, with `toml_edit`, so comments, formatting, keys Swarm does not show and hand edits to other fields stay. The page reads the file again when the Settings window gets focus, unless an edit waits to be saved. A file that does not parse shows its error and is never overwritten. **Run checks now** runs the checks on the project's open task.
-- **Terminals**: the font size (11–20 pt) applies to every terminal at once; tiles keep their size and get more or fewer rows and columns.
+- **Terminals**: the font size (11–20 pt) applies to every terminal at once; tiles keep their size and get more or fewer rows and columns. The switch **Ask before closing a terminal** (on by default) turns the Close terminal question on or off. **Do not show this again** in that dialog turns it off; this switch turns it on again.
 - **Prompts**: each prompt shows the layer the agents get. **Customize** copies the built-in prompt to `~/.config/swarm/prompts/` and opens it in the default editor; **Open** opens the copy; **Reset** removes it after a confirm. A project's own prompts in `.swarm/prompts/` show on its Projects page.
 - **Usage** shows every window of both agent kinds, like the menu bar popover. **Keyboard** lists the shortcuts, read-only.
 
@@ -150,7 +152,7 @@ Four kinds:
 | **Process** (dev server, tests, any command an agent starts) | nobody by default | the agent that started it | that agent, orchestrator, user |
 | **User** | user only | user only | user only |
 
-- **User terminals are off-limits to agents** (ADR 0006): agents cannot read, type into, resize or kill them. The layout treats them as fixed islands.
+- **User terminals are off-limits to agents** (ADR 0006): agents cannot read, type into, resize or kill them. The layout treats them as fixed islands. The header of a user terminal's tile shows the User icon and **Mine** after its name; screen readers say "Mine, agents have no access". Its close button, and the one in its sidebar row, ask **Close terminal “name”?** while the program in it runs, with the line "The program in it stops." and a **Do not show this again** box. A terminal whose program ended closes at once, and so does every close that the app or the daemon starts. Focus starts on **Cancel**; Escape cancels.
 - **Process terminals**: started with `swarm terminal spawn`. When the process exits or is killed, the terminal closes after a short delay (to show the exit code); a failed exit stays until the user closes it and the owner agent and the orchestrator get a `terminal.exited` event with who stopped it (`agent`, `user`, `process`) and the exit code or signal.
 - **Layout engine**: tiles fill the space. Priority: user terminals (fixed size), orchestrator, terminals that need attention (`blocked`, `error`), working agents, process terminals, done or idle agents. Each tile has a minimum size; tiles that don't fit move to the **tray**: chips on the left of the status bar, each with a restore icon; chips that don't fit the bar sit behind a "+N" chip that opens a menu of them. A tile that needs attention is promoted out of the tray. The user can pin or minimize any tile.
 - When the user resizes a user terminal, the other tiles reflow around it.

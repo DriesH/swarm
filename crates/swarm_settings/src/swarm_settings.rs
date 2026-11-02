@@ -226,6 +226,8 @@ pub struct TerminalSettings {
     /// [`FONT_SIZE_MIN`]..=[`FONT_SIZE_MAX`] in the file is brought into it.
     #[serde(deserialize_with = "read_font_size")]
     pub font_size: u8,
+    /// Asks before a user terminal with a running program closes.
+    pub confirm_close: bool,
 }
 
 impl Default for TerminalSettings {
@@ -233,6 +235,7 @@ impl Default for TerminalSettings {
         Self {
             allow_worker_typing: true,
             font_size: FONT_SIZE_DEFAULT,
+            confirm_close: true,
         }
     }
 }
@@ -512,6 +515,11 @@ pub fn save(path: &Path, settings: &Settings) -> Result<(), SettingsError> {
         "font_size",
         Value::from(i64::from(clamp_font_size(settings.terminals.font_size))),
     );
+    set_value(
+        terminals,
+        "confirm_close",
+        Value::from(settings.terminals.confirm_close),
+    );
 
     set_notifications(
         table_mut(document.as_table_mut(), "notifications"),
@@ -700,6 +708,58 @@ mod tests {
 
         assert!(text.contains("[terminals]\nallow_worker_typing = false"));
         assert!(!loaded.terminals.allow_worker_typing);
+    }
+
+    #[test]
+    fn closing_a_terminal_asks_by_default() {
+        let empty: Settings = toml::from_str("").unwrap();
+        let old: Settings = toml::from_str("[terminals]\nallow_worker_typing = false\n").unwrap();
+
+        assert!(Settings::default().terminals.confirm_close);
+        assert!(empty.terminals.confirm_close);
+        assert!(old.terminals.confirm_close);
+    }
+
+    #[test]
+    fn turning_the_close_question_off_is_saved_and_loaded() {
+        let folder = temp_folder("confirm-close");
+        let path = folder.join("settings.toml");
+        let mut settings = Settings::default();
+        settings.terminals.confirm_close = false;
+
+        save(&path, &settings).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let loaded = load(&path).unwrap();
+        std::fs::remove_dir_all(&folder).unwrap();
+
+        assert!(text.contains("[terminals]"));
+        assert!(text.contains("confirm_close = false"), "{text}");
+        assert!(!loaded.terminals.confirm_close);
+    }
+
+    #[test]
+    fn saving_the_close_question_keeps_comments_and_other_keys() {
+        let folder = temp_folder("confirm-close-keep");
+        let path = folder.join("settings.toml");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            &path,
+            "# my notes\n\n[terminals]\nconfirm_close = true # ask\nfont_size = 15\nextra = \"x\"\n",
+        )
+        .unwrap();
+        let mut settings = load(&path).unwrap();
+        settings.terminals.confirm_close = false;
+
+        save(&path, &settings).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let loaded = load(&path).unwrap();
+        std::fs::remove_dir_all(&folder).unwrap();
+
+        assert!(text.contains("# my notes"));
+        assert!(text.contains("confirm_close = false # ask"), "{text}");
+        assert!(text.contains("extra = \"x\""));
+        assert_eq!(loaded.terminals.font_size, 15);
+        assert!(!loaded.terminals.confirm_close);
     }
 
     #[test]
@@ -1054,6 +1114,7 @@ mod tests {
             "[agents]\nskip_permissions = \"yes\"\n",
             "[terminals]\nallow_worker_typing = \"yes\"\n",
             "[terminals]\nfont_size = \"big\"\n",
+            "[terminals]\nconfirm_close = \"no\"\n",
         ] {
             let result: Result<Settings, _> = toml::from_str(text);
 
