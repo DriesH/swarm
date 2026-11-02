@@ -19,6 +19,7 @@ mod panel;
 mod pixel_bee;
 mod popover_menu;
 mod project_tile;
+mod rail_button;
 mod resize_handle;
 mod segmented_control;
 mod status;
@@ -58,6 +59,7 @@ pub use panel::*;
 pub use pixel_bee::*;
 pub use popover_menu::*;
 pub use project_tile::*;
+pub use rail_button::*;
 pub use resize_handle::*;
 pub use segmented_control::*;
 pub use status::*;
@@ -88,6 +90,7 @@ pub fn all_components() -> Vec<ComponentEntry> {
         ComponentEntry::of::<Button>(),
         ComponentEntry::of::<TextInput>(),
         ComponentEntry::of::<IconButton>(),
+        ComponentEntry::of::<RailButton>(),
         ComponentEntry::of::<Switch>(),
         ComponentEntry::of::<Stepper>(),
         ComponentEntry::of::<Checkbox>(),
