@@ -60,12 +60,12 @@ Every agent terminal gets `SWARM_SOCKET`, `SWARM_AGENT_ID`, `SWARM_AGENT_NAME`, 
 
 ### How work starts
 
-**Opening a project.** The project opens on a **Start** tab with an **orchestrator**: a Claude Code (or Codex) session in the project root on the base branch.
+**Opening a project.** The project opens on a **Start** tab with a **plan** editor: Markdown with colors, filled from the plan template (`plan.md`, a prompt file: What, Requirements, Definition of done). No agent runs yet. The daemon keeps the plan draft, so it survives closing the tab or quitting the app.
 
-1. The user says what they want.
-2. The Start orchestrator counts the features in the request. A feature is one change a user can see or use that can be built and reviewed on its own. With more than one feature, or when it is unsure, it lists them in its terminal and talks with the user until they agree on the list.
+1. The user writes the plan, picks the orchestrator agent (Claude Code or Codex) and sends it with **Send plan** (⌘↩).
+2. Swarm starts the **Start orchestrator**, a Claude Code (or Codex) session in the project root on the base branch, with the plan as its first message, and clears the draft. The tab now shows its terminal, so the user can answer its questions. The Start orchestrator counts the features in the plan. A feature is one change a user can see or use that can be built and reviewed on its own. With more than one feature, or when it is unsure, it lists them in its terminal and talks with the user until they agree on the list.
 3. It makes exactly one task per agreed feature. A task is focused on one feature.
-4. For each task it calls `task.create`: Swarm makes the task worktree and branch, runs the setup script, opens a tab and starts that task's orchestrator with the Start orchestrator's brief as its first message.
+4. For each task it calls `task.create`: Swarm makes the task worktree and branch, runs the setup script, opens a tab and starts that task's orchestrator with the Start orchestrator's brief as its first message. The brief keeps the user's own requirements and definition of done for that task.
 5. When every orchestrator confirms its brief, the Start orchestrator exits and the Start tab closes. Focus moves to the first task tab.
 
 **When the Start tab shows.**
@@ -77,7 +77,7 @@ Every agent terminal gets `SWARM_SOCKET`, `SWARM_AGENT_ID`, `SWARM_AGENT_NAME`, 
 **Starting new work later.** The **+** in the tab bar opens a menu with two choices:
 
 - **New task**: a sheet with name, branch from (default: base branch; any local branch, so a kept branch of a closed task can be picked up again), orchestrator agent, optional first message, run setup script. Swarm creates the worktree and tab and starts one orchestrator.
-- **Plan with orchestrator**: opens a Plan tab for a bigger request that should be split into several tasks. It is the Start tab under another name, because the project already has tasks. Only one Start or Plan tab can be open per project.
+- **Plan with orchestrator**: opens a Plan tab with the plan editor, for work that the Start orchestrator turns into tasks. It is the Start tab under another name, because the project already has tasks. Only one Start or Plan tab can be open per project.
 
 Harness calls for the Start orchestrator:
 

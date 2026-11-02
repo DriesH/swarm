@@ -79,7 +79,7 @@ Each phase ends with a pull request into `main`. A phase is done when every box 
 
 **Done when:**
 
-- [ ] Situation 1: open a project, describe two features, get two tabs with briefed orchestrators, Start tab closes
+- [ ] Situation 1: open a project, write a plan with two features and send it, get two tabs with briefed orchestrators, Start tab closes
 - [ ] Situation 2: **+ › New task** starts a fresh orchestrator
 - [ ] Orchestrator spawns Claude and Codex workers; their status shows live
 - [ ] An agent starts `pnpm dev` in a sized terminal and stops it; a user stop sends `terminal.exited` to the orchestrator
@@ -133,13 +133,14 @@ Three parts: 1. Usage in the daemon and the sidebar card. 2. Menu bar and popove
 
 **Goal:** a signed app that someone else can install.
 
-**Scope:** welcome screen and system check, remaining settings pages (Terminals with the font size, Prompts, and Projects, which edits each repository's `.swarm/config.toml`), `tile.grow` / `tile.shrink` (the tile sizes themselves came early, after phase 5), file-type icons in the style of vscode-icons for files and folders (Changes tab, Changes and Files panels, Review), easter eggs, full VoiceOver and keyboard audit, performance pass, app bundle signing and notarization, updates, docs website and product website.
+**Scope:** welcome screen and system check, the plan editor on the Start tab, remaining settings pages (Terminals with the font size, Prompts, and Projects, which edits each repository's `.swarm/config.toml`), `tile.grow` / `tile.shrink` (the tile sizes themselves came early, after phase 5), file-type icons in the style of vscode-icons for files and folders (Changes tab, Changes and Files panels, Review), easter eggs, full VoiceOver and keyboard audit, performance pass, app bundle signing and notarization, updates, docs website and product website.
 
 Six parts: 1. Settings pages (Projects, Terminals, Prompts, Usage, Keyboard). 2. First launch: welcome screen, system check, `tile.grow` / `tile.shrink`. 3. File-type icons, easter eggs and Reduce Motion. 4. VoiceOver, keyboard and performance audit (findings parked in [`audits/phase-8-part-4.md`](audits/phase-8-part-4.md)). 5. Release: bundle, signing, notarization, updates and the app socket check. 6. Docs and product websites.
 
 **Done when:**
 
 - [ ] First launch guides through the system check
+- [ ] The Start tab opens on the plan editor; Send plan starts the Start orchestrator with the plan, and an unsent plan survives quitting the app
 - [ ] `tile.grow` / `tile.shrink` change a worker's tile, and a user-sized tile ignores them
 - [ ] Changing the terminal font size in Settings resizes every terminal at once
 - [ ] Settings › Projects edits `.swarm/config.toml` and keeps the file's comments and the keys it does not show
