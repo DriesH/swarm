@@ -1,0 +1,16 @@
+[package]
+name = "app_icon"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "app-icon"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+image.workspace = true
+swarm_sprite.workspace = true

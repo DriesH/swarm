@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+# Builds Swarm.app and Swarm.dmg for Apple Silicon: bundle, sign, notarize. See docs/release.md.
+#
+# Usage: script/bundle-mac [--adhoc] [--identity "<name or hash>"] [--notary-profile <name>] [--no-dmg]
+#
+# It writes to a new folder, target/bundle/<version>-<UTC time>/, and never deletes or
+# overwrites anything.
+set -euo pipefail
+
+TEAM_ID="P2DG27TUTZ"
+BUNDLE_ID="com.swarm.app"
+TARGET="aarch64-apple-darwin"
+DEPLOYMENT_TARGET="13.0"
+
+usage() {
+    cat <<'USAGE'
+Usage: script/bundle-mac [--adhoc] [--identity "<name or hash>"] [--notary-profile <name>] [--no-dmg]
+
+  --adhoc                   sign ad hoc (no certificate) and skip notarization and DMG signing
+  --identity <name|hash>    sign with this identity instead of the team's Developer ID one
+  --notary-profile <name>   notarytool keychain profile (default: $SWARM_NOTARY_PROFILE or swarm-notary)
+  --no-dmg                  make Swarm.app only
+USAGE
+}
+
+fail() {
+    printf 'bundle-mac: %s\n' "$*" >&2
+    exit 1
+}
+
+step() {
+    printf '\n==> %s\n' "$*"
+}
+
+out=""
+report_failure() {
+    local status=$?
+
+    if [[ $status -ne 0 && -n $out ]]; then
+        printf 'bundle-mac failed. What was built is in %s\n' "$out" >&2
+    fi
+}
+trap report_failure EXIT
+
+adhoc=0
+identity=""
+notary_profile="${SWARM_NOTARY_PROFILE:-swarm-notary}"
+make_dmg=1
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --adhoc) adhoc=1 ;;
+        --identity)
+            [[ $# -ge 2 ]] || fail "--identity needs a name or a hash"
+            identity="$2"
+            shift
+            ;;
+        --notary-profile)
+            [[ $# -ge 2 ]] || fail "--notary-profile needs a profile name"
+            notary_profile="$2"
+            shift
+            ;;
+        --no-dmg) make_dmg=0 ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        *) fail "unknown option: $1 (see --help)" ;;
+    esac
+    shift
+done
+
+if [[ $adhoc -eq 1 && -n $identity ]]; then
+    fail "use --adhoc or --identity, not both"
+fi
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$root"
+
+# The version is the workspace version in Cargo.toml: one place to change it.
+version="$(awk '
+    /^\[workspace\.package\]/ { in_package = 1; next }
+    /^\[/ { in_package = 0 }
+    in_package && /^version[[:space:]]*=/ {
+        gsub(/^[^"]*"/, "")
+        gsub(/".*$/, "")
+        print
+        exit
+    }
+' Cargo.toml)"
+[[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "cannot read the workspace version from Cargo.toml (got '$version')"
+
+# Finds the one Developer ID Application identity of the team, as its hash.
+find_identity() {
+    local lines count
+    lines="$(security find-identity -v -p codesigning | grep "Developer ID Application:.*(${TEAM_ID})" || true)"
+    count="$(printf '%s\n' "$lines" | grep -c . || true)"
+
+    if [[ $count -eq 0 ]]; then
+        fail "no 'Developer ID Application' identity for team ${TEAM_ID} in the keychain. Create the certificate (docs/release.md), or use --adhoc."
+    fi
+    if [[ $count -gt 1 ]]; then
+        printf '%s\n' "$lines" >&2
+        fail "more than one 'Developer ID Application' identity for team ${TEAM_ID}. Pick one with --identity <hash>."
+    fi
+
+    printf '%s\n' "$lines" | awk '{ print $2 }'
+}
+
+if [[ $adhoc -eq 1 ]]; then
+    sign_identity="-"
+elif [[ -n $identity ]]; then
+    sign_identity="$identity"
+else
+    sign_identity="$(find_identity)"
+fi
+
+# codesign <path> [identifier]: hardened runtime, and a secure timestamp unless ad hoc.
+sign() {
+    local args=(--force --options runtime --sign "$sign_identity")
+
+    if [[ $adhoc -eq 0 ]]; then
+        args+=(--timestamp)
+    fi
+    if [[ $# -ge 2 ]]; then
+        args+=(--identifier "$2")
+    fi
+
+    codesign "${args[@]}" "$1"
+}
+
+# notarize <file> <name>: submits, waits, and prints the log when Apple does not accept it.
+notarize() {
+    local file="$1" name="$2" result="$work/notary-$2.json" status id
+
+    if ! xcrun notarytool submit "$file" --keychain-profile "$notary_profile" --wait --output-format json >"$result"; then
+        cat "$result" >&2 || true
+        fail "notarytool could not submit $name"
+    fi
+
+    status="$(plutil -extract status raw -o - "$result")"
+    id="$(plutil -extract id raw -o - "$result")"
+
+    if [[ $status != "Accepted" ]]; then
+        xcrun notarytool log "$id" --keychain-profile "$notary_profile" >&2 || true
+        fail "Apple did not accept $name (status: $status, submission: $id)"
+    fi
+
+    printf 'notarized %s (submission %s)\n' "$name" "$id"
+}
+
+command -v zig >/dev/null || fail "zig is not on PATH. libghostty-vt builds with Zig 0.15."
+case "$(zig version)" in
+    0.15.*) ;;
+    *) fail "libghostty-vt needs Zig 0.15, found $(zig version)" ;;
+esac
+
+step "Building the binaries for $TARGET (macOS $DEPLOYMENT_TARGET and later)"
+export MACOSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET"
+cargo build --release --locked --target "$TARGET" -p swarm_app -p swarm_daemon -p swarm_cli
+built="$root/target/$TARGET/release"
+
+for binary in swarm-app swarm-daemon swarm; do
+    [[ -x $built/$binary ]] || fail "the build made no $binary"
+
+    minos="$(otool -l "$built/$binary" | awk '/minos/ && !found { print $2; found = 1 }')"
+    [[ $minos == "$DEPLOYMENT_TARGET" ]] || fail "$binary targets macOS $minos, not $DEPLOYMENT_TARGET"
+
+    # Only system libraries: nothing else would be in the bundle.
+    others="$(otool -L "$built/$binary" | tail -n +2 | awk '{ print $1 }' | grep -v -e '^/System/' -e '^/usr/lib/' || true)"
+    [[ -z $others ]] || fail "$binary links libraries that the bundle does not carry: $others"
+done
+
+out="$root/target/bundle/$version-$(date -u +%Y%m%dT%H%M%SZ)"
+[[ ! -e $out ]] || fail "$out exists already; run again in a second"
+mkdir -p "$root/target/bundle"
+mkdir "$out"
+
+app="$out/Swarm.app"
+work="$out/work"
+mkdir "$work"
+
+step "Making Swarm.app $version"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+
+sed -e "s/__VERSION__/$version/g" -e "s/__BUILD__/$version/g" \
+    "$root/crates/swarm_app/resources/Info.plist" >"$app/Contents/Info.plist"
+! grep -q '__[A-Z]*__' "$app/Contents/Info.plist" || fail "Info.plist still has a placeholder"
+plutil -lint "$app/Contents/Info.plist"
+
+printf 'APPL????' >"$app/Contents/PkgInfo"
+
+for binary in swarm-app swarm-daemon swarm; do
+    install -m 0755 "$built/$binary" "$app/Contents/MacOS/$binary"
+done
+
+cargo run --quiet --release --locked -p app_icon -- "$work/Swarm.iconset"
+iconutil --convert icns --output "$app/Contents/Resources/Swarm.icns" "$work/Swarm.iconset"
+
+step "Signing with ${sign_identity}"
+sign "$app/Contents/MacOS/swarm-daemon" "$BUNDLE_ID.daemon"
+sign "$app/Contents/MacOS/swarm" "$BUNDLE_ID.cli"
+sign "$app"
+codesign --verify --strict --deep --verbose=2 "$app"
+
+if [[ $adhoc -eq 0 ]]; then
+    step "Notarizing Swarm.app"
+    ditto -c -k --keepParent "$app" "$work/Swarm.zip"
+    notarize "$work/Swarm.zip" Swarm.app
+    xcrun stapler staple "$app"
+    spctl --assess --type execute -vv "$app"
+fi
+
+dmg="$out/Swarm.dmg"
+if [[ $make_dmg -eq 1 ]]; then
+    step "Making Swarm.dmg"
+    mkdir "$work/dmg"
+    ditto "$app" "$work/dmg/Swarm.app"
+    ln -s /Applications "$work/dmg/Applications"
+    hdiutil create -volname Swarm -fs HFS+ -format UDZO -srcfolder "$work/dmg" "$dmg"
+
+    if [[ $adhoc -eq 0 ]]; then
+        codesign --force --timestamp --sign "$sign_identity" "$dmg"
+        codesign --verify --verbose=2 "$dmg"
+        notarize "$dmg" Swarm.dmg
+        xcrun stapler staple "$dmg"
+        spctl --assess --type open --context context:primary-signature -vv "$dmg"
+    fi
+fi
+
+printf '\nApp: %s\n' "$app"
+if [[ $make_dmg -eq 1 ]]; then
+    printf 'DMG: %s\n' "$dmg"
+fi
