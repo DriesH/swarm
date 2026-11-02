@@ -44,8 +44,8 @@ const HEADER_HEIGHT: f32 = 47.;
 const RECENT_FOCUS: usize = 32;
 
 /// Distance from the window top to the middle of the header's content (the panel border
-/// and the header's bottom border do not count). The traffic lights, the sidebar's window
-/// row and the task tabs are all centered on this line.
+/// and the header's bottom border do not count). The sidebar's window row and the task tabs
+/// are centered on this line.
 pub(crate) const HEADER_CENTER: Pixels = px(PANEL_MARGIN + 1. + (HEADER_HEIGHT - 1.) / 2.);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,8 +87,9 @@ pub(crate) struct Workspace {
     pub active_task: TaskId,
     pub view: View,
     pub right_panel: Option<RightPanel>,
-    pub(crate) sidebar_visible: bool,
-    /// Tracks focus inside the sidebar, so hiding it can take focus back.
+    /// True when the sidebar shows as a narrow rail of buttons.
+    pub(crate) sidebar_collapsed: bool,
+    /// Tracks focus inside the sidebar and the rail, so a toggle can take focus back.
     pub(crate) sidebar_focus: FocusHandle,
     pub minimized: HashSet<TerminalId>,
     pub focused_terminal: Option<TerminalId>,
@@ -281,7 +282,7 @@ impl Workspace {
             active_task,
             view: View::Terminals,
             right_panel: Some(RightPanel::Changes),
-            sidebar_visible: true,
+            sidebar_collapsed: false,
             sidebar_focus: cx.focus_handle(),
             minimized: HashSet::new(),
             focused_terminal,
@@ -532,14 +533,17 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Shows the sidebar, or hides it when it shows. Focus inside a hidden sidebar goes to the
-    /// workspace.
+    /// Collapses the sidebar to its rail, or expands it. Focus inside the one that goes away
+    /// moves back to the focused terminal, or to the workspace when there is none.
     pub(crate) fn toggle_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.sidebar_visible && self.sidebar_focus.contains_focused(window, cx) {
-            window.focus(&self.focus_handle, cx);
+        if self.sidebar_focus.contains_focused(window, cx) {
+            match self.focused_terminal {
+                Some(_) => self.pending_focus = self.focused_terminal,
+                None => window.focus(&self.focus_handle, cx),
+            }
         }
 
-        self.sidebar_visible = !self.sidebar_visible;
+        self.sidebar_collapsed = !self.sidebar_collapsed;
 
         cx.notify();
     }
@@ -911,9 +915,22 @@ impl Render for Workspace {
                 .into_any_element();
         }
 
-        let sidebar = self
-            .sidebar_visible
-            .then(|| sidebar::render(self, window, cx));
+        let sidebar = if self.sidebar_collapsed {
+            div()
+                .w(sidebar::RAIL_WIDTH)
+                .flex_none()
+                .h_full()
+                .child(sidebar::render_rail(self, window, cx))
+        } else {
+            div()
+                .w(px(248.))
+                .flex_none()
+                .h_full()
+                .pt(HEADER_CENTER - sidebar::WINDOW_ROW_HEIGHT / 2.)
+                .px(px(8.))
+                .pb(px(10.))
+                .child(sidebar::render(self, window, cx))
+        };
         let tab_bar = tab_bar::render(self, window, cx);
         let views = views::render(self, window, cx);
         let status_bar = status_bar::render(self, window, cx);
@@ -938,48 +955,39 @@ impl Render for Workspace {
 
         let root = self.root(cx);
 
-        root.children(sidebar.map(|sidebar| {
-            div()
-                .w(px(248.))
-                .flex_none()
-                .h_full()
-                .pt(HEADER_CENTER - sidebar::WINDOW_ROW_HEIGHT / 2.)
-                .px(px(8.))
-                .pb(px(10.))
-                .child(sidebar)
-        }))
-        .child(
-            v_flex()
-                .flex_1()
-                .min_w_0()
-                .m(px(PANEL_MARGIN))
-                .when(self.sidebar_visible, Styled::ml_0)
-                .bg(panel)
-                .border_1()
-                .border_color(line)
-                .rounded(px(10.))
-                .overflow_hidden()
-                .child(
-                    div()
-                        .h(px(HEADER_HEIGHT))
-                        .flex_none()
-                        .border_b_1()
-                        .border_color(line)
-                        .child(tab_bar),
-                )
-                .child(body)
-                .child(
-                    div()
-                        .h(px(38.))
-                        .flex_none()
-                        .border_t_1()
-                        .border_color(line)
-                        .child(status_bar),
-                ),
-        )
-        .children(overlay)
-        .children(self.eggs_layer(cx))
-        .into_any_element()
+        root.child(sidebar)
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .m(px(PANEL_MARGIN))
+                    .ml_0()
+                    .bg(panel)
+                    .border_1()
+                    .border_color(line)
+                    .rounded(px(10.))
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .h(px(HEADER_HEIGHT))
+                            .flex_none()
+                            .border_b_1()
+                            .border_color(line)
+                            .child(tab_bar),
+                    )
+                    .child(body)
+                    .child(
+                        div()
+                            .h(px(38.))
+                            .flex_none()
+                            .border_t_1()
+                            .border_color(line)
+                            .child(status_bar),
+                    ),
+            )
+            .children(overlay)
+            .children(self.eggs_layer(cx))
+            .into_any_element()
     }
 }
 
@@ -1282,7 +1290,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn after_the_toggle_button_hides_the_sidebar_the_keys_and_actions_still_work(
+    fn after_the_toggle_button_collapses_the_sidebar_the_keys_and_actions_still_work(
         cx: &mut TestAppContext,
     ) {
         let (workspace, cx) = setup(cx);
@@ -1293,7 +1301,7 @@ mod tests {
 
         cx.simulate_click(button.center(), gpui::Modifiers::none());
         redraw(cx);
-        let hidden = workspace.read_with(cx, |workspace, _| !workspace.sidebar_visible);
+        let collapsed = workspace.read_with(cx, |workspace, _| workspace.sidebar_collapsed);
         let focus_lost = nothing_has_focus(cx);
 
         cx.simulate_keystrokes("cmd-k");
@@ -1303,10 +1311,131 @@ mod tests {
         cx.dispatch_action(ToggleSidebar);
         redraw(cx);
 
-        assert!(hidden);
-        assert!(!focus_lost, "nothing has focus after the sidebar went");
+        assert!(collapsed);
+        assert!(!focus_lost, "nothing has focus after the sidebar collapsed");
         assert!(palette, "Cmd-K does nothing");
-        assert!(workspace.read_with(cx, |workspace, _| workspace.sidebar_visible));
+        assert!(workspace.read_with(cx, |workspace, _| !workspace.sidebar_collapsed));
+    }
+
+    fn collapsed(workspace: &Entity<Workspace>, cx: &VisualTestContext) -> bool {
+        workspace.read_with(cx, |workspace, _| workspace.sidebar_collapsed)
+    }
+
+    /// Focuses the terminal of the first worker and returns it.
+    fn focus_a_worker(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> TerminalId {
+        redraw(cx);
+        let terminal = workspace.read_with(cx, |workspace, _| {
+            let id = workspace.active_task().workers.first().copied();
+            id.and_then(|id| workspace.data.agent(id))
+                .map_or(TerminalId(u32::MAX), |agent| agent.terminal)
+        });
+
+        workspace.update(cx, |workspace, cx| workspace.focus_terminal(terminal, cx));
+        redraw(cx);
+
+        terminal
+    }
+
+    fn holds_focus(
+        workspace: &Entity<Workspace>,
+        terminal: TerminalId,
+        cx: &mut VisualTestContext,
+    ) -> bool {
+        let handle = workspace.read_with(cx, |workspace, _| {
+            workspace.terminal_focus.get(&terminal).cloned()
+        });
+
+        handle.is_some_and(|handle| cx.update(|window, _| handle.is_focused(window)))
+    }
+
+    fn click_toggle(cx: &mut VisualTestContext) {
+        let button = cx
+            .debug_bounds("toggle-sidebar")
+            .expect("the toggle button is on screen");
+
+        cx.simulate_click(button.center(), gpui::Modifiers::none());
+        redraw(cx);
+    }
+
+    #[gpui::test]
+    fn the_rail_button_expands_the_sidebar(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let terminal = focus_a_worker(&workspace, cx);
+        workspace.update_in(cx, Workspace::toggle_sidebar);
+        redraw(cx);
+        let was_collapsed = collapsed(&workspace, cx);
+
+        click_toggle(cx);
+
+        assert!(was_collapsed);
+        assert!(!collapsed(&workspace, cx));
+        assert!(cx.debug_bounds("add-project").is_some());
+        assert!(
+            holds_focus(&workspace, terminal, cx),
+            "the focus did not come back to the terminal"
+        );
+    }
+
+    #[gpui::test]
+    fn clicking_the_sidebar_toggle_keeps_the_focus_on_the_terminal(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let terminal = focus_a_worker(&workspace, cx);
+
+        click_toggle(cx);
+        let after_collapse = (
+            collapsed(&workspace, cx),
+            holds_focus(&workspace, terminal, cx),
+        );
+        click_toggle(cx);
+        let after_expand = (
+            collapsed(&workspace, cx),
+            holds_focus(&workspace, terminal, cx),
+        );
+
+        assert_eq!(after_collapse, (true, true));
+        assert_eq!(after_expand, (false, true));
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.focused_terminal),
+            Some(terminal)
+        );
+    }
+
+    fn focus_workspace(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) {
+        let focus = workspace.read_with(cx, |workspace, _| workspace.focus_handle.clone());
+
+        cx.update(|window, cx| window.focus(&focus, cx));
+        redraw(cx);
+    }
+
+    #[gpui::test]
+    fn cmd_b_collapses_and_expands_the_sidebar(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        focus_workspace(&workspace, cx);
+
+        cx.simulate_keystrokes("cmd-b");
+        redraw(cx);
+        let after_first = collapsed(&workspace, cx);
+        cx.simulate_keystrokes("cmd-b");
+        redraw(cx);
+        let after_second = collapsed(&workspace, cx);
+
+        assert!(after_first);
+        assert!(!after_second);
+    }
+
+    // A sample tile is a plain focus handle. The real terminal view lets ⌘ keys through:
+    // see `swarm_term_view/tests/terminal_view.rs::cmd_shortcuts_are_not_consumed`.
+    #[gpui::test]
+    fn cmd_b_works_while_a_tile_has_focus(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let terminal = focus_a_worker(&workspace, cx);
+        let holds = holds_focus(&workspace, terminal, cx);
+
+        cx.simulate_keystrokes("cmd-b");
+        redraw(cx);
+
+        assert!(holds, "the tile does not hold the focus");
+        assert!(collapsed(&workspace, cx));
     }
 
     #[gpui::test]

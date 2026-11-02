@@ -302,6 +302,11 @@ fn open_files_panel(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<
     workspace.right_panel = Some(RightPanel::Files);
 }
 
+fn open_sidebar_collapsed(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
+    workspace.sidebar_collapsed = true;
+    cx.notify();
+}
+
 fn open_swarm(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
     workspace.set_view(View::Swarm, cx);
 }
@@ -919,6 +924,16 @@ pub(crate) fn run(directory: PathBuf, cx: &mut App) {
                 Appearance::Dark,
                 "workspace-changes-tree-dark.png",
                 Some(open_changes_tree),
+            ),
+            (
+                Appearance::Light,
+                "workspace-sidebar-collapsed-light.png",
+                Some(open_sidebar_collapsed),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-sidebar-collapsed-dark.png",
+                Some(open_sidebar_collapsed),
             ),
             (
                 Appearance::Light,

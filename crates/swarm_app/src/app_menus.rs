@@ -195,6 +195,7 @@ mod tests {
     use crate::menu_bar::harness;
     use crate::palette::Overlay;
     use crate::settings::SettingsWindow;
+    use crate::sidebar::RAIL_WIDTH;
     use crate::workspace::{RightPanel, View, Workspace};
 
     /// The sample workspace in the front window, with the menus set as `main` sets them.
@@ -648,29 +649,31 @@ mod tests {
     }
 
     #[gpui::test]
-    fn toggle_sidebar_hides_and_shows_the_sidebar(cx: &mut TestAppContext) {
+    fn toggle_sidebar_collapses_and_expands_the_sidebar(cx: &mut TestAppContext) {
         let (workspace, cx) = app(cx);
-        let shown = |cx: &mut VisualTestContext| {
+        let shown = |selector: &'static str, cx: &mut VisualTestContext| {
             redraw(cx);
 
-            cx.debug_bounds("add-project").is_some()
+            cx.debug_bounds(selector).is_some()
         };
-        let before = shown(cx);
+        let expanded = (shown("add-project", cx), shown("sidebar-rail", cx));
 
         choose("View", "Toggle Sidebar", cx);
-        let hidden = !shown(cx);
-        let hidden_flag = workspace.read_with(cx, |workspace, _| !workspace.sidebar_visible);
+        let collapsed = (shown("add-project", cx), shown("sidebar-rail", cx));
+        let collapsed_flag = workspace.read_with(cx, |workspace, _| workspace.sidebar_collapsed);
         choose("View", "Toggle Sidebar", cx);
-        let back = shown(cx);
+        let back = (shown("add-project", cx), shown("sidebar-rail", cx));
 
-        assert!(before);
-        assert!(hidden);
-        assert!(hidden_flag);
-        assert!(back);
+        assert_eq!(expanded, (true, false));
+        assert_eq!(collapsed, (false, true));
+        assert!(collapsed_flag);
+        assert_eq!(back, (true, false));
     }
 
     #[gpui::test]
-    fn the_header_leaves_room_for_the_traffic_lights_without_the_sidebar(cx: &mut TestAppContext) {
+    fn the_header_leaves_room_for_the_traffic_lights_with_the_sidebar_collapsed(
+        cx: &mut TestAppContext,
+    ) {
         let (_workspace, cx) = app(cx);
         redraw(cx);
         let tabs = |cx: &mut VisualTestContext| {
@@ -685,13 +688,14 @@ mod tests {
         choose("View", "Toggle Sidebar", cx);
         let without = tabs(cx);
 
-        // The close, minimize and zoom buttons end 68 points from the window's left edge.
+        // The close, minimize and zoom buttons end 69 points from the window's left edge.
         assert!(with_sidebar > px(248.));
-        assert!(without >= px(68.), "the tabs start at {without:?}");
+        assert!(without >= RAIL_WIDTH, "the tabs start at {without:?}");
+        assert!(without > px(69.), "the tabs start at {without:?}");
     }
 
     #[gpui::test]
-    fn the_sidebar_button_hides_the_sidebar_through_the_same_action(cx: &mut TestAppContext) {
+    fn the_sidebar_button_collapses_the_sidebar_through_the_same_action(cx: &mut TestAppContext) {
         let (workspace, cx) = app(cx);
         let button = cx
             .debug_bounds("toggle-sidebar")
@@ -700,7 +704,7 @@ mod tests {
         cx.simulate_click(button.center(), gpui::Modifiers::none());
         cx.run_until_parked();
 
-        assert!(!workspace.read_with(cx, |workspace, _| workspace.sidebar_visible));
+        assert!(workspace.read_with(cx, |workspace, _| workspace.sidebar_collapsed));
     }
 
     #[gpui::test]
@@ -907,7 +911,7 @@ mod tests {
         assert!(closed);
         assert_eq!(cx.windows().len(), 1, "the main window did not come back");
         assert!(workspace.read_with(cx, |workspace, _| workspace.window.is_some()));
-        assert!(!workspace.read_with(cx, |workspace, _| workspace.sidebar_visible));
+        assert!(workspace.read_with(cx, |workspace, _| workspace.sidebar_collapsed));
         let app: &TestAppContext = cx;
         assert_eq!(app.read(lifecycle::policy), gpui::ActivationPolicy::Regular);
     }
@@ -963,7 +967,7 @@ mod tests {
         cx.run_until_parked();
 
         assert!(!handled, "the main window handles the action");
-        assert!(workspace.read_with(cx, |workspace, _| workspace.sidebar_visible));
+        assert!(workspace.read_with(cx, |workspace, _| !workspace.sidebar_collapsed));
         assert_eq!(cx.windows().len(), 1);
     }
 
@@ -976,11 +980,11 @@ mod tests {
 
         choose("View", "Toggle Sidebar", cx);
 
-        assert!(!workspace.read_with(cx, |workspace, _| workspace.sidebar_visible));
+        assert!(workspace.read_with(cx, |workspace, _| workspace.sidebar_collapsed));
     }
 
     #[gpui::test]
-    fn the_view_menu_brings_the_sidebar_back_after_its_button_hid_it(cx: &mut TestAppContext) {
+    fn the_view_menu_expands_the_sidebar_after_its_button_collapsed_it(cx: &mut TestAppContext) {
         let (workspace, cx) = app(cx);
         let button = cx
             .debug_bounds("toggle-sidebar")
@@ -988,12 +992,12 @@ mod tests {
         cx.simulate_click(button.center(), gpui::Modifiers::none());
         cx.run_until_parked();
         redraw(cx);
-        let hidden = !workspace.read_with(cx, |workspace, _| workspace.sidebar_visible);
+        let collapsed = workspace.read_with(cx, |workspace, _| workspace.sidebar_collapsed);
 
         choose("View", "Toggle Sidebar", cx);
 
-        assert!(hidden);
-        assert!(workspace.read_with(cx, |workspace, _| workspace.sidebar_visible));
+        assert!(collapsed);
+        assert!(workspace.read_with(cx, |workspace, _| !workspace.sidebar_collapsed));
     }
 
     #[gpui::test]
