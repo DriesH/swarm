@@ -435,6 +435,31 @@ const PTY_BRIEF: &str = "Wire PTY read and write on a background thread in `crat
 - Resize with `TIOCSWINSZ` when the grid changes.
 - Add tests for spawn, resize and exit.";
 
+/// The plan the sample Start tab holds: one feature, with text under each heading.
+pub(crate) const SAMPLE_PLAN: &str = "## What
+
+Add **quiet hours** to notifications: no sound and no banner between two times the user picks. A task that needs a decision still shows a *badge* in the sidebar.
+
+## Requirements
+
+- A start and an end time under Settings > Notifications
+- Quiet hours may cross midnight, for example `22:00` to `07:00`
+- Same rules as the existing [notification settings](https://example.com/docs/notifications)
+
+## Definition of done
+
+- No sound or banner plays inside quiet hours
+- The badge still shows
+- `cargo test` passes
+";
+
+/// The plan template the sample Start tab starts from.
+pub(crate) const SAMPLE_PLAN_TEMPLATE: &str = "## What
+
+## Requirements
+
+## Definition of done";
+
 /// The orchestrator's draft in the `PRCreate` mockup.
 pub(crate) fn sample_draft() -> PrDraft {
     PrDraft {
@@ -2289,19 +2314,7 @@ impl FakeData {
         } else {
             START_TASK
         };
-        let live = self
-            .project(project)
-            .is_some_and(|project| project.daemon.is_some());
-        let task = if live {
-            self.add_empty_task(project, name)
-        } else {
-            let lines = vec![FakeLine {
-                text: "\u{203a} ready".into(),
-                color: Color::Muted,
-            }];
-
-            self.add_task(project, name, AgentKind::ClaudeCode, lines)
-        };
+        let task = self.add_empty_task(project, name);
 
         if let Some(entry) = self.tasks.iter_mut().find(|entry| entry.id == task) {
             entry.is_start = true;
@@ -2311,7 +2324,8 @@ impl FakeData {
         task
     }
 
-    /// Adds a task with no agent yet, for a Start tab whose orchestrator the daemon runs.
+    /// Adds a task with no agent yet, for a Start tab that shows the plan editor until its
+    /// orchestrator starts.
     fn add_empty_task(&mut self, project: ProjectId, name: &str) -> TaskId {
         let task = TaskId(
             self.tasks
@@ -2532,6 +2546,21 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(data.tasks_of(ProjectId(3)).count(), 1);
+    }
+
+    #[test]
+    fn a_start_task_has_no_agent_until_the_orchestrator_starts() {
+        let mut data = FakeData::sample();
+        let agents = data.agents.len();
+
+        let start = data.ensure_start_task(ProjectId(3));
+
+        assert_eq!(data.agents.len(), agents);
+        assert!(
+            data.task(start)
+                .is_some_and(|task| task.orchestrator.is_none())
+        );
+        assert!(!data.start_runs(ProjectId(3)));
     }
 
     #[test]

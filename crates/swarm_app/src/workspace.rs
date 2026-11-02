@@ -23,6 +23,7 @@ use crate::model::{
 };
 use crate::palette::Overlay;
 use crate::panels::ChangesList;
+use crate::plan_editor::{PlanEditor, PlanFocus};
 use crate::pull_request::PullRequests;
 use crate::review_view::ReviewView;
 use crate::settings::Page;
@@ -115,8 +116,12 @@ pub(crate) struct Workspace {
     pub(crate) setup_exits_shown: HashSet<swarm_protocol::TaskId>,
     /// Process terminals the user closed. They never get a tile again.
     pub(crate) dismissed_terminals: HashSet<swarm_protocol::TerminalId>,
-    /// Projects whose Start orchestrator was asked for. Only Plan with orchestrator asks again.
-    pub(crate) start_requested: HashSet<ProjectId>,
+    /// Projects the daemon is removing. Send plan for one does nothing.
+    pub(crate) removing_projects: HashSet<ProjectId>,
+    /// The plan editor of each project, made when its Start tab first shows it.
+    pub(crate) plan_editors: HashMap<ProjectId, Entity<PlanEditor>>,
+    /// Whether the plan editor of the open Start tab takes the focus when it shows.
+    pub(crate) plan_focus: PlanFocus,
     /// The tab used before the open one, for each project.
     pub(crate) previous_tabs: HashMap<ProjectId, TaskId>,
     /// Width and height of one cell of the terminal font, once measured.
@@ -219,6 +224,10 @@ impl Workspace {
         workspace
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one flat list of fields reads best in one place"
+    )]
     fn with_data(
         source: DataSource,
         mut data: FakeData,
@@ -289,7 +298,9 @@ impl Workspace {
             settings_path: None,
             setup_exits_shown: HashSet::new(),
             dismissed_terminals: HashSet::new(),
-            start_requested: HashSet::new(),
+            removing_projects: HashSet::new(),
+            plan_editors: HashMap::new(),
+            plan_focus: PlanFocus::Off,
             previous_tabs: HashMap::new(),
             cell_size: None,
             font_size: swarm_term_view::DEFAULT_FONT_SIZE,
@@ -468,12 +479,7 @@ impl Workspace {
             return;
         }
 
-        let project = self.active_project;
-        let task = self.data.ensure_start_task(project);
-
-        if !self.data.start_runs(project) {
-            self.start_requested.remove(&project);
-        }
+        let task = self.data.ensure_start_task(self.active_project);
 
         self.overlay = None;
         self.select_task(task, cx);
@@ -500,6 +506,11 @@ impl Workspace {
             .and_then(|id| self.data.agent(id))
             .map(|agent| agent.terminal);
         self.pending_focus = self.focused_terminal;
+        self.plan_focus = if entry.is_start {
+            PlanFocus::Asked
+        } else {
+            PlanFocus::Off
+        };
         cx.notify();
     }
 
@@ -854,7 +865,7 @@ impl Render for Workspace {
         let colors = cx.theme().colors();
         let (panel, line) = (colors.panel, colors.line);
 
-        self.start_orchestrator_if_needed(cx);
+        self.sync_plan_editor(window, cx);
         self.sync_swarm_tasks(window.is_window_active(), cx);
         self.sync_usage_clock(window.is_window_active(), cx);
         self.sync_pull_requests(window.is_window_active(), window, cx);

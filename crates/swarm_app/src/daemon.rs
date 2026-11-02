@@ -29,6 +29,8 @@ use crate::workspace::{DataSource, View, Workspace};
 const ATTACH_HISTORY: u32 = 1_000;
 const SETUP_TITLE: &str = "Setup";
 const DAEMON_BINARY: &str = "swarm-daemon";
+/// What the app says when it needs the daemon and has no connection to it.
+pub(crate) const NOT_RUNNING: &str = "The daemon is not running";
 /// The tile's header, border and body padding.
 pub(crate) const CHROME_WIDTH: f32 = 26.;
 pub(crate) const CHROME_HEIGHT: f32 = 56.;
@@ -275,7 +277,8 @@ impl Workspace {
         self.minimized.clear();
         self.disconnected.clear();
         self.dismissed_terminals.clear();
-        self.start_requested.clear();
+        self.removing_projects.clear();
+        self.plan_editors.clear();
         self.previous_tabs.clear();
         self.focused_terminal = None;
         self.data.sync_projects(projects);
@@ -333,6 +336,7 @@ impl Workspace {
     ) {
         self.daemon = Some(client.clone());
         self.forget_comment_listing();
+        self.retry_plan_loads(cx);
         Self::watch_events(&client, cx);
         crate::system_check::stop_stale_fixes(&client, terminals);
 
@@ -633,47 +637,6 @@ impl Workspace {
                 self.close_start_tab(info.id, agent, cx);
             }
         }
-    }
-
-    /// Asks the daemon for the project's Start orchestrator once, when its Start tab
-    /// shows and none runs. The daemon picks the kind from the settings.
-    pub(crate) fn start_orchestrator_if_needed(&mut self, cx: &mut Context<Self>) {
-        let task = self.active_task();
-        if !task.is_start {
-            return;
-        }
-
-        let project = task.project;
-        if self.start_requested.contains(&project) || self.data.start_runs(project) {
-            return;
-        }
-
-        let Some(client) = self.daemon.clone().filter(Client::is_connected) else {
-            return;
-        };
-        let Some(daemon_project) = self.data.project(project).and_then(|entry| entry.daemon) else {
-            return;
-        };
-
-        self.start_requested.insert(project);
-
-        let starting =
-            cx.background_spawn(async move { client.start_orchestrator(daemon_project, None) });
-
-        cx.spawn(async move |this, cx| {
-            let result = starting.await;
-
-            let updated =
-                Self::update_with_window(&this, cx, |workspace, window, cx| match result {
-                    Ok(agent) => workspace.agent_changed(&agent, window, cx),
-                    Err(error) => workspace.report_sidebar_error(error.to_string(), cx),
-                });
-
-            if let Err(error) = updated {
-                log::debug!("the workspace is gone before the orchestrator started: {error}");
-            }
-        })
-        .detach();
     }
 
     /// A task was added, also by an agent, or changed. Focus stays where it is.
@@ -1552,7 +1515,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let Some(client) = self.daemon.clone() else {
-            self.report_sidebar_error("The daemon is not running".to_owned(), cx);
+            self.report_sidebar_error(NOT_RUNNING.to_owned(), cx);
             return;
         };
 
@@ -1989,13 +1952,20 @@ pub(crate) mod tests {
         (workspace, cx)
     }
 
-    /// Starts the project's Start orchestrator and lists no terminals, for any request
-    /// that asks for it.
+    /// Starts the project's Start orchestrator, has no plan draft and lists no terminals,
+    /// for any request that asks for it.
     fn default_reply(request: &Request) -> Option<Event> {
         match request {
             Request::StartOrchestrator { call, project, .. } => Some(Event::AgentStarted {
                 call: *call,
                 agent: start_agent(100, project.0, DaemonAgentStatus::Idle),
+            }),
+            Request::PlanDraft { call, .. } => Some(Event::PlanDraft {
+                call: *call,
+                draft: swarm_protocol::PlanDraft {
+                    text: None,
+                    template: crate::model::SAMPLE_PLAN_TEMPLATE.to_owned(),
+                },
             }),
             Request::List { call } => Some(Event::Terminals {
                 call: *call,
@@ -2064,6 +2034,7 @@ pub(crate) mod tests {
             Request::DraftPr { call, .. }
             | Request::StopAgents { call }
             | Request::SaveProjectConfig { call, .. }
+            | Request::SavePlanDraft { call, .. }
             | Request::RemoveProject { call, .. }
             | Request::RunChecks { call, .. } => Some(Event::Done { call: *call }),
             Request::PrStatus { call, .. } => Some(Event::Error {
@@ -2957,7 +2928,7 @@ pub(crate) mod tests {
         assert_eq!(status, TaskStatus::Working);
     }
 
-    fn temp_settings_path(name: &str) -> PathBuf {
+    pub(crate) fn temp_settings_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "swarm-app-{name}-{}-{}",
             std::process::id(),
@@ -4275,17 +4246,27 @@ pub(crate) mod tests {
         assert_eq!(kept, Some((change.stat, change.files)));
     }
 
-    type StartRequests = flume::Receiver<(DaemonProjectId, Option<swarm_protocol::AgentKind>)>;
+    type StartRequests = flume::Receiver<(
+        DaemonProjectId,
+        Option<swarm_protocol::AgentKind>,
+        Option<String>,
+    )>;
 
-    /// A project without tasks whose daemon records every Start orchestrator request.
+    /// A live project "demo" (id 5) whose daemon records every Start orchestrator request.
     fn start_workspace(
         tasks: Vec<TaskInfo>,
         cx: &mut TestAppContext,
     ) -> (Entity<Workspace>, &mut VisualTestContext, StartRequests) {
         let (sent, requests) = flume::unbounded();
         let socket = fake_daemon_replying(move |request| {
-            if let Request::StartOrchestrator { project, kind, .. } = request {
-                sent.send((project, kind)).ok();
+            if let Request::StartOrchestrator {
+                project,
+                kind,
+                plan,
+                ..
+            } = request
+            {
+                sent.send((project, kind, plan)).ok();
             }
 
             None
@@ -4309,64 +4290,95 @@ pub(crate) mod tests {
         cx.run_until_parked();
     }
 
-    /// The color of the quad drawn at the bounds of `selector`. When more than one quad has
-    /// those bounds, the one drawn last, which is the one on top.
-    pub(crate) fn drawn_color(
+    /// The quad drawn at the bounds of `selector`. When more than one quad has those bounds,
+    /// the one drawn last, which is the one on top.
+    pub(crate) fn drawn_quad(
         selector: &'static str,
         cx: &mut VisualTestContext,
-    ) -> Option<gpui::Hsla> {
+    ) -> Option<gpui::Quad> {
         let bounds = cx.debug_bounds(selector)?;
 
         cx.update(|window, _| {
             let wanted = bounds.scale(window.scale_factor());
             let near = |a: gpui::ScaledPixels, b: gpui::ScaledPixels| (a.0 - b.0).abs() < 0.01;
 
-            window
-                .painted_quads()
-                .iter()
-                .rev()
-                .find(|quad| {
-                    near(quad.bounds.origin.x, wanted.origin.x)
-                        && near(quad.bounds.origin.y, wanted.origin.y)
-                        && near(quad.bounds.size.width, wanted.size.width)
-                        && near(quad.bounds.size.height, wanted.size.height)
-                })
-                .and_then(|quad| quad.background.as_solid())
+            window.painted_quads().into_iter().rev().find(|quad| {
+                near(quad.bounds.origin.x, wanted.origin.x)
+                    && near(quad.bounds.origin.y, wanted.origin.y)
+                    && near(quad.bounds.size.width, wanted.size.width)
+                    && near(quad.bounds.size.height, wanted.size.height)
+            })
         })
     }
 
+    /// The fill of the quad [`drawn_quad`] finds.
+    pub(crate) fn drawn_color(
+        selector: &'static str,
+        cx: &mut VisualTestContext,
+    ) -> Option<gpui::Hsla> {
+        drawn_quad(selector, cx)?.background.as_solid()
+    }
+
     #[gpui::test]
-    fn a_start_tab_asks_for_its_orchestrator_once_and_lets_the_daemon_pick_the_kind(
+    fn a_live_project_without_tasks_shows_the_plan_editor_and_starts_nothing(
         cx: &mut TestAppContext,
     ) {
-        let (sent, requests) = flume::unbounded();
+        let (workspace, cx, requests) = start_workspace(Vec::new(), cx);
+        redraw(cx);
+        redraw(cx);
+
+        let (is_start, editor, tiles, runs) = workspace.read_with(cx, |workspace, _| {
+            (
+                workspace.active_task().is_start,
+                workspace.shown_plan_editor().is_some(),
+                crate::views::tile_specs(workspace).len(),
+                workspace.data.start_runs(workspace.active_project),
+            )
+        });
+        assert!(is_start);
+        assert!(editor, "the Start tab does not show the plan editor");
+        assert!(cx.debug_bounds("plan-editor").is_some());
+        assert_eq!((tiles, runs), (0, false));
+        assert_eq!(
+            requests.try_iter().count(),
+            0,
+            "a Start orchestrator was asked for"
+        );
+    }
+
+    #[gpui::test]
+    fn a_reconnect_starts_no_orchestrator_and_keeps_the_plan_editor(cx: &mut TestAppContext) {
+        let (workspace, cx, requests) = start_workspace(Vec::new(), cx);
+        redraw(cx);
+        let before = workspace.read_with(cx, |workspace, _| workspace.shown_plan_editor());
+        let (sent, again) = flume::unbounded();
         let socket = fake_daemon_replying(move |request| {
-            if let Request::StartOrchestrator { project, kind, .. } = request {
-                sent.send((project, kind)).ok();
+            if matches!(request, Request::StartOrchestrator { .. }) {
+                sent.send(()).ok();
             }
 
             None
         });
-        let (workspace, cx) = setup(cx);
-        cx.executor().allow_parking();
-        let client = Client::connect(&socket).expect("connect to the fake daemon");
+        let client = Client::connect(&socket).expect("connect to the second fake daemon");
+
         use_projects(&workspace, &[project_info(5, "demo", Vec::new())], cx);
         workspace.update_in(cx, |workspace, window, cx| {
             workspace.use_daemon(client, &[], window, cx);
         });
-
-        cx.executor().allow_parking();
-        cx.run_until_parked();
         redraw(cx);
         redraw(cx);
 
-        let sent: Vec<_> = requests.try_iter().collect();
-        assert_eq!(sent, [(DaemonProjectId(5), None)]);
+        let after = workspace.read_with(cx, |workspace, _| workspace.shown_plan_editor());
+        assert!(before.is_some());
+        assert_eq!(before, after, "the reconnect made a new plan editor");
+        assert_eq!(requests.try_iter().count(), 0);
+        assert_eq!(again.try_iter().count(), 0);
     }
 
     #[gpui::test]
     fn the_started_orchestrator_is_the_only_tile_of_the_start_tab(cx: &mut TestAppContext) {
         let (workspace, cx, _requests) = start_workspace(Vec::new(), cx);
+        running_start(&workspace, cx);
 
         let (is_start, titles, label, runs) = workspace.read_with(cx, |workspace, _| {
             let task = workspace.active_task();
@@ -4383,22 +4395,22 @@ pub(crate) mod tests {
         assert_eq!(label, "Start");
         assert!(runs);
         assert_eq!(tile_titles(&workspace, cx), ["start"]);
+        assert!(workspace.read_with(cx, |workspace, _| workspace.shown_plan_editor().is_none()));
     }
 
     #[gpui::test]
-    fn plan_with_orchestrator_starts_one_and_then_only_focuses_it(cx: &mut TestAppContext) {
+    fn plan_with_orchestrator_opens_one_plan_editor_and_starts_nothing(cx: &mut TestAppContext) {
         let (workspace, cx, requests) = start_workspace(vec![task_info(7, 5, "login")], cx);
-        let before = requests.try_iter().count();
 
         workspace.update(cx, Workspace::open_start_task);
         redraw(cx);
-        let first = requests.try_iter().count();
+        let editor = workspace.read_with(cx, |workspace, _| workspace.shown_plan_editor());
         workspace.update(cx, |workspace, cx| workspace.select_task(TaskId(0), cx));
         workspace.update(cx, Workspace::open_start_task);
         redraw(cx);
 
-        let (second, starts, label) = (
-            requests.try_iter().count(),
+        let (again, starts, label) = (
+            workspace.read_with(cx, |workspace, _| workspace.shown_plan_editor()),
             workspace.read_with(cx, |workspace, _| {
                 workspace
                     .data
@@ -4414,8 +4426,18 @@ pub(crate) mod tests {
                     .to_string()
             }),
         );
-        assert_eq!((before, first, second, starts), (0, 1, 0, 1));
+        assert!(
+            editor.is_some(),
+            "the Plan tab does not show the plan editor"
+        );
+        assert_eq!(editor, again);
+        assert_eq!(starts, 1);
         assert_eq!(label, "Plan");
+        assert_eq!(
+            requests.try_iter().count(),
+            0,
+            "a Start orchestrator was asked for"
+        );
     }
 
     fn running_start(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) {

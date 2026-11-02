@@ -10,16 +10,21 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
-use gpui::{AnyWindowHandle, App, AsyncApp, Context, Window};
+use gpui::{AnyWindowHandle, App, AsyncApp, Context, SharedString, Window};
 use swarm_protocol::{
     CheckState, CloseCheck, RemoveCheck, ReviewSource, TaskCloseCheck, TaskId as DaemonTaskId,
     Usage, UsageProblem,
 };
+use swarm_ui::prelude::Color;
 use swarm_ui::theme::{self, Appearance};
 
 use crate::close_task::CheckState as DialogCheck;
-use crate::model::{AgentKind, ProjectId, SAMPLE_NOW, TaskId, TaskStatus};
+use crate::model::{
+    AgentKind, DaemonAgent, FakeLine, PLAN_TASK, ProjectId, SAMPLE_NOW, START_TASK, TaskId,
+    TaskStatus,
+};
 use crate::palette::Overlay;
+use crate::plan_editor::PlanEditor;
 use crate::remove_project::RemoveProjectDialog;
 use crate::review_model::{DiffStyle, LinePos};
 use crate::swarm_view::InspectorTab;
@@ -37,6 +42,77 @@ fn open_start(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Worksp
 
 fn open_start_empty(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
     workspace.select_project(ProjectId(3), cx);
+}
+
+/// The Start tab while the plan goes out: Send plan shows its spinner.
+fn open_start_sending(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    open_start(workspace, window, cx);
+
+    let project = workspace.active_project;
+    workspace
+        .plan_editor(project, cx)
+        .update(cx, PlanEditor::show_sending);
+}
+
+/// The Start tab after the daemon refused the plan.
+fn open_start_error(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    open_start(workspace, window, cx);
+
+    let project = workspace.active_project;
+    workspace.plan_editor(project, cx).update(cx, |editor, cx| {
+        editor.show_error(
+            "the daemon refused the request: the Start orchestrator already runs",
+            cx,
+        );
+    });
+}
+
+/// The project's Start tab with its orchestrator running, as the daemon reports it. The
+/// tab shows the terminal and not the plan editor.
+fn open_running_start(workspace: &mut Workspace, project: ProjectId, cx: &mut Context<Workspace>) {
+    let name = if workspace.data.tasks_of(project).next().is_some() {
+        PLAN_TASK
+    } else {
+        START_TASK
+    };
+    let lines = vec![FakeLine {
+        text: "\u{203a} ready".into(),
+        color: Color::Muted,
+    }];
+    let task = workspace
+        .data
+        .add_task(project, name, AgentKind::ClaudeCode, lines);
+
+    if let Some(entry) = workspace
+        .data
+        .tasks
+        .iter_mut()
+        .find(|entry| entry.id == task)
+    {
+        entry.is_start = true;
+        entry.branch = SharedString::default();
+    }
+    if let Some(agent) = workspace
+        .data
+        .agents
+        .iter_mut()
+        .find(|agent| agent.task == task)
+    {
+        agent.daemon = Some(DaemonAgent {
+            id: swarm_protocol::AgentId(100),
+            project: swarm_protocol::ProjectId(0),
+            task: None,
+            terminal: None,
+            status: swarm_protocol::AgentStatus::Idle,
+            message: None,
+            lifecycle: swarm_protocol::AgentLifecycle::Running,
+            revision: 1,
+            worktree: PathBuf::new(),
+            branch: "main".into(),
+        });
+    }
+
+    workspace.select_task(task, cx);
 }
 
 /// The menu of the "website" row, opened as the keyboard does: the row has focus and
@@ -702,14 +778,11 @@ fn open_egg_no_projects(workspace: &mut Workspace, _: &mut Window, cx: &mut Cont
     workspace.use_projects(&[], cx);
 }
 
-/// A project with no task: its Start view sits on the honeycomb.
-fn open_egg_start_view(
-    workspace: &mut Workspace,
-    window: &mut Window,
-    cx: &mut Context<Workspace>,
-) {
+/// A project with no task and a running Start orchestrator: its terminal sits on the
+/// honeycomb.
+fn open_egg_start_view(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
     plain_eggs(cx);
-    open_start_empty(workspace, window, cx);
+    open_running_start(workspace, ProjectId(3), cx);
 }
 
 /// The Swarm view with the honeycomb the Appearance page offers.
@@ -756,9 +829,10 @@ fn open_egg_toast_without_eggs(
 }
 
 /// The Start orchestrator with its crown, an hour after the 100th merge.
-fn open_egg_queen(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+fn open_egg_queen(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
     plain_eggs(cx);
-    open_start(workspace, window, cx);
+    let project = workspace.active_project;
+    open_running_start(workspace, project, cx);
     workspace.eggs.stats = swarm_protocol::SwarmStats {
         running_agents: 4,
         open_tasks: 3,
@@ -938,6 +1012,26 @@ pub(crate) fn run(directory: PathBuf, cx: &mut App) {
                 Appearance::Dark,
                 "workspace-start-empty-dark.png",
                 Some(open_start_empty),
+            ),
+            (
+                Appearance::Light,
+                "workspace-start-sending-light.png",
+                Some(open_start_sending),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-start-sending-dark.png",
+                Some(open_start_sending),
+            ),
+            (
+                Appearance::Light,
+                "workspace-start-error-light.png",
+                Some(open_start_error),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-start-error-dark.png",
+                Some(open_start_error),
             ),
             (
                 Appearance::Light,

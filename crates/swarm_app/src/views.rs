@@ -534,7 +534,8 @@ impl Workspace {
 fn terminals(workspace: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement + use<> {
     let area = cx.entity();
     let term = cx.theme().colors().term;
-    let is_start = workspace.active_task().is_start;
+    let editor = workspace.shown_plan_editor();
+    let on_terminal = workspace.active_task().is_start && editor.is_none();
     let tiles: Vec<AnyElement> = workspace
         .layout
         .placed
@@ -553,7 +554,7 @@ fn terminals(workspace: &Workspace, cx: &mut Context<Workspace>) -> impl IntoEle
         .id("terminals")
         .size_full()
         .relative()
-        .when(is_start, |area| area.bg(term))
+        .when(on_terminal, |area| area.bg(term))
         .on_mouse_move(cx.listener(|workspace, event: &MouseMoveEvent, _, cx| {
             workspace.drag_resize(event, cx);
         }))
@@ -567,9 +568,17 @@ fn terminals(workspace: &Workspace, cx: &mut Context<Workspace>) -> impl IntoEle
         )
         // Fills the area so its bounds are the layout area.
         .child(div().absolute().size_full())
-        .when(is_start && crate::settings::easter_eggs(cx), |area| {
+        .when(on_terminal && crate::settings::easter_eggs(cx), |area| {
             area.child(honeycomb_behind(workspace))
         })
+        .children(editor.map(|editor| {
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .child(editor)
+        }))
         .children(tiles)
 }
 
@@ -1397,7 +1406,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn the_start_view_places_exactly_one_tile(cx: &mut TestAppContext) {
+    fn the_start_view_places_no_tile_while_the_plan_editor_shows(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
 
         workspace.update(cx, |workspace, cx| {
@@ -1408,8 +1417,9 @@ mod tests {
         let (placed, tray) = workspace.read_with(cx, |workspace, _| {
             (workspace.layout.placed.len(), workspace.layout.tray.len())
         });
-        assert_eq!(placed, 1);
+        assert_eq!(placed, 0);
         assert_eq!(tray, 0);
+        assert!(cx.debug_bounds("plan-editor").is_some());
     }
 
     #[test]

@@ -11,7 +11,7 @@ use crate::model::{AgentKind, FakeLine, ProjectId};
 use crate::palette::Overlay;
 use crate::workspace::Workspace;
 
-const ORCHESTRATORS: [(&str, AgentKind); 2] = [
+pub(crate) const ORCHESTRATORS: [(&str, AgentKind); 2] = [
     ("Claude Code", AgentKind::ClaudeCode),
     ("Codex", AgentKind::Codex),
 ];
