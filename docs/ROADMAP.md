@@ -169,3 +169,7 @@ Six parts: 1. Settings pages (Projects, Terminals, Prompts, Usage, Keyboard). 2.
 - Settings › Terminals and Prompts (phase 8)
 - Menu bar usage popover (phase 7)
 - Settings: Launch at login (phase 9)
+
+## Parked
+
+- Tile controls: drag, minimize, maximize and lock tiles, with a layout engine that works around locked tiles. Spec in [`specs/tile-controls.md`](specs/tile-controls.md).
