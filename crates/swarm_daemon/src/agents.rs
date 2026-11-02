@@ -114,12 +114,17 @@ impl Plan {
     }
 }
 
+/// Runs once, after the first message was pasted and Enter was sent.
+pub(crate) type AfterFirstMessage = Box<dyn FnOnce() + Send>;
+
 /// What it takes to start a registered agent.
 pub(crate) struct Start {
     pub(crate) agent: AgentId,
     pub(crate) task_name: String,
     pub(crate) env: Vec<(String, String)>,
     pub(crate) first_message: Option<String>,
+    /// Never runs when the agent fails to start or ends before its first message.
+    pub(crate) after_first_message: Option<AfterFirstMessage>,
 }
 
 /// The agent's CLI is not on the path or in the usual folders.
@@ -1029,7 +1034,7 @@ impl Agents {
         }
 
         if let (Some(message), Some(receiver)) = (start.first_message, ready) {
-            self.type_when_ready(id, hub, message, receiver);
+            self.type_when_ready(id, hub, message, receiver, start.after_first_message);
         }
 
         Ok(())
@@ -1217,13 +1222,15 @@ impl Agents {
     }
 
     /// Types the message as a paste once the agent is ready: startup dialogs would eat
-    /// it before. It is never dropped while the agent lives.
+    /// it before. It is never dropped while the agent lives. `after` runs when the paste
+    /// and Enter went in.
     fn type_when_ready(
         self: &Arc<Self>,
         id: AgentId,
         hub: Arc<Hub>,
         message: String,
         ready: flume::Receiver<Ready>,
+        after: Option<AfterFirstMessage>,
     ) {
         let agents = Arc::clone(self);
         let spawned = thread::Builder::new()
@@ -1244,7 +1251,8 @@ impl Agents {
                 let typed = hub.send_input(TerminalInput::Paste(message));
                 sleep_for(ENTER_DELAY);
 
-                if !typed || !hub.send_input(TerminalInput::Text("\r".to_owned())) {
+                let entered = typed && hub.send_input(TerminalInput::Text("\r".to_owned()));
+                if !entered {
                     log::warn!("agent {} ended before its first message", id.0);
                 }
 
@@ -1253,6 +1261,10 @@ impl Agents {
 
                     false
                 });
+
+                if entered && let Some(after) = after {
+                    after();
+                }
             });
 
         if let Err(error) = spawned {
@@ -3127,6 +3139,7 @@ mod tests {
             task_name: task.name.clone(),
             env: Vec::new(),
             first_message: None,
+            after_first_message: None,
         };
 
         let refused = agents.start(start).expect_err("refused");

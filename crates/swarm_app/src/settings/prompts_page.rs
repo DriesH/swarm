@@ -20,7 +20,7 @@ use crate::workspace::DataSource;
 fn sample_prompts() -> Vec<PromptInfo> {
     let folder = Path::new("/Users/sam/.config/swarm/prompts");
 
-    ["orchestrator", "worker", "start", "pr"]
+    ["orchestrator", "worker", "start", "plan", "pr"]
         .into_iter()
         .map(|name| PromptInfo {
             name: name.to_owned(),
@@ -928,8 +928,10 @@ mod tests {
             "layer-orchestrator-built-in",
             "layer-worker-yours",
             "layer-start-built-in",
+            "layer-plan-built-in",
             "layer-pr-built-in",
             "customize-start",
+            "customize-plan",
             "customize-pr",
         ] {
             assert!(page.shown(shown), "{shown} is missing");

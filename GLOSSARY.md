@@ -21,7 +21,7 @@ One Claude Code or Codex process running in its own terminal.
 _Avoid_: Bot, session, pane
 
 **Orchestrator**:
-The single agent that leads one task's swarm: it splits the task, spawns workers and is the only one that talks to them. The project's **Start orchestrator** instead splits a request into tasks, briefs each task's orchestrator, then exits.
+The single agent that leads one task's swarm: it splits the task, spawns workers and is the only one that talks to them. The project's **Start orchestrator** instead splits the user's plan into tasks, briefs each task's orchestrator, then exits.
 _Avoid_: Dispatcher, lead, manager, conductor
 
 **Worker**:
@@ -47,6 +47,10 @@ _Avoid_: Event, ping, prompt
 **Brief**:
 The first message a worker or a task's orchestrator starts with: what to do and what done means.
 _Avoid_: Prompt, instructions, ticket
+
+**Plan**:
+What the user writes for the Start orchestrator: what the feature is, its requirements and its definition of done. A plan not sent yet is a **plan draft**.
+_Avoid_: Prompt, spec, request
 
 **Worktree**:
 A separate checkout of the project. Each task has a task worktree; a worker gets its own worktree only when the orchestrator has a reason.

@@ -20,7 +20,7 @@ mod client;
 pub use client::{Client, ClientError, CommentEvent, MessageEvent, PrEvent};
 
 /// Bumped on every incompatible change; the daemon refuses other versions.
-pub const VERSION: u32 = 20;
+pub const VERSION: u32 = 21;
 
 /// The most messages [`Request::ListMessages`] returns.
 pub const MESSAGES_LISTED: usize = 500;
@@ -855,6 +855,15 @@ pub struct RemoveCheck {
     pub tasks: Vec<TaskCloseCheck>,
 }
 
+/// A plan not sent yet, and the template a new plan starts from.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct PlanDraft {
+    /// The saved draft; `None` when there is none.
+    pub text: Option<String>,
+    /// The project's plan template.
+    pub template: String,
+}
+
 /// Matches a reply to its request, so a late reply never answers a newer call.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CallId(pub u32);
@@ -924,6 +933,21 @@ pub enum Request {
         project: ProjectId,
         /// `None` uses the default from the settings.
         kind: Option<AgentKind>,
+        /// With a plan, the daemon pastes it as the first message once the agent is
+        /// ready and stores it as the agent's brief. The project's plan draft goes once
+        /// the plan was typed in. Refused while a Start orchestrator already runs.
+        plan: Option<String>,
+    },
+    /// Answered with [`Event::PlanDraft`].
+    PlanDraft {
+        call: CallId,
+        project: ProjectId,
+    },
+    /// Stores the project's plan draft; `None` clears it. Answered with [`Event::Done`].
+    SavePlanDraft {
+        call: CallId,
+        project: ProjectId,
+        text: Option<String>,
     },
     /// The newest messages of a task, or of a project's Start orchestrator when `task`
     /// is `None`. Answered with [`Event::Messages`].
@@ -1249,6 +1273,10 @@ pub enum Event {
     RemoveCheck {
         call: CallId,
         check: RemoveCheck,
+    },
+    PlanDraft {
+        call: CallId,
+        draft: PlanDraft,
     },
     /// A request that has no other answer succeeded.
     Done {

@@ -858,6 +858,16 @@ impl Projects {
             .ok_or(Error::UnknownProject(project.0))
     }
 
+    /// The plan the user wrote for the project and did not send yet.
+    pub fn plan_draft(&self, project: ProjectId) -> Result<Option<String>, Error> {
+        lock(&self.store).plan_draft(project)
+    }
+
+    /// Stores the project's plan draft; `None` clears it.
+    pub fn set_plan_draft(&self, project: ProjectId, text: Option<&str>) -> Result<(), Error> {
+        lock(&self.store).set_plan_draft(project, text)
+    }
+
     /// `gh`, its sign-in and the `origin` remote of the project.
     pub fn github_status(
         &self,

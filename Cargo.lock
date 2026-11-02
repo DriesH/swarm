@@ -5382,6 +5382,7 @@ dependencies = [
  "gpui",
  "log",
  "objc2-app-kit 0.3.2",
+ "pulldown-cmark",
  "swarm_sprite",
  "unicode-segmentation",
 ]

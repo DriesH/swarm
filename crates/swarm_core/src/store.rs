@@ -295,6 +295,8 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE comments_rebuilt RENAME TO comments;
     CREATE INDEX messages_unread ON messages (to_agent) WHERE delivered_at IS NULL;
     CREATE INDEX comments_task ON comments (task)",
+    // The plan the user has written for the Start orchestrator but not sent yet.
+    "ALTER TABLE projects ADD COLUMN plan_draft TEXT;",
 ];
 
 /// The hundredth merge is the one that makes the queen bee.
@@ -631,6 +633,32 @@ impl Store {
         let rows = statement.query_map([], project_from_row)?;
 
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The plan the user wrote for the project and did not send yet.
+    pub fn plan_draft(&self, id: ProjectId) -> Result<Option<String>, Error> {
+        self.connection
+            .query_row(
+                "SELECT plan_draft FROM projects WHERE id = ?1",
+                params![to_row(id.0)?],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(Error::UnknownProject(id.0))
+    }
+
+    /// Stores the project's plan draft; `None` clears it.
+    pub fn set_plan_draft(&self, id: ProjectId, text: Option<&str>) -> Result<(), Error> {
+        let changed = self.connection.execute(
+            "UPDATE projects SET plan_draft = ?1 WHERE id = ?2",
+            params![text, to_row(id.0)?],
+        )?;
+
+        if changed == 0 {
+            return Err(Error::UnknownProject(id.0));
+        }
+
+        Ok(())
     }
 
     /// Fails when the project is unknown or still has open tasks. The message names them.
@@ -3457,7 +3485,11 @@ mod tests {
             .map(|table| values_of(&connection, table))
             .collect();
 
-        let store = Store::migrated(connection).expect("migrated");
+        // Only this migration: later ones add columns.
+        connection
+            .execute_batch(MIGRATIONS[GROWING_IDS_MIGRATION])
+            .expect("migrated");
+        let store = Store { connection };
 
         for (index, table) in GROWING_IDS_TABLES.iter().enumerate() {
             assert_eq!(
@@ -3618,5 +3650,180 @@ mod tests {
         for ((table, top), id) in GROWING_IDS_TABLES.iter().zip(tops).zip(ids) {
             assert!(id > top.unsigned_abs(), "{table}: {id} is not above {top}");
         }
+    }
+
+    /// The migration that adds the plan draft column is the twentieth.
+    const PLAN_DRAFT_MIGRATION: usize = 19;
+
+    fn store_with_project() -> (Store, StoredProject) {
+        let store = Store::open_in_memory().expect("store");
+        let project = store
+            .add_project(Path::new("/repo"), "repo")
+            .expect("project");
+
+        (store, project)
+    }
+
+    #[test]
+    fn a_new_project_has_no_plan_draft() {
+        let (store, project) = store_with_project();
+
+        assert_eq!(store.plan_draft(project.id).expect("draft"), None);
+    }
+
+    #[test]
+    fn a_saved_plan_draft_reads_back() {
+        let (store, project) = store_with_project();
+
+        store
+            .set_plan_draft(project.id, Some("## What\n\nlogin"))
+            .expect("saved");
+
+        assert_eq!(
+            store.plan_draft(project.id).expect("draft").as_deref(),
+            Some("## What\n\nlogin")
+        );
+    }
+
+    #[test]
+    fn saving_a_plan_draft_again_replaces_it() {
+        let (store, project) = store_with_project();
+        store
+            .set_plan_draft(project.id, Some("first"))
+            .expect("first");
+
+        store
+            .set_plan_draft(project.id, Some("second"))
+            .expect("second");
+
+        assert_eq!(
+            store.plan_draft(project.id).expect("draft").as_deref(),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn saving_no_text_clears_the_plan_draft() {
+        let (store, project) = store_with_project();
+        store
+            .set_plan_draft(project.id, Some("draft"))
+            .expect("saved");
+
+        store.set_plan_draft(project.id, None).expect("cleared");
+
+        assert_eq!(store.plan_draft(project.id).expect("draft"), None);
+    }
+
+    #[test]
+    fn a_plan_draft_belongs_to_its_project() {
+        let (store, project) = store_with_project();
+        let other = store
+            .add_project(Path::new("/other"), "other")
+            .expect("other project");
+
+        store
+            .set_plan_draft(project.id, Some("draft"))
+            .expect("saved");
+
+        assert_eq!(store.plan_draft(other.id).expect("draft"), None);
+    }
+
+    #[test]
+    fn adding_the_same_project_again_keeps_its_plan_draft() {
+        let (store, project) = store_with_project();
+        store
+            .set_plan_draft(project.id, Some("draft"))
+            .expect("saved");
+
+        let again = store
+            .add_project(&project.path, "renamed")
+            .expect("added again");
+
+        assert_eq!(again.id, project.id);
+        assert_eq!(
+            store.plan_draft(project.id).expect("draft").as_deref(),
+            Some("draft")
+        );
+    }
+
+    #[test]
+    fn a_plan_draft_of_an_unknown_project_is_an_error() {
+        let (store, _) = store_with_project();
+
+        let read = store.plan_draft(ProjectId(42)).expect_err("read");
+        let written = store
+            .set_plan_draft(ProjectId(42), Some("draft"))
+            .expect_err("written");
+
+        assert!(matches!(read, Error::UnknownProject(42)), "{read}");
+        assert!(matches!(written, Error::UnknownProject(42)), "{written}");
+    }
+
+    #[test]
+    fn a_removed_project_takes_its_plan_draft_along() {
+        let (store, project) = store_with_project();
+        store
+            .set_plan_draft(project.id, Some("draft"))
+            .expect("saved");
+
+        store.remove_project(project.id).expect("removed");
+        let again = store
+            .add_project(&project.path, &project.name)
+            .expect("added again");
+
+        let gone = store.plan_draft(project.id).expect_err("old project");
+        assert!(matches!(gone, Error::UnknownProject(_)), "{gone}");
+        assert_eq!(store.plan_draft(again.id).expect("draft"), None);
+    }
+
+    #[test]
+    fn a_plan_draft_survives_reopening_the_store() {
+        let folder = std::env::temp_dir().join(format!("swarm-store-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).expect("folder");
+        let database = folder.join("swarm.db");
+        let project = {
+            let store = Store::open(&database).expect("store");
+            let project = store
+                .add_project(Path::new("/repo"), "repo")
+                .expect("project");
+            store
+                .set_plan_draft(project.id, Some("draft"))
+                .expect("saved");
+            project
+        };
+
+        let reopened = Store::open(&database).expect("reopened");
+        let draft = reopened.plan_draft(project.id);
+        std::fs::remove_dir_all(&folder).expect("cleanup");
+
+        assert_eq!(draft.expect("draft").as_deref(), Some("draft"));
+    }
+
+    #[test]
+    fn a_database_from_before_plan_drafts_keeps_its_projects_with_no_draft() {
+        assert!(MIGRATIONS[PLAN_DRAFT_MIGRATION].contains("plan_draft"));
+        let connection = Connection::open_in_memory().expect("connection");
+        for migration in &MIGRATIONS[..PLAN_DRAFT_MIGRATION] {
+            connection.execute_batch(migration).expect("old schema");
+        }
+        connection
+            .pragma_update(
+                None,
+                "user_version",
+                i64::try_from(PLAN_DRAFT_MIGRATION).expect("count"),
+            )
+            .expect("version");
+        connection
+            .execute(
+                "INSERT INTO projects (path, name, added_at) VALUES ('/repo', 'repo', 1)",
+                [],
+            )
+            .expect("old project");
+
+        let store = Store::migrated(connection).expect("migrated");
+        let project = store.list_projects().expect("projects").remove(0);
+
+        assert_eq!(project.name, "repo");
+        assert_eq!(store.plan_draft(project.id).expect("draft"), None);
     }
 }

@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
-use swarm_core::store::{NewMessage, Store};
+use anyhow::{Result, bail};
+use swarm_core::store::{MAX_MESSAGE_BYTES, NewMessage, Store};
 use swarm_protocol::agent::InboxMessage;
 use swarm_protocol::{AgentId, Event, MessageId, MessageInfo};
 
@@ -13,6 +13,32 @@ use crate::hub::Clients;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Refuses a message over the size limit, in the words its sender sees.
+pub(crate) fn check_size(text: &str) -> Result<()> {
+    if text.len() <= MAX_MESSAGE_BYTES {
+        return Ok(());
+    }
+
+    bail!(
+        "message is {} KiB; the limit is {} KiB: shorten it or write it to a file and send the path",
+        text.len().div_ceil(1024),
+        MAX_MESSAGE_BYTES >> 10,
+    )
+}
+
+/// Refuses a plan or plan draft over the size limit, in the words the user sees.
+pub(crate) fn check_plan_size(text: &str) -> Result<()> {
+    if text.len() <= MAX_MESSAGE_BYTES {
+        return Ok(());
+    }
+
+    bail!(
+        "the plan is {} KiB; the limit is {} KiB",
+        text.len().div_ceil(1024),
+        MAX_MESSAGE_BYTES >> 10,
+    )
 }
 
 /// How often a waiting call looks at its peer.
@@ -269,6 +295,29 @@ mod tests {
     use swarm_protocol::{MessageKind, ProjectId};
 
     use super::*;
+
+    #[test]
+    fn a_message_over_64_kib_is_refused_with_a_way_out() {
+        let at_limit = "x".repeat(MAX_MESSAGE_BYTES);
+        let over = "x".repeat(MAX_MESSAGE_BYTES + 1);
+
+        assert!(check_size(&at_limit).is_ok());
+        let error = check_size(&over).expect_err("a message over the limit was accepted");
+        assert_eq!(
+            error.to_string(),
+            "message is 65 KiB; the limit is 64 KiB: shorten it or write it to a file and send the path"
+        );
+    }
+
+    #[test]
+    fn a_plan_over_64_kib_is_refused_in_the_words_of_a_plan() {
+        let at_limit = "x".repeat(MAX_MESSAGE_BYTES);
+        let over = "x".repeat(MAX_MESSAGE_BYTES + 1);
+
+        assert!(check_plan_size(&at_limit).is_ok());
+        let error = check_plan_size(&over).expect_err("a plan over the limit was accepted");
+        assert_eq!(error.to_string(), "the plan is 65 KiB; the limit is 64 KiB");
+    }
 
     fn messages() -> Arc<Messages> {
         let store = Store::open_in_memory().expect("store");

@@ -15,6 +15,7 @@ use crate::config;
 const ORCHESTRATOR: &str = include_str!("../prompts/orchestrator.md");
 const WORKER: &str = include_str!("../prompts/worker.md");
 const START: &str = include_str!("../prompts/start.md");
+const PLAN: &str = include_str!("../prompts/plan.md");
 const PR: &str = include_str!("../prompts/pr.md");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,13 +23,21 @@ pub enum PromptFile {
     Orchestrator,
     Worker,
     Start,
+    /// The template a new plan starts from. It is for the user, never for an agent.
+    Plan,
     /// The pull request description, sent to the orchestrator inside a `pr draft` message.
     Pr,
 }
 
 impl PromptFile {
     /// Every prompt, in the order Settings lists them.
-    pub const ALL: [Self; 4] = [Self::Orchestrator, Self::Worker, Self::Start, Self::Pr];
+    pub const ALL: [Self; 5] = [
+        Self::Orchestrator,
+        Self::Worker,
+        Self::Start,
+        Self::Plan,
+        Self::Pr,
+    ];
 
     pub fn for_role(role: AgentRole) -> Self {
         match role {
@@ -43,6 +52,7 @@ impl PromptFile {
             Self::Orchestrator => "orchestrator.md",
             Self::Worker => "worker.md",
             Self::Start => "start.md",
+            Self::Plan => "plan.md",
             Self::Pr => "pr.md",
         }
     }
@@ -64,6 +74,7 @@ impl PromptFile {
             Self::Orchestrator => ORCHESTRATOR,
             Self::Worker => WORKER,
             Self::Start => START,
+            Self::Plan => PLAN,
             Self::Pr => PR,
         }
     }
@@ -577,6 +588,64 @@ mod tests {
     }
 
     #[test]
+    fn the_start_orchestrator_reads_the_plan_and_keeps_the_user_requirements_in_the_briefs() {
+        assert!(START.contains("Read the user's plan: the first message in this terminal."));
+        assert!(START.contains("ask the user in this terminal and wait for the answer"));
+        assert!(START.contains(
+            "Keep the user's own requirements and definition of done in the brief of the task \
+             they belong to, in the user's words."
+        ));
+    }
+
+    #[test]
+    fn the_plan_template_has_the_three_sections_and_nothing_else() {
+        assert_eq!(
+            PLAN,
+            "## What\n\n## Requirements\n\n## Definition of done\n"
+        );
+    }
+
+    #[test]
+    fn the_plan_template_is_layered_like_the_others() {
+        let folders = Folders::new("plan");
+
+        let built_in = layered(
+            PromptFile::Plan,
+            Some(&folders.config()),
+            &folders.project(),
+        );
+        Folders::write(&folders.config(), "plan.md", "User plan text");
+        let user = layered(
+            PromptFile::Plan,
+            Some(&folders.config()),
+            &folders.project(),
+        );
+        Folders::write(&project_prompts(&folders), "plan.md", "Project plan text");
+        let project = layered(
+            PromptFile::Plan,
+            Some(&folders.config()),
+            &folders.project(),
+        );
+
+        assert_eq!(built_in, PLAN.trim());
+        assert_eq!(user, "User plan text");
+        assert_eq!(project, "Project plan text");
+        assert_eq!(PromptFile::Plan.file_name(), "plan.md");
+        assert_eq!(PromptFile::Plan.name(), "plan");
+    }
+
+    #[test]
+    fn no_role_gets_the_plan_template() {
+        for role in [
+            AgentRole::Orchestrator,
+            AgentRole::Worker,
+            AgentRole::StartOrchestrator,
+        ] {
+            assert_ne!(PromptFile::for_role(role), PromptFile::Plan, "{role:?}");
+        }
+    }
+
+    #[test]
     fn the_orchestrator_shares_the_task_worktree_unless_it_has_a_reason() {
         assert!(ORCHESTRATOR.contains("share the task worktree"));
         assert!(ORCHESTRATOR.contains("--own-worktree \"<reason>\""));
@@ -740,7 +809,7 @@ mod tests {
         let prompts = list(Some(&folders.config()), None).expect("list");
 
         let names: Vec<_> = prompts.iter().map(|prompt| prompt.name.as_str()).collect();
-        assert_eq!(names, ["orchestrator", "worker", "start", "pr"]);
+        assert_eq!(names, ["orchestrator", "worker", "start", "plan", "pr"]);
         for file in PromptFile::ALL {
             assert_eq!(format!("{}.md", file.name()), file.file_name());
         }
@@ -848,6 +917,7 @@ mod tests {
             ),
             (PromptFile::Worker, PromptLayer::User, "User worker text"),
             (PromptFile::Start, PromptLayer::BuiltIn, START.trim()),
+            (PromptFile::Plan, PromptLayer::BuiltIn, PLAN.trim()),
             (PromptFile::Pr, PromptLayer::Project, "Project pr text"),
         ] {
             let text = layered(file, Some(&folders.config()), &folders.project());

@@ -7,17 +7,21 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
+use swarm_core::prompts::{self, PromptFile};
+use swarm_core::store::NewMessage;
 use swarm_core::{PreparedTask, PreparedWorker};
 use swarm_protocol::{
     AgentId, AgentInfo, AgentKind, AgentRole, CloseCheck, CreateTask, CreateTerminal, Event,
-    ProjectId, RemoveCheck, TaskCloseCheck, TaskId, TaskInfo, TerminalId, TerminalKind,
+    MessageKind, PlanDraft, ProjectId, RemoveCheck, TaskCloseCheck, TaskId, TaskInfo, TerminalId,
+    TerminalKind,
 };
 use swarm_term::TerminalInput;
 use swarm_term::{ExitStatus, Palette, Rgb, Size};
 
 use crate::Services;
-use crate::agents::{Agents, CommandNotFound, Place, Start, start_key};
+use crate::agents::{AfterFirstMessage, Agents, CommandNotFound, Place, Start, start_key};
 use crate::hub::Extras;
+use crate::messages::check_plan_size;
 
 /// Default size and colors of a setup or agent terminal; the app resizes it when it
 /// attaches.
@@ -156,6 +160,7 @@ pub(crate) fn create(
             task_name: task.name.clone(),
             env,
             first_message: request.first_message.clone(),
+            after_first_message: None,
         };
         start_agent(services, start, setup);
     }
@@ -422,17 +427,28 @@ pub(crate) fn remove_project(
 }
 
 /// Starts the project's Start orchestrator in the project root, or returns the one that
-/// runs. It has no setup script and no first message: the user speaks first.
+/// runs. It has no setup script. With a `plan` that is its first message and its brief;
+/// the project's plan draft goes once the plan was typed in, so a start that fails keeps
+/// it. Without a `plan` the user speaks first. A `plan` is refused while a Start
+/// orchestrator runs.
 pub(crate) fn start_orchestrator(
     services: &Services,
     project: ProjectId,
     kind: Option<AgentKind>,
+    plan: Option<String>,
 ) -> Result<AgentInfo> {
+    if let Some(plan) = &plan {
+        if plan.trim().is_empty() {
+            bail!("a plan needs text");
+        }
+        check_plan_size(plan)?;
+    }
+
     let kind = match kind {
         Some(kind) => kind,
         None => services.agents.default_kind()?,
     };
-    let plan = services.agents.plan(kind, AgentRole::StartOrchestrator)?;
+    let launch = services.agents.plan(kind, AgentRole::StartOrchestrator)?;
 
     let (agent, created) = services.projects.start_agent_or(project, |root, base| {
         services
@@ -446,24 +462,93 @@ pub(crate) fn start_orchestrator(
                     branch: base,
                     ports: &[],
                 },
-                plan,
+                launch,
             )
             .map_err(|error| swarm_core::Error::Invalid(format!("{error:#}")))
     })?;
     if !created {
+        if plan.is_some() {
+            bail!("the Start orchestrator already runs");
+        }
+
         return Ok(services.agents.info(agent.id).unwrap_or(agent));
     }
 
     services.agents.announce(agent.id);
+    let mut after_first_message = None;
+    if let Some(plan) = &plan {
+        record_plan(services, project, agent.id, plan);
+        after_first_message = Some(clear_plan_draft_later(services, project));
+    }
+
     let start = Start {
         agent: agent.id,
         task_name: String::new(),
         env: Vec::new(),
-        first_message: None,
+        first_message: plan,
+        after_first_message,
     };
     start_agent(services, start, Setup::None);
 
     Ok(services.agents.info(agent.id).unwrap_or(agent))
+}
+
+/// Keeps the plan as the brief of the Start orchestrator. A failure is logged: the agent
+/// gets the plan anyway. The plan draft stays until the plan was typed in, see
+/// [`clear_plan_draft_later`].
+fn record_plan(services: &Services, project: ProjectId, agent: AgentId, plan: &str) {
+    let posted = services.messages.post(&NewMessage {
+        project,
+        task: None,
+        from: None,
+        to: agent,
+        kind: MessageKind::Brief,
+        text: plan,
+        delivered: true,
+    });
+    if let Err(error) = posted {
+        log::error!("cannot store the plan of project {}: {error:#}", project.0);
+    }
+}
+
+/// Clears the project's plan draft once the plan was pasted and Enter was sent. A failure
+/// is logged.
+fn clear_plan_draft_later(services: &Services, project: ProjectId) -> AfterFirstMessage {
+    let projects = Arc::clone(&services.projects);
+
+    Box::new(move || {
+        if let Err(error) = projects.set_plan_draft(project, None) {
+            log::error!(
+                "cannot clear the plan draft of project {}: {error:#}",
+                project.0
+            );
+        }
+    })
+}
+
+/// The project's saved plan draft with the plan template of its prompt layers.
+pub(crate) fn plan_draft(services: &Services, project: ProjectId) -> Result<PlanDraft> {
+    let root = services.projects.project_path(project)?;
+    let text = services.projects.plan_draft(project)?;
+    let template = prompts::layered(PromptFile::Plan, services.config_dir.as_deref(), &root);
+
+    Ok(PlanDraft { text, template })
+}
+
+/// Keeps the plan draft of the project. Text that is only whitespace clears it.
+pub(crate) fn save_plan_draft(
+    services: &Services,
+    project: ProjectId,
+    text: Option<&str>,
+) -> Result<()> {
+    if let Some(text) = text {
+        check_plan_size(text)?;
+    }
+
+    let text = text.filter(|text| !text.trim().is_empty());
+    services.projects.set_plan_draft(project, text)?;
+
+    Ok(())
 }
 
 /// Runs the worker's setup script without waiting, then starts the worker with `brief`
@@ -502,6 +587,7 @@ pub(crate) fn start_worker(
         task_name: task.name.clone(),
         env: prepared.env,
         first_message: Some(brief),
+        after_first_message: None,
     };
     start_agent(services, start, setup);
 }

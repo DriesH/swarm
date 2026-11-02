@@ -6,13 +6,14 @@ pub const UI_FONT: &str = "Geist";
 pub const MONO_FONT: &str = "Geist Mono";
 
 // Geist and Geist Mono 1.9.0 (SIL OFL 1.1), from github.com/vercel/geist-font.
-const FONTS: [&[u8]; 6] = [
+const FONTS: [&[u8]; 7] = [
     include_bytes!("../../../assets/fonts/Geist-Regular.ttf"),
     include_bytes!("../../../assets/fonts/Geist-Medium.ttf"),
     include_bytes!("../../../assets/fonts/Geist-SemiBold.ttf"),
     include_bytes!("../../../assets/fonts/GeistMono-Regular.ttf"),
     include_bytes!("../../../assets/fonts/GeistMono-Medium.ttf"),
     include_bytes!("../../../assets/fonts/GeistMono-SemiBold.ttf"),
+    include_bytes!("../../../assets/fonts/GeistMono-Italic.ttf"),
 ];
 
 /// Registers the bundled fonts with GPUI's text system.

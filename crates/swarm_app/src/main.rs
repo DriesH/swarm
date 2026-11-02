@@ -14,6 +14,7 @@ mod new_task;
 mod notifications;
 mod palette;
 mod panels;
+mod plan_editor;
 mod pull_request;
 mod pull_request_panel;
 mod remove_project;

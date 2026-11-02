@@ -17,10 +17,10 @@ use swarm_core::store::{Status, Store, unix_millis};
 use swarm_protocol::{
     AgentChange, AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, CallId,
     CloseCheck, CommentId, CommentState, CreateTask, CreateTerminal, DiffStat, Event, FileDiff,
-    FileStat, Fold, MessageInfo, MessageKind, Notice, NoticeKind, ProjectConfigFields, ProjectId,
-    ProjectInfo, PromptInfo, PromptLayer, RemoveCheck, Request, ReviewSource, SwarmStats,
-    SystemCheck, TaskDiff, TaskId, TaskInfo, TerminalId, TerminalInfo, TerminalKind, ToolCheck,
-    ToolState, Usage, UsageProblem, VERSION, read, write,
+    FileStat, Fold, MessageInfo, MessageKind, Notice, NoticeKind, PlanDraft, ProjectConfigFields,
+    ProjectId, ProjectInfo, PromptInfo, PromptLayer, RemoveCheck, Request, ReviewSource,
+    SwarmStats, SystemCheck, TaskDiff, TaskId, TaskInfo, TerminalId, TerminalInfo, TerminalKind,
+    ToolCheck, ToolState, Usage, UsageProblem, VERSION, read, write,
 };
 use swarm_term::{
     BlockedKind, ExitStatus, Palette, ProgramState, Rgb, Row, Size, TerminalInput, TerminalOutput,
@@ -2644,12 +2644,62 @@ impl Client {
             call: CALL,
             project,
             kind: None,
+            plan: None,
         });
 
         self.wait_for(|event| match event {
             Event::AgentStarted { call: CALL, agent } => Some(agent.clone()),
             _ => None,
         })
+    }
+
+    fn start_orchestrator_with_plan(
+        &mut self,
+        project: ProjectId,
+        plan: &str,
+    ) -> Result<AgentInfo, String> {
+        self.send(&Request::StartOrchestrator {
+            call: CALL,
+            project,
+            kind: None,
+            plan: Some(plan.to_owned()),
+        });
+
+        self.wait_for(|event| match event {
+            Event::AgentStarted { call: CALL, agent } => Some(Ok(agent.clone())),
+            Event::Error {
+                call: Some(CALL),
+                message,
+                ..
+            } => Some(Err(message.clone())),
+            _ => None,
+        })
+    }
+
+    fn plan_draft(&mut self, project: ProjectId) -> Result<PlanDraft, String> {
+        self.send(&Request::PlanDraft {
+            call: CALL,
+            project,
+        });
+
+        self.wait_for(|event| match event {
+            Event::PlanDraft { call: CALL, draft } => Some(Ok(draft.clone())),
+            Event::Error {
+                call: Some(CALL),
+                message,
+                ..
+            } => Some(Err(message.clone())),
+            _ => None,
+        })
+    }
+
+    fn save_plan_draft(&mut self, project: ProjectId, text: Option<&str>) -> Result<(), String> {
+        self.until_done(&Request::SavePlanDraft {
+            call: CALL,
+            project,
+            text: text.map(str::to_owned),
+        })
+        .map(|_| ())
     }
 }
 
@@ -3255,6 +3305,316 @@ esac"#,
 
     let restarted = client.start_orchestrator(project.id);
     assert_ne!(restarted.id, start.id, "a stopped one is replaced");
+}
+
+/// The plan template that ships with Swarm, as the daemon reads it.
+const BUILT_IN_PLAN_TEMPLATE: &str = include_str!("../../swarm_core/prompts/plan.md");
+
+/// A daemon whose Start orchestrator waits until it is idle, then reads three lines.
+fn plan_reader() -> Fixture {
+    fixture_with_helpers(
+        r#"case "$SWARM_ROLE" in
+start_orchestrator)
+  idle
+  IFS= read -r one
+  IFS= read -r two
+  IFS= read -r three
+  printf '%s\n%s\n%s\n' "$one" "$two" "$three" > "$OUT/plan"
+  sleep 30
+  ;;
+esac"#,
+    )
+}
+
+/// A daemon whose Start orchestrator is idle and reads nothing.
+fn idle_start_orchestrator() -> Fixture {
+    fixture_with_helpers(
+        r#"case "$SWARM_ROLE" in
+start_orchestrator)
+  idle
+  sleep 30
+  ;;
+esac"#,
+    )
+}
+
+#[test]
+fn a_start_with_a_plan_pastes_it_stores_it_as_a_brief_and_clears_the_plan_draft_once_typed_in() {
+    let fixture = plan_reader();
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    client
+        .save_plan_draft(project.id, Some("half a plan"))
+        .expect("saved");
+    let plan = "## What\n\nlogin page";
+
+    let start = client
+        .start_orchestrator_with_plan(project.id, plan)
+        .expect("started");
+
+    assert_eq!(fixture.read_when_written("plan"), format!("{plan}\n"));
+    let messages = client.list_messages(project.id, None);
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].kind, MessageKind::Brief);
+    assert_eq!(messages[0].text, plan);
+    assert_eq!(
+        (messages[0].task, messages[0].from, messages[0].to),
+        (None, None, start.id)
+    );
+    assert!(messages[0].delivered_at.is_some());
+    wait_until(|| client.plan_draft(project.id).expect("draft").text.is_none());
+}
+
+#[test]
+fn the_plan_draft_stays_until_the_plan_was_typed_in() {
+    let fixture = fixture_with_helpers(
+        r#"case "$SWARM_ROLE" in
+start_orchestrator)
+  while [ ! -e "$OUT/go" ]; do sleep 0.05; done
+  idle
+  IFS= read -r line
+  printf '%s\n' "$line" > "$OUT/plan"
+  sleep 30
+  ;;
+esac"#,
+    );
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    client
+        .save_plan_draft(project.id, Some("half a plan"))
+        .expect("saved");
+
+    client
+        .start_orchestrator_with_plan(project.id, "login page")
+        .expect("started");
+
+    let waiting = client.plan_draft(project.id).expect("draft").text;
+    assert_eq!(waiting.as_deref(), Some("half a plan"));
+    std::fs::write(fixture.out.join("go"), "").expect("go");
+    assert_eq!(fixture.read_when_written("plan"), "login page\n");
+    wait_until(|| client.plan_draft(project.id).expect("draft").text.is_none());
+}
+
+#[test]
+fn the_plan_draft_stays_when_the_agent_ends_before_the_plan_was_typed_in() {
+    let fixture = Fixture::new("exit 0");
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    client
+        .save_plan_draft(project.id, Some("half a plan"))
+        .expect("saved");
+
+    client
+        .start_orchestrator_with_plan(project.id, "login page")
+        .expect("started");
+    wait_until(|| client.projects().remove(0).start.is_none());
+
+    let draft = client.plan_draft(project.id).expect("draft").text;
+    assert_eq!(draft.as_deref(), Some("half a plan"));
+}
+
+#[test]
+fn the_plan_draft_stays_when_the_agent_command_does_not_exist() {
+    let fixture = Fixture::new("sleep 30");
+    std::fs::write(
+        fixture.settings(),
+        "[agents.claude_code]\ncommand = \"/nonexistent/claude\"\norchestrator_model = \"opus\"\nworker_model = \"sonnet\"\n",
+    )
+    .expect("settings");
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    client
+        .save_plan_draft(project.id, Some("half a plan"))
+        .expect("saved");
+
+    let refused = client.start_orchestrator_with_plan(project.id, "login page");
+
+    let message = refused.expect_err("a missing command was accepted");
+    assert!(
+        message.contains("cannot find /nonexistent/claude"),
+        "{message}"
+    );
+    let draft = client.plan_draft(project.id).expect("draft").text;
+    assert_eq!(draft.as_deref(), Some("half a plan"));
+}
+
+#[test]
+fn a_plan_is_refused_while_a_start_orchestrator_runs_and_nothing_starts() {
+    let fixture = idle_start_orchestrator();
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let running = client.start_orchestrator(project.id);
+    client
+        .save_plan_draft(project.id, Some("keep me"))
+        .expect("saved");
+
+    let refused = client.start_orchestrator_with_plan(project.id, "## What\n\nlogin page");
+
+    assert_eq!(
+        refused,
+        Err("the Start orchestrator already runs".to_owned())
+    );
+    let start = client.projects().remove(0).start;
+    assert_eq!(start.map(|agent| agent.id), Some(running.id));
+    assert_eq!(client.list_messages(project.id, None), Vec::new());
+    assert_eq!(
+        client
+            .plan_draft(project.id)
+            .expect("draft")
+            .text
+            .as_deref(),
+        Some("keep me")
+    );
+}
+
+#[test]
+fn a_plan_of_only_whitespace_is_refused_and_nothing_starts() {
+    let fixture = idle_start_orchestrator();
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    client
+        .save_plan_draft(project.id, Some("keep me"))
+        .expect("saved");
+
+    let refused = client.start_orchestrator_with_plan(project.id, " \n\t ");
+
+    assert_eq!(refused, Err("a plan needs text".to_owned()));
+    assert_eq!(client.projects().remove(0).start, None);
+    assert_eq!(
+        client
+            .plan_draft(project.id)
+            .expect("draft")
+            .text
+            .as_deref(),
+        Some("keep me")
+    );
+}
+
+#[test]
+fn a_plan_over_the_message_limit_is_refused_when_it_is_sent_and_when_it_is_saved() {
+    let fixture = idle_start_orchestrator();
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let over = "x".repeat((64 << 10) + 1);
+    let limit = "the plan is 65 KiB; the limit is 64 KiB";
+
+    let sent = client.start_orchestrator_with_plan(project.id, &over);
+    let saved = client.save_plan_draft(project.id, Some(&over));
+
+    assert_eq!(sent.expect_err("sent"), limit);
+    assert_eq!(saved.expect_err("saved"), limit);
+    assert_eq!(client.projects().remove(0).start, None);
+    assert_eq!(client.plan_draft(project.id).expect("draft").text, None);
+}
+
+#[test]
+fn a_plan_draft_is_saved_read_back_and_cleared() {
+    let repo = Repo::new("");
+    let (_config, _daemon, mut client, project) = settings_session(&repo);
+    let draft = "  ## What\n\nlogin page  \n";
+
+    let before = client.plan_draft(project).expect("draft");
+    client.save_plan_draft(project, Some(draft)).expect("saved");
+    let saved = client.plan_draft(project).expect("draft");
+    client.save_plan_draft(project, None).expect("cleared");
+    let cleared = client.plan_draft(project).expect("draft");
+
+    let template = BUILT_IN_PLAN_TEMPLATE.trim();
+    assert_eq!(
+        before,
+        PlanDraft {
+            text: None,
+            template: template.to_owned()
+        }
+    );
+    assert_eq!(saved.text.as_deref(), Some(draft));
+    assert_eq!(saved.template, template);
+    assert_eq!(cleared.text, None);
+}
+
+#[test]
+fn saving_a_plan_draft_of_only_whitespace_clears_it() {
+    let repo = Repo::new("");
+    let (_config, _daemon, mut client, project) = settings_session(&repo);
+    client
+        .save_plan_draft(project, Some("a plan"))
+        .expect("saved");
+
+    client
+        .save_plan_draft(project, Some(" \n\t "))
+        .expect("blank");
+
+    assert_eq!(client.plan_draft(project).expect("draft").text, None);
+}
+
+#[test]
+fn a_plan_draft_of_an_unknown_project_is_refused() {
+    let repo = Repo::new("");
+    let (_config, _daemon, mut client, _project) = settings_session(&repo);
+    let unknown = ProjectId(9_999);
+
+    let read = client.plan_draft(unknown);
+    let saved = client.save_plan_draft(unknown, Some("a plan"));
+
+    assert!(read.expect_err("read").contains("9999"));
+    assert!(saved.expect_err("saved").contains("9999"));
+}
+
+#[test]
+fn a_project_plan_template_wins_over_the_user_template_and_the_built_in_one() {
+    let repo = Repo::new("");
+    let (config, _daemon, mut client, project) = settings_session(&repo);
+
+    config.write_prompt("plan", "User template");
+    let user = client.plan_draft(project).expect("draft").template;
+    std::fs::create_dir_all(repo.root.join(".swarm/prompts")).expect("folder");
+    std::fs::write(repo.root.join(".swarm/prompts/plan.md"), "Project template").expect("prompt");
+    let project_layer = client.plan_draft(project).expect("draft").template;
+
+    assert_eq!(user, "User template");
+    assert_eq!(project_layer, "Project template");
+}
+
+#[test]
+fn a_plan_draft_survives_a_daemon_restart() {
+    let repo = Repo::new("");
+    let mut daemon = Daemon::start();
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    client
+        .save_plan_draft(project.id, Some("a plan"))
+        .expect("saved");
+    drop(client);
+
+    daemon.crash();
+    let restarted = Daemon::start_in(daemon.home.clone());
+    let mut client = restarted.connect();
+    client.hello();
+
+    let draft = client.plan_draft(project.id).expect("draft");
+    assert_eq!(draft.text.as_deref(), Some("a plan"));
 }
 
 #[test]
@@ -5027,6 +5387,7 @@ esac"#,
         call: CALL,
         project: project.id,
         kind: None,
+        plan: None,
     });
     let start = other.wait_for(|event| match event {
         Event::Error {
@@ -10415,7 +10776,7 @@ fn outside_any_project_every_prompt_is_built_in_and_its_user_path_is_in_the_conf
     let prompts = client.prompts(None).expect("prompts");
 
     let names: Vec<_> = prompts.iter().map(|prompt| prompt.name.as_str()).collect();
-    assert_eq!(names, ["orchestrator", "worker", "start", "pr"]);
+    assert_eq!(names, ["orchestrator", "worker", "start", "plan", "pr"]);
     for prompt in &prompts {
         assert_eq!(prompt.layer, PromptLayer::BuiltIn, "{}", prompt.name);
         assert_eq!(prompt.user_path, config.prompt(&prompt.name));

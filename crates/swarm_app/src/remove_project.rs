@@ -13,12 +13,11 @@ use swarm_ui::fonts::{MONO_FONT, UI_FONT};
 use swarm_ui::prelude::*;
 
 use crate::close_task::{CheckState, deletes_files, describe, stops_agents, stops_terminals};
+use crate::daemon::NOT_RUNNING;
 use crate::model::ProjectId;
 use crate::palette::Overlay;
 use crate::review_model::plural;
 use crate::workspace::{DataSource, Workspace};
-
-const NOT_RUNNING: &str = "The daemon is not running";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RemoveProjectEvent {
@@ -501,8 +500,8 @@ impl Workspace {
 
         dialog.update(cx, RemoveProjectDialog::set_busy);
 
-        // The Start orchestrator stops while the project goes. It must not start again.
-        let guarded = self.start_requested.insert(project);
+        // The Start orchestrator stops while the project goes. Send plan must not start it again.
+        let guarded = self.removing_projects.insert(project);
         let again = client.clone();
         let removing =
             cx.background_spawn(async move { client.remove_project(daemon_id, confirmed) });
@@ -520,7 +519,7 @@ impl Workspace {
                     log::warn!("cannot remove the project: {error}");
 
                     if guarded {
-                        workspace.start_requested.remove(&project);
+                        workspace.removing_projects.remove(&project);
                     }
 
                     dialog.update(cx, |dialog, cx| {
@@ -587,7 +586,8 @@ impl Workspace {
         }
 
         self.data.forget_project(project);
-        self.start_requested.remove(&project);
+        self.removing_projects.remove(&project);
+        self.plan_editors.remove(&project);
         self.previous_tabs.remove(&project);
         self.project_focus.remove(&project);
         self.pull_requests.setups.remove(&project);
@@ -612,15 +612,16 @@ mod tests {
 
     use gpui::{Modifiers, TestAppContext, VisualTestContext};
     use swarm_protocol::{
-        AgentLifecycle, CloseCheck, Event, ProjectId as DaemonProjectId, ProjectInfo, Request,
+        CloseCheck, Event, ProjectId as DaemonProjectId, ProjectInfo, Request,
         TaskId as DaemonTaskId,
     };
 
     use super::*;
     use crate::daemon::tests::{
-        answer_late, fake_daemon_replying, project_info, redraw, setup, start_agent, task_info,
-        use_projects, wait_until,
+        answer_late, fake_daemon_replying, project_info, redraw, setup, task_info, use_projects,
+        wait_until,
     };
+    use crate::plan_editor::PlanEditor;
 
     type Requests = Arc<Mutex<Vec<Request>>>;
 
@@ -1308,7 +1309,7 @@ mod tests {
             dialog.error_text().map(str::to_owned)
         });
         let guarded = workspace.read_with(cx, |workspace, _| {
-            workspace.start_requested.contains(&ProjectId(0))
+            workspace.removing_projects.contains(&ProjectId(0))
         });
         assert_eq!(project_names(&workspace, cx), ["demo", "other"]);
 
@@ -1331,7 +1332,7 @@ mod tests {
                 .flatten()
                 .is_some_and(|message| message.contains("login has more changes"))
         );
-        assert!(!guarded, "the Start orchestrator stays off after a refusal");
+        assert!(!guarded, "Send plan stays blocked after a refusal");
         assert!(gone);
         let sent: Vec<u32> = removals(&requests)
             .iter()
@@ -1347,11 +1348,24 @@ mod tests {
     }
 
     #[gpui::test]
-    fn the_start_orchestrator_does_not_start_again_while_the_project_goes(cx: &mut TestAppContext) {
-        let mut listed = project_info(5, "demo", Vec::new());
-        listed.start = Some(start_agent(100, 5, swarm_protocol::AgentStatus::Idle));
-        let projects = [listed, project_info(6, "other", Vec::new())];
+    fn send_plan_starts_nothing_while_the_project_goes(cx: &mut TestAppContext) {
+        let projects = [
+            project_info(5, "demo", Vec::new()),
+            project_info(6, "other", Vec::new()),
+        ];
         let (workspace, cx, requests, client) = live_with(&projects, None, |_| None, cx);
+        let editor = workspace
+            .read_with(cx, |workspace, _| workspace.shown_plan_editor())
+            .expect("the Start tab shows the plan editor");
+        wait_until(cx, |cx| {
+            !editor.read_with(cx, |editor, _| editor.is_loading())
+        });
+        editor.update(cx, |editor, cx| {
+            editor
+                .text_area()
+                .update(cx, |area, cx| area.set_text("Add a login page", cx));
+        });
+        let sendable = editor.read_with(cx, PlanEditor::can_send);
         open_dialog(0, &workspace, cx);
         wait_until(cx, |cx| {
             redraw(cx);
@@ -1359,19 +1373,13 @@ mod tests {
         });
         let view = dialog(&workspace, cx).expect("the dialog is open");
 
-        // The removal only starts when the test waits. Meanwhile the daemon stops the Start
-        // orchestrator, and the window draws.
+        // The removal only starts when the test waits.
         workspace.update(cx, |workspace, cx| {
             workspace.confirm_remove_project(view, cx);
         });
-        let mut ended = start_agent(100, 5, swarm_protocol::AgentStatus::Done);
-        ended.lifecycle = AgentLifecycle::Resumable;
-        workspace.update_in(cx, |workspace, window, cx| {
-            workspace.agent_changed(&ended, Some(window), cx);
-        });
-        cx.update(|window, cx| window.draw(cx).clear(cx));
+        editor.update(cx, PlanEditor::send);
         let guarded = workspace.read_with(cx, |workspace, _| {
-            workspace.start_requested.contains(&ProjectId(0))
+            workspace.removing_projects.contains(&ProjectId(0))
         });
 
         let gone = wait_until(cx, |cx| {
@@ -1380,16 +1388,16 @@ mod tests {
         });
         flush(&client);
 
+        assert!(sendable, "the plan could not be sent in the first place");
         assert!(guarded);
         assert!(gone);
-        // The next project opens on its own Start tab, which may ask for its orchestrator.
         assert_eq!(
             count(&requests, |request| matches!(
                 request,
                 Request::StartOrchestrator { project, .. } if *project == DaemonProjectId(5)
             )),
             0,
-            "the app asked for a Start orchestrator while the project went"
+            "the app started a Start orchestrator while the project went"
         );
     }
 

@@ -145,24 +145,6 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
             Some(hub) => forward_input(services, sink, &hub, id, input),
             None => send_missing(sink, id),
         },
-        Request::StartOrchestrator {
-            call,
-            project,
-            kind,
-        } => {
-            let services = Arc::clone(services);
-            run_slow(
-                sink,
-                "start-orchestrator",
-                call,
-                move |sink| match tasks::start_orchestrator(&services, project, kind) {
-                    Ok(agent) => {
-                        sink.send_event(&Event::AgentStarted { call, agent });
-                    }
-                    Err(error) => send_error(sink, call, &error),
-                },
-            );
-        }
         Request::ListMessages {
             call,
             project,
@@ -238,6 +220,9 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
         | Request::AddProject { .. }
         | Request::CheckRemoveProject { .. }
         | Request::RemoveProject { .. }
+        | Request::StartOrchestrator { .. }
+        | Request::PlanDraft { .. }
+        | Request::SavePlanDraft { .. }
         | Request::CreateTask { .. }) => handle_projects(services, sink, request),
     }
 }
@@ -343,6 +328,51 @@ fn handle_projects(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Re
                 let removed = tasks::remove_project(&services, project, &confirmed);
 
                 done_or_error(sink, call, removed);
+            });
+        }
+        Request::StartOrchestrator {
+            call,
+            project,
+            kind,
+            plan,
+        } => {
+            let services = Arc::clone(services);
+            run_slow(
+                sink,
+                "start-orchestrator",
+                call,
+                move |sink| match tasks::start_orchestrator(&services, project, kind, plan) {
+                    Ok(agent) => {
+                        sink.send_event(&Event::AgentStarted { call, agent });
+                    }
+                    Err(error) => send_error(sink, call, &error),
+                },
+            );
+        }
+        Request::PlanDraft { call, project } => {
+            let services = Arc::clone(services);
+            run_slow(
+                sink,
+                "plan-draft",
+                call,
+                move |sink| match tasks::plan_draft(&services, project) {
+                    Ok(draft) => {
+                        sink.send_event(&Event::PlanDraft { call, draft });
+                    }
+                    Err(error) => send_error(sink, call, &error),
+                },
+            );
+        }
+        Request::SavePlanDraft {
+            call,
+            project,
+            text,
+        } => {
+            let services = Arc::clone(services);
+            run_slow(sink, "save-plan-draft", call, move |sink| {
+                let saved = tasks::save_plan_draft(&services, project, text.as_deref());
+
+                done_or_error(sink, call, saved);
             });
         }
         Request::CreateTask { call, task } => {
