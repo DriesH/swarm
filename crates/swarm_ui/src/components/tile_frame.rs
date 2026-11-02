@@ -292,11 +292,16 @@ impl Component for TileFrame {
                     example(
                         "User terminal",
                         tile("user-wrap").child(
-                            TileFrame::new("user-terminal", IconName::User, "zsh")
+                            TileFrame::new("user-terminal", IconName::Terminal, "zsh")
                                 .name_suffix(
-                                    Label::new("You")
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Faint),
+                                    h_flex()
+                                        .gap(px(5.))
+                                        .child(
+                                            Icon::new(IconName::User)
+                                                .size(IconSize::Custom(px(13.)))
+                                                .color(Color::Muted),
+                                        )
+                                        .child(Label::new("Mine").size(LabelSize::XSmall)),
                                 )
                                 .meta("~/swarm")
                                 .ring(TileRing::Fg)
