@@ -217,7 +217,13 @@ if [[ $make_dmg -eq 1 ]]; then
     mkdir "$work/dmg"
     ditto "$app" "$work/dmg/Swarm.app"
     ln -s /Applications "$work/dmg/Applications"
-    hdiutil create -volname Swarm -fs HFS+ -format UDZO -srcfolder "$work/dmg" "$dmg"
+
+    # macOS 27 deprecates `hdiutil create`; older systems have no `diskutil image`.
+    if diskutil image create from --help >/dev/null 2>&1; then
+        diskutil image create from --format UDZO --volumeName Swarm "$work/dmg" "$dmg"
+    else
+        hdiutil create -volname Swarm -fs HFS+ -format UDZO -srcfolder "$work/dmg" "$dmg"
+    fi
 
     if [[ $adhoc -eq 0 ]]; then
         codesign --force --timestamp --sign "$sign_identity" "$dmg"
