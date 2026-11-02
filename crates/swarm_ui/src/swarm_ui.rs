@@ -8,6 +8,7 @@ pub mod components;
 pub mod contrast;
 pub mod file_icons;
 pub mod fonts;
+mod markdown_highlight;
 pub mod motion;
 pub mod prelude;
 pub mod styles;
@@ -17,6 +18,7 @@ pub mod traits;
 use gpui::{App, FocusHandle, InteractiveElement, KeyBinding, Window, actions};
 
 pub use components::*;
+pub use markdown_highlight::markdown_highlights;
 pub use swarm_sprite::Wings;
 pub use theme::{ActiveTheme, Appearance, Theme, ThemeColors, ThemeKind};
 

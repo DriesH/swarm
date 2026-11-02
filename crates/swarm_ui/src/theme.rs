@@ -707,6 +707,47 @@ mod tests {
     }
 
     #[test]
+    fn markdown_highlights_meet_wcag_aa() {
+        let mut failures = Vec::new();
+
+        for theme in themes() {
+            let colors = theme.colors();
+            let fields = [
+                ("ground", colors.ground),
+                ("panel", colors.panel),
+                ("raised", colors.raised),
+            ];
+
+            // Code gets the soft fill; every other styled text sits on the field itself.
+            // Text inside a link keeps the link color, so code in a link is accent on soft.
+            let code = [("soft", colors.soft)];
+
+            for text in [
+                ("fg", colors.fg),
+                ("muted", colors.muted),
+                ("accent", colors.accent),
+            ] {
+                check(&mut failures, &theme, TEXT_AA, text, &fields);
+                check(&mut failures, &theme, TEXT_AA, text, &code);
+            }
+
+            // Selected plain text; the marks (muted) and links (accent) dim under the selection
+            // tint and are not held to this.
+            let selected = [
+                ("ground selected", colors.ground),
+                ("panel selected", colors.panel),
+                ("raised selected", colors.raised),
+                ("soft selected", colors.soft),
+            ]
+            .map(|(name, surface)| (name, composite(surface, colors.selection)));
+
+            check(&mut failures, &theme, TEXT_AA, ("fg", colors.fg), &selected);
+        }
+
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
     fn button_labels_meet_wcag_aa_at_rest_and_on_hover() {
         use crate::components::ButtonVariant;
 

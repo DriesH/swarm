@@ -7,10 +7,10 @@ use std::time::Duration;
 use gpui::{
     AnyElement, App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, Div, ElementId,
     ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, Font,
-    GlobalElementId, Hsla, InspectorElementId, KeyBinding, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Role, ScrollEvent, SharedString,
-    Stateful, Style, Task, TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window, WrappedLine,
-    div, fill, point, px, relative, size,
+    GlobalElementId, HighlightStyle, Hsla, InspectorElementId, KeyBinding, LayoutId, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Role, ScrollEvent,
+    SharedString, Stateful, Style, Task, TextAlign, TextRun, UTF16Selection, UnderlineStyle,
+    Window, WrappedLine, div, fill, point, px, relative, size,
 };
 use unicode_segmentation::UnicodeSegmentation as _;
 
@@ -19,6 +19,7 @@ use crate::fonts::{MONO_FONT, UI_FONT};
 use crate::motion::reduce_motion;
 use crate::prelude::*;
 use crate::styles::focus_ring;
+use crate::theme::ThemeColors;
 
 mod action {
     gpui::actions!(
@@ -180,6 +181,15 @@ enum Chrome {
     Plain,
 }
 
+/// How tall a `TextArea` is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Height {
+    /// `rows` lines.
+    Rows,
+    /// The height its parent gives.
+    Fill,
+}
+
 /// How a focused text field shows focus.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FocusStyle {
@@ -206,6 +216,11 @@ pub type TextInput = TextField<false>;
 /// Create it with `cx.new(|cx| TextArea::new(cx))`.
 pub type TextArea = TextField<true>;
 
+/// Colors the text of a field: it gets the text and the theme colors and returns styled byte
+/// ranges. They must be sorted, apart and on char boundaries; the field drops any other.
+/// Of each style, the color, font weight, font style, background and underline apply.
+pub type Highlighter = fn(&str, &ThemeColors) -> Vec<(Range<usize>, HighlightStyle)>;
+
 /// The shared editor behind [`TextInput`] and [`TextArea`].
 /// Set a label: VoiceOver reads it.
 pub struct TextField<const MULTILINE: bool> {
@@ -216,6 +231,7 @@ pub struct TextField<const MULTILINE: bool> {
     mono: bool,
     disabled: bool,
     rows: usize,
+    height: Height,
     size: TextFieldSize,
     chrome: Chrome,
     prefix: Option<SharedString>,
@@ -223,6 +239,7 @@ pub struct TextField<const MULTILINE: bool> {
     role: TextFieldRole,
     expanded: Option<bool>,
     char_filter: Option<fn(char) -> bool>,
+    highlights: Highlights,
     /// A mouse button is down and dragging extends the selection.
     selecting: bool,
     scroll: Scroll,
@@ -238,6 +255,19 @@ struct Scroll {
     offset: Point<Pixels>,
     /// Scroll on the next paint so the cursor is visible.
     follow_cursor: bool,
+}
+
+/// The highlighter and its last result, kept until the text or the theme changes.
+#[derive(Default)]
+struct Highlights {
+    highlighter: Option<Highlighter>,
+    cached: Option<CachedHighlights>,
+}
+
+struct CachedHighlights {
+    revision: u64,
+    colors: ThemeColors,
+    ranges: Vec<(Range<usize>, HighlightStyle)>,
 }
 
 struct Blink {
@@ -264,6 +294,7 @@ impl<const MULTILINE: bool> TextField<MULTILINE> {
             mono: false,
             disabled: false,
             rows: DEFAULT_ROWS,
+            height: Height::Rows,
             size: TextFieldSize::default(),
             chrome: Chrome::Bordered,
             prefix: None,
@@ -271,6 +302,7 @@ impl<const MULTILINE: bool> TextField<MULTILINE> {
             role: TextFieldRole::default(),
             expanded: None,
             char_filter: None,
+            highlights: Highlights::default(),
             selecting: false,
             scroll: Scroll::default(),
             goal_x: None,
@@ -306,6 +338,7 @@ impl<const MULTILINE: bool> TextField<MULTILINE> {
         self.buffer = Buffer {
             text,
             selection: cursor..cursor,
+            revision: self.buffer.revision + 1,
             ..Buffer::default()
         };
         self.layout = None;
@@ -340,6 +373,10 @@ impl<const MULTILINE: bool> TextField<MULTILINE> {
     pub fn set_mono(&mut self, mono: bool, cx: &mut Context<Self>) {
         self.mono = mono;
         cx.notify();
+    }
+
+    pub fn is_disabled(&self) -> bool {
+        self.disabled
     }
 
     /// A disabled field is dimmed, cannot be focused and ignores input.
@@ -391,6 +428,63 @@ impl<const MULTILINE: bool> TextField<MULTILINE> {
     pub fn set_char_filter(&mut self, filter: Option<fn(char) -> bool>, cx: &mut Context<Self>) {
         self.char_filter = filter;
         cx.notify();
+    }
+
+    /// Colors the text. The highlighter runs again only after the text or the theme changes.
+    /// The placeholder is never colored.
+    pub fn set_highlighter(&mut self, highlighter: Option<Highlighter>, cx: &mut Context<Self>) {
+        self.highlights = Highlights {
+            highlighter,
+            cached: None,
+        };
+        cx.notify();
+    }
+
+    /// `true` makes a `TextArea` take the full height its parent gives, instead of `rows`
+    /// lines. A `TextInput` ignores it.
+    pub fn set_fill(&mut self, fill: bool, cx: &mut Context<Self>) {
+        self.height = if fill { Height::Fill } else { Height::Rows };
+        cx.notify();
+    }
+
+    /// Puts the cursor at the byte `offset`, clamped to the text and moved back to a char
+    /// boundary. Clears the selection and scrolls so the cursor shows on the next paint.
+    pub fn set_cursor(&mut self, offset: usize, cx: &mut Context<Self>) {
+        self.buffer.move_to(offset);
+        self.goal_x = None;
+        self.scroll.follow_cursor = true;
+        self.restart_blink(cx);
+        cx.notify();
+    }
+
+    /// Runs the highlighter when the text or the theme changed since its last run.
+    fn refresh_highlights(&mut self, colors: &ThemeColors) {
+        let Some(highlighter) = self.highlights.highlighter else {
+            return;
+        };
+
+        let fresh = self.highlights.cached.as_ref().is_some_and(|cached| {
+            cached.revision == self.buffer.revision && cached.colors == *colors
+        });
+
+        if fresh {
+            return;
+        }
+
+        let ranges = valid_highlights(&self.buffer.text, highlighter(&self.buffer.text, colors));
+
+        self.highlights.cached = Some(CachedHighlights {
+            revision: self.buffer.revision,
+            colors: colors.clone(),
+            ranges,
+        });
+    }
+
+    fn highlight_ranges(&self) -> &[(Range<usize>, HighlightStyle)] {
+        self.highlights
+            .cached
+            .as_ref()
+            .map_or(&[], |cached| cached.ranges.as_slice())
     }
 
     /// Sanitizes `text` and drops rejected characters.
@@ -809,6 +903,7 @@ impl<const MULTILINE: bool> Render for TextField<MULTILINE> {
         let border_focus = bordered && self.focus_style == FocusStyle::Border;
         let ring_focus = bordered && self.focus_style == FocusStyle::Ring;
         let placeholder = self.placeholder.clone();
+        let fill = MULTILINE && self.height == Height::Fill;
 
         let field = div()
             .id("text-field")
@@ -827,7 +922,7 @@ impl<const MULTILINE: bool> Render for TextField<MULTILINE> {
             .w_full()
             .map(|field| {
                 if MULTILINE {
-                    field.py(px(8.))
+                    field.py(px(8.)).when(fill, Styled::h_full)
                 } else {
                     field.h(self.size.height())
                 }
@@ -851,6 +946,7 @@ impl<const MULTILINE: bool> Render for TextField<MULTILINE> {
                 div()
                     .flex_1()
                     .min_w_0()
+                    .when(fill, Styled::h_full)
                     .child(FieldText { field: cx.entity() }),
             );
 
@@ -1206,8 +1302,40 @@ fn follow(scroll: Pixels, start: Pixels, end: Pixels, viewport: Pixels) -> Pixel
     }
 }
 
-fn text_runs(len: usize, font: Font, color: Hsla, marked: Option<Range<usize>>) -> Vec<TextRun> {
-    let run = TextRun {
+/// Keeps the ranges that are sorted, apart, non-empty and on char boundaries, so a bad
+/// highlighter cannot make shaping panic. A range that ends past the text or inside a char
+/// is cut back; the others that break the rules are dropped.
+fn valid_highlights(
+    text: &str,
+    highlights: Vec<(Range<usize>, HighlightStyle)>,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    let mut valid = Vec::with_capacity(highlights.len());
+    let mut previous_end = 0;
+
+    for (range, style) in highlights {
+        let end = text.floor_char_boundary(range.end);
+        let usable =
+            range.start >= previous_end && range.start < end && text.is_char_boundary(range.start);
+
+        if usable {
+            valid.push((range.start..end, style));
+            previous_end = end;
+        }
+    }
+
+    valid
+}
+
+/// The runs that cover `len` bytes: `highlights` (valid, see [`valid_highlights`]) on top of
+/// `color`, and the IME `marked` range underlined on top of both.
+fn text_runs(
+    len: usize,
+    font: Font,
+    color: Hsla,
+    highlights: &[(Range<usize>, HighlightStyle)],
+    marked: Option<Range<usize>>,
+) -> Vec<TextRun> {
+    let plain = TextRun {
         len,
         font,
         color,
@@ -1216,34 +1344,96 @@ fn text_runs(len: usize, font: Font, color: Hsla, marked: Option<Range<usize>>) 
         strikethrough: None,
     };
 
-    let Some(marked) = marked.filter(|marked| marked.end <= len) else {
-        return vec![run];
-    };
+    if len == 0 {
+        return vec![plain];
+    }
 
-    let underline = UnderlineStyle {
-        color: Some(color),
-        thickness: px(1.),
-        wavy: false,
-    };
+    let mut runs = Vec::with_capacity(highlights.len() * 2 + 1);
+    let mut end = 0;
 
-    [
-        TextRun {
-            len: marked.start,
-            ..run.clone()
-        },
-        TextRun {
-            len: marked.end - marked.start,
-            underline: Some(underline),
-            ..run.clone()
-        },
-        TextRun {
-            len: len - marked.end,
-            ..run
-        },
-    ]
-    .into_iter()
-    .filter(|run| run.len > 0)
-    .collect()
+    for (range, style) in highlights {
+        if range.start > end {
+            runs.push(TextRun {
+                len: range.start - end,
+                ..plain.clone()
+            });
+        }
+
+        runs.push(highlighted_run(&plain, range.len(), style));
+        end = range.end;
+    }
+
+    if end < len {
+        runs.push(TextRun {
+            len: len - end,
+            ..plain
+        });
+    }
+
+    match marked.filter(|marked| marked.end <= len) {
+        Some(marked) => underline_marked(runs, &marked),
+        None => runs,
+    }
+}
+
+fn highlighted_run(plain: &TextRun, len: usize, style: &HighlightStyle) -> TextRun {
+    let mut font = plain.font.clone();
+
+    if let Some(weight) = style.font_weight {
+        font.weight = weight;
+    }
+
+    if let Some(font_style) = style.font_style {
+        font.style = font_style;
+    }
+
+    TextRun {
+        len,
+        font,
+        color: style.color.unwrap_or(plain.color),
+        background_color: style.background_color,
+        underline: style.underline,
+        strikethrough: None,
+    }
+}
+
+/// Splits the runs at the ends of `marked` and underlines the part inside.
+fn underline_marked(runs: Vec<TextRun>, marked: &Range<usize>) -> Vec<TextRun> {
+    let mut underlined = Vec::with_capacity(runs.len() + 2);
+    let mut start = 0;
+
+    for run in runs {
+        let end = start + run.len;
+        let inside_start = marked.start.clamp(start, end);
+        let inside_end = marked.end.clamp(start, end);
+        let parts = [
+            (start..inside_start, false),
+            (inside_start..inside_end, true),
+            (inside_end..end, false),
+        ];
+
+        for (part, inside) in parts {
+            if part.is_empty() {
+                continue;
+            }
+
+            let underline = inside.then_some(UnderlineStyle {
+                color: Some(run.color),
+                thickness: px(1.),
+                wavy: false,
+            });
+
+            underlined.push(TextRun {
+                len: part.len(),
+                underline: underline.or(run.underline),
+                ..run.clone()
+            });
+        }
+
+        start = end;
+    }
+
+    underlined
 }
 
 /// Paints a field's text, selection and cursor, and registers it for IME.
@@ -1253,6 +1443,8 @@ struct FieldText<const MULTILINE: bool> {
 
 struct FieldPaint {
     layout: Option<FieldLayout>,
+    /// Some text has a background, which sits under the selection.
+    backgrounds: bool,
     selections: Vec<PaintQuad>,
     cursor: Option<PaintQuad>,
     scroll: Point<Pixels>,
@@ -1285,15 +1477,16 @@ impl<const MULTILINE: bool> Element for FieldText<MULTILINE> {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        let rows = if MULTILINE {
-            self.field.read(cx).rows
-        } else {
-            1
-        };
+        let field = self.field.read(cx);
+        let rows = if MULTILINE { field.rows } else { 1 };
 
         let mut style = Style::default();
         style.size.width = relative(1.).into();
-        style.size.height = (window.line_height() * rows).into();
+        style.size.height = if MULTILINE && field.height == Height::Fill {
+            relative(1.).into()
+        } else {
+            (window.line_height() * rows).into()
+        };
 
         (window.request_layout(style, [], cx), ())
     }
@@ -1307,8 +1500,14 @@ impl<const MULTILINE: bool> Element for FieldText<MULTILINE> {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        let field = self.field.read(cx);
+        if self.field.read(cx).highlights.highlighter.is_some() {
+            let colors = cx.theme().colors().clone();
+            self.field
+                .update(cx, |field, _| field.refresh_highlights(&colors));
+        }
+
         let colors = cx.theme().colors();
+        let field = self.field.read(cx);
         let style = window.text_style();
         let font_size = style.font_size.to_pixels(window.rem_size());
         let line_height = window.line_height();
@@ -1316,14 +1515,18 @@ impl<const MULTILINE: bool> Element for FieldText<MULTILINE> {
         let buffer = &field.buffer;
         let empty = buffer.text.is_empty();
 
-        let (text, color, marked) = if empty {
-            (field.placeholder.clone(), colors.faint, None)
+        let (text, color, highlights, marked) = if empty {
+            (field.placeholder.clone(), colors.faint, &[][..], None)
         } else {
             let text = SharedString::from(buffer.text.clone());
-            (text, style.color, buffer.marked.clone())
+            let highlights = field.highlight_ranges();
+            (text, style.color, highlights, buffer.marked.clone())
         };
 
-        let runs = text_runs(text.len(), style.font(), color, marked);
+        let backgrounds = highlights
+            .iter()
+            .any(|(_, style)| style.background_color.is_some());
+        let runs = text_runs(text.len(), style.font(), color, highlights, marked);
         let wrap_width = MULTILINE.then(|| (bounds.size.width - CURSOR_WIDTH).max(px(0.)));
         let shaped = match window
             .text_system()
@@ -1387,6 +1590,7 @@ impl<const MULTILINE: bool> Element for FieldText<MULTILINE> {
 
         FieldPaint {
             layout: Some(layout),
+            backgrounds,
             selections,
             cursor,
             scroll,
@@ -1416,6 +1620,24 @@ impl<const MULTILINE: bool> Element for FieldText<MULTILINE> {
         };
 
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            if paint.backgrounds {
+                for laid in &layout.lines {
+                    let origin = layout.origin + point(px(0.), laid.y);
+                    let painted = laid.line.paint_background(
+                        origin,
+                        layout.line_height,
+                        TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    );
+
+                    if let Err(error) = painted {
+                        log::error!("cannot paint text field background: {error:#}");
+                    }
+                }
+            }
+
             for selection in paint.selections.drain(..) {
                 window.paint_quad(selection);
             }
@@ -1478,6 +1700,8 @@ struct Buffer {
     redo_stack: Vec<Snapshot>,
     /// Typing or deleting right after an edit of the same kind joins its undo step.
     last_edit: Option<EditKind>,
+    /// Goes up whenever `text` changes, so a result computed from the text can tell it is stale.
+    revision: u64,
 }
 
 impl Buffer {
@@ -1623,6 +1847,7 @@ impl Buffer {
         self.reversed = snapshot.reversed;
         self.marked = None;
         self.last_edit = None;
+        self.revision += 1;
     }
 
     fn record_undo(&mut self, kind: EditKind) {
@@ -1648,6 +1873,7 @@ impl Buffer {
 
         self.record_undo(kind);
         self.text.replace_range(start..end, new_text);
+        self.revision += 1;
 
         let cursor = start + new_text.len();
         self.selection = cursor..cursor;
@@ -1804,6 +2030,22 @@ fn preview_field(field: impl IntoElement) -> impl IntoElement {
     div().w(px(240.)).child(field)
 }
 
+const MARKDOWN_SAMPLE: &str = "\
+# Docs site
+
+Add a **docs site** with a page per _component_.
+
+- [x] Pick the `mdbook` layout
+- [ ] Write the first page
+
+> Keep it short
+
+```sh
+cargo run -p gallery
+```
+
+See [the roadmap](docs/ROADMAP.md).";
+
 impl Component for TextInput {
     fn name() -> &'static str {
         "TextInput"
@@ -1862,6 +2104,15 @@ impl Component for TextInput {
             area
         });
 
+        let markdown = window.use_keyed_state("text-area-markdown", cx, |_, cx| {
+            let mut area = TextArea::new(cx);
+            area.set_label("Plan", cx);
+            area.set_fill(true, cx);
+            area.set_highlighter(Some(markdown_highlights), cx);
+            area.set_text_at_start(MARKDOWN_SAMPLE, cx);
+            area
+        });
+
         v_flex()
             .gap_6()
             .child(example_group(
@@ -1877,7 +2128,10 @@ impl Component for TextInput {
             ))
             .child(example_group(
                 "TextArea",
-                [example("First message", preview_field(message))],
+                [
+                    example("First message", preview_field(message)),
+                    example("Markdown", div().w(px(360.)).h(px(260.)).child(markdown)),
+                ],
             ))
             .into_any_element()
     }
@@ -1885,6 +2139,8 @@ impl Component for TextInput {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use gpui::{TestAppContext, VisualTestContext};
 
     use super::*;
@@ -2117,5 +2373,441 @@ mod tests {
     fn single_line_fields_turn_pasted_line_breaks_into_spaces() {
         assert_eq!(TextInput::sanitize("a\r\nb\nc"), "a b c");
         assert_eq!(TextArea::sanitize("a\r\nb"), "a\nb");
+    }
+
+    fn draw(cx: &mut VisualTestContext) {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+
+    /// A parent of a known height around a field.
+    struct Frame<const MULTILINE: bool> {
+        field: Entity<TextField<MULTILINE>>,
+        height: Pixels,
+    }
+
+    impl<const MULTILINE: bool> Render for Frame<MULTILINE> {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().h(self.height).child(self.field.clone())
+        }
+    }
+
+    fn framed<const MULTILINE: bool>(
+        height: Pixels,
+        cx: &mut TestAppContext,
+    ) -> (Entity<TextField<MULTILINE>>, &mut VisualTestContext) {
+        cx.update(crate::theme::init);
+
+        let (frame, cx) = cx.add_window_view(|_, cx| Frame {
+            field: cx.new(TextField::<MULTILINE>::new),
+            height,
+        });
+        let field = frame.read_with(cx, |frame, _| frame.field.clone());
+
+        (field, cx)
+    }
+
+    fn painted_height<const MULTILINE: bool>(
+        field: &Entity<TextField<MULTILINE>>,
+        cx: &mut VisualTestContext,
+    ) -> Option<Pixels> {
+        field.read_with(cx, |field, _| {
+            field
+                .layout
+                .as_ref()
+                .map(|layout| layout.bounds.size.height)
+        })
+    }
+
+    #[gpui::test]
+    fn a_filled_area_takes_the_height_of_its_parent(cx: &mut TestAppContext) {
+        let (area, cx) = framed::<true>(px(300.), cx);
+
+        area.update(cx, |area, cx| area.set_fill(true, cx));
+        draw(cx);
+
+        // The parent's height minus the 8px padding above and below and the 1px borders.
+        assert_eq!(painted_height(&area, cx), Some(px(300. - 16. - 2.)));
+    }
+
+    /// A header of 20px and a body that grows, as in a tab.
+    struct Tab {
+        area: Entity<TextArea>,
+    }
+
+    impl Render for Tab {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            v_flex()
+                .h(px(300.))
+                .child(div().h(px(20.)))
+                .child(div().flex_1().child(self.area.clone()))
+        }
+    }
+
+    #[gpui::test]
+    fn a_filled_area_takes_the_height_of_a_growing_parent(cx: &mut TestAppContext) {
+        cx.update(crate::theme::init);
+        let (tab, cx) = cx.add_window_view(|_, cx| Tab {
+            area: cx.new(TextArea::new),
+        });
+        let area = tab.read_with(cx, |tab, _| tab.area.clone());
+
+        area.update(cx, |area, cx| area.set_fill(true, cx));
+        draw(cx);
+
+        assert_eq!(painted_height(&area, cx), Some(px(300. - 20. - 16. - 2.)));
+    }
+
+    #[gpui::test]
+    fn an_area_without_fill_keeps_its_rows(cx: &mut TestAppContext) {
+        let (area, cx) = framed::<true>(px(300.), cx);
+
+        area.update(cx, |area, cx| {
+            area.set_fill(true, cx);
+            area.set_fill(false, cx);
+        });
+        draw(cx);
+
+        assert_eq!(painted_height(&area, cx), Some(LINE_HEIGHT * DEFAULT_ROWS));
+    }
+
+    #[gpui::test]
+    fn a_text_input_ignores_fill(cx: &mut TestAppContext) {
+        let (input, cx) = framed::<false>(px(300.), cx);
+
+        input.update(cx, |input, cx| input.set_fill(true, cx));
+        draw(cx);
+
+        assert_eq!(painted_height(&input, cx), Some(LINE_HEIGHT));
+    }
+
+    #[gpui::test]
+    fn a_filled_area_scrolls_when_the_text_is_taller_than_the_parent(cx: &mut TestAppContext) {
+        let (area, cx) = framed::<true>(px(100.), cx);
+        let lines = (0..30)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>();
+
+        area.update(cx, |area, cx| {
+            area.set_fill(true, cx);
+            area.set_text(lines.join("\n"), cx);
+        });
+        draw(cx);
+
+        let offset = area.read_with(cx, |area, _| area.scroll.offset.y);
+
+        // The cursor is at the end: 30 lines of 18px, less the parent's 100px minus its padding
+        // and borders.
+        assert_eq!(offset, px(30. * 18. - (100. - 16. - 2.)));
+    }
+
+    thread_local! {
+        static HIGHLIGHT_RUNS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn counting_highlighter(
+        text: &str,
+        colors: &ThemeColors,
+    ) -> Vec<(Range<usize>, HighlightStyle)> {
+        HIGHLIGHT_RUNS.with(|runs| runs.set(runs.get() + 1));
+
+        vec![(0..text.len(), HighlightStyle::color(colors.accent))]
+    }
+
+    fn highlight_runs() -> usize {
+        HIGHLIGHT_RUNS.with(Cell::get)
+    }
+
+    fn highlighted_area(cx: &mut TestAppContext) -> (Entity<TextArea>, &mut VisualTestContext) {
+        let (area, cx) = framed::<true>(px(300.), cx);
+
+        area.update(cx, |area, cx| {
+            area.set_text("some text", cx);
+            area.set_highlighter(Some(counting_highlighter), cx);
+        });
+        draw(cx);
+
+        (area, cx)
+    }
+
+    #[gpui::test]
+    fn the_highlighter_runs_once_for_two_paints_of_the_same_text(cx: &mut TestAppContext) {
+        let (_area, cx) = highlighted_area(cx);
+
+        draw(cx);
+
+        assert_eq!(highlight_runs(), 1);
+    }
+
+    #[gpui::test]
+    fn the_highlighter_runs_again_after_typing(cx: &mut TestAppContext) {
+        let (area, cx) = highlighted_area(cx);
+
+        area.update_in(cx, |area, window, cx| {
+            area.replace_text_in_range(None, "!", window, cx);
+        });
+        draw(cx);
+
+        assert_eq!(highlight_runs(), 2);
+    }
+
+    #[gpui::test]
+    fn the_highlighter_runs_again_after_undo(cx: &mut TestAppContext) {
+        let (area, cx) = highlighted_area(cx);
+
+        area.update_in(cx, |area, window, cx| {
+            area.replace_text_in_range(None, "!", window, cx);
+        });
+        draw(cx);
+        area.update_in(cx, |area, window, cx| {
+            area.undo(&action::Undo, window, cx);
+        });
+        draw(cx);
+
+        assert_eq!(highlight_runs(), 3);
+    }
+
+    #[gpui::test]
+    fn the_highlighter_runs_again_after_set_text(cx: &mut TestAppContext) {
+        let (area, cx) = highlighted_area(cx);
+
+        area.update(cx, |area, cx| area.set_text("other text", cx));
+        draw(cx);
+
+        assert_eq!(highlight_runs(), 2);
+    }
+
+    #[gpui::test]
+    fn the_highlighter_runs_again_after_the_theme_changes(cx: &mut TestAppContext) {
+        let (_area, cx) = highlighted_area(cx);
+
+        cx.update(|_, cx| crate::theme::set_accent(crate::theme::Accent::Honey, cx));
+        draw(cx);
+
+        assert_eq!(highlight_runs(), 2);
+    }
+
+    fn broken_highlighter(_: &str, colors: &ThemeColors) -> Vec<(Range<usize>, HighlightStyle)> {
+        let style = HighlightStyle::color(colors.accent);
+
+        // For "é👍🏽b": inside a char, ends inside a char, overlapping, empty and past the end.
+        vec![
+            (1..2, style),
+            (0..3, style),
+            (2..5, style),
+            (0..1, style),
+            (4..4, style),
+            (3..99, style),
+            (10..99, style),
+        ]
+    }
+
+    #[gpui::test]
+    fn a_broken_highlighter_leaves_only_whole_char_ranges_in_the_text(cx: &mut TestAppContext) {
+        let (area, cx) = framed::<true>(px(300.), cx);
+
+        area.update(cx, |area, cx| {
+            area.set_text("é👍🏽b", cx);
+            area.set_highlighter(Some(broken_highlighter), cx);
+        });
+        draw(cx);
+
+        let ranges: Vec<_> = area.read_with(cx, |area, _| {
+            area.highlight_ranges()
+                .iter()
+                .map(|(range, _)| range.clone())
+                .collect()
+        });
+
+        assert_eq!(ranges, [0..2, 10..11]);
+    }
+
+    #[test]
+    fn highlights_keep_only_sorted_whole_char_ranges_inside_the_text() {
+        let style = HighlightStyle::default();
+        let text = "aéb";
+        let highlights = vec![
+            (0..1, style),
+            (1..2, style),
+            (2..3, style),
+            (1..3, style),
+            (2..4, style),
+            (3..99, style),
+            (0..1, style),
+        ];
+
+        let valid: Vec<_> = valid_highlights(text, highlights)
+            .into_iter()
+            .map(|(range, _)| range)
+            .collect();
+
+        assert_eq!(valid, [0..1, 1..3, 3..4]);
+    }
+
+    fn font() -> Font {
+        gpui::font("Geist")
+    }
+
+    #[test]
+    fn runs_without_highlights_are_one_run() {
+        let runs = text_runs(5, font(), Hsla::default(), &[], None);
+
+        assert_eq!(runs.iter().map(|run| run.len).collect::<Vec<_>>(), [5]);
+    }
+
+    #[test]
+    fn runs_follow_the_highlights() {
+        let highlights = [(
+            2..4,
+            HighlightStyle {
+                color: Some(gpui::red()),
+                font_weight: Some(gpui::FontWeight::BOLD),
+                font_style: Some(gpui::FontStyle::Italic),
+                background_color: Some(gpui::blue()),
+                ..HighlightStyle::default()
+            },
+        )];
+
+        let runs = text_runs(6, font(), Hsla::default(), &highlights, None);
+
+        assert_eq!(
+            runs.iter().map(|run| run.len).collect::<Vec<_>>(),
+            [2, 2, 2]
+        );
+        assert_eq!(
+            (
+                runs[1].color,
+                runs[1].font.weight,
+                runs[1].font.style,
+                runs[1].background_color
+            ),
+            (
+                gpui::red(),
+                gpui::FontWeight::BOLD,
+                gpui::FontStyle::Italic,
+                Some(gpui::blue())
+            )
+        );
+    }
+
+    #[test]
+    fn the_plain_runs_between_highlights_keep_the_text_color() {
+        let style = HighlightStyle::color(gpui::red());
+        let highlights = [(1..2, style), (3..4, style)];
+
+        let runs = text_runs(5, font(), gpui::green(), &highlights, None);
+
+        assert_eq!(
+            runs.iter().map(|run| run.color).collect::<Vec<_>>(),
+            [
+                gpui::green(),
+                gpui::red(),
+                gpui::green(),
+                gpui::red(),
+                gpui::green()
+            ]
+        );
+    }
+
+    #[test]
+    fn the_marked_range_is_underlined_on_top_of_a_highlight() {
+        let highlights = [(
+            0..6,
+            HighlightStyle {
+                background_color: Some(gpui::blue()),
+                underline: Some(UnderlineStyle {
+                    wavy: true,
+                    ..UnderlineStyle::default()
+                }),
+                ..HighlightStyle::default()
+            },
+        )];
+
+        let runs = text_runs(6, font(), Hsla::default(), &highlights, Some(2..4));
+
+        assert_eq!(
+            runs.iter()
+                .map(|run| (run.len, run.underline.map(|underline| underline.wavy)))
+                .collect::<Vec<_>>(),
+            [(2, Some(true)), (2, Some(false)), (2, Some(true))]
+        );
+    }
+
+    #[test]
+    fn the_marked_range_keeps_the_highlight_background() {
+        let highlights = [(
+            0..6,
+            HighlightStyle {
+                background_color: Some(gpui::blue()),
+                ..HighlightStyle::default()
+            },
+        )];
+
+        let runs = text_runs(6, font(), Hsla::default(), &highlights, Some(2..4));
+
+        assert_eq!(runs[1].background_color, Some(gpui::blue()));
+    }
+
+    fn cursor_of(text: &str, offset: usize, cx: &mut TestAppContext) -> usize {
+        let (area, cx) = framed::<true>(px(300.), cx);
+
+        area.update(cx, |area, cx| {
+            area.set_text(text, cx);
+            area.set_cursor(offset, cx);
+        });
+
+        area.read_with(cx, |area, _| area.buffer.cursor())
+    }
+
+    #[gpui::test]
+    fn set_cursor_puts_the_cursor_at_the_offset(cx: &mut TestAppContext) {
+        assert_eq!(cursor_of("abc", 1, cx), 1);
+    }
+
+    #[gpui::test]
+    fn set_cursor_clamps_past_the_end(cx: &mut TestAppContext) {
+        assert_eq!(cursor_of("abc", 99, cx), 3);
+    }
+
+    #[gpui::test]
+    fn set_cursor_moves_back_to_a_char_boundary(cx: &mut TestAppContext) {
+        // "é" takes the bytes 1 and 2 of "aéb".
+        assert_eq!(cursor_of("aéb", 2, cx), 1);
+    }
+
+    #[gpui::test]
+    fn set_cursor_clears_the_selection(cx: &mut TestAppContext) {
+        let (area, cx) = framed::<true>(px(300.), cx);
+
+        area.update(cx, |area, cx| {
+            area.set_text("abc", cx);
+            area.buffer.select_range(0..3);
+            area.set_cursor(1, cx);
+        });
+
+        assert_eq!(
+            area.read_with(cx, |area, _| area.buffer.selection.clone()),
+            1..1
+        );
+    }
+
+    #[gpui::test]
+    fn set_cursor_scrolls_so_the_cursor_shows_on_the_next_paint(cx: &mut TestAppContext) {
+        let (area, cx) = framed::<true>(px(100.), cx);
+        let lines = (0..30)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>();
+
+        area.update(cx, |area, cx| {
+            area.set_fill(true, cx);
+            area.set_text(lines.join("\n"), cx);
+        });
+        draw(cx);
+        let at_the_end = area.read_with(cx, |area, _| area.scroll.offset.y);
+
+        area.update(cx, |area, cx| area.set_cursor(0, cx));
+        draw(cx);
+        let at_the_start = area.read_with(cx, |area, _| area.scroll.offset.y);
+
+        assert_eq!((at_the_end > px(0.), at_the_start), (true, px(0.)));
     }
 }
