@@ -200,6 +200,7 @@ mod tests {
     /// The sample workspace in the front window, with the menus set as `main` sets them.
     fn app(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
         harness::init(cx);
+        cx.update(|cx| crate::workspace::follow_test_reduce_motion(true, cx));
         let (workspace, cx) = cx.add_window_view(Workspace::with_sample);
         harness::install(&workspace, cx);
         cx.update(|window, cx| {

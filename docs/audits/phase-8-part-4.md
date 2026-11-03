@@ -14,8 +14,8 @@ Work in two rounds, so the app fixes can use the new `swarm_ui` pieces.
 Decisions made so far:
 
 - In a terminal, Tab and Shift-Tab go to the shell. ⌃Tab and ⌃⇧Tab move focus out of the terminal, as in macOS text views. Write a failing test first, because the audit says Tab never reaches the shell today.
-- Toggle Sidebar gets ⌃⌘S, the macOS shortcut for showing and hiding a sidebar.
-- Settings › Keyboard lists both new shortcuts.
+- Toggle Sidebar has ⌘B since 2026-11-03 (PR #43), so it needs no new shortcut.
+- Settings › Keyboard lists the new terminal focus shortcuts.
 
 ## Performance baseline
 
@@ -45,7 +45,7 @@ GPUI paths are relative to `~/.cargo/git/checkouts/zed-a70e2ad075855582/70b1b91/
 
 **H4. Tab never scrolls the focused control into view.** GPUI `focus_next`/`focus_prev` do not scroll (`src/window.rs:2508-2527`). Settings pages taller than 900 px (`settings.rs:53`, `:895-919`), Swarm graph (`swarm_view.rs:1297-1302`), message thread (`swarm_view.rs:968-1000`). Fix: a scroll container that reveals the focused child (like `swarm_ui/src/components/tab_bar.rs:160-223`).
 
-**M5. Focus falls to the window root (no role, no ring)** (`workspace.rs:733`): closing any overlay via `close_overlay` (`palette.rs:737-741`), toast closing (`eggs.rs:346-353/488/492`), Skip for now on welcome, Toggle Sidebar (`workspace.rs:520`), closing a background tab, removing a focused project row, a tile that goes away (`workspace.rs:555`, `views.rs:314-346/391-417`, `daemon.rs:427`), Delete/Resolve/Fold on a comment (`review_view/comments.rs:1205-1211/1300-1347`), removing a Review filter chip (`review_view.rs:966-970`), removing a Settings row (`settings/project.rs:1361-1379`), Reload (`settings/pages.rs:743`). Fix: focus the opener again, else the next control, never the root.
+**M5. Focus falls to the window root (no role, no ring)** (`workspace.rs:733`): closing any overlay via `close_overlay` (`palette.rs:737-741`), toast closing (`eggs.rs:346-353/488/492`), Skip for now on welcome, ~~Toggle Sidebar (`workspace.rs:520`)~~ (fixed in PR #43: focus stays where it was), closing a background tab, removing a focused project row, a tile that goes away (`workspace.rs:555`, `views.rs:314-346/391-417`, `daemon.rs:427`), Delete/Resolve/Fold on a comment (`review_view/comments.rs:1205-1211/1300-1347`), removing a Review filter chip (`review_view.rs:966-970`), removing a Settings row (`settings/project.rs:1361-1379`), Reload (`settings/pages.rs:743`). Fix: focus the opener again, else the next control, never the root.
 
 **M6. Lists are one Tab stop per item with no arrow keys:** task tabs and close buttons (`swarm_ui/src/components/tab_bar.rs:153`), sidebar lists without a List parent (`sidebar.rs:31-58/235/489`), Settings page list (`settings.rs:562`, `settings/project.rs:1033`), Files panel (`panels.rs:479-604`). Fix: one Tab stop per list, arrow keys (like TabStrip and the Changes tree).
 
@@ -64,7 +64,7 @@ GPUI paths are relative to `~/.cargo/git/checkouts/zed-a70e2ad075855582/70b1b91/
 ### Sidebar, tab bar, status bar
 
 - M: arrowing onto "Review" in the View control moves focus into the diff (`tab_bar.rs:140-153`, `workspace.rs:514`). Process rows always say "running" (`sidebar.rs:423/436`).
-- L: Changes toggle does not read its counts (`tab_bar.rs:90`); PR toggle reads "#42 · open" (`pull_request.rs:271`); All tasks menu drops each task's status (`swarm_ui/src/components/tab_bar.rs:408`); error Dismiss and Retry send focus to a container with no ring (`sidebar.rs:88/119`); Toggle Sidebar has no shortcut and no button to bring the sidebar back; the tray is a List of Buttons (`status_bar.rs:218-236`); "Projects" and "Agents" headings not in the tree.
+- L: Changes toggle does not read its counts (`tab_bar.rs:90`); PR toggle reads "#42 · open" (`pull_request.rs:271`); All tasks menu drops each task's status (`swarm_ui/src/components/tab_bar.rs:408`); error Dismiss and Retry send focus to a container with no ring (`sidebar.rs:88/119`); ~~Toggle Sidebar has no shortcut and no button to bring the sidebar back~~ (fixed in PR #43: ⌘B, and the button stays in the title bar); the tray is a List of Buttons (`status_bar.rs:218-236`); "Projects" and "Agents" headings not in the tree.
 
 ### Terminals view
 

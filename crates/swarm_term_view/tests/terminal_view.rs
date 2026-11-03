@@ -7,14 +7,16 @@ use std::rc::Rc;
 use gpui::{
     AppContext as _, ClipboardItem, Context, Entity, EntityInputHandler as _,
     InteractiveElement as _, IntoElement, Modifiers, ParentElement, Render, ScrollDelta,
-    ScrollEvent, ScrollSource, Styled as _, TestAppContext, TouchPhase, VisualContext as _,
-    VisualTestContext, Window, div, point, px,
+    ScrollEvent, ScrollSource, StyleRefinement, Styled as _, TestAppContext, TouchPhase,
+    VisualContext as _, VisualTestContext, Window, div, point, px,
 };
 use swarm_term::{
     BgSpan, Colors, Cursor, CursorStyle, EmulatorChannels, ExitStatus, History, Palette, Rgb, Row,
     Screen, Snapshot, TerminalInput, TerminalOutput, TextFlags, TextSpan, Update,
 };
-use swarm_term_view::{DEFAULT_FONT_SIZE, TerminalEvent, TerminalView, palette_for};
+use swarm_term_view::{
+    DEFAULT_FONT_SIZE, TerminalEvent, TerminalView, hold_resizes_until, palette_for,
+};
 use swarm_ui::{Appearance, Theme};
 
 type Seen = Rc<RefCell<Vec<String>>>;
@@ -23,16 +25,26 @@ type Seen = Rc<RefCell<Vec<String>>>;
 struct Harness {
     terminal: Entity<TerminalView>,
     seen: Seen,
+    /// Shows the terminal through a view cache, as the Swarm view's inspector does.
+    cached: bool,
 }
 
 impl Render for Harness {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let seen = Rc::clone(&self.seen);
+        let terminal = if self.cached {
+            self.terminal
+                .clone()
+                .cached(StyleRefinement::default().size_full())
+                .into_any_element()
+        } else {
+            self.terminal.clone().into_any_element()
+        };
 
         div()
             .size_full()
             .on_key_down(move |event, _, _| seen.borrow_mut().push(event.keystroke.key.clone()))
-            .child(self.terminal.clone())
+            .child(terminal)
     }
 }
 
@@ -44,6 +56,14 @@ struct Setup<'a> {
 }
 
 fn setup(cx: &mut TestAppContext) -> Setup<'_> {
+    setup_with(false, cx)
+}
+
+fn setup_cached(cx: &mut TestAppContext) -> Setup<'_> {
+    setup_with(true, cx)
+}
+
+fn setup_with(cached: bool, cx: &mut TestAppContext) -> Setup<'_> {
     cx.update(swarm_ui::init);
 
     let (channels, emulator) = swarm_term::channels();
@@ -57,6 +77,7 @@ fn setup(cx: &mut TestAppContext) -> Setup<'_> {
         Harness {
             terminal,
             seen: harness_seen,
+            cached,
         }
     });
     let terminal = harness.read_with(cx, |harness, _| harness.terminal.clone());
@@ -346,6 +367,77 @@ fn the_grid_in_a_space_is_the_one_the_view_sends(cx: &mut TestAppContext) {
     });
 
     assert_eq!(counted, sent);
+}
+
+#[gpui::test]
+fn a_hold_keeps_the_view_from_resizing_until_its_deadline(cx: &mut TestAppContext) {
+    const HOLD: std::time::Duration = std::time::Duration::from_millis(180);
+    let mut setup = setup(cx);
+    setup.send(snapshot(&["a"], History::default()));
+    let before = resizes(&setup.inputs());
+    setup.cx.update(|_, cx| {
+        let deadline = cx.background_executor().now() + HOLD;
+
+        hold_resizes_until(deadline, cx);
+    });
+
+    setup.cx.simulate_resize(gpui::size(px(703.), px(517.)));
+    setup.cx.update(|window, _| window.refresh());
+    setup.cx.run_until_parked();
+    let held = resizes(&setup.inputs());
+
+    setup.cx.executor().advance_clock(HOLD * 2);
+    setup.cx.run_until_parked();
+    let released = resizes(&setup.inputs());
+
+    let expected = setup.cx.update(|window, cx| {
+        let cell = TerminalView::cell_size(DEFAULT_FONT_SIZE, window, cx);
+
+        TerminalView::grid_in(gpui::size(px(703.), px(517.)), cell)
+    });
+    assert!(!before.is_empty(), "the view sent no grid before the hold");
+    assert!(
+        held.is_empty(),
+        "the view resized during the hold: {held:?}"
+    );
+    assert_eq!(released, [expected]);
+}
+
+#[gpui::test]
+fn a_view_in_a_cache_sends_its_held_size_when_the_hold_ends(cx: &mut TestAppContext) {
+    const HOLD: std::time::Duration = std::time::Duration::from_millis(180);
+    let mut setup = setup_cached(cx);
+    setup.send(snapshot(&["a"], History::default()));
+    let before = resizes(&setup.inputs());
+    setup.cx.update(|_, cx| {
+        let deadline = cx.background_executor().now() + HOLD;
+
+        hold_resizes_until(deadline, cx);
+    });
+
+    setup.cx.simulate_resize(gpui::size(px(703.), px(517.)));
+    setup.cx.update(|window, _| window.refresh());
+    setup.cx.run_until_parked();
+    let held = resizes(&setup.inputs());
+
+    // The bounds stay the same from here on, so a cached view is reused.
+    setup.cx.update(|window, cx| window.draw(cx).clear(cx));
+    setup.cx.executor().advance_clock(HOLD * 2);
+    setup.cx.run_until_parked();
+    setup.cx.update(|window, cx| window.draw(cx).clear(cx));
+    let released = resizes(&setup.inputs());
+
+    let expected = setup.cx.update(|window, cx| {
+        let cell = TerminalView::cell_size(DEFAULT_FONT_SIZE, window, cx);
+
+        TerminalView::grid_in(gpui::size(px(703.), px(517.)), cell)
+    });
+    assert!(!before.is_empty(), "the view sent no grid before the hold");
+    assert!(
+        held.is_empty(),
+        "the view resized during the hold: {held:?}"
+    );
+    assert_eq!(released, [expected]);
 }
 
 #[test]

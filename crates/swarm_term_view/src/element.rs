@@ -14,8 +14,8 @@ use swarm_term::{CursorStyle, Rgb, Row, TextFlags, TextSpan};
 use swarm_ui::fonts::MONO_FONT;
 use unicode_segmentation::UnicodeSegmentation as _;
 
-use crate::TerminalView;
 use crate::box_drawing::{self, CellRect};
+use crate::{TerminalView, resizes_held};
 
 const LINE_HEIGHT_RATIO: f32 = 1.3;
 const CURSOR_THICKNESS: Pixels = px(2.);
@@ -471,10 +471,13 @@ impl Element for TerminalElement {
         cx: &mut App,
     ) -> Prepaint {
         let focused = self.view.read(cx).focus_handle.is_focused(window);
+        let held = resizes_held(cx);
 
         let (frame, metrics) = self.view.update(cx, |view, _| {
             let metrics = view.metrics.clone();
-            view.resize_to(metrics.grid_for(bounds.size));
+            if !held {
+                view.resize_to(metrics.grid_for(bounds.size));
+            }
 
             (view.frame(focused, window), metrics)
         });

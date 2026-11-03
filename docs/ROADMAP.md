@@ -135,18 +135,18 @@ Three parts: 1. Usage in the daemon and the sidebar card. 2. Menu bar and popove
 
 **Scope:** welcome screen and system check, the plan editor on the Start tab, remaining settings pages (Terminals with the font size, Prompts, and Projects, which edits each repository's `.swarm/config.toml`), `tile.grow` / `tile.shrink` (the tile sizes themselves came early, after phase 5), file-type icons in the style of vscode-icons for files and folders (Changes tab, Changes and Files panels, Review), easter eggs, full VoiceOver and keyboard audit, performance pass, app bundle signing and notarization, updates, docs website and product website.
 
-Six parts: 1. Settings pages (Projects, Terminals, Prompts, Usage, Keyboard). 2. First launch: welcome screen, system check, `tile.grow` / `tile.shrink`. 3. File-type icons, easter eggs and Reduce Motion. 4. VoiceOver, keyboard and performance audit (findings parked in [`audits/phase-8-part-4.md`](audits/phase-8-part-4.md)). 5. Release: bundle, signing, notarization, updates and the app socket check. First slice done: the bundle, the app icon, and the signing and notarization script (`script/bundle-mac`, see [`release.md`](release.md)). Still to do: updates, the app socket check, and a test on a clean Mac. 6. Docs and product websites.
+Six parts (1–3 done): 1. Settings pages (Projects, Terminals, Prompts, Usage, Keyboard). 2. First launch: welcome screen, system check, `tile.grow` / `tile.shrink`. 3. File-type icons, easter eggs and Reduce Motion. 4. VoiceOver, keyboard and performance audit (findings parked in [`audits/phase-8-part-4.md`](audits/phase-8-part-4.md)). 5. Release: bundle, signing, notarization, updates and the app socket check. First slice done: the bundle, the app icon, and the signing and notarization script (`script/bundle-mac`, see [`release.md`](release.md)). Still to do: updates, the app socket check, and a test on a clean Mac. 6. Docs and product websites.
 
 **Done when:**
 
-- [ ] First launch guides through the system check
-- [ ] The Start tab opens on the plan editor; Send plan starts the Start orchestrator with the plan, and an unsent plan survives quitting the app
-- [ ] `tile.grow` / `tile.shrink` change a worker's tile, and a user-sized tile ignores them
-- [ ] Changing the terminal font size in Settings resizes every terminal at once
-- [ ] Settings › Projects edits `.swarm/config.toml` and keeps the file's comments and the keys it does not show
-- [ ] Files and folders show file-type icons; the icon set's license terms are met (vscode-icons: CC BY-SA 4.0 for the icons, attribution in About, branded icons excluded)
+- [x] First launch guides through the system check
+- [x] The Start tab opens on the plan editor; Send plan starts the Start orchestrator with the plan, and an unsent plan survives quitting the app
+- [x] `tile.grow` / `tile.shrink` change a worker's tile, and a user-sized tile ignores them (today a user can only minimize a worker; pin and resize come with the parked tile controls)
+- [x] Changing the terminal font size in Settings resizes every terminal at once
+- [x] Settings › Projects edits `.swarm/config.toml` and keeps the file's comments and the keys it does not show
+- [x] Files and folders show file-type icons; the icon set's license terms are met (vscode-icons: CC BY-SA 4.0 for the icons, attribution in About, branded icons excluded)
 - [ ] VoiceOver audit passes on every screen (checklist in `crates/swarm_ui/README.md`)
-- [ ] Reduce Motion reaches GPUI and stops spinners and easter-egg animations
+- [x] Reduce Motion reaches GPUI and stops spinners and easter-egg animations
 - [ ] Disabled controls and plain text are announced by VoiceOver (needs GPUI support or a contribution upstream)
 - [ ] Signed and notarized build installs on a clean Mac
 - [ ] The daemon's app socket accepts only the signed Swarm app: it reads the caller's audit token from the socket and checks its code signature, so a process an agent detached from its parent cannot get in (ADR 0008)

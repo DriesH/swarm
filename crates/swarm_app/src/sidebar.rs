@@ -69,9 +69,11 @@ pub(crate) fn render(
 }
 
 /// The sidebar collapsed to a column of buttons: search, the projects and the open task's
-/// terminals.
+/// terminals. It tracks the sidebar's focus when `track_focus` is set. While the sidebar and
+/// the rail show together, only the sidebar does.
 pub(crate) fn render_rail(
     workspace: &Workspace,
+    track_focus: bool,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement + use<> {
     let line = cx.theme().colors().line;
@@ -94,7 +96,9 @@ pub(crate) fn render_rail(
 
     v_flex()
         .id("sidebar-rail")
-        .track_focus(&workspace.sidebar_focus)
+        .when(track_focus, |rail| {
+            rail.track_focus(&workspace.sidebar_focus)
+        })
         .role(Role::Navigation)
         .aria_label("Projects and agents")
         .debug_selector(|| "sidebar-rail".to_owned())
@@ -859,7 +863,10 @@ mod tests {
     use crate::model::SAMPLE_NOW;
 
     fn setup(cx: &mut TestAppContext) -> (gpui::Entity<Workspace>, &mut VisualTestContext) {
-        cx.update(swarm_ui::theme::init);
+        cx.update(|cx| {
+            swarm_ui::theme::init(cx);
+            crate::workspace::follow_test_reduce_motion(true, cx);
+        });
 
         cx.add_window_view(Workspace::with_sample)
     }

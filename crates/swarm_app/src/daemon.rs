@@ -159,7 +159,7 @@ impl Workspace {
         self.source = DataSource::Unavailable {
             reason: reason.into(),
         };
-        self.sidebar_collapsed = false;
+        self.show_sidebar();
         cx.notify();
     }
 
@@ -1578,7 +1578,7 @@ impl Workspace {
     pub(crate) fn report_sidebar_error(&mut self, message: String, cx: &mut Context<Self>) {
         log::error!("{message}");
         self.sidebar_error = Some(SharedString::from(message));
-        self.sidebar_collapsed = false;
+        self.show_sidebar();
         cx.notify();
     }
 
