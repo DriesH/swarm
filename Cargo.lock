@@ -5384,6 +5384,7 @@ dependencies = [
  "objc2-app-kit 0.3.2",
  "pulldown-cmark",
  "swarm_sprite",
+ "swarm_ui",
  "unicode-segmentation",
 ]
 

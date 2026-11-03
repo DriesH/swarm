@@ -20,5 +20,10 @@ unicode-segmentation.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-app-kit.workspace = true
 
+[features]
+# Tab-walk helpers for tests (`swarm_ui::test_support`).
+test-support = ["gpui/test-support"]
+
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+swarm_ui = { workspace = true, features = ["test-support"] }

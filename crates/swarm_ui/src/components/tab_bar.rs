@@ -1,14 +1,16 @@
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, App, Div, ElementId, Entity, FocusHandle, Pixels, Role, ScrollHandle, SharedString,
-    Stateful, Window, div, linear_color_stop, linear_gradient, px,
+    AnyElement, App, Axis, Context, Div, ElementId, Entity, FocusHandle, Pixels, Role,
+    SharedString, Stateful, Window, div, linear_color_stop, linear_gradient, px,
 };
 
 use crate::component::{Component, example, example_group};
 use crate::components::menu::{Menu, MenuItem};
 use crate::components::popover_menu::popover_state;
 use crate::prelude::*;
+use crate::reveal::RevealFocus;
+use crate::roving::RovingFocus;
 use crate::styles::focus_ring;
 
 type SelectHandler = Rc<dyn Fn(usize, &mut Window, &mut App) + 'static>;
@@ -20,9 +22,6 @@ const OVERFLOW_MENU_WIDTH: Pixels = px(280.);
 const OVERFLOW_MENU_HEIGHT: Pixels = px(360.);
 /// Scroll positions closer than this to an edge count as the edge.
 const EDGE: Pixels = px(1.);
-/// How many frames the bar tries to bring a tab into view. Layout from the previous
-/// frame can be a little off, for example while the overflow button appears.
-const REVEAL_TRIES: u8 = 4;
 
 /// A row of [`Tab`]s that never grows past its container. Tabs shrink down to
 /// [`TAB_MIN_WIDTH`](crate::TAB_MIN_WIDTH), then the row scrolls sideways without a
@@ -103,94 +102,62 @@ impl TabBar {
     }
 }
 
-/// Scroll, overflow and focus state, kept in keyed window state because the bar is stateless.
+/// Focus, scroll and overflow state, kept in keyed window state because the bar is stateless.
 struct BarState {
-    scroll: ScrollHandle,
-    focus: Vec<(ElementId, FocusHandle)>,
-    order: Vec<ElementId>,
+    roving: RovingFocus,
+    reveal: RevealFocus,
     overflowing: bool,
     fade_start: bool,
     fade_end: bool,
     /// The tab last scrolled to for being selected.
     revealed: Option<ElementId>,
-    /// The tab to bring into view, and the frames left to try.
-    reveal: Option<(usize, u8)>,
-    /// The tab that had keyboard focus after the last layout.
-    focused: Option<usize>,
 }
 
 impl BarState {
     fn new() -> Self {
         Self {
-            scroll: ScrollHandle::new(),
-            focus: Vec::new(),
-            order: Vec::new(),
+            roving: RovingFocus::new(Axis::Horizontal),
+            reveal: RevealFocus::new(Axis::Horizontal),
             overflowing: false,
             fade_start: false,
             fade_end: false,
             revealed: None,
-            reveal: None,
-            focused: None,
         }
     }
 
-    /// One focus handle per tab, in tab order. A handle stays with its tab when others close.
+    /// One focus handle per tab, in tab order. Only one tab is a Tab stop: the selected
+    /// one, until focus lands on another.
     fn sync(
         &mut self,
         ids: &[ElementId],
         selected: usize,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> Vec<FocusHandle> {
-        self.focus.retain(|(id, _)| ids.contains(id));
-
-        let handles = ids
-            .iter()
-            .map(|id| {
-                if let Some((_, handle)) = self.focus.iter().find(|(known, _)| known == id) {
-                    return handle.clone();
-                }
-
-                let handle = cx.focus_handle().tab_stop(true);
-                self.focus.push((id.clone(), handle.clone()));
-
-                handle
-            })
-            .collect();
-
-        self.order = ids.to_vec();
+        self.roving.sync_keyed(ids, cx);
 
         let current = ids.get(selected);
-        if self.revealed.as_ref() != current {
+        if self.revealed.as_ref() == current {
+            self.roving.follow_focus(window, cx);
+        } else {
             self.revealed = current.cloned();
-            self.reveal = Some((selected, REVEAL_TRIES));
-            self.scroll.scroll_to_item(selected);
+            self.roving.set_active(selected);
+            self.reveal.reveal(selected);
         }
 
-        handles
+        self.handles()
     }
 
-    fn is_visible(&self, index: usize) -> bool {
-        let Some(tab) = self.scroll.bounds_for_item(index) else {
-            return true;
-        };
-        let row = self.scroll.bounds();
-        let offset = self.scroll.offset().x;
-
-        tab.left() + offset >= row.left() - EDGE && tab.right() + offset <= row.right() + EDGE
-    }
-
-    fn focused_tab(&self, window: &Window) -> Option<usize> {
-        self.order.iter().position(|id| {
-            self.focus
-                .iter()
-                .any(|(known, handle)| known == id && handle.is_focused(window))
-        })
+    fn handles(&self) -> Vec<FocusHandle> {
+        (0..self.roving.len())
+            .map(|index| self.roving.handle(index))
+            .collect()
     }
 
     /// Runs after layout, when the scroll range of this frame is known.
     fn settle(&mut self, window: &Window, cx: &mut Context<Self>) {
-        let max = self.scroll.max_offset().x;
-        let offset = self.scroll.offset().x;
+        let max = self.reveal.scroll().max_offset().x;
+        let offset = self.reveal.scroll().offset().x;
 
         // With the button shown, the row is narrower by the button and a gap. Counting that
         // back gives the same answer whether or not the button is shown.
@@ -207,24 +174,8 @@ impl BarState {
             != (self.overflowing, self.fade_start, self.fade_end);
         (self.overflowing, self.fade_start, self.fade_end) = (overflowing, fade_start, fade_end);
 
-        let focused = self.focused_tab(window);
-        if focused != self.focused {
-            self.focused = focused;
-
-            if let Some(index) = focused {
-                self.reveal = Some((index, REVEAL_TRIES));
-            }
-        }
-
-        if let Some((index, tries)) = self.reveal {
-            if tries == 0 || self.is_visible(index) {
-                self.reveal = None;
-            } else {
-                self.scroll.scroll_to_item(index);
-                self.reveal = Some((index, tries - 1));
-                changed = true;
-            }
-        }
+        let handles = self.handles();
+        changed |= self.reveal.settle(&handles, window, cx);
 
         if changed {
             cx.notify();
@@ -312,6 +263,47 @@ fn overflow_trigger(
         )
 }
 
+/// The overflow menu: every tab, with the selected one checked.
+fn all_tabs_menu(
+    id: &SharedString,
+    label: &SharedString,
+    entries: &[(SharedString, AgentStatus)],
+    selected: usize,
+    on_select: Option<&SelectHandler>,
+) -> Menu {
+    entries.iter().enumerate().fold(
+        Menu::new(ElementId::from(id.clone()), label.clone())
+            .width(OVERFLOW_MENU_WIDTH)
+            .max_height(OVERFLOW_MENU_HEIGHT),
+        |menu, (index, (name, status))| {
+            let select = on_select.cloned();
+
+            menu.item(
+                overflow_item(index, name, *status, index == selected).on_select(
+                    move |window, cx| {
+                        if let Some(select) = &select {
+                            select(index, window, cx);
+                        }
+                    },
+                ),
+            )
+        },
+    )
+}
+
+/// A row of the overflow menu: the ring shows the status, VoiceOver reads it.
+fn overflow_item(
+    index: usize,
+    name: &SharedString,
+    status: AgentStatus,
+    selected: bool,
+) -> MenuItem {
+    MenuItem::new(("tab", index), name.clone())
+        .accessible_label(format!("{name}, {}", status.label()))
+        .status(status)
+        .checked(selected)
+}
+
 impl RenderOnce for TabBar {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let ground = cx.theme().colors().ground;
@@ -328,7 +320,10 @@ impl RenderOnce for TabBar {
         let state: Entity<BarState> =
             window.use_keyed_state((self.id.clone(), "tab-bar"), cx, |_, _| BarState::new());
         let (focus_handles, scroll) = state.update(cx, |state, cx| {
-            (state.sync(&ids, selected, cx), state.scroll.clone())
+            (
+                state.sync(&ids, selected, window, cx),
+                state.reveal.scroll().clone(),
+            )
         });
         let (overflowing, fade_start, fade_end) = {
             let state = state.read(cx);
@@ -365,6 +360,18 @@ impl RenderOnce for TabBar {
             .gap(GAP)
             .overflow_x_scroll()
             .track_scroll(&scroll)
+            .on_key_down({
+                let state = state.clone();
+                move |event, window, cx| {
+                    let moved = state.update(cx, |state, cx| {
+                        state.roving.handle_key(&event.keystroke, window, cx)
+                    });
+
+                    if moved.is_some() {
+                        cx.stop_propagation();
+                    }
+                }
+            })
             .children(tabs);
 
         let strip = div()
@@ -397,25 +404,7 @@ impl RenderOnce for TabBar {
             div()
                 .flex_none()
                 .child(PopoverMenu::new(popover_id, trigger, move |_, _| {
-                    entries.iter().enumerate().fold(
-                        Menu::new(ElementId::from(menu_id.clone()), label.clone())
-                            .width(OVERFLOW_MENU_WIDTH)
-                            .max_height(OVERFLOW_MENU_HEIGHT),
-                        |menu, (index, (name, status))| {
-                            let select = on_select.clone();
-
-                            menu.item(
-                                MenuItem::new(("tab", index), name.clone())
-                                    .status(*status)
-                                    .checked(index == selected)
-                                    .on_select(move |window, cx| {
-                                        if let Some(select) = &select {
-                                            select(index, window, cx);
-                                        }
-                                    }),
-                            )
-                        },
-                    )
+                    all_tabs_menu(&menu_id, &label, &entries, selected, on_select.as_ref())
                 }))
         });
 
@@ -544,6 +533,13 @@ mod tests {
         assert_eq!(role, Some(Role::Button));
         assert_eq!(label.as_deref(), Some("All tasks, 9"));
         assert_eq!(expanded, Some(false));
+    }
+
+    #[test]
+    fn the_overflow_menu_items_say_the_task_status() {
+        let item = overflow_item(0, &"terminal-renderer".into(), AgentStatus::Blocked, false);
+
+        assert_eq!(item.spoken_label().as_ref(), "terminal-renderer, Blocked");
     }
 
     #[test]

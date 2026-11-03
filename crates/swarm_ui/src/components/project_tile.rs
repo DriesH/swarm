@@ -3,6 +3,10 @@ use gpui::{AnyElement, App, FontWeight, Hsla, Pixels, Window, div, px, rgb};
 use crate::component::{Component, example, example_group};
 use crate::prelude::*;
 
+/// The color of each new project's tile, in order, as `0xrrggbb`. Each takes the white
+/// letter at AA contrast.
+pub const PROJECT_TILE_COLORS: [u32; 4] = [0x004f_46e5, 0x000d_7d70, 0x00c2_410c, 0x0015_803d];
+
 /// A project's colored letter tile.
 #[derive(IntoElement)]
 #[must_use]
@@ -73,16 +77,14 @@ impl Component for ProjectTile {
 mod tests {
     use gpui::rgb;
 
+    use super::PROJECT_TILE_COLORS;
     use crate::contrast::{TEXT_AA, contrast_ratio};
     use crate::theme::Theme;
-
-    /// The tile colors in `swarm_app`'s model.
-    const TILE_COLORS: [u32; 4] = [0x004f_46e5, 0x000d_7d70, 0x00c2_410c, 0x0015_803d];
 
     #[test]
     fn on_tile_letter_meets_text_contrast_on_every_tile_color() {
         for theme in [Theme::light(), Theme::dark()] {
-            for tile in TILE_COLORS {
+            for tile in PROJECT_TILE_COLORS {
                 let ratio = contrast_ratio(theme.colors().on_tile, rgb(tile).into());
 
                 assert!(

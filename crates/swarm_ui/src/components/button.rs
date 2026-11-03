@@ -5,6 +5,7 @@ use gpui::{
 
 use super::status::spinner;
 use super::tooltip::Tooltip;
+use crate::a11y::{accessible, ignore_press, track_focus_off_tab};
 use crate::component::{Component, example, example_group};
 use crate::contrast::composite;
 use crate::prelude::*;
@@ -142,6 +143,7 @@ pub struct Button {
     icon: Option<IconName>,
     end_slot: Option<AnyElement>,
     toggle_state: Option<bool>,
+    expanded: Option<bool>,
     full_width: bool,
     debug_selector: Option<String>,
     focus_handle: Option<FocusHandle>,
@@ -162,6 +164,7 @@ impl Button {
             icon: None,
             end_slot: None,
             toggle_state: None,
+            expanded: None,
             full_width: false,
             debug_selector: None,
             focus_handle: None,
@@ -198,6 +201,12 @@ impl Button {
     /// Icon before the label.
     pub fn icon(mut self, icon: IconName) -> Self {
         self.icon = Some(icon);
+        self
+    }
+
+    /// Whether the popup this button opens is open. VoiceOver reads it on the button.
+    pub fn expanded(mut self, expanded: bool) -> Self {
+        self.expanded = Some(expanded);
         self
     }
 
@@ -283,18 +292,20 @@ impl RenderOnce for Button {
 
         let size = self.size;
 
-        div()
-            .id(self.id)
-            .role(Role::Button)
-            .aria_label(
-                self.accessible_label
-                    .clone()
-                    .unwrap_or_else(|| self.label.clone()),
-            )
+        let (disabled, loading) = (self.disabled, self.loading);
+        let label = self
+            .accessible_label
+            .clone()
+            .unwrap_or_else(|| self.label.clone());
+
+        accessible(div().id(self.id), Role::Button, label)
             .when_some(self.hint, |button, hint| {
                 button
                     .aria_description(hint.clone())
                     .tooltip(move |_, cx| Tooltip::text(hint.clone(), cx))
+            })
+            .when_some(self.expanded, |button, expanded| {
+                button.aria_expanded(expanded)
             })
             .when_some(self.toggle_state, |button, on| {
                 button.aria_toggled(if on { Toggled::True } else { Toggled::False })
@@ -343,45 +354,37 @@ impl RenderOnce for Button {
             .when_some(self.end_slot, |button, end_slot| {
                 button.child(div().ml(px(2.)).child(end_slot))
             })
+            .map(|button| match &self.focus_handle {
+                Some(handle) if disabled => track_focus_off_tab(button, handle),
+                Some(handle) => button.track_focus(handle),
+                None => button.focusable().tab_stop(!disabled),
+            })
+            .focus_visible(|style| {
+                if filled {
+                    filled_focus_ring(style, accent, ground)
+                } else {
+                    focus_ring(style, accent)
+                }
+            })
             .map(|button| {
-                if self.disabled {
-                    button.opacity(0.5).cursor_default()
-                } else if self.loading {
-                    button
-                        .map(|button| match &self.focus_handle {
-                            Some(handle) => button.track_focus(handle),
-                            None => button.focusable().tab_stop(true),
-                        })
-                        .cursor_default()
-                        .focus_visible(|style| {
-                            if filled {
-                                filled_focus_ring(style, accent, ground)
-                            } else {
-                                focus_ring(style, accent)
-                            }
-                        })
+                if disabled {
+                    ignore_press(button.opacity(0.5).cursor_default())
+                } else if loading {
+                    button.cursor_default()
                 } else {
                     button
-                        .map(|button| match &self.focus_handle {
-                            Some(handle) => button.track_focus(handle),
-                            None => button.focusable().tab_stop(true),
-                        })
                         .cursor_pointer()
                         .hover(|style| {
                             style
                                 .bg(colors.hover_background)
                                 .text_color(colors.hover_text)
                         })
-                        .focus_visible(|style| {
-                            if filled {
-                                filled_focus_ring(style, accent, ground)
-                            } else {
-                                focus_ring(style, accent)
-                            }
-                        })
                         .when_some(self.on_click, |button, handler| button.on_click(handler))
                 }
             })
+            .a11y_flags()
+            .disabled(disabled)
+            .busy(loading && !disabled)
     }
 }
 

@@ -2,6 +2,7 @@ use std::rc::Rc;
 
 use gpui::{AnyElement, App, Div, ElementId, Role, SharedString, Stateful, Window, div, px};
 
+use crate::a11y::{accessible, ignore_press, track_focus_off_tab};
 use crate::component::{Component, example, example_group};
 use crate::components::menu::{Menu, MenuItem};
 use crate::components::popover_menu::popover_state;
@@ -88,40 +89,41 @@ fn trigger(
     let (line, raised) = (colors.line, colors.raised);
     let current = options.get(selected).cloned().unwrap_or_default();
 
-    div()
-        .id((id.clone(), "trigger"))
-        .role(Role::ComboBox)
-        .aria_label(label.clone())
-        .aria_value(current.clone())
-        .aria_expanded(expanded)
-        .relative()
-        .flex()
-        .flex_row()
-        .items_center()
-        .h(px(28.))
-        .when(full_width, Styled::w_full)
-        .min_w(px(110.))
-        .pl(px(8.))
-        .pr(px(30.))
-        .rounded(px(7.))
-        .border_1()
-        .border_color(line)
-        .bg(raised)
-        .child(Label::new(current).size(LabelSize::Small))
-        .child(
-            div()
-                .absolute()
-                .top_0()
-                .bottom_0()
-                .right(px(9.))
-                .flex()
-                .items_center()
-                .child(
-                    Icon::new(IconName::ChevronDown)
-                        .size(IconSize::Small)
-                        .color(Color::Faint),
-                ),
-        )
+    accessible(
+        div().id((id.clone(), "trigger")),
+        Role::ComboBox,
+        label.clone(),
+    )
+    .aria_value(current.clone())
+    .aria_expanded(expanded)
+    .relative()
+    .flex()
+    .flex_row()
+    .items_center()
+    .h(px(28.))
+    .when(full_width, Styled::w_full)
+    .min_w(px(110.))
+    .pl(px(8.))
+    .pr(px(30.))
+    .rounded(px(7.))
+    .border_1()
+    .border_color(line)
+    .bg(raised)
+    .child(Label::new(current).size(LabelSize::Small))
+    .child(
+        div()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .right(px(9.))
+            .flex()
+            .items_center()
+            .child(
+                Icon::new(IconName::ChevronDown)
+                    .size(IconSize::Small)
+                    .color(Color::Faint),
+            ),
+    )
 }
 
 impl RenderOnce for Dropdown {
@@ -140,16 +142,28 @@ impl RenderOnce for Dropdown {
             trigger.debug_selector(move || selector)
         });
 
+        let accent = cx.theme().colors().accent;
+        let focus = window
+            .use_keyed_state((self.id.clone(), "focus"), cx, |_, cx| {
+                cx.focus_handle().tab_stop(true)
+            })
+            .read(cx)
+            .clone();
+        let trigger = if self.disabled {
+            track_focus_off_tab(trigger, &focus)
+        } else {
+            trigger.track_focus(&focus)
+        }
+        .focus_visible(move |style| focus_ring(style, accent));
+
         if self.disabled {
-            return trigger.opacity(0.5).into_any_element();
+            return ignore_press(trigger.opacity(0.5))
+                .a11y_flags()
+                .disabled(true)
+                .into_any_element();
         }
 
-        let accent = cx.theme().colors().accent;
-        let trigger = trigger
-            .focusable()
-            .tab_stop(true)
-            .cursor_pointer()
-            .focus_visible(move |style| focus_ring(style, accent));
+        let trigger = trigger.cursor_pointer();
 
         let (menu_id, label) = (self.id.clone(), self.label);
         let (options, selected, on_change) = (self.options, self.selected, self.on_change);

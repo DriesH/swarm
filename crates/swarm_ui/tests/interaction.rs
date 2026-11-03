@@ -9,21 +9,24 @@ use gpui::{
 };
 use swarm_ui::prelude::*;
 use swarm_ui::{
-    Confirm, ContextMenu, Dialog, Dismiss, FocusNext, FocusPrevious, MENU_CONTEXT, Menu, MenuItem,
-    PopoverMenu, ROOT_CONTEXT, SelectNext, SelectPrevious, ShowContextMenu, Toast, tab_navigation,
+    ContextMenu, Dialog, FocusNext, FocusPrevious, Menu, MenuItem, PopoverMenu, ROOT_CONTEXT,
+    Toast, tab_navigation,
 };
 
 type Log = Rc<RefCell<Vec<String>>>;
 
 struct Harness {
     outside: FocusHandle,
+    elsewhere: FocusHandle,
     log: Log,
     dropdown: bool,
+    moving: bool,
 }
 
 impl Render for Harness {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let log = Rc::clone(&self.log);
+        let (moving, elsewhere) = (self.moving, self.elsewhere.clone());
 
         let control = if self.dropdown {
             let changed = Rc::clone(&self.log);
@@ -51,48 +54,76 @@ impl Render for Harness {
                             .on_select(move |_, _| log.borrow_mut().push(id.to_owned()))
                     };
 
-                    Menu::new("menu", "Test menu")
+                    let menu = Menu::new("menu", "Test menu")
                         .item(item("a", &log))
                         .item(item("b", &log).disabled(true))
-                        .item(item("c", &log))
+                        .item(item("c", &log));
+                    let elsewhere = elsewhere.clone();
+
+                    menu.when(moving, |menu| {
+                        menu.item(MenuItem::new("m", "m").on_select(move |window, cx| {
+                            elsewhere.focus(window, cx);
+                        }))
+                    })
                 },
             )
             .into_any_element()
         };
 
-        v_flex().size_full().child(control).child(
-            gpui::div()
-                .id("outside")
-                .track_focus(&self.outside)
-                .size(px(40.)),
+        tab_navigation(
+            v_flex()
+                .key_context(ROOT_CONTEXT)
+                .size_full()
+                .child(control)
+                .child(
+                    gpui::div()
+                        .id("outside")
+                        .track_focus(&self.outside)
+                        .size(px(40.)),
+                )
+                .child(
+                    gpui::div()
+                        .id("elsewhere")
+                        .track_focus(&self.elsewhere)
+                        .size(px(40.)),
+                ),
         )
     }
 }
 
 fn setup(cx: &mut TestAppContext, dropdown: bool) -> (Log, FocusHandle, &mut VisualTestContext) {
+    let (log, outside, _, cx) = setup_with(cx, dropdown, false);
+
+    (log, outside, cx)
+}
+
+/// `moving` adds a last item that moves focus to the returned handle.
+fn setup_with(
+    cx: &mut TestAppContext,
+    dropdown: bool,
+    moving: bool,
+) -> (Log, FocusHandle, FocusHandle, &mut VisualTestContext) {
     cx.update(|cx| {
-        swarm_ui::theme::init(cx);
-        cx.bind_keys([
-            KeyBinding::new("escape", Dismiss, Some(MENU_CONTEXT)),
-            KeyBinding::new("up", SelectPrevious, Some(MENU_CONTEXT)),
-            KeyBinding::new("down", SelectNext, Some(MENU_CONTEXT)),
-            KeyBinding::new("enter", Confirm, Some(MENU_CONTEXT)),
-        ]);
+        swarm_ui::init(cx);
     });
 
     let log = Log::default();
     let harness_log = Rc::clone(&log);
     let (harness, cx) = cx.add_window_view(move |_, cx| Harness {
-        outside: cx.focus_handle(),
+        outside: cx.focus_handle().tab_stop(true),
+        elsewhere: cx.focus_handle(),
         log: harness_log,
         dropdown,
+        moving,
     });
 
-    let outside = harness.read_with(cx, |harness, _| harness.outside.clone());
+    let (outside, elsewhere) = harness.read_with(cx, |harness, _| {
+        (harness.outside.clone(), harness.elsewhere.clone())
+    });
     cx.update(|window, cx| outside.focus(window, cx));
     cx.run_until_parked();
 
-    (log, outside, cx)
+    (log, outside, elsewhere, cx)
 }
 
 fn click_trigger(cx: &mut VisualTestContext) {
@@ -206,6 +237,63 @@ fn escape_closes_and_returns_focus(cx: &mut TestAppContext) {
     assert!(!menu_is_open(cx));
     assert!(cx.update(|window, _| outside.is_focused(window)));
     assert!(entries(&log).is_empty());
+}
+
+#[gpui::test]
+fn space_selects_the_highlighted_item_and_closes(cx: &mut TestAppContext) {
+    let (log, _, cx) = setup(cx, false);
+    click_trigger(cx);
+
+    cx.simulate_keystrokes("down space");
+
+    assert_eq!(entries(&log), ["c"]);
+    assert!(!menu_is_open(cx));
+}
+
+#[gpui::test]
+fn home_moves_the_highlight_to_the_first_item(cx: &mut TestAppContext) {
+    let (log, _, cx) = setup(cx, false);
+    click_trigger(cx);
+
+    cx.simulate_keystrokes("down home enter");
+
+    assert_eq!(entries(&log), ["a"]);
+}
+
+#[gpui::test]
+fn end_moves_the_highlight_to_the_last_item(cx: &mut TestAppContext) {
+    let (log, _, cx) = setup(cx, false);
+    click_trigger(cx);
+
+    cx.simulate_keystrokes("end enter");
+
+    assert_eq!(entries(&log), ["c"]);
+}
+
+#[gpui::test]
+fn tab_does_not_leave_an_open_popover_menu(cx: &mut TestAppContext) {
+    let (_, outside, cx) = setup(cx, false);
+    click_trigger(cx);
+
+    cx.simulate_keystrokes("tab");
+
+    assert!(menu_is_open(cx));
+    assert!(!cx.update(|window, _| outside.is_focused(window)));
+
+    cx.simulate_keystrokes("escape");
+    assert!(cx.update(|window, _| outside.is_focused(window)));
+}
+
+#[gpui::test]
+fn a_popover_item_that_moves_focus_keeps_it(cx: &mut TestAppContext) {
+    let (_, outside, elsewhere, cx) = setup_with(cx, false, true);
+    click_trigger(cx);
+
+    cx.simulate_keystrokes("end enter");
+
+    assert!(!menu_is_open(cx));
+    assert!(cx.update(|window, _| elsewhere.is_focused(window)));
+    assert!(!cx.update(|window, _| outside.is_focused(window)));
 }
 
 #[gpui::test]
@@ -662,14 +750,7 @@ fn context_setup(
     whole_window: bool,
 ) -> (ContextRig, &mut VisualTestContext) {
     cx.update(|cx| {
-        swarm_ui::theme::init(cx);
-        cx.bind_keys([
-            KeyBinding::new("escape", Dismiss, Some(MENU_CONTEXT)),
-            KeyBinding::new("up", SelectPrevious, Some(MENU_CONTEXT)),
-            KeyBinding::new("down", SelectNext, Some(MENU_CONTEXT)),
-            KeyBinding::new("enter", Confirm, Some(MENU_CONTEXT)),
-            KeyBinding::new("shift-f10", ShowContextMenu, Some(ROOT_CONTEXT)),
-        ]);
+        swarm_ui::init(cx);
     });
 
     let log = Log::default();
@@ -825,6 +906,37 @@ fn the_keys_move_the_highlight_and_enter_runs_the_item(cx: &mut TestAppContext) 
     assert_eq!(entries(&state.log), ["c"]);
     assert!(context_menu_bounds(cx).is_none());
     assert!(cx.update(|window, _| state.row.is_focused(window)));
+}
+
+#[gpui::test]
+fn space_runs_the_highlighted_context_menu_item(cx: &mut TestAppContext) {
+    let (state, cx) = context_setup(cx, false);
+    right_click(row_center(cx), cx);
+
+    cx.simulate_keystrokes("down space");
+
+    assert_eq!(entries(&state.log), ["c"]);
+    assert!(context_menu_bounds(cx).is_none());
+}
+
+#[gpui::test]
+fn home_and_end_move_the_context_menu_highlight(cx: &mut TestAppContext) {
+    let (state, cx) = context_setup(cx, false);
+    right_click(row_center(cx), cx);
+
+    cx.simulate_keystrokes("end home enter");
+
+    assert_eq!(entries(&state.log), ["a"]);
+}
+
+#[gpui::test]
+fn end_highlights_the_last_context_menu_item(cx: &mut TestAppContext) {
+    let (state, cx) = context_setup(cx, false);
+    right_click(row_center(cx), cx);
+
+    cx.simulate_keystrokes("end enter");
+
+    assert_eq!(entries(&state.log), ["move"]);
 }
 
 #[gpui::test]

@@ -1,5 +1,6 @@
 use gpui::{AnyElement, App, ClickEvent, ElementId, Pixels, Role, SharedString, Window, div, px};
 
+use crate::a11y::{accessible, ignore_press};
 use crate::component::{Component, example, example_group};
 use crate::prelude::*;
 use crate::styles::focus_ring;
@@ -49,6 +50,7 @@ pub struct IconButton {
     debug_selector: Option<String>,
     color: Color,
     toggle_state: Option<bool>,
+    expanded: Option<bool>,
     reveal_group: Option<SharedString>,
     tab_stop: bool,
     disabled: bool,
@@ -64,6 +66,7 @@ impl IconButton {
             size: IconButtonSize::default(),
             color: Color::Faint,
             toggle_state: None,
+            expanded: None,
             reveal_group: None,
             tab_stop: true,
             debug_selector: None,
@@ -92,6 +95,12 @@ impl IconButton {
     /// focus. It stays in the tab order.
     pub fn reveal_with_group(mut self, group: impl Into<SharedString>) -> Self {
         self.reveal_group = Some(group.into());
+        self
+    }
+
+    /// Whether the popup this button opens is open. VoiceOver reads it on the button.
+    pub fn expanded(mut self, expanded: bool) -> Self {
+        self.expanded = Some(expanded);
         self
     }
 
@@ -135,13 +144,15 @@ impl RenderOnce for IconButton {
 
         let color = if pressed { Color::Default } else { self.color };
 
-        div()
-            .id(self.id)
+        let disabled = self.disabled;
+
+        accessible(div().id(self.id), Role::Button, self.label)
             .when_some(self.debug_selector, |element, selector| {
                 element.debug_selector(move || selector)
             })
-            .role(Role::Button)
-            .aria_label(self.label)
+            .when_some(self.expanded, |button, expanded| {
+                button.aria_expanded(expanded)
+            })
             .when_some(self.toggle_state, |button, on| {
                 button
                     .aria_toggled(if on {
@@ -158,13 +169,18 @@ impl RenderOnce for IconButton {
             .size(self.size.square())
             .rounded(self.size.radius())
             .child(Icon::new(self.icon).size(self.size.icon()).color(color))
+            .focusable()
+            .tab_stop(self.tab_stop && !disabled)
+            .focus_visible(|style| {
+                let style = focus_ring(style, accent);
+
+                if reveals { style.opacity(1.) } else { style }
+            })
             .map(|button| {
-                if self.disabled {
-                    button.opacity(0.5)
+                if disabled {
+                    ignore_press(button.opacity(0.5))
                 } else {
                     button
-                        .focusable()
-                        .tab_stop(self.tab_stop)
                         .cursor_pointer()
                         .hover(|style| style.bg(active))
                         .when_some(self.reveal_group.clone(), |button, group| {
@@ -172,14 +188,11 @@ impl RenderOnce for IconButton {
                                 .opacity(0.)
                                 .group_hover(group, |style| style.opacity(1.))
                         })
-                        .focus_visible(|style| {
-                            let style = focus_ring(style, accent);
-
-                            if reveals { style.opacity(1.) } else { style }
-                        })
                         .when_some(self.on_click, |button, handler| button.on_click(handler))
                 }
             })
+            .a11y_flags()
+            .disabled(disabled)
     }
 }
 

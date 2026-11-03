@@ -2,7 +2,7 @@ use std::rc::Rc;
 
 use gpui::{
     AnyElement, App, BoxShadow, Div, ElementId, FocusHandle, FontWeight, MouseButton, Pixels, Role,
-    SharedString, Stateful, Window, black, div, point, px,
+    SharedString, Stateful, Window, div, point, px,
 };
 
 use crate::component::{Component, example};
@@ -81,6 +81,12 @@ impl Dialog {
         self.into_parts(cx).2
     }
 
+    /// Like [`Self::panel`], flagged modal as the dialog is when drawn.
+    #[doc(hidden)]
+    pub fn modal_panel(self, cx: &App) -> A11yFlags<Stateful<Div>> {
+        modal(self.into_parts(cx).2)
+    }
+
     fn into_parts(self, cx: &App) -> (ElementId, Option<DismissHandler>, Stateful<Div>) {
         let colors = cx.theme().colors();
 
@@ -107,7 +113,7 @@ impl Dialog {
             .border_color(colors.line)
             .bg(colors.panel)
             .shadow(vec![BoxShadow {
-                color: black().opacity(0.35),
+                color: colors.shadow_strong,
                 offset: point(px(0.), px(24.)),
                 blur_radius: px(64.),
                 spread_radius: px(0.),
@@ -125,7 +131,7 @@ impl Dialog {
                     )
                     .child(div().flex_1())
                     .child(
-                        IconButton::new("dialog-close", IconName::Close, "Close")
+                        IconButton::new("dialog-close", IconName::Close, "Close dialog")
                             .disabled(close_disabled)
                             .on_click(move |_, window, cx| {
                                 if let Some(handler) = &close {
@@ -157,6 +163,11 @@ impl Dialog {
     }
 }
 
+/// Flags the panel modal. `render` and [`Dialog::modal_panel`] both go through it.
+fn modal(panel: Stateful<Div>) -> A11yFlags<Stateful<Div>> {
+    panel.a11y_flags().modal(true)
+}
+
 impl RenderOnce for Dialog {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let colors = cx.theme().colors();
@@ -177,7 +188,7 @@ impl RenderOnce for Dialog {
                     handler(window, cx);
                 }
             })
-            .child(panel)
+            .child(modal(panel))
     }
 }
 

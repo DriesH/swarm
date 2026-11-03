@@ -1,13 +1,13 @@
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, App, Context, Div, ElementId, FocusHandle, FontWeight, Hsla, KeyDownEvent, Role,
+    AnyElement, App, Axis, Div, ElementId, FocusHandle, FontWeight, Hsla, KeyDownEvent, Role,
     SharedString, Stateful, Window, div, px,
 };
 
 use crate::component::{Component, example, example_group};
-use crate::components::segmented_control::neighbor;
 use crate::prelude::*;
+use crate::roving::RovingFocus;
 use crate::styles::focus_ring;
 
 type SelectHandler = Rc<dyn Fn(usize, &mut Window, &mut App) + 'static>;
@@ -83,28 +83,24 @@ impl TabStrip {
     }
 }
 
-/// One focus handle per tab, kept in keyed window state because the strip is stateless.
+/// Roving focus over the tabs, kept in keyed window state because the strip is stateless.
 struct Focus {
-    handles: Vec<FocusHandle>,
+    roving: RovingFocus,
 }
 
 impl Focus {
-    /// Only the selected tab is a tab stop, so Tab enters the strip once.
-    fn sync(&mut self, count: usize, selected: usize, cx: &mut Context<Self>) -> Vec<FocusHandle> {
-        self.handles.truncate(count);
-
-        while self.handles.len() < count {
-            self.handles.push(cx.focus_handle());
+    fn new() -> Self {
+        Self {
+            roving: RovingFocus::new(Axis::Horizontal).wrapping(),
         }
+    }
 
-        self.handles = self
-            .handles
-            .iter()
-            .enumerate()
-            .map(|(index, handle)| handle.clone().tab_stop(index == selected))
-            .collect();
+    /// Only the selected tab is a tab stop, so Tab enters the strip once.
+    fn sync(&mut self, count: usize, selected: usize, cx: &mut App) -> Vec<FocusHandle> {
+        self.roving.sync(count, cx);
+        self.roving.set_active(selected);
 
-        self.handles.clone()
+        (0..count).map(|index| self.roving.handle(index)).collect()
     }
 }
 
@@ -173,9 +169,7 @@ impl RenderOnce for TabStrip {
         let (count, selected) = (self.tabs.len(), self.selected);
 
         let focus = window.with_element_namespace(self.id.clone(), |window| {
-            window.use_keyed_state("focus", cx, |_, _| Focus {
-                handles: Vec::new(),
-            })
+            window.use_keyed_state("focus", cx, |_, _| Focus::new())
         });
         let handles = focus.update(cx, |focus, cx| focus.sync(count, selected, cx));
 
@@ -201,25 +195,13 @@ impl RenderOnce for TabStrip {
 
         let on_key_down = on_select.map(|handler| {
             move |event: &KeyDownEvent, window: &mut Window, cx: &mut App| {
-                if event.keystroke.modifiers.modified() {
-                    return;
-                }
-                let key = event.keystroke.key.as_str();
-                let next = match key {
-                    "home" => Some(0),
-                    "end" => count.checked_sub(1),
-                    "left" | "right" => neighbor(key, selected, count),
-                    _ => None,
-                };
-                let Some(next) = next else {
-                    return;
-                };
+                let next = focus.update(cx, |focus, cx| {
+                    focus.roving.handle_key(&event.keystroke, window, cx)
+                });
 
-                cx.stop_propagation();
-                handler(next, window, cx);
-
-                if let Some(handle) = handles.get(next) {
-                    handle.focus(window, cx);
+                if let Some(next) = next {
+                    cx.stop_propagation();
+                    handler(next, window, cx);
                 }
             }
         });
@@ -274,7 +256,7 @@ impl Component for TabStrip {
 #[cfg(test)]
 mod tests {
     use gpui::accesskit::Node;
-    use gpui::{Element as _, Render, TestAppContext};
+    use gpui::{Context, Element as _, Render, TestAppContext};
 
     use super::*;
 
@@ -289,9 +271,7 @@ mod tests {
 
     impl Render for Probe {
         fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            let focus = window.use_keyed_state("focus", cx, |_, _| Focus {
-                handles: Vec::new(),
-            });
+            let focus = window.use_keyed_state("focus", cx, |_, _| Focus::new());
             let handles = focus.update(cx, |focus, cx| focus.sync(3, 1, cx));
             self.tab_stops = handles.iter().map(|handle| handle.tab_stop).collect();
 

@@ -2,6 +2,7 @@ use std::rc::Rc;
 
 use gpui::{AnyElement, App, ElementId, Role, SharedString, Toggled, Window, div, px};
 
+use crate::a11y::{accessible, ignore_press};
 use crate::component::{Component, example, example_group};
 use crate::prelude::*;
 use crate::styles::{filled_focus_ring, focus_ring};
@@ -72,10 +73,9 @@ impl RenderOnce for Switch {
         let (accent, ground) = (colors.accent, colors.ground);
         let on = self.on;
 
-        div()
-            .id(self.id)
-            .role(Role::Switch)
-            .aria_label(self.label)
+        let disabled = self.disabled;
+
+        accessible(div().id(self.id), Role::Switch, self.label)
             .aria_toggled(if on { Toggled::True } else { Toggled::False })
             .when_some(self.debug_selector, |switch, selector| {
                 switch.debug_selector(move || selector)
@@ -95,26 +95,28 @@ impl RenderOnce for Switch {
                     .rounded_full()
                     .bg(knob),
             )
+            .focusable()
+            .tab_stop(!disabled)
+            .focus_visible(|style| {
+                if on {
+                    filled_focus_ring(style, accent, ground)
+                } else {
+                    focus_ring(style, accent)
+                }
+            })
             .map(|switch| {
-                if self.disabled {
-                    switch.opacity(0.5)
+                if disabled {
+                    ignore_press(switch.opacity(0.5))
                 } else {
                     switch
-                        .focusable()
-                        .tab_stop(true)
                         .cursor_pointer()
-                        .focus_visible(|style| {
-                            if on {
-                                filled_focus_ring(style, accent, ground)
-                            } else {
-                                focus_ring(style, accent)
-                            }
-                        })
                         .when_some(self.on_toggle, |switch, handler| {
                             switch.on_click(move |_, window, cx| handler(!on, window, cx))
                         })
                 }
             })
+            .a11y_flags()
+            .disabled(disabled)
     }
 }
 

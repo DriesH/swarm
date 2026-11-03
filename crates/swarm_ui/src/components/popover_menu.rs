@@ -8,15 +8,18 @@ use gpui::{
 use crate::component::{Component, example, example_group};
 use crate::components::menu::{Menu, demo_menu};
 use crate::prelude::*;
+use crate::{FocusNext, FocusPrevious};
 
 type MenuBuilder = Rc<dyn Fn(&mut Window, &mut App) -> Menu + 'static>;
+type TriggerBuilder = Box<dyn FnOnce(bool) -> AnyElement>;
 
-/// A trigger that opens a [`Menu`] below it.
+/// A trigger that opens a [`Menu`] below it. Tab stays in the open menu and Escape closes
+/// it. Focus goes back to where it was unless a pick moved it on.
 #[derive(IntoElement)]
 #[must_use]
 pub struct PopoverMenu {
     id: ElementId,
-    trigger: AnyElement,
+    trigger: TriggerBuilder,
     menu: MenuBuilder,
     upward: bool,
 }
@@ -26,12 +29,22 @@ impl PopoverMenu {
     /// the popover closes itself on Escape and after a pick.
     pub fn new(
         id: impl Into<ElementId>,
-        trigger: impl IntoElement,
+        trigger: impl IntoElement + 'static,
+        menu: impl Fn(&mut Window, &mut App) -> Menu + 'static,
+    ) -> Self {
+        Self::with_trigger(id, move |_| trigger, menu)
+    }
+
+    /// Like [`new`](Self::new), but `trigger` gets whether the menu is open. Pass it on to
+    /// the trigger with `expanded`, so VoiceOver reads the state on the button.
+    pub fn with_trigger<T: IntoElement>(
+        id: impl Into<ElementId>,
+        trigger: impl FnOnce(bool) -> T + 'static,
         menu: impl Fn(&mut Window, &mut App) -> Menu + 'static,
     ) -> Self {
         Self {
             id: id.into(),
-            trigger: trigger.into_any_element(),
+            trigger: Box::new(move |open| trigger(open).into_any_element()),
             menu: Rc::new(menu),
             upward: false,
         }
@@ -85,15 +98,20 @@ fn open(state: &Entity<PopoverState>, window: &mut Window, cx: &mut App) {
     focus.focus(window, cx);
 }
 
+/// Closes the menu. Focus goes back to where it was only when it still sits in the menu:
+/// a picked item may have moved it on, for example into a dialog.
 fn close(state: &Entity<PopoverState>, window: &mut Window, cx: &mut App) {
-    let previous = state.update(cx, |state, cx| {
+    let (previous, focus_in_menu) = state.update(cx, |state, cx| {
         state.open = false;
         cx.notify();
 
-        state.previous_focus.take()
+        (
+            state.previous_focus.take(),
+            state.focus.contains_focused(window, cx),
+        )
     });
 
-    if let Some(previous) = previous {
+    if focus_in_menu && let Some(previous) = previous {
         previous.focus(window, cx);
     }
 }
@@ -131,6 +149,9 @@ impl RenderOnce for PopoverMenu {
                     .snap_to_window_with_margin(px(8.))
                     .child(
                         div()
+                            // Tab stays in the menu, so nothing moves focus out of it.
+                            .on_action(|_: &FocusPrevious, _, _| {})
+                            .on_action(|_: &FocusNext, _, _| {})
                             .on_mouse_down_out({
                                 let state = state.clone();
                                 move |event, window, cx| {
@@ -182,7 +203,7 @@ impl RenderOnce for PopoverMenu {
                             state.update(cx, |state, _| state.trigger = bounds);
                         }
                     })
-                    .child(self.trigger),
+                    .child((self.trigger)(is_open)),
             )
             .children(menu)
     }
@@ -219,5 +240,111 @@ impl Component for PopoverMenu {
                 ],
             ))
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use gpui::accesskit::{Node, Role};
+    use gpui::{Context, Element as _, Render, TestAppContext, WindowHandle};
+
+    use super::*;
+
+    struct Probe {
+        open: bool,
+        seen: Rc<Cell<Option<bool>>>,
+        wrapper_role: Option<Role>,
+        trigger_expanded: Option<bool>,
+    }
+
+    impl Render for Probe {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            if self.open {
+                let state = popover_state(&"popover".into(), window, cx);
+                state.update(cx, |state, _| state.open = true);
+            }
+
+            let seen = Rc::clone(&self.seen);
+            let wrapper = PopoverMenu::with_trigger(
+                "popover",
+                move |open| {
+                    seen.set(Some(open));
+                    IconButton::new("trigger", IconName::Plus, "New").expanded(open)
+                },
+                |_, _| demo_menu("popover-menu"),
+            )
+            .render(window, cx)
+            .into_element();
+            self.wrapper_role = wrapper.a11y_role();
+
+            let trigger = IconButton::new("trigger", IconName::Plus, "New")
+                .expanded(self.open)
+                .render(window, cx)
+                .into_element();
+            let mut node = Node::new(trigger.a11y_role().unwrap_or(Role::Unknown));
+            trigger.write_a11y_info(&mut node);
+            self.trigger_expanded = node.is_expanded();
+
+            div()
+        }
+    }
+
+    fn probe(open: bool) -> (TestAppContext, WindowHandle<Probe>) {
+        let mut app = TestAppContext::single();
+        app.update(crate::theme::init);
+        let window = app.add_window(move |_, _| Probe {
+            open,
+            seen: Rc::default(),
+            wrapper_role: None,
+            trigger_expanded: None,
+        });
+        app.run_until_parked();
+
+        (app, window)
+    }
+
+    fn read<T>(
+        window: &WindowHandle<Probe>,
+        app: &mut TestAppContext,
+        read: impl FnOnce(&Probe) -> T,
+    ) -> T {
+        app.update(|cx| window.read(cx).map(read).expect("the window"))
+    }
+
+    #[test]
+    fn the_trigger_is_told_the_menu_is_closed() {
+        let (mut app, window) = probe(false);
+
+        assert_eq!(read(&window, &mut app, |p| p.seen.get()), Some(false));
+    }
+
+    #[test]
+    fn the_trigger_is_told_the_menu_is_open() {
+        let (mut app, window) = probe(true);
+
+        assert_eq!(read(&window, &mut app, |p| p.seen.get()), Some(true));
+    }
+
+    #[test]
+    fn the_trigger_node_reports_expanded_false_when_closed() {
+        let (mut app, window) = probe(false);
+
+        assert_eq!(read(&window, &mut app, |p| p.trigger_expanded), Some(false));
+    }
+
+    #[test]
+    fn the_trigger_node_reports_expanded_true_when_open() {
+        let (mut app, window) = probe(true);
+
+        assert_eq!(read(&window, &mut app, |p| p.trigger_expanded), Some(true));
+    }
+
+    #[test]
+    fn the_wrapper_has_no_group_role() {
+        let (mut app, window) = probe(false);
+
+        assert_eq!(read(&window, &mut app, |p| p.wrapper_role), None);
     }
 }
