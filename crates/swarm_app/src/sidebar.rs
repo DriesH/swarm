@@ -8,18 +8,19 @@ use gpui::{
 };
 use swarm_ui::prelude::*;
 
-use crate::actions::{ToggleCommandPalette, ToggleSidebar};
+use crate::actions::ToggleCommandPalette;
 use crate::model::{Agent, AgentKind, Project, ProjectId, TaskStatus, Terminal};
 use crate::settings::Page;
 use crate::usage_text::{UsageSection, WindowRow, usage_sections};
 use crate::window_drag::drag_region;
 use crate::workspace::{DataSource, Workspace};
 
-/// Height of the row with the sidebar toggle.
-pub(crate) const WINDOW_ROW_HEIGHT: Pixels = px(30.);
+/// The expanded sidebar's width. The title bar keeps its leading part this wide, so the
+/// tabs line up with the card.
+pub(crate) const SIDEBAR_WIDTH: Pixels = px(248.);
 
-/// Wide enough that the traffic lights sit centered above the rail.
-pub(crate) const RAIL_WIDTH: Pixels = px(78.);
+/// Room for a 36 pt `RailButton` with 6 pt on each side.
+pub(crate) const RAIL_WIDTH: Pixels = px(48.);
 
 pub(crate) fn render(
     workspace: &Workspace,
@@ -33,6 +34,12 @@ pub(crate) fn render(
         .map(|project| project_row(workspace, project, cx))
         .collect();
 
+    let agents = if workspace.has_no_projects() {
+        Vec::new()
+    } else {
+        agent_rows(workspace, cx)
+    };
+
     v_flex()
         .id("sidebar")
         .track_focus(&workspace.sidebar_focus)
@@ -40,7 +47,6 @@ pub(crate) fn render(
         .aria_label("Projects and agents")
         .size_full()
         .gap(px(2.))
-        .child(window_row(window, cx))
         .child(logo_row(window, cx))
         .child(
             heading("Projects", 14.).h(px(30.)).child(
@@ -53,10 +59,10 @@ pub(crate) fn render(
         .children(projects)
         .children(daemon_status(workspace, cx))
         .children(error_message(workspace, cx))
-        .when(!workspace.has_no_projects(), |sidebar| {
+        .when(!agents.is_empty(), |sidebar| {
             sidebar
-                .child(heading("Agents", 18.))
-                .children(agent_rows(workspace, cx))
+                .child(heading("Agents", 18.).debug_selector(|| "agents-heading".to_owned()))
+                .children(agents)
         })
         .child(div().flex_1())
         .children(usage_card(workspace))
@@ -66,7 +72,6 @@ pub(crate) fn render(
 /// terminals.
 pub(crate) fn render_rail(
     workspace: &Workspace,
-    window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement + use<> {
     let line = cx.theme().colors().line;
@@ -96,14 +101,8 @@ pub(crate) fn render_rail(
         .size_full()
         .items_center()
         .gap(px(4.))
+        .pt(px(4.))
         .pb(px(10.))
-        .child(
-            drag_region("rail-top-drag", window, cx)
-                .w_full()
-                .h(px(36.))
-                .flex_none(),
-        )
-        .child(toggle_button())
         .child(
             IconButton::new("rail-search", IconName::Search, "Search")
                 .size(IconButtonSize::Medium)
@@ -304,29 +303,6 @@ fn error_message(workspace: &Workspace, cx: &mut Context<Workspace>) -> Option<i
                 ),
             ),
     )
-}
-
-fn window_row(window: &mut Window, cx: &mut App) -> impl IntoElement {
-    h_flex()
-        .h(WINDOW_ROW_HEIGHT)
-        .pl(px(6.))
-        .child(
-            drag_region("sidebar-top-drag", window, cx)
-                .flex_1()
-                .h_full(),
-        )
-        .child(toggle_button())
-}
-
-/// The sidebar's collapse button and the rail's expand button. Both carry the same id and
-/// selector.
-fn toggle_button() -> IconButton {
-    IconButton::new("toggle-sidebar", IconName::Sidebar, "Toggle sidebar")
-        .size(IconButtonSize::Medium)
-        .debug_selector(|| "toggle-sidebar".to_owned())
-        .on_click(|_, window, cx| {
-            window.dispatch_action(Box::new(ToggleSidebar), cx);
-        })
 }
 
 fn logo_row(window: &mut Window, cx: &mut App) -> impl IntoElement {
@@ -897,7 +873,7 @@ mod tests {
         let row = right("project-row-1");
 
         assert!(row.is_some());
-        for selector in ["toggle-sidebar", "sidebar-search", "add-project"] {
+        for selector in ["sidebar-search", "add-project"] {
             assert_eq!(right(selector), row, "{selector}");
         }
     }
@@ -1077,15 +1053,36 @@ mod tests {
     }
 
     #[gpui::test]
-    fn the_rail_toggle_sits_below_the_titlebar(cx: &mut TestAppContext) {
-        // The traffic lights live in the macOS titlebar. The rail keeps its buttons clear of it.
-        const TITLEBAR_HEIGHT: Pixels = px(32.);
+    fn the_agents_heading_shows_only_when_the_open_tab_has_rows(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        redraw(cx);
+        let with_rows = shown("agents-heading", cx);
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.select_project(ProjectId(3), cx);
+        });
+        redraw(cx);
+        let rows = workspace.read_with(cx, |workspace, _| rows(workspace).len());
+
+        assert!(with_rows);
+        assert_eq!(rows, 0);
+        assert!(!shown("agents-heading", cx));
+    }
+
+    #[gpui::test]
+    fn the_rail_is_48_points_wide_and_the_card_starts_right_after_it(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
         collapse(&workspace, cx);
 
-        let top = cx.debug_bounds("toggle-sidebar").map(|bounds| bounds.top());
+        let rail = cx.debug_bounds("sidebar-rail");
+        let card = cx.debug_bounds("main-card");
 
-        assert!(top >= Some(TITLEBAR_HEIGHT), "the toggle starts at {top:?}");
+        assert_eq!(rail.map(|bounds| bounds.size.width), Some(px(48.)));
+        assert!(card.is_some());
+        assert_eq!(
+            card.map(|bounds| bounds.left()),
+            rail.map(|bounds| bounds.right())
+        );
     }
 
     #[gpui::test]

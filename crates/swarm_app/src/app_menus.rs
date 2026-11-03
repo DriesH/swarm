@@ -186,7 +186,7 @@ fn to_main_window(action: &dyn Action, cx: &mut App) {
 mod tests {
     use gpui::{
         AnyWindowHandle, Entity, Focusable as _, Keystroke, OwnedMenu, OwnedMenuItem,
-        TestAppContext, VisualTestContext, WindowHandle, px,
+        TestAppContext, VisualTestContext, WindowHandle,
     };
 
     use super::*;
@@ -195,7 +195,6 @@ mod tests {
     use crate::menu_bar::harness;
     use crate::palette::Overlay;
     use crate::settings::SettingsWindow;
-    use crate::sidebar::RAIL_WIDTH;
     use crate::workspace::{RightPanel, View, Workspace};
 
     /// The sample workspace in the front window, with the menus set as `main` sets them.
@@ -668,30 +667,6 @@ mod tests {
         assert_eq!(collapsed, (false, true));
         assert!(collapsed_flag);
         assert_eq!(back, (true, false));
-    }
-
-    #[gpui::test]
-    fn the_header_leaves_room_for_the_traffic_lights_with_the_sidebar_collapsed(
-        cx: &mut TestAppContext,
-    ) {
-        let (_workspace, cx) = app(cx);
-        redraw(cx);
-        let tabs = |cx: &mut VisualTestContext| {
-            redraw(cx);
-
-            cx.debug_bounds("task-tabs")
-                .map(|bounds| bounds.origin.x)
-                .expect("the task tabs are on screen")
-        };
-        let with_sidebar = tabs(cx);
-
-        choose("View", "Toggle Sidebar", cx);
-        let without = tabs(cx);
-
-        // The close, minimize and zoom buttons end 69 points from the window's left edge.
-        assert!(with_sidebar > px(248.));
-        assert!(without >= RAIL_WIDTH, "the tabs start at {without:?}");
-        assert!(without > px(69.), "the tabs start at {without:?}");
     }
 
     #[gpui::test]

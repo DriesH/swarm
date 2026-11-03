@@ -44,7 +44,7 @@ mod snapshot;
 
 use gpui::{App, AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 
-use crate::workspace::Workspace;
+use crate::workspace::{Workspace, traffic_light_position};
 
 fn window_options(cx: &App) -> WindowOptions {
     let bounds = Bounds::centered(None, size(px(1600.), px(1000.)), cx);
@@ -55,7 +55,7 @@ fn window_options(cx: &App) -> WindowOptions {
         titlebar: Some(TitlebarOptions {
             title: Some("Swarm".into()),
             appears_transparent: true,
-            traffic_light_position: None,
+            traffic_light_position: Some(traffic_light_position()),
         }),
         app_owns_titlebar_drag: true,
         ..Default::default()
@@ -144,12 +144,17 @@ mod tests {
     use gpui::TestAppContext;
 
     use super::*;
+    use crate::workspace::{TITLE_BAR_HEIGHT, TRAFFIC_LIGHT_SIZE};
 
     #[gpui::test]
-    fn the_window_keeps_the_native_traffic_light_position(cx: &mut TestAppContext) {
+    fn the_traffic_lights_are_centered_on_the_title_bar(cx: &mut TestAppContext) {
         let options = cx.update(|cx| window_options(cx));
-        let titlebar = options.titlebar.expect("the window has a titlebar");
+        let position = options
+            .titlebar
+            .and_then(|titlebar| titlebar.traffic_light_position)
+            .expect("the window places the traffic lights");
 
-        assert_eq!(titlebar.traffic_light_position, None);
+        assert_eq!(position.y + TRAFFIC_LIGHT_SIZE / 2., TITLE_BAR_HEIGHT / 2.);
+        assert_eq!(position.x, px(9.));
     }
 }

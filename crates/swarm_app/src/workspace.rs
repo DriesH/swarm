@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use gpui::{
     AnyWindowHandle, AppContext as _, Bounds, Context, Div, Entity, FocusHandle, Focusable, Pixels,
-    SharedString, Size, Stateful, Subscription, Window, div, px,
+    Point, SharedString, Size, Stateful, Subscription, Window, div, point, px,
 };
 use swarm_protocol::{Client, ReviewSource};
 use swarm_ui::fonts::UI_FONT;
@@ -32,21 +32,32 @@ use crate::swarm_view::{
 };
 use crate::views::Resizing;
 use crate::welcome::Welcome;
+use crate::window_drag::drag_region;
 use crate::{panels, sidebar, status_bar, tab_bar, views};
 
 pub(crate) const RIGHT_PANEL_WIDTH: Pixels = px(320.);
 
 /// Space between the window edge and the main panel.
 const PANEL_MARGIN: f32 = 8.;
-/// The header's height, with its bottom border.
-const HEADER_HEIGHT: f32 = 47.;
 /// How many terminals `Workspace::recent_focus` remembers.
 const RECENT_FOCUS: usize = 32;
 
-/// Distance from the window top to the middle of the header's content (the panel border
-/// and the header's bottom border do not count). The sidebar's window row and the task tabs
-/// are centered on this line.
-pub(crate) const HEADER_CENTER: Pixels = px(PANEL_MARGIN + 1. + (HEADER_HEIGHT - 1.) / 2.);
+/// The title bar's height. The traffic lights, the sidebar button, the tabs and the view
+/// switch are all centered on half of it.
+pub(crate) const TITLE_BAR_HEIGHT: Pixels = px(40.);
+
+/// The standard window buttons are 14pt tall on macOS.
+pub(crate) const TRAFFIC_LIGHT_SIZE: Pixels = px(14.);
+
+/// GPUI centers the buttons in a titlebar `size + 2y` tall, so this y makes it the title bar.
+pub(crate) fn traffic_light_position() -> Point<Pixels> {
+    point(px(9.), TITLE_BAR_HEIGHT / 2. - TRAFFIC_LIGHT_SIZE / 2.)
+}
+
+/// Room for the close, minimize and zoom buttons.
+const TRAFFIC_LIGHTS_WIDTH: Pixels = px(78.);
+/// What is left of that room in full screen, where macOS hides the buttons.
+const FULL_SCREEN_INSET: Pixels = px(8.);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum View {
@@ -533,8 +544,8 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Collapses the sidebar to its rail, or expands it. Focus inside the one that goes away
-    /// moves back to the focused terminal, or to the workspace when there is none.
+    /// Collapses the sidebar to its rail, or expands it. Focus in the sidebar or the rail moves
+    /// back to the focused terminal, or to the workspace when there is none.
     pub(crate) fn toggle_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.sidebar_focus.contains_focused(window, cx) {
             match self.focused_terminal {
@@ -823,11 +834,67 @@ impl Workspace {
                 .size_full()
                 .relative()
                 .flex()
+                .flex_col()
                 .bg(ground)
                 .text_color(fg)
                 .font_family(UI_FONT)
                 .text_size(px(13.)),
         )
+    }
+
+    /// The full-width row on top of the window: room for the traffic lights, the sidebar
+    /// button and the tabs with the view switch and the panel buttons.
+    fn title_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let lights = if window.is_fullscreen() {
+            FULL_SCREEN_INSET
+        } else {
+            TRAFFIC_LIGHTS_WIDTH
+        };
+
+        let leading = h_flex()
+            .h_full()
+            .flex_none()
+            .gap(px(4.))
+            .child(
+                drag_region("traffic-lights-drag", window, cx)
+                    .w(lights)
+                    .h_full()
+                    .flex_none(),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    // A press must not take the focus: the field the user types in keeps it.
+                    .capture_any_mouse_down(|_, window, _| window.prevent_default())
+                    .child(
+                        IconButton::new("toggle-sidebar", IconName::Sidebar, "Toggle sidebar")
+                            .size(IconButtonSize::Medium)
+                            .debug_selector(|| "toggle-sidebar".to_owned())
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(ToggleSidebar), cx);
+                            }),
+                    ),
+            );
+
+        // Expanded, the leading part is as wide as the sidebar, so the tabs start where the
+        // card does. Collapsed, the tabs follow the toggle.
+        let leading = if self.sidebar_collapsed {
+            leading.pr(px(4.))
+        } else {
+            leading.w(sidebar::SIDEBAR_WIDTH).child(
+                drag_region("sidebar-title-drag", window, cx)
+                    .flex_1()
+                    .h_full(),
+            )
+        };
+
+        h_flex()
+            .h(TITLE_BAR_HEIGHT)
+            .w_full()
+            .flex_none()
+            .pr(px(PANEL_MARGIN))
+            .child(leading)
+            .child(tab_bar::render(self, window, cx))
     }
 
     /// True while the welcome screen shows: no project yet, and the user has not dealt with
@@ -919,19 +986,17 @@ impl Render for Workspace {
             div()
                 .w(sidebar::RAIL_WIDTH)
                 .flex_none()
-                .h_full()
-                .child(sidebar::render_rail(self, window, cx))
+                .child(sidebar::render_rail(self, cx))
         } else {
             div()
-                .w(px(248.))
+                .w(sidebar::SIDEBAR_WIDTH)
                 .flex_none()
-                .h_full()
-                .pt(HEADER_CENTER - sidebar::WINDOW_ROW_HEIGHT / 2.)
+                .pt(px(4.))
                 .px(px(8.))
                 .pb(px(10.))
                 .child(sidebar::render(self, window, cx))
         };
-        let tab_bar = tab_bar::render(self, window, cx);
+        let title_bar = self.title_bar(window, cx);
         let views = views::render(self, window, cx);
         let status_bar = status_bar::render(self, window, cx);
         let right_panel = self
@@ -955,34 +1020,34 @@ impl Render for Workspace {
 
         let root = self.root(cx);
 
-        root.child(sidebar)
+        root.child(title_bar)
             .child(
-                v_flex()
+                h_flex()
+                    .items_stretch()
                     .flex_1()
-                    .min_w_0()
-                    .m(px(PANEL_MARGIN))
-                    .ml_0()
-                    .bg(panel)
-                    .border_1()
-                    .border_color(line)
-                    .rounded(px(10.))
-                    .overflow_hidden()
+                    .min_h_0()
+                    .child(sidebar)
                     .child(
-                        div()
-                            .h(px(HEADER_HEIGHT))
-                            .flex_none()
-                            .border_b_1()
+                        v_flex()
+                            .debug_selector(|| "main-card".to_owned())
+                            .flex_1()
+                            .min_w_0()
+                            .mr(px(PANEL_MARGIN))
+                            .mb(px(PANEL_MARGIN))
+                            .bg(panel)
+                            .border_1()
                             .border_color(line)
-                            .child(tab_bar),
-                    )
-                    .child(body)
-                    .child(
-                        div()
-                            .h(px(38.))
-                            .flex_none()
-                            .border_t_1()
-                            .border_color(line)
-                            .child(status_bar),
+                            .rounded(px(10.))
+                            .overflow_hidden()
+                            .child(body)
+                            .child(
+                                div()
+                                    .h(px(38.))
+                                    .flex_none()
+                                    .border_t_1()
+                                    .border_color(line)
+                                    .child(status_bar),
+                            ),
                     ),
             )
             .children(overlay)
@@ -1398,6 +1463,119 @@ mod tests {
             workspace.read_with(cx, |workspace, _| workspace.focused_terminal),
             Some(terminal)
         );
+    }
+
+    fn toggle_bounds(cx: &mut VisualTestContext) -> Bounds<Pixels> {
+        cx.debug_bounds("toggle-sidebar")
+            .expect("the toggle button is on screen")
+    }
+
+    #[gpui::test]
+    fn the_sidebar_toggle_stays_put_when_the_sidebar_collapses(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        redraw(cx);
+        let expanded = toggle_bounds(cx);
+
+        workspace.update_in(cx, Workspace::toggle_sidebar);
+        redraw(cx);
+        let collapsed = toggle_bounds(cx);
+
+        assert_eq!(collapsed, expanded);
+    }
+
+    #[gpui::test]
+    fn the_sidebar_toggle_starts_right_of_the_traffic_lights(cx: &mut TestAppContext) {
+        // The close, minimize and zoom buttons end 69 points from the window's left edge.
+        const ZOOM_BUTTON_END: Pixels = px(69.);
+        let (workspace, cx) = setup(cx);
+        redraw(cx);
+        let expanded = toggle_bounds(cx).left();
+
+        workspace.update_in(cx, Workspace::toggle_sidebar);
+        redraw(cx);
+        let collapsed = toggle_bounds(cx).left();
+
+        assert!(expanded >= ZOOM_BUTTON_END, "expanded: {expanded:?}");
+        assert!(collapsed >= ZOOM_BUTTON_END, "collapsed: {collapsed:?}");
+    }
+
+    #[gpui::test]
+    fn in_full_screen_the_sidebar_toggle_moves_left_to_where_the_lights_were(
+        cx: &mut TestAppContext,
+    ) {
+        let (_workspace, cx) = setup(cx);
+        redraw(cx);
+        let windowed = toggle_bounds(cx).left();
+
+        cx.update(|window, _| window.toggle_fullscreen());
+        redraw(cx);
+        let full_screen = toggle_bounds(cx).left();
+
+        assert_eq!(
+            windowed - full_screen,
+            TRAFFIC_LIGHTS_WIDTH - FULL_SCREEN_INSET
+        );
+    }
+
+    #[gpui::test]
+    fn clicking_the_toggle_keeps_the_focus_in_the_plan_editor(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.select_project(ProjectId(3), cx);
+        });
+        redraw(cx);
+        let editor = workspace
+            .read_with(cx, |workspace, _| workspace.shown_plan_editor())
+            .expect("the Start tab shows the plan editor");
+        let field = editor.read_with(cx, PlanEditor::text_focus);
+        let before = cx.update(|window, _| field.is_focused(window));
+
+        click_toggle(cx);
+
+        assert!(before, "the plan editor does not hold the focus");
+        assert!(collapsed(&workspace, cx));
+        assert!(cx.update(|window, _| field.is_focused(window)));
+    }
+
+    /// A key press that also lets go, which is what turns Space on a button into a click.
+    fn press_space(cx: &mut VisualTestContext) {
+        cx.simulate_keystrokes("space");
+
+        if let Ok(keystroke) = gpui::Keystroke::parse("space") {
+            cx.simulate_event(gpui::KeyUpEvent { keystroke });
+        }
+
+        redraw(cx);
+    }
+
+    #[gpui::test]
+    fn space_on_the_toggle_toggles_twice_and_keeps_its_focus(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        cx.update(|_, cx| {
+            cx.bind_keys([gpui::KeyBinding::new(
+                "tab",
+                swarm_ui::FocusNext,
+                Some(swarm_ui::ROOT_CONTEXT),
+            )]);
+        });
+        focus_workspace(&workspace, cx);
+
+        cx.simulate_keystrokes("tab");
+        redraw(cx);
+        let on_toggle = cx.update(|window, cx| window.focused(cx));
+        press_space(cx);
+        let after_first = collapsed(&workspace, cx);
+        press_space(cx);
+        let after_second = collapsed(&workspace, cx);
+        let still = cx.update(|window, cx| window.focused(cx));
+
+        assert!(on_toggle.is_some());
+        assert!(
+            after_first,
+            "Space on the toggle did not collapse the sidebar"
+        );
+        assert!(!after_second, "Space did not expand it again");
+        assert_eq!(still, on_toggle);
     }
 
     fn focus_workspace(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) {
