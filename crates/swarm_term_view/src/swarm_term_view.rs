@@ -13,15 +13,15 @@ use std::time::Instant;
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
-    Global, Hsla, KeyDownEvent, Keystroke, Pixels, Point, Render, Rgba, Role, ScrollEvent,
-    SharedString, Size, Subscription, Task, TextRun, UTF16Selection, UnderlineStyle, Window, div,
-    prelude::*, px,
+    Global, Hsla, KeyBinding, KeyDownEvent, Keystroke, NoAction, Pixels, Point, Render, Rgba, Role,
+    ScrollEvent, SharedString, Size, Subscription, Task, TextRun, UTF16Selection, UnderlineStyle,
+    Window, div, prelude::*, px,
 };
 use swarm_term::{
     CursorStyle, ExitStatus, Key, Modifiers, Palette, Rgb, ScreenModel, TerminalChannels,
     TerminalInput, TerminalOutput,
 };
-use swarm_ui::{ActiveTheme as _, Theme, edit};
+use swarm_ui::{ActiveTheme as _, FocusNext, FocusPrevious, Theme, edit};
 use unicode_segmentation::UnicodeSegmentation as _;
 
 use crate::element::{
@@ -31,6 +31,25 @@ use crate::element::{
 /// The font size of a view until [`TerminalView::set_font_size`] says otherwise, in points.
 /// It is the settings' default, so the two never differ.
 pub const DEFAULT_FONT_SIZE: f32 = swarm_settings::FONT_SIZE_DEFAULT as f32;
+
+/// Key context of a focused terminal.
+pub const TERMINAL_CONTEXT: &str = "Terminal";
+
+/// Takes Tab and Shift-Tab away from the focus keys of the root, so they reach the shell.
+pub fn shell_key_bindings() -> [KeyBinding; 2] {
+    [
+        KeyBinding::new("tab", NoAction, Some(TERMINAL_CONTEXT)),
+        KeyBinding::new("shift-tab", NoAction, Some(TERMINAL_CONTEXT)),
+    ]
+}
+
+/// Moves focus out of a terminal to the next and the previous Tab stop.
+pub fn focus_key_bindings() -> [KeyBinding; 2] {
+    [
+        KeyBinding::new("ctrl-tab", FocusNext, Some(TERMINAL_CONTEXT)),
+        KeyBinding::new("ctrl-shift-tab", FocusPrevious, Some(TERMINAL_CONTEXT)),
+    ]
+}
 
 /// Holds PTY resizes until `deadline`, a time on the GPUI clock
 /// (`cx.background_executor().now()`). The view keeps drawing its grid. A refresh of all
@@ -712,6 +731,7 @@ impl Render for TerminalView {
 
         div()
             .id("terminal")
+            .key_context(TERMINAL_CONTEXT)
             .role(Role::Terminal)
             .aria_label(self.accessible_name.clone())
             .when_some(value, StatefulInteractiveElement::aria_value)
@@ -932,5 +952,145 @@ mod tests {
                 .iter()
                 .any(|input| matches!(input, TerminalInput::Paste(_)))
         );
+    }
+
+    /// A root with a stop before and a stop after the terminal. Tab moves focus through the
+    /// root context, as in the app.
+    struct TabWalk {
+        before: FocusHandle,
+        terminal: gpui::Entity<TerminalView>,
+        after: FocusHandle,
+    }
+
+    impl Render for TabWalk {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            swarm_ui::tab_navigation(
+                div()
+                    .key_context(swarm_ui::ROOT_CONTEXT)
+                    .child(div().id("before").track_focus(&self.before))
+                    .child(self.terminal.clone())
+                    .child(div().id("after").track_focus(&self.after)),
+            )
+        }
+    }
+
+    struct Walk<'a> {
+        view: gpui::Entity<TabWalk>,
+        emulator: swarm_term::EmulatorChannels,
+        cx: &'a mut gpui::VisualTestContext,
+    }
+
+    impl Walk<'_> {
+        fn handles(&mut self) -> (FocusHandle, FocusHandle, FocusHandle) {
+            self.cx.update(|_, cx| {
+                let walk = self.view.read(cx);
+
+                (
+                    walk.before.clone(),
+                    walk.terminal.read(cx).focus_handle.clone(),
+                    walk.after.clone(),
+                )
+            })
+        }
+
+        fn focus_terminal(&mut self) {
+            let (_, terminal, _) = self.handles();
+            self.cx.update(|window, cx| window.focus(&terminal, cx));
+        }
+
+        fn sent_keys(&self) -> Vec<Key> {
+            self.emulator
+                .input
+                .try_iter()
+                .filter_map(|input| match input {
+                    TerminalInput::Key(key) => Some(key),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    fn walk(cx: &mut gpui::TestAppContext) -> Walk<'_> {
+        cx.update(swarm_ui::theme::init);
+        cx.update(|cx| {
+            cx.bind_keys([
+                KeyBinding::new("tab", FocusNext, Some(swarm_ui::ROOT_CONTEXT)),
+                KeyBinding::new("shift-tab", FocusPrevious, Some(swarm_ui::ROOT_CONTEXT)),
+            ]);
+            cx.bind_keys(shell_key_bindings());
+            cx.bind_keys(focus_key_bindings());
+        });
+        let (channels, emulator) = swarm_term::channels();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let terminal = cx.new(|cx| TerminalView::new(channels, "terminal".into(), window, cx));
+
+            TabWalk {
+                before: cx.focus_handle().tab_stop(true),
+                terminal,
+                after: cx.focus_handle().tab_stop(true),
+            }
+        });
+        cx.run_until_parked();
+
+        let mut walk = Walk { view, emulator, cx };
+        walk.focus_terminal();
+
+        walk
+    }
+
+    #[gpui::test]
+    fn tab_in_a_terminal_reaches_the_shell(cx: &mut gpui::TestAppContext) {
+        let walk = walk(cx);
+
+        walk.cx.simulate_keystrokes("tab");
+
+        let keys = walk.sent_keys();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].name, "tab");
+        assert!(!keys[0].modifiers.shift);
+    }
+
+    #[gpui::test]
+    fn shift_tab_in_a_terminal_reaches_the_shell(cx: &mut gpui::TestAppContext) {
+        let walk = walk(cx);
+
+        walk.cx.simulate_keystrokes("shift-tab");
+
+        let keys = walk.sent_keys();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].name, "tab");
+        assert!(keys[0].modifiers.shift);
+    }
+
+    #[gpui::test]
+    fn tab_in_a_terminal_keeps_focus_there(cx: &mut gpui::TestAppContext) {
+        let mut walk = walk(cx);
+        let (_, terminal, _) = walk.handles();
+
+        walk.cx.simulate_keystrokes("tab");
+
+        assert!(walk.cx.update(|window, _| terminal.is_focused(window)));
+    }
+
+    #[gpui::test]
+    fn control_tab_moves_focus_to_the_next_stop(cx: &mut gpui::TestAppContext) {
+        let mut walk = walk(cx);
+        let (_, _, after) = walk.handles();
+
+        walk.cx.simulate_keystrokes("ctrl-tab");
+
+        assert!(walk.cx.update(|window, _| after.is_focused(window)));
+        assert!(walk.sent_keys().is_empty());
+    }
+
+    #[gpui::test]
+    fn control_shift_tab_moves_focus_to_the_previous_stop(cx: &mut gpui::TestAppContext) {
+        let mut walk = walk(cx);
+        let (before, _, _) = walk.handles();
+
+        walk.cx.simulate_keystrokes("ctrl-shift-tab");
+
+        assert!(walk.cx.update(|window, _| before.is_focused(window)));
+        assert!(walk.sent_keys().is_empty());
     }
 }
