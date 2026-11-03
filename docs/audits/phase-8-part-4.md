@@ -1,6 +1,19 @@
 # Phase 8 part 4: VoiceOver, keyboard and performance audit
 
-Status: parked on 2026-11-01. The audit and the performance run are done. No fix is made yet.
+Status: round 1 done on 2026-11-03 (branch `a11y-round-1`). Round 2 is next.
+
+## Round 2 carry-over
+
+Round 1 added the `swarm_ui` pieces: `A11yFlags`, `LiveRegion`, `Label::accessible` and `Label::heading`, `RovingFocus` (with `sync_keyed`), `reveal_focused`, `TextField::set_popup`, `PopoverMenu::with_trigger` and the Tab-walk support in `swarm_ui::test_support`. Round 2 uses them as planned below. Also left open:
+
+- The tray "+N" chip (`TrayMore`) has no expanded state.
+- Rail buttons have no focus handles, so focus that lands on the collapsed sidebar goes to its container.
+- The user terminal resize handle has a value and a range, but not `ResizeHandle`, because `ResizeHandle` only works left to right.
+- `palette.rs` still uses `black()` for its shadow. Move it to `colors.shadow`.
+- The `Label::accessible` test reads `Label::text_node` and not the rendered label.
+- Tests that are missing: Home and End in the Changes panel tree, and the "Close dialog" label.
+- The test platform builds no accessibility tree, so the text field caret runs, the palette active descendant and the diff list role are not tested on real nodes. Check them with VoiceOver.
+- A click on a task tab or project row keeps the current view. Only ⌘1–⌘9, the palette agent command, the agent row and the tray chip switch to Terminals.
 
 ## How to pick this up
 
