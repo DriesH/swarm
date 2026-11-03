@@ -1,4 +1,5 @@
-//! Tab bar: the project's tasks, the view switch and the panel toggles.
+//! Tab bar: the project's tasks, the view switch and the panel toggles. It fills the title bar
+//! to the right of the sidebar button.
 
 use gpui::{ClickEvent, Context, SharedString, Window, px};
 use swarm_ui::prelude::*;
@@ -14,12 +15,8 @@ const VIEWS: [(View, &str); 3] = [
     (View::Review, "Review"),
 ];
 
-/// The least room left for dragging the window by the header when tabs fill it.
+/// The least room left for dragging the window by the title bar when tabs fill it.
 const MIN_DRAG_WIDTH: gpui::Pixels = px(32.);
-
-/// Room the header leaves for the traffic lights when the sidebar, which sits next to them,
-/// is hidden.
-const TRAFFIC_LIGHTS_CLEARANCE: gpui::Pixels = px(72.);
 
 pub(crate) fn render(
     workspace: &Workspace,
@@ -27,13 +24,9 @@ pub(crate) fn render(
     cx: &mut Context<Workspace>,
 ) -> gpui::AnyElement {
     if workspace.has_no_projects() {
-        return h_flex()
-            .size_full()
-            .px(px(10.))
-            .when(!workspace.sidebar_visible, |bar| {
-                bar.pl(TRAFFIC_LIGHTS_CLEARANCE)
-            })
-            .child(drag_region("tab-bar-drag", window, cx).flex_1().h_full())
+        return drag_region("tab-bar-drag", window, cx)
+            .flex_1()
+            .h_full()
             .into_any_element();
     }
 
@@ -45,11 +38,9 @@ pub(crate) fn render(
     let pull_request = workspace.pull_request_toggle_label(task.id);
 
     h_flex()
-        .size_full()
-        .px(px(10.))
-        .when(!workspace.sidebar_visible, |bar| {
-            bar.pl(TRAFFIC_LIGHTS_CLEARANCE)
-        })
+        .flex_1()
+        .min_w_0()
+        .h_full()
         .gap(px(4.))
         .child(task_tabs(workspace, cx))
         .child(
@@ -235,7 +226,8 @@ mod tests {
 
     use super::*;
     use crate::model::AgentKind;
-    use crate::workspace::HEADER_CENTER;
+    use crate::sidebar::SIDEBAR_WIDTH;
+    use crate::workspace::TITLE_BAR_HEIGHT;
     use swarm_ui::TAB_MIN_WIDTH;
 
     fn setup(cx: &mut TestAppContext) -> (gpui::Entity<Workspace>, &mut VisualTestContext) {
@@ -927,19 +919,96 @@ mod tests {
     }
 
     #[gpui::test]
-    fn the_traffic_lights_the_sidebar_toggle_and_the_tabs_share_one_center(
-        cx: &mut TestAppContext,
-    ) {
+    fn the_sidebar_toggle_the_tabs_and_the_view_switch_share_one_center(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
         show_tasks(&workspace, 3, 1360., cx);
+        let center = TITLE_BAR_HEIGHT / 2.;
 
         let toggle = bounds_of("toggle-sidebar", cx).center().y;
         let tab = tab_bounds(&workspace, cx)[0].center().y;
-        let lights = crate::traffic_light_position().y + crate::TRAFFIC_LIGHT_SIZE / 2.;
+        let view_switch = bounds_of("view-control", cx).center().y;
 
-        assert!(level(toggle, HEADER_CENTER), "sidebar toggle at {toggle:?}");
-        assert!(level(tab, HEADER_CENTER), "tabs at {tab:?}");
-        assert!(level(lights, HEADER_CENTER), "traffic lights at {lights:?}");
+        assert!(level(toggle, center), "sidebar toggle at {toggle:?}");
+        assert!(level(tab, center), "tabs at {tab:?}");
+        assert!(level(view_switch, center), "view switch at {view_switch:?}");
+    }
+
+    #[gpui::test]
+    fn with_the_sidebar_expanded_the_first_tab_starts_where_the_card_does(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        show_tasks(&workspace, 3, 1360., cx);
+
+        let tab = tab_bounds(&workspace, cx)[0].left();
+        let card = bounds_of("main-card", cx).left();
+
+        assert_eq!(card, SIDEBAR_WIDTH);
+        assert!(level(tab, card), "first tab at {tab:?}, card at {card:?}");
+    }
+
+    #[gpui::test]
+    fn in_full_screen_the_first_tab_still_starts_where_the_card_does(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        show_tasks(&workspace, 3, 1360., cx);
+
+        cx.update(|window, _| window.toggle_fullscreen());
+        settle(cx);
+        let tab = tab_bounds(&workspace, cx)[0].left();
+        let card = bounds_of("main-card", cx).left();
+
+        assert!(level(tab, card), "first tab at {tab:?}, card at {card:?}");
+    }
+
+    #[gpui::test]
+    fn with_the_sidebar_collapsed_the_first_tab_follows_the_toggle(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        workspace.update_in(cx, Workspace::toggle_sidebar);
+        show_tasks(&workspace, 3, 1360., cx);
+
+        let tab = tab_bounds(&workspace, cx)[0].left();
+        let toggle = bounds_of("toggle-sidebar", cx).right();
+
+        assert!(
+            tab >= toggle,
+            "first tab at {tab:?}, toggle ends at {toggle:?}"
+        );
+        assert!(tab < SIDEBAR_WIDTH, "first tab at {tab:?}");
+    }
+
+    #[gpui::test]
+    fn with_the_sidebar_collapsed_in_full_screen_the_tabs_follow_the_toggle(
+        cx: &mut TestAppContext,
+    ) {
+        // Full screen hides the traffic lights, so only a small inset is left before the toggle.
+        const LIGHTS_AREA: gpui::Pixels = px(8.);
+        const GAP: gpui::Pixels = px(4.);
+        let (workspace, cx) = setup(cx);
+        workspace.update_in(cx, Workspace::toggle_sidebar);
+        show_tasks(&workspace, 3, 1360., cx);
+
+        cx.update(|window, _| window.toggle_fullscreen());
+        settle(cx);
+        let toggle = bounds_of("toggle-sidebar", cx);
+        let tab = tab_bounds(&workspace, cx)[0].left();
+
+        assert_eq!(toggle.left(), LIGHTS_AREA + GAP);
+        assert!(tab >= toggle.right(), "first tab at {tab:?}");
+        assert!(tab - toggle.right() <= GAP + px(1.), "first tab at {tab:?}");
+    }
+
+    #[gpui::test]
+    fn the_edge_fades_use_the_color_of_the_title_bar(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        show_tasks(&workspace, 6, 1360., cx);
+        let ground = cx.update(|_, cx| cx.theme().colors().ground);
+        let expected = gpui::linear_gradient(
+            90.,
+            gpui::linear_color_stop(ground.opacity(0.), 0.),
+            gpui::linear_color_stop(ground, 1.),
+        );
+
+        let fade = crate::daemon::tests::drawn_quad("task-tabs-fade-end", cx);
+
+        assert_eq!(fade.map(|quad| quad.background), Some(expected));
     }
 
     #[gpui::test]

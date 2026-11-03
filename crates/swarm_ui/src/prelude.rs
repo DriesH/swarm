@@ -7,7 +7,7 @@ pub use crate::components::{
     AgentStatus, BrandMark, Button, ButtonSize, ButtonVariant, CheckRow, CheckStatus, Checkbox,
     ConfirmRow, ContextMenu, Dialog, Dropdown, FileIcon, Highlighter, HoneyFill, Honeycomb, Icon,
     IconButton, IconButtonSize, IconName, IconSize, Kbd, Label, LabelSize, ListRow, Menu, MenuItem,
-    OutputBlock, Panel, PanelRow, PixelBee, PopoverMenu, ProjectTile, ResizeHandle,
+    OutputBlock, Panel, PanelRow, PixelBee, PopoverMenu, ProjectTile, RailButton, ResizeHandle,
     SegmentedControl, StatusDot, StatusPill, StatusRing, Stepper, Switch, SystemCheckRow,
     SystemCheckState, Tab, TabBar, TabStrip, Tag, TagTone, TextArea, TextInput, TextInputEvent,
     TileFrame, Toast, TrayChip, TrayMore, TreeRow, UsageDetailMeter, UsageMeter, UsageSurface,

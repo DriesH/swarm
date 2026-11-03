@@ -31,7 +31,7 @@ const REVEAL_TRIES: u8 = 4;
 /// that takes keyboard focus scroll into view.
 ///
 /// The bar sets each tab's selected state and click handler. Fades are drawn in the
-/// `panel` color, so the bar belongs on a `panel` surface.
+/// `ground` color, so the bar belongs on a `ground` surface.
 #[derive(IntoElement)]
 #[must_use]
 pub struct TabBar {
@@ -314,7 +314,7 @@ fn overflow_trigger(
 
 impl RenderOnce for TabBar {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let panel = cx.theme().colors().panel;
+        let ground = cx.theme().colors().ground;
 
         let count = self.tabs.len();
         let selected = self.selected.min(count.saturating_sub(1));
@@ -373,10 +373,10 @@ impl RenderOnce for TabBar {
             .min_w_0()
             .child(row)
             .when(fade_start, |strip| {
-                strip.child(fade(true, panel, selector("fade-start")))
+                strip.child(fade(true, ground, selector("fade-start")))
             })
             .when(fade_end, |strip| {
-                strip.child(fade(false, panel, selector("fade-end")))
+                strip.child(fade(false, ground, selector("fade-end")))
             });
 
         let overflow = overflowing.then(|| {
@@ -447,6 +447,7 @@ impl Component for TabBar {
     fn preview(window: &mut Window, cx: &mut App) -> AnyElement {
         let state = window.use_keyed_state("tab-bar-demo", cx, |_, _| 3_usize);
         let selected = *state.read(cx);
+        let ground = cx.theme().colors().ground;
         let names = [
             "terminal-renderer",
             "menu-bar-usage",
@@ -497,6 +498,7 @@ impl Component for TabBar {
                     "Room for all",
                     div()
                         .w(px(760.))
+                        .bg(ground)
                         .child(bar("tab-bar-few", 3, state.clone())),
                 )],
             ))
@@ -504,7 +506,10 @@ impl Component for TabBar {
                 "Many tabs",
                 [example(
                     "Shrink, then scroll, with an overflow menu",
-                    div().w(px(520.)).child(bar("tab-bar-many", 8, state)),
+                    div()
+                        .w(px(520.))
+                        .bg(ground)
+                        .child(bar("tab-bar-many", 8, state)),
                 )],
             ))
             .into_any_element()

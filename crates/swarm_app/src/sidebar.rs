@@ -3,18 +3,24 @@
 use std::path::Path;
 use std::rc::Rc;
 
-use gpui::{Context, FontWeight, Global, Pixels, Role, SharedString, WeakEntity, Window, div, px};
+use gpui::{
+    Context, FontWeight, Global, Hsla, Pixels, Role, SharedString, WeakEntity, Window, div, px,
+};
 use swarm_ui::prelude::*;
 
-use crate::actions::{ToggleCommandPalette, ToggleSidebar};
-use crate::model::{Agent, AgentKind, Project, ProjectId, Task, TaskStatus, Terminal};
+use crate::actions::ToggleCommandPalette;
+use crate::model::{Agent, AgentKind, Project, ProjectId, TaskStatus, Terminal};
 use crate::settings::Page;
 use crate::usage_text::{UsageSection, WindowRow, usage_sections};
 use crate::window_drag::drag_region;
 use crate::workspace::{DataSource, Workspace};
 
-/// Height of the row with the traffic lights and the sidebar toggle.
-pub(crate) const WINDOW_ROW_HEIGHT: Pixels = px(30.);
+/// The expanded sidebar's width. The title bar keeps its leading part this wide, so the
+/// tabs line up with the card.
+pub(crate) const SIDEBAR_WIDTH: Pixels = px(248.);
+
+/// Room for a 36 pt `RailButton` with 6 pt on each side.
+pub(crate) const RAIL_WIDTH: Pixels = px(48.);
 
 pub(crate) fn render(
     workspace: &Workspace,
@@ -28,6 +34,12 @@ pub(crate) fn render(
         .map(|project| project_row(workspace, project, cx))
         .collect();
 
+    let agents = if workspace.has_no_projects() {
+        Vec::new()
+    } else {
+        agent_rows(workspace, cx)
+    };
+
     v_flex()
         .id("sidebar")
         .track_focus(&workspace.sidebar_focus)
@@ -35,7 +47,6 @@ pub(crate) fn render(
         .aria_label("Projects and agents")
         .size_full()
         .gap(px(2.))
-        .child(window_row(window, cx))
         .child(logo_row(window, cx))
         .child(
             heading("Projects", 14.).h(px(30.)).child(
@@ -48,13 +59,181 @@ pub(crate) fn render(
         .children(projects)
         .children(daemon_status(workspace, cx))
         .children(error_message(workspace, cx))
-        .when(!workspace.has_no_projects(), |sidebar| {
+        .when(!agents.is_empty(), |sidebar| {
             sidebar
-                .child(heading("Agents", 18.))
-                .children(agent_rows(workspace, cx))
+                .child(heading("Agents", 18.).debug_selector(|| "agents-heading".to_owned()))
+                .children(agents)
         })
         .child(div().flex_1())
         .children(usage_card(workspace))
+}
+
+/// The sidebar collapsed to a column of buttons: search, the projects and the open task's
+/// terminals.
+pub(crate) fn render_rail(
+    workspace: &Workspace,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement + use<> {
+    let line = cx.theme().colors().line;
+
+    let projects: Vec<RailButton> = workspace
+        .data
+        .projects
+        .iter()
+        .map(|project| project_button(workspace, project, cx))
+        .collect();
+
+    let terminals: Vec<RailButton> = if workspace.has_no_projects() {
+        Vec::new()
+    } else {
+        rows(workspace)
+            .into_iter()
+            .map(|row| terminal_button(workspace, row, cx))
+            .collect()
+    };
+
+    v_flex()
+        .id("sidebar-rail")
+        .track_focus(&workspace.sidebar_focus)
+        .role(Role::Navigation)
+        .aria_label("Projects and agents")
+        .debug_selector(|| "sidebar-rail".to_owned())
+        .size_full()
+        .items_center()
+        .gap(px(4.))
+        .pt(px(4.))
+        .pb(px(10.))
+        .child(
+            IconButton::new("rail-search", IconName::Search, "Search")
+                .size(IconButtonSize::Medium)
+                .color(Color::Muted)
+                .debug_selector(|| "rail-search".to_owned())
+                .on_click(|_, window, cx| {
+                    window.dispatch_action(Box::new(ToggleCommandPalette), cx);
+                }),
+        )
+        .child(rail_divider(line))
+        .child(
+            div()
+                .id("rail-items")
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .overflow_y_scroll()
+                .child(
+                    v_flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .children(projects)
+                        .child(
+                            IconButton::new("rail-add-project", IconName::Plus, "Add project")
+                                .size(IconButtonSize::Medium)
+                                .debug_selector(|| "rail-add-project".to_owned())
+                                .on_click(cx.listener(|_, _, window, cx| {
+                                    Workspace::pick_project(window, cx);
+                                })),
+                        )
+                        .when(!terminals.is_empty(), |list| {
+                            list.child(rail_divider(line)).children(terminals)
+                        }),
+                ),
+        )
+}
+
+fn rail_divider(line: Hsla) -> gpui::Div {
+    div().w(px(32.)).h(px(1.)).flex_none().bg(line).my(px(4.))
+}
+
+fn project_button(
+    workspace: &Workspace,
+    project: &Project,
+    cx: &mut Context<Workspace>,
+) -> RailButton {
+    let id = project.id;
+    let summary = ProjectSummary::of(workspace, id);
+    let label = SharedString::from(project_label(project, &summary));
+
+    let badge = if summary.needs_you || project.config_error.is_some() {
+        Some(AgentStatus::Blocked)
+    } else if summary.working {
+        Some(AgentStatus::Working)
+    } else {
+        None
+    };
+
+    RailButton::new(
+        ("rail-project", id.0 as usize),
+        label.clone(),
+        ProjectTile::new(project.letter, project.tile_color).size(px(22.)),
+    )
+    .tooltip(label)
+    .toggle_state(workspace.active_project == id)
+    .badge(badge)
+    .debug_selector(move || format!("rail-project-{}", id.0))
+    .on_click(cx.listener(move |workspace, _, _, cx| {
+        workspace.select_project(id, cx);
+    }))
+}
+
+fn terminal_button(workspace: &Workspace, row: Row<'_>, cx: &mut Context<Workspace>) -> RailButton {
+    let terminal_icon = || {
+        Icon::new(IconName::Terminal)
+            .size(IconSize::Large)
+            .color(Color::Muted)
+    };
+
+    let (button, terminal) = match row {
+        Row::Agent(agent, _) => {
+            let (icon, _) = agent_kind(agent.kind);
+            let id = agent.id;
+            let label = SharedString::from(agent_label(agent));
+
+            let button = RailButton::new(
+                ("rail-agent", id.0 as usize),
+                label.clone(),
+                Icon::new(icon).size(IconSize::Large),
+            )
+            .tooltip(label)
+            .badge(Some(agent.status))
+            .debug_selector(move || format!("rail-agent-{}", id.0));
+
+            (button, agent.terminal)
+        }
+        Row::Process(terminal, owner, _) => {
+            let id = terminal.id;
+            let label = SharedString::from(process_label(terminal, owner));
+
+            let button = RailButton::new(
+                ("rail-process", id.0 as usize),
+                label.clone(),
+                terminal_icon(),
+            )
+            .tooltip(label)
+            .badge(Some(AgentStatus::Working))
+            .debug_selector(move || format!("rail-process-{}", id.0));
+
+            (button, id)
+        }
+        Row::User(terminal) => {
+            let id = terminal.id;
+
+            let button = RailButton::new(
+                ("rail-user", id.0 as usize),
+                user_label(terminal),
+                terminal_icon(),
+            )
+            .tooltip(terminal.title.clone())
+            .debug_selector(move || format!("rail-user-{}", id.0));
+
+            (button, id)
+        }
+    };
+
+    button
+        .toggle_state(workspace.focused_terminal == Some(terminal))
+        .on_click(cx.listener(move |workspace, _, _, cx| {
+            workspace.focus_terminal(terminal, cx);
+        }))
 }
 
 fn daemon_status(workspace: &Workspace, cx: &mut Context<Workspace>) -> Option<gpui::AnyElement> {
@@ -62,6 +241,7 @@ fn daemon_status(workspace: &Workspace, cx: &mut Context<Workspace>) -> Option<g
         DataSource::Connecting => Some(
             h_flex()
                 .id("daemon-status")
+                .debug_selector(|| "daemon-status".to_owned())
                 .role(Role::Status)
                 .aria_label("Connecting")
                 .h(px(28.))
@@ -74,6 +254,7 @@ fn daemon_status(workspace: &Workspace, cx: &mut Context<Workspace>) -> Option<g
         DataSource::Unavailable { reason } => Some(
             h_flex()
                 .id("daemon-status")
+                .debug_selector(|| "daemon-status".to_owned())
                 .role(Role::Status)
                 .aria_label(format!("Daemon not running: {reason}"))
                 .min_h(px(28.))
@@ -101,6 +282,7 @@ fn error_message(workspace: &Workspace, cx: &mut Context<Workspace>) -> Option<i
     Some(
         h_flex()
             .id("sidebar-error")
+            .debug_selector(|| "sidebar-error".to_owned())
             .role(Role::Alert)
             .aria_label(message.clone())
             .items_start()
@@ -121,25 +303,6 @@ fn error_message(workspace: &Workspace, cx: &mut Context<Workspace>) -> Option<i
                 ),
             ),
     )
-}
-
-fn window_row(window: &mut Window, cx: &mut App) -> impl IntoElement {
-    h_flex()
-        .h(WINDOW_ROW_HEIGHT)
-        .pl(px(6.))
-        .child(
-            drag_region("sidebar-top-drag", window, cx)
-                .flex_1()
-                .h_full(),
-        )
-        .child(
-            IconButton::new("toggle-sidebar", IconName::Sidebar, "Toggle sidebar")
-                .size(IconButtonSize::Medium)
-                .debug_selector(|| "toggle-sidebar".to_owned())
-                .on_click(|_, window, cx| {
-                    window.dispatch_action(Box::new(ToggleSidebar), cx);
-                }),
-        )
 }
 
 fn logo_row(window: &mut Window, cx: &mut App) -> impl IntoElement {
@@ -187,28 +350,8 @@ fn project_row(
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement + use<> {
     let id = project.id;
-    let tasks: Vec<&Task> = workspace.data.tasks_of(id).collect();
-    let needs_you = tasks.iter().any(|task| task.status == TaskStatus::NeedsYou);
-    let working = tasks.iter().any(|task| task.status == TaskStatus::Working);
-
-    let summary = if needs_you {
-        ", needs you"
-    } else if working {
-        ", working"
-    } else {
-        ""
-    };
-    let plural = if tasks.len() == 1 { "task" } else { "tasks" };
-    let config_error = project
-        .config_error
-        .as_ref()
-        .map(|error| format!(", config error: {error}"))
-        .unwrap_or_default();
-    let accessible = format!(
-        "{}, {} {plural}{summary}{config_error}",
-        project.name,
-        tasks.len()
-    );
+    let summary = ProjectSummary::of(workspace, id);
+    let (needs_you, working) = (summary.needs_you, summary.working);
 
     let tile = ProjectTile::new(project.letter, project.tile_color);
 
@@ -225,7 +368,7 @@ fn project_row(
         })
         .child(
             div().min_w(px(10.)).flex().justify_end().child(
-                Label::new(tasks.len().to_string())
+                Label::new(summary.task_count.to_string())
                     .mono()
                     .size(LabelSize::XSmall)
                     .color(Color::Faint),
@@ -234,7 +377,7 @@ fn project_row(
 
     let mut row = ListRow::new(("project", id.0 as usize), project.name.clone())
         .debug_selector(move || format!("project-row-{}", id.0))
-        .accessible_label(accessible)
+        .accessible_label(project_label(project, &summary))
         .toggle_state(workspace.active_project == id)
         .start_slot(tile)
         .end_slot(end)
@@ -247,6 +390,57 @@ fn project_row(
     }
 
     project_menu(id, project, row, cx)
+}
+
+/// What the tasks of a project add up to. Counted once per project.
+struct ProjectSummary {
+    task_count: usize,
+    needs_you: bool,
+    working: bool,
+}
+
+impl ProjectSummary {
+    fn of(workspace: &Workspace, project: ProjectId) -> Self {
+        let mut summary = Self {
+            task_count: 0,
+            needs_you: false,
+            working: false,
+        };
+
+        for task in workspace.data.tasks_of(project) {
+            summary.task_count += 1;
+            summary.needs_you |= task.status == TaskStatus::NeedsYou;
+            summary.working |= task.status == TaskStatus::Working;
+        }
+
+        summary
+    }
+}
+
+/// What VoiceOver reads for a project: its name, task count and status.
+fn project_label(project: &Project, summary: &ProjectSummary) -> String {
+    let status = if summary.needs_you {
+        ", needs you"
+    } else if summary.working {
+        ", working"
+    } else {
+        ""
+    };
+    let plural = if summary.task_count == 1 {
+        "task"
+    } else {
+        "tasks"
+    };
+    let config_error = project
+        .config_error
+        .as_ref()
+        .map(|error| format!(", config error: {error}"))
+        .unwrap_or_default();
+
+    format!(
+        "{}, {} {plural}{status}{config_error}",
+        project.name, summary.task_count
+    )
 }
 
 /// The row with its context menu: Show in Finder, Project settings and Remove project.
@@ -417,15 +611,10 @@ fn process_row(
     cx: &mut Context<Workspace>,
 ) -> gpui::AnyElement {
     let id = terminal.id;
-    let accessible = if owner.is_empty() {
-        format!("{}, process terminal", terminal.title)
-    } else {
-        format!("{}, started by {owner}, running", terminal.title)
-    };
 
     ListRow::new(("process", id.0 as usize), terminal.title.clone())
         .debug_selector(move || format!("process-row-{}", id.0))
-        .accessible_label(accessible)
+        .accessible_label(process_label(terminal, owner))
         .compact(true)
         .indent(indent)
         .toggle_state(workspace.focused_terminal == Some(id))
@@ -439,6 +628,19 @@ fn process_row(
             workspace.focus_terminal(id, cx);
         }))
         .into_any_element()
+}
+
+/// What VoiceOver reads for a process terminal and the agent that started it.
+fn process_label(terminal: &Terminal, owner: &str) -> String {
+    if owner.is_empty() {
+        format!("{}, process terminal", terminal.title)
+    } else {
+        format!("{}, started by {owner}, running", terminal.title)
+    }
+}
+
+fn user_label(terminal: &Terminal) -> String {
+    format!("{}, your terminal", terminal.title)
 }
 
 fn user_row(
@@ -467,7 +669,7 @@ fn user_row(
 
     ListRow::new(("user-terminal", id.0 as usize), terminal.title.clone())
         .debug_selector(move || format!("user-row-{}", id.0))
-        .accessible_label(format!("{}, your terminal", terminal.title))
+        .accessible_label(user_label(terminal))
         .compact(true)
         .toggle_state(workspace.focused_terminal == Some(id))
         .start_slot(
@@ -491,6 +693,25 @@ fn agent_row(
     agent_list_row(workspace, agent, indent, cx).into_any_element()
 }
 
+/// The icon and the name of an agent kind.
+fn agent_kind(kind: AgentKind) -> (IconName, &'static str) {
+    match kind {
+        AgentKind::ClaudeCode => (IconName::ClaudeCode, "Claude Code"),
+        AgentKind::Codex => (IconName::Codex, "Codex"),
+    }
+}
+
+/// What VoiceOver reads for an agent: its name, kind and status.
+fn agent_label(agent: &Agent) -> String {
+    let (_, kind) = agent_kind(agent.kind);
+
+    format!(
+        "{}, {kind}, {}",
+        agent.name,
+        agent.status.label().to_lowercase()
+    )
+}
+
 /// The row of an agent in the sidebar.
 pub(crate) fn agent_list_row(
     workspace: &Workspace,
@@ -499,19 +720,12 @@ pub(crate) fn agent_list_row(
     cx: &mut Context<Workspace>,
 ) -> ListRow {
     let terminal = agent.terminal;
-    let (icon, kind) = match agent.kind {
-        AgentKind::ClaudeCode => (IconName::ClaudeCode, "Claude Code"),
-        AgentKind::Codex => (IconName::Codex, "Codex"),
-    };
+    let (icon, _) = agent_kind(agent.kind);
 
     let queen = workspace.is_queen(agent, cx);
 
     ListRow::new(("agent", agent.id.0 as usize), agent.name.clone())
-        .accessible_label(format!(
-            "{}, {kind}, {}",
-            agent.name,
-            agent.status.label().to_lowercase()
-        ))
+        .accessible_label(agent_label(agent))
         .compact(true)
         .indent(indent)
         .toggle_state(workspace.focused_terminal == Some(terminal))
@@ -659,7 +873,7 @@ mod tests {
         let row = right("project-row-1");
 
         assert!(row.is_some());
-        for selector in ["toggle-sidebar", "sidebar-search", "add-project"] {
+        for selector in ["sidebar-search", "add-project"] {
             assert_eq!(right(selector), row, "{selector}");
         }
     }
@@ -830,6 +1044,142 @@ mod tests {
         assert_eq!(
             second,
             Some(("cargo test".to_owned(), "orchestrator".to_owned(), 1))
+        );
+    }
+
+    fn collapse(workspace: &gpui::Entity<Workspace>, cx: &mut VisualTestContext) {
+        workspace.update_in(cx, Workspace::toggle_sidebar);
+        redraw(cx);
+    }
+
+    #[gpui::test]
+    fn the_agents_heading_shows_only_when_the_open_tab_has_rows(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        redraw(cx);
+        let with_rows = shown("agents-heading", cx);
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.select_project(ProjectId(3), cx);
+        });
+        redraw(cx);
+        let rows = workspace.read_with(cx, |workspace, _| rows(workspace).len());
+
+        assert!(with_rows);
+        assert_eq!(rows, 0);
+        assert!(!shown("agents-heading", cx));
+    }
+
+    #[gpui::test]
+    fn the_rail_is_48_points_wide_and_the_card_starts_right_after_it(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        collapse(&workspace, cx);
+
+        let rail = cx.debug_bounds("sidebar-rail");
+        let card = cx.debug_bounds("main-card");
+
+        assert_eq!(rail.map(|bounds| bounds.size.width), Some(px(48.)));
+        assert!(card.is_some());
+        assert_eq!(
+            card.map(|bounds| bounds.left()),
+            rail.map(|bounds| bounds.right())
+        );
+    }
+
+    #[gpui::test]
+    fn an_error_opens_the_collapsed_sidebar_and_shows_the_alert(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        collapse(&workspace, cx);
+        let hidden = !shown("sidebar-error", cx);
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.report_sidebar_error("not a git repository".to_owned(), cx);
+        });
+        redraw(cx);
+
+        assert!(hidden);
+        assert!(shown("sidebar-error", cx));
+    }
+
+    #[gpui::test]
+    fn a_missing_daemon_opens_the_collapsed_sidebar_with_its_status(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        collapse(&workspace, cx);
+        let hidden = !shown("daemon-status", cx);
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.daemon_unavailable("no daemon".to_owned(), cx);
+        });
+        redraw(cx);
+
+        assert!(hidden);
+        assert!(shown("daemon-status", cx));
+    }
+
+    #[gpui::test]
+    fn the_rail_lists_each_project_and_selects_one(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        collapse(&workspace, cx);
+        let projects = workspace.read_with(cx, |workspace, _| workspace.data.projects.len());
+        let before = workspace.read_with(cx, |workspace, _| workspace.active_project);
+
+        let buttons = [
+            "rail-project-0",
+            "rail-project-1",
+            "rail-project-2",
+            "rail-project-3",
+        ];
+        let shown_all = buttons.iter().all(|selector| shown(selector, cx));
+        click_at("rail-project-2", point(px(18.), px(18.)), cx);
+
+        assert_eq!(projects, buttons.len());
+        assert!(shown_all);
+        assert_ne!(before, ProjectId(2));
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.active_project),
+            ProjectId(2)
+        );
+    }
+
+    #[gpui::test]
+    fn the_rail_focuses_an_agent_terminal(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        collapse(&workspace, cx);
+        let agent = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .data
+                .agents
+                .iter()
+                .find(|agent| agent.name == "pty-io")
+                .map(|agent| (agent.id, agent.terminal))
+        });
+        let (id, terminal) = agent.expect("the sample has a pty-io agent");
+        let before = workspace.read_with(cx, |workspace, _| workspace.focused_terminal);
+
+        assert_eq!(id, crate::model::AgentId(2));
+        click_at("rail-agent-2", point(px(18.), px(18.)), cx);
+
+        assert_ne!(before, Some(terminal));
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.focused_terminal),
+            Some(terminal)
+        );
+    }
+
+    #[gpui::test]
+    fn the_rail_shows_user_terminals(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let user = with_user_terminal(&workspace, cx);
+        collapse(&workspace, cx);
+        let before = workspace.read_with(cx, |workspace, _| workspace.focused_terminal);
+
+        assert_eq!(user, crate::model::TerminalId(14));
+        assert!(shown("rail-user-14", cx));
+        click_at("rail-user-14", point(px(18.), px(18.)), cx);
+
+        assert_ne!(before, Some(user));
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.focused_terminal),
+            Some(user)
         );
     }
 

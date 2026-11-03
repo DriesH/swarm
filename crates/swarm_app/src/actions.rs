@@ -183,6 +183,11 @@ pub(crate) fn shortcuts() -> Vec<Shortcut> {
             "Command palette",
             KeyBinding::new("cmd-k", ToggleCommandPalette, root),
         ),
+        shortcut(
+            Workspace,
+            "Toggle sidebar",
+            KeyBinding::new("cmd-b", ToggleSidebar, root),
+        ),
         shortcut(Workspace, "Quit", KeyBinding::new("cmd-q", Quit, None)),
         shortcut(
             Workspace,
@@ -296,4 +301,32 @@ fn review_shortcuts() -> Vec<Shortcut> {
 pub(crate) fn bind_keys(cx: &mut App) {
     cx.bind_keys(shortcuts().into_iter().map(|shortcut| shortcut.binding));
     cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::Keystroke;
+
+    use super::*;
+
+    #[test]
+    fn the_shortcut_list_has_toggle_sidebar() {
+        let toggle = shortcuts()
+            .into_iter()
+            .find(|shortcut| shortcut.name == "Toggle sidebar");
+
+        let keys: Option<Vec<Keystroke>> = toggle.map(|shortcut| {
+            shortcut
+                .binding
+                .keystrokes()
+                .iter()
+                .map(|keystroke| keystroke.inner().clone())
+                .collect()
+        });
+
+        assert_eq!(
+            keys,
+            Some(vec![Keystroke::parse("cmd-b").expect("a valid keystroke")])
+        );
+    }
 }

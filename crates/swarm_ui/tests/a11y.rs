@@ -103,6 +103,42 @@ fn toggle_icon_button_that_is_off_reports_not_toggled() {
 }
 
 #[test]
+fn rail_button_reads_its_label() {
+    with_window(|window, cx| {
+        let info = a11y_info(
+            RailButton::new("project", "swarm, 3 tasks", Icon::new(IconName::Plus))
+                .tooltip("swarm")
+                .badge(Some(AgentStatus::Working)),
+            window,
+            cx,
+        );
+
+        assert_eq!(info.role, Some(Role::Button));
+        assert_eq!(info.node.label(), Some("swarm, 3 tasks"));
+    });
+}
+
+#[test]
+fn rail_button_reports_its_selected_state() {
+    with_window(|window, cx| {
+        let selected = a11y_info(
+            RailButton::new("on", "swarm", Icon::new(IconName::Plus)).toggle_state(true),
+            window,
+            cx,
+        );
+        let plain = a11y_info(
+            RailButton::new("off", "swarm", Icon::new(IconName::Plus)),
+            window,
+            cx,
+        );
+
+        assert_eq!(selected.node.is_selected(), Some(true));
+        assert_eq!(plain.node.is_selected(), Some(false));
+        assert_eq!(selected.node.toggled(), None);
+    });
+}
+
+#[test]
 fn switch_reports_its_state() {
     with_window(|window, cx| {
         let on = a11y_info(
