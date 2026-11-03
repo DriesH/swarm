@@ -9,11 +9,13 @@ mod element;
 
 use std::ops::Range;
 use std::rc::Rc;
+use std::time::Instant;
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
-    Hsla, KeyDownEvent, Keystroke, Pixels, Point, Render, Rgba, Role, ScrollEvent, SharedString,
-    Size, Subscription, Task, TextRun, UTF16Selection, UnderlineStyle, Window, div, prelude::*, px,
+    Global, Hsla, KeyDownEvent, Keystroke, Pixels, Point, Render, Rgba, Role, ScrollEvent,
+    SharedString, Size, Subscription, Task, TextRun, UTF16Selection, UnderlineStyle, Window, div,
+    prelude::*, px,
 };
 use swarm_term::{
     CursorStyle, ExitStatus, Key, Modifiers, Palette, Rgb, ScreenModel, TerminalChannels,
@@ -29,6 +31,40 @@ use crate::element::{
 /// The font size of a view until [`TerminalView::set_font_size`] says otherwise, in points.
 /// It is the settings' default, so the two never differ.
 pub const DEFAULT_FONT_SIZE: f32 = swarm_settings::FONT_SIZE_DEFAULT as f32;
+
+/// Holds PTY resizes until `deadline`, a time on the GPUI clock
+/// (`cx.background_executor().now()`). The view keeps drawing its grid. A refresh of all
+/// windows at the deadline makes every view send its size, also a view that GPUI would
+/// otherwise reuse from its cache.
+pub struct ResizeHold {
+    deadline: Instant,
+    _release: Task<()>,
+}
+
+impl Global for ResizeHold {}
+
+/// Keeps every view from resizing its PTY until `deadline`, for example while the layout
+/// animates. A later call replaces the hold and its deadline.
+pub fn hold_resizes_until(deadline: Instant, cx: &mut App) {
+    let wait = deadline.saturating_duration_since(cx.background_executor().now());
+    let release = cx.spawn(async move |cx| {
+        cx.background_executor().timer(wait).await;
+        cx.update(App::refresh_windows);
+    });
+
+    cx.set_global(ResizeHold {
+        deadline,
+        _release: release,
+    });
+}
+
+/// True while a [`ResizeHold`] has not reached its deadline.
+fn resizes_held(cx: &App) -> bool {
+    let now = cx.background_executor().now();
+
+    cx.try_global::<ResizeHold>()
+        .is_some_and(|hold| hold.deadline > now)
+}
 
 /// What the app may want to react to.
 #[derive(Debug, Clone, PartialEq, Eq)]
