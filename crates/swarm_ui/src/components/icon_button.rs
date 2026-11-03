@@ -15,7 +15,8 @@ pub enum IconButtonSize {
 }
 
 impl IconButtonSize {
-    pub(crate) fn square(self) -> Pixels {
+    /// The side of the button, in pixels.
+    pub fn square(self) -> Pixels {
         match self {
             Self::Small => px(24.),
             Self::Medium => px(30.),

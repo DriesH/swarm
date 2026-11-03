@@ -231,7 +231,10 @@ mod tests {
     use swarm_ui::TAB_MIN_WIDTH;
 
     fn setup(cx: &mut TestAppContext) -> (gpui::Entity<Workspace>, &mut VisualTestContext) {
-        cx.update(swarm_ui::theme::init);
+        cx.update(|cx| {
+            swarm_ui::theme::init(cx);
+            crate::workspace::follow_test_reduce_motion(true, cx);
+        });
 
         cx.add_window_view(Workspace::with_sample)
     }

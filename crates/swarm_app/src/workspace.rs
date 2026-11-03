@@ -2,10 +2,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use gpui::{
     AnyWindowHandle, AppContext as _, Bounds, Context, Div, Entity, FocusHandle, Focusable, Pixels,
-    Point, SharedString, Size, Stateful, Subscription, Window, div, point, px,
+    Point, SharedString, Size, Stateful, Subscription, Window, div, ease_out_quint, point, px,
 };
 use swarm_protocol::{Client, ReviewSource};
 use swarm_ui::fonts::UI_FONT;
@@ -59,6 +60,113 @@ const TRAFFIC_LIGHTS_WIDTH: Pixels = px(78.);
 /// What is left of that room in full screen, where macOS hides the buttons.
 const FULL_SCREEN_INSET: Pixels = px(8.);
 
+/// Space before and after the toggle while the sidebar is collapsed.
+const COLLAPSED_GAP: Pixels = px(4.);
+/// Space between the open sidebar's content and its edge. The toggle keeps the same distance
+/// from the right end of the title bar's leading part, so it sits above the search button.
+const SIDEBAR_INSET: Pixels = px(8.);
+
+/// How long the sidebar takes to collapse or expand.
+pub(crate) const SIDEBAR_MOTION: Duration = Duration::from_millis(180);
+
+fn lerp(from: Pixels, to: Pixels, delta: f32) -> Pixels {
+    from + (to - from) * delta
+}
+
+/// Opacity of the sidebar and of the rail while the column moves. The sidebar fades out in
+/// the first half and the rail fades in over the second, so they never show on top of each other.
+fn sidebar_and_rail_opacity(openness: f32) -> (f32, f32) {
+    let sidebar = ((openness - 0.5) * 2.).clamp(0., 1.);
+    let rail = ((0.5 - openness) * 2.).clamp(0., 1.);
+
+    (sidebar, rail)
+}
+
+/// The width and right padding of the title bar's leading part, where openness 1 is the
+/// expanded sidebar and 0 the collapsed one. Collapsed it holds the lights, the toggle and a
+/// gap on both sides of the toggle, so the tabs follow the toggle.
+fn leading_size(lights: Pixels, openness: f32) -> (Pixels, Pixels) {
+    let toggle = IconButtonSize::Medium.square();
+    let collapsed = lights + COLLAPSED_GAP + toggle + COLLAPSED_GAP;
+
+    (
+        lerp(collapsed, sidebar::SIDEBAR_WIDTH, openness),
+        lerp(COLLAPSED_GAP, SIDEBAR_INSET, openness),
+    )
+}
+
+/// A running collapse or expand of the sidebar. Openness 1 is expanded and 0 is collapsed.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SidebarMotion {
+    pub from: f32,
+    pub to: f32,
+    /// On the GPUI clock, `cx.background_executor().now()`.
+    pub started: Instant,
+    /// A snapshot holds the motion at one share of its time.
+    #[cfg(feature = "snapshot")]
+    pub frozen: Option<f32>,
+}
+
+impl SidebarMotion {
+    pub(crate) fn new(from: f32, to: f32, started: Instant) -> Self {
+        Self {
+            from,
+            to,
+            started,
+            #[cfg(feature = "snapshot")]
+            frozen: None,
+        }
+    }
+
+    /// A full collapse or expand takes [`SIDEBAR_MOTION`]; a part of one takes less.
+    pub(crate) fn length(&self) -> Duration {
+        SIDEBAR_MOTION.mul_f32((self.to - self.from).abs())
+    }
+
+    pub(crate) fn deadline(&self) -> Instant {
+        self.started + self.length()
+    }
+
+    /// The share of the motion's time that has passed, from 0 to 1.
+    fn progress(&self, now: Instant) -> f32 {
+        #[cfg(feature = "snapshot")]
+        {
+            if let Some(frozen) = self.frozen {
+                return frozen;
+            }
+        }
+
+        let length = self.length();
+        if length.is_zero() {
+            return 1.;
+        }
+
+        let elapsed = now.saturating_duration_since(self.started);
+
+        (elapsed.as_secs_f32() / length.as_secs_f32()).clamp(0., 1.)
+    }
+
+    /// Decided by time, like the end of the resize hold.
+    fn finished(&self, now: Instant) -> bool {
+        #[cfg(feature = "snapshot")]
+        {
+            if self.frozen.is_some() {
+                return false;
+            }
+        }
+
+        now >= self.deadline()
+    }
+
+    pub(crate) fn openness(&self, now: Instant) -> f32 {
+        if self.finished(now) {
+            return self.to;
+        }
+
+        self.from + (self.to - self.from) * ease_out_quint()(self.progress(now))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum View {
     Terminals,
@@ -100,6 +208,8 @@ pub(crate) struct Workspace {
     pub right_panel: Option<RightPanel>,
     /// True when the sidebar shows as a narrow rail of buttons.
     pub(crate) sidebar_collapsed: bool,
+    /// The running collapse or expand animation, if any.
+    pub(crate) sidebar_motion: Option<SidebarMotion>,
     /// Tracks focus inside the sidebar and the rail, so a toggle can take focus back.
     pub(crate) sidebar_focus: FocusHandle,
     pub minimized: HashSet<TerminalId>,
@@ -211,7 +321,7 @@ pub(crate) struct Workspace {
     /// The Merged diff, while the pull request panel needs it and Review does not poll it.
     pub(crate) pr_poll: Option<DiffPoll>,
     /// How often the visible Review source and the open task's Live diff are asked for.
-    pub(crate) diff_intervals: (std::time::Duration, std::time::Duration),
+    pub(crate) diff_intervals: (Duration, Duration),
     pub(crate) pull_requests: PullRequests,
     /// The welcome screen, while it shows.
     pub(crate) welcome: Option<Entity<Welcome>>,
@@ -294,6 +404,7 @@ impl Workspace {
             view: View::Terminals,
             right_panel: Some(RightPanel::Changes),
             sidebar_collapsed: false,
+            sidebar_motion: None,
             sidebar_focus: cx.focus_handle(),
             minimized: HashSet::new(),
             focused_terminal,
@@ -545,7 +656,9 @@ impl Workspace {
     }
 
     /// Collapses the sidebar to its rail, or expands it. Focus in the sidebar or the rail moves
-    /// back to the focused terminal, or to the workspace when there is none.
+    /// back to the focused terminal, or to the workspace when there is none. The change
+    /// animates, unless Reduce Motion is on. A toggle during the animation turns it around
+    /// from where it is.
     pub(crate) fn toggle_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.sidebar_focus.contains_focused(window, cx) {
             match self.focused_terminal {
@@ -554,9 +667,53 @@ impl Workspace {
             }
         }
 
+        let now = cx.background_executor().now();
+        let from = self.sidebar_openness(now);
+
         self.sidebar_collapsed = !self.sidebar_collapsed;
+        let to = if self.sidebar_collapsed { 0. } else { 1. };
+
+        if swarm_ui::motion::reduce_motion(cx) || (to - from).abs() < f32::EPSILON {
+            self.sidebar_motion = None;
+        } else {
+            let motion = SidebarMotion::new(from, to, now);
+
+            swarm_term_view::hold_resizes_until(motion.deadline(), cx);
+            self.sidebar_motion = Some(motion);
+        }
 
         cx.notify();
+    }
+
+    /// Opens the sidebar at once, for a message it has to show.
+    pub(crate) fn show_sidebar(&mut self) {
+        self.sidebar_collapsed = false;
+        self.sidebar_motion = None;
+    }
+
+    /// How open the sidebar is at `now`: 1 expanded, 0 collapsed, in between while it moves.
+    pub(crate) fn sidebar_openness(&self, now: Instant) -> f32 {
+        match &self.sidebar_motion {
+            Some(motion) => motion.openness(now),
+            None if self.sidebar_collapsed => 0.,
+            None => 1.,
+        }
+    }
+
+    /// Ends the sidebar motion once it is over, and asks for the next frame while it runs.
+    /// Returns how open to draw the sidebar.
+    fn advance_sidebar_motion(&mut self, window: &mut Window, cx: &mut Context<Self>) -> f32 {
+        let now = cx.background_executor().now();
+
+        if let Some(motion) = self.sidebar_motion {
+            if motion.finished(now) {
+                self.sidebar_motion = None;
+            } else {
+                window.request_animation_frame();
+            }
+        }
+
+        self.sidebar_openness(now)
     }
 
     /// Opens the settings window, or focuses it. `page` is the page to show.
@@ -751,6 +908,23 @@ impl Workspace {
     }
 }
 
+#[cfg(feature = "snapshot")]
+impl Workspace {
+    /// Holds the running sidebar motion at `progress` of its time, so a snapshot shows it
+    /// in flight.
+    pub(crate) fn freeze_sidebar_motion_for_snapshot(
+        &mut self,
+        progress: f32,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(motion) = self.sidebar_motion.as_mut() {
+            motion.frozen = Some(progress);
+        }
+
+        cx.notify();
+    }
+}
+
 static NO_TASK: Task = Task {
     id: TaskId(u32::MAX),
     project: ProjectId(u32::MAX),
@@ -843,23 +1017,32 @@ impl Workspace {
     }
 
     /// The full-width row on top of the window: room for the traffic lights, the sidebar
-    /// button and the tabs with the view switch and the panel buttons.
-    fn title_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+    /// button and the tabs with the view switch and the panel buttons. The sidebar button is
+    /// at the right end of the part over the sidebar, so the tabs follow it.
+    fn title_bar(&self, openness: f32, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let lights = if window.is_fullscreen() {
             FULL_SCREEN_INSET
         } else {
             TRAFFIC_LIGHTS_WIDTH
         };
+        let (width, right_padding) = leading_size(lights, openness);
 
+        // Expanded, this part is as wide as the sidebar, so the tabs start where the card does.
         let leading = h_flex()
             .h_full()
             .flex_none()
-            .gap(px(4.))
+            .w(width)
+            .pr(right_padding)
             .child(
                 drag_region("traffic-lights-drag", window, cx)
                     .w(lights)
                     .h_full()
                     .flex_none(),
+            )
+            .child(
+                drag_region("sidebar-title-drag", window, cx)
+                    .flex_1()
+                    .h_full(),
             )
             .child(
                 div()
@@ -876,18 +1059,6 @@ impl Workspace {
                     ),
             );
 
-        // Expanded, the leading part is as wide as the sidebar, so the tabs start where the
-        // card does. Collapsed, the tabs follow the toggle.
-        let leading = if self.sidebar_collapsed {
-            leading.pr(px(4.))
-        } else {
-            leading.w(sidebar::SIDEBAR_WIDTH).child(
-                drag_region("sidebar-title-drag", window, cx)
-                    .flex_1()
-                    .h_full(),
-            )
-        };
-
         h_flex()
             .h(TITLE_BAR_HEIGHT)
             .w_full()
@@ -895,6 +1066,48 @@ impl Workspace {
             .pr(px(PANEL_MARGIN))
             .child(leading)
             .child(tab_bar::render(self, window, cx))
+    }
+
+    /// The column left of the main card. At rest it holds the sidebar or the rail. While it
+    /// moves it holds both at their full width, so the text does not reflow: the column clips
+    /// them, and one fades out before the other fades in. Only the sidebar tracks the focus.
+    fn sidebar_column(&self, openness: f32, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let column = div()
+            .debug_selector(|| "sidebar-column".to_owned())
+            .w(lerp(sidebar::RAIL_WIDTH, sidebar::SIDEBAR_WIDTH, openness))
+            .flex_none()
+            .overflow_hidden();
+
+        let moving = self.sidebar_motion.is_some();
+        if self.sidebar_collapsed && !moving {
+            return column.child(sidebar::render_rail(self, true, cx));
+        }
+
+        let sidebar = div()
+            .w(sidebar::SIDEBAR_WIDTH)
+            .h_full()
+            .pt(px(4.))
+            .px(SIDEBAR_INSET)
+            .pb(px(10.))
+            .child(sidebar::render(self, window, cx));
+        if !moving {
+            return column.child(sidebar);
+        }
+
+        let (sidebar_opacity, rail_opacity) = sidebar_and_rail_opacity(openness);
+
+        column
+            .child(sidebar.absolute().top_0().left_0().opacity(sidebar_opacity))
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .w(sidebar::RAIL_WIDTH)
+                    .h_full()
+                    .opacity(rail_opacity)
+                    .child(sidebar::render_rail(self, false, cx)),
+            )
     }
 
     /// True while the welcome screen shows: no project yet, and the user has not dealt with
@@ -982,21 +1195,9 @@ impl Render for Workspace {
                 .into_any_element();
         }
 
-        let sidebar = if self.sidebar_collapsed {
-            div()
-                .w(sidebar::RAIL_WIDTH)
-                .flex_none()
-                .child(sidebar::render_rail(self, cx))
-        } else {
-            div()
-                .w(sidebar::SIDEBAR_WIDTH)
-                .flex_none()
-                .pt(px(4.))
-                .px(px(8.))
-                .pb(px(10.))
-                .child(sidebar::render(self, window, cx))
-        };
-        let title_bar = self.title_bar(window, cx);
+        let openness = self.advance_sidebar_motion(window, cx);
+        let sidebar = self.sidebar_column(openness, window, cx);
+        let title_bar = self.title_bar(openness, window, cx);
         let views = views::render(self, window, cx);
         let status_bar = status_bar::render(self, window, cx);
         let right_panel = self
@@ -1056,6 +1257,24 @@ impl Render for Workspace {
     }
 }
 
+/// Makes the app follow Reduce Motion as `reduced` says, whatever System Settings says.
+/// Tests that read where the sidebar ends up turn it on, so a toggle ends at once.
+#[cfg(test)]
+pub(crate) fn follow_test_reduce_motion(reduced: bool, cx: &mut App) {
+    fn on() -> bool {
+        true
+    }
+
+    fn off() -> bool {
+        false
+    }
+
+    let source = if reduced { on } else { off };
+
+    cx.set_global(swarm_ui::motion::ReduceMotionSource(source));
+    swarm_ui::motion::sync_reduce_motion(cx);
+}
+
 #[cfg(test)]
 mod tests {
     use gpui::{TestAppContext, VisualTestContext};
@@ -1067,9 +1286,18 @@ mod tests {
         cx.update(|cx| {
             swarm_ui::theme::init(cx);
             actions::bind_keys(cx);
+            follow_test_reduce_motion(true, cx);
         });
 
         cx.add_window_view(Workspace::with_sample)
+    }
+
+    /// The same workspace with Reduce Motion off, so the sidebar animates.
+    fn setup_with_motion(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
+        let (workspace, cx) = setup(cx);
+        cx.update(|_, cx| follow_test_reduce_motion(false, cx));
+
+        (workspace, cx)
     }
 
     fn orchestrator_terminal(workspace: &Workspace) -> TerminalId {
@@ -1471,16 +1699,20 @@ mod tests {
     }
 
     #[gpui::test]
-    fn the_sidebar_toggle_stays_put_when_the_sidebar_collapses(cx: &mut TestAppContext) {
-        let (workspace, cx) = setup(cx);
+    fn the_toggle_lines_up_with_the_search_button_while_the_sidebar_is_open(
+        cx: &mut TestAppContext,
+    ) {
+        let (_workspace, cx) = setup(cx);
         redraw(cx);
-        let expanded = toggle_bounds(cx);
 
-        workspace.update_in(cx, Workspace::toggle_sidebar);
-        redraw(cx);
-        let collapsed = toggle_bounds(cx);
+        let toggle = toggle_bounds(cx).center().x;
+        let search = cx
+            .debug_bounds("sidebar-search")
+            .expect("the search button is on screen")
+            .center()
+            .x;
 
-        assert_eq!(collapsed, expanded);
+        assert_eq!(toggle, search);
     }
 
     #[gpui::test]
@@ -1500,10 +1732,11 @@ mod tests {
     }
 
     #[gpui::test]
-    fn in_full_screen_the_sidebar_toggle_moves_left_to_where_the_lights_were(
+    fn in_full_screen_the_collapsed_sidebar_toggle_moves_left_to_where_the_lights_were(
         cx: &mut TestAppContext,
     ) {
-        let (_workspace, cx) = setup(cx);
+        let (workspace, cx) = setup(cx);
+        workspace.update_in(cx, Workspace::toggle_sidebar);
         redraw(cx);
         let windowed = toggle_bounds(cx).left();
 
@@ -1515,6 +1748,24 @@ mod tests {
             windowed - full_screen,
             TRAFFIC_LIGHTS_WIDTH - FULL_SCREEN_INSET
         );
+    }
+
+    #[gpui::test]
+    fn in_full_screen_the_open_sidebar_toggle_stays_above_the_search_button(
+        cx: &mut TestAppContext,
+    ) {
+        let (_workspace, cx) = setup(cx);
+        cx.update(|window, _| window.toggle_fullscreen());
+        redraw(cx);
+
+        let toggle = toggle_bounds(cx).center().x;
+        let search = cx
+            .debug_bounds("sidebar-search")
+            .expect("the search button is on screen")
+            .center()
+            .x;
+
+        assert_eq!(toggle, search);
     }
 
     #[gpui::test]
@@ -1638,5 +1889,245 @@ mod tests {
         redraw(cx);
         let palette = workspace.read_with(cx, |workspace, _| workspace.overlay.is_some());
         assert!(palette, "Cmd-K does nothing after the focused row went");
+    }
+
+    /// Lets `time` pass on the GPUI clock and draws a frame.
+    fn pass(time: Duration, cx: &mut VisualTestContext) {
+        cx.executor().advance_clock(time);
+        redraw(cx);
+    }
+
+    fn column_width(cx: &mut VisualTestContext) -> Pixels {
+        cx.debug_bounds("sidebar-column")
+            .expect("the sidebar column is on screen")
+            .size
+            .width
+    }
+
+    fn sidebar_motion(
+        workspace: &Entity<Workspace>,
+        cx: &VisualTestContext,
+    ) -> Option<SidebarMotion> {
+        workspace.read_with(cx, |workspace, _| workspace.sidebar_motion)
+    }
+
+    #[gpui::test]
+    fn under_reduce_motion_the_sidebar_collapses_at_once(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        redraw(cx);
+
+        workspace.update_in(cx, Workspace::toggle_sidebar);
+        redraw(cx);
+
+        assert!(cx.debug_bounds("sidebar-rail").is_some());
+        assert_eq!(column_width(cx), sidebar::RAIL_WIDTH);
+        assert!(sidebar_motion(&workspace, cx).is_none());
+    }
+
+    /// The opacity of the quad drawn for `selector`, which is the alpha of its fill.
+    fn drawn_alpha(selector: &'static str, cx: &mut VisualTestContext) -> f32 {
+        crate::daemon::tests::drawn_color(selector, cx)
+            .unwrap_or_else(|| panic!("nothing is drawn for {selector}"))
+            .a
+    }
+
+    #[test]
+    fn the_sidebar_and_the_rail_never_show_on_top_of_each_other() {
+        let steps = (0..=100u8).map(|step| f32::from(step) / 100.);
+        let overlaps: Vec<f32> = steps
+            .filter(|&openness| {
+                let (sidebar, rail) = sidebar_and_rail_opacity(openness);
+                sidebar > 0. && rail > 0.
+            })
+            .collect();
+
+        assert_eq!(sidebar_and_rail_opacity(1.), (1., 0.));
+        assert_eq!(sidebar_and_rail_opacity(0.), (0., 1.));
+        assert!(overlaps.is_empty(), "both show at {overlaps:?}");
+    }
+
+    #[gpui::test]
+    fn halfway_through_a_collapse_the_column_and_the_toggle_are_between_their_ends(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = setup_with_motion(cx);
+        redraw(cx);
+        let expanded = toggle_bounds(cx).left();
+        let row_at_rest = drawn_alpha("project-row-0", cx);
+
+        // About 10 ms in, the sidebar is three quarters open and fading; about 46 ms in, a
+        // quarter open and the rail fading in.
+        workspace.update_in(cx, Workspace::toggle_sidebar);
+        pass(SIDEBAR_MOTION / 18, cx);
+        let (width, toggle) = (column_width(cx), toggle_bounds(cx).left());
+        let (rail, content) = (
+            cx.debug_bounds("sidebar-rail").is_some(),
+            cx.debug_bounds("add-project").is_some(),
+        );
+        let row = drawn_alpha("project-row-0", cx);
+        pass(SIDEBAR_MOTION / 5, cx);
+        let button = drawn_alpha("rail-project-0", cx);
+        pass(SIDEBAR_MOTION, cx);
+        let collapsed = toggle_bounds(cx).left();
+        let button_at_rest = drawn_alpha("rail-project-0", cx);
+
+        assert!(sidebar::RAIL_WIDTH < width && width < sidebar::SIDEBAR_WIDTH);
+        assert!(
+            collapsed < toggle && toggle < expanded,
+            "{collapsed:?} {toggle:?} {expanded:?}"
+        );
+        assert!(rail, "the rail was not drawn during the motion");
+        assert!(content, "the sidebar was not drawn during the motion");
+        assert!(
+            0. < row && row < row_at_rest,
+            "sidebar {row} of {row_at_rest}"
+        );
+        assert!(
+            0. < button && button < button_at_rest,
+            "rail {button} of {button_at_rest}"
+        );
+    }
+
+    #[gpui::test]
+    fn an_error_during_a_collapse_opens_the_sidebar_and_stops_the_motion(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup_with_motion(cx);
+        redraw(cx);
+
+        workspace.update_in(cx, Workspace::toggle_sidebar);
+        pass(SIDEBAR_MOTION / 2, cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.report_sidebar_error("no daemon".to_owned(), cx);
+        });
+        redraw(cx);
+
+        assert!(sidebar_motion(&workspace, cx).is_none());
+        assert_eq!(column_width(cx), sidebar::SIDEBAR_WIDTH);
+    }
+
+    #[gpui::test]
+    fn a_running_motion_asks_for_the_next_frame(cx: &mut TestAppContext) {
+        // Under Reduce Motion the spinners ask for no frames, so the motion's request stands out.
+        let (workspace, cx) = setup(cx);
+        redraw(cx);
+        cx.update(Window::simulate_next_frame);
+        redraw(cx);
+        let at_rest = cx.update(Window::simulate_next_frame);
+
+        workspace.update(cx, |workspace, cx| {
+            let now = cx.background_executor().now();
+
+            workspace.sidebar_collapsed = true;
+            workspace.sidebar_motion = Some(SidebarMotion::new(1., 0., now));
+            cx.notify();
+        });
+        redraw(cx);
+        let moving = cx.update(Window::simulate_next_frame);
+
+        assert!(moving > at_rest, "{moving} callbacks, {at_rest} at rest");
+    }
+
+    #[gpui::test]
+    fn after_the_motion_the_rail_shows_and_the_motion_clears(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup_with_motion(cx);
+        redraw(cx);
+
+        workspace.update_in(cx, Workspace::toggle_sidebar);
+        pass(SIDEBAR_MOTION / 2, cx);
+        let running = sidebar_motion(&workspace, cx).is_some();
+        pass(SIDEBAR_MOTION, cx);
+
+        assert!(running);
+        assert!(cx.debug_bounds("sidebar-rail").is_some());
+        assert!(sidebar_motion(&workspace, cx).is_none());
+        assert_eq!(column_width(cx), sidebar::RAIL_WIDTH);
+        assert_eq!(
+            toggle_bounds(cx).left(),
+            TRAFFIC_LIGHTS_WIDTH + COLLAPSED_GAP
+        );
+    }
+
+    #[gpui::test]
+    fn a_second_toggle_mid_motion_reverses_from_where_it_is(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup_with_motion(cx);
+        redraw(cx);
+
+        workspace.update_in(cx, Workspace::toggle_sidebar);
+        pass(SIDEBAR_MOTION / 2, cx);
+        let openness = workspace.read_with(cx, |workspace, cx| {
+            workspace.sidebar_openness(cx.background_executor().now())
+        });
+        workspace.update_in(cx, Workspace::toggle_sidebar);
+        let motion = sidebar_motion(&workspace, cx).expect("the second toggle starts a motion");
+
+        assert!(0. < openness && openness < 1., "openness {openness}");
+        assert!((motion.from - openness).abs() < f32::EPSILON);
+        assert!((motion.to - 1.).abs() < f32::EPSILON);
+    }
+
+    /// Gives the first worker a live terminal and returns the emulator's end of it.
+    fn attach_worker(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> swarm_term::EmulatorChannels {
+        let (channels, emulator) = swarm_term::channels();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let terminal = workspace
+                .active_task()
+                .workers
+                .first()
+                .and_then(|id| workspace.data.agent(*id))
+                .map_or(TerminalId(u32::MAX), |agent| agent.terminal);
+            let live = workspace.live_terminal(
+                terminal,
+                swarm_protocol::TerminalId(900),
+                "worker".into(),
+                channels,
+                window,
+                cx,
+            );
+
+            workspace.live_terminals.insert(terminal, live);
+            cx.notify();
+        });
+        redraw(cx);
+
+        emulator
+    }
+
+    /// The grids the emulator was told about since the last call.
+    fn grids(emulator: &swarm_term::EmulatorChannels) -> Vec<(u16, u16)> {
+        emulator
+            .input
+            .try_iter()
+            .filter_map(|input| match input {
+                swarm_term::TerminalInput::Resize(size) => Some((size.cols, size.rows)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[gpui::test]
+    fn the_terminals_hold_their_size_until_the_motion_ends(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup_with_motion(cx);
+        redraw(cx);
+        let emulator = attach_worker(&workspace, cx);
+        let before = grids(&emulator);
+
+        workspace.update_in(cx, Workspace::toggle_sidebar);
+        for _ in 0..3 {
+            pass(SIDEBAR_MOTION / 4, cx);
+        }
+        let during = grids(&emulator);
+        pass(SIDEBAR_MOTION, cx);
+        let after = grids(&emulator);
+        redraw(cx);
+        let settled = grids(&emulator);
+
+        assert!(!before.is_empty(), "the terminal sent no grid at first");
+        assert!(during.is_empty(), "resized during the motion: {during:?}");
+        assert_eq!(after.len(), 1, "after the motion: {after:?}");
+        assert_ne!(before.last(), after.last(), "the grid did not change");
+        assert!(settled.is_empty(), "resized again: {settled:?}");
     }
 }

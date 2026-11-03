@@ -307,6 +307,20 @@ fn open_sidebar_collapsed(workspace: &mut Workspace, _: &mut Window, cx: &mut Co
     cx.notify();
 }
 
+/// The share of its time at which the collapse has covered half its distance.
+const COLLAPSE_HALFWAY: f32 = 0.13;
+
+/// A collapse caught halfway: the column is half closed and the sidebar fades out.
+fn open_sidebar_collapsing(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    cx.set_reduce_motion(false);
+    workspace.toggle_sidebar(window, cx);
+    workspace.freeze_sidebar_motion_for_snapshot(COLLAPSE_HALFWAY, cx);
+}
+
 fn open_swarm(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
     workspace.set_view(View::Swarm, cx);
 }
@@ -934,6 +948,16 @@ pub(crate) fn run(directory: PathBuf, cx: &mut App) {
                 Appearance::Dark,
                 "workspace-sidebar-collapsed-dark.png",
                 Some(open_sidebar_collapsed),
+            ),
+            (
+                Appearance::Light,
+                "workspace-sidebar-collapsing-light.png",
+                Some(open_sidebar_collapsing),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-sidebar-collapsing-dark.png",
+                Some(open_sidebar_collapsing),
             ),
             (
                 Appearance::Light,
