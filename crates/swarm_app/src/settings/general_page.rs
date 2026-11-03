@@ -1,7 +1,9 @@
 //! Settings › General: the system check and the About section.
 
 use gpui::{AnyElement, FontWeight, Role, div, px};
+use swarm_ui::a11y::accessible;
 use swarm_ui::prelude::*;
+use swarm_ui::styles::focus_ring;
 
 use super::SettingsWindow;
 use super::pages::{page_title, plain_row, section};
@@ -30,19 +32,58 @@ const ICON_LINKS: [(&str, &str, &str, &str); 2] = [
     ),
 ];
 
-/// A button that opens `url` in the system browser.
+/// A link that opens `url` in the system browser.
+#[derive(IntoElement)]
+struct Link {
+    id: &'static str,
+    label: &'static str,
+    accessible: &'static str,
+    url: &'static str,
+}
+
 fn link(
     id: &'static str,
     label: &'static str,
     accessible: &'static str,
     url: &'static str,
-) -> Button {
-    Button::new(id, label)
-        .variant(ButtonVariant::Ghost)
-        .icon(IconName::ExternalLink)
-        .accessible_label(accessible)
-        .debug_selector(|| id.to_owned())
-        .on_click(move |_, _, cx| cx.open_url(url))
+) -> Link {
+    Link {
+        id,
+        label,
+        accessible,
+        url,
+    }
+}
+
+impl RenderOnce for Link {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        let (muted, fg, active, accent) = (colors.muted, colors.fg, colors.active, colors.accent);
+        let (id, url) = (self.id, self.url);
+
+        accessible(div().id(id), Role::Link, self.accessible)
+            .debug_selector(|| id.to_owned())
+            .focusable()
+            .tab_stop(true)
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(6.))
+            .h(px(28.))
+            .px(px(12.))
+            .rounded(px(7.))
+            .text_color(muted)
+            .cursor_pointer()
+            .hover(move |style| style.bg(active).text_color(fg))
+            .focus_visible(move |style| focus_ring(style, accent))
+            .on_click(move |_, _, cx| cx.open_url(url))
+            .child(
+                Icon::new(IconName::ExternalLink)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(Label::new(self.label).inherit_color())
+    }
 }
 
 fn about() -> impl IntoElement {
@@ -331,7 +372,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn the_about_links_are_labelled_buttons(cx: &mut TestAppContext) {
+    fn the_about_links_are_labelled_links(cx: &mut TestAppContext) {
         use gpui::accesskit::{Node, Role as AccessRole};
         use gpui::{Element as _, IntoElement as _, RenderOnce as _};
 
@@ -348,7 +389,7 @@ mod tests {
                 (element.a11y_role(), node.label().map(str::to_owned))
             });
 
-            assert_eq!(role, Some(AccessRole::Button), "{id}");
+            assert_eq!(role, Some(AccessRole::Link), "{id}");
             assert_eq!(name.as_deref(), Some(accessible), "{id}");
             assert!(accessible.starts_with(label), "{id}");
         }

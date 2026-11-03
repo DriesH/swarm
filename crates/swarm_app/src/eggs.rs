@@ -7,8 +7,8 @@
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, Context, FocusHandle, Focusable as _, SharedString,
-    Task, WeakEntity, Window, div, px,
+    Animation, AnimationExt as _, AnyElement, Context, FocusHandle, SharedString, Task, WeakEntity,
+    WeakFocusHandle, Window, div, px,
 };
 use swarm_protocol::{Client, Notice, NoticeKind, SwarmStats};
 use swarm_settings::ProjectMode;
@@ -42,6 +42,8 @@ pub(crate) struct HoneyToast {
     serial: usize,
     /// Tracks the focus in the whole toast.
     focus: FocusHandle,
+    /// What had the focus when the toast came up. The focus goes back there.
+    opener: Option<WeakFocusHandle>,
     /// True while the pointer is on the toast.
     hovered: bool,
     _timeout: Task<()>,
@@ -274,10 +276,14 @@ impl Workspace {
         &mut self,
         notice: &Notice,
         task: SharedString,
-        window: Option<&mut Window>,
+        mut window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
-        self.leave_toast(window, cx);
+        self.leave_toast(window.as_deref_mut(), cx);
+
+        let opener = window
+            .and_then(|window| window.focused(cx))
+            .map(|handle| handle.downgrade());
 
         self.eggs.serial += 1;
         let serial = self.eggs.serial;
@@ -287,6 +293,7 @@ impl Workspace {
             task,
             serial,
             focus: cx.focus_handle(),
+            opener,
             hovered: false,
             _timeout: Self::count_down_toast(serial, cx),
         });
@@ -341,16 +348,26 @@ impl Workspace {
         toast.hovered || window.is_some_and(|window| toast.focus.contains_focused(window, cx))
     }
 
-    /// Gives the focus to the workspace when it is in the toast that goes away. Without this
-    /// it falls to the window, and Tab starts from the top.
-    fn leave_toast(&self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+    /// Gives the focus back to what had it before the toast, when it is in the toast that goes
+    /// away, else to the next control that is drawn. Without this it falls to the window, and
+    /// Tab starts from the top.
+    fn leave_toast(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
         let (Some(toast), Some(window)) = (&self.eggs.toast, window) else {
             return;
         };
 
-        if toast.focus.contains_focused(window, cx) {
-            window.focus(&self.focus_handle(cx), cx);
+        if !toast.focus.contains_focused(window, cx) {
+            return;
         }
+
+        let opener = toast
+            .opener
+            .as_ref()
+            .and_then(WeakFocusHandle::upgrade)
+            .filter(|opener| !toast.focus.contains(opener, window));
+        let target = opener.unwrap_or_else(|| self.landing_handle(cx));
+
+        window.focus(&target, cx);
     }
 
     pub(crate) fn dismiss_toast(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
@@ -362,7 +379,9 @@ impl Workspace {
     }
 
     /// The Review button of the toast: opens the task in Review.
-    fn review_from_toast(&mut self, cx: &mut Context<Self>) {
+    fn review_from_toast(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.leave_toast(Some(window), cx);
+
         let Some(toast) = self.eggs.toast.take() else {
             return;
         };
@@ -408,7 +427,7 @@ impl Workspace {
         let mut layer = Vec::new();
 
         if let Some(toast) = &self.eggs.toast {
-            layer.push(self.toast_element(toast, cx));
+            layer.push(Self::toast_element(toast, cx));
         }
 
         if let Some(flight) = &self.eggs.flight {
@@ -444,14 +463,11 @@ impl Workspace {
         layer
     }
 
-    fn toast_element(&self, toast: &HoneyToast, cx: &mut Context<Self>) -> AnyElement {
+    fn toast_element(toast: &HoneyToast, cx: &mut Context<Self>) -> AnyElement {
         let workspace = cx.weak_entity();
         let dismissed = workspace.clone();
         let hover_target = workspace.clone();
         let serial = toast.serial;
-        // The button that had focus goes away with the toast, and Tab needs a focus to start from.
-        let review_focus = self.focus_handle(cx);
-        let dismiss_focus = review_focus.clone();
         let decorated = settings::easter_eggs(cx);
 
         let element = Toast::new(
@@ -485,19 +501,26 @@ impl Workspace {
             )
         })
         .action("Review", move |_, window, cx| {
-            window.focus(&review_focus, cx);
-            update(&workspace, Workspace::review_from_toast, cx);
+            update(
+                &workspace,
+                |workspace, cx| workspace.review_from_toast(window, cx),
+                cx,
+            );
         })
         .on_dismiss(move |window, cx| {
-            window.focus(&dismiss_focus, cx);
             update(
                 &dismissed,
-                |workspace, cx| workspace.dismiss_toast(None, cx),
+                |workspace, cx| workspace.dismiss_toast(Some(window), cx),
                 cx,
             );
         });
 
+        // First in Tab order, so a keyboard user reaches the toast before it times out.
         div()
+            .id("toast-slot")
+            .tab_group()
+            .tab_index(-1)
+            .tab_stop(false)
             .absolute()
             .right(px(TOAST_RIGHT))
             .bottom(px(TOAST_BOTTOM))
@@ -508,15 +531,16 @@ impl Workspace {
 
 #[cfg(test)]
 mod tests {
-    use gpui::{TestAppContext, VisualTestContext};
+    use gpui::{Focusable as _, TestAppContext, VisualTestContext};
     use swarm_protocol::{AgentId, Event, ProjectId, ProjectInfo, Request, TaskId};
 
     use super::*;
+    use crate::daemon::tests::redraw;
     use crate::daemon::tests::{
         fake_daemon_replying, project_info, send_notice, setup, start_agent, task_info,
         use_projects, wait_until,
     };
-    use crate::model::SAMPLE_NOW;
+    use crate::model::{ProjectId as ModelProjectId, SAMPLE_NOW, TerminalId};
     use crate::workspace::View;
 
     const HOUR: u64 = 3_600_000;
@@ -828,6 +852,86 @@ mod tests {
 
         assert!(!toast_is_up(cx));
         assert!(focus_is_on_the_workspace(&workspace, cx));
+    }
+
+    /// Focuses the tile of terminal 1 and returns its handle.
+    fn focus_a_tile(
+        workspace: &gpui::Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> FocusHandle {
+        redraw(cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.focus_terminal(TerminalId(1), cx);
+        });
+        redraw(cx);
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.tile_focus_handle(TerminalId(1), cx)
+        })
+    }
+
+    fn show_toast_now(workspace: &gpui::Entity<Workspace>, cx: &mut VisualTestContext) {
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.show_honey_toast_now(window, cx);
+        });
+        redraw(cx);
+    }
+
+    #[gpui::test]
+    fn a_toast_that_goes_away_gives_the_focus_back_to_what_had_it(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let tile = focus_a_tile(&workspace, cx);
+        show_toast_now(&workspace, cx);
+        tab_into_the_toast(&workspace, cx);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.dismiss_toast(Some(window), cx);
+        });
+        redraw(cx);
+
+        assert!(cx.update(|window, _| tile.is_focused(window)));
+    }
+
+    #[gpui::test]
+    fn a_toast_whose_opener_is_gone_gives_the_focus_to_a_drawn_tile(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        redraw(cx);
+        let row = workspace
+            .read_with(cx, |workspace, _| {
+                workspace.project_focus.get(&ModelProjectId(3)).cloned()
+            })
+            .expect("the open project has a row");
+        cx.update(|window, cx| window.focus(&row, cx));
+        drop(row);
+        show_toast_now(&workspace, cx);
+        tab_into_the_toast(&workspace, cx);
+        workspace.update(cx, |workspace, _| {
+            workspace.project_focus.remove(&ModelProjectId(3));
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.dismiss_toast(Some(window), cx);
+        });
+        redraw(cx);
+
+        let tile = workspace.update(cx, |workspace, cx| {
+            let focused = workspace.focused_terminal.expect("a tile is focused");
+            workspace.tile_focus_handle(focused, cx)
+        });
+        assert!(cx.update(|window, _| tile.is_focused(window)));
+    }
+
+    #[gpui::test]
+    fn the_toast_is_the_first_stop_when_nothing_has_focus(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        show_toast_now(&workspace, cx);
+
+        cx.update(|window, cx| {
+            window.blur(cx);
+            window.focus_next(cx);
+        });
+
+        assert!(focus_is_in_the_toast(&workspace, cx));
     }
 
     #[gpui::test]

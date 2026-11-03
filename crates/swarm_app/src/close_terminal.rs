@@ -27,9 +27,17 @@ pub(crate) struct CloseTerminalDialog {
     stop_asking: bool,
     focus_handle: FocusHandle,
     cancel_focus: FocusHandle,
+    /// What had the focus before the dialog opened.
+    pub(crate) opener: Option<FocusHandle>,
 }
 
 impl EventEmitter<CloseTerminalEvent> for CloseTerminalDialog {}
+
+impl gpui::Focusable for CloseTerminalDialog {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
 
 impl CloseTerminalDialog {
     pub(crate) fn new(
@@ -38,6 +46,7 @@ impl CloseTerminalDialog {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let opener = window.focused(cx);
         let cancel_focus = cx.focus_handle().tab_stop(true);
         window.focus(&cancel_focus, cx);
 
@@ -47,6 +56,7 @@ impl CloseTerminalDialog {
             stop_asking: false,
             focus_handle: cx.focus_handle(),
             cancel_focus,
+            opener,
         }
     }
 
@@ -341,6 +351,24 @@ mod tests {
 
         assert!(dialog(&workspace, cx).is_none());
         assert!(is_open(&workspace, terminal, cx));
+    }
+
+    #[gpui::test]
+    fn closing_the_terminal_gives_the_focus_back_to_what_had_it(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let terminal = open_terminal(&workspace, cx);
+        let opener = workspace
+            .read_with(cx, |workspace, _| {
+                workspace.project_focus.values().next().cloned()
+            })
+            .expect("a project has a row");
+        cx.update(|window, cx| window.focus(&opener, cx));
+        redraw(cx);
+        ask(&workspace, terminal, cx);
+
+        click("close-terminal-confirm", cx);
+
+        assert!(cx.update(|window, _| opener.is_focused(window)));
     }
 
     #[gpui::test]

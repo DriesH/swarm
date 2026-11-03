@@ -143,6 +143,9 @@ pub(crate) struct Popover {
     _clock: Option<Task<()>>,
 }
 
+/// What VoiceOver calls the popover window.
+pub(crate) const WINDOW_TITLE: &str = "Swarm";
+
 impl Popover {
     pub(crate) fn new(
         workspace: Entity<Workspace>,
@@ -150,10 +153,13 @@ impl Popover {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        window.set_window_title(WINDOW_TITLE);
+
         let mut subscriptions = vec![
             cx.observe(&workspace, |_, _, cx| cx.notify()),
             theme::follow_system_appearance(window, cx),
             swarm_ui::motion::follow_reduce_motion(window, cx),
+            Self::restore_focus_when_lost(window, cx),
         ];
 
         if closes_itself {
@@ -197,6 +203,14 @@ impl Popover {
             _subscriptions: subscriptions,
             _clock: clock,
         }
+    }
+
+    /// Without it, a control that goes away takes the keyboard with it. Open Swarm is always
+    /// drawn, so focus goes there.
+    fn restore_focus_when_lost(window: &mut Window, cx: &mut Context<Self>) -> Subscription {
+        cx.on_focus_lost(window, |this, window, cx| {
+            window.focus(&this.handles.open_swarm, cx);
+        })
     }
 
     fn summary(&self, cx: &App) -> Summary {
@@ -1512,6 +1526,20 @@ mod tests {
         draw(&mut popover);
 
         assert_eq!(on_stop.as_deref(), Some("confirm"));
+        assert_eq!(focused(&mut popover).as_deref(), Some("open-swarm"));
+    }
+
+    #[gpui::test]
+    fn when_focus_is_lost_it_goes_to_open_swarm(cx: &mut TestAppContext) {
+        let (_workspace, bar, cx) = setup(cx);
+        let mut popover = open(&bar, cx);
+        let before = focused(&mut popover);
+
+        popover.update(Window::blur);
+        draw(&mut popover);
+        draw(&mut popover);
+
+        assert_eq!(before.as_deref(), Some("needs-you-0"));
         assert_eq!(focused(&mut popover).as_deref(), Some("open-swarm"));
     }
 

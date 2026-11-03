@@ -13,9 +13,9 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    App, Bounds, Context, Entity, FocusHandle, Global, KeyBinding, Pixels, Role, ScrollHandle,
-    SharedString, Size, Subscription, TitlebarOptions, WeakEntity, Window, WindowBounds,
-    WindowHandle, WindowOptions, actions, div, point, px, size,
+    App, Bounds, Context, Entity, FocusHandle, Global, KeyBinding, KeyContext, Pixels, Role,
+    ScrollHandle, SharedString, Size, Subscription, TitlebarOptions, WeakEntity, Window,
+    WindowBounds, WindowHandle, WindowOptions, actions, div, point, px, size,
 };
 use swarm_settings::{
     AccentSetting, AppearanceSettings, CliSettings, NotificationSettings, ProjectMode, Settings,
@@ -480,6 +480,7 @@ impl SettingsWindow {
             }),
             theme::follow_system_appearance(window, cx),
             swarm_ui::motion::follow_reduce_motion(window, cx),
+            Self::restore_focus_when_lost(window, cx),
             cx.observe_window_activation(window, |this, window, cx| {
                 // The user may come back from System Settings with a new answer.
                 if window.is_window_active() {
@@ -513,39 +514,7 @@ impl SettingsWindow {
         );
         let projects = settings.projects.clone();
 
-        let agent_inputs = [0, 1].map(|index| {
-            let current = cli(&agents, index);
-            let mut input = |label: &str,
-                             text: &str,
-                             apply: fn(&mut CliSettings) -> &mut String,
-                             cx: &mut Context<Self>| {
-                let input = field(label.to_owned(), text, true, cx);
-                bind_agent_text(
-                    &mut subscriptions,
-                    &input,
-                    &state,
-                    move |agents, text| *apply(cli_mut(agents, index)) = text,
-                    cx,
-                );
-                input
-            };
-
-            CliInputs {
-                command: input("Command", &current.command, |cli| &mut cli.command, cx),
-                orchestrator_model: input(
-                    "Orchestrator model",
-                    &current.orchestrator_model,
-                    |cli| &mut cli.orchestrator_model,
-                    cx,
-                ),
-                worker_model: input(
-                    "Worker model",
-                    &current.worker_model,
-                    |cli| &mut cli.worker_model,
-                    cx,
-                ),
-            }
-        });
+        let agent_inputs = Self::agent_inputs(&state, &agents, &mut subscriptions, cx);
 
         let max_agents_per_task = numeric_field("Max agents per task", &max_agents_per_task, cx);
         bind_text(
@@ -605,6 +574,69 @@ impl SettingsWindow {
         cx.defer_in(window, |this, _, cx| this.refresh_system_check(cx));
 
         this
+    }
+
+    /// The fields of both agent cards, each bound to the settings state.
+    fn agent_inputs(
+        state: &Entity<SettingsState>,
+        agents: &swarm_settings::AgentSettings,
+        subscriptions: &mut Vec<Subscription>,
+        cx: &mut Context<Self>,
+    ) -> [CliInputs; 2] {
+        [0, 1].map(|index| {
+            let current = cli(agents, index);
+            let agent = AGENTS[index].name;
+            let mut input = |label: &str,
+                             text: &str,
+                             apply: fn(&mut CliSettings) -> &mut String,
+                             cx: &mut Context<Self>| {
+                let input = field(label.to_owned(), text, true, cx);
+                bind_agent_text(
+                    subscriptions,
+                    &input,
+                    state,
+                    move |agents, text| *apply(cli_mut(agents, index)) = text,
+                    cx,
+                );
+                input
+            };
+
+            CliInputs {
+                command: input(
+                    &format!("{agent} command"),
+                    &current.command,
+                    |cli| &mut cli.command,
+                    cx,
+                ),
+                orchestrator_model: input(
+                    &format!("{agent} orchestrator model"),
+                    &current.orchestrator_model,
+                    |cli| &mut cli.orchestrator_model,
+                    cx,
+                ),
+                worker_model: input(
+                    &format!("{agent} worker model"),
+                    &current.worker_model,
+                    |cli| &mut cli.worker_model,
+                    cx,
+                ),
+            }
+        })
+    }
+
+    /// Without it, a control that goes away takes the keyboard with it. A focus that waits for
+    /// the remove dialog is left alone.
+    fn restore_focus_when_lost(window: &mut Window, cx: &mut Context<Self>) -> Subscription {
+        cx.on_focus_lost(window, |this, window, cx| {
+            if this.remove_dialog.is_some() {
+                return;
+            }
+
+            match window.focus_lost_restore_target(cx) {
+                Some(target) => window.focus(&target, cx),
+                None => this.focus_nav(window, cx),
+            }
+        })
     }
 
     /// The check of the General page, and the focus of its Check again button, where focus
@@ -857,7 +889,8 @@ impl Render for SettingsWindow {
         swarm_ui::tab_navigation(
             div()
                 .id("settings")
-                .key_context(ROOT_CONTEXT)
+                .key_context(root_context())
+                .on_action(cx.listener(|_, _: &CloseSettings, window, _| window.remove_window()))
                 .relative()
                 .size_full()
                 .bg(ground)
@@ -866,26 +899,21 @@ impl Render for SettingsWindow {
                 .text_size(px(13.)),
         )
         .child(
-            h_flex()
-                .key_context(SETTINGS_CONTEXT)
-                .on_action(cx.listener(|_, _: &CloseSettings, window, _| window.remove_window()))
-                .size_full()
-                .child(nav)
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .min_w_0()
-                        .h_full()
-                        .pb(px(8.))
-                        .pr(px(8.))
-                        .child(
-                            gap_drag
-                                .debug_selector(|| "settings-gap-drag".to_owned())
-                                .h(px(8.))
-                                .flex_none(),
-                        )
-                        .child(
-                            v_flex()
+            h_flex().size_full().child(nav).child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .pb(px(8.))
+                    .pr(px(8.))
+                    .child(
+                        gap_drag
+                            .debug_selector(|| "settings-gap-drag".to_owned())
+                            .h(px(8.))
+                            .flex_none(),
+                    )
+                    .child(
+                        v_flex()
                                 .flex_1()
                                 .min_h_0()
                                 .bg(panel)
@@ -936,8 +964,8 @@ impl Render for SettingsWindow {
                                                 .child(page),
                                         ),
                                 ),
-                        ),
-                ),
+                    ),
+            ),
         )
         .children(
             self.remove_dialog
@@ -945,6 +973,15 @@ impl Render for SettingsWindow {
                 .map(|dialog| dialog.view.clone()),
         )
     }
+}
+
+/// The root has both contexts, so ⌘W works wherever focus is in the window.
+fn root_context() -> KeyContext {
+    let mut context = KeyContext::default();
+    context.add(ROOT_CONTEXT);
+    context.add(SETTINGS_CONTEXT);
+
+    context
 }
 
 /// Remembers the settings state across window opens, and the open window.
@@ -1284,7 +1321,12 @@ pub(crate) fn open(
 
     // The page asks the workspace, which is updating when it is the one that opens settings.
     cx.defer(move |cx| {
-        if let Err(error) = handle.update(cx, |settings, _, cx| settings.select_page(page, cx)) {
+        let shown = handle.update(cx, |settings, window, cx| {
+            settings.select_page(page, cx);
+            settings.focus_nav(window, cx);
+        });
+
+        if let Err(error) = shown {
             log::debug!("the settings window closed before it showed {page:?}: {error}");
         }
     });
@@ -1572,6 +1614,96 @@ mod tests {
     fn open_settings(cx: &mut TestAppContext) -> WindowHandle<SettingsWindow> {
         cx.update(|cx| open_window(None, None, cx))
             .expect("window opens")
+    }
+
+    #[test]
+    fn the_notification_picker_of_a_project_names_the_setting_and_the_project() {
+        assert_eq!(
+            pages::project_picker_label("swarm"),
+            "Notifications for swarm"
+        );
+    }
+
+    #[gpui::test]
+    fn the_agent_fields_name_their_agent(cx: &mut TestAppContext) {
+        setup(cx);
+        let window = open_settings(cx);
+
+        let labels = window
+            .read_with(cx, |settings, cx| {
+                settings
+                    .inputs
+                    .agents
+                    .iter()
+                    .flat_map(|agent| {
+                        [
+                            &agent.command,
+                            &agent.orchestrator_model,
+                            &agent.worker_model,
+                        ]
+                    })
+                    .map(|input| input.read(cx).label().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .expect("window is open");
+
+        assert_eq!(
+            labels,
+            [
+                "Claude Code command",
+                "Claude Code orchestrator model",
+                "Claude Code worker model",
+                "Codex command",
+                "Codex orchestrator model",
+                "Codex worker model",
+            ]
+        );
+    }
+
+    #[gpui::test]
+    fn opening_at_a_page_focuses_its_row_in_the_list(cx: &mut TestAppContext) {
+        setup(cx);
+        let window = open_settings(cx);
+
+        cx.update(|cx| {
+            open(
+                None,
+                Vec::new(),
+                WeakEntity::new_invalid(),
+                Some(Page::Notifications),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let row = window
+            .read_with(&visual, |settings, cx| {
+                settings.nav_focus[settings.nav_index(Page::Notifications, cx)].clone()
+            })
+            .expect("window is open");
+        assert!(visual.update(|window, _| row.is_focused(window)));
+    }
+
+    #[gpui::test]
+    fn focus_goes_back_to_the_list_when_the_focused_control_goes_away(cx: &mut TestAppContext) {
+        let (window, mut visual) = short_page(Page::Keyboard, cx);
+        assert!(tab_to_the_page(window, &mut visual));
+
+        window
+            .update(&mut visual, |settings, _, cx| {
+                settings.select_page(Page::Agents, cx);
+            })
+            .expect("window is open");
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        visual.run_until_parked();
+
+        let nav = window
+            .read_with(&visual, |settings, cx| {
+                settings.nav_focus[settings.nav_index(Page::Agents, cx)].clone()
+            })
+            .expect("window is open");
+        assert!(visual.update(|window, _| nav.is_focused(window)));
     }
 
     #[gpui::test]

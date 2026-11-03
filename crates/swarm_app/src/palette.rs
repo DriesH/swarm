@@ -2,13 +2,14 @@
 
 use gpui::{
     AnyElement, BoxShadow, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
-    MouseButton, Role, ScrollHandle, SharedString, Stateful, Subscription, Window, black, div,
-    point, px,
+    MouseButton, Role, ScrollHandle, SharedString, Stateful, Subscription, WeakEntity, Window,
+    black, div, point, px,
 };
 use swarm_ui::fonts::MONO_FONT;
 use swarm_ui::prelude::*;
 use swarm_ui::{
-    Confirm, Dismiss, MENU_CONTEXT, SelectNext, SelectPrevious, TextFieldRole, trap_focus,
+    Confirm, Dismiss, MENU_CONTEXT, SelectNext, SelectPrevious, TextFieldRole, TextFieldSize,
+    trap_focus,
 };
 
 use crate::actions::{
@@ -133,6 +134,39 @@ impl Row {
         self.keys = keys.to_vec();
         self
     }
+
+    /// What VoiceOver reads: the label, then the status or changes, then the shortcut.
+    fn spoken(&self) -> SharedString {
+        let mut parts = vec![self.label.to_string()];
+
+        match &self.detail {
+            Detail::None => {}
+            Detail::Changes {
+                additions,
+                deletions,
+            } => parts.push(format!("{additions} additions, {deletions} deletions")),
+            Detail::Status(status, label) => {
+                parts.push(label.unwrap_or_else(|| status.label()).to_owned());
+            }
+        }
+
+        if !self.keys.is_empty() {
+            let keys: Vec<&str> = self.keys.iter().map(|key| spoken_key(key)).collect();
+            parts.push(format!("shortcut {}", keys.join(" ")));
+        }
+
+        parts.join(", ").into()
+    }
+}
+
+fn spoken_key(key: &str) -> &str {
+    match key {
+        KEY_COMMAND => "Command",
+        KEY_SHIFT => "Shift",
+        KEY_OPTION => "Option",
+        "," => "Comma",
+        other => other,
+    }
 }
 
 const ROW_HEIGHT: f32 = 38.;
@@ -140,6 +174,16 @@ const GROUP_HEADER_HEIGHT: f32 = 24.;
 const RESULT_GAP: f32 = 1.;
 const RESULTS_PADDING_TOP: f32 = 10.;
 const RESULTS_PADDING_BOTTOM: f32 = 8.;
+const MAX_RESULTS_HEIGHT: f32 = 520.;
+const SHEET_WIDTH: f32 = 640.;
+const SHEET_BORDER: f32 = 1.;
+const SEARCH_HEIGHT: f32 = 52.;
+const FIELD_HEIGHT: f32 = 34.;
+const SEARCH_PADDING: f32 = 16.;
+const SEARCH_ICON: f32 = 17.;
+const SEARCH_GAP: f32 = 10.;
+/// The line between the search field and the results.
+const SEARCH_BORDER: f32 = 1.;
 
 const DIGITS: [&str; 9] = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
 
@@ -339,6 +383,7 @@ pub(crate) struct Palette {
     input: Entity<TextInput>,
     scroll: ScrollHandle,
     follow_highlight: bool,
+    opener: Option<FocusHandle>,
     _subscription: Subscription,
 }
 
@@ -356,12 +401,26 @@ impl Palette {
             let mut input = TextInput::new(cx);
             input.set_label("Search commands, tasks and agents", cx);
             input.set_bordered(false, cx);
+            input.set_size(TextFieldSize::Medium, cx);
             input.set_role(TextFieldRole::ComboBox, cx);
             input.set_expanded(Some(true), cx);
             input.set_placeholder("Search", cx);
             input
         });
+        let opener = window.focused(cx);
         window.focus(&input.focus_handle(cx), cx);
+
+        let palette = cx.weak_entity();
+        input.update(cx, |input, cx| {
+            input.set_popup(
+                Some(move |_: &mut Window, cx: &mut App| {
+                    palette
+                        .read_with(cx, |this, cx| vec![this.results(&palette, cx)])
+                        .unwrap_or_default()
+                }),
+                cx,
+            );
+        });
 
         let subscription = cx.subscribe(&input, |this, _, event, cx| match event {
             TextInputEvent::Changed(query) => this.set_query(query, cx),
@@ -375,6 +434,7 @@ impl Palette {
             input,
             scroll: ScrollHandle::new(),
             follow_highlight: false,
+            opener,
             _subscription: subscription,
         }
     }
@@ -418,11 +478,9 @@ impl Palette {
         self.choose(self.highlighted, cx);
     }
 
-    /// The group elements, and the top and bottom of the highlighted row in the content.
-    fn render_groups(&self, cx: &mut Context<Self>) -> (Vec<AnyElement>, (f32, f32)) {
-        let faint = cx.theme().colors().faint;
-        let mut results = Vec::new();
-        let mut group_number = 0;
+    /// The groups with the rows they show, and where the highlighted row sits.
+    fn layout(&self) -> Layout {
+        let mut groups = Vec::new();
         let mut offset = RESULTS_PADDING_TOP;
         let mut highlighted_span = (0., 0.);
 
@@ -439,24 +497,55 @@ impl Palette {
                 continue;
             }
 
-            let mut rows_in_group = Vec::new();
             let group_top = offset;
             offset += GROUP_HEADER_HEIGHT + RESULT_GAP;
 
-            for (position, index) in in_group {
-                if position == self.highlighted {
-                    let first = rows_in_group.is_empty();
-                    highlighted_span =
-                        (if first { group_top } else { offset }, offset + ROW_HEIGHT);
+            for (nth, (position, _)) in in_group.iter().enumerate() {
+                if *position == self.highlighted {
+                    let top = if nth == 0 { group_top } else { offset };
+                    highlighted_span = (top, offset + ROW_HEIGHT);
                 }
 
-                let row = self.rows[index].clone();
-                rows_in_group.push(self.render_row(position, &row, cx).into_any_element());
                 offset += ROW_HEIGHT + RESULT_GAP;
             }
 
-            results.push(
-                group_container(group_number, group.title())
+            groups.push((group, in_group));
+        }
+
+        let content = if groups.is_empty() {
+            offset
+        } else {
+            offset - RESULT_GAP
+        };
+
+        Layout {
+            groups,
+            highlighted_span,
+            height: (content + RESULTS_PADDING_BOTTOM).min(MAX_RESULTS_HEIGHT),
+        }
+    }
+
+    /// The results list. It renders inside the search field, which holds the focus, so the
+    /// highlighted row can be its active descendant.
+    fn results(&self, palette: &WeakEntity<Self>, cx: &App) -> AnyElement {
+        let colors = cx.theme().colors();
+        let (line, faint) = (colors.line, colors.faint);
+        let layout = self.layout();
+
+        let groups = layout
+            .groups
+            .iter()
+            .enumerate()
+            .map(|(number, (group, rows))| {
+                let rows: Vec<AnyElement> = rows
+                    .iter()
+                    .map(|(position, index)| {
+                        self.render_row(*position, &self.rows[*index], palette, cx)
+                            .into_any_element()
+                    })
+                    .collect();
+
+                group_container(number, group.title())
                     .flex_none()
                     .child(
                         h_flex()
@@ -468,13 +557,32 @@ impl Palette {
                             .text_color(faint)
                             .child(group.title()),
                     )
-                    .children(rows_in_group)
-                    .into_any_element(),
-            );
-            group_number += 1;
-        }
+                    .children(rows)
+                    .into_any_element()
+            });
 
-        (results, highlighted_span)
+        let left = SEARCH_PADDING + SEARCH_ICON + SEARCH_GAP;
+        let top = SEARCH_HEIGHT - (SEARCH_HEIGHT - FIELD_HEIGHT) / 2.;
+
+        v_flex()
+            .id("palette-results")
+            .role(Role::ListBox)
+            .aria_label("Results")
+            .absolute()
+            .top(px(top))
+            .left(px(-left))
+            .w(px(SHEET_WIDTH - 2. * SHEET_BORDER))
+            .h(px(layout.height + SEARCH_BORDER))
+            .border_t_1()
+            .border_color(line)
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll)
+            .gap(px(RESULT_GAP))
+            .px(px(8.))
+            .pt(px(RESULTS_PADDING_TOP))
+            .pb(px(RESULTS_PADDING_BOTTOM))
+            .children(groups)
+            .into_any_element()
     }
 
     /// Scrolls the least that shows the span, given as top and bottom in the content.
@@ -495,7 +603,14 @@ impl Palette {
         self.scroll.set_offset(point(px(0.), px(-target)));
     }
 
-    fn render_row(&self, position: usize, row: &Row, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_row(
+        &self,
+        position: usize,
+        row: &Row,
+        palette: &WeakEntity<Self>,
+        cx: &App,
+    ) -> impl IntoElement {
+        let palette = palette.clone();
         let colors = cx.theme().colors();
         let selected = position == self.highlighted;
         let (active, soft) = (colors.active, colors.soft);
@@ -529,8 +644,9 @@ impl Palette {
 
         h_flex()
             .id(("palette-row", position))
+            .debug_selector(move || format!("palette-row-{position}"))
             .role(Role::ListBoxOption)
-            .aria_label(row.label.clone())
+            .aria_label(row.spoken())
             .aria_selected(selected)
             .flex_none()
             .h(px(ROW_HEIGHT))
@@ -540,7 +656,11 @@ impl Palette {
             .cursor_pointer()
             .when(selected, |row| row.bg(active).aria_active_descendant())
             .when(!selected, |row| row.hover(move |style| style.bg(soft)))
-            .on_click(cx.listener(move |this, _, _, cx| this.choose(position, cx)))
+            .on_click(move |_, _, cx| {
+                if let Err(error) = palette.update(cx, |this, cx| this.choose(position, cx)) {
+                    log::debug!("the palette closed before a row was chosen: {error}");
+                }
+            })
             .child(
                 Icon::new(row.icon)
                     .size(IconSize::Large)
@@ -567,44 +687,33 @@ impl Render for Palette {
         let colors = cx.theme().colors();
         let (line, panel, scrim) = (colors.line, colors.panel, colors.scrim);
 
-        let (results, highlighted_span) = self.render_groups(cx);
+        let layout = self.layout();
 
         if self.follow_highlight {
             self.follow_highlight = false;
-            self.scroll_to(highlighted_span);
+            self.scroll_to(layout.highlighted_span);
         }
 
         let search = h_flex()
             .flex_none()
-            .h(px(52.))
-            .px(px(16.))
-            .gap(px(10.))
-            .border_b_1()
-            .border_color(line)
+            .h(px(SEARCH_HEIGHT))
+            .px(px(SEARCH_PADDING))
+            .gap(px(SEARCH_GAP))
             .child(
                 Icon::new(IconName::Search)
-                    .size(IconSize::Custom(px(17.)))
+                    .size(IconSize::Custom(px(SEARCH_ICON)))
                     .color(Color::Faint),
             )
             .child(div().flex_1().child(self.input.clone()))
             .child(Kbd::new("palette-dismiss-key", ["esc"]));
 
-        let results = v_flex()
-            .id("palette-results")
-            .role(Role::ListBox)
-            .aria_label("Results")
-            .max_h(px(520.))
-            .overflow_y_scroll()
-            .track_scroll(&self.scroll)
-            .gap(px(RESULT_GAP))
-            .px(px(8.))
-            .pt(px(RESULTS_PADDING_TOP))
-            .pb(px(RESULTS_PADDING_BOTTOM))
-            .children(results);
+        // The results draw inside the search field, so this keeps their room.
+        let room = div().flex_none().h(px(layout.height + SEARCH_BORDER));
 
         let input_focus = self.input.focus_handle(cx);
 
         let sheet = trap_focus(v_flex().id("palette-panel"), input_focus.clone())
+            .debug_selector(|| "palette-panel".to_owned())
             .role(Role::Dialog)
             .aria_label("Command palette")
             .key_context(MENU_CONTEXT)
@@ -618,7 +727,7 @@ impl Render for Palette {
                 window.focus(&input_focus, cx);
                 cx.stop_propagation();
             })
-            .w(px(640.))
+            .w(px(SHEET_WIDTH))
             .overflow_hidden()
             .rounded(px(14.))
             .border_1()
@@ -632,7 +741,7 @@ impl Render for Palette {
                 inset: false,
             }])
             .child(search)
-            .child(results);
+            .child(room);
 
         div()
             .id("palette")
@@ -650,6 +759,15 @@ impl Render for Palette {
             )
             .child(sheet)
     }
+}
+
+/// Where the groups and rows sit in the results.
+struct Layout {
+    groups: Vec<(Group, Vec<(usize, usize)>)>,
+    /// The top and bottom of the highlighted row in the content.
+    highlighted_span: (f32, f32),
+    /// The height of the results: the content, up to the most that shows.
+    height: f32,
 }
 
 /// The modal over the workspace: the palette or the New task dialog.
@@ -681,6 +799,30 @@ pub(crate) enum Overlay {
 }
 
 impl Overlay {
+    /// The element that had focus before the overlay opened.
+    fn opener(&self, cx: &App) -> Option<FocusHandle> {
+        match self {
+            Self::Palette { view, .. } => view.read(cx).opener.clone(),
+            Self::NewTask { view, .. } => view.read(cx).opener.clone(),
+            Self::CloseTask { view, .. } => view.read(cx).opener.clone(),
+            Self::CloseTerminal { view, .. } => view.read(cx).opener.clone(),
+            Self::CreateAnyway { view, .. } => view.read(cx).opener.clone(),
+            Self::RemoveProject { view, .. } => view.read(cx).opener.clone(),
+        }
+    }
+
+    /// The handle that holds focus for the overlay itself.
+    pub(crate) fn focus_handle(&self, cx: &App) -> FocusHandle {
+        match self {
+            Self::Palette { view, .. } => view.focus_handle(cx),
+            Self::NewTask { view, .. } => view.focus_handle(cx),
+            Self::CloseTask { view, .. } => view.focus_handle(cx),
+            Self::CloseTerminal { view, .. } => view.focus_handle(cx),
+            Self::CreateAnyway { view, .. } => view.focus_handle(cx),
+            Self::RemoveProject { view, .. } => view.focus_handle(cx),
+        }
+    }
+
     pub(crate) fn element(&self) -> AnyElement {
         match self {
             Self::Palette { view, .. } => view.clone().into_any_element(),
@@ -739,10 +881,17 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Closes the open overlay and gives focus back to the workspace.
+    /// Closes the open overlay and gives focus back to what had it before, or to the
+    /// workspace when that is unknown.
     pub(crate) fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let opener = self
+            .overlay
+            .as_ref()
+            .and_then(|overlay| overlay.opener(cx))
+            .unwrap_or_else(|| self.focus_handle(cx));
+
         self.overlay = None;
-        window.focus(&self.focus_handle(cx), cx);
+        window.focus(&opener, cx);
         cx.notify();
     }
 
@@ -848,6 +997,38 @@ mod tests {
         assert_eq!(keys_of("New task"), [KEY_COMMAND, "T"]);
     }
 
+    #[test]
+    fn a_row_reads_its_changes_and_its_shortcut() {
+        let rows = sample_rows();
+        let spoken = |label: &str| {
+            rows.iter()
+                .find(|row| row.label == label)
+                .map(|row| row.spoken().to_string())
+        };
+
+        let review = spoken("Review changes").unwrap_or_default();
+
+        assert!(review.contains(" additions, "), "{review}");
+        assert!(
+            review.contains(" deletions, shortcut Shift Command R"),
+            "{review}"
+        );
+        assert_eq!(
+            spoken("Settings").as_deref(),
+            Some("Settings, shortcut Command Comma")
+        );
+    }
+
+    #[test]
+    fn a_task_row_reads_its_status() {
+        let rows = sample_rows();
+        let task = rows.iter().find(|row| {
+            matches!(row.command, Command::Task(_)) && row.spoken().contains("Working")
+        });
+
+        assert!(task.is_some());
+    }
+
     use gpui::{TestAppContext, VisualTestContext};
 
     use crate::actions::{self, ToggleCommandPalette};
@@ -905,6 +1086,98 @@ mod tests {
 
         assert!(opened);
         assert!(closed);
+    }
+
+    fn open_palette(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Entity<Palette> {
+        cx.simulate_keystrokes("cmd-k");
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        workspace.read_with(cx, |workspace, _| match &workspace.overlay {
+            Some(Overlay::Palette { view, .. }) => view.clone(),
+            _ => panic!("the palette is not open"),
+        })
+    }
+
+    /// The row positions that report themselves as selected.
+    fn selected_rows(palette: &Entity<Palette>, cx: &mut VisualTestContext) -> Vec<usize> {
+        use gpui::Element as _;
+        use gpui::accesskit::{Node, Role as AccessRole};
+
+        let count = palette.read_with(cx, |palette, _| palette.visible.len());
+        let weak = palette.downgrade();
+
+        (0..count)
+            .filter(|position| {
+                palette.read_with(cx, |palette, cx| {
+                    let row = palette.visible[*position];
+                    let element = palette
+                        .render_row(*position, &palette.rows[row], &weak, cx)
+                        .into_element();
+                    let mut node = Node::new(AccessRole::Unknown);
+                    element.write_a11y_info(&mut node);
+
+                    node.is_selected() == Some(true)
+                })
+            })
+            .collect()
+    }
+
+    #[gpui::test]
+    fn the_highlighted_row_follows_down_and_up(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let palette = open_palette(&workspace, cx);
+
+        let start = selected_rows(&palette, cx);
+        cx.simulate_keystrokes("down");
+        let down = selected_rows(&palette, cx);
+        cx.simulate_keystrokes("down up");
+        let up = selected_rows(&palette, cx);
+
+        assert_eq!(start, [0]);
+        assert_eq!(down, [1]);
+        assert_eq!(up, [1]);
+    }
+
+    #[gpui::test]
+    fn clicking_a_result_chooses_it(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        open_palette(&workspace, cx);
+        let row = cx
+            .debug_bounds("palette-row-1")
+            .expect("the second row is drawn");
+
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        assert!(palette_labels(&workspace, cx).is_none());
+    }
+
+    #[gpui::test]
+    fn the_results_draw_inside_the_sheet_below_the_search_field(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        open_palette(&workspace, cx);
+
+        let sheet = cx.debug_bounds("palette-panel");
+        let row = cx.debug_bounds("palette-row-0");
+
+        let (sheet, row) = (
+            sheet.expect("the sheet is drawn"),
+            row.expect("a row is drawn"),
+        );
+        assert!(row.top() >= sheet.top() + px(SEARCH_HEIGHT));
+        assert!(row.bottom() <= sheet.bottom());
+    }
+
+    #[gpui::test]
+    fn closing_the_palette_gives_focus_back_to_what_had_it(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let opener = workspace.read_with(cx, |workspace, _| workspace.sidebar_focus.clone());
+        cx.update(|window, cx| window.focus(&opener, cx));
+
+        cx.simulate_keystrokes("cmd-k");
+        cx.simulate_keystrokes("escape");
+
+        assert!(cx.update(|window, _| opener.is_focused(window)));
     }
 
     #[gpui::test]
@@ -1137,6 +1410,41 @@ mod tests {
         assert_eq!(newest.clone().map(|(id, _)| id), Some(active));
         assert_eq!(newest.map(|(_, name)| name), Some("docs-site".to_owned()));
         assert!(closed);
+    }
+
+    fn tab_stops_in_the_dialog(cx: &mut VisualTestContext) -> usize {
+        let start = cx.update(|window, cx| window.focused(cx));
+        let mut stops = 0;
+
+        for _ in 0..20 {
+            cx.simulate_keystrokes("tab");
+            stops += 1;
+
+            if cx.update(|window, cx| window.focused(cx)) == start {
+                break;
+            }
+        }
+
+        stops
+    }
+
+    #[gpui::test]
+    fn the_create_button_stays_a_tab_stop_while_the_task_is_created(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        cx.simulate_keystrokes("cmd-t");
+        cx.simulate_input("docs-site");
+        crate::daemon::tests::redraw(cx);
+        let before = tab_stops_in_the_dialog(cx);
+
+        workspace.update(cx, |workspace, cx| {
+            if let Some(Overlay::NewTask { view, .. }) = &workspace.overlay {
+                view.update(cx, |dialog, cx| dialog.set_busy(true, cx));
+            }
+        });
+        crate::daemon::tests::redraw(cx);
+        let busy = tab_stops_in_the_dialog(cx);
+
+        assert_eq!(busy, before);
     }
 
     #[gpui::test]

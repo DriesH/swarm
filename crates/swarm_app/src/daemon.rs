@@ -566,7 +566,7 @@ impl Workspace {
 
         let on_active_tab = known.is_some_and(|agent| agent.task == self.active_task);
         if on_active_tab && self.focused_terminal.is_none() {
-            self.focus_terminal(terminal, cx);
+            self.claim_focus(terminal, cx);
         }
     }
 
@@ -2312,7 +2312,7 @@ pub(crate) mod tests {
     }
 
     /// A launch that can never reach a daemon: no socket and no binary to start.
-    fn unreachable_launch() -> DaemonLaunch {
+    pub(crate) fn unreachable_launch() -> DaemonLaunch {
         let folder = PathBuf::from(format!("/tmp/swa-{}-none", std::process::id()));
 
         DaemonLaunch {
@@ -4386,6 +4386,21 @@ pub(crate) mod tests {
         assert_eq!(before, after, "the reconnect made a new plan editor");
         assert_eq!(requests.try_iter().count(), 0);
         assert_eq!(again.try_iter().count(), 0);
+    }
+
+    #[gpui::test]
+    fn a_connection_made_in_the_review_view_keeps_the_view(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        workspace.update(cx, |workspace, cx| workspace.set_view(View::Review, cx));
+        redraw(cx);
+
+        use_projects(&workspace, &[project_info(5, "demo", Vec::new())], cx);
+        redraw(cx);
+
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.view),
+            View::Review
+        );
     }
 
     #[gpui::test]

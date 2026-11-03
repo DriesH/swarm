@@ -89,6 +89,11 @@ fn options(labels: &[&str]) -> Vec<SharedString> {
         .collect()
 }
 
+/// The name of a project's notification picker: the setting and the project.
+pub(super) fn project_picker_label(project: &str) -> String {
+    format!("Notifications for {project}")
+}
+
 pub(super) fn page_title(title: impl Into<SharedString>) -> impl IntoElement {
     Label::new(title)
         .size(LabelSize::Title)
@@ -402,7 +407,7 @@ impl SettingsWindow {
 
                     let picker = Dropdown::new(
                         ("project-notifications", index),
-                        name.clone(),
+                        project_picker_label(&name),
                         options(&PROJECT_NOTIFICATIONS),
                         mode_index(mode),
                     )
@@ -646,9 +651,21 @@ impl SettingsWindow {
             .get(index)
             .and_then(|settings| settings.checking.pill());
 
-        let button = Button::new("run-checks", "Run checks now")
+        let running = state
+            .read(cx)
+            .projects
+            .get(index)
+            .is_some_and(|settings| settings.checking.busy());
+        let label = if running {
+            "Running checks\u{2026}"
+        } else {
+            "Run checks now"
+        };
+
+        let button = Button::new("run-checks", label)
             .debug_selector(|| "run-checks".to_owned())
-            .disabled(!can_run)
+            .loading(running)
+            .disabled(!can_run && !running)
             .on_click(move |_, _, cx| {
                 state.update(cx, |state, cx| state.run_checks(index, cx));
             });
@@ -743,7 +760,10 @@ impl SettingsWindow {
             .child(
                 Button::new(("reload-config", index), "Reload")
                     .debug_selector(|| "reload-config".to_owned())
-                    .on_click(cx.listener(move |this, _, _, cx| this.load_project(index, cx))),
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.load_project(index, cx);
+                        window.focus(&this.remove_focus, cx);
+                    })),
             )
             .into_any_element()
     }
@@ -775,8 +795,8 @@ impl SettingsWindow {
                     ("copy-remove", file_index),
                     remove,
                     editable,
-                    cx.listener(move |this, _, _, cx| {
-                        this.remove_item(index, list, file_index, cx);
+                    cx.listener(move |this, _, window, cx| {
+                        this.remove_item(index, list, file_index, window, cx);
                     }),
                 ))
             })
@@ -833,8 +853,8 @@ impl SettingsWindow {
                     ("check-remove", check_index),
                     remove,
                     editable,
-                    cx.listener(move |this, _, _, cx| {
-                        this.remove_item(index, List::Checks, check_index, cx);
+                    cx.listener(move |this, _, window, cx| {
+                        this.remove_item(index, List::Checks, check_index, window, cx);
                     }),
                 ))
             })

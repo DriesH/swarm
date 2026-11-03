@@ -31,6 +31,20 @@ use crate::review_model::{
 const TOO_LONG: &str = "Comment is too long";
 const FIRST_WORDS: usize = 8;
 
+/// ⌥← and ⌥→ pick the side of the split view the cursor stands on.
+pub(super) fn side_of_key(keystroke: &gpui::Keystroke) -> Option<DiffSide> {
+    let modifiers = keystroke.modifiers;
+    if !modifiers.alt || modifiers.shift || modifiers.control || modifiers.platform {
+        return None;
+    }
+
+    match keystroke.key.as_str() {
+        "left" => Some(DiffSide::Old),
+        "right" => Some(DiffSide::New),
+        _ => None,
+    }
+}
+
 /// How often the relative times of delivered comments are drawn again.
 const CLOCK_TICK: Duration = Duration::from_secs(5);
 
@@ -144,6 +158,10 @@ pub(super) struct ReplyBox {
     /// focus stays on the one the user used.
     send: FocusHandle,
     cancel: FocusHandle,
+    /// The Delete, Resolve or Reopen button.
+    action: FocusHandle,
+    /// The folded card, which stands in for a thread that folds.
+    folded: FocusHandle,
     _subscription: Subscription,
 }
 
@@ -447,6 +465,11 @@ impl ReviewView {
     }
 
     #[cfg(test)]
+    pub(crate) fn folded_focus(&mut self, root: CommentId, cx: &mut Context<Self>) -> FocusHandle {
+        self.reply_box(root, cx).folded.clone()
+    }
+
+    #[cfg(test)]
     pub(crate) fn reply_sending(&self, root: CommentId) -> bool {
         self.reply_boxes
             .get(&root)
@@ -501,7 +524,6 @@ impl ReviewView {
         self.submit_composer(cx);
     }
 
-    #[cfg(test)]
     pub(crate) fn is_folded(&self, id: CommentId) -> bool {
         self.input.as_ref().is_some_and(|input| {
             input
@@ -702,6 +724,36 @@ impl ReviewView {
 
         self.set_cursor(pos, cx);
         self.body_list.scroll_to_reveal_item(row);
+    }
+
+    /// In split view, moves the cursor to the other side: the line next to it, else the
+    /// closest one on that side.
+    pub(super) fn switch_side(&mut self, side: DiffSide, cx: &mut Context<Self>) {
+        let Some(current) = self.cursor.as_ref().map(|cursor| cursor.pos) else {
+            return;
+        };
+        if self.style != DiffStyle::Split || current.side == side {
+            return;
+        }
+
+        let all = self.line_positions();
+        let Some(row) = all
+            .iter()
+            .find(|(_, pos)| *pos == current)
+            .map(|(row, _)| *row)
+        else {
+            return;
+        };
+
+        let target = all
+            .iter()
+            .filter(|(_, pos)| pos.side == side && pos.file == current.file)
+            .min_by_key(|(candidate, _)| candidate.abs_diff(row));
+
+        if let Some((row, pos)) = target.copied() {
+            self.set_cursor(pos, cx);
+            self.body_list.scroll_to_reveal_item(row);
+        }
     }
 
     /// Opens the comment box on the cursor, else on the first changed line of the
@@ -991,6 +1043,8 @@ impl ReviewView {
                 button: cx.focus_handle().tab_stop(true),
                 send: cx.focus_handle().tab_stop(true),
                 cancel: cx.focus_handle().tab_stop(true),
+                action: cx.focus_handle().tab_stop(true),
+                folded: cx.focus_handle().tab_stop(true),
                 _subscription: subscription,
             }
         })
@@ -1030,6 +1084,13 @@ impl ReviewView {
 
     /// Moves focus where the last reply action asked for.
     pub(super) fn apply_reply_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.focus_folded.filter(|id| self.is_folded(*id)) {
+            let handle = self.reply_box(id, cx).folded.clone();
+
+            self.focus_folded = None;
+            window.focus(&handle, cx);
+        }
+
         let Some(focus) = self.focus_reply.take() else {
             return;
         };
@@ -1057,6 +1118,38 @@ impl ReviewView {
                 }
             }
         }
+    }
+
+    /// Moves focus off the controls of a thread that is about to go: to the next control
+    /// after them, else the one before, else the diff.
+    fn leave_thread(&self, id: CommentId, window: &mut Window, cx: &mut App) {
+        let Some(reply) = self.reply_boxes.get(&id) else {
+            window.focus(&self.body_focus, cx);
+            return;
+        };
+        let own = [&reply.action, &reply.button, &reply.send, &reply.cancel];
+        let owns = |window: &Window| own.iter().any(|handle| handle.is_focused(window));
+        let settled = |window: &Window, cx: &App| {
+            !owns(window) && self.body_focus.contains_focused(window, cx)
+        };
+
+        window.focus(&reply.cancel, cx);
+        for _ in 0..own.len() {
+            window.focus_next(cx);
+            if settled(window, cx) {
+                return;
+            }
+        }
+
+        window.focus(&reply.action, cx);
+        for _ in 0..own.len() {
+            window.focus_prev(cx);
+            if settled(window, cx) {
+                return;
+            }
+        }
+
+        window.focus(&self.body_focus, cx);
     }
 
     /// Sends the text of a thread's reply field as a reply.
@@ -1160,7 +1253,9 @@ impl ReviewView {
         let folded = root.state == CommentState::Resolved && !self.unfolded.contains(&root.id);
 
         let card = if folded {
-            Self::folded_thread(&root, &name, index, colors, cx)
+            let focus = self.reply_box(root.id, cx).folded.clone();
+
+            Self::folded_thread(&root, &focus, &name, index, colors, cx)
         } else {
             self.open_thread(&root, placed.place == Place::Top, &name, now, colors, cx)
         };
@@ -1170,6 +1265,7 @@ impl ReviewView {
 
     fn folded_thread(
         root: &ReviewComment,
+        focus: &FocusHandle,
         name: &SharedString,
         index: usize,
         colors: &ThemeColors,
@@ -1190,8 +1286,7 @@ impl ReviewView {
                 first_words(&root.body)
             ))
             .aria_expanded(false)
-            .focusable()
-            .tab_stop(true)
+            .track_focus(focus)
             .cursor_pointer()
             .h(px(30.))
             .px(px(10.))
@@ -1252,10 +1347,14 @@ impl ReviewView {
                 reply.button.clone(),
             )
         };
-        let (send_focus, cancel_focus) = {
+        let (send_focus, cancel_focus, action_focus) = {
             let reply = self.reply_box(id, cx);
 
-            (reply.send.clone(), reply.cancel.clone())
+            (
+                reply.send.clone(),
+                reply.cancel.clone(),
+                reply.action.clone(),
+            )
         };
         let reply_empty = reply_input.read(cx).text().trim().is_empty();
         let replies: Vec<ReviewComment> = self
@@ -1307,10 +1406,12 @@ impl ReviewView {
                         IconName::ChevronDown,
                         "Fold thread",
                     )
+                    .debug_selector(|| format!("comment-fold-{numeric}"))
                     .color(Color::Muted)
                     .on_click(move |_, _, cx| {
                         fold_view.update(cx, |this, cx| {
                             this.unfolded.remove(&id);
+                            this.focus_folded = Some(id);
                             this.after_card_change();
                             cx.notify();
                         });
@@ -1369,12 +1470,15 @@ impl ReviewView {
             .collect();
 
         let workspace = self.workspace.clone();
+        let action_view = view.clone();
         let task = root.task;
         let action = if root.state == CommentState::Pending {
             Button::new(("comment-delete", numeric), "Delete")
                 .variant(ButtonVariant::Secondary)
                 .debug_selector(|| format!("comment-delete-{numeric}"))
-                .on_click(move |_, _, cx| {
+                .track_focus(&action_focus)
+                .on_click(move |_, window, cx| {
+                    action_view.update(cx, |this, cx| this.leave_thread(id, window, cx));
                     update_workspace(&workspace, cx, |workspace, cx| {
                         workspace.delete_review_comment(task, id, cx);
                     });
@@ -1387,7 +1491,12 @@ impl ReviewView {
             .variant(ButtonVariant::Secondary)
             .debug_selector(|| format!("comment-resolve-{numeric}"))
             .when(!resolved, |button| button.icon(IconName::Check))
+            .track_focus(&action_focus)
             .on_click(move |_, _, cx| {
+                if !resolved {
+                    action_view.update(cx, |this, _| this.focus_folded = Some(id));
+                }
+
                 update_workspace(&workspace, cx, |workspace, cx| {
                     workspace.resolve_review_comment(task, id, !resolved, cx);
                 });

@@ -1,6 +1,7 @@
 //! Window-level actions and their key bindings.
 
-use gpui::{Action, App, KeyBinding, actions};
+use gpui::{Action, App, KeyBinding, NoAction, actions};
+use swarm_term_view::{focus_key_bindings, shell_key_bindings};
 use swarm_ui::ROOT_CONTEXT;
 
 actions!(
@@ -68,7 +69,11 @@ actions!(
         /// Opens the folder under the cursor, or moves to its first row.
         TreeExpand,
         /// Opens the file under the cursor in the diff, or opens or closes the folder.
-        TreeActivate
+        TreeActivate,
+        /// Moves the cursor of a file tree to the first row.
+        TreeFirst,
+        /// Moves the cursor of a file tree to the last row.
+        TreeLast
     ]
 );
 
@@ -107,24 +112,30 @@ const FOCUS_KEYS: [&str; 9] = [
 pub(crate) enum ShortcutGroup {
     Workspace,
     Terminals,
+    SwarmView,
     Review,
     FileTree,
+    Settings,
 }
 
 impl ShortcutGroup {
-    pub(crate) const ALL: [Self; 4] = [
+    pub(crate) const ALL: [Self; 6] = [
         Self::Workspace,
         Self::Terminals,
+        Self::SwarmView,
         Self::Review,
         Self::FileTree,
+        Self::Settings,
     ];
 
     pub(crate) fn title(self) -> &'static str {
         match self {
             Self::Workspace => "Workspace",
             Self::Terminals => "Terminals",
+            Self::SwarmView => "Swarm view",
             Self::Review => "Review",
             Self::FileTree => "File tree",
+            Self::Settings => "Settings",
         }
     }
 }
@@ -219,9 +230,46 @@ pub(crate) fn shortcuts() -> Vec<Shortcut> {
         )
     }));
 
+    let [shell_tab, shell_back_tab] = shell_key_bindings();
+    let [next_stop, previous_stop] = focus_key_bindings();
+    shortcuts.extend([
+        shortcut(Terminals, "Tab in terminal", shell_tab),
+        shortcut(Terminals, "Back-tab in terminal", shell_back_tab),
+        shortcut(Terminals, "Next focus stop", next_stop),
+        shortcut(Terminals, "Previous focus stop", previous_stop),
+    ]);
+
     shortcuts.extend(review_shortcuts());
 
     shortcuts
+}
+
+/// A key the app handles in a place that registers no binding. The rows only name the keys
+/// for the Keyboard page, and `bind_keys` does not register them.
+fn listed(group: ShortcutGroup, name: &'static str, keys: &'static str) -> Shortcut {
+    shortcut(group, name, KeyBinding::new(keys, NoAction, None))
+}
+
+/// The keys handled by the controls themselves, which the Keyboard page lists too.
+pub(crate) fn listed_shortcuts() -> Vec<Shortcut> {
+    use ShortcutGroup::{Review, Settings, SwarmView, Terminals, Workspace};
+
+    vec![
+        listed(Workspace, "Open context menu", "shift-f10"),
+        listed(Terminals, "Make tile shorter", "up"),
+        listed(Terminals, "Make tile taller", "down"),
+        listed(SwarmView, "Previous card", "left"),
+        listed(SwarmView, "Next card", "right"),
+        listed(SwarmView, "Card above", "up"),
+        listed(SwarmView, "Card below", "down"),
+        listed(SwarmView, "Focus agent tile", "enter"),
+        listed(Review, "Post comment or reply", "cmd-enter"),
+        listed(Review, "Cursor on old side of split", "alt-left"),
+        listed(Review, "Cursor on new side of split", "alt-right"),
+        listed(Settings, "Close settings", "cmd-w"),
+        listed(Settings, "Previous page", "up"),
+        listed(Settings, "Next page", "down"),
+    ]
 }
 
 /// The keys of the Review view and of the file trees.
@@ -251,10 +299,14 @@ fn review_shortcuts() -> Vec<Shortcut> {
         ),
         shortcut(
             Review,
-            "Previous line",
+            "Previous line in diff",
             KeyBinding::new("up", PreviousLine, body),
         ),
-        shortcut(Review, "Next line", KeyBinding::new("down", NextLine, body)),
+        shortcut(
+            Review,
+            "Next line in diff",
+            KeyBinding::new("down", NextLine, body),
+        ),
         shortcut(
             FileTree,
             "Previous row",
@@ -265,6 +317,12 @@ fn review_shortcuts() -> Vec<Shortcut> {
             "Next row",
             KeyBinding::new("down", TreeNext, tree),
         ),
+        shortcut(
+            FileTree,
+            "First row",
+            KeyBinding::new("home", TreeFirst, tree),
+        ),
+        shortcut(FileTree, "Last row", KeyBinding::new("end", TreeLast, tree)),
         shortcut(
             FileTree,
             "Close folder",

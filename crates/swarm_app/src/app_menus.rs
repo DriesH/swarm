@@ -6,16 +6,18 @@
 //! Workspace items go to the main window. With that window closed they bring it back first.
 //! The rest runs in the app, so it works from any window.
 
-use gpui::{Action, App, Menu, MenuItem, OsAction, SystemMenuType};
+use gpui::{Action, App, Context, Global, Menu, MenuItem, OsAction, SystemMenuType, Window};
 use swarm_ui::edit;
 
 use crate::actions::{
-    About, AddProject, BringAllToFront, CloseTask, Hide, HideOthers, Minimize, NewTask,
-    NewTerminal, OpenHelp, OpenSettings, Quit, ShowAll, ShowReview, ShowSwarm, ShowTerminals,
-    ToggleChanges, ToggleCommandPalette, ToggleFiles, ToggleFullScreen, ToggleSidebar, Zoom,
+    About, AddProject, BringAllToFront, CloseTask, FocusAgent, Hide, HideOthers, Minimize, NewTask,
+    NewTerminal, OpenHelp, OpenSettings, PlanWithOrchestrator, Quit, ShowAll, ShowReview,
+    ShowSwarm, ShowTerminals, ToggleChanges, ToggleCommandPalette, ToggleFiles, ToggleFullScreen,
+    ToggleSidebar, Zoom,
 };
 use crate::lifecycle;
 use crate::settings::Page;
+use crate::workspace::Workspace;
 
 /// Where Swarm Help goes. A placeholder until the docs website is live.
 pub(crate) const HELP_URL: &str = "https://docs.swarm.example";
@@ -28,7 +30,37 @@ pub(crate) fn install(cx: &mut App) {
     cx.set_menus(menus());
 }
 
+/// Whether the menus offer to leave full screen. Kept so the menus are set only on a change.
+struct InFullScreen(bool);
+
+impl Global for InFullScreen {}
+
+/// Keeps the full screen item of the View menu in step with the window: Enter in a window,
+/// Exit in full screen. The window can change by the green button as well as by the menu.
+pub(crate) fn follow_full_screen(window: &mut Window, cx: &mut Context<Workspace>) {
+    cx.observe_window_bounds(window, |_, window, cx| {
+        let full_screen = window.is_fullscreen();
+        let shown = cx.try_global::<InFullScreen>().is_some_and(|shown| shown.0);
+
+        if full_screen != shown {
+            cx.set_global(InFullScreen(full_screen));
+            cx.set_menus(menus_for(full_screen));
+        }
+    })
+    .detach();
+}
+
 pub(crate) fn menus() -> Vec<Menu> {
+    menus_for(false)
+}
+
+fn menus_for(full_screen: bool) -> Vec<Menu> {
+    let full_screen_label = if full_screen {
+        "Exit Full Screen"
+    } else {
+        "Enter Full Screen"
+    };
+
     vec![
         Menu::new("Swarm").items([
             MenuItem::action("About Swarm", About),
@@ -69,7 +101,7 @@ pub(crate) fn menus() -> Vec<Menu> {
             MenuItem::separator(),
             MenuItem::action("Command Palette", ToggleCommandPalette),
             MenuItem::separator(),
-            MenuItem::action("Enter Full Screen", ToggleFullScreen),
+            MenuItem::action(full_screen_label, ToggleFullScreen),
         ]),
         // GPUI hands the menu named "Window" to macOS, which lists the open windows in it.
         Menu::new("Window").items([
@@ -94,9 +126,9 @@ fn on_app_actions(cx: &mut App) {
     cx.on_action(|_: &BringAllToFront, cx| cx.activate(true));
     cx.on_action(|_: &OpenHelp, cx| cx.open_url(HELP_URL));
     cx.on_action(|_: &Minimize, cx| {
-        cx.defer(|cx| on_front_window(cx, gpui::Window::minimize_window));
+        cx.defer(|cx| on_front_window(cx, Window::minimize_window));
     });
-    cx.on_action(|_: &Zoom, cx| cx.defer(|cx| on_front_window(cx, gpui::Window::zoom_window)));
+    cx.on_action(|_: &Zoom, cx| cx.defer(|cx| on_front_window(cx, Window::zoom_window)));
     cx.on_action(|_: &ToggleFullScreen, cx| cx.defer(toggle_full_screen));
 
     // The settings window may be the one in front, and the main window may be closed.
@@ -104,7 +136,7 @@ fn on_app_actions(cx: &mut App) {
     cx.on_action(|_: &About, cx| cx.defer(|cx| open_settings(Some(Page::General), cx)));
 }
 
-fn on_front_window(cx: &mut App, act: impl FnOnce(&gpui::Window)) {
+fn on_front_window(cx: &mut App, act: impl FnOnce(&Window)) {
     let Some(window) = cx.active_window() else {
         return;
     };
@@ -143,6 +175,8 @@ fn on_workspace_actions(cx: &mut App) {
     forward::<ToggleCommandPalette>(cx);
     forward::<NewTask>(cx);
     forward::<NewTerminal>(cx);
+    forward::<PlanWithOrchestrator>(cx);
+    forward::<FocusAgent>(cx);
     forward::<AddProject>(cx);
     forward::<CloseTask>(cx);
 }
@@ -731,6 +765,73 @@ mod tests {
         assert!(!left);
     }
 
+    fn full_screen_label(cx: &VisualTestContext) -> String {
+        let menus = menus_set(cx);
+        let view = menus.iter().find(|menu| menu.name.as_ref() == "View");
+
+        view.map(labels)
+            .and_then(|labels| {
+                labels
+                    .into_iter()
+                    .find(|label| label.ends_with("Full Screen"))
+            })
+            .unwrap_or_default()
+    }
+
+    #[gpui::test]
+    fn the_full_screen_item_says_exit_while_the_window_is_in_full_screen(cx: &mut TestAppContext) {
+        let (workspace, cx) = app(cx);
+        workspace.update_in(cx, |_, window, cx| follow_full_screen(window, cx));
+        let before = full_screen_label(cx);
+
+        choose("View", "Enter Full Screen", cx);
+        cx.update(Window::bounds_changed);
+        let inside = full_screen_label(cx);
+        choose("View", "Exit Full Screen", cx);
+        cx.update(Window::bounds_changed);
+        let after = full_screen_label(cx);
+
+        assert_eq!(before, "Enter Full Screen");
+        assert_eq!(inside, "Exit Full Screen");
+        assert_eq!(after, "Enter Full Screen");
+    }
+
+    #[gpui::test]
+    fn plan_with_orchestrator_and_the_agent_keys_work_from_the_settings_window(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = app(cx);
+        choose("Swarm", "Settings…", cx);
+        let mut front = settings_in_front(cx);
+        let plan_open = |workspace: &Entity<Workspace>, cx: &VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                workspace.active_task().name == crate::model::PLAN_TASK
+            })
+        };
+        let before = plan_open(&workspace, &front);
+
+        front.simulate_keystrokes("cmd-shift-t");
+
+        assert!(!before);
+        assert!(plan_open(&workspace, &front));
+    }
+
+    #[gpui::test]
+    fn the_agent_keys_bring_the_main_window_forward_from_the_settings_window(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = app(cx);
+        choose("Swarm", "Settings…", cx);
+        let mut front = settings_in_front(cx);
+
+        front.simulate_keystrokes("cmd-2");
+
+        assert_eq!(
+            front.update(|_, cx| cx.active_window()),
+            Some(main_window(&workspace, &front))
+        );
+    }
+
     #[gpui::test]
     fn settings_opens_the_settings_window(cx: &mut TestAppContext) {
         let (_workspace, cx) = app(cx);
@@ -950,7 +1051,7 @@ mod tests {
     #[gpui::test]
     fn a_blurred_window_gets_focus_back_so_the_menu_still_works(cx: &mut TestAppContext) {
         let (workspace, cx) = app(cx);
-        cx.update(gpui::Window::blur);
+        cx.update(Window::blur);
         redraw(cx);
         redraw(cx);
 

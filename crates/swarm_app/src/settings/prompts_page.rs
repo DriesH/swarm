@@ -473,7 +473,7 @@ fn layer_tag(name: &str, layer: PromptLayer) -> impl IntoElement + use<> {
         .id(format!("layer-{name}"))
         .debug_selector(move || selector)
         .role(Role::Label)
-        .aria_label(label)
+        .aria_label(format!("{name} prompt, {}", label.to_lowercase()))
         .child(Tag::new(label).tone(tone))
 }
 
@@ -556,6 +556,18 @@ mod tests {
     use crate::workspace::Workspace;
 
     const FOLDER: &str = "/home/sam/.config/swarm/prompts";
+
+    #[test]
+    fn a_layer_tag_names_its_prompt() {
+        use gpui::accesskit::{Node, Role as AccessRole};
+        use gpui::{Element as _, IntoElement as _};
+
+        let element = layer_tag("worker", PromptLayer::User).into_element();
+        let mut node = Node::new(AccessRole::Unknown);
+        element.write_a11y_info(&mut node);
+
+        assert_eq!(node.label(), Some("worker prompt, yours"));
+    }
 
     fn prompt(name: &str, layer: PromptLayer) -> PromptInfo {
         PromptInfo {

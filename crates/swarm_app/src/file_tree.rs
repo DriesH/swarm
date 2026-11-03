@@ -318,6 +318,8 @@ pub(crate) enum Key {
     Down,
     Left,
     Right,
+    First,
+    Last,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -345,6 +347,8 @@ pub(crate) fn step(entries: &[Entry], current: Option<usize>, key: Key) -> Move 
     match key {
         Key::Up => Move::Select(current.saturating_sub(1)),
         Key::Down => Move::Select((current + 1).min(last)),
+        Key::First => Move::Select(0),
+        Key::Last => Move::Select(last),
         Key::Right => match entries[current].kind {
             EntryKind::Folder { open: false } => Move::Open(current),
             EntryKind::Folder { open: true }
@@ -693,6 +697,15 @@ mod tests {
         assert_eq!(press(0, Key::Up), Move::Select(0));
         assert_eq!(step(&entries, None, Key::Down), Move::Select(0));
         assert_eq!(step(&[], None, Key::Down), Move::Stay);
+    }
+
+    #[test]
+    fn home_and_end_go_to_the_first_and_last_row() {
+        let files = [file("/w", "a/x.rs", None), file("/w", "b.rs", None)];
+        let (entries, press) = arrows(&files, &[]);
+
+        assert_eq!(press(2, Key::First), Move::Select(0));
+        assert_eq!(press(0, Key::Last), Move::Select(entries.len() - 1));
     }
 
     #[test]

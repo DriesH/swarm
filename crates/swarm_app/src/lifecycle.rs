@@ -25,6 +25,7 @@ pub(crate) fn start(cx: &mut App) -> anyhow::Result<()> {
     let handle = crate::open_workspace(cx)?;
     let workspace = handle.entity(cx)?;
 
+    watch_full_screen(&workspace, handle.into(), cx);
     keep(workspace.clone(), cx);
     crate::settings::follow_font_size(workspace.clone(), cx);
     crate::settings::follow_appearance(workspace.clone(), cx);
@@ -86,7 +87,10 @@ pub(crate) fn show_main_window(cx: &mut App) {
     set_policy(ActivationPolicy::Regular, cx);
 
     let opened = cx.open_window(crate::window_options(cx), |window, cx| {
-        workspace.update(cx, |workspace, cx| workspace.attach_window(window, cx));
+        workspace.update(cx, |workspace, cx| {
+            workspace.attach_window(window, cx);
+            crate::app_menus::follow_full_screen(window, cx);
+        });
 
         workspace.clone()
     });
@@ -97,6 +101,17 @@ pub(crate) fn show_main_window(cx: &mut App) {
             log::error!("could not open the main window: {error:#}");
             leave_dock(cx);
         }
+    }
+}
+
+/// Makes the View menu follow full screen in the window `handle`.
+fn watch_full_screen(workspace: &Entity<Workspace>, handle: AnyWindowHandle, cx: &mut App) {
+    let followed = handle.update(cx, |_, window, cx| {
+        workspace.update(cx, |_, cx| crate::app_menus::follow_full_screen(window, cx));
+    });
+
+    if let Err(error) = followed {
+        log::debug!("the window closed before the menu followed full screen: {error}");
     }
 }
 

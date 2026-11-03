@@ -5,8 +5,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyWindowHandle, AppContext as _, Bounds, Context, Div, Entity, FocusHandle, Focusable, Pixels,
-    Point, SharedString, Size, Stateful, Subscription, Window, div, ease_out_quint, point, px,
+    AnyWindowHandle, AppContext as _, Bounds, Context, Div, Entity, FocusHandle, Focusable, Hsla,
+    Pixels, Point, Role, SharedString, Size, Stateful, Subscription, Window, div, ease_out_quint,
+    point, px,
 };
 use swarm_protocol::{Client, ReviewSource};
 use swarm_ui::fonts::UI_FONT;
@@ -212,6 +213,8 @@ pub(crate) struct Workspace {
     pub(crate) sidebar_motion: Option<SidebarMotion>,
     /// Tracks focus inside the sidebar and the rail, so a toggle can take focus back.
     pub(crate) sidebar_focus: FocusHandle,
+    /// The Add project button of the empty state, a drawn control when no project exists.
+    pub(crate) add_project_focus: FocusHandle,
     pub minimized: HashSet<TerminalId>,
     pub focused_terminal: Option<TerminalId>,
     /// The terminals that took the focus last, the latest first. A Start tab uses it to
@@ -219,6 +222,9 @@ pub(crate) struct Workspace {
     pub(crate) recent_focus: Vec<TerminalId>,
     focus_handle: FocusHandle,
     pending_focus: Option<TerminalId>,
+    /// True after focus fell back to a drawn control. The tile that holds it then does not
+    /// become the focused one, so a tile that waits in the tray keeps its place.
+    focus_landed: bool,
     pub(crate) terminal_focus: HashMap<TerminalId, FocusHandle>,
     /// The focus of each project row in the sidebar.
     pub(crate) project_focus: HashMap<ProjectId, FocusHandle>,
@@ -406,11 +412,13 @@ impl Workspace {
             sidebar_collapsed: false,
             sidebar_motion: None,
             sidebar_focus: cx.focus_handle(),
+            add_project_focus: cx.focus_handle().tab_stop(true),
             minimized: HashSet::new(),
             focused_terminal,
             recent_focus: Vec::new(),
             focus_handle,
             pending_focus: None,
+            focus_landed: false,
             terminal_focus: HashMap::new(),
             project_focus: HashMap::new(),
             overlay: None,
@@ -493,19 +501,80 @@ impl Workspace {
     }
 
     /// Gives focus back when it is lost: to the sidebar when the focused element of it went,
-    /// and to the workspace when nothing has focus at all. Without it, Tab and the shortcuts
-    /// would do nothing. A focus that waits for its element to show, as in a dialog or in
-    /// Review, is left alone.
+    /// and to a control that is drawn when nothing has focus or the focused element is not
+    /// drawn any more. Without it, Tab and the shortcuts would do nothing. Focus in an
+    /// overlay is left alone.
     fn restore_focus_when_lost(window: &mut Window, cx: &mut Context<Self>) -> Subscription {
         cx.on_focus_lost(window, |this, window, cx| {
             let target = match window.focus_lost_restore_target(cx) {
-                Some(parent) if parent == this.sidebar_focus => parent,
-                _ if window.focused(cx).is_none() => this.focus_handle.clone(),
-                _ => return,
+                Some(parent) if parent == this.sidebar_focus => this.sidebar_landing(parent),
+                _ if window.focused(cx).is_some() && this.overlay.is_some() => return,
+                _ => {
+                    this.focus_landed = true;
+                    this.landing_handle(cx)
+                }
             };
 
             window.focus(&target, cx);
         })
+    }
+
+    /// Where focus goes when a control of the sidebar is gone: the Add project button when
+    /// there is no project, else the row of the open project, which shows a focus ring, else
+    /// the sidebar itself.
+    fn sidebar_landing(&self, sidebar: FocusHandle) -> FocusHandle {
+        if self.has_no_projects() {
+            return self.add_project_focus.clone();
+        }
+
+        if self.sidebar_collapsed {
+            return sidebar;
+        }
+
+        self.project_focus
+            .get(&self.active_project)
+            .cloned()
+            .unwrap_or(sidebar)
+    }
+
+    /// The control focus lands on when the one that had it is gone: the open overlay, else
+    /// the focused tile, or the first tile in the Terminals view, the selected card in the
+    /// Swarm view, then the row of the open project. The workspace itself is the last resort.
+    pub(crate) fn landing_handle(&mut self, cx: &mut Context<Self>) -> FocusHandle {
+        if let Some(overlay) = self.overlay.as_ref() {
+            return overlay.focus_handle(cx);
+        }
+
+        let tile = match self.view {
+            View::Terminals => self
+                .focused_terminal
+                .filter(|terminal| self.tile_is_drawn(*terminal, cx))
+                .or_else(|| {
+                    self.layout
+                        .placed
+                        .first()
+                        .map(|(tile, _)| TerminalId(tile.0))
+                        .filter(|terminal| self.tile_is_drawn(*terminal, cx))
+                }),
+            View::Swarm | View::Review => None,
+        };
+        if let Some(terminal) = tile {
+            return self.tile_focus_handle(terminal, cx);
+        }
+
+        let card = (self.view == View::Swarm)
+            .then(|| self.selected_agent())
+            .flatten()
+            .and_then(|agent| self.swarm_focus.get(&agent).cloned());
+        if let Some(card) = card {
+            return card;
+        }
+
+        let row = (!self.sidebar_collapsed)
+            .then(|| self.project_focus.get(&self.active_project).cloned())
+            .flatten();
+
+        row.unwrap_or_else(|| self.focus_handle.clone())
     }
 
     fn observe_activation(window: &mut Window, cx: &mut Context<Self>) -> Subscription {
@@ -640,19 +709,56 @@ impl Workspace {
         } else {
             PlanFocus::Off
         };
+
         cx.notify();
     }
 
+    /// Opens the Terminals view, where the tiles are drawn. Does nothing when it is open.
+    fn show_terminals(&mut self, cx: &mut Context<Self>) {
+        if self.view != View::Terminals {
+            self.set_view(View::Terminals, cx);
+        }
+    }
+
     /// Opening a view this way clears the agent filter of Review. Only View diff sets it.
+    /// Review takes the keyboard focus.
     pub(crate) fn set_view(&mut self, view: View, cx: &mut Context<Self>) {
+        self.set_view_keeping_focus(view, cx);
+        self.pending_review_focus = view == View::Review;
+    }
+
+    /// Like `set_view`, but Review does not take the keyboard focus. The View control uses
+    /// it while an arrow key moves over its segments.
+    pub(crate) fn set_view_keeping_focus(&mut self, view: View, cx: &mut Context<Self>) {
         self.view = view;
         if view != View::Review {
             self.forget_comment_listing();
         }
         self.review_agent = None;
         self.review_file = None;
-        self.pending_review_focus = view == View::Review;
+        self.pending_review_focus = false;
         cx.notify();
+    }
+
+    /// Opens a view from a shortcut and puts the focus on its first control, so the keys of
+    /// the view work at once: the focused tile, the selected card, or the diff.
+    pub(crate) fn show_view(&mut self, view: View, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_view(view, cx);
+
+        if self.overlay.is_some() {
+            return;
+        }
+
+        match view {
+            View::Terminals => self.pending_focus = self.focused_terminal,
+            View::Swarm => {
+                if let Some(agent) = self.selected_agent() {
+                    let card = self.swarm_handle(agent, cx);
+                    window.focus(&card, cx);
+                }
+            }
+            View::Review => {}
+        }
     }
 
     /// Collapses the sidebar to its rail, or expands it. Focus in the sidebar or the rail moves
@@ -751,8 +857,10 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Opens the Terminals view, restores the tile from the tray and focuses it.
     pub(crate) fn focus_terminal(&mut self, terminal: TerminalId, cx: &mut Context<Self>) {
         self.minimized.remove(&terminal);
+        self.show_terminals(cx);
         self.claim_focus(terminal, cx);
     }
 
@@ -813,7 +921,22 @@ impl Workspace {
         }
     }
 
-    /// Moves keyboard focus to the terminal that `focus_terminal` picked.
+    /// True when the tile of `terminal` is part of the frame being built: the Terminals view
+    /// shows it in the layout. Focus on a tile that is not drawn is lost.
+    fn tile_is_drawn(&self, terminal: TerminalId, cx: &App) -> bool {
+        self.view == View::Terminals
+            && !self.has_no_projects()
+            && !self.shows_welcome(cx)
+            && self.data.terminal(terminal).is_some()
+            && self
+                .layout
+                .placed
+                .iter()
+                .any(|(tile, _)| tile.0 == terminal.0)
+    }
+
+    /// Moves keyboard focus to the terminal that `focus_terminal` picked, once its tile is
+    /// drawn. A tile that is not drawn leaves the focus where it is.
     fn apply_pending_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.overlay.is_some() {
             return;
@@ -821,19 +944,65 @@ impl Workspace {
         let Some(terminal) = self.pending_focus.take() else {
             return;
         };
+        if !self.tile_is_drawn(terminal, cx) {
+            return;
+        }
 
+        let handle = self.tile_focus_handle(terminal, cx);
+
+        window.focus(&handle, cx);
+    }
+
+    /// The handle that takes keyboard focus for the tile of `terminal`. A sample orchestrator
+    /// tile takes it in its input.
+    pub(crate) fn tile_focus_handle(
+        &mut self,
+        terminal: TerminalId,
+        cx: &mut Context<Self>,
+    ) -> FocusHandle {
         let is_orchestrator = self
             .data
             .terminal(terminal)
             .is_some_and(|entry| entry.kind == TerminalKind::Orchestrator)
             && !self.live_terminals.contains_key(&terminal);
-        let handle = if is_orchestrator {
+
+        if is_orchestrator {
             self.orchestrator_input.focus_handle(cx)
         } else {
             self.terminal_focus_handle(terminal, cx)
-        };
+        }
+    }
 
-        window.focus(&handle, cx);
+    /// Makes the tile that holds keyboard focus the focused one, so its ring follows Tab.
+    fn follow_keyboard_focus(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.focus_landed)
+            || self.pending_focus.is_some()
+            || self.overlay.is_some()
+        {
+            return;
+        }
+
+        let orchestrator_input = self.orchestrator_input.focus_handle(cx);
+        let holder = self
+            .terminal_focus
+            .iter()
+            .find(|(_, handle)| handle.contains_focused(window, cx))
+            .map(|(terminal, _)| *terminal)
+            .or_else(|| {
+                orchestrator_input
+                    .contains_focused(window, cx)
+                    .then(|| self.active_task().orchestrator)
+                    .flatten()
+                    .and_then(|agent| self.data.agent(agent))
+                    .map(|agent| agent.terminal)
+            });
+
+        if let Some(terminal) = holder
+            && self.focused_terminal != Some(terminal)
+        {
+            self.focused_terminal = Some(terminal);
+            self.note_recent_focus(terminal);
+        }
     }
 
     /// Moves keyboard focus into Review after it opened, so its keys work at once.
@@ -954,14 +1123,14 @@ impl Workspace {
                 .id("workspace")
                 .key_context(swarm_ui::ROOT_CONTEXT)
                 .track_focus(&self.focus_handle)
-                .on_action(cx.listener(|this, _: &ShowTerminals, _, cx| {
-                    this.set_view(View::Terminals, cx);
+                .on_action(cx.listener(|this, _: &ShowTerminals, window, cx| {
+                    this.show_view(View::Terminals, window, cx);
                 }))
-                .on_action(cx.listener(|this, _: &ShowSwarm, _, cx| {
-                    this.set_view(View::Swarm, cx);
+                .on_action(cx.listener(|this, _: &ShowSwarm, window, cx| {
+                    this.show_view(View::Swarm, window, cx);
                 }))
-                .on_action(cx.listener(|this, _: &ShowReview, _, cx| {
-                    this.set_view(View::Review, cx);
+                .on_action(cx.listener(|this, _: &ShowReview, window, cx| {
+                    this.show_view(View::Review, window, cx);
                 }))
                 .on_action(cx.listener(|this, _: &ToggleFiles, _, cx| {
                     this.toggle_panel(RightPanel::Files, cx);
@@ -1172,7 +1341,6 @@ impl Render for Workspace {
         self.sync_swarm_tasks(window.is_window_active(), cx);
         self.sync_usage_clock(window.is_window_active(), cx);
         self.sync_pull_requests(window.is_window_active(), window, cx);
-        self.apply_pending_focus(window, cx);
         self.apply_pending_review_focus(window, cx);
         self.apply_pending_pr_focus(window, cx);
         self.ensure_focus_handles(cx);
@@ -1182,8 +1350,10 @@ impl Render for Workspace {
             self.ensure_swarm_handles(cx);
         }
 
+        self.follow_keyboard_focus(window, cx);
         self.measure_cells(window, cx);
         self.layout = views::compute_layout(self);
+        self.apply_pending_focus(window, cx);
 
         if let Some(welcome) = self.welcome_screen(window, cx) {
             let overlay = self.overlay.as_ref().map(Overlay::element);
@@ -1204,20 +1374,20 @@ impl Render for Workspace {
             .visible_panel()
             .map(|_| panels::render(self, window, cx));
         let overlay = self.overlay.as_ref().map(Overlay::element);
+        let panel_label = match self.visible_panel() {
+            Some(RightPanel::Files) => "Files",
+            Some(RightPanel::PullRequest) => "Pull request",
+            Some(RightPanel::Changes) | None => "Changes",
+        };
 
         let body = h_flex()
             .flex_1()
             .min_h_0()
             .child(div().flex_1().min_w_0().h_full().child(views))
-            .children(right_panel.map(|panel_element| {
-                div()
-                    .w(RIGHT_PANEL_WIDTH)
-                    .flex_none()
-                    .h_full()
-                    .border_l_1()
-                    .border_color(line)
-                    .child(panel_element)
-            }));
+            .children(
+                right_panel
+                    .map(|panel_element| right_panel_slot(panel_label, line).child(panel_element)),
+            );
 
         let root = self.root(cx);
 
@@ -1255,6 +1425,20 @@ impl Render for Workspace {
             .children(self.eggs_layer(cx))
             .into_any_element()
     }
+}
+
+/// The column of the right panel. A complementary landmark named after the panel, so a screen
+/// reader user can jump to it.
+fn right_panel_slot(label: &'static str, line: Hsla) -> Stateful<Div> {
+    div()
+        .id("right-panel")
+        .role(Role::Complementary)
+        .aria_label(label)
+        .w(RIGHT_PANEL_WIDTH)
+        .flex_none()
+        .h_full()
+        .border_l_1()
+        .border_color(line)
 }
 
 /// Makes the app follow Reduce Motion as `reduced` says, whatever System Settings says.
@@ -1889,6 +2073,373 @@ mod tests {
         redraw(cx);
         let palette = workspace.read_with(cx, |workspace, _| workspace.overlay.is_some());
         assert!(palette, "Cmd-K does nothing after the focused row went");
+    }
+
+    #[gpui::test]
+    fn focus_lost_behind_an_open_overlay_lands_in_the_overlay(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        redraw(cx);
+        cx.simulate_keystrokes("cmd-k");
+        redraw(cx);
+        let overlay = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .overlay
+                .as_ref()
+                .map(|overlay| overlay.focus_handle(cx))
+        });
+        let overlay = overlay.expect("the palette is open");
+
+        cx.update(Window::blur);
+        redraw(cx);
+        redraw(cx);
+
+        assert!(cx.update(|window, cx| overlay.contains_focused(window, cx)));
+    }
+
+    #[gpui::test]
+    fn the_right_panel_is_a_complementary_landmark_named_after_the_panel(cx: &mut TestAppContext) {
+        use gpui::Element as _;
+        use gpui::accesskit::{Node, Role as AccessRole};
+
+        cx.update(swarm_ui::theme::init);
+
+        let element = right_panel_slot("Files", gpui::black()).into_element();
+        let mut node = Node::new(AccessRole::Unknown);
+        element.write_a11y_info(&mut node);
+
+        assert_eq!(element.a11y_role(), Some(AccessRole::Complementary));
+        assert_eq!(node.label(), Some("Files"));
+    }
+
+    /// True when the handle of the tile of `terminal` has the keyboard focus.
+    fn tile_holds_focus(
+        workspace: &Entity<Workspace>,
+        terminal: TerminalId,
+        cx: &mut VisualTestContext,
+    ) -> bool {
+        let handle = workspace.update(cx, |workspace, cx| {
+            workspace.tile_focus_handle(terminal, cx)
+        });
+
+        cx.update(|window, _| handle.is_focused(window))
+    }
+
+    fn view_of(workspace: &Entity<Workspace>, cx: &VisualTestContext) -> View {
+        workspace.read_with(cx, |workspace, _| workspace.view)
+    }
+
+    /// Opens the Swarm view and runs `enter`, which returns the terminal it wants focused.
+    fn enter_from_swarm(
+        cx: &mut TestAppContext,
+        enter: impl FnOnce(&mut Workspace, &mut Context<Workspace>) -> TerminalId,
+    ) -> (View, bool) {
+        let (workspace, cx) = setup(cx);
+        workspace.update(cx, |workspace, cx| workspace.set_view(View::Swarm, cx));
+        redraw(cx);
+
+        let target = workspace.update(cx, enter);
+        redraw(cx);
+
+        (
+            view_of(&workspace, cx),
+            tile_holds_focus(&workspace, target, cx),
+        )
+    }
+
+    /// True when something has keyboard focus and it is not the tile of `terminal`.
+    fn focus_is_on_a_drawn_control_not_the_tile(
+        workspace: &Entity<Workspace>,
+        terminal: TerminalId,
+        cx: &mut VisualTestContext,
+    ) -> bool {
+        let tile = workspace.update(cx, |workspace, cx| {
+            workspace.tile_focus_handle(terminal, cx)
+        });
+        let focused = cx.update(|window, cx| window.focused(cx));
+
+        focused.is_some() && focused != Some(tile)
+    }
+
+    #[gpui::test]
+    fn from_the_swarm_view_enter_on_a_task_tab_keeps_the_view(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        workspace.update(cx, |workspace, cx| workspace.set_view(View::Swarm, cx));
+        redraw(cx);
+
+        let target = workspace.update(cx, |workspace, cx| {
+            workspace.select_task(TaskId(1), cx);
+
+            orchestrator_terminal(workspace)
+        });
+        redraw(cx);
+
+        assert_eq!(view_of(&workspace, cx), View::Swarm);
+        assert!(focus_is_on_a_drawn_control_not_the_tile(
+            &workspace, target, cx
+        ));
+    }
+
+    #[gpui::test]
+    fn from_the_swarm_view_enter_on_a_project_row_keeps_the_view(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        workspace.update(cx, |workspace, cx| workspace.set_view(View::Swarm, cx));
+        redraw(cx);
+
+        let target = workspace.update(cx, |workspace, cx| {
+            workspace.select_project(workspace.active_project, cx);
+
+            orchestrator_terminal(workspace)
+        });
+        redraw(cx);
+
+        assert_eq!(view_of(&workspace, cx), View::Swarm);
+        assert!(focus_is_on_a_drawn_control_not_the_tile(
+            &workspace, target, cx
+        ));
+    }
+
+    #[gpui::test]
+    fn from_the_review_view_enter_on_a_task_tab_keeps_the_view(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        workspace.update(cx, |workspace, cx| workspace.set_view(View::Review, cx));
+        redraw(cx);
+
+        let target = workspace.update(cx, |workspace, cx| {
+            workspace.select_task(TaskId(1), cx);
+
+            orchestrator_terminal(workspace)
+        });
+        redraw(cx);
+
+        assert_eq!(view_of(&workspace, cx), View::Review);
+        assert!(focus_is_on_a_drawn_control_not_the_tile(
+            &workspace, target, cx
+        ));
+    }
+
+    #[gpui::test]
+    fn from_the_swarm_view_a_tray_chip_or_agent_row_focuses_a_drawn_tile(cx: &mut TestAppContext) {
+        let (view, focused) = enter_from_swarm(cx, |workspace, cx| {
+            workspace.focus_terminal(TerminalId(1), cx);
+
+            TerminalId(1)
+        });
+
+        assert_eq!(view, View::Terminals);
+        assert!(focused);
+    }
+
+    #[gpui::test]
+    fn from_the_swarm_view_a_number_key_focuses_a_drawn_tile(cx: &mut TestAppContext) {
+        let (view, focused) = enter_from_swarm(cx, |workspace, cx| {
+            workspace.focus_agent(1, cx);
+
+            TerminalId(1)
+        });
+
+        assert_eq!(view, View::Terminals);
+        assert!(focused);
+    }
+
+    #[gpui::test]
+    fn from_the_review_view_a_number_key_focuses_a_drawn_tile(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        workspace.update(cx, |workspace, cx| workspace.set_view(View::Review, cx));
+        redraw(cx);
+
+        workspace.update(cx, |workspace, cx| workspace.focus_agent(1, cx));
+        redraw(cx);
+
+        assert_eq!(view_of(&workspace, cx), View::Terminals);
+        assert!(tile_holds_focus(&workspace, TerminalId(1), cx));
+    }
+
+    #[gpui::test]
+    fn a_pending_focus_on_a_tile_that_is_not_drawn_leaves_the_focus_on_a_drawn_control(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = setup(cx);
+        workspace.update(cx, |workspace, cx| workspace.set_view(View::Swarm, cx));
+        redraw(cx);
+
+        workspace.update(cx, |workspace, cx| workspace.claim_focus(TerminalId(1), cx));
+        redraw(cx);
+
+        let focused = cx.update(|window, cx| window.focused(cx));
+        let tile = workspace.update(cx, |workspace, cx| {
+            workspace.tile_focus_handle(TerminalId(1), cx)
+        });
+        assert!(focused.is_some(), "nothing has focus");
+        assert!(focused != Some(tile), "the tile is not drawn");
+    }
+
+    #[gpui::test]
+    fn a_tile_is_drawn_in_the_terminals_view_only(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        redraw(cx);
+
+        let in_terminals = workspace.read_with(cx, |workspace, cx| {
+            workspace.tile_is_drawn(TerminalId(1), cx)
+        });
+        workspace.update(cx, |workspace, cx| workspace.set_view(View::Swarm, cx));
+        let in_swarm = workspace.read_with(cx, |workspace, cx| {
+            workspace.tile_is_drawn(TerminalId(1), cx)
+        });
+
+        assert!(in_terminals);
+        assert!(!in_swarm);
+    }
+
+    #[gpui::test]
+    fn a_focused_tile_that_goes_away_moves_focus_to_a_drawn_control(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        focus_a_worker(&workspace, cx);
+
+        workspace.update(cx, |workspace, cx| workspace.set_view(View::Swarm, cx));
+        redraw(cx);
+        redraw(cx);
+
+        let card = workspace.update(cx, |workspace, cx| {
+            let agent = workspace.selected_agent().expect("an agent is selected");
+
+            workspace.swarm_handle(agent, cx)
+        });
+        assert!(cx.update(|window, _| card.is_focused(window)));
+    }
+
+    #[gpui::test]
+    fn the_ring_follows_the_tile_that_takes_keyboard_focus(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        redraw(cx);
+        let worker = workspace.update(cx, |workspace, cx| {
+            workspace.tile_focus_handle(TerminalId(2), cx)
+        });
+
+        cx.update(|window, cx| window.focus(&worker, cx));
+        redraw(cx);
+
+        let focused = workspace.read_with(cx, |workspace, _| workspace.focused_terminal);
+        assert_eq!(focused, Some(TerminalId(2)));
+    }
+
+    fn on_a_drawn_tile(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> bool {
+        let focused = workspace.read_with(cx, |workspace, _| workspace.focused_terminal);
+
+        focused.is_some_and(|terminal| tile_holds_focus(workspace, terminal, cx))
+    }
+
+    #[gpui::test]
+    fn removing_a_focused_project_row_moves_focus_to_the_row_of_the_open_project(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = setup(cx);
+        redraw(cx);
+        let (open, other) = workspace.read_with(cx, |workspace, _| {
+            let open = workspace.active_project;
+            let other = workspace
+                .data
+                .projects
+                .iter()
+                .map(|project| project.id)
+                .find(|id| *id != open)
+                .expect("a second project");
+
+            (open, other)
+        });
+        let rows = workspace.read_with(cx, |workspace, _| {
+            (
+                workspace.project_focus.get(&open).cloned(),
+                workspace.project_focus.get(&other).cloned(),
+            )
+        });
+        let (open_row, other_row) = (
+            rows.0.expect("the open project has a row"),
+            rows.1.expect("the other project has a row"),
+        );
+        cx.update(|window, cx| window.focus(&other_row, cx));
+        drop(other_row);
+        redraw(cx);
+
+        workspace.update(cx, |workspace, cx| workspace.project_removed(other, cx));
+        redraw(cx);
+        redraw(cx);
+
+        assert!(cx.update(|window, _| open_row.is_focused(window)));
+    }
+
+    #[gpui::test]
+    fn a_closed_tile_gives_the_focus_to_the_tile_beside_it(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        redraw(cx);
+        cx.dispatch_action(NewTerminal);
+        redraw(cx);
+        let user = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .active_task()
+                .user_terminals
+                .last()
+                .copied()
+                .expect("a user terminal")
+        });
+        workspace.update(cx, |workspace, cx| workspace.focus_terminal(user, cx));
+        redraw(cx);
+        assert!(tile_holds_focus(&workspace, user, cx));
+
+        workspace.update(cx, |workspace, cx| workspace.close_user_terminal(user, cx));
+        redraw(cx);
+        redraw(cx);
+
+        assert!(on_a_drawn_tile(&workspace, cx), "no tile has focus");
+        assert!(!tile_holds_focus(&workspace, user, cx));
+    }
+
+    #[gpui::test]
+    fn a_background_tab_that_closes_leaves_the_focus_on_a_drawn_tile(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        redraw(cx);
+        let bounds = cx.debug_bounds("tab-1").expect("the tab is on screen");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        redraw(cx);
+        workspace.update(cx, |workspace, cx| workspace.select_task(TaskId(0), cx));
+        redraw(cx);
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.remove_closed_task(TaskId(1), cx);
+        });
+        redraw(cx);
+        redraw(cx);
+
+        assert!(on_a_drawn_tile(&workspace, cx), "no tile has focus");
+    }
+
+    #[gpui::test]
+    fn the_view_shortcuts_put_the_focus_on_the_new_view(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        focus_a_worker(&workspace, cx);
+
+        cx.dispatch_action(ShowSwarm);
+        redraw(cx);
+        let card = workspace.update(cx, |workspace, cx| {
+            let agent = workspace.selected_agent().expect("an agent is selected");
+
+            workspace.swarm_handle(agent, cx)
+        });
+        let on_card = cx.update(|window, _| card.is_focused(window));
+
+        cx.dispatch_action(ShowTerminals);
+        redraw(cx);
+        let on_tile = on_a_drawn_tile(&workspace, cx);
+
+        cx.dispatch_action(ShowReview);
+        redraw(cx);
+        let body = workspace.read_with(cx, |workspace, cx| {
+            workspace.review.read(cx).body_focus().clone()
+        });
+        let on_diff = cx.update(|window, _| body.is_focused(window));
+
+        assert!(on_card, "the Swarm view has no focus");
+        assert!(on_tile, "the Terminals view has no focus");
+        assert!(on_diff, "Review has no focus");
     }
 
     /// Lets `time` pass on the GPUI clock and draws a frame.

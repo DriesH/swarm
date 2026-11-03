@@ -1,11 +1,15 @@
 //! Tab bar: the project's tasks, the view switch and the panel toggles. It fills the title bar
 //! to the right of the sidebar button.
 
-use gpui::{ClickEvent, Context, SharedString, Window, px};
+use std::cell::Cell;
+use std::rc::Rc;
+
+use gpui::{ClickEvent, Context, KeyDownEvent, SharedString, Window, div, px};
 use swarm_ui::prelude::*;
 
 use crate::actions::{NewTask, PlanWithOrchestrator};
 use crate::model::{Task, TaskId, TaskStatus};
+use crate::review_model::plural;
 use crate::window_drag::drag_region;
 use crate::workspace::{RightPanel, View, Workspace};
 
@@ -36,6 +40,7 @@ pub(crate) fn render(
     let panels_disabled = workspace.view == View::Swarm;
     let changes_disabled = workspace.view != View::Terminals;
     let pull_request = workspace.pull_request_toggle_label(task.id);
+    let pull_request_spoken = workspace.pull_request_toggle_spoken(task.id);
 
     h_flex()
         .flex_1()
@@ -67,20 +72,17 @@ pub(crate) fn render(
                                 workspace.toggle_panel(RightPanel::Files, cx);
                             }),
                         ))
-                        .child(
-                            panel_toggle(
-                                "changes",
-                                "Changes",
-                                IconName::Branch,
-                                panel == Some(RightPanel::Changes),
-                                changes_disabled,
-                                cx.listener(|workspace, _, _, cx| {
-                                    workspace.toggle_panel(RightPanel::Changes, cx);
-                                }),
-                            )
-                            .end_slot(changes_count(stat.additions, stat.deletions)),
-                        )
+                        .child(changes_toggle(
+                            panel == Some(RightPanel::Changes),
+                            changes_disabled,
+                            (stat.additions, stat.deletions),
+                            cx.listener(|workspace, _, _, cx| {
+                                workspace.toggle_panel(RightPanel::Changes, cx);
+                            }),
+                        ))
                         .children(pull_request.map(|label| {
+                            let spoken = pull_request_spoken.unwrap_or_else(|| label.clone());
+
                             panel_toggle(
                                 "pull-request",
                                 label,
@@ -91,6 +93,7 @@ pub(crate) fn render(
                                     workspace.toggle_panel(RightPanel::PullRequest, cx);
                                 }),
                             )
+                            .accessible_label(spoken)
                         }))
                 }),
         )
@@ -121,23 +124,43 @@ fn task_tabs(workspace: &Workspace, cx: &mut Context<Workspace>) -> TabBar {
         })
 }
 
-fn view_control(workspace: &Workspace, cx: &mut Context<Workspace>) -> SegmentedControl {
+fn view_control(workspace: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement + use<> {
     let selected_view = VIEWS
         .iter()
         .position(|(view, _)| *view == workspace.view)
         .unwrap_or(0);
     let workspace_handle = cx.entity();
+    let arrowing = Rc::new(Cell::new(false));
+    let on_key = Rc::clone(&arrowing);
 
-    SegmentedControl::new("view", "View", VIEWS.map(|(_, label)| label))
+    let control = SegmentedControl::new("view", "View", VIEWS.map(|(_, label)| label))
         .selected(selected_view)
         .debug_selector(|| "view-control".to_owned())
         .on_select(move |index, _, cx| {
             let Some((view, _)) = VIEWS.get(index) else {
                 return;
             };
+            let arrowing = arrowing.take();
 
-            workspace_handle.update(cx, |workspace, cx| workspace.set_view(*view, cx));
+            workspace_handle.update(cx, |workspace, cx| {
+                if arrowing {
+                    workspace.set_view_keeping_focus(*view, cx);
+                } else {
+                    workspace.set_view(*view, cx);
+                }
+            });
+        });
+
+    // An arrow key selects a segment without opening Review's diff; a click, Enter and Space do.
+    div()
+        .capture_key_down(move |event: &KeyDownEvent, _, _| {
+            on_key.set(is_arrow(&event.keystroke.key));
         })
+        .child(control)
+}
+
+fn is_arrow(key: &str) -> bool {
+    matches!(key, "left" | "right" | "up" | "down")
 }
 
 pub(crate) fn ring_status(status: TaskStatus) -> AgentStatus {
@@ -164,26 +187,28 @@ fn task_tab(workspace: &Workspace, task: &Task, cx: &mut Context<Workspace>) -> 
     })
 }
 
+fn new_tab_trigger(open: bool) -> IconButton {
+    IconButton::new("new-tab", IconName::Plus, "New tab")
+        .size(IconButtonSize::Medium)
+        .expanded(open)
+}
+
 fn new_tab_menu() -> PopoverMenu {
-    PopoverMenu::new(
-        "new-tab-menu",
-        IconButton::new("new-tab", IconName::Plus, "New tab").size(IconButtonSize::Medium),
-        |_, _| {
-            Menu::new("new-tab-items", "New tab")
-                .item(
-                    MenuItem::new("new-task", "New task")
-                        .icon(IconName::PlusSquare)
-                        .on_select(|window, cx| window.dispatch_action(Box::new(NewTask), cx)),
-                )
-                .item(
-                    MenuItem::new("plan-with-orchestrator", "Plan with orchestrator")
-                        .icon(IconName::Bee)
-                        .on_select(|window, cx| {
-                            window.dispatch_action(Box::new(PlanWithOrchestrator), cx);
-                        }),
-                )
-        },
-    )
+    PopoverMenu::with_trigger("new-tab-menu", new_tab_trigger, |_, _| {
+        Menu::new("new-tab-items", "New tab")
+            .item(
+                MenuItem::new("new-task", "New task")
+                    .icon(IconName::PlusSquare)
+                    .on_select(|window, cx| window.dispatch_action(Box::new(NewTask), cx)),
+            )
+            .item(
+                MenuItem::new("plan-with-orchestrator", "Plan with orchestrator")
+                    .icon(IconName::Bee)
+                    .on_select(|window, cx| {
+                        window.dispatch_action(Box::new(PlanWithOrchestrator), cx);
+                    }),
+            )
+    })
 }
 
 fn panel_toggle(
@@ -201,6 +226,34 @@ fn panel_toggle(
         .disabled(disabled)
         .debug_selector(move || format!("{id}-button"))
         .on_click(on_click)
+}
+
+/// The Changes toggle with the counts it shows, which VoiceOver reads too.
+fn changes_toggle(
+    open: bool,
+    disabled: bool,
+    (additions, deletions): (u32, u32),
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Button {
+    panel_toggle(
+        "changes",
+        "Changes",
+        IconName::Branch,
+        open,
+        disabled,
+        on_click,
+    )
+    .accessible_label(changes_spoken(additions, deletions))
+    .end_slot(changes_count(additions, deletions))
+}
+
+/// What VoiceOver reads for the Changes toggle: its name and the counts it shows.
+fn changes_spoken(additions: u32, deletions: u32) -> String {
+    format!(
+        "Changes, {}, {}",
+        plural(additions, "addition", "additions"),
+        plural(deletions, "deletion", "deletions")
+    )
 }
 
 fn changes_count(additions: u32, deletions: u32) -> impl IntoElement {
@@ -272,6 +325,104 @@ mod tests {
 
         let view = workspace.read_with(cx, |workspace, _| workspace.view);
         assert_eq!(view, View::Review);
+    }
+
+    fn redraw(cx: &mut VisualTestContext) {
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+
+    /// Clicks the Terminals segment, then arrows over to Review.
+    fn arrow_onto_review(cx: &mut VisualTestContext) {
+        let bounds = cx
+            .debug_bounds("view-control")
+            .expect("the control is on screen");
+        cx.simulate_click(
+            gpui::point(bounds.left() + px(14.), bounds.center().y),
+            Modifiers::none(),
+        );
+        redraw(cx);
+
+        for _ in 0..2 {
+            cx.simulate_keystrokes("right");
+            redraw(cx);
+        }
+    }
+
+    fn review_body_has_focus(
+        workspace: &gpui::Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> bool {
+        let body = workspace.read_with(cx, |workspace, cx| {
+            workspace.review.read(cx).body_focus().clone()
+        });
+
+        cx.update(|window, _| body.is_focused(window))
+    }
+
+    #[gpui::test]
+    fn arrowing_onto_review_keeps_the_focus_on_the_view_control(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+
+        arrow_onto_review(cx);
+
+        let view = workspace.read_with(cx, |workspace, _| workspace.view);
+        assert_eq!(view, View::Review);
+        assert!(!review_body_has_focus(&workspace, cx));
+    }
+
+    #[gpui::test]
+    fn enter_on_review_moves_the_focus_into_the_diff(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        arrow_onto_review(cx);
+
+        cx.simulate_keystrokes("enter");
+        if let Ok(keystroke) = gpui::Keystroke::parse("enter") {
+            cx.simulate_event(gpui::KeyUpEvent { keystroke });
+        }
+        redraw(cx);
+
+        assert!(review_body_has_focus(&workspace, cx));
+    }
+
+    #[gpui::test]
+    fn the_changes_toggle_reads_its_counts(cx: &mut TestAppContext) {
+        use gpui::Element as _;
+        use gpui::accesskit::{Node, Role as AccessRole};
+
+        let (_, cx) = setup(cx);
+
+        let label = cx.update(|window, cx| {
+            let button = changes_toggle(false, false, (12, 1), |_, _, _| {});
+            let element = button.render(window, cx).into_element();
+            let mut node = Node::new(AccessRole::Unknown);
+            element.write_a11y_info(&mut node);
+
+            node.label().map(str::to_owned)
+        });
+
+        assert_eq!(label.as_deref(), Some("Changes, 12 additions, 1 deletion"));
+    }
+
+    #[gpui::test]
+    fn the_new_tab_button_reports_whether_its_menu_is_open(cx: &mut TestAppContext) {
+        use gpui::Element as _;
+        use gpui::accesskit::{Node, Role as AccessRole};
+
+        let (_, cx) = setup(cx);
+
+        let expanded = |open: bool, cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                let element = new_tab_trigger(open).render(window, cx).into_element();
+                let mut node = Node::new(AccessRole::Unknown);
+                element.write_a11y_info(&mut node);
+
+                node.is_expanded()
+            })
+        };
+
+        assert_eq!(expanded(false, cx), Some(false));
+        assert_eq!(expanded(true, cx), Some(true));
     }
 
     #[gpui::test]
@@ -1027,20 +1178,28 @@ mod tests {
         show_tasks(&workspace, 20, 1360., cx);
         let start = tab_bounds(&workspace, cx)[0].left();
 
-        let mut scrolled_to = Vec::new();
-        for _ in 0..70 {
+        // The tabs are one Tab stop. Tab until it reaches them, then End walks to the last tab.
+        let mut scrolled_to = start;
+        for _ in 0..40 {
             cx.simulate_keystrokes("tab");
             settle(cx);
+            cx.simulate_keystrokes("end");
+            settle(cx);
 
-            scrolled_to.push(tab_bounds(&workspace, cx)[0].left());
+            scrolled_to = tab_bounds(&workspace, cx)[0].left();
+            if scrolled_to < start {
+                break;
+            }
         }
 
-        // Focus walked through every tab, so the row must have followed it to the end.
-        let furthest = scrolled_to.iter().copied().fold(start, Ord::min);
-        let hidden = tab_bounds(&workspace, cx)[19].right() - bounds_of("task-tabs", cx).left();
+        // Focus is on the last tab, so the row must have followed it to the end.
+        let row = bounds_of("task-tabs", cx);
+        let last = tab_bounds(&workspace, cx)[19];
         assert!(
-            furthest < start - px(1000.),
-            "{furthest:?} vs {start:?} ({hidden:?})"
+            scrolled_to < start - px(1000.) && last.right() <= row.right() + px(1.),
+            "{scrolled_to:?} vs {start:?}, last tab ends at {:?} in a row that ends at {:?}",
+            last.right(),
+            row.right()
         );
     }
 }
