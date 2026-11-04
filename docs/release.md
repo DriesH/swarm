@@ -14,6 +14,7 @@
 
    The script uses the profile `swarm-notary`. Another name goes in `--notary-profile` or `$SWARM_NOTARY_PROFILE`.
 3. **Tools.** The Rust toolchain from `rust-toolchain.toml`, Zig 0.15 on `PATH`, and the Xcode command line tools.
+4. **Publishing.** `gh`, signed in with write access to `DriesH/swarm` (`gh auth status`), and git-cliff (`cargo install git-cliff`).
 
 ## Run it
 
@@ -58,6 +59,19 @@ Then start the signed app and make sure that the daemon accepts it. The daemon l
 - The app connects and shows its projects.
 - `--identity` with an Apple Development certificate gives an app that the daemon refuses. The app socket accepts Developer ID only.
 
+## Publish a release
+
+A release is a GitHub release of `DriesH/swarm` (ADR 0011). Installed apps find it through its `latest.json` (Updates in `PLAN.md`).
+
+1. On an up-to-date `main`, run `script/prepare-release 1.2.0`. It opens the PR `task(release): v1.2.0` with the new version in `Cargo.toml` and the new section of `CHANGELOG.md`. Read the section: it lists the titles of the `feat`, `fix` and `perf` PRs since the last release. Fix a title that does not read well for a user in `CHANGELOG.md` in that PR. Run it without a version to see the version git-cliff suggests.
+2. Merge the PR, then pull `main`.
+3. Run `script/bundle-mac`.
+4. Run `script/publish-update target/bundle/<folder>`. It checks the build, tags `v1.2.0`, and publishes the release with `Swarm-1.2.0.zip`, `Swarm.dmg` and `latest.json`.
+
+For the first release, pass `--notes-file <file>` to `publish-update` with a short hand-written note.
+
+If `publish-update` stops halfway, the release stays a draft and the app does not see it. Fix the cause and run it again: it reuses its own draft and tag.
+
 ## Entitlements
 
 There is none: no `Swarm.entitlements` file, and the script signs without `--entitlements`. The hardened runtime needs one only for code that the Swarm binaries do not have:
@@ -80,7 +94,7 @@ cargo run -p app_icon -- --png assets/app-icon/icon-1024.png
 ## Known limits
 
 - Apple Silicon only. There is no Intel or universal build.
-- No updates yet.
+- The updater and the publish scripts are not built yet (ADR 0011).
 - No test on a clean Mac yet.
 - A Finder launch gives the app a short `PATH`. Besides `PATH`, Swarm looks for agents and `gh` only in `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin` and `~/.claude/local`. A tool in another folder, such as one of a version manager, is not found. Not tried yet on a Finder launch.
 - `CFBundleVersion` is the same as the version until updates need a build number.

@@ -311,24 +311,31 @@ Files and folders in the Review tree, the Changes and Files panels and the inspe
 
 ### Updates
 
-Swarm updates itself from an S3 bucket (ADR 0010). There is one channel, `stable`.
+Swarm updates itself with its own updater (ADR 0010) from GitHub Releases of `DriesH/swarm` (ADR 0011). There is one channel, `stable`.
 
-**Bucket layout:**
+**A release** is the tag `v<version>` with these assets:
 
-- `stable/latest.json`: the manifest. It is served with `Cache-Control: no-cache`.
-- `stable/Swarm-<version>.zip`: one notarized and stapled `Swarm.app` per release, made with `ditto -c -k --keepParent`. Old zips stay in the bucket.
+- `Swarm-<version>.zip`: the notarized and stapled `Swarm.app`, made with `ditto -c -k --keepParent`.
+- `Swarm.dmg`: the notarized DMG. Its name has no version, so the website links to `releases/latest/download/Swarm.dmg`.
+- `latest.json`: the manifest. The app reads it at `https://github.com/DriesH/swarm/releases/latest/download/latest.json`. GitHub redirects that link to the newest published release.
+
+The release notes are the git-cliff section of that version (see Publish).
 
 **Manifest:**
 
 ```json
 {
   "version": "1.2.0",
-  "url": "https://<bucket host>/stable/Swarm-1.2.0.zip",
+  "url": "https://github.com/DriesH/swarm/releases/download/v1.2.0/Swarm-1.2.0.zip",
   "sha256": "<hex>",
   "minimum_macos": "13.0",
-  "published": "2026-12-01T10:00:00Z"
+  "published": "2026-12-01T10:00:00Z",
+  "notes_url": "https://github.com/DriesH/swarm/releases/tag/v1.2.0"
 }
 ```
+
+- `url` and `notes_url` must start with `https://github.com/DriesH/swarm/`. The app ignores a manifest that points elsewhere.
+- The app follows HTTPS redirects only (GitHub serves assets from its CDN).
 
 **Check:**
 
@@ -347,7 +354,7 @@ Swarm updates itself from an S3 bucket (ADR 0010). There is one channel, `stable
 
 **Install:**
 
-- The status bar shows **Update ready** with a **Restart to update** button. VoiceOver announces it once, as a status.
+- The status bar shows **Update ready** with a **Restart to update** button and a **Release notes** link that opens `notes_url`. VoiceOver announces it once, as a status.
 - On **Restart to update**, or when the app quits normally, a helper takes over. The helper is a copy of `swarm` in the update folder. It waits until the app exits, moves the old bundle to the Trash, moves the new bundle to the same path, and opens it.
 - If the app folder is not writable, the app does not install. It shows **Download** instead, which opens the zip's URL.
 
@@ -359,13 +366,20 @@ Swarm updates itself from an S3 bucket (ADR 0010). There is one channel, `stable
 
 **Publish (the person runs it, never an agent):**
 
-- `script/publish-update <version>` takes the stapled `Swarm.app` from `script/bundle-mac`, makes the zip, writes `latest.json`, and uploads both with the AWS CLI. It uploads the zip first and the manifest last.
+Release notes and `CHANGELOG.md` come from git-cliff (`cliff.toml`): `feat` PRs under **Added**, `fix` under **Fixed**, `perf` under **Faster**; `task` and the other types are left out. The PR title is the line, so it says what changed for the person using Swarm.
+
+1. `script/prepare-release <version>` on an up-to-date `main`: makes the branch `release-v<version>`, sets the workspace version in `Cargo.toml`, prepends the git-cliff section to `CHANGELOG.md` (`git cliff --unreleased --tag v<version> --prepend CHANGELOG.md`), commits `task(release): v<version>`, pushes and opens the PR. Without a version it prints the one `git cliff --bumped-version` suggests and stops.
+2. Merge the PR.
+3. `script/bundle-mac` on `main`.
+4. `script/publish-update <bundle folder>`: checks that `HEAD` is `origin/main`, that the bundle's version is the workspace version and has no tag yet, and that the app is signed, notarized and stapled. It makes the zip and `latest.json`, tags `v<version>` and pushes the tag, creates the GitHub release as a draft with the notes from `git cliff --latest --strip all`, uploads `Swarm-<version>.zip`, `Swarm.dmg` and `latest.json`, and then publishes the release. It never deletes a release or a tag.
+
+The first release, `v1.0.0`, gets a short hand-written note (`--notes-file`) instead of every PR so far. git-cliff takes over from the next release.
 
 **Not in v1:** delta updates, a beta channel, Intel builds.
 
 ### Websites
 
-- **Product website**: one page (designed on the canvas, Website page): hero with a workspace preview, three steps with app screenshots, features, harness, download. It uses the "hero left" board. The source is plain HTML and CSS in `site/`, with no build step. `.github/workflows/pages.yml` publishes it to GitHub Pages when `site/` changes on `main`. **Download for macOS** links to the latest GitHub release until the S3 bucket exists.
+- **Product website**: one page (designed on the canvas, Website page): hero with a workspace preview, three steps with app screenshots, features, harness, download. It uses the "hero left" board. The source is plain HTML and CSS in `site/`, with no build step. `.github/workflows/pages.yml` publishes it to GitHub Pages when `site/` changes on `main`. **Download for macOS** links to the latest GitHub release.
 - **Docs website**: every explanation that the app leaves out by design, plus the harness reference. It is a Starlight (Astro) site in `docs-site/`, with its own `package.json` and Node version (`docs-site/.node-version`). The same workflow builds it and serves it under `/docs/` next to the product website. **Swarm Help** in the app opens it.
 
 ### Project config
