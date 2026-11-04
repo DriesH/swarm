@@ -1,0 +1,44 @@
+name: Product website
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - "assets/fonts/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Assemble the site
+        run: |
+          mkdir -p _site/fonts
+          cp -R site/. _site/
+          cp assets/fonts/Geist-Regular.ttf assets/fonts/Geist-Medium.ttf assets/fonts/Geist-SemiBold.ttf \
+             assets/fonts/GeistMono-Regular.ttf assets/fonts/GeistMono-Medium.ttf assets/fonts/OFL.txt _site/fonts/
+
+      - uses: actions/configure-pages@v6
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+
+      - id: deployment
+        uses: actions/deploy-pages@v5
