@@ -242,21 +242,20 @@ impl Client {
         writer.flush()?;
 
         let mut buffer = Vec::new();
-        let hello: Event = read(&mut reader, &mut buffer).map_err(|error| match error {
-            FrameError::Io(io_error)
-                if matches!(
-                    io_error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) =>
-            {
-                ClientError::Timeout
-            }
-            FrameError::Codec(_) => ClientError::Incompatible,
-            other => ClientError::Frame(other),
-        })?;
+        let hello: Event = read_handshake_frame(&mut reader, &mut buffer)?;
 
         let daemon_pid = match hello {
             Event::Hello { version, pid } if version == VERSION => {
+                let challenge: Event = read_handshake_frame(&mut reader, &mut buffer)?;
+                let Event::Challenge { nonce } = challenge else {
+                    return Err(ClientError::Daemon(format!(
+                        "unexpected reply to Hello: {challenge:?}"
+                    )));
+                };
+
+                write(&mut writer, &Request::Prove { nonce })?;
+                writer.flush()?;
+
                 stream.set_read_timeout(None)?;
                 pid
             }
@@ -1108,6 +1107,24 @@ fn wait_for_socket(socket: &Path) -> Option<UnixStream> {
     None
 }
 
+fn read_handshake_frame(
+    reader: &mut BufReader<UnixStream>,
+    buffer: &mut Vec<u8>,
+) -> Result<Event, ClientError> {
+    read(reader, buffer).map_err(|error| match error {
+        FrameError::Io(io_error)
+            if matches!(
+                io_error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) =>
+        {
+            ClientError::Timeout
+        }
+        FrameError::Codec(_) => ClientError::Incompatible,
+        other => ClientError::Frame(other),
+    })
+}
+
 fn unexpected(request: &str, event: &Event) -> ClientError {
     ClientError::Daemon(format!("unexpected reply to {request}: {event:?}"))
 }
@@ -1185,6 +1202,7 @@ fn read_events(
                 },
             ),
             Event::Hello { .. } => log::debug!("ignoring a repeated Hello"),
+            Event::Challenge { .. } => log::debug!("ignoring a repeated Challenge"),
             Event::AgentChanged { agent } => {
                 if shared.agents.send(agent).is_err() {
                     log::debug!("agent event has no listener");

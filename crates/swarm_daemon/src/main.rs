@@ -8,6 +8,7 @@ mod comments;
 mod connection;
 mod hub;
 mod messages;
+mod peer_signature;
 mod processes;
 mod pull_requests;
 mod recovery;
@@ -129,6 +130,7 @@ fn run() -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("cannot remove the stale socket"),
     }
+    peer_signature::daemon_signing();
     let listener = UnixListener::bind(&paths.socket).context("cannot bind the socket")?;
     std::fs::set_permissions(&paths.socket, Permissions::from_mode(0o600))?;
 

@@ -13,10 +13,12 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+core-foundation.workspace = true
 env_logger.workspace = true
 flume.workspace = true
 libc.workspace = true
 log.workspace = true
+security-framework.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 swarm_core.workspace = true

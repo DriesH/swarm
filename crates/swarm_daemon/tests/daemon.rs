@@ -251,6 +251,13 @@ impl Client {
     }
 
     fn hello(&mut self) {
+        let nonce = self.hello_until_challenge();
+
+        self.send(&Request::Prove { nonce });
+    }
+
+    /// Says hello and returns the challenge nonce, leaving the proof to the caller.
+    fn hello_until_challenge(&mut self) -> String {
         self.send(&Request::Hello { version: VERSION });
         assert!(matches!(
             self.next(),
@@ -259,6 +266,11 @@ impl Client {
                 ..
             }
         ));
+
+        match self.next() {
+            Event::Challenge { nonce } => nonce,
+            other => panic!("expected a challenge, got {other:?}"),
+        }
     }
 
     /// Reads events until `pick` returns a value.
@@ -449,6 +461,43 @@ fn a_wrong_version_gets_the_daemons_version() {
     });
 
     assert!(matches!(client.next(), Event::Hello { version, .. } if version == VERSION));
+}
+
+#[test]
+fn a_request_instead_of_prove_closes_the_connection() {
+    let daemon = Daemon::start();
+    let mut client = daemon.connect();
+    client.hello_until_challenge();
+
+    client.send(&Request::List { call: CALL });
+
+    assert!(matches!(client.next(), Event::Error { call: None, .. }));
+    assert!(read::<Event>(&mut client.stream, &mut Vec::new()).is_err());
+}
+
+#[test]
+fn a_wrong_nonce_closes_the_connection() {
+    let daemon = Daemon::start();
+    let mut client = daemon.connect();
+    client.hello_until_challenge();
+
+    client.send(&Request::Prove {
+        nonce: "wrong".to_owned(),
+    });
+
+    assert!(matches!(client.next(), Event::Error { call: None, .. }));
+    assert!(read::<Event>(&mut client.stream, &mut Vec::new()).is_err());
+}
+
+#[test]
+fn the_right_nonce_is_served() {
+    let daemon = Daemon::start();
+    let mut client = daemon.connect();
+    client.hello();
+
+    client.send(&Request::List { call: CALL });
+
+    assert!(matches!(client.next(), Event::Terminals { call: CALL, .. }));
 }
 
 #[test]
