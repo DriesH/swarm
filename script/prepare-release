@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+# Opens the release PR: the new workspace version and the new CHANGELOG.md section. See docs/release.md.
+#
+# Usage: script/prepare-release [--first] [<version>]
+#
+# Run it on an up-to-date main. Without a version it only prints what git-cliff suggests.
+# It makes a new branch and a new PR, and never deletes or overwrites a branch or a tag.
+set -euo pipefail
+
+REPO="DriesH/swarm"
+
+usage() {
+    cat <<'USAGE'
+Usage: script/prepare-release [--first] [<version>]
+
+  <version>   MAJOR.MINOR.PATCH, higher than the workspace version. Without it, the script
+              prints the current version, the last tag and the version git-cliff suggests.
+  --first     first release: the CHANGELOG.md section says "First release." only
+USAGE
+}
+
+fail() {
+    printf 'prepare-release: %s\n' "$*" >&2
+    exit 1
+}
+
+step() {
+    printf '\n==> %s\n' "$*"
+}
+
+first=0
+version=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --first) first=1 ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        -*) fail "unknown option: $1 (see --help)" ;;
+        *)
+            [[ -z $version ]] || fail "give one version only"
+            version="$1"
+            ;;
+    esac
+    shift
+done
+
+if [[ $first -eq 1 && -z $version ]]; then
+    fail "--first needs a version"
+fi
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$root"
+
+[[ -f Cargo.toml && -f cliff.toml && -d .git ]] || fail "run this in the Swarm repository (found no Cargo.toml, cliff.toml and .git in $root)"
+
+# The workspace version in Cargo.toml.
+workspace_version() {
+    awk '
+        /^\[workspace\.package\]/ { in_package = 1; next }
+        /^\[/ { in_package = 0 }
+        in_package && /^version[[:space:]]*=/ {
+            gsub(/^[^"]*"/, "")
+            gsub(/".*$/, "")
+            print
+            exit
+        }
+    ' Cargo.toml
+}
+
+# True when the tag exists here or on origin.
+tag_exists() {
+    git rev-parse -q --verify "refs/tags/$1" >/dev/null && return 0
+    [[ -n "$(git ls-remote --tags origin "refs/tags/$1")" ]]
+}
+
+step "Checking the repository"
+command -v gh >/dev/null || fail "gh is not installed"
+command -v git-cliff >/dev/null || fail "git-cliff is not installed (cargo install git-cliff)"
+gh auth status >/dev/null 2>&1 || fail "gh is not signed in (gh auth login)"
+
+branch="$(git rev-parse --abbrev-ref HEAD)"
+[[ $branch == "main" ]] || fail "you are on '$branch'; switch to main"
+[[ -z "$(git status --porcelain)" ]] || fail "the working tree is not clean; commit or stash your changes"
+
+git fetch --quiet origin --tags
+[[ "$(git rev-parse HEAD)" == "$(git rev-parse origin/main)" ]] || fail "main is not the same as origin/main; pull or push first"
+
+current="$(workspace_version)"
+[[ $current =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "cannot read the workspace version from Cargo.toml (got '$current')"
+
+last_tag="$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' 2>/dev/null || true)"
+
+if [[ -z $version ]]; then
+    printf 'Workspace version: %s\n' "$current"
+
+    if [[ -z $last_tag ]]; then
+        printf 'Last tag: none\n'
+        printf 'No release yet, pick the first version, for example 1.0.0\n'
+    else
+        printf 'Last tag: %s\n' "$last_tag"
+        printf 'git-cliff suggests: %s\n' "$(git cliff --bumped-version)"
+    fi
+    exit 0
+fi
+
+step "Checking version $version"
+[[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "'$version' is not MAJOR.MINOR.PATCH"
+
+if [[ $version == "$current" ]]; then
+    # Only the first release may keep the version that is in Cargo.toml.
+    if tag_exists "v$current"; then
+        fail "v$current is already released; pick a higher version"
+    fi
+else
+    highest="$(printf '%s\n%s\n' "$current" "$version" | sort -V | tail -n 1)"
+    [[ $highest == "$version" ]] || fail "$version is not higher than the workspace version $current"
+fi
+
+if tag_exists "v$version"; then
+    fail "the tag v$version exists already (here or on origin)"
+fi
+
+release_branch="release-v$version"
+if git rev-parse -q --verify "refs/heads/$release_branch" >/dev/null ||
+    [[ -n "$(git ls-remote --heads origin "refs/heads/$release_branch")" ]]; then
+    fail "the branch $release_branch exists already (here or on origin)"
+fi
+
+step "Making branch $release_branch"
+git switch --create "$release_branch"
+
+step "Setting the version in Cargo.toml"
+tmp="$(mktemp)"
+awk -v new="$version" '
+    /^\[workspace\.package\]/ { in_package = 1 }
+    /^\[/ && !/^\[workspace\.package\]/ { in_package = 0 }
+    in_package && !done && /^version[[:space:]]*=/ {
+        print "version = \"" new "\""
+        done = 1
+        next
+    }
+    { print }
+' Cargo.toml >"$tmp"
+cat "$tmp" >Cargo.toml
+[[ "$(workspace_version)" == "$version" ]] || fail "Cargo.toml does not say $version after the edit (the temporary copy is $tmp)"
+
+step "Updating Cargo.lock"
+cargo update --workspace
+
+step "Writing CHANGELOG.md"
+if [[ $first -eq 1 ]]; then
+    [[ ! -e CHANGELOG.md ]] || fail "--first needs that CHANGELOG.md does not exist yet"
+
+    # The header and the heading follow cliff.toml.
+    cat >CHANGELOG.md <<CHANGELOG
+# Changelog
+
+Every release of Swarm. The newest is on top.
+
+## $version ($(date -u +%Y-%m-%d))
+
+First release.
+CHANGELOG
+elif [[ -e CHANGELOG.md ]]; then
+    git cliff --unreleased --tag "v$version" --prepend CHANGELOG.md
+else
+    # --prepend needs a file that exists, so the first run writes it with the header.
+    git cliff --unreleased --tag "v$version" --output CHANGELOG.md
+fi
+
+grep -q "^## $version " CHANGELOG.md || fail "CHANGELOG.md has no section for $version"
+if [[ $first -eq 0 ]] && ! awk -v v="## $version " 'index($0, v) == 1 { found = 1; next } found && /^## / { exit } found && /^- / { entry = 1 } END { exit !entry }' CHANGELOG.md; then
+    fail "no feat, fix or perf PR since ${last_tag:-the start}; there is nothing to release (the branch $release_branch is local only)"
+fi
+
+git add Cargo.toml Cargo.lock CHANGELOG.md
+printf '\n--- Section for %s ---\n' "$version"
+awk -v v="## $version " 'index($0, v) == 1 { found = 1 } found && /^## / && !index($0, v) { exit } found' CHANGELOG.md
+printf -- '--- end ---\n'
+git --no-pager diff --cached --stat
+
+step "Committing and pushing"
+git commit --quiet --message "task(release): v$version" -- Cargo.toml Cargo.lock CHANGELOG.md
+git push --set-upstream origin "$release_branch"
+
+step "Opening the pull request"
+body="$(
+    cat <<BODY
+## What
+
+- set the version to $version
+- added the $version section to CHANGELOG.md
+
+## Why
+
+- release $version
+
+## Notes for reviewers
+
+- read the CHANGELOG.md section: each line is a PR title and becomes a release note
+
+## Open tasks
+
+- [ ] after merge: script/bundle-mac, then script/publish-update
+BODY
+)"
+gh pr create --repo "$REPO" --base main --head "$release_branch" --title "task(release): v$version" --body "$body"
