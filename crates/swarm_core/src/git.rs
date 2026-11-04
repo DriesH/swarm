@@ -1969,6 +1969,48 @@ pub fn uncommitted_paths(worktree: &Path) -> Result<HashSet<Vec<u8>>, Error> {
         .collect())
 }
 
+/// The sorted paths in `worktree` that git tracks, plus the untracked ones that are not
+/// ignored. A tracked file removed from disk is left out. A list longer than `limit` is
+/// cut, and the count says how many paths went.
+pub fn worktree_files(worktree: &Path, limit: usize) -> Result<(Vec<String>, usize), Error> {
+    let (arguments, output) = execute(
+        worktree,
+        [
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ],
+    )?;
+    if !output.success {
+        return Err(failure(&arguments, &output));
+    }
+
+    let mut files = nul_separated_paths(&output.raw);
+    files.sort_unstable();
+    files.dedup();
+
+    let (arguments, output) = execute(worktree, ["ls-files", "--deleted", "-z"])?;
+    if !output.success {
+        return Err(failure(&arguments, &output));
+    }
+    let deleted: HashSet<String> = nul_separated_paths(&output.raw).into_iter().collect();
+    files.retain(|path| !deleted.contains(path));
+
+    let omitted = files.len().saturating_sub(limit);
+    files.truncate(limit);
+
+    Ok((files, omitted))
+}
+
+fn nul_separated_paths(raw: &[u8]) -> Vec<String> {
+    raw.split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .collect()
+}
+
 /// The project's local branches, newest commit first.
 pub fn local_branches(root: &Path) -> Result<Vec<String>, Error> {
     let listed = run(
@@ -2429,6 +2471,72 @@ mod tests {
 
         assert_eq!(found.len(), 10_000);
         assert!(found.values().all(|fold| *fold == Fold::Generated));
+    }
+
+    fn repository_with_files(name: &str) -> Folder {
+        let folder = Folder::new(name);
+        let root = folder.0.as_path();
+        let identity = ["-c", "user.name=Test", "-c", "user.email=test@example.com"];
+        run(root, ["init", "-q"]).expect("init");
+        std::fs::create_dir(root.join("src")).expect("folder");
+        std::fs::write(root.join(".gitignore"), "target/\n").expect("ignore");
+        std::fs::write(root.join("src/b.rs"), "b\n").expect("tracked");
+        std::fs::write(root.join("a.txt"), "a\n").expect("tracked");
+        std::fs::write(root.join("gone.txt"), "gone\n").expect("tracked");
+        run(root, ["add", "."]).expect("add");
+        run(
+            root,
+            identity.into_iter().chain(["commit", "-q", "-m", "first"]),
+        )
+        .expect("commit");
+
+        std::fs::remove_file(root.join("gone.txt")).expect("remove");
+        std::fs::create_dir(root.join("target")).expect("folder");
+        std::fs::write(root.join("target/out.bin"), "x").expect("ignored");
+        std::fs::write(root.join("new.txt"), "new\n").expect("untracked");
+
+        folder
+    }
+
+    #[test]
+    fn worktree_files_lists_tracked_and_untracked_files_sorted() {
+        let folder = repository_with_files("files-listed");
+
+        let (files, omitted) = worktree_files(&folder.0, 100).expect("files");
+
+        assert_eq!(files, [".gitignore", "a.txt", "new.txt", "src/b.rs"]);
+        assert_eq!(omitted, 0);
+    }
+
+    #[test]
+    fn worktree_files_keeps_paths_with_spaces_and_newlines_and_drops_deleted_ones() {
+        let folder = repository_with_files("files-odd-names");
+        std::fs::write(folder.0.join("two words.txt"), "x").expect("untracked");
+        std::fs::write(folder.0.join("line\nbreak.txt"), "x").expect("untracked");
+
+        let (files, _) = worktree_files(&folder.0, 100).expect("files");
+
+        assert_eq!(
+            files,
+            [
+                ".gitignore",
+                "a.txt",
+                "line\nbreak.txt",
+                "new.txt",
+                "src/b.rs",
+                "two words.txt"
+            ]
+        );
+    }
+
+    #[test]
+    fn worktree_files_counts_the_paths_it_cuts() {
+        let folder = repository_with_files("files-cut");
+
+        let (files, omitted) = worktree_files(&folder.0, 3).expect("files");
+
+        assert_eq!(files.len(), 3);
+        assert_eq!(omitted, 1);
     }
 
     #[test]

@@ -10,8 +10,10 @@ use serde::{Deserialize, Serialize};
 use swarm_protocol::{AgentKind, AgentRole, NoticeKind};
 use toml_edit::{DocumentMut, Item, Table, Value};
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
-#[serde(default)]
+/// Every section reads the same way: a key whose value has the wrong type or is out of
+/// range falls back to that key's default, and the other keys still load. Only a file that
+/// is not valid TOML fails, in [`load`]. A typo must not stop the daemon from starting agents.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct Settings {
     /// The welcome screen was dealt with: skipped, or left to open a project. It shows
     /// only while this is false.
@@ -20,6 +22,122 @@ pub struct Settings {
     pub terminals: TerminalSettings,
     pub notifications: NotificationSettings,
     pub appearance: AppearanceSettings,
+}
+
+impl<'de> Deserialize<'de> for Settings {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let table = toml::Table::deserialize(deserializer)?;
+        let mut warnings = Vec::new();
+        let settings = Self::from_table(table, &mut warnings);
+
+        for warning in &warnings {
+            log::warn!("settings: {warning}");
+        }
+
+        Ok(settings)
+    }
+}
+
+impl Settings {
+    fn from_table(table: toml::Table, warnings: &mut Vec<String>) -> Self {
+        let mut root = Section {
+            name: String::new(),
+            table,
+            warnings,
+        };
+
+        Self {
+            welcome_done: root.take("welcome_done", false, BOOL),
+            agents: AgentSettings::read(root.child("agents")),
+            terminals: TerminalSettings::read(root.child("terminals")),
+            notifications: NotificationSettings::read(root.child("notifications")),
+            appearance: AppearanceSettings::read(root.child("appearance")),
+        }
+    }
+}
+
+const BOOL: &str = "a true/false value";
+const NUMBER: &str = "a whole number";
+const TEXT: &str = "text";
+
+/// One table of the file, read key by key. A key that is missing keeps its default; one
+/// that is not valid keeps it too and adds a warning that names the key.
+struct Section<'a> {
+    name: String,
+    table: toml::Table,
+    warnings: &'a mut Vec<String>,
+}
+
+impl<'a> Section<'a> {
+    fn new(name: &str, value: Option<toml::Value>, warnings: &'a mut Vec<String>) -> Self {
+        let table = match value {
+            None => toml::Table::new(),
+            Some(toml::Value::Table(table)) => table,
+            Some(_) => {
+                warnings.push(format!("{name}: not a table, using the defaults"));
+
+                toml::Table::new()
+            }
+        };
+
+        Self {
+            name: name.to_owned(),
+            table,
+            warnings,
+        }
+    }
+
+    fn path(&self, key: &str) -> String {
+        if self.name.is_empty() {
+            key.to_owned()
+        } else {
+            format!("{}.{key}", self.name)
+        }
+    }
+
+    /// The table under `key` as a section of its own. Use it before `self` again.
+    fn child(&mut self, key: &str) -> Section<'_> {
+        let value = self.table.remove(key);
+        let name = self.path(key);
+
+        Section::new(&name, value, self.warnings)
+    }
+
+    /// The value under `key`, or `default` when it is missing or not valid.
+    fn take<T: DeserializeOwned + Serialize>(
+        &mut self,
+        key: &str,
+        default: T,
+        expected: &str,
+    ) -> T {
+        self.take_if(key, default, expected, |_| true)
+    }
+
+    /// Like [`Self::take`], and a value that `accepts` refuses falls back as well.
+    fn take_if<T: DeserializeOwned + Serialize>(
+        &mut self,
+        key: &str,
+        default: T,
+        expected: &str,
+        accepts: impl FnOnce(&T) -> bool,
+    ) -> T {
+        let Some(value) = self.table.remove(key) else {
+            return default;
+        };
+
+        match T::deserialize(value) {
+            Ok(read) if accepts(&read) => read,
+            _ => {
+                let shown = toml::Value::try_from(&default)
+                    .map_or_else(|_| "the default".to_owned(), |value| value.to_string());
+                let path = self.path(key);
+                self.warnings
+                    .push(format!("{path}: not {expected}, using {shown}"));
+
+                default
+            }
+        }
+    }
 }
 
 /// The accent color of the app.
@@ -31,10 +149,20 @@ pub enum AccentSetting {
     Honey,
 }
 
-/// What the app looks like, apart from light and dark.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(default)]
+/// Light, dark, or whatever macOS is set to.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemeSetting {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+/// What the app looks like.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppearanceSettings {
+    pub theme: ThemeSetting,
     /// Turns every easter egg off when false.
     pub easter_eggs: bool,
     pub accent: AccentSetting,
@@ -45,6 +173,7 @@ pub struct AppearanceSettings {
 impl Default for AppearanceSettings {
     fn default() -> Self {
         Self {
+            theme: ThemeSetting::System,
             easter_eggs: true,
             accent: AccentSetting::Blue,
             swarm_view_honeycomb: false,
@@ -52,9 +181,24 @@ impl Default for AppearanceSettings {
     }
 }
 
-/// Which notices become system notifications, and how they are delivered. Reading never
-/// fails: a value that is not valid falls back to its default, and a line in the log
-/// says so. A typo here must not stop the daemon from starting agents.
+impl AppearanceSettings {
+    fn read(mut section: Section<'_>) -> Self {
+        let defaults = Self::default();
+
+        Self {
+            theme: section.take("theme", defaults.theme, "light, dark or system"),
+            easter_eggs: section.take("easter_eggs", defaults.easter_eggs, BOOL),
+            accent: section.take("accent", defaults.accent, "blue or honey"),
+            swarm_view_honeycomb: section.take(
+                "swarm_view_honeycomb",
+                defaults.swarm_view_honeycomb,
+                BOOL,
+            ),
+        }
+    }
+}
+
+/// Which notices become system notifications, and how they are delivered.
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 #[expect(
     clippy::struct_excessive_bools,
@@ -98,35 +242,24 @@ impl Default for NotificationSettings {
     }
 }
 
-impl<'de> Deserialize<'de> for NotificationSettings {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        toml::Value::deserialize(deserializer).map(Self::from_value)
-    }
-}
-
 impl NotificationSettings {
-    fn from_value(value: toml::Value) -> Self {
-        let toml::Value::Table(mut table) = value else {
-            log::warn!("[notifications] is not a table, so it uses the defaults");
-
-            return Self::default();
-        };
+    fn read(mut section: Section<'_>) -> Self {
         let defaults = Self::default();
 
         Self {
-            needs_decision: take_or(&mut table, "needs_decision", defaults.needs_decision),
-            prompt: take_or(&mut table, "prompt", defaults.prompt),
-            ready_for_review: take_or(&mut table, "ready_for_review", defaults.ready_for_review),
-            broke: take_or(&mut table, "broke", defaults.broke),
-            sound: take_or(&mut table, "sound", defaults.sound),
-            dock_bounce: take_or(&mut table, "dock_bounce", defaults.dock_bounce),
-            mute_while_viewing: take_or(
-                &mut table,
+            needs_decision: section.take("needs_decision", defaults.needs_decision, BOOL),
+            prompt: section.take("prompt", defaults.prompt, BOOL),
+            ready_for_review: section.take("ready_for_review", defaults.ready_for_review, BOOL),
+            broke: section.take("broke", defaults.broke, BOOL),
+            sound: section.take("sound", defaults.sound, BOOL),
+            dock_bounce: section.take("dock_bounce", defaults.dock_bounce, BOOL),
+            mute_while_viewing: section.take(
                 "mute_while_viewing",
                 defaults.mute_while_viewing,
+                BOOL,
             ),
-            menu_bar_dot: take_or(&mut table, "menu_bar_dot", defaults.menu_bar_dot),
-            projects: take_projects(&mut table),
+            menu_bar_dot: section.take("menu_bar_dot", defaults.menu_bar_dot, BOOL),
+            projects: take_projects(section.child("projects")),
         }
     }
 
@@ -159,40 +292,27 @@ impl NotificationSettings {
     }
 }
 
-/// The value under `key`, or `default` when it is missing or not valid.
-fn take_or<T: DeserializeOwned>(table: &mut toml::Table, key: &str, default: T) -> T {
-    let Some(value) = table.remove(key) else {
-        return default;
-    };
-
-    T::deserialize(value).unwrap_or_else(|error| {
-        log::warn!("notifications.{key} is not valid, so it uses the default: {error}");
-
-        default
-    })
-}
-
 /// The projects with a mode that is valid. A project whose mode is not valid is left out,
 /// which makes it [`ProjectMode::All`].
-fn take_projects(table: &mut toml::Table) -> BTreeMap<String, ProjectMode> {
-    let Some(value) = table.remove("projects") else {
-        return BTreeMap::new();
-    };
-    let toml::Value::Table(entries) = value else {
-        log::warn!("notifications.projects is not a table, so it uses the default");
+fn take_projects(section: Section<'_>) -> BTreeMap<String, ProjectMode> {
+    let Section {
+        name,
+        table,
+        warnings,
+    } = section;
 
-        return BTreeMap::new();
-    };
-
-    entries
+    table
         .into_iter()
-        .filter_map(|(path, mode)| match ProjectMode::deserialize(mode) {
-            Ok(mode) => Some((path, mode)),
-            Err(error) => {
-                log::warn!("notifications.projects has no valid mode for {path}: {error}");
+        .filter_map(|(path, mode)| {
+            let Ok(mode) = ProjectMode::deserialize(mode) else {
+                warnings.push(format!(
+                    "{name}.{path}: not all, errors_only or off, leaving it out"
+                ));
 
-                None
-            }
+                return None;
+            };
+
+            Some((path, mode))
         })
         .collect()
 }
@@ -217,14 +337,12 @@ pub const FONT_SIZE_MAX: u8 = 20;
 /// The terminal font size when the settings say nothing, in points.
 pub const FONT_SIZE_DEFAULT: u8 = 13;
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(default)]
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct TerminalSettings {
     /// Lets the user type into worker terminals.
     pub allow_worker_typing: bool,
     /// The font size of every terminal, in points. A value outside
     /// [`FONT_SIZE_MIN`]..=[`FONT_SIZE_MAX`] in the file is brought into it.
-    #[serde(deserialize_with = "read_font_size")]
     pub font_size: u8,
     /// Asks before a user terminal with a running program closes.
     pub confirm_close: bool,
@@ -240,9 +358,42 @@ impl Default for TerminalSettings {
     }
 }
 
+impl TerminalSettings {
+    fn read(mut section: Section<'_>) -> Self {
+        let defaults = Self::default();
+
+        Self {
+            allow_worker_typing: section.take(
+                "allow_worker_typing",
+                defaults.allow_worker_typing,
+                BOOL,
+            ),
+            font_size: section
+                .take(
+                    "font_size",
+                    FontSize(defaults.font_size),
+                    "a number of points",
+                )
+                .0,
+            confirm_close: section.take("confirm_close", defaults.confirm_close, BOOL),
+        }
+    }
+}
+
 /// `points` brought into the range the settings allow.
 pub fn clamp_font_size(points: u8) -> u8 {
     points.clamp(FONT_SIZE_MIN, FONT_SIZE_MAX)
+}
+
+/// A font size as the file may spell it: whole or fractional, and out of range.
+#[derive(Serialize)]
+#[serde(transparent)]
+struct FontSize(u8);
+
+impl<'de> Deserialize<'de> for FontSize {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        read_font_size(deserializer).map(Self)
+    }
 }
 
 fn read_font_size<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u8, D::Error> {
@@ -281,14 +432,29 @@ fn read_font_size<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u8, D::E
     deserializer.deserialize_any(Points)
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(from = "PartialAgentSettings")]
+/// How long an idle agent runs before the daemon stops it, in minutes, when the settings
+/// say nothing.
+pub const IDLE_STOP_MINUTES_DEFAULT: u32 = 30;
+
+/// The most agents one task runs at once, when the settings say nothing.
+pub const MAX_AGENTS_PER_TASK_DEFAULT: u32 = 6;
+
+/// The most agents all tasks run at once, when the settings say nothing.
+pub const MAX_AGENTS_TOTAL_DEFAULT: u32 = 16;
+
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct AgentSettings {
     /// The CLI that new orchestrators run.
     pub orchestrator: AgentKindSetting,
     /// Starts agents without permission prompts (Claude Code
     /// `--dangerously-skip-permissions`, Codex `--yolo`).
     pub skip_permissions: bool,
+    /// Stops an agent that has been idle this many minutes. `0` never stops one.
+    pub idle_stop_minutes: u32,
+    /// The most agents one task runs at once. At least 1.
+    pub max_agents_per_task: u32,
+    /// The most agents all tasks run at once. At least 1.
+    pub max_agents_total: u32,
     pub claude_code: CliSettings,
     pub codex: CliSettings,
 }
@@ -298,58 +464,64 @@ impl Default for AgentSettings {
         Self {
             orchestrator: AgentKindSetting::ClaudeCode,
             skip_permissions: false,
+            idle_stop_minutes: IDLE_STOP_MINUTES_DEFAULT,
+            max_agents_per_task: MAX_AGENTS_PER_TASK_DEFAULT,
+            max_agents_total: MAX_AGENTS_TOTAL_DEFAULT,
             claude_code: CliSettings::claude_code(),
             codex: CliSettings::codex(),
         }
     }
 }
 
-/// The file as written: every key can be left out.
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct PartialAgentSettings {
-    orchestrator: Option<AgentKindSetting>,
-    skip_permissions: Option<bool>,
-    claude_code: PartialCliSettings,
-    codex: PartialCliSettings,
-}
+const AT_LEAST_ONE: &str = "a number of at least 1";
 
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct PartialCliSettings {
-    command: Option<String>,
-    orchestrator_model: Option<String>,
-    worker_model: Option<String>,
-}
-
-impl PartialCliSettings {
-    fn over(self, defaults: CliSettings) -> CliSettings {
-        CliSettings {
-            command: self.command.unwrap_or(defaults.command),
-            orchestrator_model: self
-                .orchestrator_model
-                .unwrap_or(defaults.orchestrator_model),
-            worker_model: self.worker_model.unwrap_or(defaults.worker_model),
-        }
-    }
-}
-
-impl From<PartialAgentSettings> for AgentSettings {
-    fn from(partial: PartialAgentSettings) -> Self {
-        let defaults = Self::default();
-
+impl CliSettings {
+    fn read(mut section: Section<'_>, defaults: Self) -> Self {
         Self {
-            orchestrator: partial.orchestrator.unwrap_or(defaults.orchestrator),
-            skip_permissions: partial
-                .skip_permissions
-                .unwrap_or(defaults.skip_permissions),
-            claude_code: partial.claude_code.over(defaults.claude_code),
-            codex: partial.codex.over(defaults.codex),
+            command: section.take("command", defaults.command, TEXT),
+            orchestrator_model: section.take(
+                "orchestrator_model",
+                defaults.orchestrator_model,
+                TEXT,
+            ),
+            worker_model: section.take("worker_model", defaults.worker_model, TEXT),
         }
     }
 }
 
 impl AgentSettings {
+    fn read(mut section: Section<'_>) -> Self {
+        let defaults = Self::default();
+
+        Self {
+            orchestrator: section.take(
+                "orchestrator",
+                defaults.orchestrator,
+                "claude-code or codex",
+            ),
+            skip_permissions: section.take("skip_permissions", defaults.skip_permissions, BOOL),
+            idle_stop_minutes: section.take(
+                "idle_stop_minutes",
+                defaults.idle_stop_minutes,
+                NUMBER,
+            ),
+            max_agents_per_task: section.take_if(
+                "max_agents_per_task",
+                defaults.max_agents_per_task,
+                AT_LEAST_ONE,
+                |limit| *limit >= 1,
+            ),
+            max_agents_total: section.take_if(
+                "max_agents_total",
+                defaults.max_agents_total,
+                AT_LEAST_ONE,
+                |limit| *limit >= 1,
+            ),
+            claude_code: CliSettings::read(section.child("claude_code"), defaults.claude_code),
+            codex: CliSettings::read(section.child("codex"), defaults.codex),
+        }
+    }
+
     pub fn cli(&self, kind: AgentKind) -> &CliSettings {
         match kind {
             AgentKind::ClaudeCode => &self.claude_code,
@@ -440,11 +612,22 @@ pub fn default_path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/swarm/settings.toml"))
 }
 
-/// A missing file gives the defaults; keys left out keep their defaults.
+/// A missing file gives the defaults; keys left out keep their defaults, and so do keys
+/// whose value is not valid. Only a file that is not TOML fails. It logs nothing, so a
+/// caller that reads often does not repeat itself: [`load_with_warnings`] gives the
+/// warnings.
 pub fn load(path: &Path) -> Result<Settings, SettingsError> {
+    load_with_warnings(path).map(|(settings, _)| settings)
+}
+
+/// Like [`load`], and says which keys fell back to their default, for example
+/// `agents.skip_permissions: not a true/false value, using false`.
+pub fn load_with_warnings(path: &Path) -> Result<(Settings, Vec<String>), SettingsError> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Settings::default()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok((Settings::default(), Vec::new()));
+        }
         Err(source) => {
             return Err(SettingsError::Io {
                 path: path.to_owned(),
@@ -453,10 +636,14 @@ pub fn load(path: &Path) -> Result<Settings, SettingsError> {
         }
     };
 
-    toml::from_str(&text).map_err(|source| SettingsError::Parse {
+    let table: toml::Table = toml::from_str(&text).map_err(|source| SettingsError::Parse {
         path: path.to_owned(),
         source,
-    })
+    })?;
+    let mut warnings = Vec::new();
+    let settings = Settings::from_table(table, &mut warnings);
+
+    Ok((settings, warnings))
 }
 
 /// Sets the keys Swarm owns in the existing file and keeps everything else, comments
@@ -498,6 +685,13 @@ pub fn save(path: &Path, settings: &Settings) -> Result<(), SettingsError> {
         "skip_permissions",
         Value::from(settings.agents.skip_permissions),
     );
+    for (key, number) in [
+        ("idle_stop_minutes", settings.agents.idle_stop_minutes),
+        ("max_agents_per_task", settings.agents.max_agents_per_task),
+        ("max_agents_total", settings.agents.max_agents_total),
+    ] {
+        set_value(agents, key, Value::from(i64::from(number)));
+    }
     set_cli(
         table_mut(agents, "claude_code"),
         &settings.agents.claude_code,
@@ -546,6 +740,13 @@ fn set_appearance(table: &mut Table, appearance: AppearanceSettings) {
         AccentSetting::Honey => "honey",
     };
 
+    let theme = match appearance.theme {
+        ThemeSetting::System => "system",
+        ThemeSetting::Light => "light",
+        ThemeSetting::Dark => "dark",
+    };
+
+    set_value(table, "theme", Value::from(theme));
     set_value(table, "easter_eggs", Value::from(appearance.easter_eggs));
     set_value(table, "accent", Value::from(accent));
     set_value(
@@ -1107,18 +1308,215 @@ mod tests {
         assert_eq!(loaded.terminals.font_size, 20);
     }
 
-    #[test]
-    fn a_bad_value_outside_the_notifications_section_still_fails() {
-        for text in [
-            "[agents]\norchestrator = \"gemini\"\n",
-            "[agents]\nskip_permissions = \"yes\"\n",
-            "[terminals]\nallow_worker_typing = \"yes\"\n",
-            "[terminals]\nfont_size = \"big\"\n",
-            "[terminals]\nconfirm_close = \"no\"\n",
-        ] {
-            let result: Result<Settings, _> = toml::from_str(text);
+    fn load_text(name: &str, text: &str) -> Result<(Settings, Vec<String>), SettingsError> {
+        let folder = temp_folder(name);
+        let path = folder.join("settings.toml");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(&path, text).unwrap();
 
-            assert!(result.is_err(), "{text}");
+        let loaded = load_with_warnings(&path);
+        std::fs::remove_dir_all(&folder).unwrap();
+
+        loaded
+    }
+
+    #[test]
+    fn a_bad_value_in_each_section_falls_back_per_key_and_keeps_the_rest() {
+        let text = "welcome_done = \"yes\"\n\n\
+                    [agents]\norchestrator = \"gemini\"\nskip_permissions = true\n\
+                    idle_stop_minutes = \"soon\"\nmax_agents_per_task = 0\nmax_agents_total = 3\n\n\
+                    [agents.codex]\nworker_model = 5\ncommand = \"cx\"\n\n\
+                    [terminals]\nallow_worker_typing = \"yes\"\nfont_size = \"big\"\nconfirm_close = false\n\n\
+                    [appearance]\ntheme = \"dark\"\naccent = \"green\"\neaster_eggs = 1\n";
+
+        let (settings, _) = load_text("bad-each", text).unwrap();
+
+        assert!(!settings.welcome_done);
+        assert_eq!(settings.agents.orchestrator, AgentKindSetting::ClaudeCode);
+        assert!(settings.agents.skip_permissions, "a valid value stays");
+        assert_eq!(settings.agents.idle_stop_minutes, IDLE_STOP_MINUTES_DEFAULT);
+        assert_eq!(
+            settings.agents.max_agents_per_task,
+            MAX_AGENTS_PER_TASK_DEFAULT
+        );
+        assert_eq!(settings.agents.max_agents_total, 3);
+        assert_eq!(settings.agents.codex.worker_model, "gpt-6-luna");
+        assert_eq!(settings.agents.codex.command, "cx");
+        assert!(settings.terminals.allow_worker_typing);
+        assert_eq!(settings.terminals.font_size, FONT_SIZE_DEFAULT);
+        assert!(!settings.terminals.confirm_close);
+        assert_eq!(settings.appearance.theme, ThemeSetting::Dark);
+        assert_eq!(settings.appearance.accent, AccentSetting::Blue);
+        assert!(settings.appearance.easter_eggs);
+    }
+
+    #[test]
+    fn a_warning_names_the_key_that_fell_back() {
+        let text = "[agents]\nskip_permissions = \"yes\"\n\n[agents.claude_code]\ncommand = 3\n\n\
+                    [terminals]\nfont_size = \"big\"\n\n[notifications.projects]\n\"/repo\" = \"loud\"\n";
+
+        let (_, warnings) = load_text("warnings", text).unwrap();
+
+        assert!(
+            warnings.contains(
+                &"agents.skip_permissions: not a true/false value, using false".to_owned()
+            ),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.starts_with("agents.claude_code.command: not text")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.starts_with("terminals.font_size: ")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.starts_with("notifications.projects./repo: ")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_valid_file_has_no_warnings() {
+        let (_, warnings) =
+            load_text("no-warnings", "[agents]\nskip_permissions = true\n").unwrap();
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn a_section_of_the_wrong_shape_gives_its_defaults_and_a_warning() {
+        let (settings, warnings) = load_text("shape", "agents = 5\nterminals = \"x\"\n").unwrap();
+
+        assert_eq!(settings.agents, AgentSettings::default());
+        assert_eq!(settings.terminals, TerminalSettings::default());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.starts_with("agents: "))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.starts_with("terminals: "))
+        );
+    }
+
+    #[test]
+    fn a_file_that_is_not_toml_is_still_an_error() {
+        let loaded = load_text("syntax", "[agents\nskip_permissions = \n");
+
+        assert!(matches!(loaded, Err(SettingsError::Parse { .. })));
+    }
+
+    #[test]
+    fn load_returns_the_same_settings_as_load_with_warnings() {
+        let folder = temp_folder("load-same");
+        let path = folder.join("settings.toml");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            &path,
+            "[agents]\nskip_permissions = \"yes\"\nmax_agents_total = 2\n",
+        )
+        .unwrap();
+
+        let plain = load(&path).unwrap();
+        let (with_warnings, _) = load_with_warnings(&path).unwrap();
+        std::fs::remove_dir_all(&folder).unwrap();
+
+        assert_eq!(plain, with_warnings);
+        assert_eq!(plain.agents.max_agents_total, 2);
+    }
+
+    #[test]
+    fn saving_after_a_bad_value_writes_a_corrected_file() {
+        let folder = temp_folder("corrected");
+        let path = folder.join("settings.toml");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(&path, "[agents]\nskip_permissions = \"yes\"\n").unwrap();
+        let (settings, _) = load_with_warnings(&path).unwrap();
+
+        save(&path, &settings).unwrap();
+        let (_, warnings) = load_with_warnings(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_dir_all(&folder).unwrap();
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(text.contains("skip_permissions = false"), "{text}");
+    }
+
+    #[test]
+    fn the_agent_limits_and_idle_stop_have_their_defaults() {
+        let settings: Settings = toml::from_str("").unwrap();
+
+        assert_eq!(settings.agents.idle_stop_minutes, 30);
+        assert_eq!(settings.agents.max_agents_per_task, 6);
+        assert_eq!(settings.agents.max_agents_total, 16);
+    }
+
+    #[test]
+    fn the_agent_limits_and_idle_stop_round_trip_through_a_file() {
+        let folder = temp_folder("limits");
+        let path = folder.join("settings.toml");
+        let mut settings = Settings::default();
+        settings.agents.idle_stop_minutes = 0;
+        settings.agents.max_agents_per_task = 3;
+        settings.agents.max_agents_total = 9;
+
+        save(&path, &settings).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let loaded = load(&path).unwrap();
+        std::fs::remove_dir_all(&folder).unwrap();
+
+        assert!(text.contains("idle_stop_minutes = 0"), "{text}");
+        assert!(text.contains("max_agents_per_task = 3"), "{text}");
+        assert!(text.contains("max_agents_total = 9"), "{text}");
+        assert_eq!(loaded.agents, settings.agents);
+    }
+
+    #[test]
+    fn a_limit_below_one_falls_back_to_its_default() {
+        let settings: Settings =
+            toml::from_str("[agents]\nmax_agents_per_task = 0\nmax_agents_total = -2\n").unwrap();
+
+        assert_eq!(settings.agents.max_agents_per_task, 6);
+        assert_eq!(settings.agents.max_agents_total, 16);
+    }
+
+    #[test]
+    fn the_theme_is_system_by_default_and_round_trips() {
+        let folder = temp_folder("theme");
+        let path = folder.join("settings.toml");
+        let mut settings = Settings::default();
+        let default_theme = settings.appearance.theme;
+        settings.appearance.theme = ThemeSetting::Light;
+
+        save(&path, &settings).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let loaded = load(&path).unwrap();
+        std::fs::remove_dir_all(&folder).unwrap();
+
+        assert_eq!(default_theme, ThemeSetting::System);
+        assert!(text.contains("theme = \"light\""), "{text}");
+        assert_eq!(loaded.appearance.theme, ThemeSetting::Light);
+    }
+
+    #[test]
+    fn an_unknown_theme_falls_back_to_system() {
+        for text in [
+            "[appearance]\ntheme = \"sepia\"\n",
+            "[appearance]\ntheme = 4\n",
+        ] {
+            let settings: Settings = toml::from_str(text).unwrap();
+
+            assert_eq!(settings.appearance.theme, ThemeSetting::System, "{text}");
         }
     }
 
@@ -1194,5 +1592,44 @@ mod tests {
         std::fs::remove_dir_all(&folder).unwrap();
 
         assert!(!text.contains("welcome_done"), "{text}");
+    }
+
+    struct Capture;
+
+    static CAPTURED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    impl log::Log for Capture {
+        fn enabled(&self, _: &log::Metadata) -> bool {
+            true
+        }
+
+        fn log(&self, record: &log::Record) {
+            CAPTURED.lock().unwrap().push(record.args().to_string());
+        }
+
+        fn flush(&self) {}
+    }
+
+    #[test]
+    fn load_logs_nothing_and_load_with_warnings_still_reports() {
+        log::set_logger(&Capture).ok();
+        log::set_max_level(log::LevelFilter::Warn);
+        let folder =
+            std::env::temp_dir().join(format!("swarm-settings-quiet-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("settings.toml");
+        std::fs::write(&path, "[agents]\nskip_permissions = \"yes\"\n").unwrap();
+
+        let (_, warnings) = load_with_warnings(&path).unwrap();
+        load(&path).unwrap();
+        let logged = CAPTURED
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains(&*folder.to_string_lossy()));
+        std::fs::remove_dir_all(&folder).unwrap();
+
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(!logged, "load logged a warning");
     }
 }

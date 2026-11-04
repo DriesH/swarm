@@ -11,6 +11,7 @@ use swarm_ui::prelude::*;
 use swarm_ui::roving::RovingFocus;
 
 use crate::actions::ToggleCommandPalette;
+use crate::daemon::is_resumable;
 use crate::model::{Agent, AgentKind, Project, ProjectId, TaskStatus, Terminal};
 use crate::settings::Page;
 use crate::usage_text::{UsageSection, WindowRow, usage_sections};
@@ -821,11 +822,16 @@ fn agent_kind(kind: AgentKind) -> (IconName, &'static str) {
 fn agent_label(agent: &Agent) -> String {
     let (_, kind) = agent_kind(agent.kind);
 
-    format!(
+    let mut label = format!(
         "{}, {kind}, {}",
         agent.name,
         agent.status.label().to_lowercase()
-    )
+    );
+    if is_resumable(agent) {
+        label.push_str(", resumable");
+    }
+
+    label
 }
 
 /// The row of an agent in the sidebar.
@@ -850,6 +856,13 @@ pub(crate) fn agent_list_row(
             h_flex()
                 .gap(px(6.))
                 .when(queen, |end| end.child(queen_crown(agent)))
+                .when(is_resumable(agent), |end| {
+                    end.child(
+                        Label::new("resumable")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Faint),
+                    )
+                })
                 .child(StatusDot::new(agent.status)),
         )
         .on_click(cx.listener(move |workspace, _, _, cx| {
@@ -986,6 +999,32 @@ mod tests {
         });
 
         cx.add_window_view(Workspace::with_sample)
+    }
+
+    #[gpui::test]
+    fn the_sidebar_names_a_resumable_agent_as_resumable(cx: &mut TestAppContext) {
+        let (workspace, cx, _resumed) = crate::daemon::tests::resume_workspace(None, cx);
+
+        let label = workspace.read_with(cx, |workspace, _| {
+            agent_label(workspace.data.agents.first().expect("one agent"))
+        });
+
+        assert_eq!(label, "orchestrator, Claude Code, idle, resumable");
+    }
+
+    #[gpui::test]
+    fn the_sidebar_does_not_call_a_running_agent_resumable(cx: &mut TestAppContext) {
+        let (workspace, cx, _resumed) = crate::daemon::tests::resume_workspace(None, cx);
+        let running = crate::daemon::tests::agent_info(1, 7, swarm_protocol::AgentStatus::Idle);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.agent_changed(&running, Some(window), cx);
+        });
+
+        let label = workspace.read_with(cx, |workspace, _| {
+            agent_label(workspace.data.agents.first().expect("one agent"))
+        });
+
+        assert_eq!(label, "orchestrator, Claude Code, idle");
     }
 
     #[gpui::test]

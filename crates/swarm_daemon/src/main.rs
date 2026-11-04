@@ -13,6 +13,7 @@ mod processes;
 mod pull_requests;
 mod recovery;
 mod stats;
+mod task_files;
 mod tasks;
 #[cfg(test)]
 mod temp_folder;
@@ -209,6 +210,8 @@ fn run() -> Result<()> {
         Arc::clone(&messages),
         Arc::clone(&agents),
     );
+
+    agents.watch_idle(Arc::clone(&processes));
 
     let checks = Checks::new(
         Arc::clone(&projects),

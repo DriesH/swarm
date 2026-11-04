@@ -621,6 +621,19 @@ impl SystemCheckView {
         self.fallback_focus = Some(handle);
     }
 
+    /// Shows `report` as the daemon's answer.
+    #[cfg(test)]
+    pub(crate) fn show_report(&mut self, report: Report, cx: &mut Context<Self>) {
+        self.answer = Some(Ok(report));
+        cx.notify();
+    }
+
+    /// The latest report of the daemon. `None` before the first one, and when the last
+    /// check failed.
+    pub(crate) fn report(&self) -> Option<&Report> {
+        self.answer.as_ref()?.as_ref().ok()
+    }
+
     fn backend(&self, cx: &App) -> Backend {
         let Some(workspace) = self.workspace.as_ref().and_then(WeakEntity::upgrade) else {
             return Backend::Sample;

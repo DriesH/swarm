@@ -19,6 +19,7 @@ use gpui::{
 };
 use swarm_settings::{
     AccentSetting, AppearanceSettings, CliSettings, NotificationSettings, ProjectMode, Settings,
+    ThemeSetting,
 };
 use swarm_ui::a11y::ignore_press;
 use swarm_ui::fonts::UI_FONT;
@@ -49,6 +50,8 @@ const NAV_CONTEXT: &str = "SettingsNav";
 const SAVE_DELAY: Duration = Duration::from_millis(300);
 
 const NOT_CONNECTED: &str = "Not connected to the daemon";
+const MAX_AGENTS_PER_TASK_ERROR: &str = "Max agents per task: 1 or more";
+const MAX_AGENTS_TOTAL_ERROR: &str = "Max agents in total: 1 or more";
 
 /// How far an arrow key scrolls a page without controls.
 const PAGE_LINE: Pixels = px(40.);
@@ -58,24 +61,71 @@ const MIN_WINDOW_SIZE: Size<Pixels> = size(px(900.), px(600.));
 
 pub(crate) struct AgentInfo {
     pub name: &'static str,
-    pub version: &'static str,
     pub icon: IconName,
 }
 
 pub(crate) const AGENTS: [AgentInfo; 2] = [
     AgentInfo {
         name: "Claude Code",
-        version: "2.1.314",
         icon: IconName::ClaudeCode,
     },
     AgentInfo {
         name: "Codex",
-        version: "0.154.0",
         icon: IconName::Codex,
     },
 ];
 
 pub(crate) const IDLE_OPTIONS: [&str; 4] = ["10 minutes", "30 minutes", "1 hour", "Never"];
+
+/// The minutes of each option in [`IDLE_OPTIONS`]. `0` is Never.
+const IDLE_MINUTES: [u32; 4] = [10, 30, 60, 0];
+
+/// The position in [`IDLE_OPTIONS`] of the option nearest to `minutes`.
+pub(crate) fn idle_index(minutes: u32) -> usize {
+    if minutes == 0 {
+        return IDLE_MINUTES.len() - 1;
+    }
+
+    IDLE_MINUTES[..IDLE_MINUTES.len() - 1]
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, option)| option.abs_diff(minutes))
+        .map_or(0, |(index, _)| index)
+}
+
+/// The minutes of the option at `index` of [`IDLE_OPTIONS`].
+fn idle_minutes(index: usize) -> Option<u32> {
+    IDLE_MINUTES.get(index).copied()
+}
+
+/// What the Theme control offers, in the order of [`theme::Appearance::ALL`].
+const THEME_CHOICES: [ThemeSetting; 3] = [
+    ThemeSetting::Light,
+    ThemeSetting::Dark,
+    ThemeSetting::System,
+];
+
+/// The theme the app uses for a setting.
+pub(crate) fn appearance_of(setting: ThemeSetting) -> theme::Appearance {
+    match setting {
+        ThemeSetting::Light => theme::Appearance::Light,
+        ThemeSetting::Dark => theme::Appearance::Dark,
+        ThemeSetting::System => theme::Appearance::System,
+    }
+}
+
+/// Reads a limit typed in a field. A number below 1 or no number leaves `limit` as it is
+/// and returns false.
+fn apply_limit(limit: &mut u32, text: &str) -> bool {
+    match text.trim().parse::<u32>() {
+        Ok(number) if number >= 1 => {
+            *limit = number;
+
+            true
+        }
+        _ => false,
+    }
+}
 pub(crate) const NOTIFY_WHEN: [&str; 4] = [
     "Orchestrator needs a decision",
     "Permission or question prompt",
@@ -168,9 +218,13 @@ pub(crate) struct SettingsState {
     /// The settings last loaded or queued for saving.
     queued: Settings,
     pending_save: Option<gpui::Task<()>>,
-    pub idle_stop: usize,
-    pub max_agents_per_task: String,
-    pub max_agents_total: String,
+    /// The keys of the settings file that fell back to their default when it was loaded.
+    /// A save writes them corrected and clears this.
+    pub warnings: Vec<String>,
+    /// The text in the Max agents per task field is not a number of at least 1.
+    pub max_agents_per_task_invalid: bool,
+    /// The text in the Max agents in total field is not a number of at least 1.
+    pub max_agents_total_invalid: bool,
     pub projects: Vec<ProjectSettings>,
     /// How each project's saves stand, in the order of `projects`.
     saves: Vec<ProjectSave>,
@@ -202,9 +256,9 @@ impl SettingsState {
             load_failed: false,
             queued: Settings::default(),
             pending_save: None,
-            idle_stop: 1,
-            max_agents_per_task: "6".to_owned(),
-            max_agents_total: "16".to_owned(),
+            warnings: Vec::new(),
+            max_agents_per_task_invalid: false,
+            max_agents_total_invalid: false,
             projects,
             saves,
             workspace: None,
@@ -234,9 +288,14 @@ impl SettingsState {
             return;
         };
 
-        match swarm_settings::load(path) {
-            Ok(settings) => {
+        match swarm_settings::load_with_warnings(path) {
+            Ok((settings, warnings)) => {
+                for warning in &warnings {
+                    log::warn!("{}: {warning}", path.display());
+                }
+
                 self.settings = settings;
+                self.warnings = warnings;
                 self.save_error = None;
                 self.load_failed = false;
             }
@@ -276,10 +335,28 @@ impl SettingsState {
             return;
         }
 
-        self.save_error = swarm_settings::save(path, &self.settings)
-            .err()
-            .map(|error| error.to_string().into());
+        let saved = swarm_settings::save(path, &self.settings);
+
+        if saved.is_ok() {
+            self.warnings.clear();
+        }
+
+        self.save_error = saved.err().map(|error| error.to_string().into());
         cx.notify();
+    }
+
+    /// The warnings of the settings file that belong to the page of `section`, such as
+    /// `agents`.
+    pub(crate) fn warnings_of(&self, section: &str) -> Vec<SharedString> {
+        self.warnings
+            .iter()
+            .filter(|warning| {
+                warning
+                    .strip_prefix(section)
+                    .is_some_and(|rest| rest.starts_with(['.', ':']))
+            })
+            .map(|warning| SharedString::from(warning.clone()))
+            .collect()
     }
 
     /// The welcome screen is dealt with. The flag is saved at once, as nothing else would
@@ -425,6 +502,40 @@ fn numeric_field(label: impl Into<SharedString>, text: &str, cx: &mut App) -> En
     input
 }
 
+/// A number field for a limit of at least 1, with its text bound to the state. `apply`
+/// writes the text into the state and says whether the text is invalid; an invalid text
+/// puts the field in an error state with `message`.
+fn limit_field(
+    subscriptions: &mut Vec<Subscription>,
+    state: &Entity<SettingsState>,
+    (label, value): (&'static str, u32),
+    message: &'static str,
+    apply: impl Fn(&mut SettingsState, String) -> bool + 'static,
+    cx: &mut Context<SettingsWindow>,
+) -> Entity<TextInput> {
+    let input = numeric_field(label, &value.to_string(), cx);
+    let state = state.clone();
+
+    subscriptions.push(
+        cx.subscribe(&input, move |_, input, event: &TextInputEvent, cx| {
+            let TextInputEvent::Changed(text) = event else {
+                return;
+            };
+
+            let invalid = state.update(cx, |state, cx| {
+                let invalid = apply(state, text.to_string());
+                cx.notify();
+
+                invalid
+            });
+            let error = invalid.then(|| SharedString::from(message));
+            input.update(cx, |input, cx| input.set_error(error, cx));
+        }),
+    );
+
+    input
+}
+
 /// Writes the input's text into the state.
 fn bind_text(
     subscriptions: &mut Vec<Subscription>,
@@ -517,34 +628,40 @@ impl SettingsWindow {
         }
 
         let agents = state.read(cx).settings.agents.clone();
-        let settings = state.read(cx);
-        let (max_agents_per_task, max_agents_total) = (
-            settings.max_agents_per_task.clone(),
-            settings.max_agents_total.clone(),
-        );
-        let projects = settings.projects.clone();
+        let projects = state.read(cx).projects.clone();
 
         let agent_inputs = Self::agent_inputs(&state, &agents, &mut subscriptions, cx);
 
-        let max_agents_per_task = numeric_field("Max agents per task", &max_agents_per_task, cx);
-        bind_text(
+        let max_agents_per_task = limit_field(
             &mut subscriptions,
-            &max_agents_per_task,
             &state,
-            |state, text| state.max_agents_per_task = text,
+            ("Max agents per task", agents.max_agents_per_task),
+            MAX_AGENTS_PER_TASK_ERROR,
+            |state, text| {
+                state.max_agents_per_task_invalid =
+                    !apply_limit(&mut state.settings.agents.max_agents_per_task, &text);
+
+                state.max_agents_per_task_invalid
+            },
             cx,
         );
-
-        let max_agents_total = numeric_field("Max agents in total", &max_agents_total, cx);
-        bind_text(
+        let max_agents_total = limit_field(
             &mut subscriptions,
-            &max_agents_total,
             &state,
-            |state, text| state.max_agents_total = text,
+            ("Max agents in total", agents.max_agents_total),
+            MAX_AGENTS_TOTAL_ERROR,
+            |state, text| {
+                state.max_agents_total_invalid =
+                    !apply_limit(&mut state.settings.agents.max_agents_total, &text);
+
+                state.max_agents_total_invalid
+            },
             cx,
         );
 
         let (system_check, check_again_focus) = Self::system_check_for(&state, window, cx);
+        // The Agents page shows the versions this check finds.
+        subscriptions.push(cx.observe(&system_check, |_, _, cx| cx.notify()));
 
         let page_reveal = cx.new(|_| RevealFocus::new(Axis::Vertical));
         let page_scroll = page_reveal.read(cx).scroll().clone();
@@ -690,9 +807,9 @@ impl SettingsWindow {
         &self.system_check
     }
 
-    /// Asks the daemon about the tools again, while the General page shows.
+    /// Asks the daemon about the tools again, while the General or the Agents page shows.
     fn refresh_system_check(&self, cx: &mut Context<Self>) {
-        if self.page == Page::General {
+        if matches!(self.page, Page::General | Page::Agents) {
             self.system_check.update(cx, SystemCheckView::refresh);
         }
     }
@@ -1125,11 +1242,13 @@ fn bind_keys(cx: &mut App) {
     ]);
 }
 
-/// Loads the settings file at startup, so the settings apply before the window opens.
+/// Loads the settings file at startup, so the settings apply before the window opens. The
+/// saved theme applies here, before the first frame.
 pub(crate) fn load(path: Option<PathBuf>, cx: &mut App) {
     let state = shared_state(path, cx);
 
     state.update(cx, SettingsState::reload);
+    theme::set_appearance(appearance_of(appearance(cx).theme), cx);
 }
 
 /// The notification settings. They stay the defaults until the settings load.
@@ -1184,11 +1303,52 @@ pub(crate) fn follow_appearance(workspace: Entity<Workspace>, cx: &mut App) {
             return;
         }
 
+        let theme_changed = current.theme != applied.theme;
+
         applied = current;
         theme::set_accent(accent_of(current.accent), cx);
+
+        if theme_changed {
+            theme::set_appearance(appearance_of(current.theme), cx);
+        }
+
         workspace.update(cx, |_, cx| cx.notify());
     })
     .detach();
+}
+
+/// Whether agents start without permission prompts. It stays off until the settings load.
+pub(crate) fn skip_permissions(cx: &App) -> bool {
+    cx.try_global::<Registry>()
+        .is_some_and(|registry| registry.state.read(cx).settings.agents.skip_permissions)
+}
+
+/// Draws the workspace again when the skip permissions setting changes: the status bar
+/// shows a note while it is on.
+pub(crate) fn follow_skip_permissions(workspace: Entity<Workspace>, cx: &mut App) {
+    let settings = shared_state(None, cx);
+    let mut applied = skip_permissions(cx);
+
+    cx.observe(&settings, move |_, cx| {
+        let current = skip_permissions(cx);
+
+        if current != applied {
+            applied = current;
+            workspace.update(cx, |_, cx| cx.notify());
+        }
+    })
+    .detach();
+}
+
+/// Changes the agent settings the way the page does.
+#[cfg(test)]
+pub(crate) fn change_agents(edit: impl FnOnce(&mut swarm_settings::AgentSettings), cx: &mut App) {
+    let state = shared_state(None, cx);
+
+    state.update(cx, |state, cx| {
+        edit(&mut state.settings.agents);
+        cx.notify();
+    });
 }
 
 /// Changes the appearance settings the way the page does.
@@ -2118,6 +2278,130 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_bad_value_loads_with_a_warning_on_its_page_and_a_save_corrects_the_file(
+        cx: &mut TestAppContext,
+    ) {
+        let path = temp_path("warnings");
+        std::fs::write(
+            &path,
+            "[agents]\nskip_permissions = \"yes\"\nmax_agents_total = 5\n\n\
+             [terminals]\nconfirm_close = false\n",
+        )
+        .expect("write the settings");
+
+        let state = open_with(&path, cx);
+        let (agents, terminals, loaded) = state.read_with(cx, |state, _| {
+            (
+                state.warnings_of("agents"),
+                state.warnings_of("terminals"),
+                state.settings.agents.max_agents_total,
+            )
+        });
+        state.update(cx, SettingsState::save);
+        let (after, saved) = state.read_with(cx, |state, _| {
+            (state.warnings.clone(), std::fs::read_to_string(&path))
+        });
+        let text = saved.expect("read the file");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(
+            agents,
+            ["agents.skip_permissions: not a true/false value, using false"]
+        );
+        assert!(terminals.is_empty(), "a page shows only its own keys");
+        assert_eq!(loaded, 5, "the other keys still load");
+        assert!(after.is_empty());
+        assert!(text.contains("skip_permissions = false"), "{text}");
+    }
+
+    #[gpui::test]
+    fn a_file_that_is_not_toml_keeps_the_error_and_saves_nothing(cx: &mut TestAppContext) {
+        let path = temp_path("syntax");
+        std::fs::write(&path, "[agents\n").expect("write the settings");
+
+        let state = open_with(&path, cx);
+        state.update(cx, SettingsState::save);
+        let (error, text) = (
+            state.read_with(cx, |state, _| state.save_error.is_some()),
+            std::fs::read_to_string(&path).expect("read the file"),
+        );
+        std::fs::remove_file(&path).ok();
+
+        assert!(error);
+        assert_eq!(text, "[agents\n");
+    }
+
+    #[test]
+    fn the_agent_version_comes_from_the_check() {
+        use swarm_protocol::{ToolCheck, ToolState};
+
+        let check = |state, version: Option<&str>| ToolCheck {
+            state,
+            version: version.map(str::to_owned),
+            detail: None,
+            fix: Vec::new(),
+        };
+
+        let ready = pages::version_pill(Some(&check(ToolState::Ready, Some("2.1.314"))));
+        let signed_out = pages::version_pill(Some(&check(ToolState::SignedOut, Some("0.9.0"))));
+        let missing = pages::version_pill(Some(&check(ToolState::Missing, None)));
+        let no_version = pages::version_pill(Some(&check(ToolState::Ready, None)));
+        let unanswered = pages::version_pill(None);
+
+        assert_eq!(ready, Some((AgentStatus::Done, "2.1.314".to_owned())));
+        assert_eq!(signed_out, Some((AgentStatus::Done, "0.9.0".to_owned())));
+        assert_eq!(missing, Some((AgentStatus::Error, "Not found".to_owned())));
+        assert_eq!(no_version, None);
+        assert_eq!(unanswered, None, "no pill before the check answers");
+    }
+
+    #[gpui::test]
+    fn the_agents_page_shows_the_versions_of_the_latest_check(cx: &mut TestAppContext) {
+        use swarm_protocol::{SystemCheck, ToolCheck, ToolState};
+
+        let check = |state, version: Option<&str>| ToolCheck {
+            state,
+            version: version.map(str::to_owned),
+            detail: None,
+            fix: Vec::new(),
+        };
+        setup(cx);
+        let window = open_settings(cx);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        let shown = |visual: &mut gpui::VisualTestContext| {
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+
+            (
+                visual.debug_bounds("agent-version-0").is_some(),
+                visual.debug_bounds("agent-version-1").is_some(),
+            )
+        };
+        let before = shown(&mut visual);
+
+        window
+            .update(&mut visual, |settings, _, cx| {
+                settings.system_check.update(cx, |check_view, cx| {
+                    check_view.show_report(
+                        SystemCheck {
+                            git: check(ToolState::Ready, None),
+                            claude: check(ToolState::Ready, Some("2.1.314")),
+                            codex: check(ToolState::Missing, None),
+                            gh: check(ToolState::Ready, None),
+                            github_account: check(ToolState::Ready, None),
+                        },
+                        cx,
+                    );
+                });
+            })
+            .expect("window is open");
+        let after = shown(&mut visual);
+
+        assert_eq!(before, (false, false), "no pill before a check answers");
+        assert_eq!(after, (true, true));
+    }
+
+    #[gpui::test]
     fn an_edit_is_saved_after_the_pause(cx: &mut TestAppContext) {
         let path = temp_path("save");
         let state = open_with(&path, cx);
@@ -2616,9 +2900,43 @@ mod tests {
         setup(cx);
         let window = open_settings(cx);
 
+        let state = cx.update(state);
+
         window
-            .update(cx, |_, _, cx| pages::apply_appearance(1, cx))
+            .update(cx, |_, window, cx| {
+                pages::apply_theme(&state)(1, window, cx);
+            })
             .expect("window is open");
+
+        assert_eq!(
+            cx.update(|cx| theme::appearance(cx)),
+            theme::Appearance::Dark
+        );
+    }
+
+    #[gpui::test]
+    fn the_theme_choice_is_saved_in_the_settings(cx: &mut TestAppContext) {
+        setup(cx);
+        let window = open_settings(cx);
+        let state = cx.update(state);
+
+        window
+            .update(cx, |_, window, cx| {
+                pages::apply_theme(&state)(0, window, cx);
+            })
+            .expect("window is open");
+
+        assert_eq!(cx.update(|cx| appearance(cx).theme), ThemeSetting::Light);
+    }
+
+    #[gpui::test]
+    fn the_saved_theme_applies_when_the_settings_load(cx: &mut TestAppContext) {
+        setup(cx);
+        let path = temp_path("theme-at-start");
+        std::fs::write(&path, "[appearance]\ntheme = \"dark\"\n").expect("write the settings");
+
+        cx.update(|cx| load(Some(path.clone()), cx));
+        std::fs::remove_file(&path).ok();
 
         assert_eq!(
             cx.update(|cx| theme::appearance(cx)),
@@ -2883,9 +3201,122 @@ mod tests {
         visual.simulate_input("1a2b");
 
         let text = input.read_with(&visual, |input, _| input.text());
-        let stored = state.read_with(&visual, |state, _| state.max_agents_per_task.clone());
+        let stored = state.read_with(&visual, |state, _| {
+            state.settings.agents.max_agents_per_task
+        });
         assert_eq!(text.as_ref(), "12");
-        assert_eq!(stored, "12");
+        assert_eq!(stored, 12);
+    }
+
+    #[gpui::test]
+    fn a_limit_below_one_shows_the_error_and_is_not_saved(cx: &mut TestAppContext) {
+        let (_, state, mut visual) = numeric_input(cx);
+        let read = |visual: &gpui::VisualTestContext| {
+            state.read_with(visual, |state, _| {
+                (
+                    state.settings.agents.max_agents_per_task,
+                    state.max_agents_per_task_invalid,
+                )
+            })
+        };
+
+        visual.simulate_input("4");
+        let valid = read(&visual);
+        visual.simulate_keystrokes("backspace");
+        let empty = read(&visual);
+        visual.simulate_input("0");
+        let zero = read(&visual);
+        visual.simulate_input("5");
+        let fixed = read(&visual);
+
+        assert_eq!(valid, (4, false));
+        assert_eq!(empty, (4, true), "no number keeps the last good limit");
+        assert_eq!(zero, (4, true));
+        assert_eq!(fixed, (5, false), "05 is the number 5");
+    }
+
+    #[gpui::test]
+    fn an_invalid_limit_puts_the_field_in_an_error_state_until_fixed(cx: &mut TestAppContext) {
+        let (input, _, mut visual) = numeric_input(cx);
+        let error = |visual: &gpui::VisualTestContext| {
+            input.read_with(visual, |input, _| input.error().cloned())
+        };
+
+        visual.simulate_input("0");
+        let invalid = error(&visual);
+        visual.simulate_input("5");
+        let fixed = error(&visual);
+
+        assert_eq!(invalid.as_deref(), Some(MAX_AGENTS_PER_TASK_ERROR));
+        assert_eq!(fixed, None);
+    }
+
+    #[gpui::test]
+    fn the_limit_fields_show_the_settings_and_a_save_keeps_them(cx: &mut TestAppContext) {
+        cx.update(swarm_ui::init);
+        setup(cx);
+        let path = temp_path("limits");
+        std::fs::write(
+            &path,
+            "[agents]\nmax_agents_per_task = 3\nmax_agents_total = 9\nidle_stop_minutes = 60\n",
+        )
+        .expect("write the settings");
+        let window = cx
+            .update(|cx| open_window(Some(path.clone()), None, cx))
+            .expect("window opens");
+
+        let (per_task, total) = window
+            .read_with(cx, |settings, cx| {
+                (
+                    settings
+                        .inputs
+                        .max_agents_per_task
+                        .read(cx)
+                        .text()
+                        .to_string(),
+                    settings.inputs.max_agents_total.read(cx).text().to_string(),
+                )
+            })
+            .expect("window is open");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(per_task, "3");
+        assert_eq!(total, "9");
+    }
+
+    #[test]
+    fn the_idle_options_map_to_minutes_and_back() {
+        let minutes: Vec<Option<u32>> = (0..5).map(idle_minutes).collect();
+        let indexes: Vec<usize> = [10, 30, 60, 0].map(idle_index).to_vec();
+
+        assert_eq!(minutes, [Some(10), Some(30), Some(60), Some(0), None]);
+        assert_eq!(indexes, [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn a_stored_idle_value_that_is_not_an_option_shows_as_the_nearest_one() {
+        let nearest: Vec<usize> = [1, 14, 25, 44, 46, 200].map(idle_index).to_vec();
+
+        assert_eq!(nearest, [0, 0, 1, 1, 2, 2]);
+    }
+
+    #[gpui::test]
+    fn picking_an_idle_option_saves_its_minutes_and_a_stored_value_stays_until_then(
+        cx: &mut TestAppContext,
+    ) {
+        setup(cx);
+        let window = open_settings(cx);
+        let state = window
+            .read_with(cx, |settings, _| settings.state.clone())
+            .expect("window is open");
+        state.update(cx, |state, _| state.settings.agents.idle_stop_minutes = 45);
+        let kept = state.read_with(cx, |state, _| state.settings.agents.idle_stop_minutes);
+
+        state.update(cx, |state, _| pages::set_idle_stop(state, 3));
+        let never = state.read_with(cx, |state, _| state.settings.agents.idle_stop_minutes);
+
+        assert_eq!(kept, 45);
+        assert_eq!(never, 0);
     }
 
     #[gpui::test]

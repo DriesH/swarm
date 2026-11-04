@@ -21,9 +21,12 @@ use swarm_term::{ExitStatus, TerminalChannels, TerminalInput};
 use swarm_term_view::{TerminalEvent, TerminalView, palette_for};
 use swarm_ui::ActiveTheme as _;
 
-use crate::model::{AgentChanges, FakeData, ProjectId, TaskId, TerminalId, TerminalKind};
+use crate::model::{
+    Agent, AgentChanges, AgentId, FakeData, ProjectId, TaskFileList, TaskId, TerminalId,
+    TerminalKind,
+};
 use crate::pull_request::SetupStep;
-use crate::workspace::{DataSource, View, Workspace};
+use crate::workspace::{DataSource, RightPanel, View, Workspace};
 
 /// Scrollback lines requested when attaching.
 const ATTACH_HISTORY: u32 = 1_000;
@@ -922,6 +925,7 @@ impl Workspace {
     /// restarts, and so asks at once, when the open task changes.
     pub(crate) fn sync_swarm_tasks(&mut self, window_active: bool, cx: &mut Context<Self>) {
         self.sync_diff_polls(window_active, cx);
+        self.sync_files(cx);
 
         if self.view != View::Swarm || self.has_no_projects() || !window_active {
             self.changes_poll = None;
@@ -1073,6 +1077,93 @@ impl Workspace {
 
         if self.data.store_diff(diff) {
             self.reload_changed_files(task, source, cx);
+
+            if source == ReviewSource::Live && self.files_task == Some(task) {
+                self.data.rebuild_file_tree(task, true);
+                self.request_files(task, cx);
+            }
+
+            cx.notify();
+        }
+    }
+
+    /// Asks for the files of the task the Files panel shows when the panel opens or the
+    /// task changes. A new Live diff asks again, see [`Self::apply_diff`].
+    fn sync_files(&mut self, cx: &mut Context<Self>) {
+        let shown = self.visible_panel() == Some(RightPanel::Files)
+            && self.daemon.as_ref().is_some_and(Client::is_connected);
+        let wanted = self
+            .data
+            .task(self.active_task)
+            .and_then(|task| task.daemon.as_ref())
+            .map(|daemon| daemon.id)
+            .filter(|_| shown);
+
+        if wanted == self.files_task {
+            return;
+        }
+        self.files_task = wanted;
+
+        if let Some(task) = wanted {
+            self.data.rebuild_file_tree(task, false);
+            self.request_files(task, cx);
+        }
+    }
+
+    /// Asks for the files of `task`. One ask is in flight per task: a change while it
+    /// runs asks once more after the reply, so replies never cross.
+    fn request_files(&mut self, task: swarm_protocol::TaskId, cx: &mut Context<Self>) {
+        let Some(client) = self.daemon.clone().filter(Client::is_connected) else {
+            return;
+        };
+
+        if let Some(dirty) = self.files_asks.get_mut(&task) {
+            *dirty = true;
+
+            return;
+        }
+        self.files_asks.insert(task, false);
+
+        let asking = cx.background_spawn(async move { client.task_files(task) });
+
+        cx.spawn(async move |this, cx| {
+            let answer = asking.await;
+            let finished = this.update(cx, |workspace, cx| {
+                let ask_again = workspace.files_asks.remove(&task).unwrap_or(false);
+
+                match answer {
+                    Ok((paths, omitted)) => {
+                        workspace.apply_task_files(task, TaskFileList { paths, omitted }, cx);
+                    }
+                    Err(error) => log::debug!("cannot read the task files: {error}"),
+                }
+
+                if ask_again {
+                    workspace.request_files(task, cx);
+                }
+            });
+
+            if let Err(error) = finished {
+                log::debug!("the window closed before the task files arrived: {error}");
+            }
+        })
+        .detach();
+    }
+
+    /// Keeps the file list the daemon sent, and redraws the tree when the panel shows it.
+    pub(crate) fn apply_task_files(
+        &mut self,
+        task: swarm_protocol::TaskId,
+        list: TaskFileList,
+        cx: &mut Context<Self>,
+    ) {
+        if self.data.task_files.get(&task) == Some(&list) {
+            return;
+        }
+        self.data.task_files.insert(task, list);
+
+        if self.files_task == Some(task) {
+            self.data.rebuild_file_tree(task, true);
             cx.notify();
         }
     }
@@ -1575,6 +1666,40 @@ impl Workspace {
         self.select_project(project, cx);
     }
 
+    /// Asks the daemon to start a resumable agent again. Its new status and terminal
+    /// arrive as agent changes; a refusal shows in the sidebar.
+    pub(crate) fn resume_agent(&mut self, id: AgentId, cx: &mut Context<Self>) {
+        let Some(daemon_id) = self
+            .data
+            .agent(id)
+            .filter(|agent| is_resumable(agent))
+            .map(Agent::protocol_id)
+        else {
+            return;
+        };
+        let Some(client) = self.daemon.clone().filter(Client::is_connected) else {
+            self.report_sidebar_error(NOT_RUNNING.to_owned(), cx);
+            return;
+        };
+
+        let resuming = cx.background_spawn(async move { client.resume_agent(daemon_id) });
+
+        cx.spawn(async move |this, cx| {
+            let result = resuming.await;
+
+            let updated = this.update(cx, |workspace, cx| {
+                if let Err(error) = result {
+                    workspace.report_sidebar_error(error.to_string(), cx);
+                }
+            });
+
+            if let Err(error) = updated {
+                log::debug!("the window closed before the agent resumed: {error}");
+            }
+        })
+        .detach();
+    }
+
     pub(crate) fn report_sidebar_error(&mut self, message: String, cx: &mut Context<Self>) {
         log::error!("{message}");
         self.sidebar_error = Some(SharedString::from(message));
@@ -1908,6 +2033,14 @@ fn is_ended(lifecycle: AgentLifecycle) -> bool {
     )
 }
 
+/// The daemon can start the agent again from its saved session.
+pub(crate) fn is_resumable(agent: &Agent) -> bool {
+    agent
+        .daemon
+        .as_ref()
+        .is_some_and(|daemon| daemon.lifecycle == AgentLifecycle::Resumable)
+}
+
 pub(crate) fn exit_text(status: &ExitStatus) -> String {
     match status {
         ExitStatus::Code(code) => format!("exit {code}"),
@@ -2001,6 +2134,11 @@ pub(crate) mod tests {
                 call: *call,
                 file: None,
             }),
+            Request::TaskFiles { call, .. } => Some(Event::TaskFiles {
+                call: *call,
+                files: Vec::new(),
+                omitted: 0,
+            }),
             Request::ListComments { call, .. } => Some(Event::Comments {
                 call: *call,
                 comments: Vec::new(),
@@ -2035,6 +2173,7 @@ pub(crate) mod tests {
                 call: *call,
                 fields: swarm_protocol::ProjectConfigFields::default(),
                 error: None,
+                pre_push_hook: None,
             }),
             Request::Prompts { call, .. } => Some(Event::Prompts {
                 call: *call,
@@ -4877,6 +5016,185 @@ pub(crate) mod tests {
         assert_eq!(back, (false, true));
     }
 
+    fn changed_file(path: &str, change: swarm_protocol::FileChange) -> swarm_protocol::FileDiff {
+        swarm_protocol::FileDiff {
+            worktree: PathBuf::from("/tmp/worktree"),
+            path: PathBuf::from(path),
+            agent: None,
+            change,
+            mode_change: None,
+            additions: 1,
+            deletions: 0,
+            binary: false,
+            hunks: Vec::new(),
+            truncated: false,
+            digest: 0,
+            fold: None,
+        }
+    }
+
+    type ListRequests = flume::Receiver<()>;
+
+    /// A daemon that lists `paths` for every task and counts the asks.
+    fn files_daemon(paths: &[&str], omitted: usize) -> (PathBuf, ListRequests) {
+        let paths: Vec<String> = paths.iter().map(|path| (*path).to_owned()).collect();
+        let (asked, requests) = flume::unbounded();
+        let socket = fake_daemon_replying(move |request| match request {
+            Request::TaskFiles { call, .. } => {
+                asked.send(()).ok();
+
+                Some(Event::TaskFiles {
+                    call,
+                    files: paths.clone(),
+                    omitted,
+                })
+            }
+            _ => None,
+        });
+
+        (socket, requests)
+    }
+
+    type TreeRow = (String, u8, bool, Option<crate::model::FileMark>);
+
+    fn tree_rows(workspace: &Entity<Workspace>, cx: &VisualTestContext) -> Vec<TreeRow> {
+        workspace.read_with(cx, |workspace, _| {
+            workspace
+                .data
+                .file_tree
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.path.to_string(),
+                        entry.depth,
+                        entry.is_dir,
+                        entry.mark,
+                    )
+                })
+                .collect()
+        })
+    }
+
+    fn open_files_panel(
+        workspace: &Entity<Workspace>,
+        requests: &ListRequests,
+        cx: &mut VisualTestContext,
+    ) -> bool {
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_panel(RightPanel::Files, cx);
+        });
+        redraw(cx);
+
+        wait_until(cx, |cx| {
+            redraw(cx);
+            !requests.is_empty()
+                && workspace.read_with(cx, |workspace, _| !workspace.data.file_tree.is_empty())
+        })
+    }
+
+    #[gpui::test]
+    fn the_files_panel_lists_the_task_worktree_with_the_changed_files_marked(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::model::FileMark;
+        use swarm_protocol::FileChange;
+
+        let paths = ["Cargo.toml", "src/lib.rs", "src/ui/button.rs", "zeta.txt"];
+        let (socket, requests) = files_daemon(&paths, 0);
+        let (workspace, cx, _client) = real_task_workspace(&socket, cx);
+        workspace.update(cx, |workspace, _| {
+            let mut diff = diff_of(7, ReviewSource::Live, 9);
+            diff.files = vec![
+                changed_file("src/lib.rs", FileChange::Modified),
+                changed_file("zeta.txt", FileChange::Added),
+            ];
+            workspace.data.store_diff(diff);
+        });
+
+        let filled = open_files_panel(&workspace, &requests, cx);
+
+        let row = |path: &str, depth, is_dir, mark| (path.to_owned(), depth, is_dir, mark);
+        assert!(filled, "the list arrived");
+        assert_eq!(
+            tree_rows(&workspace, cx),
+            [
+                row("src", 0, true, None),
+                row("src/ui", 1, true, None),
+                row("src/ui/button.rs", 2, false, None),
+                row("src/lib.rs", 1, false, Some(FileMark::Modified)),
+                row("Cargo.toml", 0, false, None),
+                row("zeta.txt", 0, false, Some(FileMark::Added)),
+            ]
+        );
+        assert!(cx.debug_bounds("files-omitted").is_none());
+    }
+
+    #[gpui::test]
+    fn a_new_live_diff_asks_for_the_files_again_and_moves_the_marks(cx: &mut TestAppContext) {
+        use crate::model::FileMark;
+        use swarm_protocol::FileChange;
+
+        let (socket, requests) = files_daemon(&["Cargo.toml", "src/lib.rs"], 0);
+        let (workspace, cx, _client) = real_task_workspace(&socket, cx);
+        assert!(open_files_panel(&workspace, &requests, cx));
+        requests.try_iter().for_each(drop);
+
+        workspace.update(cx, |workspace, cx| {
+            let mut diff = diff_of(7, ReviewSource::Live, 10);
+            diff.files = vec![changed_file("Cargo.toml", FileChange::Added)];
+            workspace.apply_diff(diff, cx);
+        });
+        let marked = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .data
+                .file_tree
+                .iter()
+                .find(|entry| entry.path.as_ref() == "Cargo.toml")
+                .and_then(|entry| entry.mark)
+        });
+        let asked_again = wait_until(cx, |cx| {
+            redraw(cx);
+            !requests.is_empty()
+        });
+
+        assert_eq!(marked, Some(FileMark::Added));
+        assert!(asked_again);
+    }
+
+    #[gpui::test]
+    fn changes_during_a_files_ask_cost_one_more_ask_not_one_each(cx: &mut TestAppContext) {
+        let (socket, requests) = files_daemon(&["Cargo.toml"], 0);
+        let (workspace, cx, _client) = real_task_workspace(&socket, cx);
+
+        workspace.update(cx, |workspace, cx| {
+            for _ in 0..3 {
+                workspace.request_files(DaemonTaskId(7), cx);
+            }
+        });
+        let settled = wait_until(cx, |cx| {
+            workspace.read_with(cx, |workspace, _| workspace.files_asks.is_empty())
+        });
+
+        assert!(settled);
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[gpui::test]
+    fn a_cut_files_list_ends_with_the_count_of_the_files_left_out(cx: &mut TestAppContext) {
+        let (socket, requests) = files_daemon(&["a.txt"], 5);
+        let (workspace, cx, _client) = real_task_workspace(&socket, cx);
+
+        let filled = open_files_panel(&workspace, &requests, cx);
+        redraw(cx);
+
+        assert!(filled);
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.data.files_omitted),
+            5
+        );
+        assert!(cx.debug_bounds("files-omitted").is_some());
+    }
+
     type CommentRequests = flume::Receiver<Request>;
 
     /// A daemon that lists no comments and accepts adds, and reports what it was asked.
@@ -6292,5 +6610,94 @@ pub(crate) mod tests {
         );
 
         assert_eq!(answer.ok(), Some(None));
+    }
+
+    /// A live task "login" with one resumable orchestrator (daemon id 1). The daemon
+    /// sends every `ResumeAgent` to the channel and answers with `refusal` if there is one.
+    pub(crate) fn resume_workspace<'a>(
+        refusal: Option<&'static str>,
+        cx: &'a mut TestAppContext,
+    ) -> (
+        Entity<Workspace>,
+        &'a mut VisualTestContext,
+        flume::Receiver<DaemonAgentId>,
+    ) {
+        let (sent, resumed) = flume::unbounded();
+        let socket = fake_daemon_replying(move |request| {
+            let Request::ResumeAgent { call, agent } = request else {
+                return None;
+            };
+            sent.send(agent).ok();
+
+            Some(match refusal {
+                Some(message) => Event::Error {
+                    call: Some(call),
+                    id: None,
+                    message: message.to_owned(),
+                },
+                None => Event::AgentStarted {
+                    call,
+                    agent: agent_info(agent.0, 7, DaemonAgentStatus::Idle),
+                },
+            })
+        });
+        let (workspace, cx, _client) = real_task_workspace(&socket, cx);
+        let mut info = agent_info(1, 7, DaemonAgentStatus::Idle);
+        info.lifecycle = AgentLifecycle::Resumable;
+        change_agent(&workspace, &info, cx);
+
+        (workspace, cx, resumed)
+    }
+
+    pub(crate) fn first_agent(workspace: &Entity<Workspace>, cx: &VisualTestContext) -> AgentId {
+        workspace.read_with(cx, |workspace, _| {
+            workspace.data.agents.first().expect("one agent").id
+        })
+    }
+
+    #[gpui::test]
+    fn resuming_a_resumable_agent_sends_resume_agent_to_the_daemon(cx: &mut TestAppContext) {
+        let (workspace, cx, resumed) = resume_workspace(None, cx);
+        let agent = first_agent(&workspace, cx);
+
+        workspace.update(cx, |workspace, cx| workspace.resume_agent(agent, cx));
+
+        let sent = wait_until(cx, |_| !resumed.is_empty());
+        assert!(sent, "the daemon got no ResumeAgent");
+        assert_eq!(resumed.try_recv().ok(), Some(DaemonAgentId(1)));
+    }
+
+    #[gpui::test]
+    fn an_agent_that_runs_is_not_resumed(cx: &mut TestAppContext) {
+        let (workspace, cx, resumed) = resume_workspace(None, cx);
+        change_agent(
+            &workspace,
+            &agent_info(1, 7, DaemonAgentStatus::Working),
+            cx,
+        );
+        let agent = first_agent(&workspace, cx);
+
+        workspace.update(cx, |workspace, cx| workspace.resume_agent(agent, cx));
+
+        assert!(!wait_until(cx, |_| !resumed.is_empty()));
+    }
+
+    #[gpui::test]
+    fn a_resume_the_daemon_refuses_shows_its_reason_in_the_sidebar(cx: &mut TestAppContext) {
+        let reason = "1 agents are running, the limit is 1 (Settings \u{203a} Agents)";
+        let (workspace, cx, _resumed) = resume_workspace(Some(reason), cx);
+        let agent = first_agent(&workspace, cx);
+
+        workspace.update(cx, |workspace, cx| workspace.resume_agent(agent, cx));
+
+        let shown = wait_until(cx, |cx| {
+            workspace.read_with(cx, |workspace, _| workspace.sidebar_error.is_some())
+        });
+        assert!(shown, "the refusal never showed");
+        let message = workspace.read_with(cx, |workspace, _| workspace.sidebar_error.clone());
+        assert!(
+            message.is_some_and(|message| message.contains(reason)),
+            "the sidebar does not say why"
+        );
     }
 }

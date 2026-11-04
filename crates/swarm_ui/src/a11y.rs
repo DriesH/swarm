@@ -21,6 +21,7 @@ pub struct A11yFlags<E> {
     modal: bool,
     read_only: bool,
     hidden: bool,
+    invalid: bool,
 }
 
 impl<E> A11yFlags<E> {
@@ -33,6 +34,7 @@ impl<E> A11yFlags<E> {
             modal: false,
             read_only: false,
             hidden: false,
+            invalid: false,
         }
     }
 
@@ -63,6 +65,12 @@ impl<E> A11yFlags<E> {
 
     pub fn hidden(mut self, hidden: bool) -> Self {
         self.hidden = hidden;
+        self
+    }
+
+    /// The element holds a value the user must fix, like `aria-invalid`.
+    pub fn invalid(mut self, invalid: bool) -> Self {
+        self.invalid = invalid;
         self
     }
 }
@@ -170,6 +178,10 @@ impl<E: Element> Element for A11yFlags<E> {
         if self.hidden {
             node.set_hidden();
         }
+
+        if self.invalid {
+            node.set_invalid(accesskit::Invalid::True);
+        }
     }
 
     fn a11y_synthetic_children(
@@ -221,4 +233,26 @@ pub fn track_focus_off_tab<E: InteractiveElement>(element: E, handle: &FocusHand
 /// the control.
 pub fn ignore_press<E: InteractiveElement>(element: E) -> E {
     element.on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::div;
+
+    use super::*;
+
+    fn invalid_of(invalid: bool) -> Option<accesskit::Invalid> {
+        let element = div().a11y_flags().invalid(invalid);
+        let mut node = accesskit::Node::new(Role::Unknown);
+
+        element.write_a11y_info(&mut node);
+
+        node.invalid()
+    }
+
+    #[test]
+    fn an_invalid_element_says_so_to_assistive_technology() {
+        assert_eq!(invalid_of(true), Some(accesskit::Invalid::True));
+        assert_eq!(invalid_of(false), None);
+    }
 }

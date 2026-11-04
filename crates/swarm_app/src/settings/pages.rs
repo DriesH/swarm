@@ -3,18 +3,20 @@
 use std::path::Path;
 
 use gpui::{AnyElement, ElementId, Entity, FontWeight, Role, SharedString, Stateful, div, px};
+use swarm_protocol::{ToolCheck, ToolState};
 use swarm_settings::{AccentSetting, AgentKindSetting, ProjectMode};
 use swarm_ui::a11y::accessible;
 use swarm_ui::prelude::*;
 use swarm_ui::styles::focus_ring;
-use swarm_ui::theme::{self, Accent, Appearance};
+use swarm_ui::theme::{self, Accent};
 
 use super::open_file;
 use super::project::{List, Load, ProjectSettings};
 use super::{
-    AGENTS, DELIVERY, IDLE_OPTIONS, NOTIFY_WHEN, PROJECT_MODES, PROJECT_NOTIFICATIONS, Page,
-    SettingsState, SettingsWindow, accent_of, delivery, delivery_mut, mode_index, notify_when,
-    notify_when_mut,
+    AGENTS, DELIVERY, IDLE_OPTIONS, MAX_AGENTS_PER_TASK_ERROR, MAX_AGENTS_TOTAL_ERROR, NOTIFY_WHEN,
+    PROJECT_MODES, PROJECT_NOTIFICATIONS, Page, SettingsState, SettingsWindow, THEME_CHOICES,
+    accent_of, appearance_of, delivery, delivery_mut, idle_index, idle_minutes, mode_index,
+    notify_when, notify_when_mut,
 };
 use crate::announce::announce;
 use crate::notifications::{self, Permission};
@@ -43,9 +45,39 @@ impl ParentElement for PageBlocks {
     }
 }
 
-pub(super) fn apply_appearance(index: usize, cx: &mut App) {
-    if let Some(appearance) = Appearance::ALL.get(index) {
-        theme::set_appearance(*appearance, cx);
+/// Saves the theme and applies it at once. `index` is a place in [`THEME_CHOICES`].
+pub(super) fn apply_theme(state: &State) -> impl Fn(usize, &mut Window, &mut App) + 'static {
+    let state = state.clone();
+
+    move |index, _, cx| {
+        let Some(choice) = THEME_CHOICES.get(index).copied() else {
+            return;
+        };
+
+        state.update(cx, |state, cx| {
+            state.settings.appearance.theme = choice;
+            cx.notify();
+        });
+        theme::set_appearance(appearance_of(choice), cx);
+    }
+}
+
+/// Saves the idle option at `index` of [`IDLE_OPTIONS`].
+pub(super) fn set_idle_stop(state: &mut SettingsState, index: usize) {
+    if let Some(minutes) = idle_minutes(index) {
+        state.settings.agents.idle_stop_minutes = minutes;
+    }
+}
+
+/// The pill of an agent card: the version the check found, or that the tool is missing.
+/// `None` before the check has answered, and when it has no version to show.
+pub(super) fn version_pill(check: Option<&ToolCheck>) -> Option<(AgentStatus, String)> {
+    let check = check?;
+
+    match (&check.version, check.state) {
+        (_, ToolState::Missing) => Some((AgentStatus::Error, "Not found".to_owned())),
+        (Some(version), _) => Some((AgentStatus::Done, version.clone())),
+        (None, _) => None,
     }
 }
 
@@ -168,6 +200,23 @@ pub(super) fn save_error(state: &SettingsState, cx: &App) -> Option<LiveRegion> 
         .save_error
         .clone()
         .map(|message| alert_message("settings-save-error", message, cx))
+}
+
+/// One line for each key of the settings file in `section` that fell back to its default.
+pub(super) fn warning_lines(state: &SettingsState, section: &str, cx: &App) -> Vec<LiveRegion> {
+    state
+        .warnings_of(section)
+        .into_iter()
+        .enumerate()
+        .map(|(index, warning)| {
+            LiveRegion::status(("settings-warning", index), warning.clone()).child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(Color::Warn.hsla(cx))
+                    .child(warning),
+            )
+        })
+        .collect()
 }
 
 /// A red message that a screen reader speaks at once.
@@ -319,8 +368,21 @@ impl SettingsWindow {
         let state = &self.state;
         let settings = state.read(cx);
 
+        let report = self.system_check.read(cx).report();
+
         let cards = AGENTS.iter().enumerate().map(|(index, info)| {
             let inputs = &self.inputs.agents[index];
+            let check = report.map(|report| {
+                if index == 0 {
+                    &report.claude
+                } else {
+                    &report.codex
+                }
+            });
+            let pill = version_pill(check).map(|(status, text)| {
+                readable_pill(("agent-version", index), status, text)
+                    .debug_selector(move || format!("agent-version-{index}"))
+            });
             let icon_color = if index == 0 {
                 Color::Claude
             } else {
@@ -334,11 +396,7 @@ impl SettingsWindow {
                         .flex_1()
                         .child(Label::new(info.name).weight(FontWeight::MEDIUM)),
                 )
-                .child(readable_pill(
-                    ("agent-version", index),
-                    AgentStatus::Done,
-                    info.version,
-                ));
+                .children(pill);
 
             let card = Panel::new()
                 .row(header)
@@ -389,8 +447,8 @@ impl SettingsWindow {
                 "idle-stop",
                 "Stop idle agents after",
                 options(&IDLE_OPTIONS),
-                settings.idle_stop,
-                |state, value| state.idle_stop = value,
+                idle_index(settings.settings.agents.idle_stop_minutes),
+                set_idle_stop,
             ))
             .row(input_row(
                 "Max agents per task",
@@ -404,12 +462,33 @@ impl SettingsWindow {
             ));
 
         let error = save_error(settings, cx);
+        let warnings = warning_lines(settings, "agents", cx);
+
+        let limit_errors = [
+            (
+                settings.max_agents_per_task_invalid,
+                "max-agents-per-task-error",
+                MAX_AGENTS_PER_TASK_ERROR,
+            ),
+            (
+                settings.max_agents_total_invalid,
+                "max-agents-total-error",
+                MAX_AGENTS_TOTAL_ERROR,
+            ),
+        ]
+        .into_iter()
+        .filter(|(invalid, ..)| *invalid)
+        .map(|(_, id, message)| alert_message(id, message.into(), cx));
 
         PageBlocks::new(26.)
             .child(page_title("Agents"))
             .children(error)
+            .children(warnings)
             .children(cards)
-            .child(section("Workers", workers))
+            .child(section(
+                "Workers",
+                v_flex().gap(px(8.)).child(workers).children(limit_errors),
+            ))
     }
 
     fn notifications_page(&self, cx: &Context<Self>) -> PageBlocks {
@@ -515,10 +594,12 @@ impl SettingsWindow {
         );
 
         let error = save_error(settings, cx);
+        let warnings = warning_lines(settings, "notifications", cx);
 
         PageBlocks::new(28.)
             .child(page_title("Notifications"))
             .children(error)
+            .children(warnings)
             .child(section("Permission", Panel::new().row(permission_row)))
             .child(section("Notify me when", when))
             .child(section("Delivery", delivery_panel))
@@ -536,19 +617,21 @@ impl SettingsWindow {
         let state = &self.state;
         let settings = state.read(cx).settings.appearance;
 
-        let selected = Appearance::ALL
+        let selected = THEME_CHOICES
             .iter()
-            .position(|appearance| *appearance == theme::appearance(cx))
+            .position(|choice| *choice == settings.theme)
             .unwrap_or(0);
 
         let control = SegmentedControl::new(
             "appearance",
             "Theme",
-            Appearance::ALL.map(Appearance::label),
+            THEME_CHOICES.map(|choice| appearance_of(choice).label()),
         )
         .debug_selector(|| "theme".to_owned())
         .selected(selected)
-        .on_select(|index, _, cx| apply_appearance(index, cx));
+        .on_select(apply_theme(state));
+
+        let warnings = warning_lines(state.read(cx), "appearance", cx);
 
         let accent = SegmentedControl::new("accent", "Accent", Accent::ALL.map(Accent::label))
             .debug_selector(|| "accent".to_owned())
@@ -580,6 +663,7 @@ impl SettingsWindow {
 
         PageBlocks::new(26.)
             .child(page_title("Appearance"))
+            .children(warnings)
             .child(section(
                 "Theme",
                 Panel::new().row(PanelRow::new("Theme").end_slot(control)),
@@ -907,13 +991,14 @@ impl SettingsWindow {
             ))
             .row(PanelRow::new("Required to pass").end_slot(required));
 
-        if settings.load == Load::Sample {
-            panel.row(
+        match &settings.pre_push_hook {
+            Some(tool) => panel.row(
                 PanelRow::new("Git pre-push hook").end_slot(
                     h_flex()
+                        .debug_selector(|| "pre-push-hook".to_owned())
                         .gap_2()
                         .child(
-                            Label::new("lefthook")
+                            Label::new(tool.clone())
                                 .accessible("hook-name")
                                 .mono()
                                 .size(LabelSize::XSmall)
@@ -925,9 +1010,8 @@ impl SettingsWindow {
                             "Detected",
                         )),
                 ),
-            )
-        } else {
-            panel
+            ),
+            None => panel,
         }
     }
 

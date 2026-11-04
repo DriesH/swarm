@@ -309,6 +309,10 @@ impl Calls {
         text: &str,
         delivered: bool,
     ) -> Result<Sent, Failure> {
+        if !delivered {
+            self.services.agents.resume_for_message(to.id)?;
+        }
+
         let message = self.services.messages.post(&NewMessage {
             project: from.project,
             task: from.task,
@@ -579,10 +583,7 @@ impl Calls {
         }
         check_size(&brief)?;
 
-        let kind = match kind {
-            Some(kind) => kind,
-            None => self.services.agents.default_kind()?,
-        };
+        let kind = kind.unwrap_or_else(|| self.services.agents.default_kind());
         let request = CreateTask {
             project: caller.project,
             name,
@@ -788,17 +789,28 @@ impl Calls {
     }
 }
 
-/// The task's orchestrator stopped. Its `Done` status only marks the end of a turn.
+/// The task's orchestrator stopped and no worker still runs. Its `Done` status only
+/// marks the end of a turn.
 fn task_is_done(task: &TaskInfo) -> bool {
-    task.agents
-        .iter()
-        .find(|agent| agent.role == AgentRole::Orchestrator)
-        .is_some_and(|orchestrator| {
-            matches!(
-                orchestrator.lifecycle,
-                AgentLifecycle::Stopped | AgentLifecycle::Resumable
+    let workers_run = task.agents.iter().any(|agent| {
+        agent.role == AgentRole::Worker
+            && matches!(
+                agent.lifecycle,
+                AgentLifecycle::Starting | AgentLifecycle::Running
             )
-        })
+    });
+
+    !workers_run
+        && task
+            .agents
+            .iter()
+            .find(|agent| agent.role == AgentRole::Orchestrator)
+            .is_some_and(|orchestrator| {
+                matches!(
+                    orchestrator.lifecycle,
+                    AgentLifecycle::Stopped | AgentLifecycle::Resumable
+                )
+            })
 }
 
 /// The reply for a claim of messages; the claim waits for the write.
@@ -898,5 +910,32 @@ mod tests {
 
             assert!(task_is_done(&task), "{lifecycle:?}");
         }
+    }
+
+    #[test]
+    fn a_task_whose_orchestrator_stopped_is_not_done_while_a_worker_runs() {
+        let mut task = task_with_orchestrator(AgentStatus::Idle, AgentLifecycle::Resumable);
+        for lifecycle in [AgentLifecycle::Starting, AgentLifecycle::Running] {
+            let mut worker = task.agents[0].clone();
+            worker.id = AgentId(2);
+            worker.role = AgentRole::Worker;
+            worker.lifecycle = lifecycle;
+            task.agents.truncate(1);
+            task.agents.push(worker);
+
+            assert!(!task_is_done(&task), "{lifecycle:?}");
+        }
+    }
+
+    #[test]
+    fn a_task_whose_orchestrator_and_workers_stopped_is_done() {
+        let mut task = task_with_orchestrator(AgentStatus::Idle, AgentLifecycle::Resumable);
+        let mut worker = task.agents[0].clone();
+        worker.id = AgentId(2);
+        worker.role = AgentRole::Worker;
+        worker.lifecycle = AgentLifecycle::Resumable;
+        task.agents.push(worker);
+
+        assert!(task_is_done(&task));
     }
 }

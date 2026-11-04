@@ -4,7 +4,7 @@ use swarm_settings::{FONT_SIZE_DEFAULT, FONT_SIZE_MAX, FONT_SIZE_MIN};
 use swarm_ui::prelude::*;
 
 use super::SettingsWindow;
-use super::pages::{PageBlocks, page_title, save_error, section, switch_row};
+use super::pages::{PageBlocks, page_title, save_error, section, switch_row, warning_lines};
 
 impl SettingsWindow {
     pub(super) fn terminals_page(&self, cx: &Context<Self>) -> PageBlocks {
@@ -41,10 +41,12 @@ impl SettingsWindow {
 
         let font = Panel::new().row(PanelRow::new("Font size").end_slot(stepper));
         let error = save_error(settings, cx);
+        let warnings = warning_lines(settings, "terminals", cx);
 
         PageBlocks::new(26.)
             .child(page_title("Terminals"))
             .children(error)
+            .children(warnings)
             .child(section("Font", font))
             .child(section("Closing", closing))
     }

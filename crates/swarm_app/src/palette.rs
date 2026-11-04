@@ -19,7 +19,8 @@ use crate::actions::{
 use crate::announce::announce;
 use crate::close_task::CloseTaskDialog;
 use crate::close_terminal::CloseTerminalDialog;
-use crate::model::{AgentKind, FakeData, ProjectId, TaskId, TaskStatus, TerminalId};
+use crate::daemon::is_resumable;
+use crate::model::{AgentId, AgentKind, FakeData, ProjectId, TaskId, TaskStatus, TerminalId};
 use crate::new_task::NewTaskDialog;
 use crate::pull_request::AnywayDialog;
 use crate::remove_project::RemoveProjectDialog;
@@ -54,6 +55,7 @@ pub(crate) enum Command {
     ShowHoneyToast,
     Task(TaskId),
     Agent(TerminalId),
+    ResumeAgent(AgentId),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -289,6 +291,19 @@ pub(crate) fn rows(data: &FakeData, project: ProjectId, task: TaskId, view: View
                 }
 
                 row
+            }),
+    );
+
+    rows.extend(
+        data.agents_of(task)
+            .filter(|agent| is_resumable(agent))
+            .map(|agent| {
+                Row::new(
+                    Group::Agents,
+                    IconName::Agent,
+                    format!("Resume agent \u{201c}{}\u{201d}", agent.name),
+                    Command::ResumeAgent(agent.id),
+                )
             }),
     );
 
@@ -927,6 +942,7 @@ impl Workspace {
         match command {
             Command::Task(task) => self.select_task(task, cx),
             Command::Agent(terminal) => self.focus_terminal(terminal, cx),
+            Command::ResumeAgent(agent) => self.resume_agent(agent, cx),
             Command::ReviewChanges => window.dispatch_action(Box::new(ShowReview), cx),
             Command::FocusOrchestrator => {
                 window.dispatch_action(Box::new(FocusAgent { index: 0 }), cx);
@@ -1114,6 +1130,48 @@ mod tests {
 
         assert!(opened);
         assert!(closed);
+    }
+
+    const RESUME_ORCHESTRATOR: &str = "Resume agent \u{201c}orchestrator\u{201d}";
+
+    #[gpui::test]
+    fn the_palette_offers_resume_for_a_resumable_agent(cx: &mut TestAppContext) {
+        let (workspace, cx, _resumed) = crate::daemon::tests::resume_workspace(None, cx);
+
+        cx.simulate_keystrokes("cmd-k");
+
+        let labels = palette_labels(&workspace, cx).unwrap_or_default();
+        assert!(
+            labels.iter().any(|label| label == RESUME_ORCHESTRATOR),
+            "{labels:?}"
+        );
+    }
+
+    #[test]
+    fn the_palette_offers_no_resume_for_an_agent_that_is_not_resumable() {
+        let labels: Vec<String> = sample_rows()
+            .iter()
+            .map(|row| row.label().to_owned())
+            .collect();
+
+        assert!(labels.iter().all(|label| !label.starts_with("Resume")));
+    }
+
+    #[gpui::test]
+    fn choosing_resume_in_the_palette_asks_the_daemon(cx: &mut TestAppContext) {
+        let (workspace, cx, resumed) = crate::daemon::tests::resume_workspace(None, cx);
+        cx.simulate_keystrokes("cmd-k");
+        cx.simulate_input("Resume agent");
+        cx.simulate_keystrokes("enter");
+
+        let sent = crate::daemon::tests::wait_until(cx, |_| !resumed.is_empty());
+
+        assert!(sent, "the daemon got no ResumeAgent");
+        assert_eq!(resumed.try_recv().ok(), Some(swarm_protocol::AgentId(1)));
+        assert!(
+            palette_labels(&workspace, cx).is_none(),
+            "the palette closed"
+        );
     }
 
     fn open_palette(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Entity<Palette> {

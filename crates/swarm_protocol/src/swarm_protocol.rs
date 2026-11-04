@@ -17,10 +17,10 @@ use swarm_term::{Palette, Size, TerminalInput, TerminalOutput};
 pub mod agent;
 mod client;
 
-pub use client::{Client, ClientError, CommentEvent, MessageEvent, PrEvent};
+pub use client::{Client, ClientError, CommentEvent, MessageEvent, PrEvent, ProjectConfigRead};
 
 /// Bumped on every incompatible change; the daemon refuses other versions.
-pub const VERSION: u32 = 22;
+pub const VERSION: u32 = 23;
 
 /// The most messages [`Request::ListMessages`] returns.
 pub const MESSAGES_LISTED: usize = 500;
@@ -34,6 +34,9 @@ pub const COMMENT_BYTES: usize = 16 << 10;
 
 /// The most files one [`TaskDiff`] lists. Its totals still count every file.
 pub const DIFF_FILES: usize = 1_000;
+
+/// The most paths [`Event::TaskFiles`] lists.
+pub const TASK_FILES_LISTED: usize = 20_000;
 
 /// The most lines one [`FileDiff`] carries; the rest is left out and the file is
 /// marked truncated.
@@ -938,6 +941,13 @@ pub enum Request {
         /// the plan was typed in. Refused while a Start orchestrator already runs.
         plan: Option<String>,
     },
+    /// Starts a `Resumable` agent again in its worktree with its saved session, without
+    /// a new first message. Refused for any other agent and past the agent limits.
+    /// Answered with [`Event::AgentStarted`].
+    ResumeAgent {
+        call: CallId,
+        agent: AgentId,
+    },
     /// Answered with [`Event::PlanDraft`].
     PlanDraft {
         call: CallId,
@@ -968,6 +978,11 @@ pub enum Request {
         task: TaskId,
         source: ReviewSource,
         known: Option<u64>,
+    },
+    /// The files in the task worktree. Answered with [`Event::TaskFiles`].
+    TaskFiles {
+        call: CallId,
+        task: TaskId,
     },
     /// The lines of one file of the diff, folded or not, under the same caps as a
     /// [`TaskDiff`]. Answered with [`Event::FileHunks`].
@@ -1265,6 +1280,14 @@ pub enum Event {
         call: CallId,
         diff: Option<TaskDiff>,
     },
+    /// Paths relative to the task worktree, sorted: tracked files and untracked files
+    /// that git does not ignore. Cut at [`TASK_FILES_LISTED`]; `omitted` counts the paths
+    /// cut, zero when none.
+    TaskFiles {
+        call: CallId,
+        files: Vec<String>,
+        omitted: usize,
+    },
     /// `None` when the diff no longer holds the file.
     FileHunks {
         call: CallId,
@@ -1337,10 +1360,13 @@ pub enum Event {
         branches: Vec<String>,
     },
     /// `error` says why the file does not parse; `fields` are the defaults then.
+    /// `pre_push_hook` names the tool behind the project's git pre-push hook, if it has one.
     ProjectConfig {
         call: CallId,
         fields: ProjectConfigFields,
         error: Option<String>,
+        #[serde(default)]
+        pre_push_hook: Option<String>,
     },
     Prompts {
         call: CallId,

@@ -24,7 +24,7 @@ use crate::hub::{CREATE_HISTORY_LINES, ClientSink, Frame, Hub, QUEUE_FRAMES};
 use crate::peer_signature::{self, AuditToken};
 use crate::pull_requests::{self, NewRequest};
 use crate::usage::configured_command;
-use crate::{Services, comments, stats, tasks};
+use crate::{Services, comments, stats, task_files, tasks};
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -288,6 +288,7 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
                 usage: services.usage.current(),
             });
         }
+        Request::TaskFiles { call, task } => send_task_files(services, sink, call, task),
         Request::StopAgents { call } => {
             services.agents.stop_all();
             sink.send_event(&Event::Done { call });
@@ -324,10 +325,36 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
         | Request::CheckRemoveProject { .. }
         | Request::RemoveProject { .. }
         | Request::StartOrchestrator { .. }
+        | Request::ResumeAgent { .. }
         | Request::PlanDraft { .. }
         | Request::SavePlanDraft { .. }
         | Request::CreateTask { .. }) => handle_projects(services, sink, request),
     }
+}
+
+fn send_task_files(
+    services: &Arc<Services>,
+    sink: &Arc<ClientSink>,
+    call: CallId,
+    task: swarm_protocol::TaskId,
+) {
+    let services = Arc::clone(services);
+
+    run_slow(
+        sink,
+        "task-files",
+        call,
+        move |sink| match task_files::list(&services, task) {
+            Ok((files, omitted)) => {
+                sink.send_event(&Event::TaskFiles {
+                    call,
+                    files,
+                    omitted,
+                });
+            }
+            Err(error) => send_error(sink, call, &error),
+        },
+    );
 }
 
 fn send_stats(services: &Services, sink: &ClientSink, call: CallId) {
@@ -452,6 +479,17 @@ fn handle_projects(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Re
                 },
             );
         }
+        Request::ResumeAgent { call, agent } => {
+            let services = Arc::clone(services);
+            run_slow(sink, "resume-agent", call, move |sink| {
+                match services.agents.resume(agent) {
+                    Ok(agent) => {
+                        sink.send_event(&Event::AgentStarted { call, agent });
+                    }
+                    Err(error) => send_error(sink, call, &error),
+                }
+            });
+        }
         Request::PlanDraft { call, project } => {
             let services = Arc::clone(services);
             run_slow(
@@ -534,10 +572,17 @@ fn handle_settings(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Re
             run_slow(sink, "project-config", call, move |sink| {
                 match services.projects.project_config(project) {
                     Ok((fields, error)) => {
+                        let pre_push_hook = services
+                            .projects
+                            .project_path(project)
+                            .ok()
+                            .and_then(|root| swarm_core::git::pre_push_hook(&root));
+
                         sink.send_event(&Event::ProjectConfig {
                             call,
                             fields,
                             error,
+                            pre_push_hook,
                         });
                     }
                     Err(error) => send_error(sink, call, &error),

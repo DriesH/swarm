@@ -1,7 +1,7 @@
 //! Fake data for the app shell. Plain data, no gpui entities.
 
-use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gpui::{Hsla, SharedString, rgb};
@@ -558,6 +558,118 @@ pub(crate) fn sample_github() -> GithubStatus {
     }
 }
 
+/// The paths in a task worktree, relative to it and sorted.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TaskFileList {
+    pub paths: Vec<String>,
+    /// How many paths the daemon cut from the end of the list.
+    pub omitted: usize,
+}
+
+#[derive(Default)]
+struct FolderNode<'a> {
+    folders: BTreeMap<&'a str, FolderNode<'a>>,
+    files: Vec<&'a str>,
+}
+
+struct TreeBuilder<'a> {
+    marks: &'a HashMap<String, FileMark>,
+    open: &'a HashMap<String, bool>,
+    entries: Vec<TreeEntry>,
+}
+
+impl TreeBuilder<'_> {
+    /// Adds the rows under `node`: folders first, then files, each by name. A folder with
+    /// no saved state comes open when a marked file is inside. Returns whether one is.
+    fn add(&mut self, node: &FolderNode<'_>, prefix: &str, depth: u8) -> bool {
+        let mut marked = false;
+
+        for (name, child) in &node.folders {
+            let path = format!("{prefix}{name}");
+            let at = self.entries.len();
+            self.entries.push(TreeEntry {
+                path: path.clone().into(),
+                depth,
+                is_dir: true,
+                expanded: false,
+                mark: None,
+            });
+
+            let inside = self.add(child, &format!("{path}/"), depth.saturating_add(1));
+            let expanded = self.open.get(&path).copied().unwrap_or(inside);
+            if let Some(entry) = self.entries.get_mut(at) {
+                entry.expanded = expanded;
+            }
+            marked |= inside;
+        }
+
+        for path in &node.files {
+            let mark = self.marks.get(*path).copied();
+
+            marked |= mark.is_some();
+            self.entries.push(TreeEntry {
+                path: SharedString::new(*path),
+                depth,
+                is_dir: false,
+                expanded: false,
+                mark,
+            });
+        }
+
+        marked
+    }
+}
+
+/// The rows of the Files tree for the sorted `paths` of a worktree. `open` holds the
+/// folders the user opened or closed, by path.
+fn files_tree(
+    paths: &[String],
+    marks: &HashMap<String, FileMark>,
+    open: &HashMap<String, bool>,
+) -> Vec<TreeEntry> {
+    let mut root = FolderNode::default();
+
+    for path in paths {
+        let mut folder = &mut root;
+
+        if let Some((parents, _)) = path.rsplit_once('/') {
+            for name in parents.split('/') {
+                folder = folder.folders.entry(name).or_default();
+            }
+        }
+        folder.files.push(path);
+    }
+
+    let mut builder = TreeBuilder {
+        marks,
+        open,
+        entries: Vec::new(),
+    };
+    builder.add(&root, "", 0);
+
+    builder.entries
+}
+
+/// The files a diff adds or changes in `worktree`, by path relative to it. A deleted file
+/// is not in the worktree, and a file of another worktree is not in this tree.
+fn file_marks(diff: &TaskDiff, worktree: &Path) -> HashMap<String, FileMark> {
+    let mut marks = HashMap::new();
+
+    for file in diff.files.iter().filter(|file| file.worktree == worktree) {
+        let mark = match file.change {
+            swarm_protocol::FileChange::Added => FileMark::Added,
+            swarm_protocol::FileChange::Modified => FileMark::Modified,
+            swarm_protocol::FileChange::Deleted => continue,
+        };
+
+        marks
+            .entry(file.path.to_string_lossy().into_owned())
+            .or_insert(mark);
+    }
+
+    marks
+}
+
 fn sample_file_tree() -> Vec<TreeEntry> {
     let dir = |path: &str, depth: u8, expanded: bool| TreeEntry {
         path: SharedString::new(path),
@@ -625,6 +737,10 @@ pub(crate) struct FakeData {
     /// Counts every change to `usage`, so an answer asked before a change can tell it is old.
     pub usage_revision: u64,
     pub file_tree: Vec<TreeEntry>,
+    /// How many paths the daemon cut from the list behind `file_tree`.
+    pub files_omitted: usize,
+    /// The files in each real task's worktree, as the daemon last listed them.
+    pub task_files: HashMap<swarm_protocol::TaskId, TaskFileList>,
     /// The GitHub setup of each project, once the daemon answered.
     pub github: HashMap<ProjectId, GithubStatus>,
     /// The latest local checks run of each task, under [`FakeData::diff_id`].
@@ -1649,6 +1765,39 @@ impl FakeData {
         true
     }
 
+    /// Fills the Files tree from the file list and the Live diff of a real task. With
+    /// `keep_open` the folders keep the state they have in the tree now.
+    pub(crate) fn rebuild_file_tree(&mut self, task: swarm_protocol::TaskId, keep_open: bool) {
+        let Some(list) = self.task_files.get(&task) else {
+            self.file_tree.clear();
+            self.files_omitted = 0;
+
+            return;
+        };
+
+        let worktree = self
+            .task_with_daemon_id(task)
+            .and_then(|task| self.worktree_of(task));
+        let marks = self
+            .diffs
+            .get(&(task, ReviewSource::Live))
+            .zip(worktree)
+            .map(|(diff, worktree)| file_marks(diff, &worktree))
+            .unwrap_or_default();
+        let open: HashMap<String, bool> = if keep_open {
+            self.file_tree
+                .iter()
+                .filter(|entry| entry.is_dir)
+                .map(|entry| (entry.path.to_string(), entry.expanded))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
+        self.file_tree = files_tree(&list.paths, &marks, &open);
+        self.files_omitted = list.omitted;
+    }
+
     /// Keeps the answer to a request for the lines of one folded file, see
     /// [`LoadedFiles::finish`]. The stored diff is never edited except to merge the lines.
     ///
@@ -2517,6 +2666,61 @@ mod tests {
             depths,
             [0, 1, 2, 3, 3, 3, 3, 3, 2, 1, 2, 3, 3, 3, 1, 0, 0, 1, 1]
         );
+    }
+
+    #[test]
+    fn a_marked_file_opens_its_folders_unless_the_user_closed_one() {
+        let paths = ["src/ui/a.rs".to_owned(), "src/lib.rs".to_owned()];
+        let marks = HashMap::from([("src/ui/a.rs".to_owned(), FileMark::Modified)]);
+        let closed = HashMap::from([("src/ui".to_owned(), false)]);
+
+        let by_default = files_tree(&paths, &marks, &HashMap::new());
+        let after_closing = files_tree(&paths, &marks, &closed);
+
+        let open = |tree: &[TreeEntry]| -> Vec<bool> {
+            tree.iter()
+                .filter(|entry| entry.is_dir)
+                .map(|entry| entry.expanded)
+                .collect()
+        };
+        assert_eq!(open(&by_default), [true, true]);
+        assert_eq!(open(&after_closing), [true, false]);
+    }
+
+    fn marked_diff(worktree: &str, path: &str) -> swarm_protocol::FileDiff {
+        swarm_protocol::FileDiff {
+            worktree: PathBuf::from(worktree),
+            path: PathBuf::from(path),
+            agent: None,
+            change: swarm_protocol::FileChange::Modified,
+            mode_change: None,
+            additions: 1,
+            deletions: 0,
+            binary: false,
+            hunks: Vec::new(),
+            truncated: false,
+            digest: 0,
+            fold: None,
+        }
+    }
+
+    #[test]
+    fn a_change_in_a_worker_worktree_does_not_mark_the_task_tree() {
+        let diff = TaskDiff {
+            task: swarm_protocol::TaskId(7),
+            source: ReviewSource::Live,
+            fingerprint: 1,
+            head: String::new(),
+            stat: DiffStat::default(),
+            files: vec![
+                marked_diff("/wt/task", "a.rs"),
+                marked_diff("/wt/worker", "b.rs"),
+            ],
+        };
+
+        let marks = file_marks(&diff, Path::new("/wt/task"));
+
+        assert_eq!(marks.keys().collect::<Vec<_>>(), ["a.rs"]);
     }
 
     #[test]

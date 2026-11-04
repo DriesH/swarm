@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 use gpui::{App, Context, Entity, Focusable as _, SharedString, Subscription, WeakEntity, Window};
 use swarm_protocol::{
-    ChecksRun, Client, ClientError, ProjectConfigFields, ProjectId as DaemonProjectId, PromptInfo,
-    TaskId as DaemonTaskId,
+    ChecksRun, Client, ClientError, ProjectConfigFields, ProjectConfigRead,
+    ProjectId as DaemonProjectId, PromptInfo, TaskId as DaemonTaskId,
 };
 use swarm_ui::prelude::*;
 
@@ -154,6 +154,8 @@ pub(crate) struct ProjectSettings {
     /// The page has no field for the teardown script. A save sends it back as it was read.
     teardown: String,
     pub prompts: Vec<ProjectPrompt>,
+    /// The tool behind the repository's git pre-push hook. `None` without a hook.
+    pub pre_push_hook: Option<String>,
     pub checking: ChecksStatus,
     /// Why the daemon refused the last save.
     pub refusal: Option<SharedString>,
@@ -184,6 +186,7 @@ impl ProjectSettings {
             checks_required: false,
             teardown: String::new(),
             prompts: Vec::new(),
+            pre_push_hook: None,
             checking: ChecksStatus::Idle,
             refusal: None,
         }
@@ -217,6 +220,7 @@ impl ProjectSettings {
             ],
             checks_required: true,
             prompts: vec![prompt],
+            pre_push_hook: Some("lefthook".to_owned()),
             ..Self::blank(project, Load::Sample)
         }
     }
@@ -473,7 +477,7 @@ impl ProjectInputs {
 
 /// What the daemon answered when a project page opened.
 pub(super) struct Loaded {
-    config: Result<(ProjectConfigFields, Option<String>), ClientError>,
+    config: Result<ProjectConfigRead, ClientError>,
     branches: Option<Vec<String>>,
     prompts: Option<Vec<PromptInfo>>,
 }
@@ -481,7 +485,7 @@ pub(super) struct Loaded {
 impl Loaded {
     /// Blocks on the daemon: call it on the background executor.
     fn read(client: &Client, project: DaemonProjectId) -> Self {
-        let config = client.project_config(project);
+        let config = client.read_project_config(project);
 
         if config.is_err() {
             return Self {
@@ -644,12 +648,21 @@ impl SettingsState {
 
         match loaded.config {
             Err(error) => entry.load = Load::Unreadable(refusal(&error)),
-            Ok((fields, Some(error))) => {
+            Ok(ProjectConfigRead {
+                fields,
+                error: Some(error),
+                ..
+            }) => {
                 entry.apply(fields);
                 entry.load = Load::Unreadable(error.into());
             }
-            Ok((fields, None)) => {
+            Ok(ProjectConfigRead {
+                fields,
+                error: None,
+                pre_push_hook,
+            }) => {
                 entry.apply(fields);
+                entry.pre_push_hook = pre_push_hook;
                 entry.load = Load::Ready;
                 entry.refusal = None;
 
@@ -1607,6 +1620,7 @@ mod tests {
                 call: *call,
                 fields: config,
                 error: None,
+                pre_push_hook: None,
             }),
             Request::ListBranches { call, .. } => Some(Event::Branches {
                 call: *call,
@@ -2277,7 +2291,11 @@ mod tests {
         assert!(rig.wait_for_requests(&seen, |seen| save_count(seen) == 1));
         assert!(rig.wait_until_saved());
         let stale = Loaded {
-            config: Ok((fields(), None)),
+            config: Ok(ProjectConfigRead {
+                fields: fields(),
+                error: None,
+                pre_push_hook: None,
+            }),
             branches: None,
             prompts: None,
         };
@@ -2409,6 +2427,34 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_detected_pre_push_hook_shows_its_tool_and_detected(cx: &mut TestAppContext) {
+        let (socket, _seen) = daemon(|request| match request {
+            Request::ProjectConfig { call, .. } => Some(Event::ProjectConfig {
+                call: *call,
+                fields: fields(),
+                error: None,
+                pre_push_hook: Some("husky".to_owned()),
+            }),
+            other => project_reply(other),
+        });
+        let mut rig = rig(&socket, vec![task_info(7, 5, "login")], Vec::new(), cx);
+
+        rig.show(0);
+        assert!(rig.wait_for_project(|project| project.load == Load::Ready));
+
+        assert_eq!(rig.project().pre_push_hook.as_deref(), Some("husky"));
+        assert!(rig.is_on_screen("pre-push-hook"));
+    }
+
+    #[gpui::test]
+    fn a_project_without_a_pre_push_hook_has_no_hook_row(cx: &mut TestAppContext) {
+        let (mut rig, _seen) = loaded(cx);
+
+        assert_eq!(rig.project().pre_push_hook, None);
+        assert!(!rig.is_on_screen("pre-push-hook"));
+    }
+
+    #[gpui::test]
     fn a_refusal_shows_its_message_and_keeps_the_value_until_a_save_works(cx: &mut TestAppContext) {
         let (socket, seen) = daemon(|request| match request {
             Request::SaveProjectConfig { call, fields, .. } if fields.worktree_folder == "/bad" => {
@@ -2470,6 +2516,7 @@ mod tests {
                         call: *call,
                         fields: config,
                         error,
+                        pre_push_hook: None,
                     })
                 }
                 other => project_reply(other),

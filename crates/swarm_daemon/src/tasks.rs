@@ -444,10 +444,7 @@ pub(crate) fn start_orchestrator(
         check_plan_size(plan)?;
     }
 
-    let kind = match kind {
-        Some(kind) => kind,
-        None => services.agents.default_kind()?,
-    };
+    let kind = kind.unwrap_or_else(|| services.agents.default_kind());
     let launch = services.agents.plan(kind, AgentRole::StartOrchestrator)?;
 
     let (agent, created) = services.projects.start_agent_or(project, |root, base| {

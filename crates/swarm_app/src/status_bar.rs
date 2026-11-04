@@ -125,7 +125,13 @@ pub(crate) fn render(
                         mono,
                     ))
                 })
-                .child(permissions_note())
+                .when(crate::settings::skip_permissions(cx), |bar| {
+                    bar.child(
+                        div()
+                            .debug_selector(|| "permissions-skipped".to_owned())
+                            .child(permissions_note()),
+                    )
+                })
                 .child(mono("⌘K".into())),
         )
         .into_any_element()
@@ -446,6 +452,35 @@ mod tests {
 
         assert_eq!(seen.role, Some(Role::Label));
         assert_eq!(seen.value.as_deref(), Some("permissions skipped"));
+    }
+
+    fn redraw(cx: &mut VisualTestContext) {
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+
+    #[gpui::test]
+    fn the_permissions_note_shows_only_while_permissions_are_skipped(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        cx.update(|_, cx| crate::settings::follow_skip_permissions(workspace.clone(), cx));
+        redraw(cx);
+        let before = cx.debug_bounds("permissions-skipped").is_some();
+
+        cx.update(|_, cx| {
+            crate::settings::change_agents(|agents| agents.skip_permissions = true, cx);
+        });
+        redraw(cx);
+        let on = cx.debug_bounds("permissions-skipped").is_some();
+
+        cx.update(|_, cx| {
+            crate::settings::change_agents(|agents| agents.skip_permissions = false, cx);
+        });
+        redraw(cx);
+        let off = cx.debug_bounds("permissions-skipped").is_some();
+
+        assert!(!before, "off by default");
+        assert!(on);
+        assert!(!off);
     }
 
     #[gpui::test]
