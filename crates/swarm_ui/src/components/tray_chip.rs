@@ -3,6 +3,7 @@ use gpui::{
     TextRun, Window, div, font, px,
 };
 
+use crate::a11y::accessible;
 use crate::component::{Component, example, example_group};
 use crate::fonts::UI_FONT;
 use crate::prelude::*;
@@ -100,10 +101,7 @@ impl RenderOnce for TrayChip {
             self.status.label().to_lowercase()
         ));
 
-        div()
-            .id(self.id)
-            .role(Role::Button)
-            .aria_label(label)
+        accessible(div().id(self.id), Role::Button, label)
             .focusable()
             .tab_stop(true)
             .cursor_pointer()
@@ -145,6 +143,7 @@ impl RenderOnce for TrayChip {
 pub struct TrayMore {
     id: ElementId,
     count: usize,
+    expanded: Option<bool>,
     debug_selector: Option<String>,
 }
 
@@ -153,8 +152,15 @@ impl TrayMore {
         Self {
             id: id.into(),
             count,
+            expanded: None,
             debug_selector: None,
         }
+    }
+
+    /// Whether the menu this chip opens is open. VoiceOver reads it on the chip.
+    pub fn expanded(mut self, expanded: bool) -> Self {
+        self.expanded = Some(expanded);
+        self
     }
 
     /// Name for `VisualTestContext::debug_bounds`. Only recorded in test builds.
@@ -185,32 +191,34 @@ impl RenderOnce for TrayMore {
         let (line, raised, active, accent) =
             (colors.line, colors.raised, colors.active, colors.accent);
 
-        div()
-            .id(self.id)
-            .when_some(self.debug_selector, |element, selector| {
-                element.debug_selector(move || selector)
-            })
-            .role(Role::Button)
-            .aria_label(Self::accessible_label(self.count))
-            .focusable()
-            .tab_stop(true)
-            .cursor_pointer()
-            .flex()
-            .flex_none()
-            .items_center()
-            .h(px(HEIGHT))
-            .px(px(PADDING))
-            .rounded(px(6.))
-            .border_1()
-            .border_color(line)
-            .bg(raised)
-            .hover(|style| style.bg(active))
-            .focus_visible(|style| focus_ring(style, accent))
-            .child(
-                Label::new(Self::text(self.count))
-                    .size(LABEL_SIZE)
-                    .weight(LABEL_WEIGHT),
-            )
+        accessible(
+            div().id(self.id),
+            Role::Button,
+            Self::accessible_label(self.count),
+        )
+        .when_some(self.debug_selector, |element, selector| {
+            element.debug_selector(move || selector)
+        })
+        .when_some(self.expanded, StatefulInteractiveElement::aria_expanded)
+        .focusable()
+        .tab_stop(true)
+        .cursor_pointer()
+        .flex()
+        .flex_none()
+        .items_center()
+        .h(px(HEIGHT))
+        .px(px(PADDING))
+        .rounded(px(6.))
+        .border_1()
+        .border_color(line)
+        .bg(raised)
+        .hover(|style| style.bg(active))
+        .focus_visible(|style| focus_ring(style, accent))
+        .child(
+            Label::new(Self::text(self.count))
+                .size(LABEL_SIZE)
+                .weight(LABEL_WEIGHT),
+        )
     }
 }
 

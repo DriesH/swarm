@@ -5,6 +5,7 @@ use gpui::{
     SharedString, Toggled, Window, div, point, px,
 };
 
+use crate::a11y::accessible;
 use crate::component::{Component, example, example_group};
 use crate::prelude::*;
 use crate::{
@@ -262,10 +263,7 @@ fn render_item(
         Role::MenuItem
     };
 
-    div()
-        .id(item.id)
-        .role(role)
-        .aria_label(accessible_label)
+    accessible(div().id(item.id), role, accessible_label)
         .when_some(item.checked, |row, checked| {
             row.aria_toggled(if checked {
                 Toggled::True
@@ -435,10 +433,7 @@ impl RenderOnce for Menu {
 
         let selector = self.id.to_string();
 
-        v_flex()
-            .id(self.id)
-            .role(Role::Menu)
-            .aria_label(self.label)
+        accessible(v_flex().id(self.id), Role::Menu, self.label)
             .debug_selector(move || selector)
             .key_context(format!("{MENU_CONTEXT} {MENU_LIST_CONTEXT}").as_str())
             .when_some(self.focus.as_ref(), InteractiveElement::track_focus)

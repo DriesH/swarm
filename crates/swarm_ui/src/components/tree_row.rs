@@ -3,6 +3,7 @@ use gpui::{
     Window, div, px,
 };
 
+use crate::a11y::accessible;
 use crate::component::{Component, example, example_group};
 use crate::prelude::*;
 use crate::styles::focus_ring;
@@ -192,79 +193,80 @@ impl RenderOnce for TreeRow {
                 .bg(line)
         });
 
-        div()
-            .id(self.id)
-            .when_some(self.debug_selector, |row, selector| {
-                row.debug_selector(move || selector)
-            })
-            .role(Role::TreeItem)
-            .aria_label(self.accessible_label.unwrap_or_else(|| self.label.clone()))
-            .aria_level(self.level + 1)
-            .when_some(self.position_in_set, |row, (position, size)| {
-                row.aria_position_in_set(position).aria_size_of_set(size)
-            })
-            .when_some(self.folder, StatefulInteractiveElement::aria_expanded)
-            .aria_selected(self.selected)
-            .when(self.selected && !self.focusable, |row| {
-                row.aria_active_descendant()
-            })
-            .when(self.focusable, |row| {
-                row.focusable()
-                    .tab_stop(true)
-                    .focus_visible(move |style| focus_ring(style, accent))
-            })
-            .cursor_pointer()
-            .relative()
-            .flex()
-            .items_center()
-            .h(px(TREE_ROW_HEIGHT))
-            .w_full()
-            .pl(px(level_offset(self.level)))
-            .pr(px(8.))
-            .gap(px(6.))
-            .rounded(px(5.))
-            .when(self.selected, |row| row.bg(active))
-            .when(!self.selected, |row| {
-                row.hover(move |style| style.bg(raised))
-            })
-            .when(self.ring, |mut row| {
-                row.style()
-                    .refine(&focus_ring(StyleRefinement::default(), accent));
+        accessible(
+            div().id(self.id),
+            Role::TreeItem,
+            self.accessible_label.unwrap_or_else(|| self.label.clone()),
+        )
+        .when_some(self.debug_selector, |row, selector| {
+            row.debug_selector(move || selector)
+        })
+        .aria_level(self.level + 1)
+        .when_some(self.position_in_set, |row, (position, size)| {
+            row.aria_position_in_set(position).aria_size_of_set(size)
+        })
+        .when_some(self.folder, StatefulInteractiveElement::aria_expanded)
+        .aria_selected(self.selected)
+        .when(self.selected && !self.focusable, |row| {
+            row.aria_active_descendant()
+        })
+        .when(self.focusable, |row| {
+            row.focusable()
+                .tab_stop(true)
+                .focus_visible(move |style| focus_ring(style, accent))
+        })
+        .cursor_pointer()
+        .relative()
+        .flex()
+        .items_center()
+        .h(px(TREE_ROW_HEIGHT))
+        .w_full()
+        .pl(px(level_offset(self.level)))
+        .pr(px(8.))
+        .gap(px(6.))
+        .rounded(px(5.))
+        .when(self.selected, |row| row.bg(active))
+        .when(!self.selected, |row| {
+            row.hover(move |style| style.bg(raised))
+        })
+        .when(self.ring, |mut row| {
+            row.style()
+                .refine(&focus_ring(StyleRefinement::default(), accent));
 
-                row
-            })
-            .children(guides)
-            .child(
-                div()
-                    .w(px(TREE_INDENT))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .children(chevron),
-            )
-            .child(match self.file_icon {
-                Some(file_icon) => FileIcon::new(file_icon)
-                    .size(FILE_ICON_SIZE)
-                    .when_some(file_icon_selector, |file_icon, selector| {
-                        file_icon.debug_selector(|| selector)
-                    })
-                    .into_any_element(),
-                None => Icon::new(icon)
-                    .size(IconSize::Medium)
-                    .color(Color::Muted)
-                    .into_any_element(),
-            })
-            .child(
-                div().flex_1().min_w_0().flex().child(
-                    Label::new(self.label)
-                        .size(LabelSize::Small)
-                        .color(self.label_color)
-                        .truncate(),
-                ),
-            )
-            .when_some(self.end, ParentElement::child)
-            .when_some(self.on_click, |row, handler| row.on_click(handler))
+            row
+        })
+        .children(guides)
+        .child(
+            div()
+                .w(px(TREE_INDENT))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .children(chevron),
+        )
+        .child(match self.file_icon {
+            Some(file_icon) => FileIcon::new(file_icon)
+                .size(FILE_ICON_SIZE)
+                .when_some(file_icon_selector, |file_icon, selector| {
+                    file_icon.debug_selector(|| selector)
+                })
+                .into_any_element(),
+            None => Icon::new(icon)
+                .size(IconSize::Medium)
+                .color(Color::Muted)
+                .into_any_element(),
+        })
+        .child(
+            div().flex_1().min_w_0().flex().child(
+                Label::new(self.label)
+                    .size(LabelSize::Small)
+                    .color(self.label_color)
+                    .truncate(),
+            ),
+        )
+        .when_some(self.end, ParentElement::child)
+        .when_some(self.on_click, |row, handler| row.on_click(handler))
     }
 }
 

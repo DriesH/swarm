@@ -5,6 +5,7 @@ use gpui::{
     Window, point, px,
 };
 
+use crate::a11y::accessible;
 use crate::component::{Component, example, example_group};
 use crate::prelude::*;
 use crate::traits::ClickHandler;
@@ -158,10 +159,7 @@ impl RenderOnce for Toast {
             .on_click(move |_, window, cx| handler(window, cx))
         });
 
-        h_flex()
-            .id(self.id)
-            .role(Role::Status)
-            .aria_label(label.clone())
+        accessible(h_flex().id(self.id), Role::Status, label.clone())
             .aria_value(label)
             .when_some(selector, |toast, selector| {
                 toast.debug_selector(move || selector)

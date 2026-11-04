@@ -166,7 +166,7 @@ fn control_name(kind: Kind) -> &'static str {
         Kind::Switch => "Switch Control",
         Kind::Checkbox => "CheckBox Control",
         Kind::Dropdown => "ComboBox Control",
-        Kind::TextInput => "unnamed",
+        Kind::TextInput => "TextInput Control",
     }
 }
 
@@ -311,7 +311,7 @@ fn a_read_only_text_input_stays_a_tab_stop(cx: &mut TestAppContext) {
 
     assert_eq!(
         walk(&harness, cx),
-        ["Button Before", "unnamed", "Button After"]
+        ["Button Before", "TextInput Control", "Button After"]
     );
 }
 

@@ -3,6 +3,7 @@ use gpui::{
     div, px,
 };
 
+use crate::a11y::accessible;
 use crate::component::{Component, example, example_group};
 use crate::prelude::*;
 use crate::styles::focus_ring;
@@ -116,7 +117,7 @@ impl RenderOnce for ListRow {
         )]
         let indent = px(14. * self.indent as f32);
 
-        let accessible = self.accessible_label.unwrap_or_else(|| self.label.clone());
+        let spoken = self.accessible_label.unwrap_or_else(|| self.label.clone());
         let has_detail = self.detail.is_some();
         let label = Label::new(self.label).weight(FontWeight::MEDIUM).truncate();
         let text = match self.detail {
@@ -140,13 +141,10 @@ impl RenderOnce for ListRow {
                 .into_any_element(),
         };
 
-        div()
-            .id(self.id)
+        accessible(div().id(self.id), Role::ListItem, spoken)
             .when_some(self.debug_selector, |row, selector| {
                 row.debug_selector(move || selector)
             })
-            .role(Role::ListItem)
-            .aria_label(accessible)
             .aria_selected(self.selected)
             .map(|row| match &self.focus_handle {
                 Some(handle) => row.track_focus(handle),

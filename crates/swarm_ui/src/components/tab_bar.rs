@@ -5,6 +5,7 @@ use gpui::{
     SharedString, Stateful, Window, div, linear_color_stop, linear_gradient, px,
 };
 
+use crate::a11y::accessible;
 use crate::component::{Component, example, example_group};
 use crate::components::menu::{Menu, MenuItem};
 use crate::components::popover_menu::popover_state;
@@ -228,13 +229,10 @@ fn overflow_trigger(
     let colors = cx.theme().colors();
     let (active, accent) = (colors.active, colors.accent);
 
-    div()
-        .id(id)
+    accessible(div().id(id), Role::Button, format!("{label}, {count}"))
         .when_some(debug_selector, |trigger, selector| {
             trigger.debug_selector(move || selector)
         })
-        .role(Role::Button)
-        .aria_label(format!("{label}, {count}"))
         .aria_expanded(open)
         .focusable()
         .tab_stop(true)

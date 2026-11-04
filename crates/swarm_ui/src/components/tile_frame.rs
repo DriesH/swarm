@@ -3,6 +3,7 @@ use gpui::{
     relative,
 };
 
+use crate::a11y::accessible;
 use crate::component::{Component, example, example_group};
 use crate::fonts::MONO_FONT;
 use crate::prelude::*;
@@ -193,10 +194,7 @@ impl RenderOnce for TileFrame {
             })
             .children(self.actions);
 
-        div()
-            .id(self.id)
-            .role(Role::Group)
-            .aria_label(label)
+        accessible(div().id(self.id), Role::Group, label)
             .map(|tile| match &self.focus_handle {
                 Some(handle) => tile.track_focus(handle),
                 None => tile,

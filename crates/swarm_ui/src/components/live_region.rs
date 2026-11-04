@@ -50,13 +50,16 @@ impl ParentElement for LiveRegion {
 
 impl RenderOnce for LiveRegion {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        div()
-            .id(self.id)
-            .role(self.role)
-            .aria_value(self.value)
-            .children(self.children)
-            .a11y_flags()
-            .live(self.live)
+        let region = div().id(self.id).role(self.role);
+
+        // An empty value would make macOS announce nothing when the node appears.
+        let region = if self.value.is_empty() {
+            region
+        } else {
+            region.aria_value(self.value)
+        };
+
+        region.children(self.children).a11y_flags().live(self.live)
     }
 }
 

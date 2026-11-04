@@ -8,6 +8,7 @@ use gpui::{
     ease_out_quint, px,
 };
 
+use crate::a11y::accessible;
 use crate::component::{Component, example, example_group};
 use crate::prelude::*;
 use crate::styles::focus_ring;
@@ -232,10 +233,7 @@ fn render_segment(
             Color::Muted
         });
 
-    div()
-        .id(("segment", index))
-        .role(Role::RadioButton)
-        .aria_label(label.clone())
+    accessible(div().id(("segment", index)), Role::RadioButton, label.clone())
         .aria_toggled(if is_selected {
             Toggled::True
         } else {

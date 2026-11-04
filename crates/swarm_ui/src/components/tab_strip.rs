@@ -5,6 +5,7 @@ use gpui::{
     SharedString, Stateful, Window, div, px,
 };
 
+use crate::a11y::accessible;
 use crate::component::{Component, example, example_group};
 use crate::prelude::*;
 use crate::roving::RovingFocus;
@@ -119,10 +120,7 @@ fn strip_tab(
         None => tab.label.clone(),
     };
 
-    div()
-        .id(("strip-tab", index))
-        .role(Role::Tab)
-        .aria_label(accessible_label)
+    accessible(div().id(("strip-tab", index)), Role::Tab, accessible_label)
         .aria_selected(is_selected)
         .aria_position_in_set(index + 1)
         .aria_size_of_set(count)

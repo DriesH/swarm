@@ -1,8 +1,10 @@
 use gpui::{
-    AnyElement, App, ClickEvent, ElementId, Hsla, Pixels, Role, SharedString, Window, div, px, rgb,
+    AnyElement, App, ClickEvent, ElementId, FocusHandle, Hsla, Pixels, Role, SharedString, Window,
+    div, px, rgb,
 };
 
 use super::tooltip::Tooltip;
+use crate::a11y::accessible;
 use crate::component::{Component, example, example_group};
 use crate::prelude::*;
 use crate::styles::focus_ring;
@@ -22,6 +24,7 @@ pub struct RailButton {
     badge: Option<AgentStatus>,
     toggle_state: bool,
     debug_selector: Option<String>,
+    focus_handle: Option<FocusHandle>,
     on_click: Option<ClickHandler>,
 }
 
@@ -39,6 +42,7 @@ impl RailButton {
             badge: None,
             toggle_state: false,
             debug_selector: None,
+            focus_handle: None,
             on_click: None,
         }
     }
@@ -58,6 +62,13 @@ impl RailButton {
     /// Name for `VisualTestContext::debug_bounds`. Only recorded in test builds.
     pub fn debug_selector(mut self, selector: impl FnOnce() -> String) -> Self {
         self.debug_selector = Some(selector());
+        self
+    }
+
+    /// Tracks focus with `handle`, so the owner can move focus onto the button. Create the
+    /// handle with `tab_stop(true)` to keep the button in the Tab order.
+    pub fn track_focus(mut self, handle: &FocusHandle) -> Self {
+        self.focus_handle = Some(handle.clone());
         self
     }
 }
@@ -82,13 +93,10 @@ impl RenderOnce for RailButton {
         let colors = cx.theme().colors();
         let (active, accent) = (colors.active, colors.accent);
 
-        div()
-            .id(self.id)
+        accessible(div().id(self.id), Role::Button, self.label)
             .when_some(self.debug_selector, |button, selector| {
                 button.debug_selector(move || selector)
             })
-            .role(Role::Button)
-            .aria_label(self.label)
             .aria_selected(self.toggle_state)
             .relative()
             .flex()
@@ -98,8 +106,10 @@ impl RenderOnce for RailButton {
             .size(SIZE)
             .rounded(px(8.))
             .when(self.toggle_state, |button| button.bg(active))
-            .focusable()
-            .tab_stop(true)
+            .map(|button| match &self.focus_handle {
+                Some(handle) => button.track_focus(handle),
+                None => button.focusable().tab_stop(true),
+            })
             .cursor_pointer()
             .hover(|style| style.bg(active))
             .focus_visible(|style| focus_ring(style, accent))

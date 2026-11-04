@@ -155,6 +155,16 @@ fn a_status_region_has_a_value_and_speaks_politely() {
 }
 
 #[test]
+fn an_empty_region_has_no_value() {
+    with_window(|window, cx| {
+        let info = a11y_info(LiveRegion::alert("failed", ""), window, cx);
+
+        assert_eq!(info.node.value(), None);
+        assert_eq!(info.node.live(), Some(Live::Assertive));
+    });
+}
+
+#[test]
 fn an_alert_region_has_a_value_and_speaks_at_once() {
     with_window(|window, cx| {
         let info = a11y_info(LiveRegion::alert("failed", "Merge failed"), window, cx);
@@ -193,19 +203,19 @@ fn a_plain_label_has_no_node() {
 
 #[test]
 fn an_accessible_label_is_a_label_with_its_text_as_value() {
-    let text = Label::new("Command K")
-        .accessible("shortcut")
-        .text_node()
-        .expect("an accessible label has a text node");
-    let info = info_of(&text);
+    with_window(|window, cx| {
+        let mut element = Label::new("Command K")
+            .accessible("shortcut")
+            .render(window, cx)
+            .into_any_element();
+        let label = element
+            .downcast_mut::<Stateful<Div>>()
+            .expect("an accessible label is a node");
+        let info = info_of(&*label);
 
-    assert_eq!(info.role, Some(Role::Label));
-    assert_eq!(info.node.value(), Some("Command K"));
-}
-
-#[test]
-fn a_plain_label_has_no_text_node() {
-    assert!(Label::new("Plain").text_node().is_none());
+        assert_eq!(info.role, Some(Role::Label));
+        assert_eq!(info.node.value(), Some("Command K"));
+    });
 }
 
 #[test]
