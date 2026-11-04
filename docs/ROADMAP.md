@@ -135,7 +135,7 @@ Three parts: 1. Usage in the daemon and the sidebar card. 2. Menu bar and popove
 
 **Scope:** welcome screen and system check, the plan editor on the Start tab, remaining settings pages (Terminals with the font size, Prompts, and Projects, which edits each repository's `.swarm/config.toml`), `tile.grow` / `tile.shrink` (the tile sizes themselves came early, after phase 5), file-type icons in the style of vscode-icons for files and folders (Changes tab, Changes and Files panels, Review), easter eggs, full VoiceOver and keyboard audit, performance pass, app bundle signing and notarization, updates, docs website and product website.
 
-Six parts (1–3 done): 1. Settings pages (Projects, Terminals, Prompts, Usage, Keyboard). 2. First launch: welcome screen, system check, `tile.grow` / `tile.shrink`. 3. File-type icons, easter eggs and Reduce Motion. 4. VoiceOver, keyboard and performance audit (findings parked in [`audits/phase-8-part-4.md`](audits/phase-8-part-4.md)). 5. Release: bundle, signing, notarization, updates and the app socket check. First slice done: the bundle, the app icon, and the signing and notarization script (`script/bundle-mac`, see [`release.md`](release.md)). Still to do: updates, the app socket check, and a test on a clean Mac. 6. Docs and product websites.
+Six parts (1–3 done): 1. Settings pages (Projects, Terminals, Prompts, Usage, Keyboard). 2. First launch: welcome screen, system check, `tile.grow` / `tile.shrink`. 3. File-type icons, easter eggs and Reduce Motion. 4. VoiceOver, keyboard and performance audit (findings in [`audits/phase-8-part-4.md`](audits/phase-8-part-4.md); rounds 1 and 2 done; the VoiceOver check on the real app is left). After round 2: drop files and images into a terminal, so an agent gets the image. 5. Release: bundle, signing, notarization, updates and the app socket check. First slice done: the bundle, the app icon, and the signing and notarization script (`script/bundle-mac`, see [`release.md`](release.md)). Still to do: updates, the app socket check, and a test on a clean Mac. 6. Docs and product websites.
 
 **Done when:**
 
@@ -147,6 +147,7 @@ Six parts (1–3 done): 1. Settings pages (Projects, Terminals, Prompts, Usage, 
 - [x] Files and folders show file-type icons; the icon set's license terms are met (vscode-icons: CC BY-SA 4.0 for the icons, attribution in About, branded icons excluded)
 - [ ] VoiceOver audit passes on every screen (checklist in `crates/swarm_ui/README.md`)
 - [x] Reduce Motion reaches GPUI and stops spinners and easter-egg animations
+- [ ] Dropping files or images on a terminal types their quoted paths, and ⌘V with an image on the clipboard sends ⌃V, so Claude Code and Codex attach the image
 - [ ] Disabled controls and plain text are announced by VoiceOver (needs GPUI support or a contribution upstream)
 - [ ] Signed and notarized build installs on a clean Mac
 - [ ] The daemon's app socket accepts only the signed Swarm app: it reads the caller's audit token from the socket and checks its code signature, so a process an agent detached from its parent cannot get in (ADR 0008)
