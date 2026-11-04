@@ -8,11 +8,11 @@ Each phase ends with a pull request into `main`. A phase is done when every box 
 | 1 | Foundation: workspace, `swarm_ui`, gallery | Done ([PR #2](https://github.com/DriesH/swarm/pull/2)) |
 | 2 | App shell with fake data | Done ([PR #3](https://github.com/DriesH/swarm/pull/3)) |
 | 3 | Daemon, terminals and worktrees | Done ([#4](https://github.com/DriesH/swarm/pull/4), [#5](https://github.com/DriesH/swarm/pull/5), [#6](https://github.com/DriesH/swarm/pull/6)) |
-| 4 | Agents and harness | In progress |
-| 5 | Swarm view | In progress |
-| 6 | Review and pull requests | In progress |
-| 7 | Menu bar, usage and notifications | In progress |
-| 8 | Polish and first release | Not started |
+| 4 | Agents and harness | Built; the checks on the real app are left |
+| 5 | Swarm view | Built; the checks on the real app are left |
+| 6 | Review and pull requests | Built; the checks on the real app are left |
+| 7 | Menu bar, usage and notifications | Built; the checks on the real app are left |
+| 8 | Polish and first release | In progress |
 | 9 | After first release | Not started |
 
 ## 0. Plan, design, spikes
@@ -135,7 +135,7 @@ Three parts: 1. Usage in the daemon and the sidebar card. 2. Menu bar and popove
 
 **Scope:** welcome screen and system check, the plan editor on the Start tab, remaining settings pages (Terminals with the font size, Prompts, and Projects, which edits each repository's `.swarm/config.toml`), `tile.grow` / `tile.shrink` (the tile sizes themselves came early, after phase 5), file-type icons in the style of vscode-icons for files and folders (Changes tab, Changes and Files panels, Review), easter eggs, full VoiceOver and keyboard audit, performance pass, app bundle signing and notarization, updates, docs website and product website.
 
-Six parts (1–3 done): 1. Settings pages (Projects, Terminals, Prompts, Usage, Keyboard). 2. First launch: welcome screen, system check, `tile.grow` / `tile.shrink`. 3. File-type icons, easter eggs and Reduce Motion. 4. VoiceOver, keyboard and performance audit (findings in [`audits/phase-8-part-4.md`](audits/phase-8-part-4.md); rounds 1 and 2 done; the VoiceOver check on the real app is left). After round 2: drop files and images into a terminal, so an agent gets the image. 5. Release: bundle, signing, notarization, updates and the app socket check. First slice done: the bundle, the app icon, and the signing and notarization script (`script/bundle-mac`, see [`release.md`](release.md)). Still to do: the app socket check, updates (own updater from S3, see Updates in [`PLAN.md`](PLAN.md) and ADR 0010), and a test on a clean Mac. 6. Docs and product websites.
+Six parts (1–3 done): 1. Settings pages (Projects, Terminals, Prompts, Usage, Keyboard). 2. First launch: welcome screen, system check, `tile.grow` / `tile.shrink`. 3. File-type icons, easter eggs and Reduce Motion. 4. VoiceOver, keyboard and performance audit (findings in [`audits/phase-8-part-4.md`](audits/phase-8-part-4.md); rounds 1 and 2 done; the VoiceOver check on the real app is left). After round 2: drop files and images into a terminal, so an agent gets the image (built; the check with Claude Code and Codex on the real app is left). 5. Release: bundle, signing, notarization, updates and the app socket check. Done: the bundle, the app icon, the signing and notarization script (`script/bundle-mac`, see [`release.md`](release.md)) and the app socket check (the check with a signed build is left). Still to do: updates (own updater from S3, see Updates in [`PLAN.md`](PLAN.md) and ADR 0010) and a test on a clean Mac. 6. Docs and product websites. The product website is in `site/` and GitHub Pages serves it; the docs website is still to do.
 
 **Done when:**
 
