@@ -9,6 +9,7 @@ mod hook;
 mod mcp;
 mod session;
 mod statusline;
+mod update_install;
 
 use std::io::Write as _;
 use std::process::ExitCode;
@@ -141,6 +142,22 @@ enum Action {
     /// An easter egg: the pixel bee and the swarm's counts. Left out of the help.
     #[command(hide = true)]
     Buzz,
+    /// Swap the app bundle after the app has quit. Started by the app; left out of the help.
+    #[command(hide = true)]
+    UpdateInstall {
+        /// The app process to wait for.
+        #[arg(long)]
+        pid: u32,
+        /// The installed `Swarm.app`.
+        #[arg(long)]
+        old: std::path::PathBuf,
+        /// The checked `Swarm.app` that replaces it.
+        #[arg(long)]
+        new: std::path::PathBuf,
+        /// Open the new app when done.
+        #[arg(long)]
+        reopen: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -350,7 +367,9 @@ impl Action {
             Self::Task { action } => action.command(stdin)?,
             Self::Exit => Command::Exit,
             Self::Terminal { action } => action.command(),
-            Self::Mcp | Self::Hook | Self::Statusline | Self::Buzz => return Ok(None),
+            Self::Mcp | Self::Hook | Self::Statusline | Self::Buzz | Self::UpdateInstall { .. } => {
+                return Ok(None);
+            }
         };
 
         Ok(Some(command))
@@ -503,6 +522,15 @@ fn main() -> ExitCode {
         buzz::run();
 
         return ExitCode::SUCCESS;
+    }
+    if let Action::UpdateInstall {
+        pid,
+        old,
+        new,
+        reopen,
+    } = &cli.command
+    {
+        return update_install::run(*pid, old, new, *reopen);
     }
 
     run(cli)
@@ -1043,6 +1071,51 @@ mod tests {
         ] {
             assert!(!help.to_string().contains("buzz"), "{help}");
         }
+    }
+
+    #[test]
+    fn update_install_is_a_hidden_command_with_its_arguments() {
+        let action = parse(&[
+            "update-install",
+            "--pid",
+            "42",
+            "--old",
+            "/Applications/Swarm.app",
+            "--new",
+            "/tmp/Swarm.app",
+            "--reopen",
+        ])
+        .expect("parse")
+        .command;
+        assert!(matches!(
+            &action,
+            Action::UpdateInstall { pid: 42, reopen: true, old, new }
+                if old == std::path::Path::new("/Applications/Swarm.app")
+                    && new == std::path::Path::new("/tmp/Swarm.app")
+        ));
+        assert!(action.command(&mut std::io::empty()).expect("ok").is_none());
+
+        let command = Cli::command();
+        assert!(
+            command
+                .find_subcommand("update-install")
+                .expect("update-install")
+                .is_hide_set()
+        );
+        for help in [
+            command.clone().render_help(),
+            command.clone().render_long_help(),
+        ] {
+            assert!(!help.to_string().contains("update-install"), "{help}");
+        }
+    }
+
+    #[test]
+    fn update_install_needs_pid_old_and_new() {
+        assert!(parse(&["update-install"]).is_err());
+        assert!(parse(&["update-install", "--pid", "1", "--old", "/a"]).is_err());
+        assert!(parse(&["update-install", "--pid", "x", "--old", "/a", "--new", "/b"]).is_err());
+        assert!(parse(&["update-install", "--pid", "1", "--old", "/a", "--new", "/b"]).is_ok());
     }
 
     #[test]

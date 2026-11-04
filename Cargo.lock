@@ -5289,6 +5289,7 @@ dependencies = [
  "serde_json",
  "swarm_protocol",
  "swarm_sprite",
+ "swarm_update",
  "swarm_usage",
 ]
 
@@ -5411,6 +5412,23 @@ dependencies = [
  "swarm_sprite",
  "swarm_ui",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "swarm_update"
+version = "0.1.0"
+dependencies = [
+ "block2 0.6.2",
+ "core-foundation",
+ "libc",
+ "log",
+ "objc2 0.6.5",
+ "objc2-foundation 0.3.2",
+ "security-framework",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
