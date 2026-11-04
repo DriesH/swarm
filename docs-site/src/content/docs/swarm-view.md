@@ -35,6 +35,7 @@ The header has:
 - the kind icon, the name and the status
 - **View diff**: opens [Review](/swarm/docs/review/) filtered to this agent
 - **Focus**: opens the Terminals view with this agent's tile focused, restored from the tray if needed
+- **Resume**, for a resumable agent: starts it again with its saved conversation. See [Idle stop and resume](/swarm/docs/how-work-starts/#idle-stop-and-resume).
 
 Under the header, one line gives the agent's kind and model, its running time, and **Task worktree** or **Own worktree**. The next line gives its branch.
 

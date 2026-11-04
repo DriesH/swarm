@@ -66,7 +66,7 @@ What happens next depends on the source.
 - On **Live**, the button is **Comment**. The comment goes at once.
 - On **Merged**, the button is **Add comment**. The comment waits as **Pending**. **Request changes · N** sends all pending comments together.
 
-Swarm refuses to send while the task's orchestrator is stopped.
+When the task's orchestrator is resumable, sending a comment [resumes it](/swarm/docs/how-work-starts/#idle-stop-and-resume) first. Swarm refuses to send when the orchestrator cannot resume, or when resuming it would go over an [agent limit](/swarm/docs/how-work-starts/#agent-limits). The error says why.
 
 A thread shows its state: **Pending**, **In flight** (the orchestrator has not received it), **Delivered** with its time, or **Resolved**.
 

@@ -1,6 +1,6 @@
 ---
 title: Troubleshooting
-description: Fixes for system check failures, the daemon, notifications and usage numbers.
+description: Fixes for system check failures, the daemon, agents, settings, notifications and usage numbers.
 ---
 
 Each entry names what you see and what to do.
@@ -49,8 +49,26 @@ pkill -x swarm-daemon
 ```
 
 :::caution
-Stopping the daemon ends every running agent.
+Stopping the daemon stops every running agent. Agents with a saved conversation become resumable. See [Idle stop and resume](/swarm/docs/how-work-starts/#idle-stop-and-resume).
 :::
+
+## Agents
+
+### An agent stopped by itself and shows **resumable**
+
+Idle stop stopped it after the time in **Settings › Agents › Stop idle agents after**. It resumes with its conversation when a message arrives for it. To resume it now, select **Resume** in its inspector in the Swarm view, or run **Resume agent “name”** from the palette (⌘K). To turn idle stop off, choose **Never**.
+
+### Swarm refuses to start an agent: "the limit is …"
+
+The task or all tasks together reached a limit in **Settings › Agents**: **Max agents per task** or **Max agents in total**. Stop an agent, or raise the limit. A resume counts as a start.
+
+### Settings shows a warning about a key
+
+A value in `~/.config/swarm/settings.toml` is not valid, so Swarm uses that key's default. The warning names the key. Change the setting in the Settings window, or fix the value in the file.
+
+### Settings shows an error and changes are not saved
+
+The file is not valid TOML, for example after a hand edit with a missing quote. Swarm uses the defaults and does not overwrite the file. Fix the file in an editor, then close the Settings window and open it again. Settings reads the file when its window opens.
 
 ## Notifications
 
