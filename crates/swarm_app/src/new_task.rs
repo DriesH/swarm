@@ -1,12 +1,13 @@
 //! The New task dialog.
 
 use gpui::{
-    AppContext as _, Context, Div, Entity, EventEmitter, FocusHandle, Focusable as _, Role,
-    SharedString, Subscription, WeakEntity, Window, div, px,
+    AppContext as _, Context, Div, Entity, EventEmitter, FocusHandle, Focusable as _, SharedString,
+    Subscription, WeakEntity, Window, div, px,
 };
 use swarm_protocol::{ClientError, CreateTask};
 use swarm_ui::prelude::*;
 
+use crate::announce::announce;
 use crate::model::{AgentKind, FakeLine, ProjectId};
 use crate::palette::Overlay;
 use crate::workspace::Workspace;
@@ -188,6 +189,19 @@ impl NewTaskDialog {
         cx.notify();
     }
 
+    /// Speaks "Creating task" while the daemon works.
+    fn status_region(&self) -> LiveRegion {
+        LiveRegion::status(
+            "new-task-status",
+            if self.busy { "Creating task" } else { "" },
+        )
+    }
+
+    /// Speaks why the task was not created.
+    fn alert_region(&self) -> LiveRegion {
+        LiveRegion::alert("new-task-error", self.error.clone().unwrap_or_default())
+    }
+
     pub(crate) fn create(&mut self, cx: &mut Context<Self>) {
         if !self.can_create(cx) {
             return;
@@ -293,16 +307,6 @@ impl Render for NewTaskDialog {
         } else {
             "Create task"
         };
-        let error = self.error.clone().map(|message| {
-            div()
-                .id("new-task-error")
-                .role(Role::Alert)
-                .aria_label(message.clone())
-                .text_size(px(12.))
-                .text_color(Color::Del.hsla(cx))
-                .child(message)
-        });
-
         let footer = h_flex()
             .gap(px(8.))
             .child(
@@ -336,7 +340,13 @@ impl Render for NewTaskDialog {
             )
             .child(field("First message", self.message.clone()))
             .child(setup)
-            .children(error)
+            .children(
+                self.error
+                    .clone()
+                    .map(|message| Label::new(message).size(LabelSize::Small).color(Color::Del)),
+            )
+            .child(announce("new-task-alert", self.alert_region()))
+            .child(announce("new-task-status", self.status_region()))
             .footer(footer)
     }
 }
@@ -538,7 +548,12 @@ impl Workspace {
 
 #[cfg(test)]
 mod tests {
+    use gpui::{TestAppContext, VisualTestContext};
+
     use super::*;
+    use crate::daemon::tests::{redraw, setup};
+    use crate::live_probe::{assert_named, is_quiet, reversed, see_in};
+    use swarm_ui::test_support::tab_walk;
 
     fn names(choices: &[SharedString]) -> Vec<&str> {
         choices.iter().map(AsRef::as_ref).collect()
@@ -565,5 +580,96 @@ mod tests {
         let choices = branch_choices(&"main".into(), Some(&"swarm/login".into()), &[]);
 
         assert_eq!(names(&choices), ["main", "swarm/login"]);
+    }
+
+    fn open_dialog(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> Entity<NewTaskDialog> {
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_new_task(window, cx);
+        });
+        redraw(cx);
+
+        workspace.read_with(cx, |workspace, _| match &workspace.overlay {
+            Some(Overlay::NewTask { view, .. }) => view.clone(),
+            _ => panic!("the dialog is not open"),
+        })
+    }
+
+    #[gpui::test]
+    fn the_dialog_draws_the_regions_that_speak_its_state(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let _view = open_dialog(&workspace, cx);
+
+        assert!(cx.debug_bounds("new-task-alert").is_some());
+        assert!(cx.debug_bounds("new-task-status").is_some());
+    }
+
+    #[gpui::test]
+    fn creating_a_task_is_spoken_politely(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let view = open_dialog(&workspace, cx);
+
+        let idle = see_in(view.read_with(cx, |dialog, _| dialog.status_region()), cx);
+        view.update(cx, |dialog, cx| dialog.set_busy(true, cx));
+        let busy = see_in(view.read_with(cx, |dialog, _| dialog.status_region()), cx);
+
+        assert!(is_quiet(&idle));
+        assert_eq!(busy.value.as_deref(), Some("Creating task"));
+        assert_eq!(busy.live, Some(Live::Polite));
+    }
+
+    fn dialog_root(view: &Entity<NewTaskDialog>, cx: &VisualTestContext) -> FocusHandle {
+        view.read_with(cx, |dialog, _| dialog.focus_handle.clone())
+    }
+
+    #[gpui::test]
+    fn tab_walks_the_dialog_in_order_and_never_leaves_it(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let view = open_dialog(&workspace, cx);
+        let root = dialog_root(&view, cx);
+
+        let forward = tab_walk(cx, &root, "tab");
+        let backward = tab_walk(cx, &root, "shift-tab");
+
+        assert_eq!(
+            forward,
+            [
+                "TextInput Name",
+                "ComboBox Branch from",
+                "ComboBox Orchestrator",
+                "MultilineTextInput First message",
+                "CheckBox Run setup script",
+                "Button Cancel",
+                "Button Close dialog",
+            ]
+        );
+        assert_eq!(backward, reversed(&forward));
+        assert_named(&forward);
+    }
+
+    #[gpui::test]
+    fn closing_the_dialog_gives_focus_back_to_what_had_it(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let row = workspace.read_with(cx, |workspace, _| workspace.sidebar_focus.clone());
+        cx.update(|window, cx| window.focus(&row, cx));
+
+        open_dialog(&workspace, cx);
+        cx.simulate_keystrokes("escape");
+
+        assert!(cx.update(|window, _| row.is_focused(window)));
+    }
+
+    #[gpui::test]
+    fn a_failed_task_is_an_alert(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let view = open_dialog(&workspace, cx);
+
+        view.update(cx, |dialog, cx| dialog.fail("Cannot create".to_owned(), cx));
+        let alert = see_in(view.read_with(cx, |dialog, _| dialog.alert_region()), cx);
+
+        assert_eq!(alert.value.as_deref(), Some("Cannot create"));
+        assert_eq!(alert.live, Some(Live::Assertive));
     }
 }

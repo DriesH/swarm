@@ -1,12 +1,12 @@
 //! Settings › General: the system check and the About section.
 
-use gpui::{AnyElement, FontWeight, Role, div, px};
+use gpui::{FontWeight, Role, div, px};
 use swarm_ui::a11y::accessible;
 use swarm_ui::prelude::*;
 use swarm_ui::styles::focus_ring;
 
 use super::SettingsWindow;
-use super::pages::{page_title, plain_row, section};
+use super::pages::{PageBlocks, page_title, plain_row, section};
 use crate::system_check::SystemCheckView;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -86,11 +86,28 @@ impl RenderOnce for Link {
     }
 }
 
+fn version_label() -> Label {
+    Label::new(APP_VERSION)
+        .accessible("about-version-text")
+        .mono()
+        .size(LabelSize::Small)
+}
+
+fn credit_label() -> Label {
+    Label::new(ICONS_CREDIT).accessible("about-file-icons-text")
+}
+
+fn changes_label() -> Label {
+    Label::new(ICONS_CHANGES)
+        .accessible("about-icon-changes-text")
+        .size(LabelSize::Small)
+}
+
 fn about() -> impl IntoElement {
     let version = PanelRow::new("Version").end_slot(
         div()
             .debug_selector(|| "about-version".to_owned())
-            .child(Label::new(APP_VERSION).mono().size(LabelSize::Small)),
+            .child(version_label()),
     );
 
     let icons = plain_row()
@@ -98,7 +115,7 @@ fn about() -> impl IntoElement {
             div()
                 .flex_1()
                 .debug_selector(|| "about-file-icons".to_owned())
-                .child(Label::new(ICONS_CREDIT)),
+                .child(credit_label()),
         )
         .children(
             ICON_LINKS
@@ -109,14 +126,14 @@ fn about() -> impl IntoElement {
     let changes = PanelRow::new("File icon changes").end_slot(
         div()
             .debug_selector(|| "about-icon-changes".to_owned())
-            .child(Label::new(ICONS_CHANGES).size(LabelSize::Small)),
+            .child(changes_label()),
     );
 
     section("About", Panel::new().row(version).row(icons).row(changes))
 }
 
 impl SettingsWindow {
-    pub(super) fn general_page(&self, _cx: &Context<Self>) -> AnyElement {
+    pub(super) fn general_page(&self, _cx: &Context<Self>) -> PageBlocks {
         let check = self.system_check.clone();
 
         let check_again = Button::new("check-again", "Check again")
@@ -142,12 +159,10 @@ impl SettingsWindow {
             )
             .child(self.system_check.clone());
 
-        v_flex()
-            .gap(px(26.))
+        PageBlocks::new(26.)
             .child(page_title("General"))
             .child(system)
             .child(about())
-            .into_any_element()
     }
 }
 
@@ -392,6 +407,32 @@ mod tests {
             assert_eq!(role, Some(AccessRole::Link), "{id}");
             assert_eq!(name.as_deref(), Some(accessible), "{id}");
             assert!(accessible.starts_with(label), "{id}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod value_tests {
+    use gpui::TestAppContext;
+    use gpui::accesskit::Role as NodeRole;
+
+    use super::*;
+    use crate::live_probe::see_label_in;
+
+    #[gpui::test]
+    fn the_read_only_values_are_text_in_the_tree(cx: &mut TestAppContext) {
+        cx.update(swarm_ui::init);
+        let (_, cx) = cx.add_window_view(|_, _| gpui::Empty);
+
+        for (label, expected) in [
+            (version_label(), APP_VERSION),
+            (credit_label(), ICONS_CREDIT),
+            (changes_label(), ICONS_CHANGES),
+        ] {
+            let seen = see_label_in(label, cx);
+
+            assert_eq!(seen.role, Some(NodeRole::Label), "{expected}");
+            assert_eq!(seen.value.as_deref(), Some(expected));
         }
     }
 }

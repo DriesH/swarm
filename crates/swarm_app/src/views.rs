@@ -1,26 +1,28 @@
 //! The main area: terminals, swarm and review views.
 
 use gpui::{
-    AnyElement, AppContext as _, Bounds, Context, Div, Entity, FontWeight, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, Orientation, Pixels, Role, SharedString, Size,
-    Stateful, Subscription, Window, div, px,
+    AnyElement, AppContext as _, Bounds, Context, Div, DragMoveEvent, Entity, FocusHandle,
+    FontWeight, MouseButton, Pixels, Role, SharedString, Size, Stateful, Subscription, Window, div,
+    px,
 };
 use swarm_layout::{Activity, Layout, LayoutStyle, Rect, TileId, TileKind, TileSpec};
 use swarm_term_view::TerminalView;
 use swarm_ui::fonts::MONO_FONT;
 use swarm_ui::prelude::*;
-use swarm_ui::styles::focus_ring;
-use swarm_ui::{FocusStyle, TextFieldSize, TileRing};
+use swarm_ui::{FocusStyle, Nudge, ResizeAxis, TextFieldSize, TileRing};
 
 use crate::daemon::{CHROME_HEIGHT, CHROME_WIDTH, exit_failed};
 use crate::model::{Agent, AgentKind, FakeLine, Terminal, TerminalId, TerminalKind};
+use crate::sidebar::update_workspace;
 use crate::workspace::{DataSource, View, Workspace};
 
 /// The padding a terminal view leaves around its grid.
 const VIEW_PADDING: f32 = 8.;
 const CHAR_WIDTH: f32 = 7.2;
 const ROW_HEIGHT: f32 = 17.;
-const HANDLE_HEIGHT: f32 = 6.;
+/// The resize handle reaches this far above its parent's top, so its parent is this tall and
+/// the handle ends at the tile's edge.
+const HANDLE_HEIGHT: f32 = 4.;
 /// The rows of the terminal a small tile shows.
 const SMALL_TILE_ROWS: u16 = 12;
 /// The rows of the terminal a process tile shows.
@@ -43,9 +45,11 @@ const DEFAULT_USER_SIZE: Size<Pixels> = Size {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Resizing {
     terminal: TerminalId,
-    start_y: Pixels,
-    start_height: Pixels,
 }
+
+/// The payload of a drag on a user terminal's resize handle.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TileDrag(TerminalId);
 
 pub(crate) fn render(
     workspace: &Workspace,
@@ -595,6 +599,7 @@ impl Workspace {
         self.data.close_user_terminal(task, terminal);
         self.disconnected.remove(&terminal);
         self.terminal_focus.remove(&terminal);
+        self.resize_focus.remove(&terminal);
         self.user_sizes.remove(&terminal);
         self.minimized.remove(&terminal);
         self.forget_recent_focus(terminal);
@@ -670,38 +675,28 @@ impl Workspace {
         }
     }
 
-    fn start_resize(&mut self, terminal: TerminalId, start_y: Pixels, cx: &mut Context<Self>) {
-        let Some(rect) = self.layout.rect(TileId(terminal.0)) else {
-            return;
-        };
-
-        self.resizing = Some(Resizing {
-            terminal,
-            start_y,
-            start_height: px(rect.size.height),
-        });
-        cx.notify();
-    }
-
-    fn drag_resize(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
-        let Some(resizing) = self.resizing else {
-            return;
-        };
-
-        if event.pressed_button != Some(MouseButton::Left) {
+    /// The tile reaches from its top to the pointer, wherever the pointer is in the window.
+    fn drag_resize(&mut self, event: &DragMoveEvent<TileDrag>, cx: &mut Context<Self>) {
+        if event.event.pressed_button != Some(MouseButton::Left) {
             self.end_resize(cx);
             return;
         }
 
-        let Some(rect) = self.layout.rect(TileId(resizing.terminal.0)) else {
+        let terminal = event.drag(cx).0;
+        let Some(rect) = self.layout.rect(TileId(terminal.0)) else {
             return;
         };
 
+        if self.resizing.map(|resizing| resizing.terminal) != Some(terminal) {
+            self.resizing = Some(Resizing { terminal });
+            cx.notify();
+        }
+
         let size = Size {
             width: px(rect.size.width),
-            height: resizing.start_height + (event.position.y - resizing.start_y),
+            height: event.event.position.y - event.bounds.top() - px(rect.origin.y),
         };
-        self.resize_user_terminal(resizing.terminal, size, cx);
+        self.resize_user_terminal(terminal, size, cx);
     }
 
     fn end_resize(&mut self, cx: &mut Context<Self>) {
@@ -710,14 +705,22 @@ impl Workspace {
         }
     }
 
-    fn nudge_resize(&mut self, terminal: TerminalId, delta: f32, cx: &mut Context<Self>) {
+    /// Up and Down change the height by a step. Home and End go to the limits.
+    fn nudge_resize(&mut self, terminal: TerminalId, nudge: Nudge, cx: &mut Context<Self>) {
         let Some(rect) = self.layout.rect(TileId(terminal.0)) else {
             return;
         };
 
+        let height = match nudge {
+            Nudge::Left => px(rect.size.height - KEY_STEP),
+            Nudge::Right => px(rect.size.height + KEY_STEP),
+            Nudge::Smallest => MIN_TILE.height,
+            Nudge::Largest => self.largest_user_tile().height,
+        };
+
         let size = Size {
             width: px(rect.size.width),
-            height: px(rect.size.height + delta),
+            height,
         };
         self.resize_user_terminal(terminal, size, cx);
     }
@@ -757,9 +760,11 @@ fn terminals(workspace: &Workspace, cx: &mut Context<Workspace>) -> impl IntoEle
         .size_full()
         .relative()
         .when(on_terminal, |area| area.bg(term))
-        .on_mouse_move(cx.listener(|workspace, event: &MouseMoveEvent, _, cx| {
-            workspace.drag_resize(event, cx);
-        }))
+        .on_drag_move(
+            cx.listener(|workspace, event: &DragMoveEvent<TileDrag>, _, cx| {
+                workspace.drag_resize(event, cx);
+            }),
+        )
         .on_mouse_up(
             MouseButton::Left,
             cx.listener(|workspace, _, _, cx| workspace.end_resize(cx)),
@@ -812,8 +817,22 @@ fn tile(
                 f32::from(workspace.largest_user_tile().height),
             );
 
-            resize_handle(id, &label, size.height, range, resizing.is_some(), cx).into_any_element()
+            let focus = workspace.resize_focus.get(&id)?;
+
+            Some(
+                resize_handle(
+                    id,
+                    &label,
+                    size.height,
+                    range,
+                    resizing.is_some(),
+                    focus,
+                    cx,
+                )
+                .into_any_element(),
+            )
         });
+    let handle = handle.flatten();
     let badge = resizing.map(|_| size_badge(size, workspace.cell_size, cx));
 
     Some(
@@ -1109,51 +1128,41 @@ fn resize_handle(
     height: Pixels,
     range: (f32, f32),
     dragging: bool,
-    cx: &mut Context<Workspace>,
-) -> Stateful<Div> {
-    let colors = cx.theme().colors();
-    let (accent, ground) = (colors.accent, colors.ground);
-    let height = f32::from(height);
+    focus: &FocusHandle,
+    cx: &Context<Workspace>,
+) -> Div {
+    let handle = tile_resize_handle(id, label, height, range, dragging, focus, cx);
 
     div()
-        .id(("resize", id.0))
         .debug_selector(move || format!("resize-{}", id.0))
-        .role(Role::Splitter)
-        .aria_label(label.to_owned())
-        .aria_orientation(Orientation::Horizontal)
-        .aria_value(format!("{} pixels", height.round()))
-        .aria_numeric_value(f64::from(height))
-        .aria_min_numeric_value(f64::from(range.0))
-        .aria_max_numeric_value(f64::from(range.1))
-        .focusable()
-        .tab_stop(true)
         .absolute()
         .left_0()
         .right_0()
         .bottom_0()
         .h(px(HANDLE_HEIGHT))
-        .flex()
-        .items_center()
-        .justify_center()
-        .cursor_row_resize()
-        .when(dragging, |handle| handle.bg(accent))
-        .focus_visible(move |style| focus_ring(style.bg(accent), accent))
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |workspace, event: &MouseDownEvent, _, cx| {
-                cx.stop_propagation();
-                workspace.start_resize(id, event.position.y, cx);
-            }),
-        )
-        .on_key_down(cx.listener(move |workspace, event: &KeyDownEvent, _, cx| {
-            match event.keystroke.key.as_str() {
-                "up" => workspace.nudge_resize(id, -KEY_STEP, cx),
-                "down" => workspace.nudge_resize(id, KEY_STEP, cx),
-                _ => {}
-            }
-        }))
-        .when(dragging, |handle| {
-            handle.child(div().w(px(36.)).h(px(4.)).rounded(px(2.)).bg(ground))
+        .child(handle)
+}
+
+fn tile_resize_handle(
+    id: TerminalId,
+    label: &str,
+    height: Pixels,
+    range: (f32, f32),
+    dragging: bool,
+    focus: &FocusHandle,
+    cx: &Context<Workspace>,
+) -> ResizeHandle {
+    let workspace = cx.weak_entity();
+
+    ResizeHandle::new(("resize", id.0), label.to_owned(), focus)
+        .axis(ResizeAxis::Vertical)
+        .value(f32::from(height), range.0, range.1)
+        .dragging(dragging)
+        .on_drag(TileDrag(id))
+        .on_nudge(move |nudge, _, cx| {
+            update_workspace(&workspace, cx, |workspace, cx| {
+                workspace.nudge_resize(id, nudge, cx);
+            });
         })
 }
 
@@ -2317,21 +2326,24 @@ mod tests {
 
     #[gpui::test]
     fn the_resize_handle_reads_its_height_and_names_its_terminal(cx: &mut TestAppContext) {
-        use gpui::Element as _;
         use gpui::accesskit::{Node, Orientation as AccessOrientation, Role as AccessRole};
+        use gpui::{Element as _, RenderOnce as _};
 
-        let (workspace, _) = setup(cx);
+        let (workspace, cx) = setup(cx);
 
-        let (role, node) = workspace.update(cx, |_, cx| {
-            let element = resize_handle(
+        let handle = workspace.update(cx, |_, cx| {
+            tile_resize_handle(
                 TerminalId(14),
                 "Resize your terminal 2",
                 px(300.),
                 (160., 780.),
                 false,
+                &cx.focus_handle(),
                 cx,
             )
-            .into_element();
+        });
+        let (role, node) = cx.update(|window, cx| {
+            let element = handle.render(window, cx).into_element();
             let mut node = Node::new(AccessRole::Unknown);
             element.write_a11y_info(&mut node);
 
@@ -2345,6 +2357,98 @@ mod tests {
         assert_eq!(node.min_numeric_value(), Some(160.));
         assert_eq!(node.max_numeric_value(), Some(780.));
         assert_eq!(node.orientation(), Some(AccessOrientation::Horizontal));
+    }
+
+    /// A user terminal on the task, with its resize handle focused. Returns its height.
+    fn focused_resize_handle(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> (TerminalId, f32) {
+        cx.dispatch_action(NewTerminal);
+        redraw(cx);
+
+        let user = workspace.read_with(cx, |workspace, _| {
+            workspace.active_task().user_terminals.first().copied()
+        });
+        let user = user.expect("a user terminal");
+        let handle = workspace.read_with(cx, |workspace, _| workspace.resize_focus[&user].clone());
+        cx.update(|window, cx| handle.focus(window, cx));
+
+        (user, tile_height(workspace, user, cx))
+    }
+
+    #[gpui::test]
+    fn closing_a_user_terminal_drops_its_resize_handle(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let (user, _) = focused_resize_handle(&workspace, cx);
+
+        workspace.update(cx, |workspace, cx| workspace.close_user_terminal(user, cx));
+        redraw(cx);
+
+        let kept = workspace.read_with(cx, |workspace, _| {
+            workspace.resize_focus.contains_key(&user)
+        });
+        assert!(!kept);
+    }
+
+    fn tile_height(
+        workspace: &Entity<Workspace>,
+        user: TerminalId,
+        cx: &mut VisualTestContext,
+    ) -> f32 {
+        redraw(cx);
+
+        workspace.read_with(cx, |workspace, _| {
+            workspace
+                .layout
+                .rect(TileId(user.0))
+                .map_or(0., |rect| rect.size.height)
+        })
+    }
+
+    #[gpui::test]
+    fn the_arrows_home_and_end_resize_a_user_terminal_from_its_handle(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let (user, start) = focused_resize_handle(&workspace, cx);
+
+        cx.simulate_keystrokes("down");
+        let after_down = tile_height(&workspace, user, cx);
+        cx.simulate_keystrokes("up up");
+        let after_up = tile_height(&workspace, user, cx);
+        cx.simulate_keystrokes("home");
+        let smallest = tile_height(&workspace, user, cx);
+
+        assert!((after_down - (start + KEY_STEP)).abs() < 0.5);
+        assert!((after_up - (start - KEY_STEP)).abs() < 0.5);
+        assert!((smallest - f32::from(MIN_TILE.height)).abs() < 0.5);
+    }
+
+    #[gpui::test]
+    fn dragging_the_handle_sets_the_height_from_the_tile_top(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let (user, _) = focused_resize_handle(&workspace, cx);
+        let handle = cx.debug_bounds("resize-14").expect("the handle");
+        let area = cx.debug_bounds("tile-slot-14").expect("the tile");
+
+        cx.simulate_mouse_down(handle.center(), MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(
+            gpui::point(handle.center().x, area.top() + px(300.)),
+            MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_move(
+            gpui::point(handle.center().x, area.top() + px(320.)),
+            MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        let dragged = tile_height(&workspace, user, cx);
+        cx.simulate_mouse_up(
+            gpui::point(handle.center().x, area.top() + px(320.)),
+            MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+
+        assert!((dragged - 320.).abs() < 0.5);
     }
 
     #[gpui::test]

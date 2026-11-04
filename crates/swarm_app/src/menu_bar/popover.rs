@@ -15,6 +15,7 @@ use swarm_ui::{Dismiss, ROOT_CONTEXT, theme};
 
 use super::summary::{NeedsYou, Summary};
 use crate::actions::Quit;
+use crate::announce::announce;
 use crate::lifecycle;
 use crate::model::TaskId;
 use crate::usage_text::{UsageSection, WindowRow};
@@ -439,6 +440,27 @@ impl Popover {
             .into_any_element()
     }
 
+    /// Speaks "Stopping agents" while the daemon stops them.
+    fn stop_status(&self) -> LiveRegion {
+        let value = if self.stop == StopState::Stopping {
+            "Stopping agents"
+        } else {
+            ""
+        };
+
+        LiveRegion::status("popover-stop-status", value)
+    }
+
+    /// Speaks why Stop all failed.
+    fn stop_alert(&self) -> LiveRegion {
+        let message = match &self.stop {
+            StopState::Failed(message) => message.clone(),
+            _ => SharedString::default(),
+        };
+
+        LiveRegion::alert("popover-stop-alert", message)
+    }
+
     fn footer(&self, summary: &Summary, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let line = cx.theme().colors().line;
 
@@ -476,6 +498,8 @@ impl Popover {
             .border_t_1()
             .border_color(line)
             .child(div().min_h(px(28.)).child(stop_row))
+            .child(announce("popover-stop-status", self.stop_status()))
+            .child(announce("popover-stop-alert", self.stop_alert()))
             .child(
                 h_flex()
                     .gap(px(8.))
@@ -593,16 +617,15 @@ pub(crate) fn usage_section(section: &UsageSection, surface: UsageSurface) -> gp
     let problem = section.problem.as_ref().map(|(shown, spoken)| {
         let problem_id = format!("{id}-problem");
 
-        div()
-            .id(SharedString::from(problem_id.clone()))
-            .debug_selector(move || problem_id)
-            .role(Role::Status)
-            .aria_label(spoken.clone())
-            .child(
+        let region_id = SharedString::from(problem_id.clone());
+
+        div().debug_selector(move || problem_id).child(
+            LiveRegion::status(region_id, spoken.clone()).child(
                 Label::new(shown.clone())
                     .size(LabelSize::Small)
                     .color(Color::Warn),
-            )
+            ),
+        )
     });
 
     v_flex()
@@ -704,7 +727,9 @@ mod tests {
     use crate::daemon::tests::{
         agent_info, fake_daemon_replying, project_info, task_info, use_projects, wait_until,
     };
+    use crate::live_probe::{assert_named, is_quiet, reversed, see_in};
     use crate::model::{SAMPLE_NOW, TaskStatus};
+    use swarm_ui::test_support::tab_walk;
 
     const NOW: u64 = SAMPLE_NOW / 1_000;
 
@@ -833,6 +858,8 @@ mod tests {
         assert!(shown("popover-needs-you-1", &mut popover));
         assert!(!shown("popover-needs-you-2", &mut popover));
         assert!(shown("popover-stop-all", &mut popover));
+        assert!(shown("popover-stop-status", &mut popover));
+        assert!(shown("popover-stop-alert", &mut popover));
         assert!(shown("popover-open-swarm", &mut popover));
         assert!(shown("popover-quit", &mut popover));
     }
@@ -1173,6 +1200,57 @@ mod tests {
             "quit",
         ];
         assert_eq!(order, expected.map(|name| Some(name.to_owned())));
+    }
+
+    #[gpui::test]
+    fn stopping_the_agents_is_spoken_politely(cx: &mut TestAppContext) {
+        let (_workspace, bar, cx) = setup(cx);
+        let mut popover = open(&bar, cx);
+
+        let idle = read(&mut popover, |popover, _| popover.stop_status());
+        set_stop(StopState::Stopping, &mut popover);
+        let stopping = read(&mut popover, |popover, _| popover.stop_status());
+
+        assert!(is_quiet(&see_in(idle, &mut popover)));
+        let seen = see_in(stopping, &mut popover);
+        assert_eq!(seen.value.as_deref(), Some("Stopping agents"));
+        assert_eq!(seen.live, Some(Live::Polite));
+    }
+
+    #[gpui::test]
+    fn a_failed_stop_is_an_alert(cx: &mut TestAppContext) {
+        let (_workspace, bar, cx) = setup(cx);
+        let mut popover = open(&bar, cx);
+
+        set_stop(StopState::Failed("no permission".into()), &mut popover);
+        let alert = read(&mut popover, |popover, _| popover.stop_alert());
+        let seen = see_in(alert, &mut popover);
+
+        assert_eq!(seen.value.as_deref(), Some("no permission"));
+        assert_eq!(seen.live, Some(Live::Assertive));
+    }
+
+    #[gpui::test]
+    fn tab_walks_the_popover_in_order_and_names_every_stop(cx: &mut TestAppContext) {
+        let (_workspace, bar, cx) = setup(cx);
+        let mut popover = open(&bar, cx);
+        let root = read(&mut popover, |popover, _| popover.handles.root.clone());
+
+        let forward = tab_walk(&mut popover, &root, "tab");
+        let backward = tab_walk(&mut popover, &root, "shift-tab");
+
+        assert_eq!(
+            forward,
+            [
+                "ListItem swarm, menu-bar-usage, needs you",
+                "ListItem website, landing-page, needs you",
+                "Button Stop all",
+                "Button Open Swarm",
+                "Button Quit",
+            ]
+        );
+        assert_eq!(backward, reversed(&forward));
+        assert_named(&forward);
     }
 
     #[gpui::test]

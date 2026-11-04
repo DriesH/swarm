@@ -4,6 +4,7 @@ use std::path::Path;
 
 use gpui::{AnyElement, ElementId, Entity, FontWeight, Role, SharedString, Stateful, div, px};
 use swarm_settings::{AccentSetting, AgentKindSetting, ProjectMode};
+use swarm_ui::a11y::accessible;
 use swarm_ui::prelude::*;
 use swarm_ui::styles::focus_ring;
 use swarm_ui::theme::{self, Accent, Appearance};
@@ -15,9 +16,32 @@ use super::{
     SettingsState, SettingsWindow, accent_of, delivery, delivery_mut, mode_index, notify_when,
     notify_when_mut,
 };
+use crate::announce::announce;
 use crate::notifications::{self, Permission};
 
 type State = Entity<SettingsState>;
+
+/// The blocks of one settings page, top to bottom. The window scrolls to the block that
+/// takes keyboard focus.
+pub(super) struct PageBlocks {
+    pub(super) gap: f32,
+    pub(super) blocks: Vec<AnyElement>,
+}
+
+impl PageBlocks {
+    pub(super) fn new(gap: f32) -> Self {
+        Self {
+            gap,
+            blocks: Vec::new(),
+        }
+    }
+}
+
+impl ParentElement for PageBlocks {
+    fn extend(&mut self, elements: impl IntoIterator<Item = AnyElement>) {
+        self.blocks.extend(elements);
+    }
+}
 
 pub(super) fn apply_appearance(index: usize, cx: &mut App) {
     if let Some(appearance) = Appearance::ALL.get(index) {
@@ -94,10 +118,27 @@ pub(super) fn project_picker_label(project: &str) -> String {
     format!("Notifications for {project}")
 }
 
-pub(super) fn page_title(title: impl Into<SharedString>) -> impl IntoElement {
+pub(super) fn page_title(title: impl Into<SharedString>) -> Label {
     Label::new(title)
+        .heading("page-title", 1)
         .size(LabelSize::Title)
         .weight(FontWeight::SEMIBOLD)
+}
+
+/// A status pill that screen readers can read.
+pub(super) fn readable_pill(
+    id: impl Into<ElementId>,
+    status: AgentStatus,
+    text: impl Into<SharedString>,
+) -> Stateful<gpui::Div> {
+    let text = text.into();
+
+    div()
+        .id(id)
+        .role(Role::Label)
+        .aria_value(text.clone())
+        .flex_none()
+        .child(StatusPill::new(status).label(text))
 }
 
 /// A labeled group: a small heading above a card.
@@ -122,16 +163,36 @@ pub(super) fn plain_row() -> gpui::Div {
 }
 
 /// The line that says why the settings file could not be read or written, in red.
-pub(super) fn save_error(state: &SettingsState, cx: &App) -> Option<impl IntoElement> {
-    state.save_error.clone().map(|message| {
+pub(super) fn save_error(state: &SettingsState, cx: &App) -> Option<LiveRegion> {
+    state
+        .save_error
+        .clone()
+        .map(|message| alert_message("settings-save-error", message, cx))
+}
+
+/// A red message that a screen reader speaks at once.
+pub(super) fn alert_message(
+    id: impl Into<ElementId>,
+    message: SharedString,
+    cx: &App,
+) -> LiveRegion {
+    LiveRegion::alert(id, message.clone()).child(
         div()
-            .id("settings-save-error")
-            .role(Role::Alert)
-            .aria_label(message.clone())
             .text_size(px(12.))
             .text_color(Color::Del.hsla(cx))
-            .child(message)
-    })
+            .child(message),
+    )
+}
+
+/// What a screen reader speaks for **Run checks now**: that it runs, then the result.
+fn run_checks_status(running: bool, result: Option<&str>) -> LiveRegion {
+    let value = if running {
+        "Running checks"
+    } else {
+        result.unwrap_or_default()
+    };
+
+    LiveRegion::status("run-checks-status", value.to_owned())
 }
 
 pub(super) fn switch_row(
@@ -178,10 +239,7 @@ fn add_row(
     let colors = cx.theme().colors();
     let (accent, raised) = (colors.accent, colors.raised);
 
-    let row = h_flex()
-        .id(id)
-        .role(Role::Button)
-        .aria_label(label)
+    let row = accessible(h_flex().id(id), Role::Button, label)
         .debug_selector(|| id.to_owned())
         .gap(px(6.))
         .h(px(40.))
@@ -235,24 +293,29 @@ pub(crate) fn tilde(path: &Path) -> String {
 }
 
 impl SettingsWindow {
-    pub(super) fn render_page(&self, cx: &Context<Self>) -> AnyElement {
+    pub(super) fn render_page(&self, window: &mut Window, cx: &mut Context<Self>) -> PageBlocks {
         match self.page {
             Page::Agents => self.agents_page(cx),
             Page::Notifications => self.notifications_page(cx),
             Page::Appearance => self.appearance_page(cx),
             Page::Project(project) => match self.state.read(cx).index_of(project) {
                 Some(index) => self.project_page(index, cx),
-                None => div().into_any_element(),
+                None => PageBlocks::new(0.),
             },
             Page::Terminals => self.terminals_page(cx),
-            Page::Prompts => self.prompts.clone().into_any_element(),
-            Page::Usage => self.usage.clone().into_any_element(),
+            Page::Prompts => {
+                let prompts = self.prompts.clone();
+                let blocks = prompts.update(cx, |page, cx| page.blocks(window, cx));
+
+                PageBlocks::new(0.).children(blocks)
+            }
+            Page::Usage => PageBlocks::new(0.).child(self.usage.clone()),
             Page::Keyboard => Self::keyboard_page(),
             Page::General => self.general_page(cx),
         }
     }
 
-    fn agents_page(&self, cx: &Context<Self>) -> AnyElement {
+    fn agents_page(&self, cx: &Context<Self>) -> PageBlocks {
         let state = &self.state;
         let settings = state.read(cx);
 
@@ -271,7 +334,11 @@ impl SettingsWindow {
                         .flex_1()
                         .child(Label::new(info.name).weight(FontWeight::MEDIUM)),
                 )
-                .child(StatusPill::new(AgentStatus::Done).label(info.version));
+                .child(readable_pill(
+                    ("agent-version", index),
+                    AgentStatus::Done,
+                    info.version,
+                ));
 
             let card = Panel::new()
                 .row(header)
@@ -336,26 +403,16 @@ impl SettingsWindow {
                 64.,
             ));
 
-        let error = settings.save_error.clone().map(|message| {
-            div()
-                .id("settings-save-error")
-                .role(Role::Alert)
-                .aria_label(message.clone())
-                .text_size(px(12.))
-                .text_color(Color::Del.hsla(cx))
-                .child(message)
-        });
+        let error = save_error(settings, cx);
 
-        v_flex()
-            .gap(px(26.))
+        PageBlocks::new(26.)
             .child(page_title("Agents"))
             .children(error)
             .children(cards)
             .child(section("Workers", workers))
-            .into_any_element()
     }
 
-    fn notifications_page(&self, cx: &Context<Self>) -> AnyElement {
+    fn notifications_page(&self, cx: &Context<Self>) -> PageBlocks {
         let state = &self.state;
         let settings = state.read(cx);
         let notifications = &settings.settings.notifications;
@@ -444,7 +501,7 @@ impl SettingsWindow {
                 Permission::Unavailable => AgentStatus::Unknown,
             };
 
-            StatusPill::new(tone).label(permission.label())
+            readable_pill("notification-permission", tone, permission.label())
         });
 
         let permission_row = PanelRow::new("macOS permission").end_slot(
@@ -457,18 +514,9 @@ impl SettingsWindow {
             }),
         );
 
-        let error = settings.save_error.clone().map(|message| {
-            div()
-                .id("settings-save-error")
-                .role(Role::Alert)
-                .aria_label(message.clone())
-                .text_size(px(12.))
-                .text_color(Color::Del.hsla(cx))
-                .child(message)
-        });
+        let error = save_error(settings, cx);
 
-        v_flex()
-            .gap(px(28.))
+        PageBlocks::new(28.)
             .child(page_title("Notifications"))
             .children(error)
             .child(section("Permission", Panel::new().row(permission_row)))
@@ -482,10 +530,9 @@ impl SettingsWindow {
                         .on_click(|_, _, cx| notifications::send_test(cx)),
                 ),
             )
-            .into_any_element()
     }
 
-    fn appearance_page(&self, cx: &Context<Self>) -> AnyElement {
+    fn appearance_page(&self, cx: &Context<Self>) -> PageBlocks {
         let state = &self.state;
         let settings = state.read(cx).settings.appearance;
 
@@ -531,8 +578,7 @@ impl SettingsWindow {
                 ),
             );
 
-        v_flex()
-            .gap(px(26.))
+        PageBlocks::new(26.)
             .child(page_title("Appearance"))
             .child(section(
                 "Theme",
@@ -543,16 +589,15 @@ impl SettingsWindow {
                 Panel::new().row(PanelRow::new("Accent").end_slot(accent)),
             ))
             .child(section("Easter eggs", eggs))
-            .into_any_element()
     }
 
-    fn project_page(&self, index: usize, cx: &Context<Self>) -> AnyElement {
+    fn project_page(&self, index: usize, cx: &Context<Self>) -> PageBlocks {
         let state = &self.state;
         let (Some(settings), Some(inputs)) = (
             state.read(cx).projects.get(index),
             self.inputs.projects.get(index),
         ) else {
-            return div().into_any_element();
+            return PageBlocks::new(0.);
         };
 
         let editable = settings.load.editable();
@@ -609,8 +654,7 @@ impl SettingsWindow {
 
         let run_checks = self.run_checks_row(index, cx);
 
-        v_flex()
-            .gap(px(26.))
+        PageBlocks::new(26.)
             .child(header)
             .children(unreadable)
             .child(section("Worktrees", worktrees))
@@ -638,7 +682,6 @@ impl SettingsWindow {
                         })),
                 ),
             )
-            .into_any_element()
     }
 
     /// **Run checks now** and the short result of the run.
@@ -669,16 +712,19 @@ impl SettingsWindow {
             .on_click(move |_, _, cx| {
                 state.update(cx, |state, cx| state.run_checks(index, cx));
             });
+        let spoken = run_checks_status(running, result.as_ref().map(|(_, text)| text.as_ref()));
         let result = result.map(|(tone, text)| {
             div()
-                .id("run-checks-result")
-                .role(Role::Status)
-                .aria_label(text.clone())
                 .debug_selector(|| "run-checks-result".to_owned())
                 .child(StatusPill::new(tone).label(text))
         });
 
-        h_flex().mt(px(12.)).gap_3().child(button).children(result)
+        h_flex()
+            .mt(px(12.))
+            .gap_3()
+            .child(button)
+            .children(result)
+            .child(announce("run-checks-announce", spoken))
     }
 
     /// The project's tile, name and path, and next to the name what the page is doing.
@@ -690,21 +736,15 @@ impl SettingsWindow {
 
         let status: Option<AnyElement> = if settings.load == Load::Loading {
             Some(
-                StatusPill::new(AgentStatus::Working)
-                    .label("Loading")
+                readable_pill("project-loading", AgentStatus::Working, "Loading")
                     .into_any_element(),
             )
         } else {
             settings.refusal.clone().map(|message| {
                 div()
-                    .id("project-refusal")
-                    .role(Role::Alert)
-                    .aria_label(message.clone())
                     .debug_selector(|| "project-refusal".to_owned())
                     .min_w_0()
-                    .text_size(px(12.))
-                    .text_color(Color::Del.hsla(cx))
-                    .child(message)
+                    .child(alert_message("project-refusal", message, cx))
                     .into_any_element()
             })
         };
@@ -727,6 +767,7 @@ impl SettingsWindow {
                     )
                     .child(
                         Label::new(location)
+                            .accessible("project-location")
                             .mono()
                             .size(LabelSize::XSmall)
                             .color(Color::Faint),
@@ -740,9 +781,6 @@ impl SettingsWindow {
         let colors = cx.theme().colors();
 
         h_flex()
-            .id("config-error")
-            .role(Role::Alert)
-            .aria_label(message.clone())
             .debug_selector(|| "config-error".to_owned())
             .gap_3()
             .px(px(14.))
@@ -752,10 +790,10 @@ impl SettingsWindow {
             .border_color(colors.line)
             .bg(colors.del_bg)
             .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(Label::new(message).size(LabelSize::Small).color(Color::Del)),
+                div().flex_1().min_w_0().child(
+                    LiveRegion::alert("config-error", message.clone())
+                        .child(Label::new(message).size(LabelSize::Small).color(Color::Del)),
+                ),
             )
             .child(
                 Button::new(("reload-config", index), "Reload")
@@ -876,11 +914,16 @@ impl SettingsWindow {
                         .gap_2()
                         .child(
                             Label::new("lefthook")
+                                .accessible("hook-name")
                                 .mono()
                                 .size(LabelSize::XSmall)
                                 .color(Color::Muted),
                         )
-                        .child(StatusPill::new(AgentStatus::Done).label("Detected")),
+                        .child(readable_pill(
+                            "hook-detected",
+                            AgentStatus::Done,
+                            "Detected",
+                        )),
                 ),
             )
         } else {
@@ -922,5 +965,83 @@ impl SettingsWindow {
         );
 
         Some(panel)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::TestAppContext;
+    use gpui::accesskit::Role as NodeRole;
+
+    use super::*;
+    use crate::live_probe::{is_quiet, see_in};
+
+    fn setup(cx: &mut TestAppContext) -> &mut gpui::VisualTestContext {
+        cx.update(theme::init);
+        let (_view, cx) = cx.add_window_view(|_, _| gpui::Empty);
+
+        cx
+    }
+
+    #[gpui::test]
+    fn a_page_title_is_a_level_one_heading(cx: &mut TestAppContext) {
+        let cx = setup(cx);
+
+        let (role, level, label) = cx.update(|window, cx| {
+            let mut element = page_title("Keyboard").render(window, cx).into_any_element();
+            let heading = element
+                .downcast_mut::<Stateful<gpui::Div>>()
+                .expect("a heading is a node");
+            let mut node = gpui::accesskit::Node::new(NodeRole::Unknown);
+            heading.write_a11y_info(&mut node);
+
+            (
+                heading.a11y_role(),
+                node.level(),
+                node.label().map(str::to_owned),
+            )
+        });
+
+        assert_eq!(role, Some(NodeRole::Heading));
+        assert_eq!(level, Some(1));
+        assert_eq!(label.as_deref(), Some("Keyboard"));
+    }
+
+    #[gpui::test]
+    fn a_settings_error_is_an_alert_that_speaks_at_once(cx: &mut TestAppContext) {
+        let cx = setup(cx);
+
+        let region =
+            cx.update(|_, cx| alert_message("settings-save-error", "Cannot save".into(), cx));
+        let seen = see_in(region, cx);
+
+        assert_eq!(seen.role, Some(NodeRole::Alert));
+        assert_eq!(seen.value.as_deref(), Some("Cannot save"));
+        assert_eq!(seen.live, Some(Live::Assertive));
+    }
+
+    #[gpui::test]
+    fn running_checks_is_spoken_and_then_the_result(cx: &mut TestAppContext) {
+        let cx = setup(cx);
+
+        let running = see_in(run_checks_status(true, None), cx);
+        let result = see_in(run_checks_status(false, Some("2 passed")), cx);
+        let before = see_in(run_checks_status(false, None), cx);
+
+        assert_eq!(running.value.as_deref(), Some("Running checks"));
+        assert_eq!(running.live, Some(Live::Polite));
+        assert_eq!(result.value.as_deref(), Some("2 passed"));
+        assert!(is_quiet(&before));
+    }
+
+    #[test]
+    fn a_readable_pill_carries_its_text() {
+        let pill = readable_pill("version", AgentStatus::Done, "2.1.0").into_element();
+        let mut node = gpui::accesskit::Node::new(NodeRole::Label);
+        pill.write_a11y_info(&mut node);
+
+        assert_eq!(pill.a11y_role(), Some(NodeRole::Label));
+        assert_eq!(node.label(), None);
+        assert_eq!(node.value(), Some("2.1.0"));
     }
 }

@@ -11,6 +11,7 @@ use swarm_term_view::TerminalEvent;
 use super::harness::{Fixture, report_with, tool_check, welcome_fixture, welcome_fixture_listing};
 use super::*;
 use crate::daemon::tests::wait_until;
+use crate::live_probe::{is_quiet, see_in};
 
 const BREW: &str = "/opt/homebrew/bin/brew";
 const GH: &str = "/opt/homebrew/bin/gh";
@@ -1049,4 +1050,70 @@ fn fix_terminals_left_by_an_earlier_run_are_stopped_when_the_app_connects(cx: &m
     fixture.wait(|_, _| false);
 
     assert_eq!(fixture.seen.killed(), [TerminalId(7)]);
+}
+
+#[gpui::test]
+fn the_check_draws_the_regions_that_speak_it(cx: &mut TestAppContext) {
+    let mut fixture = welcome_fixture(report_with(&[]), Permission::Allowed, cx);
+    fixture.settle();
+
+    assert!(fixture.cx.debug_bounds("system-check-status").is_some());
+    assert!(fixture.cx.debug_bounds("system-check-alert").is_some());
+}
+
+#[gpui::test]
+fn checking_turns_into_the_result_in_one_polite_region(cx: &mut TestAppContext) {
+    let mut fixture = welcome_fixture(report_with(&[]), Permission::Allowed, cx);
+    let check = fixture.check();
+
+    check.update(fixture.cx, SystemCheckView::refresh);
+    let checking = see_in(
+        check.read_with(fixture.cx, |check, _| check.status_region()),
+        fixture.cx,
+    );
+    fixture.settle();
+    let settled = see_in(
+        check.read_with(fixture.cx, |check, _| check.status_region()),
+        fixture.cx,
+    );
+
+    assert_eq!(checking.value.as_deref(), Some("Checking"));
+    assert_eq!(checking.live, Some(Live::Polite));
+    assert_eq!(settled.value.as_deref(), Some("System check, 6 of 6 ready"));
+}
+
+#[gpui::test]
+fn a_failed_check_is_an_alert(cx: &mut TestAppContext) {
+    let mut fixture = welcome_fixture(report_with(&[]), Permission::Allowed, cx);
+    let check = fixture.check();
+
+    fixture.fail_checks.store(true, Ordering::SeqCst);
+    check.update(fixture.cx, SystemCheckView::refresh);
+    fixture.settle();
+    let alert = see_in(
+        check.read_with(fixture.cx, |check, _| check.alert_region()),
+        fixture.cx,
+    );
+
+    assert_eq!(alert.role, Some(Role::Alert));
+    assert_eq!(alert.live, Some(Live::Assertive));
+    assert!(
+        alert
+            .value
+            .as_deref()
+            .is_some_and(|value| value.contains("the check broke"))
+    );
+}
+
+#[gpui::test]
+fn without_a_failure_the_alert_is_quiet(cx: &mut TestAppContext) {
+    let fixture = welcome_fixture(report_with(&[]), Permission::Allowed, cx);
+    let check = fixture.check();
+
+    let alert = see_in(
+        check.read_with(fixture.cx, |check, _| check.alert_region()),
+        fixture.cx,
+    );
+
+    assert!(is_quiet(&alert));
 }

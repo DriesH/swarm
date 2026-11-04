@@ -1,6 +1,6 @@
 //! The pull request panel: a new pull request, or the status of the one that exists.
 
-use gpui::{AnyElement, Context, ElementId, FontWeight, Role, SharedString, div, px};
+use gpui::{AnyElement, Context, ElementId, FontWeight, Role, SharedString, Text, div, px};
 use swarm_protocol::{
     CheckState, GithubCheck, GithubCheckState, GithubStatus, LocalCheck, MergeMethod, PrState,
     PullRequest, ReviewState,
@@ -138,20 +138,84 @@ fn work_state(running: bool, blocked: bool) -> (bool, bool) {
     (running, blocked && !running)
 }
 
+fn status_text(text: &SharedString, color: Color) -> Label {
+    Label::new(text.clone())
+        .size(LabelSize::Small)
+        .color(color)
+        .truncate()
+}
+
+/// Progress or a result, spoken when it shows or changes.
+fn status_region(text: &SharedString, color: Color) -> LiveRegion {
+    LiveRegion::status(
+        (ElementId::from("pull-request-live"), text.clone()),
+        text.clone(),
+    )
+    .child(status_text(text, color))
+}
+
+/// A failure, spoken at once.
+fn alert_region(text: &SharedString) -> LiveRegion {
+    LiveRegion::alert(
+        (ElementId::from("pull-request-alert"), text.clone()),
+        text.clone(),
+    )
+    .child(status_text(text, Color::Del))
+}
+
 fn status_label(text: impl Into<SharedString>, color: Color) -> gpui::Stateful<gpui::Div> {
     let text = text.into();
 
     div()
         .id((ElementId::from("pull-request-status"), text.clone()))
-        .role(Role::Status)
-        .aria_label(text.clone())
         .min_w_0()
-        .child(
-            Label::new(text)
-                .size(LabelSize::Small)
-                .color(color)
-                .truncate(),
-        )
+        .child(status_region(&text, color))
+}
+
+fn alert_label(text: impl Into<SharedString>) -> gpui::Stateful<gpui::Div> {
+    let text = text.into();
+
+    div()
+        .id((ElementId::from("pull-request-status"), text.clone()))
+        .min_w_0()
+        .child(alert_region(&text))
+}
+
+/// An error block that a screen reader speaks when it shows.
+fn error_block(
+    id: &'static str,
+    label: &'static str,
+    message: impl Into<SharedString>,
+) -> LiveRegion {
+    let message = message.into();
+
+    LiveRegion::alert((ElementId::from(id), "alert"), message.clone()).child(
+        OutputBlock::new(id, label, message)
+            .debug_selector(|| id.to_owned())
+            .tone(Color::Del),
+    )
+}
+
+/// The wait a busy action shows next to its button, else nothing. The merge and ready
+/// buttons say it themselves.
+fn busy_text(action: &PanelAction) -> Option<&'static str> {
+    match action {
+        PanelAction::Busy(ActionKind::Review) => Some("Requesting review\u{2026}"),
+        _ => None,
+    }
+}
+
+/// The tag of a pull request that is merged, closed or a draft. It is a status, so a
+/// merge that finishes is spoken.
+fn state_tag(status: &PullRequest) -> Option<LiveRegion> {
+    let (text, tag) = match status.state {
+        PrState::Merged => ("Merged", Tag::new("Merged").tone(TagTone::Ok)),
+        PrState::Closed => ("Closed", Tag::new("Closed").tone(TagTone::Del)),
+        PrState::Open if status.draft => ("Draft", Tag::new("Draft")),
+        PrState::Open => return None,
+    };
+
+    Some(LiveRegion::status("pull-request-state", text).child(tag))
 }
 
 // A new pull request
@@ -237,8 +301,7 @@ fn github_section(
                 None,
             ),
             GithubSetup::Failed { step, reason, .. } => row(
-                status_label(format!("{} \u{b7} {reason}", step.failed()), Color::Del)
-                    .into_any_element(),
+                alert_label(format!("{} \u{b7} {reason}", step.failed())).into_any_element(),
                 Some(
                     Button::new("try-again", "Try again")
                         .variant(ButtonVariant::Secondary)
@@ -432,6 +495,10 @@ fn local_checks(
                     .child(div().flex_1())
                     .child(run_button),
             )
+            .children(
+                form.checks_busy
+                    .then(|| status_label("Running checks\u{2026}", Color::Muted)),
+            )
             .children((stale || unclean).then(|| {
                 h_flex()
                     .gap(px(6.))
@@ -447,13 +514,7 @@ fn local_checks(
                     .aria_label(format!("pre-push hook: {hook}"))
                     .child(mono(format!("pre-push hook: {hook}")).color(Color::Faint))
             }))
-            .children(form.checks_error.clone().map(|message| {
-                div()
-                    .id("checks-error")
-                    .role(Role::Alert)
-                    .aria_label(message.clone())
-                    .child(Label::new(message).size(LabelSize::Small).color(Color::Del))
-            })),
+            .children(form.checks_error.clone().map(alert_label)),
     )
 }
 
@@ -501,11 +562,11 @@ fn new_footer(
     };
 
     let error = match &form.create {
-        CreateStatus::Failed(message) => Some(
-            OutputBlock::new("create-error", "Pull request error", message.clone())
-                .debug_selector(|| "create-error".to_owned())
-                .tone(Color::Del),
-        ),
+        CreateStatus::Failed(message) => Some(error_block(
+            "create-error",
+            "Pull request error",
+            message.clone(),
+        )),
         CreateStatus::Idle | CreateStatus::Creating => None,
     };
 
@@ -561,12 +622,7 @@ fn status_panel(
         .debug_selector(|| "open-on-github".to_owned())
         .on_click(cx.listener(|this, _, _, cx| this.open_pull_request_url(cx)));
 
-    let tag = status.and_then(|status| match status.state {
-        PrState::Merged => Some(Tag::new("Merged").tone(TagTone::Ok)),
-        PrState::Closed => Some(Tag::new("Closed").tone(TagTone::Del)),
-        PrState::Open if status.draft => Some(Tag::new("Draft")),
-        PrState::Open => None,
-    });
+    let tag = status.and_then(state_tag);
 
     let header = panel_header(
         h_flex()
@@ -575,7 +631,8 @@ fn status_panel(
                 Label::new(format!("#{number}"))
                     .mono()
                     .size(LabelSize::Small)
-                    .weight(FontWeight::MEDIUM),
+                    .weight(FontWeight::MEDIUM)
+                    .accessible("pull-request-number"),
             )
             .children(tag)
             .into_any_element(),
@@ -593,7 +650,7 @@ fn status_panel(
                         .text_size(px(14.))
                         .line_height(px(19.6))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child(title),
+                        .child(Text::new("pull-request-title".into(), title)),
                 )
                 .child(branches_row(base, task.branch.clone(), None, cx)),
         )
@@ -610,11 +667,11 @@ fn status_panel(
     }
 
     if let PanelAction::Failed(message) = &form.action {
-        content = content.child(
-            OutputBlock::new("pull-request-error", "Pull request error", message.clone())
-                .debug_selector(|| "pull-request-error".to_owned())
-                .tone(Color::Del),
-        );
+        content = content.child(error_block(
+            "pull-request-error",
+            "Pull request error",
+            message.clone(),
+        ));
     }
 
     let mut panel = v_flex().child(header).child(content);
@@ -852,18 +909,18 @@ fn status_footer(
     });
 
     let error = match &form.create {
-        CreateStatus::Failed(message) => Some(
-            OutputBlock::new("push-error", "Push error", message.clone())
-                .debug_selector(|| "push-error".to_owned())
-                .tone(Color::Del),
-        ),
+        CreateStatus::Failed(message) => {
+            Some(error_block("push-error", "Push error", message.clone()))
+        }
         CreateStatus::Idle | CreateStatus::Creating => None,
     };
+    let working = busy_text(&form.action).map(|text| status_label(text, Color::Muted));
 
     footer(cx)
         .children(error)
         .children(push.map(|state| push_row(state, pushing, busy, cx)))
         .children(queued)
+        .children(working)
         .child(
             h_flex()
                 .gap(px(8.))
@@ -925,7 +982,7 @@ fn closed_footer(cx: &mut Context<Workspace>) -> gpui::Div {
 
 #[cfg(test)]
 mod tests {
-    use gpui::Element;
+    use gpui::{Element, TestAppContext};
 
     use super::*;
 
@@ -937,6 +994,129 @@ mod tests {
     #[test]
     fn a_blocked_idle_button_is_disabled_and_not_loading() {
         assert_eq!(work_state(false, true), (false, true));
+    }
+
+    /// The role, value and live setting of an element in the accessibility tree.
+    fn node_of(element: impl IntoElement) -> (Option<Role>, Option<String>, Option<Live>) {
+        let element = element.into_element();
+        let mut node = gpui::accesskit::Node::new(Role::Unknown);
+
+        element.write_a11y_info(&mut node);
+
+        (
+            element.a11y_role(),
+            node.value().map(str::to_owned),
+            node.live(),
+        )
+    }
+
+    fn pull_request(state: PrState, draft: bool) -> PullRequest {
+        PullRequest {
+            number: 42,
+            url: String::new(),
+            title: "Add the grid".to_owned(),
+            state,
+            draft,
+            checks: Vec::new(),
+            reviewers: Vec::new(),
+            mergeable: false,
+            read_at: 0,
+        }
+    }
+
+    #[gpui::test]
+    fn progress_is_a_polite_status_with_its_text_as_the_value(cx: &mut TestAppContext) {
+        let (_window, cx) = cx.add_window_view(|_, _| gpui::Empty);
+
+        let node = cx.update(|window, cx| {
+            let text = SharedString::from("Checking GitHub\u{2026}");
+
+            node_of(status_region(&text, Color::Faint).render(window, cx))
+        });
+
+        assert_eq!(
+            node,
+            (
+                Some(Role::Status),
+                Some("Checking GitHub\u{2026}".to_owned()),
+                Some(Live::Polite)
+            )
+        );
+    }
+
+    #[gpui::test]
+    fn a_failure_is_an_assertive_alert(cx: &mut TestAppContext) {
+        let (_window, cx) = cx.add_window_view(|_, _| gpui::Empty);
+
+        let node = cx.update(|window, cx| {
+            let text = SharedString::from("Setup failed");
+
+            node_of(alert_region(&text).render(window, cx))
+        });
+
+        assert_eq!(
+            node,
+            (
+                Some(Role::Alert),
+                Some("Setup failed".to_owned()),
+                Some(Live::Assertive)
+            )
+        );
+    }
+
+    #[gpui::test]
+    fn an_error_block_is_an_alert_around_the_message(cx: &mut TestAppContext) {
+        let (_window, cx) = cx.add_window_view(|_, _| gpui::Empty);
+
+        let node = cx.update(|window, cx| {
+            node_of(error_block("push-error", "Push error", "remote rejected").render(window, cx))
+        });
+
+        assert_eq!(
+            node,
+            (
+                Some(Role::Alert),
+                Some("remote rejected".to_owned()),
+                Some(Live::Assertive)
+            )
+        );
+    }
+
+    #[test]
+    fn a_busy_action_names_its_wait_unless_its_button_does() {
+        assert_eq!(busy_text(&PanelAction::Busy(ActionKind::Merge)), None);
+        assert_eq!(busy_text(&PanelAction::Busy(ActionKind::Ready)), None);
+        assert_eq!(
+            busy_text(&PanelAction::Busy(ActionKind::Review)),
+            Some("Requesting review\u{2026}")
+        );
+        assert_eq!(busy_text(&PanelAction::Idle), None);
+    }
+
+    #[gpui::test]
+    fn a_merged_pull_request_announces_its_state(cx: &mut TestAppContext) {
+        let (_window, cx) = cx.add_window_view(|_, _| gpui::Empty);
+
+        let node = cx.update(|window, cx| {
+            state_tag(&pull_request(PrState::Merged, false))
+                .map(|tag| node_of(tag.render(window, cx)))
+        });
+
+        assert_eq!(
+            node,
+            Some((
+                Some(Role::Status),
+                Some("Merged".to_owned()),
+                Some(Live::Polite)
+            ))
+        );
+    }
+
+    #[test]
+    fn an_open_pull_request_has_no_state_tag_unless_it_is_a_draft() {
+        assert!(state_tag(&pull_request(PrState::Open, false)).is_none());
+        assert!(state_tag(&pull_request(PrState::Open, true)).is_some());
+        assert!(state_tag(&pull_request(PrState::Closed, false)).is_some());
     }
 
     #[test]

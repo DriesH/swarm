@@ -9,19 +9,25 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{
     AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, DragMoveEvent, Entity, EventEmitter,
-    Focusable as _, FollowMode, FontWeight, Hsla, KeyDownEvent, ListAlignment, ListState,
-    MouseButton, Pixels, Role, SharedString, StyleRefinement, Window, canvas, div,
-    linear_color_stop, linear_gradient, list, point, px, uniform_list,
+    FocusHandle, Focusable as _, FollowMode, FontWeight, Hsla, KeyDownEvent, ListAlignment,
+    ListState, MouseButton, Pixels, Role, ScrollStrategy, SharedString, StyleRefinement,
+    UniformListScrollHandle, Window, canvas, div, linear_color_stop, linear_gradient, list, point,
+    px, uniform_list,
 };
 use swarm_protocol::{AgentId as DaemonAgentId, FileStat, MessageId, MessageKind};
 use swarm_term_view::TerminalView;
+use swarm_ui::a11y::accessible;
 use swarm_ui::fonts::MONO_FONT;
 use swarm_ui::prelude::*;
 use swarm_ui::styles::focus_ring;
 use swarm_ui::{ButtonVariant, Nudge, ThemeColors};
 
+use crate::actions::{
+    FILE_TREE_CONTEXT, TreeActivate, TreeFirst, TreeLast, TreeNext, TreePrevious,
+};
 use crate::markdown::{self, Markdown, Parsed};
 use crate::model::{Agent, AgentId, AgentKind, Message, TerminalId};
+use crate::panels::empty_status;
 use crate::workspace::{View, Workspace};
 
 const ORCHESTRATOR_SIZE: (f32, f32) = (210., 80.);
@@ -286,11 +292,7 @@ impl Workspace {
         cx.notify();
     }
 
-    pub(crate) fn swarm_handle(
-        &mut self,
-        agent: AgentId,
-        cx: &mut Context<Self>,
-    ) -> gpui::FocusHandle {
+    pub(crate) fn swarm_handle(&mut self, agent: AgentId, cx: &mut Context<Self>) -> FocusHandle {
         self.swarm_focus
             .entry(agent)
             .or_insert_with(|| cx.focus_handle().tab_stop(true))
@@ -796,6 +798,10 @@ pub(crate) struct MessageThread {
     names: Rc<HashMap<DaemonAgentId, SharedString>>,
     now: u64,
     scroll_key: Option<(AgentId, Option<MessageId>)>,
+    /// The focus handle of each message's Show more button, made when its row first draws.
+    folds: Rc<RefCell<HashMap<MessageId, FocusHandle>>>,
+    /// The message whose button had focus at the last draw.
+    revealed: Option<MessageId>,
 }
 
 impl MessageThread {
@@ -812,6 +818,31 @@ impl MessageThread {
             names: Rc::default(),
             now: 0,
             scroll_key: None,
+            folds: Rc::default(),
+            revealed: None,
+        }
+    }
+
+    /// Scrolls the row of a Show more button that just took focus into view. The list
+    /// draws only the rows near the view, so Tab can land on a row that sticks out.
+    fn reveal_focused_fold(&mut self, window: &Window, cx: &App) {
+        let focused = self.messages.iter().position(|message| {
+            self.folds
+                .borrow()
+                .get(&message.id)
+                .is_some_and(|handle| handle.contains_focused(window, cx))
+        });
+        let message = focused
+            .and_then(|index| self.messages.get(index))
+            .map(|message| message.id);
+
+        if message == self.revealed {
+            return;
+        }
+        self.revealed = message;
+
+        if let Some(index) = focused {
+            self.list.scroll_to_reveal_item(index);
         }
     }
 
@@ -868,6 +899,7 @@ impl MessageThread {
         self.agent = None;
         self.messages = Rc::from([]);
         self.parsed = Rc::from([]);
+        self.folds.borrow_mut().clear();
         self.scroll_key = None;
         self.list.reset(0);
         cx.notify();
@@ -892,6 +924,9 @@ impl MessageThread {
             .collect();
 
         self.parsed = parsed.into();
+
+        let kept: HashSet<MessageId> = messages.iter().map(|message| message.id).collect();
+        self.folds.borrow_mut().retain(|id, _| kept.contains(id));
     }
 
     /// Takes what the last paint found: whether the text of a message is taller than the
@@ -957,9 +992,12 @@ impl MessageThread {
 }
 
 impl Render for MessageThread {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.reveal_focused_fold(window, cx);
+
         let colors = cx.theme().colors().clone();
         let thread = cx.entity();
+        let folds = Rc::clone(&self.folds);
         let (messages, parsed) = (Rc::clone(&self.messages), Rc::clone(&self.parsed));
         let (expanded, tall, names) = (
             Rc::clone(&self.expanded),
@@ -968,7 +1006,7 @@ impl Render for MessageThread {
         );
         let now = self.now;
 
-        list(self.list.clone(), move |index, _, _| {
+        list(self.list.clone(), move |index, _, cx| {
             let (Some(message), Some(markdown)) = (messages.get(index), parsed.get(index)) else {
                 return div().into_any_element();
             };
@@ -976,11 +1014,19 @@ impl Render for MessageThread {
             let measured = tall.borrow().get(&id).copied();
             let is_tall = markdown.overflows() || measured == Some(true);
             let (toggled, measuring) = (thread.clone(), thread.clone());
+            let fold_focus = is_tall.then(|| {
+                folds
+                    .borrow_mut()
+                    .entry(id)
+                    .or_insert_with(|| cx.focus_handle().tab_stop(true))
+                    .clone()
+            });
 
             let row = MessageRow {
                 index,
                 message,
                 markdown,
+                fold_focus,
                 tall: is_tall,
                 folded: is_tall && !expanded.contains(&id),
                 measured,
@@ -994,7 +1040,7 @@ impl Render for MessageThread {
                 }),
             };
 
-            message_row(&row, &colors)
+            message_row(&row, &colors).into_any_element()
         })
         .size_full()
     }
@@ -1030,7 +1076,7 @@ struct SwarmData<'a> {
 
 pub(crate) fn render(
     workspace: &Workspace,
-    _window: &mut Window,
+    window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> AnyElement {
     let task = workspace.active_task();
@@ -1083,9 +1129,9 @@ pub(crate) fn render(
                 .flex_1()
                 .min_w_0()
                 .h_full()
-                .child(graph(workspace, &data, cx)),
+                .child(graph(workspace, &data, window, cx)),
         )
-        .child(inspector(workspace, &data, cx))
+        .child(inspector(workspace, &data, window, cx))
         .child({
             let this = cx.entity();
 
@@ -1143,10 +1189,18 @@ fn kind_icon(kind: AgentKind) -> IconName {
     clippy::too_many_lines,
     reason = "one flat element tree reads best in one place"
 )]
-fn graph(workspace: &Workspace, data: &SwarmData, cx: &mut Context<Workspace>) -> AnyElement {
+fn graph(
+    workspace: &Workspace,
+    data: &SwarmData,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> AnyElement {
     let colors = cx.theme().colors().clone();
     let zoom = workspace.swarm_zoom;
     let scale = |value: f32| px(value * zoom);
+    let reveal = window.use_keyed_state("graph-reveal", cx, |_, _| GraphReveal::new());
+    let scroll = reveal.read(cx).scroll.clone();
+    let mut spots = Vec::new();
 
     let orchestrator = data
         .agents
@@ -1182,11 +1236,14 @@ fn graph(workspace: &Workspace, data: &SwarmData, cx: &mut Context<Workspace>) -
     let mut extras = Vec::new();
 
     if let Some(agent) = orchestrator {
+        let at = (center - ORCHESTRATOR_SIZE.0 / 2., ORCHESTRATOR_TOP);
+
+        spots.extend(card_spot(workspace, agent, at, ORCHESTRATOR_SIZE, zoom));
         cards.push(card(
             workspace,
             agent,
             data,
-            (center - ORCHESTRATOR_SIZE.0 / 2., ORCHESTRATOR_TOP),
+            at,
             ORCHESTRATOR_SIZE,
             true,
             cx,
@@ -1197,6 +1254,13 @@ fn graph(workspace: &Workspace, data: &SwarmData, cx: &mut Context<Workspace>) -
         #[expect(clippy::cast_precision_loss, reason = "a handful of workers")]
         let left = row_left + index as f32 * (WORKER_SIZE.0 + WORKER_GAP);
 
+        spots.extend(card_spot(
+            workspace,
+            agent,
+            (left, WORKER_TOP),
+            WORKER_SIZE,
+            zoom,
+        ));
         cards.push(card(
             workspace,
             agent,
@@ -1282,6 +1346,7 @@ fn graph(workspace: &Workspace, data: &SwarmData, cx: &mut Context<Workspace>) -
 
     div()
         .id("agent-graph")
+        .debug_selector(|| "agent-graph".to_owned())
         .role(Role::Region)
         .aria_label("Agent graph")
         .relative()
@@ -1306,7 +1371,15 @@ fn graph(workspace: &Workspace, data: &SwarmData, cx: &mut Context<Workspace>) -
         })
         .child(
             div()
+                .on_children_prepainted(move |_, window, cx| {
+                    reveal.update(cx, |reveal, cx| {
+                        if reveal.settle(&spots, window, cx) {
+                            cx.notify();
+                        }
+                    });
+                })
                 .id("graph-scroll")
+                .track_scroll(&scroll)
                 .size_full()
                 .flex()
                 .overflow_scroll()
@@ -1314,6 +1387,111 @@ fn graph(workspace: &Workspace, data: &SwarmData, cx: &mut Context<Workspace>) -
         )
         .child(zoom_buttons)
         .into_any_element()
+}
+
+/// The focus handle of an agent's card and the card's rectangle in the graph.
+struct CardSpot {
+    focus: FocusHandle,
+    rect: Bounds<Pixels>,
+}
+
+fn card_spot(
+    workspace: &Workspace,
+    agent: &Agent,
+    (left, top): (f32, f32),
+    (width, height): (f32, f32),
+    zoom: f32,
+) -> Option<CardSpot> {
+    Some(CardSpot {
+        focus: workspace.swarm_focus.get(&agent.id)?.clone(),
+        rect: Bounds::new(
+            point(px(left * zoom), px(top * zoom)),
+            gpui::size(px(width * zoom), px(height * zoom)),
+        ),
+    })
+}
+
+/// How many frames to try to bring a card into view. The layout of the frame before
+/// can be a little off.
+const REVEAL_TRIES: u8 = 4;
+
+/// Scrolls the graph to the agent card that takes keyboard focus. GPUI's Tab moves
+/// focus but never scrolls, and the cards sit in a child of the scroll container.
+struct GraphReveal {
+    scroll: gpui::ScrollHandle,
+    focused: Option<usize>,
+    tries: u8,
+}
+
+impl GraphReveal {
+    fn new() -> Self {
+        Self {
+            scroll: gpui::ScrollHandle::new(),
+            focused: None,
+            tries: 0,
+        }
+    }
+
+    /// Runs after layout. Starts a reveal when focus moved to another card, and repeats
+    /// it until the card shows. Returns `true` when the graph must draw again.
+    fn settle(&mut self, spots: &[CardSpot], window: &Window, cx: &App) -> bool {
+        let focused = spots
+            .iter()
+            .position(|spot| spot.focus.contains_focused(window, cx));
+
+        if focused != self.focused {
+            self.focused = focused;
+            self.tries = if focused.is_some() { REVEAL_TRIES } else { 0 };
+        }
+
+        let (Some(spot), true) = (focused.and_then(|index| spots.get(index)), self.tries > 0)
+        else {
+            return false;
+        };
+        let Some(content) = self.scroll.bounds_for_item(0) else {
+            return false;
+        };
+
+        let card = Bounds::new(content.origin + spot.rect.origin, spot.rect.size);
+        let offset = self.scroll.offset();
+        let max = self.scroll.max_offset();
+        let view = self.scroll.bounds();
+
+        let x = reveal_offset(
+            card.left()..card.right(),
+            view.left()..view.right(),
+            offset.x,
+        );
+        let y = reveal_offset(
+            card.top()..card.bottom(),
+            view.top()..view.bottom(),
+            offset.y,
+        );
+        let target = point(x.clamp(-max.x, Pixels::ZERO), y.clamp(-max.y, Pixels::ZERO));
+
+        if target == offset {
+            self.tries = 0;
+
+            return false;
+        }
+
+        self.scroll.set_offset(target);
+        self.tries -= 1;
+
+        true
+    }
+}
+
+/// The scroll offset that shows `item` inside `view` with the least movement. Both are
+/// in the unscrolled layout, and `offset` is the scroll now.
+fn reveal_offset(item: Range<Pixels>, view: Range<Pixels>, offset: Pixels) -> Pixels {
+    if item.start + offset < view.start {
+        view.start - item.start
+    } else if item.end + offset > view.end {
+        view.end - item.end
+    } else {
+        offset
+    }
 }
 
 /// Paints every dot as two triangles of one path. Thousands of quads would each cost a
@@ -1476,11 +1654,13 @@ fn stats_line(workspace: &Workspace, agent: &Agent, zoom: f32, cx: &App) -> gpui
 /// A card is an item of the agent list. macOS reports selection on list items, not on
 /// buttons.
 fn card_frame(id: AgentId, label: String, selected: bool) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(("agent-card", id.0 as usize))
-        .role(Role::ListItem)
-        .aria_label(label)
-        .aria_selected(selected)
+    accessible(
+        div().id(("agent-card", id.0 as usize)),
+        Role::ListItem,
+        label,
+    )
+    .debug_selector(|| format!("agent-card-{}", id.0))
+    .aria_selected(selected)
 }
 
 fn card(
@@ -1574,7 +1754,12 @@ fn card(
     .into_any_element()
 }
 
-fn inspector(workspace: &Workspace, data: &SwarmData, cx: &mut Context<Workspace>) -> AnyElement {
+fn inspector(
+    workspace: &Workspace,
+    data: &SwarmData,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> AnyElement {
     let colors = cx.theme().colors().clone();
     let (nudge, reset) = (cx.entity(), cx.entity());
 
@@ -1583,7 +1768,7 @@ fn inspector(workspace: &Workspace, data: &SwarmData, cx: &mut Context<Workspace
         .and_then(|id| data.agents.iter().copied().find(|agent| agent.id == id));
 
     let body = match selected {
-        Some(agent) => inspector_body(workspace, agent, data, cx),
+        Some(agent) => inspector_body(workspace, agent, data, window, cx),
         None => div()
             .flex_1()
             .flex()
@@ -1633,6 +1818,7 @@ fn inspector_body(
     workspace: &Workspace,
     agent: &Agent,
     data: &SwarmData,
+    window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> AnyElement {
     let colors = cx.theme().colors().clone();
@@ -1732,7 +1918,7 @@ fn inspector_body(
                 .child(workspace.thread.clone().cached(full_size()))
                 .into_any_element(),
         ),
-        InspectorTab::Changes => ("Changes", changes_tab(workspace, agent, cx)),
+        InspectorTab::Changes => ("Changes", changes_tab(workspace, agent, window, cx)),
         InspectorTab::Terminal => ("Terminal", terminal_tab(workspace, agent, cx)),
     };
     let panel = tab_panel(tab_name, content);
@@ -1773,7 +1959,79 @@ fn signed(additions: u32, deletions: u32, colors: &ThemeColors) -> gpui::Div {
         .child(mono(format!("\u{2212}{deletions}"), 11., colors.del))
 }
 
-fn changes_tab(workspace: &Workspace, agent: &Agent, cx: &mut Context<Workspace>) -> AnyElement {
+/// The keyboard state of the changed files in the inspector: one stop for Tab, with a
+/// cursor that the arrow keys move. The list draws only the rows in view, so the rows
+/// are not stops of their own.
+struct ChangedFilesNav {
+    focus: FocusHandle,
+    scroll: UniformListScrollHandle,
+    cursor: usize,
+}
+
+impl ChangedFilesNav {
+    fn new(cx: &mut Context<Self>) -> Self {
+        Self {
+            focus: cx.focus_handle().tab_stop(true),
+            scroll: UniformListScrollHandle::new(),
+            cursor: 0,
+        }
+    }
+
+    /// Puts the cursor on a row the user clicked.
+    fn select(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.cursor = index;
+        cx.notify();
+    }
+
+    /// Moves the cursor by a key and scrolls it into view.
+    fn press(&mut self, key: ChangedFilesKey, count: usize, cx: &mut Context<Self>) {
+        let last = count.saturating_sub(1);
+        let current = self.cursor.min(last);
+
+        self.cursor = match key {
+            ChangedFilesKey::Up => current.saturating_sub(1),
+            ChangedFilesKey::Down => (current + 1).min(last),
+            ChangedFilesKey::First => 0,
+            ChangedFilesKey::Last => last,
+        };
+        self.scroll
+            .scroll_to_item(self.cursor, ScrollStrategy::Nearest);
+        cx.notify();
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ChangedFilesKey {
+    Up,
+    Down,
+    First,
+    Last,
+}
+
+fn changed_files_listener<A: gpui::Action>(
+    nav: &Entity<ChangedFilesNav>,
+    key: ChangedFilesKey,
+    count: usize,
+    cx: &mut Context<Workspace>,
+) -> impl Fn(&A, &mut Window, &mut App) + 'static {
+    let nav = nav.clone();
+
+    cx.listener(move |_, _: &A, _, cx| {
+        nav.update(cx, |nav, cx| nav.press(key, count, cx));
+        cx.notify();
+    })
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "one flat element tree reads best in one place"
+)]
+fn changes_tab(
+    workspace: &Workspace,
+    agent: &Agent,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> AnyElement {
     let colors = cx.theme().colors().clone();
     let id = agent.id;
 
@@ -1788,31 +2046,73 @@ fn changes_tab(workspace: &Workspace, agent: &Agent, cx: &mut Context<Workspace>
             .flex()
             .items_center()
             .justify_center()
-            .child(Label::new("No changes").color(Color::Faint))
+            .child(empty_status("changed-files-empty", "No changes"))
             .into_any_element();
     };
     let stat = changes.stat;
+    let count = changes.files.len();
     let hidden = usize::try_from(stat.files)
         .unwrap_or(usize::MAX)
-        .saturating_sub(changes.files.len());
+        .saturating_sub(count);
+
+    let nav = window.use_keyed_state(("changed-files-nav", id.0 as usize), cx, |_, cx| {
+        ChangedFilesNav::new(cx)
+    });
+    let (focus, scroll, cursor) = {
+        let nav = nav.read(cx);
+
+        (
+            nav.focus.clone(),
+            nav.scroll.clone(),
+            nav.cursor.min(count.saturating_sub(1)),
+        )
+    };
+    let ring = focus.is_focused(window) && window.last_input_was_keyboard();
+    let list_focus = focus.clone();
+    let row_nav = nav.clone();
 
     let files = uniform_list(
         "changed-files",
-        changes.files.len(),
+        count,
         cx.processor(move |workspace, range: Range<usize>, _, cx| {
             let colors = cx.theme().colors().clone();
             let Some(changes) = workspace.data.agent_changes.get(&id) else {
                 return Vec::new();
             };
             let listed = Rc::clone(&changes.files);
+            let focus = list_focus.clone();
+            let nav = row_nav.clone();
 
             range
                 .filter_map(|index| listed.get(index).map(|file| (index, file)))
-                .map(|(index, file)| file_row(index, file, id, &colors, cx))
+                .map(|(index, file)| {
+                    let current = (index == cursor, ring);
+
+                    file_row(index, file, id, (current, &focus), &nav, &colors, cx)
+                })
                 .collect()
         }),
     )
+    .track_scroll(&scroll)
     .size_full();
+
+    let open = {
+        let nav = nav.clone();
+
+        cx.listener(move |workspace, _: &TreeActivate, _, cx| {
+            let cursor = nav.read(cx).cursor;
+            let path = workspace
+                .data
+                .agent_changes
+                .get(&id)
+                .and_then(|changes| changes.files.get(cursor))
+                .map(|file| file.path.clone());
+
+            if let Some(path) = path {
+                workspace.view_file_diff(id, path, cx);
+            }
+        })
+    };
 
     v_flex()
         .flex_1()
@@ -1832,10 +2132,34 @@ fn changes_tab(workspace: &Workspace, agent: &Agent, cx: &mut Context<Workspace>
                 ),
         )
         .child(
-            div()
-                .id("changed-files-list")
-                .role(Role::List)
-                .aria_label("Changed files")
+            accessible(div().id("changed-files-list"), Role::List, "Changed files")
+                .key_context(FILE_TREE_CONTEXT)
+                .track_focus(&focus)
+                .on_action(changed_files_listener::<TreePrevious>(
+                    &nav,
+                    ChangedFilesKey::Up,
+                    count,
+                    cx,
+                ))
+                .on_action(changed_files_listener::<TreeNext>(
+                    &nav,
+                    ChangedFilesKey::Down,
+                    count,
+                    cx,
+                ))
+                .on_action(changed_files_listener::<TreeFirst>(
+                    &nav,
+                    ChangedFilesKey::First,
+                    count,
+                    cx,
+                ))
+                .on_action(changed_files_listener::<TreeLast>(
+                    &nav,
+                    ChangedFilesKey::Last,
+                    count,
+                    cx,
+                ))
+                .on_action(open)
                 .flex_1()
                 .min_h_0()
                 .px(px(8.))
@@ -1888,6 +2212,8 @@ fn file_row(
     index: usize,
     file: &FileStat,
     agent: AgentId,
+    ((selected, ring), focus): ((bool, bool), &FocusHandle),
+    nav: &Entity<ChangedFilesNav>,
     colors: &ThemeColors,
     cx: &mut Context<Workspace>,
 ) -> AnyElement {
@@ -1901,6 +2227,8 @@ fn file_row(
         .map(|folder| folder.display().to_string())
         .unwrap_or_default();
     let (path, accent, active) = (file.path.clone(), colors.accent, colors.active);
+    let list_focus = focus.clone();
+    let nav = nav.clone();
 
     div()
         .h(px(36.))
@@ -1908,18 +2236,26 @@ fn file_row(
             h_flex()
                 .id(("changed-file", index))
                 .debug_selector(|| format!("changed-file-{index}"))
-                .role(Role::Button)
+                .role(Role::ListItem)
                 .aria_label(file_label(&file.path, file.additions, file.deletions))
-                .focusable()
-                .tab_stop(true)
+                .aria_selected(selected)
+                .when(selected, StatefulInteractiveElement::aria_active_descendant)
                 .cursor_pointer()
                 .h(px(34.))
                 .gap(px(10.))
                 .px(px(8.))
                 .rounded(px(7.))
+                .when(selected, |row| row.bg(active))
                 .hover(move |style| style.bg(active))
-                .focus_visible(move |style| focus_ring(style, accent))
-                .on_click(cx.listener(move |workspace, _: &ClickEvent, _, cx| {
+                .when(selected && ring, |mut row| {
+                    row.style()
+                        .refine(&focus_ring(StyleRefinement::default(), accent));
+
+                    row
+                })
+                .on_click(cx.listener(move |workspace, _: &ClickEvent, window, cx| {
+                    window.focus(&list_focus, cx);
+                    nav.update(cx, |nav, cx| nav.select(index, cx));
                     workspace.view_file_diff(agent, path.clone(), cx);
                 }))
                 .child(
@@ -2023,37 +2359,39 @@ fn process_row(
         dot.border_1().border_color(colors.faint)
     };
 
-    h_flex()
-        .id(("process", id.0 as usize))
-        .debug_selector(|| format!("process-{}", id.0))
-        .role(Role::Button)
-        .aria_label(label)
-        .focusable()
-        .tab_stop(true)
-        .cursor_pointer()
-        .h(px(32.))
-        .gap(px(10.))
-        .mx(px(-8.))
-        .px(px(8.))
-        .rounded(px(7.))
-        .hover(move |style| style.bg(active))
-        .focus_visible(move |style| focus_ring(style, accent))
-        .on_click(cx.listener(move |workspace, _: &ClickEvent, _, cx| {
-            workspace.focus_process(id, cx);
-        }))
-        .child(dot)
-        .child(
-            div().flex_1().min_w_0().child(
-                mono(terminal.title.clone(), 11.5, colors.fg)
-                    .whitespace_nowrap()
-                    .truncate(),
-            ),
-        )
-        .children(size.map(|(columns, rows)| {
-            mono(format!("{columns}\u{d7}{rows}"), 11., colors.faint).flex_none()
-        }))
-        .child(Label::new(state).size(LabelSize::Small).color(Color::Muted))
-        .into_any_element()
+    accessible(
+        h_flex()
+            .id(("process", id.0 as usize))
+            .debug_selector(|| format!("process-{}", id.0)),
+        Role::Button,
+        label,
+    )
+    .focusable()
+    .tab_stop(true)
+    .cursor_pointer()
+    .h(px(32.))
+    .gap(px(10.))
+    .mx(px(-8.))
+    .px(px(8.))
+    .rounded(px(7.))
+    .hover(move |style| style.bg(active))
+    .focus_visible(move |style| focus_ring(style, accent))
+    .on_click(cx.listener(move |workspace, _: &ClickEvent, _, cx| {
+        workspace.focus_process(id, cx);
+    }))
+    .child(dot)
+    .child(
+        div().flex_1().min_w_0().child(
+            mono(terminal.title.clone(), 11.5, colors.fg)
+                .whitespace_nowrap()
+                .truncate(),
+        ),
+    )
+    .children(size.map(|(columns, rows)| {
+        mono(format!("{columns}\u{d7}{rows}"), 11., colors.faint).flex_none()
+    }))
+    .child(Label::new(state).size(LabelSize::Small).color(Color::Muted))
+    .into_any_element()
 }
 
 fn agent_name(
@@ -2078,6 +2416,8 @@ struct MessageRow<'a> {
     index: usize,
     message: &'a Message,
     markdown: &'a Markdown,
+    /// The focus of the Show more button, kept so the thread can scroll to it.
+    fold_focus: Option<FocusHandle>,
     /// The text is taller than [`FOLDED_HEIGHT`], so the row has a fold.
     tall: bool,
     folded: bool,
@@ -2111,7 +2451,22 @@ fn kind_tag_colors(kind: MessageKind, colors: &ThemeColors) -> (Hsla, Hsla) {
     }
 }
 
-fn message_row(row: &MessageRow<'_>, colors: &ThemeColors) -> AnyElement {
+/// What a screen reader says for a message before its text: who sent it to whom, what
+/// kind it is and when. The text follows as the children of the row.
+fn message_label(
+    names: &HashMap<DaemonAgentId, SharedString>,
+    message: &Message,
+    when: &str,
+) -> String {
+    format!(
+        "Message from {} to {}, {}, {when}",
+        agent_name(names, message.from),
+        agent_name(names, Some(message.to)),
+        message.kind.label(),
+    )
+}
+
+fn message_row(row: &MessageRow<'_>, colors: &ThemeColors) -> gpui::Stateful<gpui::Div> {
     let message = row.message;
     let in_flight = message.delivered_at.is_none();
     let when = if in_flight {
@@ -2120,6 +2475,7 @@ fn message_row(row: &MessageRow<'_>, colors: &ThemeColors) -> AnyElement {
         relative_time(message.sent_at, row.now)
     };
     let (tag_color, tag_fill) = kind_tag_colors(message.kind, colors);
+    let label = message_label(row.names, message, &when);
 
     let header = h_flex()
         .gap(px(6.))
@@ -2197,18 +2553,24 @@ fn message_row(row: &MessageRow<'_>, colors: &ThemeColors) -> AnyElement {
         });
 
     let toggle = row.tall.then(|| {
-        h_flex().child(fold_toggle(
+        let button = fold_toggle(
             (row.index, message.id.0),
             &fold_target(row.names, message),
             row.folded,
             colors.accent,
             Rc::clone(&row.on_toggle),
-        ))
+        );
+
+        h_flex().child(match &row.fold_focus {
+            Some(focus) => button.track_focus(focus),
+            None => button,
+        })
     });
 
     v_flex()
         .id(("message", message.id.0))
         .role(Role::ListItem)
+        .aria_label(label)
         .w_full()
         .py(px(12.))
         .gap(px(8.))
@@ -2217,7 +2579,6 @@ fn message_row(row: &MessageRow<'_>, colors: &ThemeColors) -> AnyElement {
         .child(header)
         .child(body)
         .children(toggle)
-        .into_any_element()
 }
 
 /// Names a message for the button that folds it.
@@ -2239,24 +2600,26 @@ fn fold_toggle(
 ) -> gpui::Stateful<gpui::Div> {
     let label = if folded { "Show more" } else { "Show less" };
 
-    div()
-        .id(("message-fold", message))
-        .debug_selector(|| format!("message-fold-{index}"))
-        .role(Role::Button)
-        .aria_label(format!("{label}, {target}"))
-        .aria_expanded(!folded)
-        .focusable()
-        .tab_stop(true)
-        .cursor_pointer()
-        .rounded(px(4.))
-        .focus_visible(move |style| focus_ring(style, accent))
-        .on_click(move |_, _, cx| on_toggle(cx))
-        .child(
-            Label::new(label)
-                .size(LabelSize::Small)
-                .weight(FontWeight::MEDIUM)
-                .color(Color::Accent),
-        )
+    accessible(
+        div()
+            .id(("message-fold", message))
+            .debug_selector(|| format!("message-fold-{index}")),
+        Role::Button,
+        format!("{label}, {target}"),
+    )
+    .aria_expanded(!folded)
+    .focusable()
+    .tab_stop(true)
+    .cursor_pointer()
+    .rounded(px(4.))
+    .focus_visible(move |style| focus_ring(style, accent))
+    .on_click(move |_, _, cx| on_toggle(cx))
+    .child(
+        Label::new(label)
+            .size(LabelSize::Small)
+            .weight(FontWeight::MEDIUM)
+            .color(Color::Accent),
+    )
 }
 
 /// What the thread was last scrolled for: the agent and its newest message.
@@ -2820,6 +3183,288 @@ mod tests {
         workspace.read_with(cx, |workspace, _| workspace.inspector_tab)
     }
 
+    fn swarm_walk(key: &str, cx: &mut TestAppContext) -> Vec<String> {
+        use gpui::Focusable as _;
+
+        let (workspace, cx) = setup(cx);
+        let root = workspace.read_with(cx, Workspace::focus_handle);
+        let orchestrator = workspace.read_with(cx, |workspace, _| {
+            workspace.active_task().orchestrator.unwrap_or(AgentId(0))
+        });
+        let handle = workspace.update(cx, |workspace, cx| workspace.swarm_handle(orchestrator, cx));
+        cx.update(|window, cx| window.focus(&handle, cx));
+        redraw(cx);
+
+        swarm_ui::test_support::tab_walk(cx, &root, key)
+    }
+
+    #[gpui::test]
+    fn tab_visits_the_swarm_stops_in_order_and_names_each(cx: &mut TestAppContext) {
+        let stops = swarm_walk("tab", cx);
+
+        assert_eq!(
+            stops[..11],
+            [
+                "ListItem orchestrator, Claude Code, Working, 2 messages in flight",
+                "ListItem term-render, Claude Code, Working, 1 message in flight",
+                "ListItem pty-io, Codex, Blocked, 1 message in flight",
+                "ListItem ui-tokens, Claude Code, Done",
+                "ListItem bench, Codex, Idle",
+                "Button Zoom out",
+                "Button Zoom in",
+                "Button View diff, orchestrator",
+                "Button Focus orchestrator",
+                "Tab Messages, 7",
+                "Button Show more, message from orchestrator to pty-io",
+            ]
+        );
+        assert!(
+            stops
+                .iter()
+                .all(|stop| !matches!(stop.as_str(), "unnamed" | "nothing" | "not drawn")),
+            "{stops:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn shift_tab_visits_the_swarm_stops_in_reverse(cx: &mut TestAppContext) {
+        let forward = swarm_walk("tab", cx);
+        let backward = swarm_walk("shift-tab", cx);
+
+        let mut expected = vec![forward[0].clone()];
+        expected.extend(forward[1..].iter().rev().cloned());
+        assert_eq!(backward, expected);
+    }
+
+    #[gpui::test]
+    fn a_message_is_a_named_list_item(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+
+        let (role, label) = workspace.read_with(cx, |workspace, cx| {
+            let thread = workspace.thread.read(cx);
+            let colors = cx.theme().colors().clone();
+            let row = MessageRow {
+                index: 0,
+                message: &thread.messages[0],
+                markdown: &thread.parsed[0],
+                fold_focus: None,
+                tall: false,
+                folded: false,
+                measured: None,
+                names: &thread.names,
+                now: thread.now,
+                on_toggle: Rc::new(|_: &mut App| {}),
+                on_measure: Rc::new(|_: bool, _: &mut App| {}),
+            };
+            let element = message_row(&row, &colors);
+            let mut node = gpui::accesskit::Node::new(Role::Unknown);
+
+            Element::write_a11y_info(&element, &mut node);
+
+            (
+                Element::a11y_role(&element),
+                node.label().map(str::to_owned),
+            )
+        });
+
+        assert_eq!(role, Some(Role::ListItem));
+        assert!(
+            label.is_some_and(|label| label.starts_with("Message from ")),
+            "the row has no label"
+        );
+    }
+
+    fn give_changes(
+        workspace: &Entity<Workspace>,
+        agent: AgentId,
+        count: u32,
+        cx: &mut VisualTestContext,
+    ) {
+        workspace.update(cx, |workspace, cx| {
+            let files: Vec<FileStat> = (0..count)
+                .map(|index| FileStat {
+                    path: PathBuf::from(format!("src/file{index:03}.rs")),
+                    additions: 1,
+                    deletions: 0,
+                })
+                .collect();
+
+            if let Some(changes) = workspace.data.agent_changes.get_mut(&agent) {
+                changes.stat.files = count;
+                changes.files = files.into();
+            }
+            cx.notify();
+        });
+        redraw(cx);
+    }
+
+    fn tab_to(name: &str, workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> bool {
+        use gpui::Focusable as _;
+
+        let root = workspace.read_with(cx, Workspace::focus_handle);
+
+        for _ in 0..80 {
+            if swarm_ui::test_support::focused_stop(cx, &root) == name {
+                return true;
+            }
+            cx.simulate_keystrokes("tab");
+            redraw(cx);
+        }
+
+        false
+    }
+
+    #[gpui::test]
+    fn the_changed_files_are_one_stop_and_the_keys_scroll_the_list(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let pty_io = show_agent(&workspace, "pty-io", cx);
+        click("inspector-tab-1", cx);
+        give_changes(&workspace, pty_io, 80, cx);
+
+        assert!(tab_to("List Changed files", &workspace, cx));
+        let first_on_screen = cx.debug_bounds("changed-file-0").is_some();
+        cx.simulate_keystrokes("end");
+        redraw(cx);
+        redraw(cx);
+        let last_on_screen = cx.debug_bounds("changed-file-79").is_some();
+        let first_gone = cx.debug_bounds("changed-file-0").is_none();
+        cx.simulate_keystrokes("home");
+        redraw(cx);
+        redraw(cx);
+
+        assert!(first_on_screen);
+        assert!(last_on_screen, "End did not scroll to the last file");
+        assert!(first_gone);
+        assert!(
+            cx.debug_bounds("changed-file-0").is_some(),
+            "Home did not scroll back"
+        );
+    }
+
+    #[gpui::test]
+    fn enter_on_the_changed_files_opens_review_at_the_cursor(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let pty_io = show_agent(&workspace, "pty-io", cx);
+        click("inspector-tab-1", cx);
+        give_changes(&workspace, pty_io, 80, cx);
+
+        assert!(tab_to("List Changed files", &workspace, cx));
+        cx.simulate_keystrokes("down");
+        cx.simulate_keystrokes("enter");
+
+        let (view, file) = workspace.read_with(cx, |workspace, _| {
+            (workspace.view, workspace.review_file.clone())
+        });
+        assert_eq!(view, View::Review);
+        assert_eq!(file, Some(PathBuf::from("src/file001.rs")));
+    }
+
+    #[gpui::test]
+    fn selecting_a_changed_file_row_moves_the_cursor_to_it(cx: &mut TestAppContext) {
+        let nav = cx.new(ChangedFilesNav::new);
+
+        nav.update(cx, |nav, cx| nav.select(2, cx));
+
+        assert_eq!(nav.read_with(cx, |nav, _| nav.cursor), 2);
+    }
+
+    #[gpui::test]
+    fn focus_moving_to_a_card_out_of_view_scrolls_the_graph(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        cx.simulate_resize(gpui::size(px(1100.), px(800.)));
+        workspace.update(cx, |workspace, cx| workspace.zoom_swarm(4, cx));
+        redraw(cx);
+        let last = workspace.read_with(cx, |workspace, _| {
+            workspace.active_task().workers.last().copied()
+        });
+        let last = last.expect("the task has workers");
+        let graph = cx.debug_bounds("agent-graph").expect("the graph");
+        let selector: &'static str = Box::leak(format!("agent-card-{}", last.0).into_boxed_str());
+        let hidden = cx
+            .debug_bounds(selector)
+            .is_none_or(|card| card.right() > graph.right());
+
+        let handle = workspace.update(cx, |workspace, cx| workspace.swarm_handle(last, cx));
+        cx.update(|window, cx| window.focus(&handle, cx));
+        for _ in 0..4 {
+            redraw(cx);
+        }
+        let card = cx.debug_bounds(selector).expect("the card is drawn");
+
+        assert!(hidden, "the card was in view before focus moved");
+        assert!(card.right() <= graph.right() + px(1.), "{card:?} {graph:?}");
+        assert!(card.left() >= graph.left() - px(1.), "{card:?} {graph:?}");
+    }
+
+    #[gpui::test]
+    fn focus_moving_to_a_show_more_button_out_of_view_scrolls_the_thread(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        for id in 800..812 {
+            post_to_bench(&workspace, id, &paragraphs(9), cx);
+        }
+        settle(cx);
+        workspace.read_with(cx, |workspace, cx| {
+            workspace.thread.read(cx).list.scroll_to(gpui::ListOffset {
+                item_ix: 0,
+                offset_in_item: px(0.),
+            });
+        });
+        settle(cx);
+        let before = scroll_position(&workspace, cx);
+
+        let handle = workspace.read_with(cx, |workspace, cx| {
+            let thread = workspace.thread.read(cx);
+            let folds = thread.folds.borrow();
+
+            thread
+                .messages
+                .iter()
+                .enumerate()
+                .filter_map(|(index, message)| Some((index, folds.get(&message.id)?.clone())))
+                .next_back()
+        });
+        let (index, handle) = handle.expect("a tall row is drawn");
+        assert!(index > 0, "only the first row is drawn");
+        cx.update(|window, cx| window.focus(&handle, cx));
+        settle(cx);
+
+        let after = scroll_position(&workspace, cx);
+        assert_ne!(
+            (before.item_ix, before.offset_in_item),
+            (after.item_ix, after.offset_in_item),
+            "the thread did not scroll to row {index}"
+        );
+    }
+
+    #[gpui::test]
+    fn the_fold_handles_of_messages_that_are_gone_are_dropped(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        for id in 800..804 {
+            post_to_bench(&workspace, id, &paragraphs(9), cx);
+        }
+        settle(cx);
+        let drawn = workspace.read_with(cx, |workspace, cx| {
+            workspace.thread.read(cx).folds.borrow().len()
+        });
+
+        show_agent(&workspace, "pty-io", cx);
+        settle(cx);
+
+        let stale = workspace.read_with(cx, |workspace, cx| {
+            let thread = workspace.thread.read(cx);
+            let current: HashSet<MessageId> = thread.messages.iter().map(|m| m.id).collect();
+
+            thread
+                .folds
+                .borrow()
+                .keys()
+                .filter(|id| !current.contains(id))
+                .count()
+        });
+        assert!(drawn > 0, "no tall row was drawn");
+        assert_eq!(stale, 0);
+    }
+
     #[gpui::test]
     fn the_tabs_switch_and_keep_their_choice_for_every_agent(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
@@ -2913,7 +3558,7 @@ mod tests {
             .iter()
             .map(|block| match block {
                 markdown::Block::Paragraph(_) => "paragraph",
-                markdown::Block::Heading(_) => "heading",
+                markdown::Block::Heading { .. } => "heading",
                 markdown::Block::Item { .. } => "item",
                 markdown::Block::Code { .. } => "code",
             })

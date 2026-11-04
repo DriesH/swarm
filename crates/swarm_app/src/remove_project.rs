@@ -12,6 +12,7 @@ use swarm_protocol::{Client, RemoveCheck, TaskCloseCheck};
 use swarm_ui::fonts::{MONO_FONT, UI_FONT};
 use swarm_ui::prelude::*;
 
+use crate::announce::announce;
 use crate::close_task::{
     CheckState, deletes_files, describe, leave_confirm, stops_agents, stops_terminals,
 };
@@ -138,6 +139,24 @@ impl RemoveProjectDialog {
         } else {
             ("Remove".to_owned(), format!("Remove project {}", self.name))
         }
+    }
+
+    /// Speaks "Checking" while the check runs. The focused Remove button says the removing.
+    fn status_region(&self) -> LiveRegion {
+        let checking = !self.busy && matches!(self.check, CheckState::Checking);
+        let value = if checking { "Checking" } else { "" };
+
+        LiveRegion::status("remove-project-status", value)
+    }
+
+    /// Speaks a failed check or a project that was not removed.
+    fn alert_region(&self) -> LiveRegion {
+        let message = match (&self.error, &self.check) {
+            (Some(message), _) | (None, CheckState::Failed(message)) => message.clone(),
+            _ => SharedString::default(),
+        };
+
+        LiveRegion::alert("remove-project-alert", message)
     }
 
     /// The sentence under the title, and the range of it that shows in mono.
@@ -292,21 +311,13 @@ impl Render for RemoveProjectDialog {
 
         let body = match &self.check {
             CheckState::Checking => Some(
-                div()
-                    .id("remove-project-checking")
-                    .role(Role::Status)
-                    .aria_label("Checking")
-                    .child(Label::new("Checking\u{2026}").color(Color::Faint))
+                Label::new("Checking\u{2026}")
+                    .color(Color::Faint)
                     .into_any_element(),
             ),
-            CheckState::Failed(message) => Some(
-                div()
-                    .id("remove-project-check-error")
-                    .role(Role::Alert)
-                    .aria_label(message.clone())
-                    .child(wrapping(message.clone(), Color::Del, cx))
-                    .into_any_element(),
-            ),
+            CheckState::Failed(message) => {
+                Some(wrapping(message.clone(), Color::Del, cx).into_any_element())
+            }
             CheckState::Ready(_) => {
                 let lines = self.lines();
 
@@ -328,15 +339,10 @@ impl Render for RemoveProjectDialog {
             }
         };
 
-        let error = self.error.clone().map(|message| {
-            div()
-                .id("remove-project-error")
-                .role(Role::Alert)
-                .aria_label(message.clone())
-                .text_size(px(12.))
-                .text_color(Color::Del.hsla(cx))
-                .child(message)
-        });
+        let error = self
+            .error
+            .clone()
+            .map(|message| Label::new(message).size(LabelSize::Small).color(Color::Del));
 
         let (label, accessible) = self.confirm_labels();
         let footer = h_flex()
@@ -373,6 +379,8 @@ impl Render for RemoveProjectDialog {
             .child(info)
             .children(body)
             .children(error)
+            .child(announce("remove-project-alert", self.alert_region()))
+            .child(announce("remove-project-status", self.status_region()))
             .footer(footer)
     }
 }
@@ -648,7 +656,9 @@ mod tests {
         answer_late, fake_daemon_replying, project_info, redraw, setup, task_info, use_projects,
         wait_until,
     };
+    use crate::live_probe::{Seen, assert_named, is_quiet, reversed, see_in};
     use crate::plan_editor::PlanEditor;
+    use swarm_ui::test_support::tab_walk;
 
     type Requests = Arc<Mutex<Vec<Request>>>;
 
@@ -678,6 +688,75 @@ mod tests {
             Modifiers::none(),
         );
         redraw(cx);
+    }
+
+    fn spoken(
+        view: &Entity<RemoveProjectDialog>,
+        region: fn(&RemoveProjectDialog) -> LiveRegion,
+        cx: &mut VisualTestContext,
+    ) -> Seen {
+        let region = view.read_with(cx, |dialog, _| region(dialog));
+
+        see_in(region, cx)
+    }
+
+    #[gpui::test]
+    fn the_check_is_spoken_politely_until_it_is_ready(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        open_dialog(0, &workspace, cx);
+        let view = dialog(&workspace, cx).expect("the dialog is open");
+
+        view.update(cx, |dialog, cx| dialog.set_check(CheckState::Checking, cx));
+        let checking = spoken(&view, RemoveProjectDialog::status_region, cx);
+        view.update(cx, |dialog, cx| {
+            dialog.set_check(CheckState::Ready(RemoveCheck { tasks: Vec::new() }), cx);
+        });
+        let ready = spoken(&view, RemoveProjectDialog::status_region, cx);
+
+        assert_eq!(checking.value.as_deref(), Some("Checking"));
+        assert_eq!(checking.live, Some(Live::Polite));
+        assert!(is_quiet(&ready));
+    }
+
+    #[gpui::test]
+    fn the_dialog_draws_the_regions_that_speak_its_state(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        open_dialog(0, &workspace, cx);
+
+        assert!(cx.debug_bounds("remove-project-alert").is_some());
+        assert!(cx.debug_bounds("remove-project-status").is_some());
+    }
+
+    #[gpui::test]
+    fn removing_is_spoken_by_the_button_and_not_the_status(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        open_dialog(0, &workspace, cx);
+        let view = dialog(&workspace, cx).expect("the dialog is open");
+
+        view.update(cx, RemoveProjectDialog::set_busy);
+        let busy = spoken(&view, RemoveProjectDialog::status_region, cx);
+
+        assert!(is_quiet(&busy));
+        assert_eq!(busy.live, Some(Live::Polite));
+    }
+
+    #[gpui::test]
+    fn a_failed_check_and_a_failed_removal_are_alerts(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        open_dialog(0, &workspace, cx);
+        let view = dialog(&workspace, cx).expect("the dialog is open");
+
+        view.update(cx, |dialog, cx| {
+            dialog.set_check(CheckState::Failed("No daemon".into()), cx);
+        });
+        let check = spoken(&view, RemoveProjectDialog::alert_region, cx);
+        view.update(cx, |dialog, cx| dialog.fail("Cannot remove".into(), cx));
+        let removal = spoken(&view, RemoveProjectDialog::alert_region, cx);
+
+        assert_eq!(check.value.as_deref(), Some("No daemon"));
+        assert_eq!(check.live, Some(Live::Assertive));
+        assert_eq!(removal.value.as_deref(), Some("Cannot remove"));
+        assert_eq!(removal.role, Some(Role::Alert));
     }
 
     fn project_names(workspace: &Entity<Workspace>, cx: &VisualTestContext) -> Vec<String> {
@@ -1016,6 +1095,30 @@ mod tests {
 
         assert!(dialog(&workspace, cx).is_none());
         assert_eq!(project_names(&workspace, cx).len(), 4);
+    }
+
+    #[gpui::test]
+    fn tab_walks_the_dialog_in_order_and_never_leaves_it(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        open_dialog(3, &workspace, cx);
+        let view = dialog(&workspace, cx).expect("the dialog is open");
+        let root = view.read_with(cx, |dialog, _| dialog.focus_handle.clone());
+        let (_, cancel) = view.read_with(cx, |dialog, _| dialog.focus_handles());
+        cx.update(|window, cx| window.focus(&cancel, cx));
+
+        let forward = tab_walk(cx, &root, "tab");
+        let backward = tab_walk(cx, &root, "shift-tab");
+
+        assert_eq!(
+            forward,
+            [
+                "Button Cancel",
+                "Button Remove project extensions",
+                "Button Close dialog",
+            ]
+        );
+        assert_eq!(backward, reversed(&forward));
+        assert_named(&forward);
     }
 
     #[gpui::test]

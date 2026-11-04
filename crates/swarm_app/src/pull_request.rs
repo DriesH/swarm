@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use gpui::{
     AppContext as _, Context, Entity, FocusHandle, Focusable as _, SharedString, Subscription,
-    Window, div,
+    Window,
 };
 use swarm_protocol::{
     CheckState, ChecksRun, Client, ClientError, GithubCheckState, GithubStatus, MergeMethod,
@@ -600,6 +600,12 @@ impl AnywayDialog {
     }
 }
 
+/// Why the pull request is blocked, spoken when the dialog opens.
+fn problem_region(problem: &'static str) -> LiveRegion {
+    LiveRegion::alert("create-anyway-problem", problem)
+        .child(Label::new(problem).color(Color::Warn))
+}
+
 impl Render for AnywayDialog {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let on_dismiss = cx.entity();
@@ -628,13 +634,7 @@ impl Render for AnywayDialog {
         .on_dismiss(move |_, cx| {
             on_dismiss.update(cx, |_, cx| cx.emit(AnywayEvent::Dismissed));
         })
-        .child(
-            div()
-                .id("create-anyway-problem")
-                .role(gpui::Role::Status)
-                .aria_label(self.problem.label())
-                .child(Label::new(self.problem.label()).color(Color::Warn)),
-        )
+        .child(problem_region(self.problem.label()))
         .footer(footer)
     }
 }

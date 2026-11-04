@@ -22,6 +22,7 @@ use super::{
 use crate::actions::{COMPOSER_CONTEXT, CancelReply, REPLY_CONTEXT};
 use crate::markdown;
 use crate::model::TaskId;
+use crate::panels::error_alert;
 use crate::review_comments::CommentSlot;
 use crate::review_model::{
     ComposerAt, LinePos, Place, Row, ago, anchor_for, find_line, first_changed_line, place_threads,
@@ -152,6 +153,8 @@ pub(super) struct ReplyBox {
     open: bool,
     /// The reply is on its way to the daemon.
     sending: bool,
+    /// The last reply went through, and the field has not opened since.
+    sent: bool,
     /// The Reply button, which gets focus back when the field closes.
     button: FocusHandle,
     /// The Send and Cancel buttons. Both are off while the reply is on its way, but
@@ -260,6 +263,19 @@ pub(super) fn state_label(comment: &ReviewComment, now: u64) -> (String, TagTone
         }
         (CommentState::Resolved, _) => ("Resolved".to_owned(), TagTone::Neutral),
     }
+}
+
+/// What a screen reader says about a reply: it is on its way, or it went through.
+pub(super) fn reply_status(thread: usize, sending: bool, sent: bool) -> Option<LiveRegion> {
+    let text = if sending {
+        "Sending reply"
+    } else if sent {
+        "Reply sent"
+    } else {
+        return None;
+    };
+
+    Some(LiveRegion::status(("comment-reply-status", thread), text))
 }
 
 fn state_tag(comment: &ReviewComment, now: u64) -> Tag {
@@ -453,6 +469,11 @@ impl ReviewView {
     #[cfg(test)]
     pub(crate) fn reply_is_open(&self, root: CommentId) -> bool {
         self.reply_boxes.get(&root).is_some_and(|reply| reply.open)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reply_sent(&self, root: CommentId) -> bool {
+        self.reply_boxes.get(&root).is_some_and(|reply| reply.sent)
     }
 
     #[cfg(test)]
@@ -982,6 +1003,7 @@ impl ReviewView {
 
         if let Some(reply) = self.reply_boxes.get_mut(&root) {
             reply.sending = false;
+            reply.sent = sent;
             reply.open = !sent;
             reply.input.update(cx, |input, cx| {
                 input.set_disabled(false, cx);
@@ -1040,6 +1062,7 @@ impl ReviewView {
                 input,
                 open: false,
                 sending: false,
+                sent: false,
                 button: cx.focus_handle().tab_stop(true),
                 send: cx.focus_handle().tab_stop(true),
                 cancel: cx.focus_handle().tab_stop(true),
@@ -1056,7 +1079,9 @@ impl ReviewView {
 
     /// Shows the reply field of a thread and moves focus into it.
     pub(crate) fn open_reply(&mut self, root: CommentId, cx: &mut Context<Self>) {
-        self.reply_box(root, cx).open = true;
+        let reply = self.reply_box(root, cx);
+        reply.open = true;
+        reply.sent = false;
         self.focus_reply = Some(ReplyFocus::Field(root));
 
         self.after_card_change();
@@ -1337,7 +1362,7 @@ impl ReviewView {
         let numeric = usize::try_from(id.0).unwrap_or(usize::MAX);
         let resolved = root.state == CommentState::Resolved;
         let view = cx.entity();
-        let (reply_input, reply_open, reply_sending, reply_button) = {
+        let (reply_input, reply_open, reply_sending, reply_button, reply_sent) = {
             let reply = self.reply_box(id, cx);
 
             (
@@ -1345,6 +1370,7 @@ impl ReviewView {
                 reply.open,
                 reply.sending,
                 reply.button.clone(),
+                reply.sent,
             )
         };
         let (send_focus, cancel_focus, action_focus) = {
@@ -1593,14 +1619,12 @@ impl ReviewView {
             )
             .children(editor)
             .child(footer)
+            .children(reply_status(numeric, reply_sending, reply_sent))
             .children(error.map(|message| {
                 div()
-                    .id(("comment-error", numeric))
-                    .role(Role::Alert)
-                    .aria_label(message.clone())
                     .px(px(12.))
                     .pb(px(8.))
-                    .child(Label::new(message).size(LabelSize::Small).color(Color::Del))
+                    .child(error_alert(("comment-error", numeric), message))
             }))
             .into_any_element()
     }
@@ -1679,13 +1703,7 @@ impl ReviewView {
                     )
             }))
             .child(self.composer.input.clone())
-            .children(error.map(|message| {
-                div()
-                    .id("comment-composer-error")
-                    .role(Role::Alert)
-                    .aria_label(message.clone())
-                    .child(Label::new(message).size(LabelSize::Small).color(Color::Del))
-            }))
+            .children(error.map(|message| error_alert("comment-composer-error", message)))
             .child(
                 h_flex()
                     .gap(px(8.))

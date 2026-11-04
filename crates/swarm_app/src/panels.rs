@@ -5,10 +5,12 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, ClickEvent, Context, Entity, FocusHandle, FontWeight, Role, ScrollStrategy,
-    SharedString, Subscription, UniformListScrollHandle, WeakEntity, Window, div, px, uniform_list,
+    Action, AnyElement, ClickEvent, Context, ElementId, Entity, FocusHandle, FontWeight, Role,
+    ScrollHandle, ScrollStrategy, SharedString, Subscription, UniformListScrollHandle, WeakEntity,
+    Window, div, px, uniform_list,
 };
 use swarm_protocol::{ReviewSource, TaskDiff};
+use swarm_ui::a11y::accessible;
 use swarm_ui::prelude::*;
 
 use crate::actions::{
@@ -32,6 +34,26 @@ pub(crate) fn render(
         Some(RightPanel::PullRequest) => crate::pull_request_panel::render(workspace, cx),
         None => div().into_any_element(),
     }
+}
+
+/// An empty state that a screen reader speaks when it shows.
+pub(crate) fn empty_status(id: &'static str, text: &'static str) -> LiveRegion {
+    LiveRegion::status(id, text).child(Label::new(text).color(Color::Faint))
+}
+
+/// A failure that a screen reader speaks at once, cut to one line on screen.
+pub(crate) fn error_alert(
+    id: impl Into<ElementId>,
+    message: impl Into<SharedString>,
+) -> LiveRegion {
+    let message = message.into();
+
+    LiveRegion::alert(id, message.clone()).child(
+        Label::new(message)
+            .size(LabelSize::Small)
+            .color(Color::Del)
+            .truncate(),
+    )
 }
 
 pub(crate) fn mono(text: impl Into<SharedString>) -> Label {
@@ -78,8 +100,16 @@ fn changes(workspace: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
         .child(
             header(cx)
                 .h(px(40.))
-                .child(Label::new("Changes").weight(FontWeight::MEDIUM))
-                .child(mono(plural(stat.files, "file", "files")).color(Color::Faint))
+                .child(
+                    Label::new("Changes")
+                        .weight(FontWeight::MEDIUM)
+                        .heading("changes-heading", 2),
+                )
+                .child(
+                    mono(plural(stat.files, "file", "files"))
+                        .color(Color::Faint)
+                        .accessible("changes-count"),
+                )
                 .child(div().flex_1())
                 .child(
                     Button::new("review", "Review")
@@ -398,7 +428,7 @@ impl Render for ChangesList {
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(Label::new("No changes").color(Color::Faint))
+                .child(empty_status("changes-empty", "No changes"))
                 .into_any_element();
         }
 
@@ -410,32 +440,34 @@ impl Render for ChangesList {
         .track_scroll(&self.scroll)
         .size_full();
 
-        div()
-            .id("changes-tree")
-            .debug_selector(|| "changes-tree".to_owned())
-            .role(Role::Tree)
-            .aria_label("Changed files")
-            .key_context(FILE_TREE_CONTEXT)
-            .track_focus(&self.focus_handle)
-            .on_action(cx.listener(|this, _: &TreePrevious, _, cx| this.move_cursor(Key::Up, cx)))
-            .on_action(cx.listener(|this, _: &TreeNext, _, cx| this.move_cursor(Key::Down, cx)))
-            .on_action(cx.listener(|this, _: &TreeCollapse, _, cx| {
-                this.move_cursor(Key::Left, cx);
-            }))
-            .on_action(cx.listener(|this, _: &TreeExpand, _, cx| {
-                this.move_cursor(Key::Right, cx);
-            }))
-            .on_action(cx.listener(|this, _: &TreeFirst, _, cx| this.move_cursor(Key::First, cx)))
-            .on_action(cx.listener(|this, _: &TreeLast, _, cx| this.move_cursor(Key::Last, cx)))
-            .on_action(cx.listener(|this, _: &TreeActivate, _, cx| {
-                if let Some(row) = this.cursor_row() {
-                    this.activate_row(row, cx);
-                }
-            }))
-            .size_full()
-            .px(px(4.))
-            .child(rows)
-            .into_any_element()
+        accessible(
+            div()
+                .id("changes-tree")
+                .debug_selector(|| "changes-tree".to_owned()),
+            Role::Tree,
+            "Changed files",
+        )
+        .key_context(FILE_TREE_CONTEXT)
+        .track_focus(&self.focus_handle)
+        .on_action(cx.listener(|this, _: &TreePrevious, _, cx| this.move_cursor(Key::Up, cx)))
+        .on_action(cx.listener(|this, _: &TreeNext, _, cx| this.move_cursor(Key::Down, cx)))
+        .on_action(cx.listener(|this, _: &TreeCollapse, _, cx| {
+            this.move_cursor(Key::Left, cx);
+        }))
+        .on_action(cx.listener(|this, _: &TreeExpand, _, cx| {
+            this.move_cursor(Key::Right, cx);
+        }))
+        .on_action(cx.listener(|this, _: &TreeFirst, _, cx| this.move_cursor(Key::First, cx)))
+        .on_action(cx.listener(|this, _: &TreeLast, _, cx| this.move_cursor(Key::Last, cx)))
+        .on_action(cx.listener(|this, _: &TreeActivate, _, cx| {
+            if let Some(row) = this.cursor_row() {
+                this.activate_row(row, cx);
+            }
+        }))
+        .size_full()
+        .px(px(4.))
+        .child(rows)
+        .into_any_element()
     }
 }
 
@@ -525,6 +557,126 @@ fn row_label(name: &SharedString, mark: Option<FileMark>) -> SharedString {
     }
 }
 
+/// A key of the Files tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FilesKey {
+    Up,
+    Down,
+    First,
+    Last,
+    Left,
+    Right,
+}
+
+/// What a key does in the Files tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FilesMove {
+    /// Puts the selection on this index of the tree.
+    Select(usize),
+    /// Opens or closes the folder at this index of the tree.
+    Fold(usize, bool),
+    Stay,
+}
+
+/// Works out a key of the Files tree over `rows`, the indexes of the shown entries.
+/// `selected` is the index of the selected entry, which a filter may hide.
+fn files_step(tree: &[TreeEntry], rows: &[usize], selected: usize, key: FilesKey) -> FilesMove {
+    let (Some(first), Some(last)) = (rows.first().copied(), rows.last().copied()) else {
+        return FilesMove::Stay;
+    };
+    let position = rows.iter().position(|row| *row == selected);
+    let entry = position.and_then(|_| tree.get(selected));
+
+    match (key, position) {
+        (FilesKey::First | FilesKey::Down, None) | (FilesKey::First, _) => FilesMove::Select(first),
+        (FilesKey::Last | FilesKey::Up, None) | (FilesKey::Last, _) => FilesMove::Select(last),
+        (FilesKey::Down, Some(at)) => FilesMove::Select(rows.get(at + 1).copied().unwrap_or(last)),
+        (FilesKey::Up, Some(at)) => {
+            FilesMove::Select(rows.get(at.saturating_sub(1)).copied().unwrap_or(first))
+        }
+        (FilesKey::Left, Some(at)) => match entry {
+            Some(entry) if entry.is_dir && entry.expanded => FilesMove::Fold(selected, false),
+            Some(entry) => rows[..at]
+                .iter()
+                .rev()
+                .find(|row| {
+                    tree.get(**row)
+                        .is_some_and(|parent| parent.is_dir && parent.depth < entry.depth)
+                })
+                .map_or(FilesMove::Stay, |parent| FilesMove::Select(*parent)),
+            None => FilesMove::Stay,
+        },
+        (FilesKey::Right, Some(at)) => match entry {
+            Some(entry) if entry.is_dir && !entry.expanded => FilesMove::Fold(selected, true),
+            Some(entry) if entry.is_dir => rows
+                .get(at + 1)
+                .map_or(FilesMove::Stay, |next| FilesMove::Select(*next)),
+            _ => FilesMove::Stay,
+        },
+        (FilesKey::Left | FilesKey::Right, None) => FilesMove::Stay,
+    }
+}
+
+/// What the Files tree needs to handle a key.
+#[derive(Clone)]
+struct FilesTree {
+    selected: Entity<usize>,
+    filter: Entity<TextInput>,
+    scroll: ScrollHandle,
+}
+
+impl FilesTree {
+    fn press(&self, key: FilesKey, workspace: &mut Workspace, cx: &mut Context<Workspace>) {
+        let query = self.filter.read(cx).text();
+        let rows = matching_rows(&workspace.data.file_tree, &query);
+        let selected = *self.selected.read(cx);
+
+        match files_step(&workspace.data.file_tree, &rows, selected, key) {
+            FilesMove::Select(index) => {
+                self.select(index, &rows);
+                self.selected.update(cx, |selected, _| *selected = index);
+            }
+            FilesMove::Fold(index, open) => {
+                if let Some(entry) = workspace.data.file_tree.get_mut(index) {
+                    entry.expanded = open;
+                }
+            }
+            FilesMove::Stay => {}
+        }
+
+        cx.notify();
+    }
+
+    /// Enter opens or closes a folder. A file stays selected.
+    fn activate(&self, workspace: &mut Workspace, cx: &mut Context<Workspace>) {
+        let selected = *self.selected.read(cx);
+
+        if let Some(entry) = workspace.data.file_tree.get_mut(selected)
+            && entry.is_dir
+        {
+            entry.expanded = !entry.expanded;
+        }
+
+        cx.notify();
+    }
+
+    fn select(&self, index: usize, rows: &[usize]) {
+        if let Some(position) = rows.iter().position(|row| *row == index) {
+            self.scroll.scroll_to_item(position);
+        }
+    }
+
+    fn listener<A: Action>(
+        &self,
+        key: FilesKey,
+        cx: &mut Context<Workspace>,
+    ) -> impl Fn(&A, &mut Window, &mut App) + 'static {
+        let tree = self.clone();
+
+        cx.listener(move |workspace, _: &A, _, cx| tree.press(key, workspace, cx))
+    }
+}
+
 /// The search field above the file tree.
 struct FilesFilter {
     input: Entity<TextInput>,
@@ -555,6 +707,10 @@ impl FilesFilter {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one flat element tree reads best in one place"
+)]
 fn files(workspace: &Workspace, window: &mut Window, cx: &mut Context<Workspace>) -> AnyElement {
     let tree = &workspace.data.file_tree;
     let first_modified = tree
@@ -571,13 +727,36 @@ fn files(workspace: &Workspace, window: &mut Window, cx: &mut Context<Workspace>
     let input = filter_state.read(cx).input.clone();
     let query = input.read(cx).text();
 
-    let mut list = v_flex()
-        .id("file-tree")
-        .role(Role::Tree)
-        .aria_label("Files")
+    let focus: Entity<FocusHandle> =
+        window.use_keyed_state("files-focus", cx, |_, cx| cx.focus_handle().tab_stop(true));
+    let focus = focus.read(cx).clone();
+    let scroll: Entity<ScrollHandle> =
+        window.use_keyed_state("files-scroll", cx, |_, _| ScrollHandle::new());
+    let keys = FilesTree {
+        selected: selected_state.clone(),
+        filter: input.clone(),
+        scroll: scroll.read(cx).clone(),
+    };
+    let ring = focus.is_focused(window) && window.last_input_was_keyboard();
+
+    let mut list = accessible(v_flex().id("file-tree"), Role::Tree, "Files")
+        .key_context(FILE_TREE_CONTEXT)
+        .track_focus(&focus)
+        .on_action(keys.listener::<TreePrevious>(FilesKey::Up, cx))
+        .on_action(keys.listener::<TreeNext>(FilesKey::Down, cx))
+        .on_action(keys.listener::<TreeFirst>(FilesKey::First, cx))
+        .on_action(keys.listener::<TreeLast>(FilesKey::Last, cx))
+        .on_action(keys.listener::<TreeCollapse>(FilesKey::Left, cx))
+        .on_action(keys.listener::<TreeExpand>(FilesKey::Right, cx))
+        .on_action({
+            let keys = keys.clone();
+
+            cx.listener(move |workspace, _: &TreeActivate, _, cx| keys.activate(workspace, cx))
+        })
+        .track_scroll(&keys.scroll)
         .flex_1()
         .min_h_0()
-        .overflow_hidden()
+        .overflow_y_scroll()
         .px(px(4.))
         .py(px(4.));
 
@@ -593,6 +772,7 @@ fn files(workspace: &Workspace, window: &mut Window, cx: &mut Context<Workspace>
         let is_selected = index == selected;
         let is_dir = entry.is_dir;
         let state = selected_state.clone();
+        let row_focus = focus.clone();
 
         let name_color = if is_selected {
             Color::Accent
@@ -620,15 +800,15 @@ fn files(workspace: &Workspace, window: &mut Window, cx: &mut Context<Workspace>
             .level(usize::from(entry.depth))
             .label_color(name_color)
             .toggle_state(is_selected)
-            .focusable(true)
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if is_dir {
-                    if let Some(entry) = this.data.file_tree.get_mut(index) {
-                        entry.expanded = !entry.expanded;
-                    }
-                } else {
-                    state.update(cx, |selected, _| *selected = index);
+            .ring(is_selected && ring)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                window.focus(&row_focus, cx);
+
+                if is_dir && let Some(entry) = this.data.file_tree.get_mut(index) {
+                    entry.expanded = !entry.expanded;
                 }
+
+                state.update(cx, |selected, _| *selected = index);
                 cx.notify();
             }));
         let row = if is_dir {
@@ -662,8 +842,16 @@ fn files(workspace: &Workspace, window: &mut Window, cx: &mut Context<Workspace>
         .child(
             header(cx)
                 .h(px(40.))
-                .child(Label::new("Files").weight(FontWeight::MEDIUM))
-                .child(mono(workspace.active_task().name.clone()).color(Color::Faint)),
+                .child(
+                    Label::new("Files")
+                        .weight(FontWeight::MEDIUM)
+                        .heading("files-heading", 2),
+                )
+                .child(
+                    mono(workspace.active_task().name.clone())
+                        .color(Color::Faint)
+                        .accessible("files-task"),
+                ),
         )
         .child(filter)
         .child(list)
@@ -672,7 +860,8 @@ fn files(workspace: &Workspace, window: &mut Window, cx: &mut Context<Workspace>
 
 #[cfg(test)]
 mod tests {
-    use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext};
+    use gpui::{Entity, Focusable as _, Modifiers, TestAppContext, VisualTestContext};
+    use swarm_ui::test_support::focused_stop;
 
     use super::*;
     use crate::actions;
@@ -697,6 +886,161 @@ mod tests {
             cx.simulate_click(center, Modifiers::none());
         }
         cx.run_until_parked();
+    }
+
+    fn redraw(cx: &mut VisualTestContext) {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.run_until_parked();
+    }
+
+    fn open_files(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) {
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_panel(RightPanel::Files, cx);
+        });
+        redraw(cx);
+    }
+
+    fn expanded(workspace: &Entity<Workspace>, index: usize, cx: &VisualTestContext) -> bool {
+        workspace.read_with(cx, |workspace, _| workspace.data.file_tree[index].expanded)
+    }
+
+    /// The role and value of an element, as the accessibility tree would hold them.
+    fn text_node(element: impl IntoElement) -> (Option<Role>, Option<String>, Option<Live>) {
+        use gpui::Element as _;
+
+        let element = element.into_element();
+        let mut node = gpui::accesskit::Node::new(Role::Unknown);
+
+        element.write_a11y_info(&mut node);
+
+        (
+            element.a11y_role(),
+            node.value().map(str::to_owned),
+            node.live(),
+        )
+    }
+
+    #[gpui::test]
+    fn the_files_tree_takes_one_tab_stop_and_names_it(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        open_files(&workspace, cx);
+
+        click("files-row-3", cx);
+        let root = workspace.read_with(cx, Workspace::focus_handle);
+
+        assert_eq!(focused_stop(cx, &root), "Tree Files");
+    }
+
+    #[gpui::test]
+    fn the_changes_tree_is_a_named_tab_stop(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        redraw(cx);
+        let list = workspace.read_with(cx, |workspace, _| workspace.changes_list.clone());
+        let handle = list.read_with(cx, |list, _| list.tree_focus().clone());
+        cx.update(|window, cx| window.focus(&handle, cx));
+        redraw(cx);
+        let root = workspace.read_with(cx, Workspace::focus_handle);
+
+        assert_eq!(focused_stop(cx, &root), "Tree Changed files");
+    }
+
+    #[gpui::test]
+    fn home_and_left_close_the_first_folder_of_the_files_tree(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        open_files(&workspace, cx);
+        click("files-row-3", cx);
+        assert!(expanded(&workspace, 0, cx));
+
+        cx.simulate_keystrokes("home");
+        cx.simulate_keystrokes("left");
+
+        assert!(!expanded(&workspace, 0, cx));
+    }
+
+    #[gpui::test]
+    fn end_then_left_then_right_opens_the_folder_above_the_last_row(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        open_files(&workspace, cx);
+        click("files-row-3", cx);
+        let last = workspace.read_with(cx, |workspace, _| workspace.data.file_tree.len() - 1);
+        let parent = workspace.read_with(cx, |workspace, _| {
+            let tree = &workspace.data.file_tree;
+
+            (0..last)
+                .rev()
+                .find(|index| tree[*index].is_dir && tree[*index].depth < tree[last].depth)
+        });
+        let parent = parent.expect("the last row has a folder above it");
+        assert!(!expanded(&workspace, parent, cx), "the sample closes it");
+
+        cx.simulate_keystrokes("end");
+        cx.simulate_keystrokes("left");
+        cx.simulate_keystrokes("right");
+
+        assert!(expanded(&workspace, parent, cx));
+    }
+
+    #[gpui::test]
+    fn enter_opens_a_closed_folder_of_the_files_tree(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        open_files(&workspace, cx);
+        click("files-row-14", cx);
+        assert!(expanded(&workspace, 14, cx), "the click opened it");
+
+        cx.simulate_keystrokes("enter");
+
+        assert!(!expanded(&workspace, 14, cx));
+    }
+
+    #[test]
+    fn a_files_key_with_nothing_to_show_does_nothing() {
+        assert_eq!(files_step(&[], &[], 0, FilesKey::Down), FilesMove::Stay);
+    }
+
+    #[test]
+    fn down_from_a_hidden_selection_lands_on_the_first_shown_row() {
+        let data = crate::model::FakeData::sample();
+        let rows = [4, 5];
+
+        assert_eq!(
+            files_step(&data.file_tree, &rows, 0, FilesKey::Down),
+            FilesMove::Select(4)
+        );
+        assert_eq!(
+            files_step(&data.file_tree, &rows, 0, FilesKey::Up),
+            FilesMove::Select(5)
+        );
+    }
+
+    #[test]
+    fn right_on_an_open_folder_moves_to_its_first_row() {
+        let data = crate::model::FakeData::sample();
+        let rows = visible_rows(&data.file_tree);
+
+        assert_eq!(
+            files_step(&data.file_tree, &rows, 0, FilesKey::Right),
+            FilesMove::Select(1)
+        );
+    }
+
+    #[gpui::test]
+    fn an_empty_state_is_a_status_with_its_text_as_the_value(cx: &mut TestAppContext) {
+        let (_workspace, cx) = setup(cx);
+
+        let status = cx.update(|window, cx| {
+            let region = empty_status("changes-empty", "No changes").render(window, cx);
+
+            text_node(region)
+        });
+
+        assert_eq!(
+            status,
+            (
+                Some(Role::Status),
+                Some("No changes".to_owned()),
+                Some(Live::Polite)
+            )
+        );
     }
 
     #[gpui::test]
