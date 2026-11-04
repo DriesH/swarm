@@ -157,7 +157,11 @@ esac
 
 step "Building the binaries for $TARGET (macOS $DEPLOYMENT_TARGET and later)"
 export MACOSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET"
-cargo build --release --locked --target "$TARGET" -p swarm_app -p swarm_daemon -p swarm_cli
+if [[ $adhoc -eq 1 ]]; then
+    cargo build --release --locked --target "$TARGET" -p swarm_app -p swarm_daemon -p swarm_cli
+else
+    SWARM_TEAM_ID="$TEAM_ID" cargo build --release --locked --target "$TARGET" -p swarm_app -p swarm_daemon -p swarm_cli
+fi
 built="$root/target/$TARGET/release"
 
 for binary in swarm-app swarm-daemon swarm; do

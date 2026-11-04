@@ -1,7 +1,8 @@
 //! One client: a reader thread (this one) handles requests in order, and a writer
 //! thread sends the queued frames, so a slow client never blocks a terminal.
 
-use std::io::{BufReader, BufWriter, ErrorKind, Write};
+use std::fmt::Write as _;
+use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
 use std::net::Shutdown;
 use std::os::fd::AsRawFd as _;
 use std::os::unix::net::UnixStream;
@@ -20,6 +21,7 @@ use swarm_protocol::{
 use swarm_term::TerminalInput;
 
 use crate::hub::{CREATE_HISTORY_LINES, ClientSink, Frame, Hub, QUEUE_FRAMES};
+use crate::peer_signature::{self, AuditToken};
 use crate::pull_requests::{self, NewRequest};
 use crate::usage::configured_command;
 use crate::{Services, comments, stats, tasks};
@@ -32,19 +34,25 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 const MAX_ANCESTORS: usize = 256;
 
 pub(crate) fn serve(services: &Arc<Services>, client: u64, mut stream: UnixStream) -> Result<()> {
-    if let Some(reason) = refusal(&stream) {
-        log::warn!("client {client} refused: {reason}");
-        write(
-            &mut stream,
-            &Event::Error {
-                call: None,
-                id: None,
-                message: reason,
-            },
-        )?;
+    let pinned = match admit(&stream) {
+        Ok(token) => token,
+        Err(reason) => {
+            log::warn!("client {client} refused: {reason}");
+            write(
+                &mut stream,
+                &Event::Error {
+                    call: None,
+                    id: None,
+                    message: reason,
+                },
+            )?;
 
-        return Ok(());
-    }
+            return Ok(());
+        }
+    };
+
+    let probe = stream.try_clone()?;
+    let token_now = || peer_signature::peer_audit_token(&probe);
 
     let (frames, queue) = flume::bounded::<Frame>(QUEUE_FRAMES);
 
@@ -57,16 +65,15 @@ pub(crate) fn serve(services: &Arc<Services>, client: u64, mut stream: UnixStrea
     let mut reader = BufReader::new(stream);
     let mut buffer = Vec::new();
 
-    if handshake(&sink, &mut reader, &mut buffer) {
+    if handshake(&sink, &mut reader, &mut buffer, &pinned, &token_now) {
         services.clients.add(&sink);
         services.usage.client_connected();
 
         loop {
-            match read::<Request>(&mut reader, &mut buffer) {
+            match read_pinned(&mut reader, &mut buffer, &pinned, &token_now) {
                 Ok(request) => handle(services, &sink, request),
-                Err(FrameError::Io(error)) if error.kind() == ErrorKind::UnexpectedEof => break,
                 Err(error) => {
-                    log::info!("client {client} ended: {error}");
+                    log_end(client, &error);
                     break;
                 }
             }
@@ -79,13 +86,50 @@ pub(crate) fn serve(services: &Arc<Services>, client: u64, mut stream: UnixStrea
     Ok(())
 }
 
-/// The first request must be a `Hello` with our version.
-fn handshake(sink: &ClientSink, reader: &mut BufReader<UnixStream>, buffer: &mut Vec<u8>) -> bool {
-    let reply = match read::<Request>(reader, buffer) {
-        Ok(Request::Hello { version }) if version == VERSION => Event::Hello {
-            version: VERSION,
-            pid: std::process::id(),
-        },
+/// Why a read from a pinned client ended.
+#[derive(Debug)]
+enum PinnedError {
+    Frame(FrameError),
+    /// A different process holds the client's end of the socket now.
+    TokenChanged,
+}
+
+/// Reads one request, then checks the peer's audit token is still the pinned one.
+/// `exec` and a handover of the socket both change the token.
+fn read_pinned(
+    reader: &mut impl Read,
+    buffer: &mut Vec<u8>,
+    pinned: &AuditToken,
+    token_now: &impl Fn() -> Option<AuditToken>,
+) -> Result<Request, PinnedError> {
+    let request = read::<Request>(reader, buffer).map_err(PinnedError::Frame)?;
+
+    match token_now() {
+        Some(token) if token == *pinned => Ok(request),
+        _ => Err(PinnedError::TokenChanged),
+    }
+}
+
+fn log_end(client: u64, error: &PinnedError) {
+    match error {
+        PinnedError::Frame(FrameError::Io(error)) if error.kind() == ErrorKind::UnexpectedEof => {}
+        PinnedError::Frame(error) => log::info!("client {client} ended: {error}"),
+        PinnedError::TokenChanged => {
+            log::warn!("client {client} closed: the connecting process changed");
+        }
+    }
+}
+
+/// The client must send `Hello` with our version, then answer our challenge with `Prove`.
+fn handshake(
+    sink: &ClientSink,
+    reader: &mut impl Read,
+    buffer: &mut Vec<u8>,
+    pinned: &AuditToken,
+    token_now: &impl Fn() -> Option<AuditToken>,
+) -> bool {
+    match read_pinned(reader, buffer, pinned, token_now) {
+        Ok(Request::Hello { version }) if version == VERSION => {}
         // Answer with our own Hello and close: only `Hello` decodes across versions.
         Ok(Request::Hello { version }) => {
             log::info!(
@@ -96,23 +140,75 @@ fn handshake(sink: &ClientSink, reader: &mut BufReader<UnixStream>, buffer: &mut
                 version: VERSION,
                 pid: std::process::id(),
             });
+
             return false;
         }
-        Ok(_) => Event::Error {
-            call: None,
-            id: None,
-            message: "the first request must be Hello".to_owned(),
-        },
+        Ok(_) => {
+            send_handshake_error(sink, "the first request must be Hello");
+
+            return false;
+        }
         Err(error) => {
-            log::info!("client {} left before saying hello: {error}", sink.id());
+            log_end(sink.id(), &error);
+
             return false;
         }
+    }
+
+    sink.send_event(&Event::Hello {
+        version: VERSION,
+        pid: std::process::id(),
+    });
+
+    let Some(nonce) = new_nonce() else {
+        log::error!("client {}: cannot make a challenge nonce", sink.id());
+        send_handshake_error(sink, "cannot make a challenge");
+
+        return false;
     };
+    sink.send_event(&Event::Challenge {
+        nonce: nonce.clone(),
+    });
 
-    let accepted = matches!(reply, Event::Hello { .. });
-    sink.send_event(&reply);
+    match read_pinned(reader, buffer, pinned, token_now) {
+        Ok(Request::Prove { nonce: answer }) if answer == nonce => true,
+        Ok(_) => {
+            send_handshake_error(sink, "the request after Hello must be Prove with the nonce");
 
-    accepted
+            false
+        }
+        Err(error) => {
+            log_end(sink.id(), &error);
+
+            false
+        }
+    }
+}
+
+fn send_handshake_error(sink: &ClientSink, message: &str) {
+    sink.send_event(&Event::Error {
+        call: None,
+        id: None,
+        message: message.to_owned(),
+    });
+}
+
+/// 32 random bytes as hex.
+fn new_nonce() -> Option<String> {
+    let mut bytes = [0_u8; 32];
+
+    // SAFETY: the pointer is valid for `bytes.len()` writable bytes, at most 256.
+    let result = unsafe { libc::getentropy(bytes.as_mut_ptr().cast(), bytes.len()) };
+    if result != 0 {
+        return None;
+    }
+
+    let mut nonce = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(nonce, "{byte:02x}").ok()?;
+    }
+
+    Some(nonce)
 }
 
 fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
@@ -123,6 +219,13 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
             sink.send_event(&Event::Hello {
                 version: VERSION,
                 pid: std::process::id(),
+            });
+        }
+        Request::Prove { .. } => {
+            sink.send_event(&Event::Error {
+                call: None,
+                id: None,
+                message: "Prove is only valid right after Hello".to_owned(),
             });
         }
         Request::List { call } => {
@@ -861,8 +964,27 @@ fn write_frames(queue: &flume::Receiver<Frame>, stream: UnixStream) {
     }
 }
 
-/// Why the peer must not talk to the daemon, if it must not (ADR 0008).
-fn refusal(stream: &UnixStream) -> Option<String> {
+/// The peer's audit token if it may talk to the daemon, else why not (ADR 0008).
+/// The caller pins the token for the life of the connection.
+fn admit(stream: &UnixStream) -> Result<AuditToken, String> {
+    let token = peer_signature::peer_audit_token(stream)
+        .ok_or_else(|| "cannot tell which process connected".to_owned())?;
+
+    match first_refusal(ancestry_refusal(stream), || peer_signature::refusal(&token)) {
+        Some(reason) => Err(reason),
+        None => Ok(token),
+    }
+}
+
+/// The ancestry refusal wins; the signature is only checked for a peer that passed it.
+fn first_refusal(
+    ancestry: Option<String>,
+    signature: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    ancestry.or_else(signature)
+}
+
+fn ancestry_refusal(stream: &UnixStream) -> Option<String> {
     let Some(peer) = peer_pid(stream) else {
         return Some("cannot tell which process connected".to_owned());
     };
@@ -945,7 +1067,10 @@ fn descends_from(pid: u32, ancestor: u32, parent_of: impl Fn(u32) -> Option<u32>
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use super::*;
 
@@ -985,5 +1110,203 @@ mod tests {
         let swapped = |pid| Some(if pid == 5 { 6 } else { 5 });
 
         assert_eq!(descends_from(5, 10, swapped), None);
+    }
+
+    #[test]
+    fn the_ancestry_refusal_wins_over_the_signature() {
+        let checked = Cell::new(false);
+
+        let refusal = first_refusal(Some("ancestry".to_owned()), || {
+            checked.set(true);
+            Some("signature".to_owned())
+        });
+
+        assert_eq!(
+            (refusal.as_deref(), checked.get()),
+            (Some("ancestry"), false)
+        );
+    }
+
+    #[test]
+    fn the_signature_refusal_applies_when_ancestry_passes() {
+        let refusal = first_refusal(None, || Some("signature".to_owned()));
+
+        assert_eq!(refusal.as_deref(), Some("signature"));
+    }
+
+    const PINNED: AuditToken = [1; 32];
+    const OTHER: AuditToken = [2; 32];
+    const WAIT: Duration = Duration::from_secs(5);
+
+    /// A handshake running on a thread against a client end the test holds.
+    struct Handshake {
+        client: UnixStream,
+        events: flume::Receiver<Frame>,
+        done: thread::JoinHandle<bool>,
+    }
+
+    impl Handshake {
+        /// `token_now` is called once per frame the daemon reads.
+        fn start(token_now: impl Fn() -> Option<AuditToken> + Send + 'static) -> Self {
+            let (client, server) = UnixStream::pair().expect("pair");
+            let (frames, events) = flume::bounded::<Frame>(16);
+
+            let done = thread::spawn(move || {
+                let sink = ClientSink::new(1, frames, None);
+                let mut reader = BufReader::new(server);
+
+                handshake(&sink, &mut reader, &mut Vec::new(), &PINNED, &token_now)
+            });
+
+            Self {
+                client,
+                events,
+                done,
+            }
+        }
+
+        fn send(&mut self, request: &Request) {
+            write(&mut self.client, request).expect("send");
+        }
+
+        fn next_event(&self) -> Event {
+            let frame = self.events.recv_timeout(WAIT).expect("an event");
+
+            read(&mut &frame[..], &mut Vec::new()).expect("decode")
+        }
+
+        fn nonce(&self) -> String {
+            assert!(matches!(self.next_event(), Event::Hello { .. }));
+
+            match self.next_event() {
+                Event::Challenge { nonce } => nonce,
+                other => panic!("expected a challenge, got {other:?}"),
+            }
+        }
+
+        fn finish(self) -> bool {
+            self.done.join().expect("handshake thread")
+        }
+    }
+
+    const SAME_TOKEN: fn() -> Option<AuditToken> = || Some(PINNED);
+
+    #[test]
+    fn the_right_nonce_is_served() {
+        let mut client = Handshake::start(SAME_TOKEN);
+        client.send(&Request::Hello { version: VERSION });
+
+        let nonce = client.nonce();
+        client.send(&Request::Prove { nonce });
+
+        assert!(client.finish());
+    }
+
+    #[test]
+    fn a_request_instead_of_prove_is_closed_with_an_error() {
+        let mut client = Handshake::start(SAME_TOKEN);
+        client.send(&Request::Hello { version: VERSION });
+        client.nonce();
+
+        client.send(&Request::List { call: CallId(1) });
+
+        assert!(matches!(client.next_event(), Event::Error { .. }));
+        assert!(!client.finish());
+    }
+
+    #[test]
+    fn a_wrong_nonce_is_closed_with_an_error() {
+        let mut client = Handshake::start(SAME_TOKEN);
+        client.send(&Request::Hello { version: VERSION });
+        client.nonce();
+
+        client.send(&Request::Prove {
+            nonce: "wrong".to_owned(),
+        });
+
+        assert!(matches!(client.next_event(), Event::Error { .. }));
+        assert!(!client.finish());
+    }
+
+    #[test]
+    fn a_token_that_changes_after_hello_closes_the_connection() {
+        let reads = AtomicUsize::new(0);
+        let mut client = Handshake::start(move || {
+            Some(if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                OTHER
+            } else {
+                PINNED
+            })
+        });
+
+        client.send(&Request::Hello { version: VERSION });
+
+        assert!(!client.finish());
+    }
+
+    #[test]
+    fn a_token_that_changes_after_the_proof_closes_the_connection() {
+        let reads = AtomicUsize::new(0);
+        let mut client = Handshake::start(move || {
+            Some(if reads.fetch_add(1, Ordering::SeqCst) < 1 {
+                PINNED
+            } else {
+                OTHER
+            })
+        });
+        client.send(&Request::Hello { version: VERSION });
+
+        let nonce = client.nonce();
+        client.send(&Request::Prove { nonce });
+
+        assert!(!client.finish());
+    }
+
+    #[test]
+    fn a_token_that_cannot_be_read_closes_the_connection() {
+        let mut client = Handshake::start(|| None);
+
+        client.send(&Request::Hello { version: VERSION });
+
+        assert!(!client.finish());
+    }
+
+    #[test]
+    fn a_pinned_read_returns_the_request_while_the_token_holds() {
+        let mut bytes = Vec::new();
+        write(&mut bytes, &Request::List { call: CallId(7) }).expect("encode");
+
+        let request = read_pinned(&mut &bytes[..], &mut Vec::new(), &PINNED, &SAME_TOKEN);
+
+        assert!(matches!(request, Ok(Request::List { call: CallId(7) })));
+    }
+
+    #[test]
+    fn a_pinned_read_fails_when_the_token_changed() {
+        let mut bytes = Vec::new();
+        write(&mut bytes, &Request::List { call: CallId(7) }).expect("encode");
+
+        let request = read_pinned(&mut &bytes[..], &mut Vec::new(), &PINNED, &|| Some(OTHER));
+
+        assert!(matches!(request, Err(PinnedError::TokenChanged)));
+    }
+
+    #[test]
+    fn a_pinned_read_fails_when_the_token_cannot_be_read() {
+        let mut bytes = Vec::new();
+        write(&mut bytes, &Request::List { call: CallId(7) }).expect("encode");
+
+        let request = read_pinned(&mut &bytes[..], &mut Vec::new(), &PINNED, &|| None);
+
+        assert!(matches!(request, Err(PinnedError::TokenChanged)));
+    }
+
+    #[test]
+    fn a_nonce_is_64_hex_characters_and_never_repeats() {
+        let first = new_nonce().expect("nonce");
+        let second = new_nonce().expect("nonce");
+
+        assert!(first.len() == 64 && first.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(first, second);
     }
 }

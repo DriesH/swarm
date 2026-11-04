@@ -2136,7 +2136,22 @@ pub(crate) mod tests {
                     },
                 )
                 .ok();
+                write(
+                    &mut writer,
+                    &Event::Challenge {
+                        nonce: "fake".to_owned(),
+                    },
+                )
+                .ok();
                 writer.flush().ok();
+
+                let proof: Result<Request, _> = read(&mut reader, &mut buffer);
+                assert_eq!(
+                    proof.ok(),
+                    Some(Request::Prove {
+                        nonce: "fake".to_owned()
+                    })
+                );
 
                 match leave {
                     Some(leaving) => {
@@ -2202,7 +2217,22 @@ pub(crate) mod tests {
                     },
                 )
                 .ok();
+                write(
+                    &mut writer,
+                    &Event::Challenge {
+                        nonce: "fake".to_owned(),
+                    },
+                )
+                .ok();
                 writer.flush().ok();
+
+                let proof: Result<Request, _> = read(&mut reader, &mut buffer);
+                assert_eq!(
+                    proof.ok(),
+                    Some(Request::Prove {
+                        nonce: "fake".to_owned()
+                    })
+                );
 
                 while let Ok(request) = read::<Request>(&mut reader, &mut buffer) {
                     let fallback = default_reply(&request);

@@ -11,10 +11,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use swarm_protocol::{
-    AgentChange, AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, Client,
-    ClientError, CreateTask, CreateTerminal, DiffStat, Event, FileStat, GridSize, MessageEvent,
-    MessageId, MessageInfo, MessageKind, PlanDraft, ProjectId, ProjectInfo, Request, TaskId,
-    TaskInfo, TerminalId, TerminalInfo, TerminalKind, VERSION, read, write,
+    AgentChange, AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, CallId,
+    Client, ClientError, CreateTask, CreateTerminal, DiffStat, Event, FileStat, GridSize,
+    MessageEvent, MessageId, MessageInfo, MessageKind, PlanDraft, ProjectId, ProjectInfo, Request,
+    TaskId, TaskInfo, TerminalId, TerminalInfo, TerminalKind, VERSION, read, write,
 };
 use swarm_term::{Palette, Rgb, Size, TerminalInput, TerminalOutput};
 
@@ -42,6 +42,23 @@ impl Fake {
     fn handshake(&mut self, version: u32) {
         assert_eq!(self.request(), Some(Request::Hello { version: VERSION }));
         self.send(&Event::Hello { version, pid: 1 });
+
+        if version == VERSION {
+            self.challenge("fake-nonce");
+        }
+    }
+
+    /// Sends a challenge and checks the client answers it with the same nonce.
+    fn challenge(&mut self, nonce: &str) {
+        self.send(&Event::Challenge {
+            nonce: nonce.to_owned(),
+        });
+        assert_eq!(
+            self.request(),
+            Some(Request::Prove {
+                nonce: nonce.to_owned()
+            })
+        );
     }
 
     /// Reads requests until the client hangs up.
@@ -139,6 +156,51 @@ fn connect_completes_the_handshake() {
     let client = Client::connect(&socket).expect("connect");
 
     assert!(client.is_connected());
+}
+
+#[test]
+fn connect_answers_the_challenge_with_its_nonce() {
+    let (proved, proof) = flume::bounded(1);
+    let socket = serve(move |fake| {
+        assert_eq!(fake.request(), Some(Request::Hello { version: VERSION }));
+        fake.send(&Event::Hello {
+            version: VERSION,
+            pid: 1,
+        });
+        fake.send(&Event::Challenge {
+            nonce: "abc123".to_owned(),
+        });
+
+        proved.send(fake.request()).expect("test is listening");
+        fake.drain();
+    });
+
+    let client = Client::connect(&socket).expect("connect");
+
+    assert_eq!(
+        proof.recv_timeout(WAIT).expect("the client answered"),
+        Some(Request::Prove {
+            nonce: "abc123".to_owned()
+        })
+    );
+    assert!(client.is_connected());
+}
+
+#[test]
+fn connect_fails_when_the_daemon_skips_the_challenge() {
+    let socket = serve(|fake| {
+        assert_eq!(fake.request(), Some(Request::Hello { version: VERSION }));
+        fake.send(&Event::Hello {
+            version: VERSION,
+            pid: 1,
+        });
+        fake.send(&Event::Done { call: CallId(1) });
+        fake.drain();
+    });
+
+    let result = Client::connect(&socket);
+
+    assert!(matches!(result, Err(ClientError::Daemon(_))));
 }
 
 #[test]

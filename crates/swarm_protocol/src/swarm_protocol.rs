@@ -20,7 +20,7 @@ mod client;
 pub use client::{Client, ClientError, CommentEvent, MessageEvent, PrEvent};
 
 /// Bumped on every incompatible change; the daemon refuses other versions.
-pub const VERSION: u32 = 21;
+pub const VERSION: u32 = 22;
 
 /// The most messages [`Request::ListMessages`] returns.
 pub const MESSAGES_LISTED: usize = 500;
@@ -1178,6 +1178,10 @@ pub enum Request {
         task: TaskId,
         confirmed: CloseCheck,
     },
+    /// The answer to [`Event::Challenge`]; it must be the client's frame after `Hello`.
+    Prove {
+        nonce: String,
+    },
 }
 
 /// Daemon → client. `Hello` stays first, as in [`Request`].
@@ -1362,6 +1366,11 @@ pub enum Event {
     PrStatus {
         call: CallId,
         pull_request: PullRequest,
+    },
+    /// Sent right after the daemon's `Hello`. The client's next frame must be
+    /// [`Request::Prove`] with the same `nonce`.
+    Challenge {
+        nonce: String,
     },
 }
 

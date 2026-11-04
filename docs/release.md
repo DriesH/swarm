@@ -33,7 +33,7 @@ The output goes to a new folder, `target/bundle/<version>-<UTC time>/`. The scri
 
 ## What the script does
 
-1. Builds `swarm-app`, `swarm-daemon` and `swarm` in release mode for `aarch64-apple-darwin`, with `MACOSX_DEPLOYMENT_TARGET=13.0`. It stops when a binary targets another macOS or links a library the bundle does not carry.
+1. Builds `swarm-app`, `swarm-daemon` and `swarm` in release mode for `aarch64-apple-darwin`, with `MACOSX_DEPLOYMENT_TARGET=13.0`. A build that is not ad hoc also sets `SWARM_TEAM_ID`, so the daemon knows its team and never skips the app socket check (ADR 0008). It stops when a binary targets another macOS or links a library the bundle does not carry.
 2. Makes `Swarm.app` from `crates/swarm_app/resources/Info.plist`: the three binaries in `Contents/MacOS/`, and `Swarm.icns` in `Contents/Resources/`. The app starts `swarm-daemon` from its own folder, and the daemon finds `swarm` next to itself.
 3. Draws the icon with `crates/app_icon` and turns it into `Swarm.icns` with `iconutil`.
 4. Signs from the inside out, each with the hardened runtime and (not ad hoc) a secure timestamp: `swarm-daemon` as `com.swarm.app.daemon`, `swarm` as `com.swarm.app.cli`, then the app as `com.swarm.app`. Then `codesign --verify --strict --deep`.
@@ -52,6 +52,11 @@ spctl --assess --type open --context context:primary-signature -vv Swarm.dmg
 
 - `codesign -dv` shows the identifier (`com.swarm.app`, `.daemon` or `.cli`), the team, and `flags=0x10000(runtime)`. An ad hoc build shows `flags=0x10002(adhoc,runtime)`.
 - `spctl` says `accepted` with `source=Notarized Developer ID`.
+
+Then start the signed app and make sure that the daemon accepts it. The daemon log shows no "refused" line for the app. These checks need a signed build, because tests run unsigned:
+
+- The app connects and shows its projects.
+- `--identity` with an Apple Development certificate gives an app that the daemon refuses. The app socket accepts Developer ID only.
 
 ## Entitlements
 
@@ -76,7 +81,6 @@ cargo run -p app_icon -- --png assets/app-icon/icon-1024.png
 
 - Apple Silicon only. There is no Intel or universal build.
 - No updates yet.
-- The daemon's app socket does not check the caller's code signature yet (ADR 0008).
 - No test on a clean Mac yet.
 - A Finder launch gives the app a short `PATH`. Besides `PATH`, Swarm looks for agents and `gh` only in `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin` and `~/.claude/local`. A tool in another folder, such as one of a version manager, is not found. Not tried yet on a Finder launch.
 - `CFBundleVersion` is the same as the version until updates need a build number.

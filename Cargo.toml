@@ -38,6 +38,8 @@ swarm_usage = { path = "crates/swarm_usage" }
 
 anyhow = "1"
 clap = { version = "4.6", features = ["derive"] }
+# Same version gpui uses, so it is built once.
+core-foundation = "0.10"
 env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
 flume = "0.12"
 image = { version = "0.25", default-features = false, features = ["png"] }
@@ -52,6 +54,8 @@ postcard = { version = "1.1", features = ["use-std"] }
 pulldown-cmark = { version = "0.13.6", default-features = false }
 # Bundled: SQLite builds from source, so every Mac gets the same version (ADR 0005).
 rusqlite = { version = "0.41", features = ["bundled"] }
+# System Security.framework: the daemon checks the app's code signature (ADR 0008).
+security-framework = { version = "3.7", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
