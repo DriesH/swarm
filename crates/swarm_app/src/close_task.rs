@@ -7,6 +7,7 @@ use gpui::{
 use swarm_protocol::{ClientError, CloseCheck};
 use swarm_ui::prelude::*;
 
+use crate::announce::announce;
 use crate::model::TaskId;
 use crate::palette::Overlay;
 use crate::review_model::plural;
@@ -147,6 +148,24 @@ impl CloseTaskDialog {
         self.error.as_deref()
     }
 
+    /// Speaks "Checking" while the check runs. The focused Close button says the closing.
+    fn status_region(&self) -> LiveRegion {
+        let checking = !self.busy && matches!(self.check, CheckState::Checking);
+        let value = if checking { "Checking" } else { "" };
+
+        LiveRegion::status("close-task-status", value)
+    }
+
+    /// Speaks a failed check or a task that did not close.
+    fn alert_region(&self) -> LiveRegion {
+        let message = match (&self.error, &self.check) {
+            (Some(message), _) | (None, CheckState::Failed(message)) => message.clone(),
+            _ => SharedString::default(),
+        };
+
+        LiveRegion::alert("close-task-alert", message)
+    }
+
     fn can_confirm(&self) -> bool {
         !self.busy && matches!(self.check, CheckState::Ready(_))
     }
@@ -205,17 +224,11 @@ impl Render for CloseTaskDialog {
         }
 
         let body = match &self.check {
-            CheckState::Checking => div()
-                .id("close-task-checking")
-                .role(Role::Status)
-                .aria_label("Checking")
-                .child(Label::new("Checking").color(Color::Faint))
+            CheckState::Checking => Label::new("Checking")
+                .color(Color::Faint)
                 .into_any_element(),
-            CheckState::Failed(message) => div()
-                .id("close-task-check-error")
-                .role(Role::Alert)
-                .aria_label(message.clone())
-                .child(Label::new(message.clone()).color(Color::Del))
+            CheckState::Failed(message) => Label::new(message.clone())
+                .color(Color::Del)
                 .into_any_element(),
             CheckState::Ready(_) => v_flex()
                 .id("close-task-lines")
@@ -237,15 +250,10 @@ impl Render for CloseTaskDialog {
                 .into_any_element(),
         };
 
-        let error = self.error.clone().map(|message| {
-            div()
-                .id("close-task-error")
-                .role(Role::Alert)
-                .aria_label(message.clone())
-                .text_size(px(12.))
-                .text_color(Color::Del.hsla(cx))
-                .child(message)
-        });
+        let error = self
+            .error
+            .clone()
+            .map(|message| Label::new(message).size(LabelSize::Small).color(Color::Del));
 
         let (confirm_label, accessible_label) = if busy {
             ("Closing\u{2026}", format!("Closing task {}", self.name))
@@ -289,6 +297,8 @@ impl Render for CloseTaskDialog {
         })
         .child(body)
         .children(error)
+        .child(announce("close-task-alert", self.alert_region()))
+        .child(announce("close-task-status", self.status_region()))
         .footer(footer)
     }
 }
@@ -448,6 +458,8 @@ mod tests {
 
     use super::*;
     use crate::daemon::tests::{redraw, setup};
+    use crate::live_probe::{Seen, assert_named, is_quiet, reversed, see_in};
+    use swarm_ui::test_support::tab_walk;
 
     fn open_dialog(
         workspace: &Entity<Workspace>,
@@ -465,6 +477,71 @@ mod tests {
         })
     }
 
+    fn spoken(
+        view: &Entity<CloseTaskDialog>,
+        region: fn(&CloseTaskDialog) -> LiveRegion,
+        cx: &mut VisualTestContext,
+    ) -> Seen {
+        let region = view.read_with(cx, |dialog, _| region(dialog));
+
+        see_in(region, cx)
+    }
+
+    #[gpui::test]
+    fn the_dialog_draws_the_regions_that_speak_its_state(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let _view = open_dialog(&workspace, cx);
+
+        assert!(cx.debug_bounds("close-task-alert").is_some());
+        assert!(cx.debug_bounds("close-task-status").is_some());
+    }
+
+    #[gpui::test]
+    fn the_check_is_spoken_politely_until_it_is_ready(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let view = open_dialog(&workspace, cx);
+
+        view.update(cx, |dialog, cx| dialog.set_check(CheckState::Checking, cx));
+        let checking = spoken(&view, CloseTaskDialog::status_region, cx);
+        view.update(cx, |dialog, cx| {
+            dialog.set_check(CheckState::Ready(CloseCheck::default()), cx);
+        });
+        let ready = spoken(&view, CloseTaskDialog::status_region, cx);
+
+        assert_eq!(checking.value.as_deref(), Some("Checking"));
+        assert_eq!(checking.live, Some(Live::Polite));
+        assert!(is_quiet(&ready));
+    }
+
+    #[gpui::test]
+    fn closing_is_spoken_by_the_button_and_not_the_status(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let view = open_dialog(&workspace, cx);
+
+        view.update(cx, CloseTaskDialog::set_busy);
+        let busy = spoken(&view, CloseTaskDialog::status_region, cx);
+
+        assert!(is_quiet(&busy));
+        assert_eq!(busy.live, Some(Live::Polite));
+    }
+
+    #[gpui::test]
+    fn a_failed_check_and_a_failed_close_are_alerts(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let view = open_dialog(&workspace, cx);
+
+        view.update(cx, |dialog, cx| {
+            dialog.set_check(CheckState::Failed("No daemon".into()), cx);
+        });
+        let check = spoken(&view, CloseTaskDialog::alert_region, cx);
+        view.update(cx, |dialog, cx| dialog.fail("Cannot close".into(), cx));
+        let close = spoken(&view, CloseTaskDialog::alert_region, cx);
+
+        assert_eq!(check.value.as_deref(), Some("No daemon"));
+        assert_eq!(check.live, Some(Live::Assertive));
+        assert_eq!(close.value.as_deref(), Some("Cannot close"));
+    }
+
     #[gpui::test]
     fn focus_moves_to_cancel_when_a_new_check_disables_close(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
@@ -479,6 +556,29 @@ mod tests {
         cx.simulate_keystrokes("escape");
         let closed = workspace.read_with(cx, |workspace, _| workspace.overlay.is_none());
         assert!(closed, "Escape still closes");
+    }
+
+    #[gpui::test]
+    fn tab_walks_the_dialog_in_order_and_never_leaves_it(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let view = open_dialog(&workspace, cx);
+        let root = view.read_with(cx, |dialog, _| dialog.focus_handle.clone());
+        let (_, cancel) = view.read_with(cx, |dialog, _| dialog.focus_handles());
+        cx.update(|window, cx| window.focus(&cancel, cx));
+
+        let forward = tab_walk(cx, &root, "tab");
+        let backward = tab_walk(cx, &root, "shift-tab");
+
+        assert_eq!(
+            forward,
+            [
+                "Button Cancel",
+                "Button Close task terminal-renderer",
+                "Button Close dialog",
+            ]
+        );
+        assert_eq!(backward, reversed(&forward));
+        assert_named(&forward);
     }
 
     #[gpui::test]

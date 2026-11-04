@@ -125,15 +125,18 @@ pub(crate) fn render(
                         mono,
                     ))
                 })
-                .child(
-                    Label::new("permissions skipped")
-                        .mono()
-                        .size(LabelSize::XSmall)
-                        .color(Color::Warn),
-                )
+                .child(permissions_note())
                 .child(mono("⌘K".into())),
         )
         .into_any_element()
+}
+
+fn permissions_note() -> Label {
+    Label::new("permissions skipped")
+        .accessible("permissions-skipped")
+        .mono()
+        .size(LabelSize::XSmall)
+        .color(Color::Warn)
 }
 
 fn count(number: usize, one: &str, many: &str) -> SharedString {
@@ -238,14 +241,21 @@ fn tray(
         .child(measure)
 }
 
+/// The "+N" chip, which says whether its menu is open.
+fn more_trigger(count: usize, open: bool) -> TrayMore {
+    TrayMore::new("tray-more-chip", count)
+        .expanded(open)
+        .debug_selector(|| "tray-more".to_owned())
+}
+
 /// "+N": a menu of the tiles that did not fit, each one restored and focused when picked.
 fn more_chip(hidden: Vec<TrayEntry>, cx: &mut Context<Workspace>) -> PopoverMenu {
     let count = hidden.len();
     let workspace = cx.entity();
 
-    PopoverMenu::new(
+    PopoverMenu::with_trigger(
         "tray-more",
-        TrayMore::new("tray-more-chip", count).debug_selector(|| "tray-more".to_owned()),
+        move |open| more_trigger(count, open),
         move |_, _| {
             hidden
                 .iter()
@@ -426,6 +436,36 @@ mod tests {
 
         assert_eq!(role, Some(Role::Toolbar));
         assert_eq!(label.as_deref(), Some("Tray"));
+    }
+
+    #[gpui::test]
+    fn permissions_skipped_is_a_label_with_its_text_as_value(cx: &mut TestAppContext) {
+        let (_, cx) = setup(cx);
+
+        let seen = crate::live_probe::see_label_in(permissions_note(), cx);
+
+        assert_eq!(seen.role, Some(Role::Label));
+        assert_eq!(seen.value.as_deref(), Some("permissions skipped"));
+    }
+
+    #[gpui::test]
+    fn the_more_chip_says_whether_its_menu_is_open(cx: &mut TestAppContext) {
+        use gpui::{Element as _, RenderOnce as _};
+
+        let (_, cx) = setup(cx);
+
+        let expanded = |open: bool, cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                let element = more_trigger(3, open).render(window, cx).into_element();
+                let mut node = gpui::accesskit::Node::new(Role::Unknown);
+                element.write_a11y_info(&mut node);
+
+                node.is_expanded()
+            })
+        };
+
+        assert_eq!(expanded(false, cx), Some(false));
+        assert_eq!(expanded(true, cx), Some(true));
     }
 
     fn more(_: usize) -> f32 {

@@ -7,6 +7,7 @@
 )]
 
 mod actions;
+mod announce;
 mod app_menus;
 mod close_task;
 mod close_terminal;
@@ -40,6 +41,9 @@ mod views;
 mod welcome;
 mod window_drag;
 mod workspace;
+
+#[cfg(test)]
+mod live_probe;
 
 #[cfg(any(feature = "snapshot", feature = "frame-stats"))]
 mod demo;

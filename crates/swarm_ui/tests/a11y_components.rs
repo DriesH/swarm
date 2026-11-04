@@ -1,11 +1,12 @@
 //! Accessibility checks for Button, Kbd, Stepper, Dropdown, `PopoverMenu`, the tray chips and
 //! `UsageMeter` and `UsageDetailMeter`.
 
-use gpui::accesskit::{Action, Node, Role, Toggled};
+use gpui::accesskit::{Action, Node, Orientation, Role, Toggled};
 use gpui::{
     App, Context, Element as _, Render, RenderOnce, TestAppContext, VisualTestContext, Window, div,
     px,
 };
+use swarm_ui::ResizeAxis;
 use swarm_ui::prelude::*;
 
 struct A11yInfo {
@@ -365,6 +366,35 @@ fn tray_more_chip_says_how_many_tiles_it_stands_for() {
         assert_eq!(four.role, Some(Role::Button));
         assert_eq!(four.node.label(), Some("4 more tiles"));
         assert_eq!(one.node.label(), Some("1 more tile"));
+    });
+}
+
+#[test]
+fn tray_more_chip_reports_whether_its_menu_is_open() {
+    with_window(|window, cx| {
+        let open = a11y_info(TrayMore::new("open", 4).expanded(true), window, cx);
+        let closed = a11y_info(TrayMore::new("closed", 4).expanded(false), window, cx);
+        let plain = a11y_info(TrayMore::new("plain", 4), window, cx);
+
+        assert_eq!(open.node.is_expanded(), Some(true));
+        assert_eq!(closed.node.is_expanded(), Some(false));
+        assert_eq!(plain.node.is_expanded(), None);
+    });
+}
+
+#[test]
+fn a_resize_handle_reports_the_orientation_of_its_axis() {
+    with_window(|window, cx| {
+        let focus = cx.focus_handle();
+        let horizontal = a11y_info(ResizeHandle::new("h", "Resize", &focus), window, cx);
+        let vertical = a11y_info(
+            ResizeHandle::new("v", "Resize", &focus).axis(ResizeAxis::Vertical),
+            window,
+            cx,
+        );
+
+        assert_eq!(horizontal.node.orientation(), Some(Orientation::Vertical));
+        assert_eq!(vertical.node.orientation(), Some(Orientation::Horizontal));
     });
 }
 

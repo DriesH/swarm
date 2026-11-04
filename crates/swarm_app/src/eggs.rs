@@ -464,13 +464,29 @@ impl Workspace {
     }
 
     fn toast_element(toast: &HoneyToast, cx: &mut Context<Self>) -> AnyElement {
+        let element = Self::honey_toast(toast, cx);
+
+        // First in Tab order, so a keyboard user reaches the toast before it times out.
+        div()
+            .id("toast-slot")
+            .tab_group()
+            .tab_index(-1)
+            .tab_stop(false)
+            .absolute()
+            .right(px(TOAST_RIGHT))
+            .bottom(px(TOAST_BOTTOM))
+            .child(element)
+            .into_any_element()
+    }
+
+    fn honey_toast(toast: &HoneyToast, cx: &mut Context<Self>) -> Toast {
         let workspace = cx.weak_entity();
         let dismissed = workspace.clone();
         let hover_target = workspace.clone();
         let serial = toast.serial;
         let decorated = settings::easter_eggs(cx);
 
-        let element = Toast::new(
+        Toast::new(
             ("honey-toast", toast.serial),
             toast.task.clone(),
             "Ready for review",
@@ -513,19 +529,7 @@ impl Workspace {
                 |workspace, cx| workspace.dismiss_toast(Some(window), cx),
                 cx,
             );
-        });
-
-        // First in Tab order, so a keyboard user reaches the toast before it times out.
-        div()
-            .id("toast-slot")
-            .tab_group()
-            .tab_index(-1)
-            .tab_stop(false)
-            .absolute()
-            .right(px(TOAST_RIGHT))
-            .bottom(px(TOAST_BOTTOM))
-            .child(element)
-            .into_any_element()
+        })
     }
 }
 
@@ -758,6 +762,33 @@ mod tests {
         assert_eq!(task.as_deref(), Some("signup"));
     }
 
+    #[gpui::test]
+    fn the_toast_is_a_polite_status_that_reads_its_text(cx: &mut TestAppContext) {
+        let (workspace, cx) = open_projects(cx);
+        receive(
+            &workspace,
+            &notice(NoticeKind::ReadyForReview, 5, Some(7)),
+            cx,
+        );
+
+        let toast = workspace.update(cx, |workspace, cx| {
+            let toast = workspace.eggs.toast.take().expect("a toast");
+            let element = Workspace::honey_toast(&toast, cx);
+            workspace.eggs.toast = Some(toast);
+
+            element
+        });
+        let seen = crate::live_probe::see_in(toast, cx);
+
+        assert_eq!(seen.role, Some(gpui::accesskit::Role::Status));
+        assert_eq!(seen.live, Some(Live::Polite));
+        assert!(
+            seen.value
+                .as_deref()
+                .is_some_and(|value| value.contains("login"))
+        );
+    }
+
     fn focus_is_on_the_workspace(
         workspace: &gpui::Entity<Workspace>,
         cx: &mut VisualTestContext,
@@ -907,6 +938,7 @@ mod tests {
         tab_into_the_toast(&workspace, cx);
         workspace.update(cx, |workspace, _| {
             workspace.project_focus.remove(&ModelProjectId(3));
+            workspace.project_roving = swarm_ui::roving::RovingFocus::new(gpui::Axis::Vertical);
         });
 
         workspace.update_in(cx, |workspace, window, cx| {

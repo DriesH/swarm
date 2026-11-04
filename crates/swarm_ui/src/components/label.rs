@@ -1,6 +1,5 @@
 use gpui::{
-    AnyElement, App, ElementId, FontWeight, Pixels, Role, SharedString, Text, Window, div, px,
-    relative,
+    AnyElement, App, ElementId, FontWeight, Pixels, Role, SharedString, Window, div, px, relative,
 };
 
 use crate::component::{Component, example, example_group};
@@ -76,15 +75,6 @@ impl Label {
         self
     }
 
-    /// The text node [`Self::accessible`] adds. Public so tests can read it.
-    #[doc(hidden)]
-    pub fn text_node(&self) -> Option<Text> {
-        match &self.node {
-            Node::Text(id) => Some(Text::new(id.clone(), self.text.clone())),
-            Node::None | Node::Heading(..) => None,
-        }
-    }
-
     /// Makes the text a heading of `level` (1 is the highest).
     pub fn heading(mut self, id: impl Into<ElementId>, level: usize) -> Self {
         self.node = Node::Heading(id.into(), level);
@@ -127,8 +117,6 @@ impl Label {
 
 impl RenderOnce for Label {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let text_node = self.text_node();
-
         let base = div()
             .font_family(if self.mono { MONO_FONT } else { UI_FONT })
             .text_size(self.size.pixels())
@@ -140,7 +128,12 @@ impl RenderOnce for Label {
 
         match self.node {
             Node::None => base.child(self.text).into_any_element(),
-            Node::Text(_) => base.children(text_node).into_any_element(),
+            Node::Text(id) => base
+                .id(id)
+                .role(Role::Label)
+                .aria_value(self.text.clone())
+                .child(self.text)
+                .into_any_element(),
             Node::Heading(id, level) => base
                 .id(id)
                 .role(Role::Heading)

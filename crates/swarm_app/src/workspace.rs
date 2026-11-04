@@ -5,13 +5,14 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyWindowHandle, AppContext as _, Bounds, Context, Div, Entity, FocusHandle, Focusable, Hsla,
-    Pixels, Point, Role, SharedString, Size, Stateful, Subscription, Window, div, ease_out_quint,
-    point, px,
+    AnyWindowHandle, AppContext as _, Axis, Bounds, Context, Div, ElementId, Entity, FocusHandle,
+    Focusable, Hsla, Pixels, Point, Role, SharedString, Size, Stateful, Subscription, Window, div,
+    ease_out_quint, point, px,
 };
 use swarm_protocol::{Client, ReviewSource};
 use swarm_ui::fonts::UI_FONT;
 use swarm_ui::prelude::*;
+use swarm_ui::roving::RovingFocus;
 
 use crate::actions::{
     About, AddProject, CloseTask, CreatePullRequest, FocusAgent, NewTask, NewTerminal,
@@ -226,8 +227,15 @@ pub(crate) struct Workspace {
     /// become the focused one, so a tile that waits in the tray keeps its place.
     focus_landed: bool,
     pub(crate) terminal_focus: HashMap<TerminalId, FocusHandle>,
+    /// The focus of the resize handle under each user terminal.
+    pub(crate) resize_focus: HashMap<TerminalId, FocusHandle>,
     /// The focus of each project row in the sidebar.
     pub(crate) project_focus: HashMap<ProjectId, FocusHandle>,
+    /// One Tab stop for the project list, arrow keys inside it. It owns the handles of
+    /// `project_focus`.
+    pub(crate) project_roving: RovingFocus,
+    /// The same for the agent list below the projects.
+    pub(crate) agent_roving: RovingFocus,
     pub(crate) overlay: Option<Overlay>,
     pub(crate) terminal_area: Option<Bounds<Pixels>>,
     /// True when the right panel was shown as `terminal_area` was measured.
@@ -420,7 +428,10 @@ impl Workspace {
             pending_focus: None,
             focus_landed: false,
             terminal_focus: HashMap::new(),
+            resize_focus: HashMap::new(),
             project_focus: HashMap::new(),
+            project_roving: RovingFocus::new(Axis::Vertical),
+            agent_roving: RovingFocus::new(Axis::Vertical),
             overlay: None,
             terminal_area: None,
             terminal_area_had_panel: false,
@@ -520,15 +531,11 @@ impl Workspace {
     }
 
     /// Where focus goes when a control of the sidebar is gone: the Add project button when
-    /// there is no project, else the row of the open project, which shows a focus ring, else
-    /// the sidebar itself.
-    fn sidebar_landing(&self, sidebar: FocusHandle) -> FocusHandle {
+    /// there is no project, else the row of the open project (its rail button when the sidebar
+    /// is collapsed), which shows a focus ring, else the sidebar itself.
+    pub(crate) fn sidebar_landing(&self, sidebar: FocusHandle) -> FocusHandle {
         if self.has_no_projects() {
             return self.add_project_focus.clone();
-        }
-
-        if self.sidebar_collapsed {
-            return sidebar;
         }
 
         self.project_focus
@@ -896,13 +903,30 @@ impl Workspace {
             .clone()
     }
 
-    /// Makes the focus handle of each project row. They are tab stops, like the rows.
-    fn ensure_project_focus(&mut self, cx: &mut Context<Self>) {
-        for project in &self.data.projects {
-            self.project_focus
-                .entry(project.id)
-                .or_insert_with(|| cx.focus_handle().tab_stop(true));
-        }
+    /// Syncs the roving focus of the two sidebar lists with their rows, and keeps
+    /// `project_focus` pointing at the project handles. A row focused by a click becomes the
+    /// Tab stop of its list.
+    fn ensure_project_focus(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let keys: Vec<ElementId> = self
+            .data
+            .projects
+            .iter()
+            .map(|project| ElementId::from(("project", project.id.0 as usize)))
+            .collect();
+        self.project_roving.sync_keyed(&keys, cx);
+
+        self.project_focus = self
+            .data
+            .projects
+            .iter()
+            .enumerate()
+            .map(|(index, project)| (project.id, self.project_roving.handle(index)))
+            .collect();
+
+        self.agent_roving.sync_keyed(&sidebar::row_keys(self), cx);
+
+        self.project_roving.follow_focus(window, cx);
+        self.agent_roving.follow_focus(window, cx);
     }
 
     fn ensure_focus_handles(&mut self, cx: &mut Context<Self>) {
@@ -918,6 +942,13 @@ impl Workspace {
 
         for terminal in terminals {
             self.terminal_focus_handle(terminal, cx);
+        }
+
+        let users = self.active_task().user_terminals.clone();
+        for terminal in users {
+            self.resize_focus
+                .entry(terminal)
+                .or_insert_with(|| cx.focus_handle().tab_stop(true));
         }
     }
 
@@ -1344,7 +1375,7 @@ impl Render for Workspace {
         self.apply_pending_review_focus(window, cx);
         self.apply_pending_pr_focus(window, cx);
         self.ensure_focus_handles(cx);
-        self.ensure_project_focus(cx);
+        self.ensure_project_focus(window, cx);
 
         if self.view == View::Swarm {
             self.ensure_swarm_handles(cx);
@@ -2680,5 +2711,113 @@ mod tests {
         assert_eq!(after.len(), 1, "after the motion: {after:?}");
         assert_ne!(before.last(), after.last(), "the grid did not change");
         assert!(settled.is_empty(), "resized again: {settled:?}");
+    }
+
+    mod tab_walk {
+        use swarm_ui::test_support::tab_walk;
+
+        use super::*;
+        use crate::live_probe::{assert_named, reversed};
+
+        fn setup(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
+            cx.update(|cx| {
+                swarm_ui::init(cx);
+                actions::bind_keys(cx);
+                follow_test_reduce_motion(true, cx);
+            });
+
+            cx.add_window_view(Workspace::with_sample)
+        }
+
+        const OPEN: [&str; 24] = [
+            "Button Toggle sidebar",
+            "Tab terminal-renderer, Working",
+            "Button New tab",
+            "RadioButton Terminals",
+            "Button Files",
+            "Button Changes, 2623 additions, 394 deletions",
+            "Button Search",
+            "Button Add project",
+            "ListItem swarm, 3 tasks, needs you",
+            "ListItem orchestrator, Claude Code, working",
+            "TextInput Message the orchestrator",
+            "Group term-render terminal",
+            "Button Move term-render to tray",
+            "Group pty-io terminal",
+            "Button Move pty-io to tray",
+            "Button Review",
+            "Tree Changed files",
+            "Button Show ui-tokens, done",
+            "Button Show bench, idle",
+            "Button Show cargo test, working",
+            "Button Show pnpm dev, working",
+            "Button Show cargo test -p swarm-term --watch, working",
+            "Button Show cargo build -p swarm-term, done",
+            "Button Terminal",
+        ];
+
+        const COLLAPSED: [&str; 24] = [
+            "Button Toggle sidebar",
+            "Tab terminal-renderer, Working",
+            "Button New tab",
+            "RadioButton Terminals",
+            "Button Files",
+            "Button Changes, 2623 additions, 394 deletions",
+            "Button Search",
+            "Button swarm, 3 tasks, needs you",
+            "Button Add project",
+            "Button orchestrator, Claude Code, working",
+            "TextInput Message the orchestrator",
+            "Group term-render terminal",
+            "Button Move term-render to tray",
+            "Group pty-io terminal",
+            "Button Move pty-io to tray",
+            "Button Review",
+            "Tree Changed files",
+            "Button Show ui-tokens, done",
+            "Button Show bench, idle",
+            "Button Show cargo test, working",
+            "Button Show pnpm dev, working",
+            "Button Show cargo test -p swarm-term --watch, working",
+            "Button Show cargo build -p swarm-term, done",
+            "Button Terminal",
+        ];
+
+        /// Presses Tab once, so focus is on the first stop, then walks the whole window.
+        fn walks(
+            workspace: &Entity<Workspace>,
+            cx: &mut VisualTestContext,
+        ) -> (Vec<String>, Vec<String>) {
+            redraw(cx);
+            let root = workspace.read_with(cx, |workspace, _| workspace.focus_handle.clone());
+            cx.update(|window, cx| window.focus(&root, cx));
+            cx.simulate_keystrokes("tab");
+
+            let forward = tab_walk(cx, &root, "tab");
+            let backward = tab_walk(cx, &root, "shift-tab");
+
+            (forward, backward)
+        }
+
+        #[gpui::test]
+        fn the_main_window_tab_order_with_the_sidebar_open(cx: &mut TestAppContext) {
+            let (workspace, cx) = setup(cx);
+            let (forward, backward) = walks(&workspace, cx);
+
+            assert_named(&forward);
+            assert_eq!(forward, OPEN);
+            assert_eq!(backward, reversed(&forward));
+        }
+
+        #[gpui::test]
+        fn the_main_window_tab_order_with_the_sidebar_collapsed(cx: &mut TestAppContext) {
+            let (workspace, cx) = setup(cx);
+            workspace.update_in(cx, Workspace::toggle_sidebar);
+            let (forward, backward) = walks(&workspace, cx);
+
+            assert_named(&forward);
+            assert_eq!(forward, COLLAPSED);
+            assert_eq!(backward, reversed(&forward));
+        }
     }
 }

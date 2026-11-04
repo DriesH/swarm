@@ -5,6 +5,7 @@ use gpui::{
     Orientation, Render, Role, SharedString, Stateful, Window, div, px,
 };
 
+use crate::a11y::accessible;
 use crate::component::{Component, example, example_group};
 use crate::prelude::*;
 
@@ -13,6 +14,9 @@ type ResetHandler = Rc<dyn Fn(&mut Window, &mut App) + 'static>;
 type NudgeHandler = Rc<dyn Fn(Nudge, &mut Window, &mut App) + 'static>;
 
 /// How a key moves the border: an arrow key a step, Home and End to the limits.
+///
+/// On a vertical handle ([`ResizeAxis::Vertical`]) `Left` is the Up key and `Right` the
+/// Down key: the start and the end of the axis.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Nudge {
     Left,
@@ -23,14 +27,26 @@ pub enum Nudge {
     Largest,
 }
 
-/// A vertical drag handle on the left border of a panel. Its parent must be positioned
-/// (`relative`). The hit area is 8 px wide and centered on the border.
+/// The direction a handle moves its border.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ResizeAxis {
+    /// The handle sits on a left border and moves left and right.
+    #[default]
+    Horizontal,
+    /// The handle sits on a top border and moves up and down.
+    Vertical,
+}
+
+/// A drag handle on the left border of a panel, or on the top border with
+/// [`ResizeAxis::Vertical`]. Its parent must be positioned (`relative`). The hit area is
+/// 8 px thick and centered on the border.
 #[derive(IntoElement)]
 #[must_use]
 pub struct ResizeHandle {
     id: ElementId,
     label: SharedString,
     focus_handle: FocusHandle,
+    axis: ResizeAxis,
     value: f32,
     range: (f32, f32),
     dragging: bool,
@@ -49,6 +65,7 @@ impl ResizeHandle {
             id: id.into(),
             label: label.into(),
             focus_handle: focus_handle.clone(),
+            axis: ResizeAxis::default(),
             value: 0.,
             range: (0., 0.),
             dragging: false,
@@ -56,6 +73,12 @@ impl ResizeHandle {
             on_reset: None,
             on_nudge: None,
         }
+    }
+
+    /// The direction the handle moves. Left and right by default.
+    pub fn axis(mut self, axis: ResizeAxis) -> Self {
+        self.axis = axis;
+        self
     }
 
     /// The size the handle sets, in pixels, with its smallest and largest value.
@@ -114,31 +137,51 @@ impl RenderOnce for ResizeHandle {
         let focused = self.focus_handle.is_focused(window);
         let thick = self.dragging || focused;
         let group: SharedString = "resize-handle".into();
+        let axis = self.axis;
+        let line_offset = px(if thick { 3. } else { 4. });
+        let line_thickness = px(if thick { 3. } else { 1. });
 
-        div()
-            .id(self.id)
+        accessible(div().id(self.id), Role::Splitter, self.label)
             .group(group.clone())
-            .role(Role::Splitter)
-            .aria_label(self.label)
-            .aria_orientation(Orientation::Vertical)
+            .aria_orientation(match axis {
+                ResizeAxis::Horizontal => Orientation::Vertical,
+                ResizeAxis::Vertical => Orientation::Horizontal,
+            })
             .aria_value(format!("{} pixels", self.value.round()))
             .aria_numeric_value(f64::from(self.value))
             .aria_min_numeric_value(f64::from(self.range.0))
             .aria_max_numeric_value(f64::from(self.range.1))
             .track_focus(&self.focus_handle)
             .absolute()
-            .left(px(-4.))
-            .top_0()
-            .bottom_0()
-            .w(px(8.))
-            .cursor_col_resize()
+            .map(|handle| match axis {
+                ResizeAxis::Horizontal => handle
+                    .left(px(-4.))
+                    .top_0()
+                    .bottom_0()
+                    .w(px(8.))
+                    .cursor_col_resize(),
+                ResizeAxis::Vertical => handle
+                    .top(px(-4.))
+                    .left_0()
+                    .right_0()
+                    .h(px(8.))
+                    .cursor_row_resize(),
+            })
             .child(
                 div()
-                    .h_full()
-                    .ml(px(if thick { 3. } else { 4. }))
-                    .w(px(if thick { 3. } else { 1. }))
+                    .map(|bar| match axis {
+                        ResizeAxis::Horizontal => bar.h_full().ml(line_offset).w(line_thickness),
+                        ResizeAxis::Vertical => bar.w_full().mt(line_offset).h(line_thickness),
+                    })
                     .bg(if thick { accent } else { line })
-                    .group_hover(group, move |style| style.ml(px(3.)).w(px(3.)).bg(accent)),
+                    .group_hover(group, move |style| {
+                        let style = match axis {
+                            ResizeAxis::Horizontal => style.ml(px(3.)).w(px(3.)),
+                            ResizeAxis::Vertical => style.mt(px(3.)).h(px(3.)),
+                        };
+
+                        style.bg(accent)
+                    }),
             )
             .when_some(self.drag, |handle, apply| apply(handle))
             .when_some(self.on_reset, |handle, handler| {
@@ -155,11 +198,15 @@ impl RenderOnce for ResizeHandle {
                         return;
                     }
 
-                    let nudge = match event.keystroke.key.as_str() {
-                        "left" => Nudge::Left,
-                        "right" => Nudge::Right,
-                        "home" => Nudge::Smallest,
-                        "end" => Nudge::Largest,
+                    let nudge = match (axis, event.keystroke.key.as_str()) {
+                        (ResizeAxis::Horizontal, "left") | (ResizeAxis::Vertical, "up") => {
+                            Nudge::Left
+                        }
+                        (ResizeAxis::Horizontal, "right") | (ResizeAxis::Vertical, "down") => {
+                            Nudge::Right
+                        }
+                        (_, "home") => Nudge::Smallest,
+                        (_, "end") => Nudge::Largest,
                         _ => return,
                     };
 

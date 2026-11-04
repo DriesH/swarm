@@ -6,13 +6,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    AnyElement, Context, Entity, FocusHandle, Render, Role, SharedString, WeakEntity, Window, div,
-    px,
+    AnyElement, App, Context, Div, Entity, FocusHandle, IntoElement, Role, SharedString, Stateful,
+    WeakEntity, Window, div, px,
 };
 use swarm_protocol::{Client, ClientError, PromptInfo, PromptLayer};
 use swarm_ui::prelude::*;
 
-use super::pages::{page_title, plain_row};
+use super::pages::{alert_message, page_title, plain_row};
 use super::{NOT_CONNECTED, Page, SettingsState, SettingsWindow, open_file};
 use crate::workspace::DataSource;
 
@@ -477,12 +477,63 @@ fn layer_tag(name: &str, layer: PromptLayer) -> impl IntoElement + use<> {
         .child(Tag::new(label).tone(tone))
 }
 
-impl Render for PromptsPage {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let prompts = self.prompts.clone();
+/// One prompt's row, drawn as a slice of the list's card. Each row is a block of its own, so
+/// Tab scrolls the page row by row.
+fn row_block(
+    index: usize,
+    count: usize,
+    name: &str,
+    row: impl IntoElement,
+    cx: &App,
+) -> Stateful<Div> {
+    let colors = cx.theme().colors();
 
-        let mut panel = Panel::new().accessible("prompts", "Prompts");
-        for prompt in &prompts {
+    div()
+        .id(("prompt-row", index))
+        .role(Role::Group)
+        .aria_label(format!("{name}.md"))
+        .overflow_hidden()
+        .bg(colors.panel)
+        .border_color(colors.line)
+        .border_x_1()
+        .border_t_1()
+        .when(index == 0, |block| block.rounded_t(px(10.)))
+        .when(index + 1 == count, |block| {
+            block.border_b_1().rounded_b(px(10.))
+        })
+        .child(row)
+}
+
+impl PromptsPage {
+    /// The blocks of the page: its title, the error if any, then one block per prompt.
+    pub(super) fn blocks(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let prompts = self.prompts.clone();
+        let count = prompts.len();
+        let mut blocks = vec![
+            div()
+                .pb(px(26.))
+                .child(page_title("Prompts"))
+                .into_any_element(),
+        ];
+
+        let error = self
+            .action_error
+            .clone()
+            .or_else(|| self.list_error.clone())
+            .map(|message| {
+                div()
+                    .pb(px(26.))
+                    .debug_selector(|| "prompts-error".to_owned())
+                    .child(alert_message("prompts-error", message, cx))
+                    .into_any_element()
+            });
+        blocks.extend(error);
+
+        for (index, prompt) in prompts.iter().enumerate() {
             let controls = self.controls(prompt, cx);
 
             let row = plain_row()
@@ -496,31 +547,12 @@ impl Render for PromptsPage {
                 )
                 .child(controls);
 
-            panel = panel.row(row);
+            blocks.push(row_block(index, count, &prompt.name, row, cx).into_any_element());
         }
 
         self.apply_focus(window, cx);
 
-        let error = self
-            .action_error
-            .clone()
-            .or_else(|| self.list_error.clone())
-            .map(|message| {
-                div()
-                    .id("prompts-error")
-                    .debug_selector(|| "prompts-error".to_owned())
-                    .role(Role::Alert)
-                    .aria_label(message.clone())
-                    .text_size(px(12.))
-                    .text_color(Color::Del.hsla(cx))
-                    .child(message)
-            });
-
-        v_flex()
-            .gap(px(26.))
-            .child(page_title("Prompts"))
-            .children(error)
-            .child(panel)
+        blocks
     }
 }
 
@@ -764,6 +796,47 @@ mod tests {
             prompt("worker", PromptLayer::User),
             prompt("start", PromptLayer::BuiltIn),
         ])
+    }
+
+    #[gpui::test]
+    fn tab_to_the_last_prompt_row_of_a_tall_page_scrolls_it_into_view(cx: &mut TestAppContext) {
+        let mut page = open_page(cx, None);
+        page.settings.simulate_resize(size(px(1280.), px(240.)));
+        redraw(&mut page.settings);
+        let last = page
+            .window
+            .read_with(&page.settings, |settings, cx| {
+                settings
+                    .prompts
+                    .read(cx)
+                    .handles
+                    .get(&("pr".to_owned(), Control::Customize))
+                    .cloned()
+            })
+            .expect("the window is open")
+            .expect("the last row has a Customize button");
+
+        let mut reached = false;
+        for _ in 0..12 {
+            page.settings.simulate_keystrokes("tab");
+            redraw(&mut page.settings);
+            redraw(&mut page.settings);
+
+            if page.settings.update(|window, _| last.is_focused(window)) {
+                reached = true;
+                break;
+            }
+        }
+
+        let bounds = page
+            .settings
+            .debug_bounds("customize-pr")
+            .expect("the button is drawn");
+        let window_bottom = page
+            .settings
+            .update(|window, _| window.viewport_size().height);
+        assert!(reached);
+        assert!(bounds.bottom() <= window_bottom, "{bounds:?}");
     }
 
     #[gpui::test]

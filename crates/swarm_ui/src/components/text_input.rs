@@ -15,7 +15,7 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation as _;
 
-use crate::a11y::{ignore_press, track_focus_off_tab};
+use crate::a11y::{accessible, ignore_press, track_focus_off_tab};
 use crate::component::{Component, example, example_group};
 use crate::fonts::{MONO_FONT, UI_FONT};
 use crate::motion::reduce_motion;
@@ -958,10 +958,7 @@ impl<const MULTILINE: bool> Render for TextField<MULTILINE> {
             .map(|build| build(window, cx))
             .unwrap_or_default();
 
-        let field = div()
-            .id("text-field")
-            .role(role)
-            .aria_label(self.label.clone())
+        let field = accessible(div().id("text-field"), role, self.label.clone())
             .aria_value(self.text())
             .a11y_synthetic_children(a11y_text_children(
                 &self.buffer.text,

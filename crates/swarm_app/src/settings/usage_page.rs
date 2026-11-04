@@ -79,14 +79,13 @@ impl Render for UsagePage {
 
         let body = if sections.is_empty() {
             div()
-                .id("usage-empty")
                 .debug_selector(|| "usage-empty".to_owned())
-                .role(gpui::Role::Status)
-                .aria_label("No usage data")
                 .child(
-                    Label::new("No usage data")
-                        .size(LabelSize::Small)
-                        .color(Color::Faint),
+                    LiveRegion::status("usage-empty", "No usage data").child(
+                        Label::new("No usage data")
+                            .size(LabelSize::Small)
+                            .color(Color::Faint),
+                    ),
                 )
                 .into_any_element()
         } else {

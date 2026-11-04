@@ -1,11 +1,11 @@
 //! Settings › Keyboard: the shortcuts of the app, read-only. The rows come from the same
 //! bindings the app registers, so the page cannot go stale.
 
-use gpui::{AnyElement, KeybindingKeystroke, SharedString, div, px};
+use gpui::{KeybindingKeystroke, Role, SharedString, div, px};
 use swarm_ui::prelude::*;
 
 use super::SettingsWindow;
-use super::pages::{page_title, section};
+use super::pages::{PageBlocks, page_title, section};
 use crate::actions::{self, ShortcutGroup};
 
 const KEY_CONTROL: &str = "\u{2303}";
@@ -146,29 +146,35 @@ fn slug(name: &str) -> String {
 
 fn row_element(index: usize, row: &Row) -> impl IntoElement + use<> {
     let mut keys = h_flex().gap(px(6.));
+    let mut spoken = Vec::new();
 
     for (position, alternative) in row.alternatives.iter().enumerate() {
         if position > 0 {
             keys = keys.child(Label::new("or").size(LabelSize::Small).color(Color::Faint));
         }
 
-        keys = keys.child(Kbd::new(
+        let kbd = Kbd::new(
             ("shortcut-keys", index * 10 + position),
             alternative.clone(),
-        ));
+        );
+        spoken.push(kbd.spoken());
+        keys = keys.child(kbd);
     }
 
     let selector = format!("shortcut-{}", slug(row.name));
 
     div()
+        .id(("shortcut-row", index))
+        .role(Role::Group)
+        .aria_label(format!("{}, {}", row.name, spoken.join(" or ")))
         .debug_selector(move || selector)
         .child(PanelRow::new(row.name).end_slot(keys))
 }
 
 impl SettingsWindow {
-    pub(super) fn keyboard_page() -> AnyElement {
+    pub(super) fn keyboard_page() -> PageBlocks {
         let rows = rows();
-        let mut page = v_flex().gap(px(26.)).child(page_title("Keyboard"));
+        let mut page = PageBlocks::new(26.).child(page_title("Keyboard"));
 
         for group in ShortcutGroup::ALL {
             let panel = rows
@@ -182,7 +188,7 @@ impl SettingsWindow {
             page = page.child(section(group.title(), panel));
         }
 
-        page.into_any_element()
+        page
     }
 }
 
@@ -236,6 +242,23 @@ mod tests {
         assert_eq!(caps_of("Next file"), [["J"]]);
         assert_eq!(caps_of("Previous line in diff"), [["\u{2191}"]]);
         assert_eq!(caps_of("Cancel comment"), [["esc"]]);
+    }
+
+    #[test]
+    fn a_row_is_a_group_named_after_its_action_and_keys() {
+        use gpui::Element as _;
+        use gpui::accesskit::Node;
+
+        let row = rows()
+            .into_iter()
+            .find(|row| row.name == "Command palette")
+            .expect("the palette has a row");
+        let element = row_element(0, &row).into_element();
+        let mut node = Node::new(element.a11y_role().unwrap_or(Role::Unknown));
+        element.write_a11y_info(&mut node);
+
+        assert_eq!(element.a11y_role(), Some(Role::Group));
+        assert_eq!(node.label(), Some("Command palette, Command K"));
     }
 
     #[test]

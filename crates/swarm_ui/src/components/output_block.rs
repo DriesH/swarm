@@ -2,6 +2,7 @@ use gpui::{
     AnyElement, App, ElementId, Pixels, Role, ScrollHandle, SharedString, Window, div, point, px,
 };
 
+use crate::a11y::accessible;
 use crate::component::{Component, example};
 use crate::fonts::MONO_FONT;
 use crate::prelude::*;
@@ -96,13 +97,10 @@ impl RenderOnce for OutputBlock {
         let colors = cx.theme().colors();
         let accent = colors.accent;
 
-        div()
-            .id(self.id)
+        accessible(div().id(self.id), Role::Log, self.label)
             .when_some(self.debug_selector, |block, selector| {
                 block.debug_selector(move || selector)
             })
-            .role(Role::Log)
-            .aria_label(self.label)
             .aria_value(self.text.clone())
             .focusable()
             .tab_stop(true)

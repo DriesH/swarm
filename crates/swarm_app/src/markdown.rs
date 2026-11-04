@@ -64,6 +64,8 @@ struct Run {
 pub(crate) struct Inline {
     pub spans: Vec<Span>,
     text: SharedString,
+    /// What a screen reader reads: the text as written, where `text` may be changed for the eye.
+    spoken: SharedString,
     runs: Vec<Run>,
     mono: Vec<(Range<usize>, SharedString)>,
     boxes: Vec<Range<usize>>,
@@ -104,9 +106,12 @@ impl Inline {
             }
         }
 
+        let text = SharedString::from(text);
+
         Self {
             spans,
-            text: SharedString::from(text),
+            spoken: text.clone(),
+            text,
             runs,
             mono,
             boxes,
@@ -114,8 +119,10 @@ impl Inline {
         }
     }
 
+    /// Heading text is drawn in capitals but spoken as written.
     fn heading(spans: &[Span]) -> Self {
-        Self::new(
+        let spoken: String = spans.iter().map(|span| span.text.as_str()).collect();
+        let mut inline = Self::new(
             spans
                 .iter()
                 .map(|span| Span {
@@ -123,7 +130,10 @@ impl Inline {
                     ..span.clone()
                 })
                 .collect(),
-        )
+        );
+        inline.spoken = spoken.into();
+
+        inline
     }
 
     fn highlights(&self, colors: &ThemeColors) -> Vec<(Range<usize>, HighlightStyle)> {
@@ -162,7 +172,11 @@ pub(crate) enum Marker {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Block {
     Paragraph(Inline),
-    Heading(Inline),
+    /// A heading of `level`, 1 being the highest.
+    Heading {
+        level: usize,
+        inline: Inline,
+    },
     /// One list item, or a block that continues one: it has no marker but keeps the
     /// item's depth. Nested lists are items with a higher `depth`.
     Item {
@@ -173,7 +187,7 @@ pub(crate) enum Block {
     /// A code block, indented under its list item when `depth` is set.
     Code {
         depth: Option<usize>,
-        code: String,
+        code: SharedString,
     },
 }
 
@@ -202,7 +216,7 @@ struct Builder {
     spans: Vec<Span>,
     lists: Vec<Option<u64>>,
     items: Vec<OpenItem>,
-    heading: bool,
+    heading: Option<usize>,
     code: Option<String>,
     bold: usize,
     italic: usize,
@@ -241,8 +255,11 @@ impl Builder {
             return;
         }
 
-        let block = if self.heading {
-            Block::Heading(Inline::heading(&spans))
+        let block = if let Some(level) = self.heading {
+            Block::Heading {
+                level,
+                inline: Inline::heading(&spans),
+            }
         } else if let Some(item) = self.items.last_mut() {
             let marker = (!item.started).then_some(item.marker);
             item.started = true;
@@ -291,13 +308,13 @@ impl Builder {
                 self.flush();
                 self.lists.pop();
             }
-            Event::Start(Tag::Heading { .. }) => {
+            Event::Start(Tag::Heading { level, .. }) => {
                 self.flush();
-                self.heading = true;
+                self.heading = Some(level as usize);
             }
             Event::End(TagEnd::Heading(_)) => {
                 self.flush();
-                self.heading = false;
+                self.heading = None;
             }
             Event::Start(Tag::Item) => {
                 self.flush();
@@ -315,7 +332,7 @@ impl Builder {
                 if let Some(code) = self.code.take() {
                     self.blocks.push(Block::Code {
                         depth: self.items.last().map(|item| item.depth),
-                        code: code.trim_end_matches('\n').to_owned(),
+                        code: code.trim_end_matches('\n').to_owned().into(),
                     });
                 }
             }
@@ -380,16 +397,32 @@ fn item_indent(depth: usize) -> f32 {
     levels * LEVEL_INDENT
 }
 
+fn heading_block(
+    index: usize,
+    level: usize,
+    inline: &Inline,
+    colors: &ThemeColors,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(("heading", index))
+        .role(Role::Heading)
+        .aria_level(level)
+        .aria_label(inline.spoken.clone())
+        .mt(px(4.))
+        .text_size(px(11.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(colors.faint)
+        .child(inline_body(inline, ("heading-text", index).into(), colors))
+}
+
 fn render_block(index: usize, block: &Block, colors: &ThemeColors) -> AnyElement {
     match block {
-        Block::Paragraph(inline) => render_inline(inline, ("paragraph", index).into(), colors),
-        Block::Heading(inline) => div()
-            .mt(px(4.))
-            .text_size(px(11.))
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(colors.faint)
-            .child(render_inline(inline, ("heading", index).into(), colors))
-            .into_any_element(),
+        Block::Paragraph(inline) => {
+            render_inline(inline, ("paragraph", index).into(), colors).into_any_element()
+        }
+        Block::Heading { level, inline } => {
+            heading_block(index, *level, inline, colors).into_any_element()
+        }
         Block::Item {
             marker,
             depth,
@@ -423,6 +456,9 @@ fn render_block(index: usize, block: &Block, colors: &ThemeColors) -> AnyElement
             let indent = depth.map_or(0., |depth| item_indent(depth) + MARKER_WIDTH + MARKER_GAP);
 
             div()
+                .id(("code", index))
+                .role(Role::Label)
+                .aria_value(code.clone())
                 .flex()
                 .flex_col()
                 .ml(px(indent))
@@ -448,8 +484,22 @@ fn render_block(index: usize, block: &Block, colors: &ThemeColors) -> AnyElement
     }
 }
 
-/// One run of text with its inline styles. Inline code gets a box behind it.
-fn render_inline(inline: &Inline, id: ElementId, colors: &ThemeColors) -> AnyElement {
+/// One run of text with its inline styles, and the same text in the accessibility tree:
+/// the styled text itself is not.
+fn render_inline(
+    inline: &Inline,
+    id: ElementId,
+    colors: &ThemeColors,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id((id.clone(), "text"))
+        .role(Role::Label)
+        .aria_value(inline.spoken.clone())
+        .child(inline_body(inline, id, colors))
+}
+
+/// Inline code gets a box behind it.
+fn inline_body(inline: &Inline, id: ElementId, colors: &ThemeColors) -> AnyElement {
     let styled = StyledText::new(inline.text.clone())
         .with_highlights(inline.highlights(colors))
         .with_font_family_overrides(inline.mono.clone());
@@ -701,7 +751,10 @@ mod tests {
             parsed.blocks,
             [
                 Block::Paragraph(Inline::new(vec![plain("Wire "), code("pty"), plain(".")])),
-                Block::Heading(Inline::new(vec![plain("SCOPE")])),
+                Block::Heading {
+                    level: 2,
+                    inline: Inline::heading(&[plain("Scope")]),
+                },
                 item(Some(Marker::Bullet), 0, "one"),
                 Block::Item {
                     marker: Some(Marker::Bullet),
@@ -746,7 +799,7 @@ mod tests {
                 item(Some(Marker::Number(1)), 0, "step one"),
                 Block::Code {
                     depth: Some(0),
-                    code: "code".to_owned(),
+                    code: "code".into(),
                 },
                 item(None, 0, "more text"),
                 item(Some(Marker::Number(2)), 0, "two"),
@@ -777,7 +830,7 @@ mod tests {
             parsed.blocks,
             [Block::Code {
                 depth: None,
-                code: "let a = 1;\n\nlet b = 2;".to_owned(),
+                code: "let a = 1;\n\nlet b = 2;".into(),
             }]
         );
     }
@@ -898,6 +951,53 @@ mod tests {
         let start = WRAPPED.find(needle).expect("the needle");
 
         code_lines(layout, WRAPPED, &(start..start + needle.len()))
+    }
+
+    fn node_of(element: impl IntoElement) -> (Option<Role>, Option<String>) {
+        use gpui::Element as _;
+
+        let element = element.into_element();
+        let mut node = gpui::accesskit::Node::new(Role::Unknown);
+
+        element.write_a11y_info(&mut node);
+
+        (element.a11y_role(), node.value().map(str::to_owned))
+    }
+
+    #[gpui::test]
+    fn a_paragraph_puts_its_text_in_the_accessibility_tree(cx: &mut TestAppContext) {
+        cx.update(swarm_ui::init);
+        let colors = cx.update(|cx| cx.theme().colors().clone());
+        let inline = Inline::new(vec![plain("Wire "), code("pty"), plain(" first")]);
+
+        let node = node_of(render_inline(
+            &inline,
+            ("paragraph", 0_usize).into(),
+            &colors,
+        ));
+
+        assert_eq!(node, (Some(Role::Label), Some("Wire pty first".to_owned())));
+    }
+
+    #[gpui::test]
+    fn a_heading_is_a_heading_with_its_level_and_its_own_case(cx: &mut TestAppContext) {
+        cx.update(swarm_ui::init);
+        let colors = cx.update(|cx| cx.theme().colors().clone());
+        let parsed = parse("### Scope\n");
+        let Some(Block::Heading { level, inline }) = parsed.blocks.first() else {
+            panic!("expected a heading, got {:?}", parsed.blocks);
+        };
+
+        let element = heading_block(1, *level, inline, &colors).into_element();
+        let mut node = gpui::accesskit::Node::new(Role::Unknown);
+        {
+            use gpui::Element as _;
+            element.write_a11y_info(&mut node);
+            assert_eq!(element.a11y_role(), Some(Role::Heading));
+        }
+
+        assert_eq!(node.level(), Some(3));
+        assert_eq!(node.label(), Some("Scope"));
     }
 
     struct LinkProbe {

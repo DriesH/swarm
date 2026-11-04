@@ -3,6 +3,7 @@ use gpui::{
     SharedString, Window, div, linear_color_stop, linear_gradient, px,
 };
 
+use crate::a11y::accessible;
 use crate::component::{Component, example, example_group};
 use crate::components::icon_button::IconButtonSize;
 use crate::fonts::UI_FONT;
@@ -168,14 +169,11 @@ impl RenderOnce for Tab {
         let floating_button = self.on_close.is_some() && !selected;
         let min_width = TAB_MIN_WIDTH.min(natural_width(&self.label, inline_button, window));
 
-        div()
-            .id(self.id)
+        accessible(div().id(self.id), Role::Tab, accessible_label)
             .group(group.clone())
             .when_some(self.debug_selector, |element, selector| {
                 element.debug_selector(move || selector)
             })
-            .role(Role::Tab)
-            .aria_label(accessible_label)
             .aria_selected(selected)
             .track_focus(&focus)
             .cursor_pointer()

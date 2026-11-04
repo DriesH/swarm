@@ -23,6 +23,7 @@ use swarm_term_view::{TerminalEvent, TerminalView, palette_for};
 use swarm_ui::ActiveTheme as _;
 use swarm_ui::prelude::*;
 
+use crate::announce::announce;
 use crate::daemon::exit_text;
 use crate::notifications::{self, Permission};
 use crate::workspace::{DataSource, Workspace};
@@ -813,6 +814,40 @@ impl SystemCheckView {
                 && self.fixes.values().all(|fix| fix.terminal.is_some()))
     }
 
+    /// Speaks "Checking" while the check runs, then how many tools are ready.
+    fn status_region(&self) -> LiveRegion {
+        let value = if self.is_settled() {
+            let rows = self.rows();
+
+            format!(
+                "System check, {} of {} ready",
+                ready_count(&rows),
+                rows.len()
+            )
+        } else {
+            "Checking".to_owned()
+        };
+
+        LiveRegion::status("system-check-status", value)
+    }
+
+    /// Speaks a check that failed and a fix that did not start.
+    fn alert_region(&self) -> LiveRegion {
+        let mut messages: Vec<String> = Vec::new();
+
+        if let Some(Err(message)) = &self.answer {
+            messages.push(message.to_string());
+        }
+
+        for tool in Tool::ALL {
+            if let Some(error) = self.errors.get(&tool) {
+                messages.push(format!("{}: {error}", tool.name()));
+            }
+        }
+
+        LiveRegion::alert("system-check-alert", messages.join(". "))
+    }
+
     /// The focus of a tool's button.
     #[cfg(test)]
     pub(crate) fn action_focus(&self, tool: Tool) -> Option<FocusHandle> {
@@ -1157,5 +1192,7 @@ impl Render for SystemCheckView {
             .id("system-check")
             .debug_selector(|| "system-check".to_owned())
             .child(panel)
+            .child(announce("system-check-status", self.status_region()))
+            .child(announce("system-check-alert", self.alert_region()))
     }
 }

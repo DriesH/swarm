@@ -25,9 +25,11 @@ use crate::actions::{
     PreviousFile, PreviousLine, REVIEW_BODY_CONTEXT, REVIEW_CONTEXT, SetUpGithub, ToggleViewed,
     TreeActivate, TreeCollapse, TreeExpand, TreeFirst, TreeLast, TreeNext, TreePrevious,
 };
+use crate::announce::announce;
 use crate::file_tree::{self, Entry, EntryKind, Key, Mark, Move};
 use crate::markdown::Markdown;
 use crate::model::{AgentKind, TaskId};
+use crate::panels::{empty_status, error_alert};
 use crate::pull_request::PrOffer;
 use crate::review_comments::refusal;
 use crate::review_model::{
@@ -36,6 +38,7 @@ use crate::review_model::{
     plural, sample_lines, thousands, visible_files, worktree_count,
 };
 use crate::workspace::{View, Workspace};
+use swarm_ui::a11y::accessible;
 
 mod comments;
 
@@ -793,6 +796,33 @@ impl ReviewView {
     }
 }
 
+/// The status of the agents, as text in the tree. It is not a live region: the count would be
+/// spoken at every change while the user reads a diff.
+fn header_pill(working: usize) -> Stateful<Div> {
+    let label = pill_label(working);
+    let pill = if working == 0 {
+        StatusPill::new(AgentStatus::Done)
+    } else {
+        StatusPill::new(AgentStatus::Blocked)
+    }
+    .label(label.clone())
+    .truncate();
+
+    div()
+        .id("review-agents-status")
+        .role(Role::Label)
+        .aria_value(label)
+        .min_w_0()
+        .child(pill)
+}
+
+/// Speaks the move to none working, and nothing else.
+fn agents_done_region(working: usize) -> LiveRegion {
+    let value = if working == 0 { "All agents done" } else { "" };
+
+    LiveRegion::status("review-agents-done", value)
+}
+
 fn pill_label(count: usize) -> SharedString {
     if count == 0 {
         "All agents done".into()
@@ -920,7 +950,7 @@ fn centered(text: &'static str) -> Div {
         .flex()
         .items_center()
         .justify_center()
-        .child(Label::new(text).color(Color::Faint))
+        .child(empty_status("review-state", text))
 }
 
 impl Render for ReviewView {
@@ -949,18 +979,8 @@ impl Render for ReviewView {
             .on_action(cx.listener(|this, _: &CancelComment, _, cx| this.cancel_composer(cx)));
 
         let Some(input) = self.input.clone() else {
-            let accent = colors.accent;
-
             return root
-                .child(
-                    centered("No changes")
-                        .id("review-body")
-                        .debug_selector(|| "review-empty".to_owned())
-                        .role(Role::Group)
-                        .aria_label("No changes")
-                        .track_focus(&self.body_focus)
-                        .focus_visible(move |style| focus_ring(style, accent)),
-                )
+                .child(self.empty_body("No changes", &colors))
                 .into_any_element();
         };
 
@@ -998,7 +1018,8 @@ impl ReviewView {
                     "files",
                 ))
                 .size(LabelSize::Small)
-                .weight(FontWeight::MEDIUM),
+                .weight(FontWeight::MEDIUM)
+                .accessible("review-nav-files"),
             )
             .child(div().flex_1())
             .child(
@@ -1016,42 +1037,44 @@ impl ReviewView {
             let nav_focus = self.nav_focus.clone();
 
             h_flex().px(px(8.)).pb(px(8.)).child(
-                h_flex()
-                    .id("review-filter")
-                    .debug_selector(|| "review-filter".to_owned())
-                    .role(Role::Button)
-                    .aria_label(format!("Remove filter, {name}"))
-                    .focusable()
-                    .tab_stop(true)
-                    .cursor_pointer()
-                    .h(px(24.))
-                    .pl(px(8.))
-                    .pr(px(6.))
-                    .gap(px(6.))
-                    .rounded(px(6.))
-                    .bg(colors.soft)
-                    .hover({
-                        let active = colors.active;
-                        move |style| style.bg(active)
-                    })
-                    .focus_visible({
-                        let accent = colors.accent;
-                        move |style| focus_ring(style, accent)
-                    })
-                    .on_click(move |_, window, cx| {
-                        // The chip goes away, so focus moves on to the file tree.
-                        window.focus(&nav_focus, cx);
-                        update_workspace(&workspace, cx, |workspace, cx| {
-                            workspace.clear_review_agent(cx);
-                        });
-                    })
-                    .child(Icon::new(kind_icon(agent.kind)).size(IconSize::Small))
-                    .child(Label::new(name).size(LabelSize::Small))
-                    .child(
-                        Icon::new(IconName::Close)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
-                    ),
+                accessible(
+                    h_flex()
+                        .id("review-filter")
+                        .debug_selector(|| "review-filter".to_owned()),
+                    Role::Button,
+                    format!("Remove filter, {name}"),
+                )
+                .focusable()
+                .tab_stop(true)
+                .cursor_pointer()
+                .h(px(24.))
+                .pl(px(8.))
+                .pr(px(6.))
+                .gap(px(6.))
+                .rounded(px(6.))
+                .bg(colors.soft)
+                .hover({
+                    let active = colors.active;
+                    move |style| style.bg(active)
+                })
+                .focus_visible({
+                    let accent = colors.accent;
+                    move |style| focus_ring(style, accent)
+                })
+                .on_click(move |_, window, cx| {
+                    // The chip goes away, so focus moves on to the file tree.
+                    window.focus(&nav_focus, cx);
+                    update_workspace(&workspace, cx, |workspace, cx| {
+                        workspace.clear_review_agent(cx);
+                    });
+                })
+                .child(Icon::new(kind_icon(agent.kind)).size(IconSize::Small))
+                .child(Label::new(name).size(LabelSize::Small))
+                .child(
+                    Icon::new(IconName::Close)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                ),
             )
         });
 
@@ -1063,24 +1086,26 @@ impl ReviewView {
         .track_scroll(&self.nav_scroll)
         .size_full();
 
-        let tree = div()
-            .id("review-tree")
-            .debug_selector(|| "review-tree".to_owned())
-            .role(Role::Tree)
-            .aria_label("File tree")
-            .key_context(FILE_TREE_CONTEXT)
-            .track_focus(&self.nav_focus)
-            .on_action(cx.listener(|this, _: &TreePrevious, _, cx| this.move_tree(Key::Up, cx)))
-            .on_action(cx.listener(|this, _: &TreeNext, _, cx| this.move_tree(Key::Down, cx)))
-            .on_action(cx.listener(|this, _: &TreeCollapse, _, cx| this.move_tree(Key::Left, cx)))
-            .on_action(cx.listener(|this, _: &TreeExpand, _, cx| this.move_tree(Key::Right, cx)))
-            .on_action(cx.listener(|this, _: &TreeFirst, _, cx| this.move_tree(Key::First, cx)))
-            .on_action(cx.listener(|this, _: &TreeLast, _, cx| this.move_tree(Key::Last, cx)))
-            .on_action(cx.listener(|this, _: &TreeActivate, _, cx| this.activate_cursor(cx)))
-            .flex_1()
-            .min_h_0()
-            .px(px(4.))
-            .child(items);
+        let tree = accessible(
+            div()
+                .id("review-tree")
+                .debug_selector(|| "review-tree".to_owned()),
+            Role::Tree,
+            "File tree",
+        )
+        .key_context(FILE_TREE_CONTEXT)
+        .track_focus(&self.nav_focus)
+        .on_action(cx.listener(|this, _: &TreePrevious, _, cx| this.move_tree(Key::Up, cx)))
+        .on_action(cx.listener(|this, _: &TreeNext, _, cx| this.move_tree(Key::Down, cx)))
+        .on_action(cx.listener(|this, _: &TreeCollapse, _, cx| this.move_tree(Key::Left, cx)))
+        .on_action(cx.listener(|this, _: &TreeExpand, _, cx| this.move_tree(Key::Right, cx)))
+        .on_action(cx.listener(|this, _: &TreeFirst, _, cx| this.move_tree(Key::First, cx)))
+        .on_action(cx.listener(|this, _: &TreeLast, _, cx| this.move_tree(Key::Last, cx)))
+        .on_action(cx.listener(|this, _: &TreeActivate, _, cx| this.activate_cursor(cx)))
+        .flex_1()
+        .min_h_0()
+        .px(px(4.))
+        .child(items);
 
         v_flex()
             .id("review-nav")
@@ -1267,13 +1292,7 @@ impl ReviewView {
         colors: &ThemeColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let pill = if input.working == 0 {
-            StatusPill::new(AgentStatus::Done)
-        } else {
-            StatusPill::new(AgentStatus::Blocked)
-        }
-        .label(pill_label(input.working))
-        .truncate();
+        let pill = header_pill(input.working);
 
         let (place, counts) = Self::summary(input);
 
@@ -1337,17 +1356,9 @@ impl ReviewView {
 
         let error = input.approve_error.clone().map(|message| {
             div()
-                .id("review-approve-error")
-                .role(Role::Alert)
-                .aria_label(message.clone())
                 .max_w(px(260.))
                 .min_w_0()
-                .child(
-                    Label::new(message)
-                        .size(LabelSize::Small)
-                        .color(Color::Del)
-                        .truncate(),
-                )
+                .child(error_alert("review-approve-error", message))
         });
 
         h_flex()
@@ -1358,7 +1369,10 @@ impl ReviewView {
             .pr(px(12.))
             .border_b_1()
             .border_color(colors.line)
-            .child(pill)
+            .child(div().min_w_0().child(pill).child(announce(
+                "review-agents-done",
+                agents_done_region(input.working),
+            )))
             .child(place)
             .children(counts)
             .child(div().flex_1())
@@ -1383,6 +1397,7 @@ impl ReviewView {
                 )
             }),
         };
+        let spoken = place.clone();
         let place = if input.diff.is_some() && !place.is_empty() {
             format!("{place} \u{b7}")
         } else {
@@ -1392,6 +1407,8 @@ impl ReviewView {
         let place = div()
             .id("review-place")
             .debug_selector(|| "review-place".to_owned())
+            .role(Role::Label)
+            .aria_value(spoken)
             .flex_shrink(PLACE_SHRINK)
             .min_w_0()
             .mr(px(-8.))
@@ -1404,9 +1421,17 @@ impl ReviewView {
                     .truncate(),
             );
         let counts = input.diff.as_ref().map(|diff| {
+            let spoken = format!(
+                "{}, {}",
+                plural(diff.stat.additions, "addition", "additions"),
+                plural(diff.stat.deletions, "deletion", "deletions")
+            );
+
             counts(diff.stat.additions, diff.stat.deletions, LabelSize::XSmall)
                 .id("review-counts")
                 .debug_selector(|| "review-counts".to_owned())
+                .role(Role::Label)
+                .aria_value(spoken)
         });
 
         (place, counts)
@@ -1437,28 +1462,28 @@ impl ReviewView {
             cx.processor(|this, index: usize, window, cx| this.body_row(index, window, cx)),
         )
         .size_full();
+
+        area.child(self.diff_body(colors, cx).size_full().child(rows))
+            .into_any_element()
+    }
+
+    /// The diff as a list: a screen reader reads the number of lines and the one with
+    /// the cursor.
+    fn diff_body(&self, colors: &ThemeColors, cx: &mut Context<Self>) -> Stateful<Div> {
         let accent = colors.accent;
 
-        area.child(
-            div()
-                .id("review-body")
-                .role(Role::List)
-                .aria_label("Diff")
-                .key_context(REVIEW_BODY_CONTEXT)
-                .track_focus(&self.body_focus)
-                .focus_visible(move |style| focus_ring(style, accent))
-                .on_action(cx.listener(|this, _: &PreviousLine, _, cx| this.move_cursor(-1, cx)))
-                .on_action(cx.listener(|this, _: &NextLine, _, cx| this.move_cursor(1, cx)))
-                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                    if let Some(side) = comments::side_of_key(&event.keystroke) {
-                        this.switch_side(side, cx);
-                        cx.stop_propagation();
-                    }
-                }))
-                .size_full()
-                .child(rows),
-        )
-        .into_any_element()
+        accessible(div().id("review-body"), Role::List, "Diff")
+            .key_context(REVIEW_BODY_CONTEXT)
+            .track_focus(&self.body_focus)
+            .focus_visible(move |style| focus_ring(style, accent))
+            .on_action(cx.listener(|this, _: &PreviousLine, _, cx| this.move_cursor(-1, cx)))
+            .on_action(cx.listener(|this, _: &NextLine, _, cx| this.move_cursor(1, cx)))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if let Some(side) = comments::side_of_key(&event.keystroke) {
+                    this.switch_side(side, cx);
+                    cx.stop_propagation();
+                }
+            }))
     }
 
     /// The message that stands in for the diff. It holds the body's focus, so the keyboard
@@ -1466,11 +1491,11 @@ impl ReviewView {
     fn empty_body(&self, message: &'static str, colors: &ThemeColors) -> Stateful<Div> {
         let accent = colors.accent;
 
+        // The status inside speaks the message, so the group needs no label of its own.
         centered(message)
             .id("review-body")
             .debug_selector(|| "review-empty".to_owned())
             .role(Role::Group)
-            .aria_label(message)
             .track_focus(&self.body_focus)
             .focus_visible(move |style| focus_ring(style, accent))
     }
@@ -1737,18 +1762,10 @@ impl ReviewView {
             .child(div().flex_1())
             .children(error.map(|message| {
                 div()
-                    .id(("review-load-error", file))
                     .debug_selector(|| format!("review-load-error-{file}"))
-                    .role(Role::Alert)
-                    .aria_label(message.clone())
                     .max_w(px(260.))
                     .min_w_0()
-                    .child(
-                        Label::new(message)
-                            .size(LabelSize::Small)
-                            .color(Color::Del)
-                            .truncate(),
-                    )
+                    .child(error_alert(("review-load-error", file), message))
             }))
             .children(show)
             .children(agent.map(|agent| {
@@ -1845,25 +1862,39 @@ fn hunk_row(
         .text_color(colors.faint)
         .whitespace_nowrap()
         .overflow_hidden()
-        .child(text)
+        .child(hunk_text(index, text))
         .into_any_element()
 }
 
-fn note_row(index: usize, note: Note, colors: &ThemeColors) -> AnyElement {
-    let text = match note {
+/// The hunk header, which is also in the accessibility tree.
+fn hunk_text(index: usize, text: String) -> gpui::Text {
+    gpui::Text::new(("review-hunk-text", index).into(), text.into())
+}
+
+fn note_message(note: Note) -> String {
+    match note {
         Note::Binary => "Binary file".to_owned(),
         Note::Empty => "Empty file".to_owned(),
         Note::TooLarge => "Too large to show".to_owned(),
         Note::Truncated(0) => "More lines not shown".to_owned(),
         Note::Truncated(count) => format!("{} lines not shown", thousands(count)),
-    };
+    }
+}
 
+fn note_label(index: usize, note: Note) -> Label {
+    Label::new(note_message(note))
+        .size(LabelSize::Small)
+        .color(Color::Faint)
+        .accessible(("review-note-text", index))
+}
+
+fn note_row(index: usize, note: Note, colors: &ThemeColors) -> AnyElement {
     h_flex()
         .id(("review-note", index))
         .h(px(30.))
         .px(px(12.))
         .text_color(colors.faint)
-        .child(Label::new(text).size(LabelSize::Small).color(Color::Faint))
+        .child(note_label(index, note))
         .into_any_element()
 }
 
@@ -2608,6 +2639,7 @@ mod tests {
 
     use super::*;
     use crate::actions;
+    use crate::live_probe::see_label_in;
     use crate::model::AgentId;
     use crate::review_model::{
         ComposerAt, LinePos, Note, Place, Row, count_comments, first_changed_line, sample_diff,
@@ -3411,6 +3443,21 @@ mod tests {
         assert!(
             cx.debug_bounds("review-empty").is_some() || cx.debug_bounds("review-body").is_some()
         );
+    }
+
+    #[gpui::test]
+    fn the_empty_body_leaves_the_speaking_to_its_status(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = open_review(&workspace, cx);
+
+        let body = review.read_with(cx, |review, cx| {
+            let colors = cx.theme().colors().clone();
+
+            spoken(review.empty_body("No changes", &colors))
+        });
+
+        assert_eq!(body.role, Some(Role::Group));
+        assert_eq!(body.label, None);
     }
 
     #[gpui::test]
@@ -5526,6 +5573,243 @@ mod tests {
                 .as_deref()
                 .is_some_and(|label| label.starts_with("Old line") && label.contains("unchanged"))
         );
+    }
+
+    /// What an element puts in the accessibility tree.
+    #[derive(Debug, PartialEq)]
+    struct Spoken {
+        role: Option<Role>,
+        label: Option<String>,
+        value: Option<String>,
+        live: Option<Live>,
+    }
+
+    fn spoken(element: impl IntoElement) -> Spoken {
+        use gpui::Element as _;
+
+        let element = element.into_element();
+        let mut node = gpui::accesskit::Node::new(Role::Unknown);
+
+        element.write_a11y_info(&mut node);
+
+        Spoken {
+            role: element.a11y_role(),
+            label: node.label().map(str::to_owned),
+            value: node.value().map(str::to_owned),
+            live: node.live(),
+        }
+    }
+
+    fn render_once(region: impl RenderOnce, cx: &mut VisualTestContext) -> Spoken {
+        cx.update(|window, cx| spoken(region.render(window, cx)))
+    }
+
+    #[gpui::test]
+    fn an_error_is_spoken_at_once(cx: &mut TestAppContext) {
+        let (_workspace, cx) = setup(cx);
+
+        let alert = render_once(error_alert("review-approve-error", "Not connected"), cx);
+
+        assert_eq!(alert.role, Some(Role::Alert));
+        assert_eq!(alert.value.as_deref(), Some("Not connected"));
+        assert_eq!(alert.live, Some(Live::Assertive));
+    }
+
+    #[gpui::test]
+    fn the_agent_status_in_the_header_is_text_that_is_not_live(cx: &mut TestAppContext) {
+        let (_workspace, cx) = setup(cx);
+
+        let working = cx.update(|_, _| spoken(header_pill(2)));
+
+        assert_eq!(working.role, Some(Role::Label));
+        assert_eq!(working.value.as_deref(), Some("2 agents working"));
+        assert_eq!(working.live, None);
+    }
+
+    #[gpui::test]
+    fn only_the_move_to_none_working_is_spoken(cx: &mut TestAppContext) {
+        let (_workspace, cx) = setup(cx);
+
+        let working = render_once(agents_done_region(2), cx);
+        let done = render_once(agents_done_region(0), cx);
+
+        assert_eq!(done.value.as_deref(), Some("All agents done"));
+        assert_eq!(done.live, Some(Live::Polite));
+        assert!(working.value.as_deref().is_none_or(str::is_empty));
+        assert_eq!(working.live, Some(Live::Polite));
+    }
+
+    #[gpui::test]
+    fn the_header_draws_the_region_that_speaks_the_move_to_done(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let _review = open_review(&workspace, cx);
+
+        assert!(cx.debug_bounds("review-agents-done").is_some());
+    }
+
+    #[gpui::test]
+    fn the_header_place_and_totals_are_text_in_the_tree(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = open_review(&workspace, cx);
+        let input = review.read_with(cx, |review, _| review.input.clone());
+        let input = input.expect("the sample has a diff");
+        let stat = input.diff.as_ref().map(|diff| diff.stat);
+
+        let (place, counts) = ReviewView::summary(&input);
+        let (place, counts) = (spoken(place), counts.map(spoken));
+
+        assert_eq!(place.role, Some(Role::Label));
+        assert!(
+            place
+                .value
+                .is_some_and(|value| !value.is_empty() && !value.ends_with('\u{b7}'))
+        );
+        assert_eq!(
+            counts.map(|counts| counts.value),
+            stat.map(|stat| Some(format!(
+                "{}, {}",
+                plural(stat.additions, "addition", "additions"),
+                plural(stat.deletions, "deletion", "deletions")
+            )))
+        );
+    }
+
+    #[gpui::test]
+    fn note_rows_and_hunk_headers_put_their_text_in_the_tree(cx: &mut TestAppContext) {
+        let (_workspace, cx) = setup(cx);
+
+        let note = see_label_in(note_label(3, Note::Truncated(1_200)), cx);
+        let hunk = cx.update(|_, _| spoken(hunk_text(4, "@@ -1,3 +1,4 @@ fn main".to_owned())));
+
+        assert_eq!(note.role, Some(Role::Label));
+        assert_eq!(note.value.as_deref(), Some("1,200 lines not shown"));
+        assert_eq!(hunk.role, Some(Role::Label));
+        assert_eq!(hunk.value.as_deref(), Some("@@ -1,3 +1,4 @@ fn main"));
+    }
+
+    #[gpui::test]
+    fn the_diff_body_is_a_list_named_diff(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = open_review(&workspace, cx);
+        let colors = cx.update(|_, cx| cx.theme().colors().clone());
+
+        let body = review.update(cx, |review, cx| spoken(review.diff_body(&colors, cx)));
+
+        assert_eq!(body.role, Some(Role::List));
+        assert_eq!(body.label.as_deref(), Some("Diff"));
+    }
+
+    #[gpui::test]
+    fn a_reply_says_when_it_is_on_its_way_and_when_it_went_through(cx: &mut TestAppContext) {
+        let (_workspace, cx) = setup(cx);
+
+        let sending = comments::reply_status(3, true, false).map(|region| render_once(region, cx));
+        let sent = comments::reply_status(3, false, true).map(|region| render_once(region, cx));
+
+        assert_eq!(
+            sending.map(|node| (node.role, node.value, node.live)),
+            Some((
+                Some(Role::Status),
+                Some("Sending reply".to_owned()),
+                Some(Live::Polite)
+            ))
+        );
+        assert_eq!(
+            sent.and_then(|node| node.value).as_deref(),
+            Some("Reply sent")
+        );
+        assert!(comments::reply_status(3, false, false).is_none());
+    }
+
+    #[gpui::test]
+    fn a_reply_that_went_through_is_marked_sent_until_the_field_opens_again(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = setup(cx);
+        let review = thread_three(&workspace, cx);
+        let root = CommentId(3);
+
+        click("comment-reply-open-3", cx);
+        cx.simulate_input("Thanks");
+        cx.simulate_keystrokes("cmd-enter");
+        cx.run_until_parked();
+        redraw(cx);
+        let sent = review.read_with(cx, |review, _| review.reply_sent(root));
+        click("comment-reply-open-3", cx);
+        let reopened = review.read_with(cx, |review, _| review.reply_sent(root));
+
+        assert!(sent);
+        assert!(!reopened);
+    }
+
+    #[gpui::test]
+    fn home_and_end_move_the_changes_panel_cursor_to_the_first_and_last_row(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = setup(cx);
+        redraw(cx);
+        let list = workspace.read_with(cx, |workspace, _| workspace.changes_list.clone());
+        let handle = list.read_with(cx, |list, _| list.tree_focus().clone());
+        let rows = list.read_with(cx, |list, _| list.tree_rows().len());
+        cx.update(|window, cx| window.focus(&handle, cx));
+        redraw(cx);
+        list.update(cx, |list, cx| list.put_cursor_for_test(2, cx));
+
+        cx.simulate_keystrokes("end");
+        let at_end = list.read_with(cx, |list, _| list.cursor_at());
+        cx.simulate_keystrokes("home");
+        let at_start = list.read_with(cx, |list, _| list.cursor_at());
+
+        assert_eq!(at_end, Some(rows - 1));
+        assert_eq!(at_start, Some(0));
+    }
+
+    fn review_walk(key: &str, cx: &mut TestAppContext) -> Vec<String> {
+        use gpui::Focusable as _;
+
+        let (workspace, cx) = setup(cx);
+        let review = open_review(&workspace, cx);
+        let root = workspace.read_with(cx, Workspace::focus_handle);
+        let tree = review.read_with(cx, |review, _| review.tree_focus().clone());
+        cx.update(|window, cx| window.focus(&tree, cx));
+        redraw(cx);
+
+        swarm_ui::test_support::tab_walk(cx, &root, key)
+    }
+
+    #[gpui::test]
+    fn tab_visits_the_review_stops_in_order_and_names_each(cx: &mut TestAppContext) {
+        let stops = review_walk("tab", cx);
+
+        assert_eq!(
+            stops[..8],
+            [
+                "Tree File tree",
+                "RadioButton Live",
+                "RadioButton Unified",
+                "List Diff",
+                "Button Collapse, lib.rs",
+                "CheckBox Viewed, lib.rs",
+                "Button Collapse, theme.rs",
+                "CheckBox Viewed, theme.rs",
+            ]
+        );
+        assert!(
+            stops
+                .iter()
+                .all(|stop| !matches!(stop.as_str(), "unnamed" | "nothing" | "not drawn")),
+            "{stops:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn shift_tab_visits_the_review_stops_in_reverse(cx: &mut TestAppContext) {
+        let forward = review_walk("tab", cx);
+        let backward = review_walk("shift-tab", cx);
+
+        let mut expected = vec![forward[0].clone()];
+        expected.extend(forward[1..].iter().rev().cloned());
+        assert_eq!(backward, expected);
     }
 
     #[test]

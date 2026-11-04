@@ -46,8 +46,8 @@ impl RevealFocus {
     }
 
     /// Runs after layout. `handles` holds one focus handle per child, in order; a handle
-    /// may belong to the child or to an element inside it. Starts a reveal when focus has
-    /// moved to another child, and repeats it until the child shows. Returns `true` when
+    /// may belong to the child or to an element inside it. Starts a reveal when keyboard
+    /// focus has moved to another child (a click never scrolls), and repeats it until the child shows. Returns `true` when
     /// the container must draw again.
     pub fn settle(&mut self, handles: &[FocusHandle], window: &Window, cx: &App) -> bool {
         let focused = handles
@@ -57,7 +57,9 @@ impl RevealFocus {
         if focused != self.focused {
             self.focused = focused;
 
-            if let Some(index) = focused {
+            if let Some(index) = focused
+                && window.last_input_was_keyboard()
+            {
                 self.pending = Some((index, TRIES));
             }
         }
@@ -100,6 +102,11 @@ impl RevealFocus {
                 view.bottom(),
             ),
         };
+
+        // A child taller than the view counts as visible while it overlaps the view.
+        if end - start > view_end - view_start {
+            return end > view_start && start < view_end;
+        }
 
         start >= view_start - EDGE && end <= view_end + EDGE
     }
@@ -155,6 +162,7 @@ mod tests {
 
     struct List {
         handles: Vec<FocusHandle>,
+        row_height: Pixels,
         reveal: Option<Entity<RevealFocus>>,
     }
 
@@ -176,7 +184,7 @@ mod tests {
                 div()
                     .id(("row", index))
                     .flex_none()
-                    .h(px(30.))
+                    .h(self.row_height)
                     .track_focus(handle)
             }))
         }
@@ -189,8 +197,21 @@ mod tests {
         Entity<RevealFocus>,
         &mut VisualTestContext,
     ) {
+        sized_list(cx, px(30.), ROWS)
+    }
+
+    fn sized_list(
+        cx: &mut TestAppContext,
+        row_height: Pixels,
+        rows: usize,
+    ) -> (
+        Vec<FocusHandle>,
+        Entity<RevealFocus>,
+        &mut VisualTestContext,
+    ) {
         let (view, cx) = cx.add_window_view(|_, cx| List {
-            handles: (0..ROWS).map(|_| cx.focus_handle()).collect(),
+            handles: (0..rows).map(|_| cx.focus_handle()).collect(),
+            row_height,
             reveal: None,
         });
         cx.run_until_parked();
@@ -202,8 +223,15 @@ mod tests {
         (handles, reveal, cx)
     }
 
-    /// Focuses the handle and draws, as a real window does when focus moves.
+    /// Focuses the handle after a key press and draws, as a real window does when focus
+    /// moves with the keyboard.
     fn focus(handle: &FocusHandle, cx: &mut VisualTestContext) {
+        cx.simulate_keystrokes("tab");
+        focus_as_is(handle, cx);
+    }
+
+    /// Focuses the handle without any key press: the last input stays the mouse.
+    fn focus_as_is(handle: &FocusHandle, cx: &mut VisualTestContext) {
         cx.update(|window, cx| handle.focus(window, cx));
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
@@ -241,5 +269,30 @@ mod tests {
 
         // Row 3 ends at 120 px; the view shows 100 px.
         assert_eq!(offset(&reveal, cx), px(-20.));
+    }
+
+    #[gpui::test]
+    fn focusing_a_row_by_click_does_not_scroll(cx: &mut TestAppContext) {
+        let (handles, reveal, cx) = list(cx);
+
+        focus_as_is(&handles[ROWS - 1], cx);
+
+        assert_eq!(offset(&reveal, cx), Pixels::ZERO);
+    }
+
+    #[gpui::test]
+    fn a_row_taller_than_the_view_in_view_does_not_snap(cx: &mut TestAppContext) {
+        // Two rows of 300 px in a 100 px view. Scroll to the bottom of row 0.
+        let (handles, reveal, cx) = sized_list(cx, px(300.), 2);
+        cx.update(|_, cx| {
+            reveal
+                .read(cx)
+                .scroll()
+                .set_offset(gpui::point(px(0.), px(-200.)));
+        });
+
+        focus(&handles[0], cx);
+
+        assert_eq!(offset(&reveal, cx), px(-200.));
     }
 }

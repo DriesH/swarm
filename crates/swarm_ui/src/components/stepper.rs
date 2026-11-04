@@ -4,6 +4,7 @@ use gpui::{
     AccessibleAction, AnyElement, App, ElementId, FocusHandle, Role, SharedString, Window, div, px,
 };
 
+use crate::a11y::accessible;
 use crate::component::{Component, example, example_group};
 use crate::prelude::*;
 use crate::styles::focus_ring;
@@ -166,10 +167,7 @@ impl RenderOnce for Stepper {
             .min_w(px(52.))
             .child(Label::new(shown.clone()).mono());
 
-        let mut stepper = h_flex()
-            .id(self.id)
-            .role(Role::SpinButton)
-            .aria_label(self.label)
+        let mut stepper = accessible(h_flex().id(self.id), Role::SpinButton, self.label)
             .aria_value(shown)
             .aria_numeric_value(f64::from(value))
             .aria_min_numeric_value(f64::from(min))

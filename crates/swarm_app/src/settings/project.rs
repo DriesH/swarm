@@ -1029,9 +1029,9 @@ impl SettingsWindow {
             added
         });
 
-        for index in added {
-            self.nav_focus.push(cx.focus_handle().tab_stop(true));
+        self.sync_nav(cx);
 
+        for index in added {
             if let Some(inputs) = self.project_inputs(index, cx) {
                 self.inputs.projects.push(inputs);
                 self.sync_inputs(index, cx);
@@ -1159,14 +1159,11 @@ impl SettingsWindow {
             self.inputs.projects.remove(index);
         }
 
-        let row = Page::SECTIONS.len() + index;
-        if row < self.nav_focus.len() {
-            self.nav_focus.remove(row);
-        }
-
         if self.page == Page::Project(project) {
             self.select_page(Page::Agents, cx);
         }
+
+        self.sync_nav(cx);
 
         if window.is_window_active() {
             self.focus_nav(window, cx);
@@ -2371,6 +2368,14 @@ mod tests {
     }
 
     #[gpui::test]
+    fn the_page_draws_the_region_that_speaks_the_checks(cx: &mut TestAppContext) {
+        let (mut rig, _seen) = loaded(cx);
+        redraw(&mut rig.cx);
+
+        assert!(rig.cx.debug_bounds("run-checks-announce").is_some());
+    }
+
+    #[gpui::test]
     fn run_checks_now_waits_for_an_edit_that_is_not_saved_yet(cx: &mut TestAppContext) {
         let (mut rig, seen) = loaded(cx);
 
@@ -2673,7 +2678,7 @@ mod tests {
         // A button that stops taking focus sends it to the list.
         let list = rig
             .window
-            .read_with(&rig.cx, |settings, _| settings.nav_focus.clone())
+            .read_with(&rig.cx, |settings, _| settings.nav_handles())
             .expect("the settings window is open");
         let focused = rig.cx.update(|window, cx| window.focused(cx));
         assert!(button.as_ref().is_some_and(|focus| !list.contains(focus)));
@@ -3071,7 +3076,7 @@ mod tests {
                 (
                     settings.page,
                     settings.inputs.projects.len(),
-                    settings.nav_focus.len(),
+                    settings.nav.len(),
                     names,
                 )
             })

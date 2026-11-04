@@ -1,14 +1,13 @@
 //! Settings › Terminals: the font size of every terminal and the question before one closes.
 
-use gpui::{AnyElement, px};
 use swarm_settings::{FONT_SIZE_DEFAULT, FONT_SIZE_MAX, FONT_SIZE_MIN};
 use swarm_ui::prelude::*;
 
 use super::SettingsWindow;
-use super::pages::{page_title, save_error, section, switch_row};
+use super::pages::{PageBlocks, page_title, save_error, section, switch_row};
 
 impl SettingsWindow {
-    pub(super) fn terminals_page(&self, cx: &Context<Self>) -> AnyElement {
+    pub(super) fn terminals_page(&self, cx: &Context<Self>) -> PageBlocks {
         let state = self.state.clone();
         let settings = state.read(cx);
         let points = settings.settings.terminals.font_size;
@@ -43,13 +42,11 @@ impl SettingsWindow {
         let font = Panel::new().row(PanelRow::new("Font size").end_slot(stepper));
         let error = save_error(settings, cx);
 
-        v_flex()
-            .gap(px(26.))
+        PageBlocks::new(26.)
             .child(page_title("Terminals"))
             .children(error)
             .child(section("Font", font))
             .child(section("Closing", closing))
-            .into_any_element()
     }
 }
 
@@ -146,7 +143,7 @@ mod tests {
             .downcast::<SettingsWindow>()
             .expect("the settings window");
         let nav = window
-            .read_with(visual, |settings, _| settings.nav_focus.clone())
+            .read_with(visual, |settings, _| settings.nav_handles())
             .expect("the window is open");
 
         for _ in 0..40 {

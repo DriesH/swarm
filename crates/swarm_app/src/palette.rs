@@ -2,20 +2,21 @@
 
 use gpui::{
     AnyElement, BoxShadow, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
-    MouseButton, Role, ScrollHandle, SharedString, Stateful, Subscription, WeakEntity, Window,
-    black, div, point, px,
+    MouseButton, Role, ScrollHandle, SharedString, Stateful, Subscription, WeakEntity, Window, div,
+    point, px,
 };
 use swarm_ui::fonts::MONO_FONT;
 use swarm_ui::prelude::*;
 use swarm_ui::{
     Confirm, Dismiss, MENU_CONTEXT, SelectNext, SelectPrevious, TextFieldRole, TextFieldSize,
-    trap_focus,
+    ThemeColors, trap_focus,
 };
 
 use crate::actions::{
     CreatePullRequest, FocusAgent, NewTask, NewTerminal, OpenSettings, PlanWithOrchestrator,
     ShowReview,
 };
+use crate::announce::announce;
 use crate::close_task::CloseTaskDialog;
 use crate::close_terminal::CloseTerminalDialog;
 use crate::model::{AgentKind, FakeData, ProjectId, TaskId, TaskStatus, TerminalId};
@@ -439,6 +440,17 @@ impl Palette {
         }
     }
 
+    /// Speaks "No results" when the search finds nothing.
+    fn status_region(&self) -> LiveRegion {
+        let value = if self.visible.is_empty() {
+            "No results"
+        } else {
+            ""
+        };
+
+        LiveRegion::status("palette-status", value)
+    }
+
     fn set_query(&mut self, query: &str, cx: &mut Context<Self>) {
         self.visible = filter(&self.rows, query);
         self.highlighted = 0;
@@ -513,7 +525,7 @@ impl Palette {
         }
 
         let content = if groups.is_empty() {
-            offset
+            offset + ROW_HEIGHT
         } else {
             offset - RESULT_GAP
         };
@@ -582,6 +594,14 @@ impl Palette {
             .pt(px(RESULTS_PADDING_TOP))
             .pb(px(RESULTS_PADDING_BOTTOM))
             .children(groups)
+            .when(layout.groups.is_empty(), |list| {
+                list.child(
+                    h_flex()
+                        .h(px(ROW_HEIGHT))
+                        .px(px(10.))
+                        .child(Label::new("No results").color(Color::Faint)),
+                )
+            })
             .into_any_element()
     }
 
@@ -733,15 +753,10 @@ impl Render for Palette {
             .border_1()
             .border_color(line)
             .bg(panel)
-            .shadow(vec![BoxShadow {
-                color: black().opacity(0.35),
-                offset: point(px(0.), px(24.)),
-                blur_radius: px(64.),
-                spread_radius: px(0.),
-                inset: false,
-            }])
+            .shadow(sheet_shadow(colors))
             .child(search)
-            .child(room);
+            .child(room)
+            .child(announce("palette-status", self.status_region()));
 
         div()
             .id("palette")
@@ -768,6 +783,17 @@ struct Layout {
     highlighted_span: (f32, f32),
     /// The height of the results: the content, up to the most that shows.
     height: f32,
+}
+
+/// The shadow under the palette sheet, from the theme.
+fn sheet_shadow(colors: &ThemeColors) -> Vec<BoxShadow> {
+    vec![BoxShadow {
+        color: colors.shadow_strong,
+        offset: point(px(0.), px(24.)),
+        blur_radius: px(64.),
+        spread_radius: px(0.),
+        inset: false,
+    }]
 }
 
 /// The modal over the workspace: the palette or the New task dialog.
@@ -1032,7 +1058,9 @@ mod tests {
     use gpui::{TestAppContext, VisualTestContext};
 
     use crate::actions::{self, ToggleCommandPalette};
+    use crate::live_probe::{Seen, is_quiet, see_in};
     use crate::model::PLAN_TASK;
+    use swarm_ui::test_support::focused_stop;
 
     fn setup(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
         cx.update(|cx| {
@@ -1168,6 +1196,44 @@ mod tests {
         assert!(row.bottom() <= sheet.bottom());
     }
 
+    fn status_of(palette: &Entity<Palette>, cx: &mut VisualTestContext) -> Seen {
+        let region = palette.read_with(cx, |palette, _| palette.status_region());
+
+        see_in(region, cx)
+    }
+
+    #[gpui::test]
+    fn the_palette_draws_the_region_that_speaks_its_results(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let _palette = open_palette(&workspace, cx);
+
+        assert!(cx.debug_bounds("palette-status").is_some());
+    }
+
+    #[gpui::test]
+    fn a_search_with_no_match_says_no_results_politely(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let palette = open_palette(&workspace, cx);
+
+        let before = status_of(&palette, cx);
+        cx.simulate_input("zzzz");
+        let after = status_of(&palette, cx);
+
+        assert!(is_quiet(&before));
+        assert_eq!(after.value.as_deref(), Some("No results"));
+        assert_eq!(after.live, Some(Live::Polite));
+    }
+
+    #[gpui::test]
+    fn the_sheet_shadow_comes_from_the_theme(cx: &mut TestAppContext) {
+        let (_workspace, cx) = setup(cx);
+
+        let shadow = cx.update(|_, cx| sheet_shadow(cx.theme().colors()));
+        let expected = cx.update(|_, cx| cx.theme().colors().shadow_strong);
+
+        assert_eq!(shadow[0].color, expected);
+    }
+
     #[gpui::test]
     fn closing_the_palette_gives_focus_back_to_what_had_it(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
@@ -1188,6 +1254,23 @@ mod tests {
         cx.simulate_keystrokes("cmd-k");
 
         assert!(palette_labels(&workspace, cx).is_none());
+    }
+
+    #[gpui::test]
+    fn tab_keeps_focus_on_the_search_field_and_in_the_palette(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let palette = open_palette(&workspace, cx);
+        let root = palette.read_with(cx, Palette::focus_handle);
+
+        let start = focused_stop(cx, &root);
+        cx.simulate_keystrokes("tab");
+        let after_tab = focused_stop(cx, &root);
+        cx.simulate_keystrokes("shift-tab");
+        let after_shift_tab = focused_stop(cx, &root);
+
+        assert_eq!(start, "EditableComboBox Search commands, tasks and agents");
+        assert_eq!(after_tab, start);
+        assert_eq!(after_shift_tab, start);
     }
 
     #[gpui::test]

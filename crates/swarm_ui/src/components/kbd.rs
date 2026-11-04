@@ -24,7 +24,8 @@ impl Kbd {
         }
     }
 
-    fn spoken(&self) -> String {
+    /// The keys as VoiceOver reads them, for example "Command Shift R".
+    pub fn spoken(&self) -> String {
         self.keys
             .iter()
             .map(|key| match key.as_ref() {

@@ -13,15 +13,18 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    App, Bounds, Context, Entity, FocusHandle, Global, KeyBinding, KeyContext, Pixels, Role,
-    ScrollHandle, SharedString, Size, Subscription, TitlebarOptions, WeakEntity, Window,
-    WindowBounds, WindowHandle, WindowOptions, actions, div, point, px, size,
+    App, Axis, Bounds, Context, ElementId, Entity, FocusHandle, Global, KeyBinding, KeyContext,
+    KeyDownEvent, Pixels, Role, ScrollHandle, SharedString, Size, Subscription, TitlebarOptions,
+    WeakEntity, Window, WindowBounds, WindowHandle, WindowOptions, actions, div, point, px, size,
 };
 use swarm_settings::{
     AccentSetting, AppearanceSettings, CliSettings, NotificationSettings, ProjectMode, Settings,
 };
+use swarm_ui::a11y::ignore_press;
 use swarm_ui::fonts::UI_FONT;
 use swarm_ui::prelude::*;
+use swarm_ui::reveal::{RevealFocus, reveal_focused};
+use swarm_ui::roving::RovingFocus;
 use swarm_ui::styles::focus_ring;
 use swarm_ui::theme;
 use swarm_ui::{ROOT_CONTEXT, SelectNext, SelectPrevious, TextFieldSize, scroll_for_key};
@@ -364,7 +367,8 @@ struct Inputs {
 pub(crate) struct SettingsWindow {
     state: Entity<SettingsState>,
     page: Page,
-    nav_focus: Vec<FocusHandle>,
+    /// One Tab stop for the page list and the project list below it; the arrows move inside.
+    nav: RovingFocus,
     inputs: Inputs,
     prompts: Entity<PromptsPage>,
     usage: Entity<UsagePage>,
@@ -373,11 +377,17 @@ pub(crate) struct SettingsWindow {
     /// Where a page without controls takes keyboard focus, to scroll with the keys.
     page_focus: FocusHandle,
     page_scroll: ScrollHandle,
+    /// Scrolls the page to the block that takes focus.
+    page_reveal: Entity<RevealFocus>,
+    /// One handle per block of the open page, to see which block has focus.
+    block_focus: Vec<FocusHandle>,
     subscriptions: Vec<Subscription>,
     /// The dialog that asks before a project goes, while it shows.
     remove_dialog: Option<RemoveDialog>,
     /// The Remove project button of the open page, where focus returns after the dialog.
     remove_focus: FocusHandle,
+    /// The window's root, to tell whether focus is inside the window.
+    root_focus: FocusHandle,
 }
 
 struct RemoveDialog {
@@ -536,12 +546,13 @@ impl SettingsWindow {
 
         let (system_check, check_again_focus) = Self::system_check_for(&state, window, cx);
 
+        let page_reveal = cx.new(|_| RevealFocus::new(Axis::Vertical));
+        let page_scroll = page_reveal.read(cx).scroll().clone();
+
         let mut this = Self {
             state: state.clone(),
             page,
-            nav_focus: (0..Page::SECTIONS.len() + projects.len())
-                .map(|_| cx.focus_handle().tab_stop(true))
-                .collect(),
+            nav: RovingFocus::new(Axis::Vertical),
             inputs: Inputs {
                 agents: agent_inputs,
                 max_agents_per_task,
@@ -553,10 +564,13 @@ impl SettingsWindow {
             system_check,
             check_again_focus,
             page_focus: cx.focus_handle().tab_stop(true),
-            page_scroll: ScrollHandle::new(),
+            page_scroll,
+            page_reveal,
+            block_focus: Vec::new(),
             subscriptions,
             remove_dialog: None,
             remove_focus: cx.focus_handle().tab_stop(true),
+            root_focus: cx.focus_handle(),
         };
 
         for index in 0..projects.len() {
@@ -566,6 +580,11 @@ impl SettingsWindow {
             }
         }
 
+        // The page draws the rows of the prompts itself, so a change must redraw this window.
+        let prompts_changed = cx.observe(&this.prompts, |_, _, cx| cx.notify());
+        this.subscriptions.push(prompts_changed);
+
+        this.sync_nav(cx);
         this.focus_nav(window, cx);
         this.refresh_permission(cx);
         this.refresh_prompts(cx);
@@ -633,8 +652,12 @@ impl SettingsWindow {
             }
 
             match window.focus_lost_restore_target(cx) {
-                Some(target) => window.focus(&target, cx),
-                None => this.focus_nav(window, cx),
+                Some(target)
+                    if target != this.root_focus && !this.block_focus.contains(&target) =>
+                {
+                    window.focus(&target, cx);
+                }
+                _ => this.focus_nav(window, cx),
             }
         })
     }
@@ -745,20 +768,52 @@ impl SettingsWindow {
             .map_or(Page::Agents, |entry| Page::Project(entry.project.id))
     }
 
+    /// Gives every nav row a focus handle and makes the open page's row the Tab stop.
+    fn sync_nav(&mut self, cx: &mut App) {
+        let keys: Vec<ElementId> =
+            (0..Page::SECTIONS.len())
+                .map(|index| ElementId::from(("settings-section", index)))
+                .chain(self.state.read(cx).projects.iter().map(|entry| {
+                    ElementId::from(format!("settings-project-{}", entry.project.id.0))
+                }))
+                .collect();
+
+        self.nav.sync_keyed(&keys, cx);
+
+        let active = self.nav_index(self.page, cx);
+        self.nav.set_active(active);
+    }
+
+    fn nav_handle(&self, index: usize) -> Option<FocusHandle> {
+        (index < self.nav.len()).then(|| self.nav.handle(index))
+    }
+
+    #[cfg(test)]
+    fn nav_handles(&self) -> Vec<FocusHandle> {
+        (0..self.nav.len())
+            .map(|index| self.nav.handle(index))
+            .collect()
+    }
+
     fn focus_nav(&self, window: &mut Window, cx: &mut App) {
-        if let Some(handle) = self.nav_focus.get(self.nav_index(self.page, cx)) {
-            window.focus(handle, cx);
+        if let Some(handle) = self.nav_handle(self.nav_index(self.page, cx)) {
+            window.focus(&handle, cx);
         }
     }
 
     fn move_selection(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
-        let last = self.nav_focus.len().saturating_sub(1);
-        let next = self
-            .nav_index(self.page, cx)
-            .saturating_add_signed(step)
-            .min(last);
+        let next = self.nav_index(self.page, cx).saturating_add_signed(step);
+
+        self.select_row(next, window, cx);
+    }
+
+    /// Opens the page of nav row `index`, or of the nearest row, and moves focus to it.
+    fn select_row(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let last = self.nav.len().saturating_sub(1);
+        let next = index.min(last);
 
         self.page = self.page_at(next, cx);
+        self.sync_nav(cx);
         self.page_scroll.set_offset(point(px(0.), px(0.)));
         self.refresh_permission(cx);
         self.refresh_system_check(cx);
@@ -795,8 +850,8 @@ impl SettingsWindow {
                 this.focus_nav(window, cx);
             }));
 
-        if let Some(handle) = self.nav_focus.get(index) {
-            row = row.track_focus(handle);
+        if let Some(handle) = self.nav_handle(index) {
+            row = row.track_focus(&handle);
         }
 
         if let Some(tile) = tile {
@@ -829,6 +884,19 @@ impl SettingsWindow {
             }))
             .on_action(cx.listener(|this, _: &SelectNext, window, cx| {
                 this.move_selection(1, window, cx);
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.modifiers.modified() {
+                    return;
+                }
+
+                match event.keystroke.key.as_str() {
+                    "home" => this.select_row(0, window, cx),
+                    "end" => this.select_row(usize::MAX, window, cx),
+                    _ => return,
+                }
+
+                cx.stop_propagation();
             }))
             .w(px(232.))
             .flex_none()
@@ -879,16 +947,40 @@ impl Render for SettingsWindow {
             colors.accent,
         );
 
+        self.sync_nav(cx);
+
         let nav = self.nav(window, cx);
-        let page = self.render_page(cx);
+        let page = self.render_page(window, cx);
+        while self.block_focus.len() < page.blocks.len() {
+            self.block_focus.push(cx.focus_handle());
+        }
+        let handles: Vec<FocusHandle> = self.block_focus[..page.blocks.len()].to_vec();
+        let blocks: Vec<_> = page
+            .blocks
+            .into_iter()
+            .zip(&handles)
+            .enumerate()
+            .map(|(index, (block, handle))| {
+                ignore_press(
+                    div()
+                        .id(("settings-block", index))
+                        .debug_selector(|| format!("settings-block-{index}"))
+                        .track_focus(handle)
+                        .flex_none()
+                        .max_w(px(660.))
+                        .child(block),
+                )
+            })
+            .collect();
         let scrolls_with_keys = matches!(self.page, Page::Keyboard | Page::Usage);
         let scroll = self.page_scroll.clone();
         let gap_drag = drag_region("settings-gap-drag", window, cx);
         let page_drag = drag_region("settings-page-drag", window, cx);
 
-        swarm_ui::tab_navigation(
+        swarm_ui::tab_navigation(ignore_press(
             div()
                 .id("settings")
+                .track_focus(&self.root_focus)
                 .key_context(root_context())
                 .on_action(cx.listener(|_, _: &CloseSettings, window, _| window.remove_window()))
                 .relative()
@@ -897,7 +989,7 @@ impl Render for SettingsWindow {
                 .text_color(fg)
                 .font_family(UI_FONT)
                 .text_size(px(13.)),
-        )
+        ))
         .child(
             h_flex().size_full().child(nav).child(
                 v_flex()
@@ -929,9 +1021,20 @@ impl Render for SettingsWindow {
                                         .flex_none(),
                                 )
                                 .child(
-                                    div()
-                                        .id("settings-page")
-                                        .debug_selector(|| "settings-page".to_owned())
+                                    reveal_focused(
+                                        v_flex()
+                                            .debug_selector(|| "settings-page".to_owned())
+                                            .flex_1()
+                                            .min_h_0()
+                                            .px(px(48.))
+                                            .pb(px(36.))
+                                            .gap(px(page.gap)),
+                                        "settings-page",
+                                        &self.page_reveal,
+                                        handles,
+                                        cx,
+                                    )
+                                    .children(blocks)
                                         .when(scrolls_with_keys, |page_area| {
                                             let scroll = scroll.clone();
 
@@ -950,19 +1053,7 @@ impl Render for SettingsWindow {
                                                         cx.stop_propagation();
                                                     }
                                                 })
-                                        })
-                                        .flex_1()
-                                        .min_h_0()
-                                        .overflow_y_scroll()
-                                        .track_scroll(&self.page_scroll)
-                                        .child(
-                                            v_flex()
-                                                .max_w(px(756.))
-                                                .px(px(48.))
-                                                .pb(px(36.))
-                                                .gap(px(26.))
-                                                .child(page),
-                                        ),
+                                        }),
                                 ),
                     ),
             ),
@@ -1601,6 +1692,7 @@ mod tests {
     use gpui::{Focusable, TestAppContext};
 
     use super::*;
+    use crate::live_probe::{assert_named, reversed};
     use crate::notifications::harness::{Recorder, known_authorization};
     use crate::notifications::{Authorization, Delivery};
 
@@ -1679,7 +1771,9 @@ mod tests {
         let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
         let row = window
             .read_with(&visual, |settings, cx| {
-                settings.nav_focus[settings.nav_index(Page::Notifications, cx)].clone()
+                settings
+                    .nav
+                    .handle(settings.nav_index(Page::Notifications, cx))
             })
             .expect("window is open");
         assert!(visual.update(|window, _| row.is_focused(window)));
@@ -1700,7 +1794,7 @@ mod tests {
 
         let nav = window
             .read_with(&visual, |settings, cx| {
-                settings.nav_focus[settings.nav_index(Page::Agents, cx)].clone()
+                settings.nav.handle(settings.nav_index(Page::Agents, cx))
             })
             .expect("window is open");
         assert!(visual.update(|window, _| nav.is_focused(window)));
@@ -1812,6 +1906,185 @@ mod tests {
             .read_with(&visual, |settings, _| settings.page())
             .expect("window is open");
         assert_eq!(page, Page::Terminals);
+    }
+
+    #[gpui::test]
+    fn only_the_open_page_is_a_tab_stop_in_the_page_list(cx: &mut TestAppContext) {
+        setup(cx);
+        let window = open_settings(cx);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        let stops = |visual: &mut gpui::VisualTestContext| -> Vec<bool> {
+            window
+                .read_with(visual, |settings, _| {
+                    settings
+                        .nav_handles()
+                        .iter()
+                        .map(|handle| handle.tab_stop)
+                        .collect()
+                })
+                .expect("window is open")
+        };
+        let opening = stops(&mut visual);
+        visual.dispatch_action(SelectNext);
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let after = stops(&mut visual);
+
+        assert_eq!(opening.iter().filter(|stop| **stop).count(), 1);
+        assert!(opening[1], "Agents is the open page");
+        assert_eq!(after.iter().filter(|stop| **stop).count(), 1);
+        assert!(after[2], "Terminals is the next page");
+    }
+
+    #[gpui::test]
+    fn one_tab_leaves_the_page_list(cx: &mut TestAppContext) {
+        cx.update(swarm_ui::init);
+        setup(cx);
+        let window = open_settings(cx);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let nav = window
+            .read_with(&visual, |settings, _| settings.nav_handles())
+            .expect("window is open");
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+
+        visual.simulate_keystrokes("tab");
+
+        let in_nav = visual.update(|window, _| nav.iter().any(|handle| handle.is_focused(window)));
+        assert!(!in_nav, "Tab stayed in the list");
+    }
+
+    #[gpui::test]
+    fn home_and_end_open_the_first_and_last_page(cx: &mut TestAppContext) {
+        setup(cx);
+        let window = open_settings(cx);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let page = |visual: &mut gpui::VisualTestContext| {
+            window
+                .read_with(visual, |settings, _| settings.page())
+                .expect("window is open")
+        };
+
+        visual.simulate_keystrokes("end");
+        let last = page(&mut visual);
+        visual.simulate_keystrokes("home");
+        let first = page(&mut visual);
+
+        let expected_last = window
+            .read_with(&visual, |settings, cx| {
+                settings.page_at(settings.nav.len() - 1, cx)
+            })
+            .expect("window is open");
+        assert!(matches!(last, Page::Project(_)));
+        assert_eq!(last, expected_last);
+        assert_eq!(first, Page::General);
+    }
+
+    /// Opens `page` in a tall window with focus on its row in the list, and walks Tab and
+    /// Shift-Tab through the window.
+    fn walk(page: impl Fn(&SettingsWindow, &App) -> Page, cx: &mut TestAppContext) -> Walk {
+        cx.update(swarm_ui::init);
+        setup(cx);
+        let window = open_settings(cx);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(size(px(1280.), px(2400.)));
+
+        window
+            .update(&mut visual, |settings, window, cx| {
+                let wanted = page(settings, cx);
+                settings.select_page(wanted, cx);
+                settings.sync_nav(cx);
+                settings.focus_nav(window, cx);
+            })
+            .expect("window is open");
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        visual.run_until_parked();
+
+        let root = window
+            .read_with(&visual, |settings, _| settings.root_focus.clone())
+            .expect("window is open");
+
+        Walk {
+            forward: swarm_ui::test_support::tab_walk(&mut visual, &root, "tab"),
+            backward: swarm_ui::test_support::tab_walk(&mut visual, &root, "shift-tab"),
+        }
+    }
+
+    struct Walk {
+        forward: Vec<String>,
+        backward: Vec<String>,
+    }
+
+    #[gpui::test]
+    fn tab_walks_the_general_page_in_order_and_shift_tab_walks_it_back(cx: &mut TestAppContext) {
+        let walk = walk(|_, _| Page::General, cx);
+
+        assert_eq!(
+            walk.forward,
+            [
+                "ListItem General",
+                "Button Check again",
+                "Button Allow notifications",
+                "Link Repository, vscode-icons on GitHub",
+                "Link License, CC BY-SA 4.0",
+            ]
+        );
+        assert_eq!(walk.backward, reversed(&walk.forward));
+        assert_named(&walk.forward);
+    }
+
+    #[gpui::test]
+    fn tab_walks_a_project_page_and_shift_tab_walks_it_back(cx: &mut TestAppContext) {
+        let walk = walk(
+            |settings, cx| settings.page_at(Page::SECTIONS.len(), cx),
+            cx,
+        );
+
+        assert_eq!(
+            walk.forward,
+            [
+                "ListItem swarm",
+                "ComboBox Base branch",
+                "TextInput Worktree folder",
+                "TextInput Port range",
+                "TextInput Ports per worktree",
+                "MultilineTextInput Setup script",
+                "TextInput File to copy 1",
+                "Button Stop copying .env",
+                "TextInput File to copy 2",
+                "Button Stop copying CLAUDE.local.md",
+                "Button Add file",
+                "TextInput Check 1",
+                "Button Remove cargo test --workspace",
+                "TextInput Check 2",
+                "Button Remove cargo clippy --workspace",
+                "Button Add check",
+                "Switch Required to pass",
+                "Button Run checks now",
+                "Button Open worker",
+                "Button Remove project\u{2026}",
+            ]
+        );
+        assert_eq!(walk.backward, reversed(&walk.forward));
+        assert_named(&walk.forward);
+    }
+
+    #[gpui::test]
+    fn tab_scrolls_a_control_below_the_fold_into_view(cx: &mut TestAppContext) {
+        let (window, mut visual) = short_page(Page::Appearance, cx);
+        let scrolled = |visual: &mut gpui::VisualTestContext| {
+            window
+                .read_with(visual, |settings, _| settings.page_scroll.offset().y)
+                .expect("window is open")
+        };
+        let before = scrolled(&mut visual);
+
+        for _ in 0..6 {
+            visual.simulate_keystrokes("tab");
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+        }
+
+        assert_eq!(before, Pixels::ZERO);
+        assert!(scrolled(&mut visual) < Pixels::ZERO);
     }
 
     fn temp_path(name: &str) -> PathBuf {
@@ -2240,6 +2513,57 @@ mod tests {
         std::fs::remove_file(&path).ok();
         assert_eq!(before, Some(Permission::NotAllowed));
         assert_eq!(after, Some(Permission::Allowed));
+    }
+
+    #[gpui::test]
+    fn a_click_on_blank_space_in_a_block_keeps_focus(cx: &mut TestAppContext) {
+        let path = temp_path("blank-click");
+        let (_state, _recorder, mut visual) =
+            notifications_page(&path, None, Permission::NotAllowed, cx);
+        click("open-system-settings", &mut visual);
+        let before = visual.update(|window, cx| window.focused(cx));
+
+        let block = visual
+            .debug_bounds("settings-block-0")
+            .expect("block is on screen");
+        let blank = block.bottom_right() - point(px(2.), px(2.));
+        visual.simulate_click(blank, gpui::Modifiers::none());
+        visual.run_until_parked();
+
+        let after = visual.update(|window, cx| window.focused(cx));
+        std::fs::remove_file(&path).ok();
+        assert!(before.is_some());
+        assert_eq!(after, before);
+    }
+
+    #[gpui::test]
+    fn focus_goes_to_a_named_control_when_open_system_settings_goes_away(cx: &mut TestAppContext) {
+        let path = temp_path("button-gone");
+        let (_state, recorder, mut visual) =
+            notifications_page(&path, None, Permission::NotAllowed, cx);
+        click("open-system-settings", &mut visual);
+
+        recorder.permission.set(Permission::Allowed);
+        visual.deactivate_window();
+        visual.update(|window, _| window.activate_window());
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        visual.run_until_parked();
+
+        let root = visual.update(|window, cx| {
+            window
+                .root::<SettingsWindow>()
+                .flatten()
+                .map(|settings| settings.read(cx).root_focus.clone())
+        });
+        let root = root.expect("window has a root");
+        let stop = swarm_ui::test_support::focused_stop(&mut visual, &root);
+        std::fs::remove_file(&path).ok();
+        assert!(visual.debug_bounds("open-system-settings").is_none());
+        assert!(
+            !matches!(stop.as_str(), "unnamed" | "nothing" | "not drawn"),
+            "{stop}"
+        );
     }
 
     #[gpui::test]

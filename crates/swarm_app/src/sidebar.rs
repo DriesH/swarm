@@ -4,9 +4,11 @@ use std::path::Path;
 use std::rc::Rc;
 
 use gpui::{
-    Context, FontWeight, Global, Hsla, Pixels, Role, SharedString, WeakEntity, Window, div, px,
+    Context, ElementId, FocusHandle, FontWeight, Global, Hsla, KeyDownEvent, Pixels, Role,
+    SharedString, WeakEntity, Window, div, px,
 };
 use swarm_ui::prelude::*;
+use swarm_ui::roving::RovingFocus;
 
 use crate::actions::ToggleCommandPalette;
 use crate::model::{Agent, AgentKind, Project, ProjectId, TaskStatus, Terminal};
@@ -32,7 +34,8 @@ pub(crate) fn render(
         .data
         .projects
         .iter()
-        .map(|project| project_row(workspace, project, cx))
+        .enumerate()
+        .map(|(index, project)| project_row(workspace, project, index, cx))
         .collect();
 
     let agents = if workspace.has_no_projects() {
@@ -50,20 +53,57 @@ pub(crate) fn render(
         .gap(px(2.))
         .child(logo_row(window, cx))
         .child(
-            heading("Projects", 14.).h(px(30.)).child(
-                IconButton::new("add-project", IconName::Plus, "Add project")
-                    .size(IconButtonSize::Medium)
-                    .debug_selector(|| "add-project".to_owned())
-                    .on_click(cx.listener(|_, _, window, cx| Workspace::pick_project(window, cx))),
-            ),
+            heading("projects-heading", "Projects", 14.)
+                .h(px(30.))
+                .child(
+                    IconButton::new("add-project", IconName::Plus, "Add project")
+                        .size(IconButtonSize::Medium)
+                        .debug_selector(|| "add-project".to_owned())
+                        .on_click(
+                            cx.listener(|_, _, window, cx| Workspace::pick_project(window, cx)),
+                        ),
+                ),
         )
-        .children(projects)
+        .child(
+            v_flex()
+                .id("project-list")
+                .role(Role::List)
+                .aria_label("Projects")
+                .on_key_down(cx.listener(|workspace, event: &KeyDownEvent, window, cx| {
+                    if workspace
+                        .project_roving
+                        .handle_key(&event.keystroke, window, cx)
+                        .is_some()
+                    {
+                        cx.stop_propagation();
+                    }
+                }))
+                .children(projects),
+        )
         .children(daemon_status(workspace, cx))
         .children(error_message(workspace, cx))
         .when(!agents.is_empty(), |sidebar| {
             sidebar
-                .child(heading("Agents", 18.).debug_selector(|| "agents-heading".to_owned()))
-                .children(agents)
+                .child(
+                    heading("agents-heading", "Agents", 18.)
+                        .debug_selector(|| "agents-heading".to_owned()),
+                )
+                .child(
+                    v_flex()
+                        .id("agent-list")
+                        .role(Role::List)
+                        .aria_label("Agents")
+                        .on_key_down(cx.listener(|workspace, event: &KeyDownEvent, window, cx| {
+                            if workspace
+                                .agent_roving
+                                .handle_key(&event.keystroke, window, cx)
+                                .is_some()
+                            {
+                                cx.stop_propagation();
+                            }
+                        }))
+                        .children(agents),
+                )
         })
         .child(div().flex_1())
         .children(usage_card(workspace))
@@ -83,7 +123,10 @@ pub(crate) fn render_rail(
         .data
         .projects
         .iter()
-        .map(|project| project_button(workspace, project, cx))
+        .enumerate()
+        .map(|(index, project)| {
+            project_button(workspace, project, track_focus.then_some(index), cx)
+        })
         .collect();
 
     let terminals: Vec<RailButton> = if workspace.has_no_projects() {
@@ -91,7 +134,8 @@ pub(crate) fn render_rail(
     } else {
         rows(workspace)
             .into_iter()
-            .map(|row| terminal_button(workspace, row, cx))
+            .enumerate()
+            .map(|(index, row)| terminal_button(workspace, row, track_focus.then_some(index), cx))
             .collect()
     };
 
@@ -121,6 +165,19 @@ pub(crate) fn render_rail(
         .child(
             div()
                 .id("rail-items")
+                .on_key_down(cx.listener(|workspace, event: &KeyDownEvent, window, cx| {
+                    let roving = if workspace.project_roving.focused(window, cx).is_some() {
+                        &mut workspace.project_roving
+                    } else {
+                        &mut workspace.agent_roving
+                    };
+
+                    if roving.focused(window, cx).is_some()
+                        && roving.handle_key(&event.keystroke, window, cx).is_some()
+                    {
+                        cx.stop_propagation();
+                    }
+                }))
                 .flex_1()
                 .min_h_0()
                 .w_full()
@@ -149,9 +206,11 @@ fn rail_divider(line: Hsla) -> gpui::Div {
     div().w(px(32.)).h(px(1.)).flex_none().bg(line).my(px(4.))
 }
 
+/// `focus_index` is the row's place in the project list when the rail holds the focus.
 fn project_button(
     workspace: &Workspace,
     project: &Project,
+    focus_index: Option<usize>,
     cx: &mut Context<Workspace>,
 ) -> RailButton {
     let id = project.id;
@@ -166,21 +225,33 @@ fn project_button(
         None
     };
 
-    RailButton::new(
+    let button = RailButton::new(
         ("rail-project", id.0 as usize),
         label.clone(),
         ProjectTile::new(project.letter, project.tile_color).size(px(22.)),
-    )
-    .tooltip(label)
-    .toggle_state(workspace.active_project == id)
-    .badge(badge)
-    .debug_selector(move || format!("rail-project-{}", id.0))
-    .on_click(cx.listener(move |workspace, _, _, cx| {
-        workspace.select_project(id, cx);
-    }))
+    );
+    let button = match focus_index.and_then(|index| handle_at(&workspace.project_roving, index)) {
+        Some(handle) => button.track_focus(&handle),
+        None => button,
+    };
+
+    button
+        .tooltip(label)
+        .toggle_state(workspace.active_project == id)
+        .badge(badge)
+        .debug_selector(move || format!("rail-project-{}", id.0))
+        .on_click(cx.listener(move |workspace, _, _, cx| {
+            workspace.select_project(id, cx);
+        }))
 }
 
-fn terminal_button(workspace: &Workspace, row: Row<'_>, cx: &mut Context<Workspace>) -> RailButton {
+/// `focus_index` is the row's place in the agent list when the rail holds the focus.
+fn terminal_button(
+    workspace: &Workspace,
+    row: Row<'_>,
+    focus_index: Option<usize>,
+    cx: &mut Context<Workspace>,
+) -> RailButton {
     let terminal_icon = || {
         Icon::new(IconName::Terminal)
             .size(IconSize::Large)
@@ -234,6 +305,11 @@ fn terminal_button(workspace: &Workspace, row: Row<'_>, cx: &mut Context<Workspa
         }
     };
 
+    let button = match focus_index.and_then(|index| handle_at(&workspace.agent_roving, index)) {
+        Some(handle) => button.track_focus(&handle),
+        None => button,
+    };
+
     button
         .toggle_state(workspace.focused_terminal == Some(terminal))
         .on_click(cx.listener(move |workspace, _, _, cx| {
@@ -241,44 +317,47 @@ fn terminal_button(workspace: &Workspace, row: Row<'_>, cx: &mut Context<Workspa
         }))
 }
 
-fn daemon_status(workspace: &Workspace, cx: &mut Context<Workspace>) -> Option<gpui::AnyElement> {
+fn daemon_status(workspace: &Workspace, cx: &mut Context<Workspace>) -> Option<LiveRegion> {
     match &workspace.source {
         DataSource::Connecting => Some(
-            h_flex()
-                .id("daemon-status")
-                .debug_selector(|| "daemon-status".to_owned())
-                .role(Role::Status)
-                .aria_label("Connecting")
-                .h(px(28.))
-                .gap(px(8.))
-                .px(px(8.))
-                .child(StatusRing::new(AgentStatus::Working))
-                .child(Label::new("Connecting").color(Color::Muted))
-                .into_any_element(),
+            LiveRegion::status("daemon-status", "Connecting").child(
+                h_flex()
+                    .debug_selector(|| "daemon-status".to_owned())
+                    .h(px(28.))
+                    .gap(px(8.))
+                    .px(px(8.))
+                    .child(StatusRing::new(AgentStatus::Working))
+                    .child(Label::new("Connecting").color(Color::Muted)),
+            ),
         ),
         DataSource::Unavailable { reason } => Some(
-            h_flex()
-                .id("daemon-status")
-                .debug_selector(|| "daemon-status".to_owned())
-                .role(Role::Status)
-                .aria_label(format!("Daemon not running: {reason}"))
-                .min_h(px(28.))
-                .gap(px(8.))
-                .px(px(8.))
-                .child(
-                    div()
-                        .flex_1()
-                        .child(Label::new("Daemon not running").color(Color::Muted)),
-                )
-                .child(
-                    Button::new("retry-daemon", "Retry")
-                        .debug_selector(|| "retry-daemon".to_owned())
-                        .on_click(cx.listener(|workspace, _, _, cx| workspace.retry_daemon(cx))),
-                )
-                .into_any_element(),
+            LiveRegion::alert("daemon-status", format!("Daemon not running: {reason}")).child(
+                h_flex()
+                    .debug_selector(|| "daemon-status".to_owned())
+                    .min_h(px(28.))
+                    .gap(px(8.))
+                    .px(px(8.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(Label::new("Daemon not running").color(Color::Muted)),
+                    )
+                    .child(
+                        Button::new("retry-daemon", "Retry")
+                            .debug_selector(|| "retry-daemon".to_owned())
+                            .on_click(
+                                cx.listener(|workspace, _, _, cx| workspace.retry_daemon(cx)),
+                            ),
+                    ),
+            ),
         ),
         DataSource::Sample | DataSource::Live => None,
     }
+}
+
+/// The error text as an alert, so VoiceOver speaks it when it appears.
+fn error_region(message: &SharedString) -> LiveRegion {
+    LiveRegion::alert("sidebar-error", message.clone()).child(message.clone())
 }
 
 fn error_message(workspace: &Workspace, cx: &mut Context<Workspace>) -> Option<impl IntoElement> {
@@ -287,10 +366,7 @@ fn error_message(workspace: &Workspace, cx: &mut Context<Workspace>) -> Option<i
 
     Some(
         h_flex()
-            .id("sidebar-error")
             .debug_selector(|| "sidebar-error".to_owned())
-            .role(Role::Alert)
-            .aria_label(message.clone())
             .items_start()
             .gap(px(6.))
             .mx(px(8.))
@@ -301,7 +377,7 @@ fn error_message(workspace: &Workspace, cx: &mut Context<Workspace>) -> Option<i
                     .min_w_0()
                     .text_size(px(12.))
                     .text_color(color)
-                    .child(message),
+                    .child(error_region(&message)),
             )
             .child(
                 IconButton::new("dismiss-error", IconName::Close, "Dismiss message")
@@ -344,17 +420,25 @@ fn logo_row(window: &mut Window, cx: &mut App) -> impl IntoElement {
         )
 }
 
-fn heading(title: &'static str, top_margin: f32) -> gpui::Div {
-    h_flex().h(px(28.)).pl(px(8.)).mt(px(top_margin)).child(
-        div()
-            .flex_1()
-            .child(Label::new(title).size(LabelSize::Small).color(Color::Faint)),
-    )
+fn heading(id: &'static str, title: &'static str, top_margin: f32) -> gpui::Div {
+    h_flex()
+        .h(px(28.))
+        .pl(px(8.))
+        .mt(px(top_margin))
+        .child(div().flex_1().child(heading_label(id, title)))
+}
+
+fn heading_label(id: &'static str, title: &'static str) -> Label {
+    Label::new(title)
+        .heading(id, 2)
+        .size(LabelSize::Small)
+        .color(Color::Faint)
 }
 
 fn project_row(
     workspace: &Workspace,
     project: &Project,
+    index: usize,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement + use<> {
     let id = project.id;
@@ -390,6 +474,7 @@ fn project_row(
         .start_slot(tile)
         .end_slot(end)
         .on_click(cx.listener(move |workspace, _, _, cx| {
+            workspace.project_roving.set_active(index);
             workspace.select_project(id, cx);
         }));
 
@@ -598,15 +683,45 @@ fn rows(workspace: &Workspace) -> Vec<Row<'_>> {
     rows
 }
 
+/// The handle of row `index`, or none when the roving focus has not synced to this many rows.
+fn handle_at(roving: &RovingFocus, index: usize) -> Option<FocusHandle> {
+    (index < roving.len()).then(|| roving.handle(index))
+}
+
+/// The key of each row of the agent list, in order. The roving focus keeps a handle per key.
+pub(crate) fn row_keys(workspace: &Workspace) -> Vec<ElementId> {
+    if workspace.has_no_projects() {
+        return Vec::new();
+    }
+
+    rows(workspace)
+        .iter()
+        .map(|row| match row {
+            Row::Agent(agent, _) => ElementId::from(("agent", agent.id.0 as usize)),
+            Row::Process(terminal, ..) => ElementId::from(("process", terminal.id.0 as usize)),
+            Row::User(terminal) => ElementId::from(("user-terminal", terminal.id.0 as usize)),
+        })
+        .collect()
+}
+
 fn agent_rows(workspace: &Workspace, cx: &mut Context<Workspace>) -> Vec<gpui::AnyElement> {
     rows(workspace)
         .into_iter()
-        .map(|row| match row {
-            Row::Agent(agent, indent) => agent_row(workspace, agent, indent, cx),
-            Row::Process(terminal, owner, indent) => {
-                process_row(workspace, terminal, owner, indent, cx)
+        .enumerate()
+        .map(|(index, row)| {
+            let list_row = match row {
+                Row::Agent(agent, indent) => agent_list_row(workspace, agent, indent, cx),
+                Row::Process(terminal, owner, indent) => {
+                    process_row(workspace, terminal, owner, indent, cx)
+                }
+                Row::User(terminal) => user_row(workspace, terminal, cx),
+            };
+
+            match handle_at(&workspace.agent_roving, index) {
+                Some(handle) => list_row.track_focus(&handle),
+                None => list_row,
             }
-            Row::User(terminal) => user_row(workspace, terminal, cx),
+            .into_any_element()
         })
         .collect()
 }
@@ -617,7 +732,7 @@ fn process_row(
     owner: &str,
     indent: usize,
     cx: &mut Context<Workspace>,
-) -> gpui::AnyElement {
+) -> ListRow {
     let id = terminal.id;
 
     ListRow::new(("process", id.0 as usize), terminal.title.clone())
@@ -635,7 +750,6 @@ fn process_row(
         .on_click(cx.listener(move |workspace, _, _, cx| {
             workspace.focus_terminal(id, cx);
         }))
-        .into_any_element()
 }
 
 /// What VoiceOver reads for a process terminal, the agent that started it and how it is
@@ -658,11 +772,7 @@ fn user_label(workspace: &Workspace, terminal: &Terminal) -> String {
     )
 }
 
-fn user_row(
-    workspace: &Workspace,
-    terminal: &Terminal,
-    cx: &mut Context<Workspace>,
-) -> gpui::AnyElement {
+fn user_row(workspace: &Workspace, terminal: &Terminal, cx: &mut Context<Workspace>) -> ListRow {
     let id = terminal.id;
 
     let end = h_flex()
@@ -675,6 +785,7 @@ fn user_row(
                 format!("Close {}", terminal.title),
             )
             .debug_selector(move || format!("sidebar-close-terminal-{}", id.0))
+            .skip_tab_stop()
             .on_click(cx.listener(move |workspace, _, window, cx| {
                 // The row under the button must not select the terminal as well.
                 cx.stop_propagation();
@@ -696,16 +807,6 @@ fn user_row(
         .on_click(cx.listener(move |workspace, _, _, cx| {
             workspace.focus_terminal(id, cx);
         }))
-        .into_any_element()
-}
-
-fn agent_row(
-    workspace: &Workspace,
-    agent: &Agent,
-    indent: usize,
-    cx: &mut Context<Workspace>,
-) -> gpui::AnyElement {
-    agent_list_row(workspace, agent, indent, cx).into_any_element()
 }
 
 /// The icon and the name of an agent kind.
@@ -818,15 +919,11 @@ fn usage_group(section: &UsageSection) -> impl IntoElement + use<> {
         let problem_id = format!("{id}-problem");
 
         div()
-            .id(SharedString::from(problem_id.clone()))
-            .debug_selector(move || problem_id)
-            .role(Role::Status)
-            .aria_label(spoken.clone())
-            .child(
-                Label::new(shown.clone())
-                    .size(LabelSize::XSmall)
-                    .color(Color::Faint),
-            )
+            .debug_selector({
+                let selector = problem_id.clone();
+                move || selector
+            })
+            .child(problem_region(problem_id, shown, spoken))
     });
 
     v_flex()
@@ -847,6 +944,15 @@ fn usage_group(section: &UsageSection) -> impl IntoElement + use<> {
                 .map(|(index, window)| usage_meter(&id, index, window)),
         )
         .children(problem)
+}
+
+/// Why a usage figure is missing, spoken when it appears.
+fn problem_region(id: String, shown: &str, spoken: &str) -> LiveRegion {
+    LiveRegion::status(SharedString::from(id), spoken.to_owned()).child(
+        Label::new(shown.to_owned())
+            .size(LabelSize::XSmall)
+            .color(Color::Faint),
+    )
 }
 
 fn usage_meter(group: &SharedString, index: usize, row: &WindowRow) -> UsageMeter {
@@ -1986,5 +2092,302 @@ mod tests {
         let closed = workspace.read_with(cx, |workspace, _| workspace.overlay.is_none());
         assert!(closed, "Escape did not reach the dialog");
         assert!(row_is_focused(&workspace, cx));
+    }
+
+    mod a11y {
+        use gpui::Stateful;
+        use gpui::accesskit::Role as NodeRole;
+
+        use super::*;
+        use crate::live_probe::{Seen, see_in};
+
+        fn heading_of(
+            label: Label,
+            cx: &mut VisualTestContext,
+        ) -> (Option<NodeRole>, Option<usize>) {
+            cx.update(|window, cx| {
+                let mut element = label.render(window, cx).into_any_element();
+                let node = element
+                    .downcast_mut::<Stateful<gpui::Div>>()
+                    .expect("a heading is a node");
+
+                (node.a11y_role(), {
+                    let mut data = gpui::accesskit::Node::new(NodeRole::Unknown);
+                    node.write_a11y_info(&mut data);
+                    data.level()
+                })
+            })
+        }
+
+        fn seen(role: NodeRole, live: Live, value: &str) -> Seen {
+            Seen {
+                role: Some(role),
+                label: None,
+                value: Some(value.to_owned()),
+                live: Some(live),
+                heading_level: None,
+                read_only: false,
+            }
+        }
+
+        #[gpui::test]
+        fn the_projects_and_agents_headings_are_level_two_headings(cx: &mut TestAppContext) {
+            let (_, cx) = setup(cx);
+
+            let projects = heading_of(heading_label("projects-heading", "Projects"), cx);
+            let agents = heading_of(heading_label("agents-heading", "Agents"), cx);
+
+            assert_eq!(projects, (Some(NodeRole::Heading), Some(2)));
+            assert_eq!(agents, (Some(NodeRole::Heading), Some(2)));
+        }
+
+        #[gpui::test]
+        fn connecting_is_a_polite_status(cx: &mut TestAppContext) {
+            let (workspace, cx) = setup(cx);
+            workspace.update(cx, |workspace, _| workspace.source = DataSource::Connecting);
+
+            let region = workspace.update(cx, |workspace, cx| daemon_status(workspace, cx));
+            let region = region.expect("a status while connecting");
+
+            assert_eq!(
+                see_in(region, cx),
+                seen(NodeRole::Status, Live::Polite, "Connecting")
+            );
+        }
+
+        #[gpui::test]
+        fn a_missing_daemon_is_an_assertive_alert_with_the_reason(cx: &mut TestAppContext) {
+            let (workspace, cx) = setup(cx);
+            workspace.update(cx, |workspace, _| {
+                workspace.source = DataSource::Unavailable {
+                    reason: "no daemon".into(),
+                };
+            });
+
+            let region = workspace.update(cx, |workspace, cx| daemon_status(workspace, cx));
+            let region = region.expect("an alert without a daemon");
+
+            assert_eq!(
+                see_in(region, cx),
+                seen(
+                    NodeRole::Alert,
+                    Live::Assertive,
+                    "Daemon not running: no daemon"
+                )
+            );
+        }
+
+        #[gpui::test]
+        fn the_sidebar_error_is_an_assertive_alert(cx: &mut TestAppContext) {
+            let (_, cx) = setup(cx);
+
+            let region = error_region(&SharedString::from("not a git repository"));
+
+            assert_eq!(
+                see_in(region, cx),
+                seen(NodeRole::Alert, Live::Assertive, "not a git repository")
+            );
+        }
+
+        #[gpui::test]
+        fn a_usage_problem_is_a_polite_status_with_the_spoken_text(cx: &mut TestAppContext) {
+            let (_, cx) = setup(cx);
+
+            let region = problem_region(
+                "usage-claude-problem".to_owned(),
+                "Not signed in",
+                "Claude Code is not signed in",
+            );
+
+            assert_eq!(
+                see_in(region, cx),
+                seen(
+                    NodeRole::Status,
+                    Live::Polite,
+                    "Claude Code is not signed in"
+                )
+            );
+        }
+
+        /// The workspace with the list focus handles synced, as after a frame.
+        fn list_counts(
+            workspace: &gpui::Entity<Workspace>,
+            cx: &mut VisualTestContext,
+        ) -> ((usize, usize), (usize, usize)) {
+            redraw(cx);
+
+            workspace.read_with(cx, |workspace, _| {
+                let stops = |roving: &RovingFocus| {
+                    (0..roving.len())
+                        .filter(|index| roving.handle(*index).tab_stop)
+                        .count()
+                };
+
+                (
+                    (
+                        workspace.project_roving.len(),
+                        stops(&workspace.project_roving),
+                    ),
+                    (workspace.agent_roving.len(), stops(&workspace.agent_roving)),
+                )
+            })
+        }
+
+        #[gpui::test]
+        fn focus_that_lands_on_the_collapsed_sidebar_goes_to_a_rail_button(
+            cx: &mut TestAppContext,
+        ) {
+            let (workspace, cx) = setup(cx);
+            collapse(&workspace, cx);
+            redraw(cx);
+
+            let landing = workspace.read_with(cx, |workspace, _| {
+                workspace.sidebar_landing(workspace.sidebar_focus.clone())
+            });
+            cx.update(|window, cx| landing.focus(window, cx));
+            let root = workspace.read_with(cx, |workspace, _| workspace.sidebar_focus.clone());
+
+            let stop = swarm_ui::test_support::focused_stop(cx, &root);
+
+            assert!(stop.starts_with("Button swarm"), "{stop}");
+        }
+
+        #[gpui::test]
+        fn each_list_has_one_tab_stop(cx: &mut TestAppContext) {
+            let (workspace, cx) = setup(cx);
+
+            let ((projects, project_stops), (agents, agent_stops)) = list_counts(&workspace, cx);
+
+            assert!(projects > 1);
+            assert!(agents > 1);
+            assert_eq!((project_stops, agent_stops), (1, 1));
+        }
+
+        #[gpui::test]
+        fn a_user_terminal_adds_no_tab_stop_to_the_agent_list(cx: &mut TestAppContext) {
+            cx.update(|cx| {
+                swarm_ui::init(cx);
+                crate::actions::bind_keys(cx);
+            });
+            let (workspace, cx) = setup(cx);
+            with_user_terminal(&workspace, cx);
+            let first = workspace.read_with(cx, |workspace, _| workspace.agent_roving.handle(0));
+            cx.update(|window, cx| first.focus(window, cx));
+            redraw(cx);
+            let root = workspace.read_with(cx, |workspace, _| workspace.sidebar_focus.clone());
+
+            let ((_, _), (agents, agent_stops)) = list_counts(&workspace, cx);
+            let walk = swarm_ui::test_support::tab_walk(cx, &root, "tab");
+
+            assert!(agents > 1);
+            assert_eq!(agent_stops, 1);
+            assert!(
+                walk.iter().all(|stop| !stop.contains("Close")),
+                "a close button is a Tab stop: {walk:?}"
+            );
+        }
+
+        fn focus_project(
+            workspace: &gpui::Entity<Workspace>,
+            index: usize,
+            cx: &mut VisualTestContext,
+        ) {
+            let handle =
+                workspace.read_with(cx, |workspace, _| workspace.project_roving.handle(index));
+
+            cx.update(|window, cx| handle.focus(window, cx));
+            redraw(cx);
+        }
+
+        fn focused_project(
+            workspace: &gpui::Entity<Workspace>,
+            cx: &mut VisualTestContext,
+        ) -> Option<usize> {
+            cx.update(|window, cx| {
+                workspace.read_with(cx, |workspace, cx| {
+                    workspace.project_roving.focused(window, cx)
+                })
+            })
+        }
+
+        #[gpui::test]
+        fn the_arrows_home_and_end_move_through_the_projects(cx: &mut TestAppContext) {
+            let (workspace, cx) = setup(cx);
+            redraw(cx);
+            focus_project(&workspace, 0, cx);
+
+            cx.simulate_keystrokes("down");
+            let after_down = focused_project(&workspace, cx);
+            cx.simulate_keystrokes("end");
+            let after_end = focused_project(&workspace, cx);
+            cx.simulate_keystrokes("up");
+            let after_up = focused_project(&workspace, cx);
+            cx.simulate_keystrokes("home");
+            let after_home = focused_project(&workspace, cx);
+
+            let last = workspace.read_with(cx, |workspace, _| workspace.data.projects.len() - 1);
+            assert_eq!(after_down, Some(1));
+            assert_eq!(after_end, Some(last));
+            assert_eq!(after_up, Some(last - 1));
+            assert_eq!(after_home, Some(0));
+        }
+
+        #[gpui::test]
+        fn the_arrows_move_through_the_agents(cx: &mut TestAppContext) {
+            let (workspace, cx) = setup(cx);
+            redraw(cx);
+            let first = workspace.read_with(cx, |workspace, _| workspace.agent_roving.handle(0));
+            cx.update(|window, cx| first.focus(window, cx));
+            redraw(cx);
+
+            cx.simulate_keystrokes("down down");
+
+            let focused = cx.update(|window, cx| {
+                workspace.read_with(cx, |workspace, cx| {
+                    workspace.agent_roving.focused(window, cx)
+                })
+            });
+            assert_eq!(focused, Some(2));
+        }
+
+        #[gpui::test]
+        fn clicking_a_project_makes_it_the_tab_stop_of_the_list(cx: &mut TestAppContext) {
+            let (workspace, cx) = setup(cx);
+            redraw(cx);
+
+            click_center("project-row-2", cx);
+            redraw(cx);
+
+            let (active, stop) = workspace.read_with(cx, |workspace, _| {
+                (
+                    workspace.project_roving.active(),
+                    workspace.project_roving.handle(2).tab_stop,
+                )
+            });
+            assert_eq!(active, 2);
+            assert!(stop);
+        }
+
+        #[gpui::test]
+        fn removing_the_focused_project_keeps_focus_on_a_drawn_row(cx: &mut TestAppContext) {
+            let (workspace, cx) = setup(cx);
+            redraw(cx);
+            focus_project(&workspace, 1, cx);
+
+            workspace.update(cx, |workspace, cx| {
+                workspace.data.projects.remove(1);
+                cx.notify();
+            });
+            redraw(cx);
+            redraw(cx);
+
+            let on_row = cx.update(|window, cx| {
+                workspace.read_with(cx, |workspace, cx| {
+                    workspace.project_roving.focused(window, cx).is_some()
+                        || workspace.agent_roving.focused(window, cx).is_some()
+                })
+            });
+            assert!(on_row);
+        }
     }
 }

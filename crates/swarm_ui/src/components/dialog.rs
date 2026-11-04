@@ -5,6 +5,7 @@ use gpui::{
     SharedString, Stateful, Window, div, point, px,
 };
 
+use crate::a11y::accessible;
 use crate::component::{Component, example};
 use crate::prelude::*;
 use crate::traits::Clickable as _;
@@ -96,10 +97,7 @@ impl Dialog {
         let on_action = self.on_dismiss;
         let close_disabled = self.close_disabled;
 
-        let panel = v_flex()
-            .id("dialog-panel")
-            .role(Role::Dialog)
-            .aria_label(title.clone())
+        let panel = accessible(v_flex().id("dialog-panel"), Role::Dialog, title.clone())
             .key_context(DIALOG_CONTEXT)
             .track_focus(&self.focus_handle)
             .when_some(on_action, |panel, handler| {
