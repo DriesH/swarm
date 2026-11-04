@@ -283,7 +283,7 @@ mod tests {
         let asked = wait_until(&mut settings, |cx| {
             redraw(cx);
 
-            checks.load(Ordering::SeqCst) == 2
+            checks.load(Ordering::SeqCst) == 3
         });
         let count = window
             .read_with(&settings, |settings, cx| {
@@ -292,7 +292,10 @@ mod tests {
             .expect("the window is open");
 
         assert!(settled, "the check never settled");
-        assert_eq!(first, 1, "the page asks once when it opens");
+        assert_eq!(
+            first, 2,
+            "the Agents page the window opens on asks once, and General asks once when it opens"
+        );
         assert!(center.is_some(), "Check again is not on screen");
         assert!(asked, "Check again did not ask the daemon");
         assert_eq!(

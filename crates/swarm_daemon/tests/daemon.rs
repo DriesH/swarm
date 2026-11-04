@@ -4531,6 +4531,65 @@ fn a_task_diff_has_files_and_answers_none_for_a_known_fingerprint() {
     assert_ne!(changed.fingerprint, diff.fingerprint);
 }
 
+impl Client {
+    /// The files of a task worktree and the count the cap cut, or the daemon's error text.
+    fn task_files(&mut self, task: TaskId) -> Result<(Vec<String>, usize), String> {
+        self.send(&Request::TaskFiles { call: CALL, task });
+
+        self.wait_for(|event| match event {
+            Event::TaskFiles {
+                call: CALL,
+                files,
+                omitted,
+            } => Some(Ok((files.clone(), *omitted))),
+            Event::Error {
+                call: Some(CALL),
+                message,
+                ..
+            } => Some(Err(message.clone())),
+            _ => None,
+        })
+    }
+}
+
+#[test]
+fn task_files_lists_tracked_and_untracked_files_and_skips_ignored_ones() {
+    let repo = Repo::new("");
+    let daemon = Daemon::start();
+    let (mut client, task) = reviewed_task(&daemon, &repo);
+    std::fs::write(task.worktree.join(".gitignore"), "ignored.txt\n").expect("ignore");
+    std::fs::write(task.worktree.join("ignored.txt"), "x").expect("ignored file");
+    std::fs::create_dir(task.worktree.join("src")).expect("folder");
+    std::fs::write(task.worktree.join("src/new.rs"), "x").expect("untracked file");
+
+    let (files, omitted) = client.task_files(task.id).expect("files");
+
+    assert!(
+        files.contains(&"review.txt".to_owned()),
+        "tracked: {files:?}"
+    );
+    assert!(
+        files.contains(&"src/new.rs".to_owned()),
+        "untracked: {files:?}"
+    );
+    assert!(
+        !files.contains(&"ignored.txt".to_owned()),
+        "ignored: {files:?}"
+    );
+    assert!(files.iter().all(|path| !path.starts_with(".git/")));
+    assert!(files.is_sorted());
+    assert_eq!(omitted, 0);
+}
+
+#[test]
+fn task_files_of_an_unknown_task_is_an_error() {
+    let daemon = Daemon::start();
+    let mut client = daemon.connect();
+    client.hello();
+
+    assert!(client.task_files(TaskId(999)).is_err());
+}
+
 #[test]
 fn a_new_commit_with_the_same_changes_is_still_sent() {
     let repo = Repo::new("");
@@ -10396,12 +10455,30 @@ impl Client {
                 call: CALL,
                 fields,
                 error,
+                ..
             } => Some(Ok((fields.clone(), error.clone()))),
             Event::Error {
                 call: Some(CALL),
                 message,
                 ..
             } => Some(Err(message.clone())),
+            _ => None,
+        })
+    }
+
+    /// The tool behind the project's git pre-push hook, as the config answer names it.
+    fn project_pre_push_hook(&mut self, project: ProjectId) -> Option<String> {
+        self.send(&Request::ProjectConfig {
+            call: CALL,
+            project,
+        });
+
+        self.wait_for(|event| match event {
+            Event::ProjectConfig {
+                call: CALL,
+                pre_push_hook,
+                ..
+            } => Some(pre_push_hook.clone()),
             _ => None,
         })
     }
@@ -10562,6 +10639,21 @@ fn a_project_without_a_config_file_reads_as_the_defaults() {
     let read = client.project_config(project);
 
     assert_eq!(read, Ok((default_fields(), None)));
+}
+
+#[test]
+fn the_project_config_names_the_pre_push_hook_of_the_repo() {
+    let repo = Repo::new("");
+    let (_config, _daemon, mut client, project) = settings_session(&repo);
+    let without = client.project_pre_push_hook(project);
+
+    let hook = repo.root.join(".git/hooks/pre-push");
+    std::fs::write(&hook, "#!/bin/sh\ncall_lefthook run pre-push\n").expect("hook");
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).expect("mode");
+    let with = client.project_pre_push_hook(project);
+
+    assert_eq!(without, None);
+    assert_eq!(with.as_deref(), Some("lefthook"));
 }
 
 #[test]
@@ -11945,4 +12037,434 @@ fn the_merge_count_and_the_hundredth_time_survive_a_daemon_restart() {
     client.hello();
 
     assert_eq!(client.stats(), before);
+}
+
+/// Writes its arguments, reports a session and copies what is typed into `inbox`.
+const RESUMING_AGENT: &str = r#"printf '%s\n' "$*" >> "$OUT/args"
+printf '\033]7501;state=idle\007'
+printf '{"hook_event_name":"SessionStart","session_id":"hook-session-2"}' | "$SWARM" hook
+while IFS= read -r line; do printf '%s\n' "$line" >> "$OUT/inbox"; done"#;
+
+/// Waits until the agent's session is confirmed in the database.
+fn wait_for_confirmed_session(daemon: &Daemon, agent: AgentId) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !database(daemon)
+        .agent(agent)
+        .expect("read")
+        .expect("row")
+        .session_confirmed
+    {
+        assert!(Instant::now() < deadline, "the session was never confirmed");
+        thread::park_timeout(Duration::from_millis(30));
+    }
+}
+
+/// Crashes the daemon and starts it again on the same folder with the fixture settings.
+/// The crashed one must outlive the new one: dropping it removes the folder.
+fn restart(daemon: &mut Daemon, fixture: &Fixture) -> Daemon {
+    daemon.crash();
+    let restarted = Daemon::spawn_with(daemon.home.clone(), Some(&fixture.settings()), None);
+    restarted.wait_until_listening();
+
+    restarted
+}
+
+/// A task whose orchestrator reported its session, then the daemon crashed and started
+/// again: the orchestrator is `Resumable` and nothing resumed it.
+fn task_with_resumable_orchestrator(
+    fixture: &Fixture,
+    repo: &Repo,
+) -> (Daemon, Daemon, Client, TaskInfo) {
+    let mut daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let task = client.create_task(orchestrator_task(project.id, false));
+    wait_for_confirmed_session(&daemon, task.agents[0].id);
+    drop(client);
+
+    let restarted = restart(&mut daemon, fixture);
+    let mut client = restarted.connect();
+    client.hello();
+    let agent = &client.projects()[0].tasks[0].agents[0];
+    assert_eq!(agent.lifecycle, AgentLifecycle::Resumable);
+
+    (daemon, restarted, client, task)
+}
+
+impl Client {
+    /// Asks to resume the agent and returns what the daemon answers.
+    fn resume(&mut self, agent: AgentId) -> Result<AgentInfo, String> {
+        self.send(&Request::ResumeAgent { call: CALL, agent });
+
+        self.wait_for(|event| match event {
+            Event::AgentStarted { call: CALL, agent } => Some(Ok(agent.clone())),
+            Event::Error {
+                call: Some(CALL),
+                message,
+                ..
+            } => Some(Err(message.clone())),
+            _ => None,
+        })
+    }
+}
+
+#[test]
+fn a_resumable_agent_resumes_with_its_session_and_gets_no_new_message() {
+    let fixture = Fixture::new(RESUMING_AGENT);
+    let repo = Repo::new("");
+    let (_crashed, daemon, mut client, task) = task_with_resumable_orchestrator(&fixture, &repo);
+    let id = task.agents[0].id;
+
+    let started = client.resume(id).expect("resumed");
+    client.wait_for_agent(|agent| agent.id == id && agent.status == AgentStatus::Idle);
+
+    assert_eq!(started.id, id);
+    assert!(matches!(
+        started.lifecycle,
+        AgentLifecycle::Starting | AgentLifecycle::Running
+    ));
+    let arguments = fixture.read_when("args", |text| text.lines().count() == 2);
+    let resumed = arguments.lines().nth(1).expect("the second start");
+    assert!(resumed.contains("--resume hook-session-2"), "{resumed}");
+    assert!(!resumed.contains("--session-id"), "{resumed}");
+    thread::park_timeout(Duration::from_millis(500));
+    assert!(
+        !fixture.out.join("inbox").exists(),
+        "nothing is typed into a resumed agent"
+    );
+    let stored = database(&daemon).agent(id).expect("read").expect("row");
+    assert_eq!(stored.info.lifecycle, AgentLifecycle::Running);
+}
+
+#[test]
+fn a_resumed_agent_keeps_its_worktree_and_name() {
+    let fixture = Fixture::new(RESUMING_AGENT);
+    let repo = Repo::new("");
+    let (_crashed, _daemon, mut client, task) = task_with_resumable_orchestrator(&fixture, &repo);
+
+    let resumed = client.resume(task.agents[0].id).expect("resumed");
+
+    assert_eq!(resumed.worktree, task.worktree);
+    assert_eq!(resumed.name, task.agents[0].name);
+    assert_eq!(resumed.model, task.agents[0].model);
+}
+
+#[test]
+fn a_message_for_a_resumable_agent_resumes_it_and_is_delivered() {
+    let fixture = Fixture::new(RESUMING_AGENT);
+    let repo = Repo::new("");
+    let (_crashed, _daemon, mut client, task) = task_with_resumable_orchestrator(&fixture, &repo);
+    std::fs::write(task.worktree.join("api.txt"), "one\ntwo\n").expect("file");
+    commit_all(&task.worktree);
+
+    client
+        .add_comment(comment_at(&task, ReviewSource::Live, 1, "one", "Cache it."))
+        .expect("added");
+
+    client.wait_for_agent(|agent| agent.id == task.agents[0].id && agent.terminal.is_some());
+    let inbox = fixture.read_when("inbox", |text| text.contains("Cache it."));
+    assert!(inbox.contains("Cache it."), "{inbox}");
+    let arguments = fixture.read_when("args", |text| text.lines().count() == 2);
+    assert!(arguments.contains("--resume hook-session-2"), "{arguments}");
+}
+
+#[test]
+fn an_agent_without_a_confirmed_session_cannot_resume() {
+    let fixture = Fixture::new(
+        r"printf '\033]7501;state=working\007'
+sleep 30",
+    );
+    let repo = Repo::new("");
+    let mut daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let task = client.create_task(orchestrator_task(project.id, false));
+    client.wait_for_agent(|agent| agent.status == AgentStatus::Working);
+    drop(client);
+
+    let restarted = restart(&mut daemon, &fixture);
+    let mut client = restarted.connect();
+    client.hello();
+
+    let refused = client.resume(task.agents[0].id).expect_err("refused");
+
+    assert!(refused.contains("cannot resume"), "{refused}");
+    assert_eq!(
+        client.projects()[0].tasks[0].agents[0].lifecycle,
+        AgentLifecycle::Stopped
+    );
+}
+
+#[test]
+fn an_agent_that_does_not_exist_cannot_resume() {
+    let daemon = Daemon::start();
+    let mut client = daemon.connect();
+    client.hello();
+
+    let refused = client.resume(AgentId(404)).expect_err("refused");
+
+    assert_eq!(refused, "the agent does not exist");
+}
+
+/// Adds `[agents] max_agents_total` to the fixture settings.
+fn limit_total_agents(fixture: &Fixture, limit: u32) {
+    let settings = std::fs::read_to_string(fixture.settings()).expect("settings");
+    let limited = format!("{settings}\n[agents]\nmax_agents_total = {limit}\n");
+    std::fs::write(fixture.settings(), limited).expect("settings");
+}
+
+#[test]
+fn a_resume_past_the_total_limit_is_refused_with_the_limit() {
+    let fixture = Fixture::new(RESUMING_AGENT);
+    let repo = Repo::new("");
+    let mut daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let first = client.create_task(orchestrator_task(project.id, false));
+    let second = client.create_task(CreateTask {
+        name: "Second task".to_owned(),
+        ..orchestrator_task(project.id, false)
+    });
+    wait_for_confirmed_session(&daemon, first.agents[0].id);
+    wait_for_confirmed_session(&daemon, second.agents[0].id);
+    drop(client);
+    limit_total_agents(&fixture, 1);
+
+    let restarted = restart(&mut daemon, &fixture);
+    let mut client = restarted.connect();
+    client.hello();
+
+    client.resume(first.agents[0].id).expect("under the limit");
+    let refused = client.resume(second.agents[0].id).expect_err("refused");
+
+    assert_eq!(
+        refused,
+        "1 agents are running, the limit is 1 (Settings › Agents)"
+    );
+    let agents = client.projects()[0].tasks.clone();
+    assert!(
+        agents
+            .iter()
+            .flat_map(|task| &task.agents)
+            .any(|agent| agent.id == second.agents[0].id
+                && agent.lifecycle == AgentLifecycle::Resumable),
+        "the refused agent stays resumable"
+    );
+}
+
+/// A resumed agent reports its session at once but takes input only after a second,
+/// like a real TUI that is still drawing. Input before that goes to `early`.
+const SLOW_RESUMING_AGENT: &str = r#"printf '%s\n' "$*" >> "$OUT/args"
+case "$*" in
+*--resume*)
+  MARK=ready-2
+  printf '{"hook_event_name":"SessionStart","session_id":"hook-session-2"}' | "$SWARM" hook
+  ( sleep 1; touch "$OUT/$MARK"; printf '\033]7501;state=idle\007' ) &
+  ;;
+*)
+  MARK=ready-1
+  touch "$OUT/$MARK"
+  printf '\033]7501;state=idle\007'
+  printf '{"hook_event_name":"SessionStart","session_id":"hook-session-2"}' | "$SWARM" hook
+  ;;
+esac
+while IFS= read -r line; do
+  if [ -e "$OUT/$MARK" ]; then printf '%s\n' "$line" >> "$OUT/inbox"; else printf '%s\n' "$line" >> "$OUT/early"; fi
+done"#;
+
+#[test]
+fn a_resumed_agent_gets_its_messages_only_once_it_takes_input() {
+    let fixture = Fixture::new(SLOW_RESUMING_AGENT);
+    let repo = Repo::new("");
+    let (_crashed, _daemon, mut client, task) = task_with_resumable_orchestrator(&fixture, &repo);
+    std::fs::write(task.worktree.join("api.txt"), "one\ntwo\n").expect("file");
+    commit_all(&task.worktree);
+
+    client
+        .add_comment(comment_at(&task, ReviewSource::Live, 1, "one", "Cache it."))
+        .expect("added");
+
+    let inbox = fixture.read_when("inbox", |text| text.contains("Cache it."));
+    assert!(inbox.contains("Cache it."), "{inbox}");
+    assert!(
+        !fixture.out.join("early").exists(),
+        "the message was typed before the agent took input"
+    );
+}
+
+/// Reports a session, then a resume finds no conversation and exits.
+const GONE_SESSION_AGENT: &str = r#"printf '%s\n' "$*" >> "$OUT/args"
+case "$*" in
+*--resume*)
+  echo "No conversation found with session ID"
+  exit 1
+  ;;
+esac
+printf '\033]7501;state=idle\007'
+printf '{"hook_event_name":"SessionStart","session_id":"hook-session-2"}' | "$SWARM" hook
+while IFS= read -r line; do printf '%s\n' "$line" >> "$OUT/inbox"; done"#;
+
+#[test]
+fn a_resume_whose_session_is_gone_ends_stopped_and_cannot_resume_again() {
+    let fixture = Fixture::new(GONE_SESSION_AGENT);
+    let repo = Repo::new("");
+    let (_crashed, daemon, mut client, task) = task_with_resumable_orchestrator(&fixture, &repo);
+    let id = task.agents[0].id;
+
+    client.resume(id).expect("started");
+    client.wait_for_agent(|agent| agent.id == id && agent.lifecycle == AgentLifecycle::Stopped);
+
+    assert_eq!(
+        database(&daemon).agent(id).unwrap().unwrap().info.lifecycle,
+        AgentLifecycle::Stopped
+    );
+    let refused = client.resume(id).expect_err("refused");
+    assert!(refused.contains("cannot resume"), "{refused}");
+}
+
+#[test]
+fn a_comment_for_an_orchestrator_that_cannot_resume_fails_with_the_limit() {
+    let fixture = Fixture::new(RESUMING_AGENT);
+    let repo = Repo::new("");
+    let mut daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let first = client.create_task(orchestrator_task(project.id, false));
+    let second = client.create_task(CreateTask {
+        name: "Second task".to_owned(),
+        ..orchestrator_task(project.id, false)
+    });
+    wait_for_confirmed_session(&daemon, first.agents[0].id);
+    wait_for_confirmed_session(&daemon, second.agents[0].id);
+    drop(client);
+    limit_total_agents(&fixture, 1);
+    let restarted = restart(&mut daemon, &fixture);
+    let mut client = restarted.connect();
+    client.hello();
+    client.resume(first.agents[0].id).expect("under the limit");
+    std::fs::write(second.worktree.join("api.txt"), "one\ntwo\n").expect("file");
+    commit_all(&second.worktree);
+
+    let refused = client
+        .add_comment(comment_at(
+            &second,
+            ReviewSource::Live,
+            1,
+            "one",
+            "Cache it.",
+        ))
+        .expect_err("refused");
+
+    assert_eq!(
+        refused,
+        "1 agents are running, the limit is 1 (Settings › Agents)"
+    );
+}
+
+/// Blocks on a prompt, then ends by itself. A resumed run reads its inbox.
+const BLOCKED_THEN_GONE_AGENT: &str = r#"printf '%s\n' "$*" >> "$OUT/args"
+printf '{"hook_event_name":"SessionStart","session_id":"hook-session-2"}' | "$SWARM" hook
+case "$*" in
+*--resume*)
+  printf '\033]7501;state=idle\007'
+  while IFS= read -r line; do printf '%s\n' "$line" >> "$OUT/inbox"; done
+  ;;
+*)
+  printf '\033]7501;state=blocked:kind=permission\007'
+  sleep 4
+  exit 0
+  ;;
+esac"#;
+
+#[test]
+fn an_agent_that_crashes_with_unread_messages_waits_for_the_next_one() {
+    let fixture = Fixture::new(&BLOCKED_THEN_GONE_AGENT.replace("exit 0", "exit 1"));
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let task = client.create_task(orchestrator_task(project.id, false));
+    let id = task.agents[0].id;
+    wait_for_confirmed_session(&daemon, id);
+    client
+        .wait_for_agent(|agent| agent.id == id && matches!(agent.status, AgentStatus::Blocked(_)));
+    std::fs::write(task.worktree.join("api.txt"), "one\ntwo\n").expect("file");
+    commit_all(&task.worktree);
+
+    client
+        .add_comment(comment_at(&task, ReviewSource::Live, 1, "one", "Cache it."))
+        .expect("added");
+    client.wait_for_agent(|agent| agent.id == id && agent.lifecycle == AgentLifecycle::Resumable);
+
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    while Instant::now() < deadline {
+        thread::park_timeout(Duration::from_millis(50));
+    }
+    let arguments = fixture.read_when_written("args");
+    assert_eq!(arguments.lines().count(), 1, "{arguments}");
+}
+
+#[test]
+fn an_agent_that_ends_with_unread_messages_resumes_for_them() {
+    let fixture = Fixture::new(BLOCKED_THEN_GONE_AGENT);
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let task = client.create_task(orchestrator_task(project.id, false));
+    let id = task.agents[0].id;
+    wait_for_confirmed_session(&daemon, id);
+    client
+        .wait_for_agent(|agent| agent.id == id && matches!(agent.status, AgentStatus::Blocked(_)));
+    std::fs::write(task.worktree.join("api.txt"), "one\ntwo\n").expect("file");
+    commit_all(&task.worktree);
+
+    client
+        .add_comment(comment_at(&task, ReviewSource::Live, 1, "one", "Cache it."))
+        .expect("added");
+
+    let inbox = fixture.read_when("inbox", |text| text.contains("Cache it."));
+    assert!(inbox.contains("Cache it."), "{inbox}");
+    let arguments = fixture.read_when("args", |text| text.lines().count() == 2);
+    assert!(arguments.contains("--resume hook-session-2"), "{arguments}");
+}
+
+#[test]
+fn a_new_task_past_the_total_limit_is_refused_and_leaves_no_worktree() {
+    let fixture = Fixture::new("sleep 60");
+    limit_total_agents(&fixture, 1);
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    client.create_task(orchestrator_task(project.id, false));
+
+    client.send(&Request::CreateTask {
+        call: CALL,
+        task: CreateTask {
+            name: "Second task".to_owned(),
+            ..orchestrator_task(project.id, false)
+        },
+    });
+
+    let message = client.wait_for(|event| match event {
+        Event::Error {
+            call: Some(CALL),
+            message,
+            ..
+        } => Some(message.clone()),
+        _ => None,
+    });
+    assert!(
+        message.contains("1 agents are running, the limit is 1 (Settings › Agents)"),
+        "{message}"
+    );
+    assert!(!repo.root.join(".worktrees/second-task").exists());
 }

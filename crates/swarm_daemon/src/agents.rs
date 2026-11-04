@@ -20,6 +20,7 @@ use swarm_core::git;
 use swarm_core::github::Github;
 use swarm_core::prompts::{self, Harness, PromptFile};
 use swarm_core::store::{NewAgent, NewMessage, Store, unix_millis};
+use swarm_core::task_env;
 use swarm_protocol::agent::render_inbox;
 use swarm_protocol::{
     AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, CreateTerminal, Event,
@@ -30,7 +31,7 @@ use swarm_term::{ExitStatus, ProgramState, Row, TerminalInput, TerminalOutput};
 
 use crate::hub::{Clients, Extras, Hub, Terminals};
 use crate::messages::Messages;
-use crate::processes::exit_text;
+use crate::processes::{Processes, exit_text};
 use crate::tasks::{TERMINAL_PALETTE, TERMINAL_SIZE};
 
 /// How long the first message waits for a ready signal before it looks at the agent.
@@ -51,6 +52,9 @@ const BLOCKED_POLL: Duration = Duration::from_millis(200);
 /// A line the user began holds messages back until they send it or this long after the
 /// last key.
 const DRAFT_PATIENCE: Duration = Duration::from_secs(60);
+
+/// How often the daemon looks for agents that rested long enough to stop.
+const IDLE_CHECK: Duration = Duration::from_secs(60);
 
 /// Why an agent that the user stopped cannot start more agents.
 pub(crate) const STOPPED_BY_USER: &str = "the user stopped you, so nothing new starts";
@@ -101,6 +105,8 @@ pub(crate) struct Plan {
     model: String,
     command: String,
     skip_permissions: bool,
+    max_agents_per_task: u32,
+    max_agents_total: u32,
 }
 
 impl Plan {
@@ -165,8 +171,43 @@ struct Live {
     /// The user stopped it: it can still resume, and the orchestrator is not told.
     stopped_by_user: bool,
     typing: UserTyping,
+    rest: RestClock,
     /// One paste at a time, so two deliveries never interleave in the terminal.
     paste: Arc<Mutex<()>>,
+}
+
+/// Since when an agent has been idle or done without a break.
+#[derive(Default)]
+struct RestClock {
+    since: Option<Instant>,
+}
+
+impl RestClock {
+    /// Starts on the first resting status and resets on any other.
+    fn observe(&mut self, resting: bool, now: Instant) {
+        if !resting {
+            self.since = None;
+        } else if self.since.is_none() {
+            self.since = Some(now);
+        }
+    }
+
+    /// A rest that goes on begins again at `now`: the user is at the terminal.
+    fn restart(&mut self, now: Instant) {
+        if self.since.is_some() {
+            self.since = Some(now);
+        }
+    }
+
+    /// `minutes` of `0` means never.
+    fn is_over(&self, now: Instant, minutes: u32) -> bool {
+        let limit = Duration::from_secs(u64::from(minutes) * 60);
+
+        minutes > 0
+            && self
+                .since
+                .is_some_and(|since| now.saturating_duration_since(since) >= limit)
+    }
 }
 
 /// Follows what the user types into an agent's terminal.
@@ -309,6 +350,47 @@ impl Live {
         }
     }
 
+    /// An agent with a confirmed session that nobody ended for good can resume.
+    fn ended_lifecycle(&self) -> AgentLifecycle {
+        if !self.stop_requested && self.session_id.is_some() && self.session_confirmed {
+            AgentLifecycle::Resumable
+        } else {
+            AgentLifecycle::Stopped
+        }
+    }
+
+    /// Call after every change of the status. A notice shows as blocked, so it breaks
+    /// the rest.
+    fn track_rest(&mut self, now: Instant) {
+        let resting = matches!(self.merge.status(), AgentStatus::Idle | AgentStatus::Done);
+
+        self.rest.observe(resting, now);
+    }
+
+    /// Whether the agent stops for resting too long: the Start orchestrator, an agent
+    /// with a process terminal of its own, an orchestrator whose workers run (their
+    /// task is in `supervising`) and an agent whose user types keep running.
+    fn stops_when_idle(
+        &self,
+        now: Instant,
+        minutes: u32,
+        busy: &HashSet<AgentId>,
+        supervising: &HashSet<TaskId>,
+    ) -> bool {
+        let leads_workers = self.info.role == AgentRole::Orchestrator
+            && self
+                .info
+                .task
+                .is_some_and(|task| supervising.contains(&task));
+
+        self.info.role != AgentRole::StartOrchestrator
+            && !busy.contains(&self.info.id)
+            && !leads_workers
+            && !self.stopped_by_user
+            && !self.typing.drafting(now)
+            && self.rest.is_over(now, minutes)
+    }
+
     fn signal_ready(&self, ready: Ready) {
         if let Some(sender) = &self.ready
             && sender.send(ready).is_err()
@@ -351,6 +433,10 @@ pub(crate) struct Agents {
     reviews: Mutex<HashMap<TaskId, ReviewWatch>>,
     /// The daemon is stopping, so agents that end are not broken.
     shutting_down: AtomicBool,
+    /// The last settings error that was logged, so one error is logged once.
+    settings_error: Mutex<Option<String>>,
+    /// The warnings of the last settings read, for the same reason.
+    settings_warnings: Mutex<Vec<String>>,
 }
 
 /// Held while a project is removed; dropping it lets the project take agents again.
@@ -447,6 +533,8 @@ impl Agents {
             removing: Mutex::default(),
             reviews: Mutex::default(),
             shutting_down: AtomicBool::new(false),
+            settings_error: Mutex::default(),
+            settings_warnings: Mutex::default(),
         })
     }
 
@@ -559,6 +647,91 @@ impl Agents {
     pub(crate) fn stop_all(&self) {
         let terminals = self.mark_stopped(|_| true, |agent| agent.stopped_by_user = true);
 
+        self.kill(terminals);
+    }
+
+    /// Stops the agents that rested `minutes` or longer, the way the user's stop does:
+    /// one with a confirmed session ends `Resumable`, and no orchestrator is told.
+    /// `busy` holds the agents with a process terminal; `0` minutes stops none.
+    /// Returns the stopped agents.
+    pub(crate) fn stop_idle(
+        &self,
+        now: Instant,
+        minutes: u32,
+        busy: &HashSet<AgentId>,
+    ) -> Vec<AgentId> {
+        let due: Vec<AgentId> = {
+            let live = lock(&self.live);
+            let supervising: HashSet<TaskId> = live
+                .values()
+                .filter(|agent| {
+                    agent.info.role == AgentRole::Worker
+                        && matches!(
+                            agent.info.lifecycle,
+                            AgentLifecycle::Starting | AgentLifecycle::Running
+                        )
+                })
+                .filter_map(|agent| agent.info.task)
+                .collect();
+
+            live.values()
+                .filter(|agent| agent.stops_when_idle(now, minutes, busy, &supervising))
+                .map(|agent| agent.info.id)
+                .collect()
+        };
+        let stopping: Vec<AgentId> = due.into_iter().filter(|id| !self.has_mail(*id)).collect();
+        if stopping.is_empty() {
+            return stopping;
+        }
+
+        let terminals = self.mark_stopped(
+            |agent| stopping.contains(&agent.info.id),
+            |agent| agent.stopped_by_user = true,
+        );
+        self.kill(terminals);
+
+        stopping
+    }
+
+    /// True when the agent has unread messages or sits in a `wait` that takes them.
+    /// A store error counts as mail: the agent keeps running.
+    fn has_mail(&self, id: AgentId) -> bool {
+        if self.messages.is_waiting(id) {
+            return true;
+        }
+
+        lock(&self.store).has_unread(id).unwrap_or_else(|error| {
+            log::error!("cannot check agent {} for messages: {error}", id.0);
+
+            true
+        })
+    }
+
+    /// Checks for agents that rested too long every [`IDLE_CHECK`], on a thread of its
+    /// own. The setting is read each time, so a change applies without a restart.
+    pub(crate) fn watch_idle(self: &Arc<Self>, processes: Arc<Processes>) {
+        let agents = Arc::clone(self);
+        let spawned = thread::Builder::new()
+            .name("idle-stop".into())
+            .spawn(move || {
+                loop {
+                    sleep_for(IDLE_CHECK);
+
+                    let minutes = agents.settings().agents.idle_stop_minutes;
+                    let stopped =
+                        agents.stop_idle(Instant::now(), minutes, &processes.running_owners());
+                    if !stopped.is_empty() {
+                        log::info!("stopped {} idle agents", stopped.len());
+                    }
+                }
+            });
+
+        if let Err(error) = spawned {
+            log::error!("cannot start the idle stop thread: {error}");
+        }
+    }
+
+    fn kill(&self, terminals: Vec<TerminalId>) {
         for hub in terminals
             .into_iter()
             .filter_map(|terminal| self.terminals.get(terminal))
@@ -593,7 +766,7 @@ impl Agents {
                 continue;
             };
 
-            agent.info.lifecycle = AgentLifecycle::Stopped;
+            agent.info.lifecycle = agent.ended_lifecycle();
             agent.info.ended_at = Some(unix_millis());
             self.publish(&mut agent);
         }
@@ -635,13 +808,55 @@ impl Agents {
         lock(&self.on_end).push(observer);
     }
 
-    /// Reads the settings. Call it before anything is created, so a broken settings
-    /// file fails the request early.
-    pub(crate) fn plan(&self, kind: AgentKind, role: AgentRole) -> Result<Plan> {
-        let settings = match &self.config.settings {
-            Some(path) => swarm_settings::load(path)?,
-            None => Settings::default(),
+    /// The settings. A file that cannot be read gives the defaults, so agents keep
+    /// starting; the error is logged once.
+    fn settings(&self) -> Settings {
+        let Some(path) = &self.config.settings else {
+            return Settings::default();
         };
+
+        match swarm_settings::load_with_warnings(path) {
+            Ok((settings, warnings)) => {
+                *lock(&self.settings_error) = None;
+                if self.note_warnings(&warnings) {
+                    for warning in &warnings {
+                        log::warn!("{}: {warning}", path.display());
+                    }
+                }
+
+                settings
+            }
+            Err(error) => {
+                let text = error.to_string();
+
+                let mut last = lock(&self.settings_error);
+                if last.as_deref() != Some(text.as_str()) {
+                    log::warn!("cannot read the settings, using the defaults: {text}");
+                    *last = Some(text);
+                }
+
+                Settings::default()
+            }
+        }
+    }
+
+    /// Remembers the warnings. True when they differ from the last ones, so the caller
+    /// logs each distinct set once; a file without warnings forgets them.
+    fn note_warnings(&self, warnings: &[String]) -> bool {
+        let mut last = lock(&self.settings_warnings);
+        if last.as_slice() == warnings {
+            return false;
+        }
+
+        warnings.clone_into(&mut last);
+
+        !warnings.is_empty()
+    }
+
+    /// Reads the settings. Call it before anything is created, so a missing CLI fails
+    /// the request early.
+    pub(crate) fn plan(&self, kind: AgentKind, role: AgentRole) -> Result<Plan> {
+        let settings = self.settings();
 
         let command = settings.agents.cli(kind).command.clone();
         Self::find_command(&command)?;
@@ -652,6 +867,8 @@ impl Agents {
             model: settings.agents.model(kind, role).to_owned(),
             command,
             skip_permissions: settings.agents.skip_permissions,
+            max_agents_per_task: settings.agents.max_agents_per_task,
+            max_agents_total: settings.agents.max_agents_total,
         })
     }
 
@@ -668,13 +885,8 @@ impl Agents {
     }
 
     /// The agent kind the settings pick for orchestrators.
-    pub(crate) fn default_kind(&self) -> Result<AgentKind> {
-        let settings = match &self.config.settings {
-            Some(path) => swarm_settings::load(path)?,
-            None => Settings::default(),
-        };
-
-        Ok(settings.agents.orchestrator.into())
+    pub(crate) fn default_kind(&self) -> AgentKind {
+        self.settings().agents.orchestrator.into()
     }
 
     /// Writes the agent's row and makes it known to the agent socket. Nothing runs yet.
@@ -720,11 +932,15 @@ impl Agents {
         // Checked again under the lock that a stop takes after it sets its flag: a stop
         // either finds the new entry or this sees the flag.
         let mut live = lock(&self.live);
-        let refusal = self.place_refusal(place).or_else(|| {
-            asker
-                .is_some_and(|asker| live.get(&asker).is_none_or(|agent| agent.stopped_by_user))
-                .then_some(STOPPED_BY_USER)
-        });
+        let refusal = self
+            .place_refusal(place)
+            .or_else(|| {
+                asker
+                    .is_some_and(|asker| live.get(&asker).is_none_or(|agent| agent.stopped_by_user))
+                    .then_some(STOPPED_BY_USER)
+            })
+            .map(str::to_owned)
+            .or_else(|| limit_refusal(&live, place.task, &plan));
         if let Some(reason) = refusal {
             drop(live);
             if let Err(error) = lock(&self.store).delete_agent(info.id) {
@@ -749,11 +965,192 @@ impl Agents {
                 stop_requested: false,
                 stopped_by_user: false,
                 typing: UserTyping::default(),
+                rest: RestClock::default(),
                 paste: Arc::default(),
             },
         );
 
         Ok(info)
+    }
+
+    /// Starts a `Resumable` agent again in its worktree with its saved session. The role
+    /// prompt and the brief are not sent again: the session has them (ADR 0004). It counts
+    /// against the agent limits. Returns the agent as it is when it already runs.
+    pub(crate) fn resume(self: &Arc<Self>, id: AgentId) -> Result<AgentInfo> {
+        if let Some(agent) = lock(&self.live).get(&id) {
+            return running_agent(agent);
+        }
+
+        let stored = lock(&self.store)
+            .agent(id)?
+            .context("the agent does not exist")?;
+        let mut info = stored.info;
+        if info.lifecycle != AgentLifecycle::Resumable
+            || !stored.session_confirmed
+            || stored.session_id.is_none()
+        {
+            bail!("{} has no saved session, so it cannot resume", info.name);
+        }
+
+        if self
+            .shutting_down
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            bail!("the daemon is stopping");
+        }
+
+        let plan = self
+            .plan(info.kind, info.role)?
+            .with_model(Some(info.model.clone()));
+        let (task_name, env) = self.resume_env(&info)?;
+        let token = new_token().context("cannot make a token")?;
+
+        info.lifecycle = AgentLifecycle::Starting;
+        info.terminal = None;
+        info.ended_at = None;
+
+        {
+            let mut live = lock(&self.live);
+            if let Some(running) = live.get(&id) {
+                return running_agent(running);
+            }
+            if info.role == AgentRole::StartOrchestrator
+                && live.values().any(|agent| {
+                    agent.info.project == info.project
+                        && agent.info.role == AgentRole::StartOrchestrator
+                })
+            {
+                bail!("the Start orchestrator already runs");
+            }
+
+            let place = Place {
+                project: info.project,
+                task: info.task,
+                name: &info.name,
+                worktree: &info.worktree,
+                branch: &info.branch,
+                ports: &[],
+            };
+            let refusal = self
+                .place_refusal(&place)
+                .map(str::to_owned)
+                .or_else(|| limit_refusal(&live, info.task, &plan));
+            if let Some(reason) = refusal {
+                bail!(reason);
+            }
+
+            let mut agent = Live {
+                info: info.clone(),
+                plan,
+                token,
+                merge: StatusMerge::default(),
+                session_id: stored.session_id,
+                session_confirmed: false,
+                screen: Some(ScreenText::default()),
+                ready: None,
+                delivery_open: false,
+                stop_requested: false,
+                stopped_by_user: false,
+                typing: UserTyping::default(),
+                rest: RestClock::default(),
+                paste: Arc::default(),
+            };
+            self.publish(&mut agent);
+            live.insert(id, agent);
+        }
+
+        let start = Start {
+            agent: id,
+            task_name,
+            env,
+            first_message: None,
+            after_first_message: None,
+        };
+        if let Err(error) = self.launch(start, true) {
+            self.back_to_resumable(id);
+
+            return Err(error);
+        }
+
+        Ok(self.info(id).unwrap_or(info))
+    }
+
+    /// The task's name and the ports environment the agent had before.
+    fn resume_env(&self, info: &AgentInfo) -> Result<(String, Vec<(String, String)>)> {
+        let Some(task) = info.task else {
+            return Ok((String::new(), Vec::new()));
+        };
+
+        let store = lock(&self.store);
+        let mut task = store.task(task)?.context("the task is gone")?;
+        if info.role == AgentRole::Worker {
+            task.ports = store.agent_ports(info.id)?;
+        }
+
+        Ok((task.name.clone(), task_env(&task)))
+    }
+
+    /// A resume that could not start the process leaves the agent as it was.
+    fn back_to_resumable(&self, id: AgentId) {
+        let Some(mut agent) = lock(&self.live).remove(&id) else {
+            return;
+        };
+
+        agent.info.lifecycle = AgentLifecycle::Resumable;
+        agent.info.terminal = None;
+        agent.info.ended_at = Some(unix_millis());
+        self.publish(&mut agent);
+    }
+
+    /// Resumes the receiver of a message when it is `Resumable`, before the message is
+    /// queued. A refused resume is the error the sender sees.
+    pub(crate) fn resume_for_message(self: &Arc<Self>, id: AgentId) -> Result<()> {
+        let resumable = lock(&self.store)
+            .agent(id)?
+            .is_some_and(|stored| stored.info.lifecycle == AgentLifecycle::Resumable);
+
+        if resumable {
+            self.resume(id)?;
+        }
+
+        Ok(())
+    }
+
+    /// Resumes a `Resumable` agent that has unread messages, on a thread of its own.
+    /// The normal delivery pastes them once the agent is idle.
+    fn resume_for_messages(self: &Arc<Self>, id: AgentId) {
+        let wanted = {
+            let store = lock(&self.store);
+
+            store.agent(id).and_then(|stored| {
+                let resumable =
+                    stored.is_some_and(|stored| stored.info.lifecycle == AgentLifecycle::Resumable);
+
+                Ok(resumable && store.has_unread(id)?)
+            })
+        };
+        match wanted {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                log::error!("cannot check agent {} for messages: {error}", id.0);
+
+                return;
+            }
+        }
+
+        let agents = Arc::clone(self);
+        let spawned = thread::Builder::new()
+            .name(format!("resume-{}", id.0))
+            .spawn(move || {
+                if let Err(error) = agents.resume(id) {
+                    log::warn!("cannot resume agent {} for its messages: {error:#}", id.0);
+                }
+            });
+
+        if let Err(error) = spawned {
+            log::error!("cannot start the resume thread: {error}");
+        }
     }
 
     /// Why nothing new may start in the place: its task closes or its project is removed.
@@ -846,6 +1243,8 @@ impl Agents {
             let agent = live.get_mut(&id)?;
             let now = Instant::now();
 
+            agent.rest.restart(now);
+
             let sent = agent.typing.track_draft(input, now);
             let told = role == AgentRole::Worker && agent.typing.observe(input, now);
 
@@ -919,6 +1318,11 @@ impl Agents {
 
     /// Starts the agent's process in the task worktree.
     pub(crate) fn start(self: &Arc<Self>, start: Start) -> Result<()> {
+        self.launch(start, false)
+    }
+
+    /// Starts the process of a new agent, or of one that continues its saved session.
+    fn launch(self: &Arc<Self>, start: Start, resuming: bool) -> Result<()> {
         let id = start.agent;
         let known = self.info(id);
         if self.is_closing(known.as_ref().and_then(|info| info.task)) {
@@ -965,6 +1369,11 @@ impl Agents {
         let harness_env = harness_env(&info, &self.config.socket, &token);
         let writable_roots = Self::writable_roots(&plan, &info.worktree);
 
+        let session = match (resuming, session_id.as_deref()) {
+            (true, Some(session_id)) => Session::Resume(session_id),
+            _ => Session::New(session_id.as_deref()),
+        };
+
         let agent_dir = self.config.data_dir.join("agents").join(id.0.to_string());
         let launch = adapters::build(&LaunchSpec {
             kind: plan.kind,
@@ -975,7 +1384,7 @@ impl Agents {
             skip_permissions: plan.skip_permissions,
             swarm: &self.config.swarm,
             agent_dir: &agent_dir,
-            session: Session::New(session_id.as_deref()),
+            session,
             harness_env: &harness_env,
             writable_roots: &writable_roots,
         });
@@ -986,7 +1395,9 @@ impl Agents {
         env.extend(harness_env);
         env.push(("PATH".to_owned(), self.agent_path()));
 
-        let ready = start.first_message.as_ref().map(|_| flume::unbounded());
+        // A resumed TUI takes no input at once either: delivery waits for it like a
+        // first message does.
+        let ready = (start.first_message.is_some() || resuming).then(flume::unbounded);
         if let Some((sender, _)) = &ready {
             self.update(id, |live| {
                 live.ready = Some(sender.clone());
@@ -1033,11 +1444,47 @@ impl Agents {
             hub.send_input(TerminalInput::Kill);
         }
 
-        if let (Some(message), Some(receiver)) = (start.first_message, ready) {
-            self.type_when_ready(id, hub, message, receiver, start.after_first_message);
+        match (start.first_message, ready) {
+            (Some(message), Some(receiver)) => {
+                self.type_when_ready(id, hub, message, receiver, start.after_first_message);
+            }
+            (None, Some(receiver)) => self.open_when_ready(id, receiver),
+            _ => {}
         }
 
         Ok(())
+    }
+
+    /// Opens delivery for a resumed agent once it can take input, then pastes what is
+    /// unread. Nothing is typed first: the session has its prompt.
+    fn open_when_ready(self: &Arc<Self>, id: AgentId, ready: flume::Receiver<Ready>) {
+        let agents = Arc::clone(self);
+        let spawned = thread::Builder::new()
+            .name(format!("resume-ready-{}", id.0))
+            .spawn(move || {
+                let waited = wait_until_ready(
+                    &ready,
+                    || agents.waiting(id),
+                    FIRST_MESSAGE_PATIENCE,
+                    SESSION_START_GRACE,
+                );
+                if !waited {
+                    log::debug!("agent {} ended before it took input", id.0);
+
+                    return;
+                }
+
+                agents.update(id, |live| {
+                    live.delivery_open = true;
+
+                    false
+                });
+                agents.deliver_unread(id);
+            });
+
+        if let Err(error) = spawned {
+            log::error!("cannot start the resume thread: {error}");
+        }
     }
 
     /// True when a stop, a close or `swarm exit` ran while the process started. Their
@@ -1204,6 +1651,7 @@ impl Agents {
         if outcome.changed {
             self.publish(agent);
         }
+        agent.track_rest(Instant::now());
         self.send_notices(agent);
         drop(live);
 
@@ -1303,6 +1751,9 @@ impl Agents {
         let (terminal, paste) = {
             let mut live = lock(&self.live);
             let Some(agent) = live.get_mut(&id) else {
+                drop(live);
+                self.resume_for_messages(id);
+
                 return;
             };
 
@@ -1452,12 +1903,7 @@ impl Agents {
         let failure_told = agent.merge.failure_told();
         agent.merge.process_exited(exit);
         agent.info.terminal = None;
-        agent.info.lifecycle =
-            if !agent.stop_requested && agent.session_id.is_some() && agent.session_confirmed {
-                AgentLifecycle::Resumable
-            } else {
-                AgentLifecycle::Stopped
-            };
+        agent.info.lifecycle = agent.ended_lifecycle();
         agent.info.ended_at = Some(unix_millis());
         self.publish(&mut agent);
 
@@ -1478,6 +1924,13 @@ impl Agents {
         for observer in lock(&self.on_end).iter() {
             observer(id, agent.stopped_by_user);
         }
+
+        // Mail that came in while it stopped must not wait for the next message. Not
+        // after a crash: a CLI that crashes right after each resume would loop.
+        let crashed = !agent.stopped_by_user && exit_failure(exit).is_some();
+        if agent.info.lifecycle == AgentLifecycle::Resumable && !crashed {
+            self.resume_for_messages(id);
+        }
     }
 
     /// Runs `change` on a live agent and publishes when it returns true.
@@ -1491,6 +1944,7 @@ impl Agents {
             self.publish(agent);
         }
 
+        agent.track_rest(Instant::now());
         self.send_notices(agent);
         self.end_queue_if_stopped(agent);
     }
@@ -1628,6 +2082,57 @@ impl Agents {
             },
         });
     }
+}
+
+/// The agent as it runs, or a refusal when it is on its way out.
+fn running_agent(agent: &Live) -> Result<AgentInfo> {
+    if agent.stopped_by_user || agent.stop_requested {
+        bail!("the agent is stopping");
+    }
+
+    Ok(agent.info.clone())
+}
+
+/// Why one more agent may not start: the task, or all tasks together, already have as
+/// many agents starting or running as the settings allow. The Start orchestrator has no
+/// task, so only the total counts for it.
+fn limit_refusal(
+    live: &HashMap<AgentId, Live>,
+    task: Option<TaskId>,
+    plan: &Plan,
+) -> Option<String> {
+    let running: Vec<&Live> = live
+        .values()
+        .filter(|agent| {
+            matches!(
+                agent.info.lifecycle,
+                AgentLifecycle::Starting | AgentLifecycle::Running
+            )
+        })
+        .collect();
+
+    if let Some(task) = task {
+        let in_task = running
+            .iter()
+            .filter(|agent| agent.info.task == Some(task))
+            .count();
+        if in_task >= plan.max_agents_per_task as usize {
+            return Some(format!(
+                "the task has {in_task} agents running, the limit is {} (Settings › Agents)",
+                plan.max_agents_per_task
+            ));
+        }
+    }
+
+    if running.len() >= plan.max_agents_total as usize {
+        return Some(format!(
+            "{} agents are running, the limit is {} (Settings › Agents)",
+            running.len(),
+            plan.max_agents_total
+        ));
+    }
+
+    None
 }
 
 /// Waits for the agent's ready signal. Returns false when the agent ended first.
@@ -1829,6 +2334,18 @@ mod tests {
 
     const SHORT: Duration = Duration::from_millis(40);
 
+    fn test_plan(kind: AgentKind, role: AgentRole) -> Plan {
+        Plan {
+            kind,
+            role,
+            model: "model".to_owned(),
+            command: "agent".to_owned(),
+            skip_permissions: false,
+            max_agents_per_task: 6,
+            max_agents_total: 16,
+        }
+    }
+
     fn channel() -> (flume::Sender<Ready>, flume::Receiver<Ready>) {
         flume::unbounded()
     }
@@ -1941,13 +2458,7 @@ mod tests {
                 started_at: None,
                 ended_at: None,
             },
-            plan: Plan {
-                kind,
-                role: AgentRole::Orchestrator,
-                model: "model".to_owned(),
-                command: "agent".to_owned(),
-                skip_permissions: false,
-            },
+            plan: test_plan(kind, AgentRole::Orchestrator),
             token: String::new(),
             merge,
             session_id: None,
@@ -1958,6 +2469,7 @@ mod tests {
             stop_requested: false,
             stopped_by_user: false,
             typing: UserTyping::default(),
+            rest: RestClock::default(),
             paste: Arc::default(),
         }
     }
@@ -2418,6 +2930,13 @@ mod tests {
     /// Like [`agents_with_a_task`], with a connected client; `frames` holds what the
     /// client was sent.
     fn agents_with_a_client() -> (Arc<Agents>, TaskInfo, flume::Receiver<Frame>) {
+        agents_with_settings(None)
+    }
+
+    /// Like [`agents_with_a_client`], reading the settings from `settings`.
+    fn agents_with_settings(
+        settings: Option<PathBuf>,
+    ) -> (Arc<Agents>, TaskInfo, flume::Receiver<Frame>) {
         use swarm_core::store::NewTask;
 
         let store = Store::open_in_memory().expect("store");
@@ -2446,7 +2965,7 @@ mod tests {
             AgentConfig {
                 data_dir: PathBuf::from("/tmp/none-data"),
                 socket: PathBuf::from("/tmp/none.sock"),
-                settings: None,
+                settings,
                 swarm: PathBuf::from("/tmp/swarm"),
                 github: Github::with_folders(PathBuf::from("/tmp/none-bin"), None, Vec::new()),
             },
@@ -2460,13 +2979,7 @@ mod tests {
     }
 
     fn register_in(agents: &Agents, task: &TaskInfo, asker: Option<AgentId>) -> Result<AgentInfo> {
-        let plan = Plan {
-            kind: AgentKind::ClaudeCode,
-            role: AgentRole::Orchestrator,
-            model: "model".to_owned(),
-            command: "agent".to_owned(),
-            skip_permissions: false,
-        };
+        let plan = test_plan(AgentKind::ClaudeCode, AgentRole::Orchestrator);
 
         agents.register_asked_by(asker, &Place::of_task(task), plan)
     }
@@ -2807,13 +3320,7 @@ mod tests {
     }
 
     fn register_worker(agents: &Agents, task: &TaskInfo) -> AgentInfo {
-        let plan = Plan {
-            kind: AgentKind::ClaudeCode,
-            role: AgentRole::Worker,
-            model: "model".to_owned(),
-            command: "agent".to_owned(),
-            skip_permissions: false,
-        };
+        let plan = test_plan(AgentKind::ClaudeCode, AgentRole::Worker);
 
         agents
             .register_asked_by(None, &Place::of_task(task), plan)
@@ -2995,13 +3502,7 @@ mod tests {
 
     /// A Start orchestrator of `project` that was registered and not started.
     fn register_start(agents: &Agents, project: ProjectId) -> AgentInfo {
-        let plan = Plan {
-            kind: AgentKind::ClaudeCode,
-            role: AgentRole::StartOrchestrator,
-            model: "model".to_owned(),
-            command: "agent".to_owned(),
-            skip_permissions: false,
-        };
+        let plan = test_plan(AgentKind::ClaudeCode, AgentRole::StartOrchestrator);
         let place = Place {
             project,
             task: None,
@@ -3212,5 +3713,471 @@ mod tests {
             AgentLifecycle::Stopped,
             "the project is gone, so the session cannot resume"
         );
+    }
+
+    const HALF_AN_HOUR: Duration = Duration::from_mins(30);
+    const JUST_UNDER: Duration = Duration::from_mins(29);
+    const TWO_DAYS: Duration = Duration::from_hours(48);
+
+    #[test]
+    fn a_rest_is_over_when_the_limit_is_reached() {
+        let start = Instant::now();
+        let mut clock = RestClock::default();
+        clock.observe(true, start);
+
+        assert!(!clock.is_over(start + JUST_UNDER, 30));
+        assert!(clock.is_over(start + HALF_AN_HOUR, 30));
+    }
+
+    #[test]
+    fn a_limit_of_zero_minutes_never_ends_a_rest() {
+        let start = Instant::now();
+        let mut clock = RestClock::default();
+        clock.observe(true, start);
+
+        assert!(!clock.is_over(start + TWO_DAYS, 0));
+    }
+
+    #[test]
+    fn another_status_resets_the_rest() {
+        let start = Instant::now();
+        let mut clock = RestClock::default();
+        clock.observe(true, start);
+        clock.observe(false, start + Duration::from_secs(60));
+        clock.observe(true, start + Duration::from_secs(120));
+
+        assert!(!clock.is_over(start + HALF_AN_HOUR, 30));
+        assert!(clock.is_over(start + Duration::from_secs(120) + HALF_AN_HOUR, 30));
+    }
+
+    #[test]
+    fn a_second_resting_status_keeps_the_first_time() {
+        let start = Instant::now();
+        let mut clock = RestClock::default();
+        clock.observe(true, start);
+        clock.observe(true, start + Duration::from_secs(600));
+
+        assert!(clock.is_over(start + HALF_AN_HOUR, 30));
+    }
+
+    fn rest(agents: &Arc<Agents>, id: AgentId, state: ProgramState) {
+        report(agents, id, state, None);
+    }
+
+    #[test]
+    fn an_agent_that_rested_long_enough_is_stopped_as_the_users_stop_does() {
+        let (agents, task) = agents_with_a_task();
+        let agent = register_in(&agents, &task, None).expect("register");
+        rest(&agents, agent.id, ProgramState::Idle);
+
+        let stopped = agents.stop_idle(Instant::now() + HALF_AN_HOUR, 30, &HashSet::new());
+
+        assert_eq!(stopped, vec![agent.id]);
+        assert!(agents.is_stopped(agent.id), "the stop is the user's kind");
+    }
+
+    #[test]
+    fn a_done_agent_is_stopped_after_idle_and_done_together_rested_long_enough() {
+        let (agents, task) = agents_with_a_task();
+        let agent = register_in(&agents, &task, None).expect("register");
+        rest(&agents, agent.id, ProgramState::Idle);
+        rest(&agents, agent.id, ProgramState::Done);
+
+        let stopped = agents.stop_idle(Instant::now() + HALF_AN_HOUR, 30, &HashSet::new());
+
+        assert_eq!(stopped, vec![agent.id]);
+    }
+
+    #[test]
+    fn an_agent_that_rested_less_than_the_limit_keeps_running() {
+        let (agents, task) = agents_with_a_task();
+        let agent = register_in(&agents, &task, None).expect("register");
+        rest(&agents, agent.id, ProgramState::Idle);
+
+        let soon = Instant::now() + JUST_UNDER;
+
+        assert!(agents.stop_idle(soon, 30, &HashSet::new()).is_empty());
+        assert!(!agents.is_stopped(agent.id));
+    }
+
+    #[test]
+    fn work_between_two_rests_restarts_the_clock() {
+        let (agents, task) = agents_with_a_task();
+        let agent = register_in(&agents, &task, None).expect("register");
+        rest(&agents, agent.id, ProgramState::Idle);
+        rest(&agents, agent.id, ProgramState::Working);
+
+        assert!(
+            agents
+                .stop_idle(Instant::now() + HALF_AN_HOUR, 30, &HashSet::new())
+                .is_empty(),
+            "a working agent is not idle"
+        );
+
+        rest(&agents, agent.id, ProgramState::Idle);
+
+        assert!(
+            agents
+                .stop_idle(Instant::now(), 30, &HashSet::new())
+                .is_empty(),
+            "the rest began again just now"
+        );
+    }
+
+    #[test]
+    fn zero_minutes_stops_no_agent() {
+        let (agents, task) = agents_with_a_task();
+        let agent = register_in(&agents, &task, None).expect("register");
+        rest(&agents, agent.id, ProgramState::Idle);
+
+        let much_later = Instant::now() + TWO_DAYS;
+
+        assert!(agents.stop_idle(much_later, 0, &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn the_start_orchestrator_is_never_stopped_for_resting() {
+        let (agents, task) = agents_with_a_task();
+        let start = register_start(&agents, task.project);
+        rest(&agents, start.id, ProgramState::Idle);
+
+        let much_later = Instant::now() + TWO_DAYS;
+
+        assert!(agents.stop_idle(much_later, 30, &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn an_agent_with_a_running_process_terminal_is_not_stopped_for_resting() {
+        let (agents, task) = agents_with_a_task();
+        let worker = register_worker(&agents, &task);
+        rest(&agents, worker.id, ProgramState::Idle);
+        let busy = HashSet::from([worker.id]);
+
+        let stopped = agents.stop_idle(Instant::now() + HALF_AN_HOUR, 30, &busy);
+
+        assert!(stopped.is_empty());
+    }
+
+    #[test]
+    fn an_agent_that_shows_a_notice_is_not_resting() {
+        let (agents, task) = agents_with_a_task();
+        let agent = register_in(&agents, &task, None).expect("register");
+        rest(&agents, agent.id, ProgramState::Idle);
+        agents.notify(agent.id, "needs you");
+
+        let stopped = agents.stop_idle(Instant::now() + HALF_AN_HOUR, 30, &HashSet::new());
+
+        assert!(stopped.is_empty());
+    }
+
+    #[test]
+    fn an_agent_that_stopped_for_resting_ends_resumable_when_its_session_is_confirmed() {
+        let (agents, task, frames) = agents_with_a_client();
+        let agent = register_in(&agents, &task, None).expect("register");
+        start_without_a_hub(&agents, agent.id);
+        {
+            let mut live = lock(&agents.live);
+            let entry = live.get_mut(&agent.id).expect("live");
+            entry.session_confirmed = true;
+            entry.session_id = Some("session".to_owned());
+        }
+        rest(&agents, agent.id, ProgramState::Idle);
+        agents.stop_idle(Instant::now() + HALF_AN_HOUR, 30, &HashSet::new());
+
+        agents.exited(agent.id, Some(&ExitStatus::Signal("SIGKILL".to_owned())));
+
+        let stored = lock(&agents.store)
+            .agent(agent.id)
+            .expect("read")
+            .expect("row");
+        assert_eq!(stored.info.lifecycle, AgentLifecycle::Resumable);
+        assert!(notices(&frames).is_empty(), "nobody hears of the stop");
+    }
+
+    fn plan_with_limits(role: AgentRole, per_task: u32, total: u32) -> Plan {
+        Plan {
+            max_agents_per_task: per_task,
+            max_agents_total: total,
+            ..test_plan(AgentKind::ClaudeCode, role)
+        }
+    }
+
+    fn register_with(agents: &Agents, task: &TaskInfo, plan: Plan) -> Result<AgentInfo> {
+        agents.register_asked_by(None, &Place::of_task(task), plan)
+    }
+
+    #[test]
+    fn a_task_at_its_agent_limit_takes_no_more_agents() {
+        let (agents, task) = agents_with_a_task();
+        for _ in 0..2 {
+            register_with(&agents, &task, plan_with_limits(AgentRole::Worker, 2, 16))
+                .expect("under the limit");
+        }
+
+        let refused = register_with(&agents, &task, plan_with_limits(AgentRole::Worker, 2, 16))
+            .expect_err("over the limit");
+
+        assert_eq!(
+            refused.to_string(),
+            "the task has 2 agents running, the limit is 2 (Settings › Agents)"
+        );
+    }
+
+    #[test]
+    fn a_refused_agent_leaves_no_row_behind() {
+        let (agents, task) = agents_with_a_task();
+        register_with(&agents, &task, plan_with_limits(AgentRole::Worker, 1, 16))
+            .expect("under the limit");
+
+        register_with(&agents, &task, plan_with_limits(AgentRole::Worker, 1, 16))
+            .expect_err("over the limit");
+
+        let rows = lock(&agents.store).list_agents(task.id).expect("list");
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn all_tasks_together_are_held_to_the_total_limit() {
+        let (agents, task) = agents_with_a_task();
+        for _ in 0..3 {
+            register_with(&agents, &task, plan_with_limits(AgentRole::Worker, 6, 3))
+                .expect("under the limit");
+        }
+
+        let refused = register_with(&agents, &task, plan_with_limits(AgentRole::Worker, 6, 3))
+            .expect_err("over the limit");
+
+        assert_eq!(
+            refused.to_string(),
+            "3 agents are running, the limit is 3 (Settings › Agents)"
+        );
+    }
+
+    #[test]
+    fn the_start_orchestrator_counts_only_against_the_total() {
+        let (agents, task) = agents_with_a_task();
+        register_with(&agents, &task, plan_with_limits(AgentRole::Worker, 1, 16))
+            .expect("under the limit");
+        let place = Place {
+            project: task.project,
+            task: None,
+            name: "start",
+            worktree: Path::new("/repo"),
+            branch: "main",
+            ports: &[],
+        };
+
+        let start = agents.register(
+            &place,
+            plan_with_limits(AgentRole::StartOrchestrator, 1, 16),
+        );
+        let full = agents.register(&place, plan_with_limits(AgentRole::StartOrchestrator, 1, 1));
+
+        assert!(start.is_ok(), "the per-task limit does not apply");
+        assert_eq!(
+            full.expect_err("total").to_string(),
+            "2 agents are running, the limit is 1 (Settings › Agents)"
+        );
+    }
+
+    #[test]
+    fn an_agent_that_ended_frees_its_place() {
+        let (agents, task) = agents_with_a_task();
+        let first = register_with(&agents, &task, plan_with_limits(AgentRole::Worker, 1, 16))
+            .expect("under the limit");
+        agents.exited(first.id, None);
+
+        let next = register_with(&agents, &task, plan_with_limits(AgentRole::Worker, 1, 16));
+
+        assert!(next.is_ok());
+    }
+
+    #[test]
+    fn settings_that_cannot_be_parsed_give_the_defaults() {
+        let folder = crate::temp_folder::TempFolder::new("broken-settings");
+        let file = folder.path().join("settings.toml");
+        std::fs::write(&file, "[agents\nthis is not toml").expect("settings");
+        let (agents, _, _) = agents_with_settings(Some(file));
+
+        let settings = agents.settings();
+
+        assert_eq!(settings, Settings::default());
+        assert_eq!(
+            agents.default_kind(),
+            AgentKind::from(Settings::default().agents.orchestrator)
+        );
+    }
+
+    #[test]
+    fn a_settings_error_is_remembered_so_it_is_logged_once_and_forgotten_when_fixed() {
+        let folder = crate::temp_folder::TempFolder::new("broken-settings-once");
+        let file = folder.path().join("settings.toml");
+        std::fs::write(&file, "[agents\nthis is not toml").expect("settings");
+        let (agents, _, _) = agents_with_settings(Some(file.clone()));
+
+        agents.settings();
+        let first = lock(&agents.settings_error).clone();
+        agents.settings();
+        let second = lock(&agents.settings_error).clone();
+        std::fs::write(&file, "").expect("fixed");
+        agents.settings();
+        let fixed = lock(&agents.settings_error).clone();
+
+        assert!(first.is_some());
+        assert_eq!(first, second);
+        assert_eq!(fixed, None);
+    }
+
+    #[test]
+    fn each_distinct_set_of_settings_warnings_is_logged_once() {
+        let (agents, _, _) = agents_with_settings(None);
+        let first = vec!["agents.skip_permissions: not a true/false value".to_owned()];
+        let second = vec!["agents.max_agents_total: below 1".to_owned()];
+
+        assert!(agents.note_warnings(&first));
+        assert!(!agents.note_warnings(&first), "the same set is not new");
+        assert!(agents.note_warnings(&second));
+        assert!(!agents.note_warnings(&[]), "a clean file logs nothing");
+        assert!(
+            agents.note_warnings(&first),
+            "a fault that came back is new"
+        );
+    }
+
+    /// Settings that point both CLIs at a program that exists everywhere.
+    fn settings_with_a_cli(folder: &crate::temp_folder::TempFolder) -> PathBuf {
+        let file = folder.path().join("settings.toml");
+        std::fs::write(
+            &file,
+            "[agents.claude_code]\ncommand = \"/bin/sh\"\n[agents.codex]\ncommand = \"/bin/sh\"\n",
+        )
+        .expect("settings");
+
+        file
+    }
+
+    #[test]
+    fn an_agent_that_is_stopping_cannot_be_resumed() {
+        let (agents, task) = agents_with_a_task();
+        let agent = register_in(&agents, &task, None).expect("register");
+        start_without_a_hub(&agents, agent.id);
+        agents.stop_all();
+
+        let refused = agents.resume(agent.id).expect_err("refused");
+
+        assert_eq!(refused.to_string(), "the agent is stopping");
+    }
+
+    #[test]
+    fn a_resumed_start_orchestrator_is_refused_while_the_project_has_one() {
+        let folder = crate::temp_folder::TempFolder::new("resume-start-twice");
+        let (agents, task, _) = agents_with_settings(Some(settings_with_a_cli(&folder)));
+        register_start(&agents, task.project);
+        let old = {
+            let store = lock(&agents.store);
+            let mut info = store
+                .add_agent(&NewAgent {
+                    project: task.project,
+                    task: None,
+                    role: AgentRole::StartOrchestrator,
+                    kind: AgentKind::ClaudeCode,
+                    model: "model",
+                    session_id: Some("old-session"),
+                    name: "old start",
+                    worktree: Path::new("/repo"),
+                    branch: "main",
+                    ports: &[],
+                })
+                .expect("old start agent");
+            store.confirm_agent_session(info.id).expect("confirm");
+            info.lifecycle = AgentLifecycle::Resumable;
+            store.save_agent(&info).expect("save");
+
+            info
+        };
+
+        let refused = agents.resume(old.id).expect_err("refused");
+
+        assert_eq!(refused.to_string(), "the Start orchestrator already runs");
+    }
+
+    fn post_unread(agents: &Agents, task: &TaskInfo, to: AgentId) {
+        agents
+            .messages
+            .post(&NewMessage {
+                project: task.project,
+                task: Some(task.id),
+                from: None,
+                to,
+                kind: MessageKind::Report,
+                text: "unread",
+                delivered: false,
+            })
+            .expect("post");
+    }
+
+    #[test]
+    fn an_orchestrator_is_not_stopped_while_a_worker_of_its_task_runs() {
+        let (agents, task) = agents_with_a_task();
+        let (orchestrator, _worker) = a_swarm(&agents, &task);
+        rest(&agents, orchestrator.id, ProgramState::Idle);
+
+        let stopped = agents.stop_idle(Instant::now() + HALF_AN_HOUR, 30, &HashSet::new());
+
+        assert!(stopped.is_empty(), "{stopped:?}");
+    }
+
+    #[test]
+    fn an_orchestrator_is_stopped_once_its_workers_ended() {
+        let (agents, task) = agents_with_a_task();
+        let (orchestrator, worker) = a_swarm(&agents, &task);
+        agents.update(worker.id, |live| {
+            live.info.lifecycle = AgentLifecycle::Stopped;
+
+            true
+        });
+        rest(&agents, orchestrator.id, ProgramState::Idle);
+
+        let stopped = agents.stop_idle(Instant::now() + HALF_AN_HOUR, 30, &HashSet::new());
+
+        assert_eq!(stopped, vec![orchestrator.id]);
+    }
+
+    #[test]
+    fn an_agent_with_unread_messages_is_not_stopped_for_resting() {
+        let (agents, task) = agents_with_a_task();
+        let agent = register_in(&agents, &task, None).expect("register");
+        rest(&agents, agent.id, ProgramState::Idle);
+        post_unread(&agents, &task, agent.id);
+
+        let stopped = agents.stop_idle(Instant::now() + HALF_AN_HOUR, 30, &HashSet::new());
+
+        assert!(stopped.is_empty());
+    }
+
+    #[test]
+    fn an_agent_whose_user_has_a_draft_is_not_stopped_for_resting() {
+        let began = Instant::now();
+        let mut agent = live(AgentKind::ClaudeCode, ProgramState::Idle);
+        agent.rest.observe(true, began);
+        agent.typing.draft_at = Some(began + JUST_UNDER + Duration::from_secs(30));
+        let now = began + HALF_AN_HOUR;
+
+        assert!(!agent.stops_when_idle(now, 30, &HashSet::new(), &HashSet::new()));
+    }
+
+    #[test]
+    fn typing_into_an_agent_restarts_its_rest() {
+        let (agents, task) = agents_with_a_task();
+        let agent = register_in(&agents, &task, None).expect("register");
+        start_without_a_hub(&agents, agent.id);
+        rest(&agents, agent.id, ProgramState::Idle);
+        let began = lock(&agents.live)[&agent.id].rest.since.expect("resting");
+        sleep_for(SHORT);
+
+        agents.app_input(TerminalId(99), &TerminalInput::Text("a".to_owned()));
+
+        let stopped = agents.stop_idle(began + HALF_AN_HOUR, 30, &HashSet::new());
+        assert!(stopped.is_empty(), "the user was just there");
     }
 }

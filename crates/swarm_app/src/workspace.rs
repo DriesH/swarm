@@ -332,6 +332,11 @@ pub(crate) struct Workspace {
     pub(crate) pending_review_focus: bool,
     pub(crate) review_poll: Option<DiffPoll>,
     pub(crate) live_poll: Option<DiffPoll>,
+    /// The real task whose files the Files panel shows now, once the daemon was asked.
+    pub(crate) files_task: Option<swarm_protocol::TaskId>,
+    /// The tasks whose file list is being asked for now. The value says whether a change
+    /// came in meanwhile, so the list is asked once more.
+    pub(crate) files_asks: HashMap<swarm_protocol::TaskId, bool>,
     /// The Merged diff, while the pull request panel needs it and Review does not poll it.
     pub(crate) pr_poll: Option<DiffPoll>,
     /// How often the visible Review source and the open task's Live diff are asked for.
@@ -495,6 +500,8 @@ impl Workspace {
             pending_review_focus: false,
             review_poll: None,
             live_poll: None,
+            files_task: None,
+            files_asks: HashMap::new(),
             pr_poll: None,
             diff_intervals: (crate::daemon::REVIEW_INTERVAL, crate::daemon::LIVE_INTERVAL),
             pull_requests: PullRequests::default(),

@@ -25,6 +25,7 @@ use swarm_ui::{ButtonVariant, Nudge, ThemeColors};
 use crate::actions::{
     FILE_TREE_CONTEXT, TreeActivate, TreeFirst, TreeLast, TreeNext, TreePrevious,
 };
+use crate::daemon::is_resumable;
 use crate::markdown::{self, Markdown, Parsed};
 use crate::model::{Agent, AgentId, AgentKind, Message, TerminalId};
 use crate::panels::empty_status;
@@ -253,6 +254,10 @@ fn view_diff_label(agent: &str) -> String {
 
 fn focus_label(agent: &str) -> String {
     format!("Focus {agent}")
+}
+
+fn resume_label(agent: &str) -> String {
+    format!("Resume {agent}")
 }
 
 fn plural(count: u32, one: &str, many: &str) -> String {
@@ -1814,6 +1819,17 @@ fn inspector(
         .into_any_element()
 }
 
+fn resume_button(agent: &Agent, cx: &mut Context<Workspace>) -> Button {
+    let id = agent.id;
+
+    Button::new("inspector-resume", "Resume")
+        .accessible_label(resume_label(&agent.name))
+        .debug_selector(|| "inspector-resume".to_owned())
+        .on_click(cx.listener(move |workspace, _: &ClickEvent, _, cx| {
+            workspace.resume_agent(id, cx);
+        }))
+}
+
 fn inspector_body(
     workspace: &Workspace,
     agent: &Agent,
@@ -1839,6 +1855,9 @@ fn inspector_body(
         )
         .child(StatusPill::new(agent.status))
         .child(div().flex_1())
+        .when(is_resumable(agent), |title| {
+            title.child(resume_button(agent, cx))
+        })
         .child(
             Button::new("inspector-diff", "View diff")
                 .accessible_label(view_diff_label(&agent.name))
@@ -3091,6 +3110,39 @@ mod tests {
         assert_eq!(agent, Some(worker));
         assert_eq!(count, expected);
         assert!(count > 0);
+    }
+
+    #[gpui::test]
+    fn the_inspector_of_a_resumable_agent_has_a_resume_button_that_asks_the_daemon(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx, resumed) = crate::daemon::tests::resume_workspace(None, cx);
+        let agent = crate::daemon::tests::first_agent(&workspace, cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_view(View::Swarm, cx);
+            workspace.select_swarm_agent(agent, cx);
+        });
+        redraw(cx);
+
+        click("inspector-resume", cx);
+
+        let sent = crate::daemon::tests::wait_until(cx, |_| !resumed.is_empty());
+        assert!(sent, "the daemon got no ResumeAgent");
+        assert_eq!(resumed.try_recv().ok(), Some(DaemonAgentId(1)));
+    }
+
+    #[test]
+    fn the_resume_button_is_named_after_the_agent() {
+        assert_eq!(resume_label("orchestrator"), "Resume orchestrator");
+    }
+
+    #[gpui::test]
+    fn the_inspector_of_an_agent_that_is_not_resumable_has_no_resume_button(
+        cx: &mut TestAppContext,
+    ) {
+        let (_workspace, cx) = setup(cx);
+
+        assert!(cx.debug_bounds("inspector-resume").is_none());
     }
 
     #[gpui::test]

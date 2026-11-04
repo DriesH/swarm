@@ -234,6 +234,7 @@ pub struct TextField<const MULTILINE: bool> {
     buffer: Buffer,
     placeholder: SharedString,
     label: SharedString,
+    error: Option<SharedString>,
     mono: bool,
     disabled: bool,
     read_only: bool,
@@ -302,6 +303,7 @@ impl<const MULTILINE: bool> TextField<MULTILINE> {
             buffer: Buffer::default(),
             placeholder: SharedString::default(),
             label: SharedString::default(),
+            error: None,
             mono: false,
             disabled: false,
             read_only: false,
@@ -398,6 +400,20 @@ impl<const MULTILINE: bool> TextField<MULTILINE> {
         self.disabled = disabled;
         self.selecting = false;
         cx.notify();
+    }
+
+    /// The message of the error the field shows, if any.
+    pub fn error(&self) -> Option<&SharedString> {
+        self.error.as_ref()
+    }
+
+    /// `Some` puts the field in an error state: a red border, and the message as its
+    /// description with the invalid flag for VoiceOver. `None` clears it.
+    pub fn set_error(&mut self, error: Option<SharedString>, cx: &mut Context<Self>) {
+        if self.error != error {
+            self.error = error;
+            cx.notify();
+        }
     }
 
     pub fn is_read_only(&self) -> bool {
@@ -939,6 +955,11 @@ impl<const MULTILINE: bool> Render for TextField<MULTILINE> {
             colors.fg,
             colors.faint,
         );
+        let border = if self.error.is_some() {
+            colors.del
+        } else {
+            line
+        };
 
         let role = match (self.role, MULTILINE) {
             (TextFieldRole::ComboBox, _) => Role::EditableComboBox,
@@ -971,6 +992,9 @@ impl<const MULTILINE: bool> Render for TextField<MULTILINE> {
             .when_some(self.expanded, |field, expanded| {
                 field.aria_expanded(expanded)
             })
+            .when_some(self.error.clone(), |field, error| {
+                field.aria_description(error)
+            })
             .key_context(Self::key_context())
             .flex()
             .items_center()
@@ -987,7 +1011,7 @@ impl<const MULTILINE: bool> Render for TextField<MULTILINE> {
                     .px(px(10.))
                     .rounded(px(8.))
                     .border_1()
-                    .border_color(line)
+                    .border_color(border)
                     .bg(raised)
             })
             .font_family(font)
@@ -1022,6 +1046,7 @@ impl<const MULTILINE: bool> Render for TextField<MULTILINE> {
                 field.focus(|style| style.border_color(accent))
             })
             .a11y_flags()
+            .invalid(self.error.is_some())
             .disabled(self.disabled)
             .read_only(self.read_only)
     }
@@ -2232,6 +2257,13 @@ impl Component for TextInput {
             input.set_disabled(true, cx);
             input
         });
+        let invalid = window.use_keyed_state("text-input-error", cx, |_, cx| {
+            let mut input = TextInput::new(cx);
+            input.set_label("Max agents", cx);
+            input.set_text("0", cx);
+            input.set_error(Some("Max agents: 1 or more".into()), cx);
+            input
+        });
         let small = window.use_keyed_state("text-input-small", cx, |_, cx| {
             let mut input = TextInput::new(cx);
             input.set_label("Small field", cx);
@@ -2280,6 +2312,7 @@ impl Component for TextInput {
                     example("Name", preview_field(name)),
                     example("Filter files", preview_field(filter)),
                     example("Disabled", preview_field(disabled)),
+                    example("Error", preview_field(invalid)),
                     example("Small", preview_field(small)),
                     example("Borderless with prefix", preview_field(search)),
                     example("Border focus", preview_field(orchestrator)),
@@ -2309,6 +2342,20 @@ mod tests {
 
         cx.update(|window, cx| handle.focus(window, cx));
         cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn a_field_keeps_its_error_until_it_is_cleared(cx: &mut TestAppContext) {
+        cx.update(crate::theme::init);
+        let (input, cx) = cx.add_window_view(|_, cx| TextInput::new(cx));
+
+        input.update(cx, |input, cx| input.set_error(Some("Bad".into()), cx));
+        let set = input.read_with(cx, |input, _| input.error().cloned());
+        input.update(cx, |input, cx| input.set_error(None, cx));
+        let cleared = input.read_with(cx, |input, _| input.error().cloned());
+
+        assert_eq!(set.as_deref(), Some("Bad"));
+        assert_eq!(cleared, None);
     }
 
     #[gpui::test]

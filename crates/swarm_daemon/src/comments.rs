@@ -3,9 +3,10 @@
 
 use anyhow::Result;
 use swarm_core::comments::Written;
-use swarm_protocol::{CommentId, Event, NewComment, TaskId};
+use swarm_protocol::{AgentRole, CommentId, Event, NewComment, TaskId};
 
 use crate::Services;
+use crate::agents::lock;
 
 /// Stores the comment. A comment that is not held back goes to the orchestrator now.
 pub(crate) fn add(services: &Services, new: &NewComment) -> Result<()> {
@@ -13,20 +14,28 @@ pub(crate) fn add(services: &Services, new: &NewComment) -> Result<()> {
         .projects
         .add_comment(new, &|written| announce(services, written))?;
 
-    deliver(services, &written);
-
-    Ok(())
+    deliver(services, &written)
 }
 
-/// Sends every pending comment of the task.
+/// Sends every pending comment of the task. A `Resumable` orchestrator resumes first;
+/// a refused resume fails the call and the comments stay pending.
 pub(crate) fn send_pending(services: &Services, task: TaskId) -> Result<()> {
+    if !services.projects.pending_comments(task)?.is_empty() {
+        let orchestrator = lock(&services.store)
+            .list_agents(task)?
+            .into_iter()
+            .find(|agent| agent.role == AgentRole::Orchestrator);
+
+        if let Some(orchestrator) = orchestrator {
+            services.agents.resume_for_message(orchestrator.id)?;
+        }
+    }
+
     let written = services
         .projects
         .send_comments(task, &|written| announce(services, written))?;
 
-    deliver(services, &written);
-
-    Ok(())
+    deliver(services, &written)
 }
 
 pub(crate) fn delete(services: &Services, id: CommentId) -> Result<()> {
@@ -66,12 +75,16 @@ fn announce(services: &Services, written: &Written) {
     }
 }
 
-/// Wakes the orchestrator if it waits, and pastes the messages if it is idle.
-fn deliver(services: &Services, written: &Written) {
+/// Wakes the orchestrator if it waits, and pastes the messages if it is idle. A
+/// `Resumable` orchestrator resumes first; a refused resume is the error.
+fn deliver(services: &Services, written: &Written) -> Result<()> {
     let Some(first) = written.messages.first() else {
-        return;
+        return Ok(());
     };
 
+    services.agents.resume_for_message(first.to)?;
     services.messages.wake();
     services.agents.deliver_unread(first.to);
+
+    Ok(())
 }

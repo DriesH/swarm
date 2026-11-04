@@ -24,6 +24,16 @@ use crate::{
     TerminalInfo, Usage, VERSION, check_private_dir, read, write,
 };
 
+/// A project's config file as the daemon read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectConfigRead {
+    pub fields: ProjectConfigFields,
+    /// Why the file does not parse; `fields` are the defaults then.
+    pub error: Option<String>,
+    /// The tool behind the project's git pre-push hook.
+    pub pre_push_hook: Option<String>,
+}
+
 /// Local checks moved on, or the orchestrator sent a pull request draft.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrEvent {
@@ -536,6 +546,14 @@ impl Client {
         }
     }
 
+    /// Starts a `Resumable` agent again with its saved session.
+    pub fn resume_agent(&self, agent: AgentId) -> Result<AgentInfo, ClientError> {
+        match self.call(|call| Request::ResumeAgent { call, agent }, None)? {
+            Event::AgentStarted { agent, .. } => Ok(agent),
+            other => Err(unexpected("ResumeAgent", &other)),
+        }
+    }
+
     /// The project's saved plan draft and its plan template.
     pub fn plan_draft(&self, project: ProjectId) -> Result<PlanDraft, ClientError> {
         match self.call(|call| Request::PlanDraft { call, project }, None)? {
@@ -614,6 +632,18 @@ impl Client {
         match reply {
             Event::TaskDiff { diff, .. } => Ok(diff),
             other => Err(unexpected("TaskDiff", &other)),
+        }
+    }
+
+    /// The sorted paths in the task worktree, and how many paths the daemon cut.
+    pub fn task_files(&self, task: TaskId) -> Result<(Vec<String>, usize), ClientError> {
+        let timeout = self.reply_timeout.max(GIT_TIMEOUT);
+        let reply =
+            self.call_with_timeout(|call| Request::TaskFiles { call, task }, None, timeout)?;
+
+        match reply {
+            Event::TaskFiles { files, omitted, .. } => Ok((files, omitted)),
+            other => Err(unexpected("TaskFiles", &other)),
         }
     }
 
@@ -736,8 +766,28 @@ impl Client {
         &self,
         project: ProjectId,
     ) -> Result<(ProjectConfigFields, Option<String>), ClientError> {
+        let read = self.read_project_config(project)?;
+
+        Ok((read.fields, read.error))
+    }
+
+    /// The project's config as [`Self::project_config`] gives it, and the tool behind its
+    /// git pre-push hook.
+    pub fn read_project_config(
+        &self,
+        project: ProjectId,
+    ) -> Result<ProjectConfigRead, ClientError> {
         match self.call(|call| Request::ProjectConfig { call, project }, None)? {
-            Event::ProjectConfig { fields, error, .. } => Ok((fields, error)),
+            Event::ProjectConfig {
+                fields,
+                error,
+                pre_push_hook,
+                ..
+            } => Ok(ProjectConfigRead {
+                fields,
+                error,
+                pre_push_hook,
+            }),
             other => Err(unexpected("ProjectConfig", &other)),
         }
     }
@@ -1241,6 +1291,18 @@ fn read_events(
             Event::TaskDiff { call, diff } => {
                 deliver(shared, call, Event::TaskDiff { call, diff });
             }
+            Event::TaskFiles {
+                call,
+                files,
+                omitted,
+            } => {
+                let event = Event::TaskFiles {
+                    call,
+                    files,
+                    omitted,
+                };
+                deliver(shared, call, event);
+            }
             Event::FileHunks { call, file } => {
                 deliver(shared, call, Event::FileHunks { call, file });
             }
@@ -1273,6 +1335,7 @@ fn read_events(
                 call,
                 fields,
                 error,
+                pre_push_hook,
             } => deliver(
                 shared,
                 call,
@@ -1280,6 +1343,7 @@ fn read_events(
                     call,
                     fields,
                     error,
+                    pre_push_hook,
                 },
             ),
             Event::Prompts { call, prompts } => {

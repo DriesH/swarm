@@ -2,7 +2,7 @@
 //! stopped them (ADR 0006). User and agent terminals are never in here, so no call can
 //! reach them.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -589,6 +589,17 @@ impl Processes {
                 log::error!("cannot watch terminal {} stop: {error}", id.0);
             }
         }
+    }
+
+    /// The agents that own a process terminal that still runs.
+    pub(crate) fn running_owners(&self) -> HashSet<AgentId> {
+        let entries: Vec<Arc<Entry>> = lock(&self.entries).values().cloned().collect();
+
+        entries
+            .iter()
+            .filter(|entry| !lock(&entry.state).ended)
+            .map(|entry| entry.owner)
+            .collect()
     }
 
     /// Drops the entries of a removed project, ended ones too.
