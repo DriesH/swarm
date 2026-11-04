@@ -8,14 +8,15 @@ mod box_drawing;
 mod element;
 
 use std::ops::Range;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Instant;
 
 use gpui::{
-    App, Bounds, ClipboardItem, Context, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
-    Global, Hsla, KeyBinding, KeyDownEvent, Keystroke, NoAction, Pixels, Point, Render, Rgba, Role,
-    ScrollEvent, SharedString, Size, Subscription, Task, TextRun, UTF16Selection, UnderlineStyle,
-    Window, div, prelude::*, px,
+    App, Bounds, ClipboardEntry, Context, EntityInputHandler, EventEmitter, ExternalPaths,
+    FocusHandle, Focusable, Global, Hsla, KeyBinding, KeyDownEvent, Keystroke, NoAction, Pixels,
+    Point, Render, Rgba, Role, ScrollEvent, SharedString, Size, Subscription, Task, TextRun,
+    UTF16Selection, UnderlineStyle, Window, div, prelude::*, px,
 };
 use swarm_term::{
     CursorStyle, ExitStatus, Key, Modifiers, Palette, Rgb, ScreenModel, TerminalChannels,
@@ -569,7 +570,7 @@ impl TerminalView {
         })
     }
 
-    fn on_key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
         if !self.typing_allowed(cx) {
             return;
@@ -582,7 +583,7 @@ impl TerminalView {
                 && !keystroke.modifiers.control;
 
             if plain_paste {
-                self.paste(cx);
+                self.paste(window, cx);
                 cx.stop_propagation();
             }
 
@@ -594,19 +595,56 @@ impl TerminalView {
         cx.stop_propagation();
     }
 
-    fn paste(&mut self, cx: &mut Context<Self>) {
+    fn paste(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.typing_allowed(cx) {
             return;
         }
 
-        let text = cx
-            .read_from_clipboard()
-            .and_then(|item: ClipboardItem| item.text());
+        let Some(item) = cx.read_from_clipboard() else {
+            return;
+        };
 
-        if let Some(text) = text.filter(|text| !text.is_empty()) {
-            self.send(TerminalInput::Paste(text));
-            self.scroll_to_bottom(cx);
+        match item.entries().first() {
+            // The program reads the clipboard image itself when it gets Ctrl-V.
+            Some(ClipboardEntry::Image(image)) if !image.bytes.is_empty() => {
+                self.send(TerminalInput::Key(Key {
+                    name: "v".to_owned(),
+                    modifiers: Modifiers {
+                        control: true,
+                        ..Modifiers::default()
+                    },
+                    text: None,
+                    repeat: false,
+                }));
+                self.scroll_to_bottom(cx);
+            }
+            Some(ClipboardEntry::ExternalPaths(paths)) => {
+                self.paste_paths(paths.paths(), window, cx);
+            }
+            _ => {
+                if let Some(text) = item.text().filter(|text| !text.is_empty()) {
+                    self.send(TerminalInput::Paste(text));
+                    self.scroll_to_bottom(cx);
+                }
+            }
         }
+    }
+
+    /// Types the quoted `paths` into the program, as a paste. A program like Claude Code
+    /// attaches an image path it sees in its input.
+    fn paste_paths(&mut self, paths: &[PathBuf], window: &mut Window, cx: &mut Context<Self>) {
+        if !self.typing_allowed(cx) {
+            return;
+        }
+
+        let text = paths_text(paths);
+        if text.is_empty() {
+            return;
+        }
+
+        window.focus(&self.focus_handle, cx);
+        self.send(TerminalInput::Paste(text));
+        self.scroll_to_bottom(cx);
     }
 
     fn on_scroll(&mut self, event: &ScrollEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -685,6 +723,35 @@ fn key_from(keystroke: &Keystroke, repeat: bool) -> Key {
     }
 }
 
+/// `path` as one POSIX shell word. A path of safe characters stays as it is.
+fn quote_path(path: &str) -> String {
+    let safe =
+        |character: char| character.is_ascii_alphanumeric() || "/._-+,:@%".contains(character);
+
+    if !path.is_empty() && path.chars().all(safe) {
+        return path.to_owned();
+    }
+
+    format!("'{}'", path.replace('\'', r"'\''"))
+}
+
+/// The text to type for dropped `paths`: a space before each quoted path and one at the end.
+/// A path that is not valid UTF-8 is skipped. It is empty when no path is left.
+fn paths_text(paths: &[PathBuf]) -> String {
+    let mut text = String::new();
+
+    for path in paths.iter().filter_map(|path| path.to_str()) {
+        text.push(' ');
+        text.push_str(&quote_path(path));
+    }
+
+    if !text.is_empty() {
+        text.push(' ');
+    }
+
+    text
+}
+
 /// The terminal colors for `theme`: `term` background, `fg` text and cursor, and the
 /// theme's 16 ANSI colors.
 pub fn palette_for(theme: &Theme) -> Palette {
@@ -726,6 +793,7 @@ impl Render for TerminalView {
             || cx.theme().colors().term,
             |model| hsla(model.screen().colors.bg),
         );
+        let drop_ring = cx.theme().colors().accent;
         // Building the text costs a pass over the rows, so only do it for a screen reader.
         let value = window.is_a11y_active().then(|| self.visible_text());
 
@@ -739,9 +807,15 @@ impl Render for TerminalView {
             .bg(background)
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
-            .on_action(cx.listener(|view, _: &edit::Paste, _, cx| view.paste(cx)))
+            .on_action(cx.listener(|view, _: &edit::Paste, window, cx| view.paste(window, cx)))
+            .on_drop(cx.listener(|view, dropped: &ExternalPaths, window, cx| {
+                view.paste_paths(dropped.paths(), window, cx);
+            }))
             .on_scroll(cx.listener(Self::on_scroll))
             .child(TerminalElement::new(cx.entity()))
+            .child(div().absolute().size_full().drag_over::<ExternalPaths>(
+                move |style, _, _, _| style.border_2().border_color(drop_ring),
+            ))
     }
 }
 
@@ -844,7 +918,7 @@ impl EntityInputHandler for TerminalView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::Modifiers as GpuiModifiers;
+    use gpui::{ClipboardItem, Modifiers as GpuiModifiers};
 
     fn keystroke(key: &str, key_char: Option<&str>, modifiers: GpuiModifiers) -> Keystroke {
         Keystroke {
@@ -947,6 +1021,203 @@ mod tests {
         cx.dispatch_action(edit::Paste);
 
         let sent: Vec<TerminalInput> = emulator.input.try_iter().collect();
+        assert!(
+            !sent
+                .iter()
+                .any(|input| matches!(input, TerminalInput::Paste(_)))
+        );
+    }
+
+    fn pasted_text(emulator: &swarm_term::EmulatorChannels) -> Vec<String> {
+        emulator
+            .input
+            .try_iter()
+            .filter_map(|input| match input {
+                TerminalInput::Paste(text) => Some(text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn is_control_v(input: &TerminalInput) -> bool {
+        matches!(
+            input,
+            TerminalInput::Key(key)
+                if key.name == "v" && key.modifiers.control && !key.modifiers.command
+        )
+    }
+
+    fn paths(names: &[&str]) -> ExternalPaths {
+        ExternalPaths(names.iter().map(PathBuf::from).collect())
+    }
+
+    #[test]
+    fn a_plain_path_is_not_quoted() {
+        assert_eq!(
+            quote_path("/tmp/shot-1_a.b+c,d:e@f%g.png"),
+            "/tmp/shot-1_a.b+c,d:e@f%g.png"
+        );
+    }
+
+    #[test]
+    fn a_path_with_spaces_is_single_quoted() {
+        assert_eq!(quote_path("/tmp/my shot.png"), "'/tmp/my shot.png'");
+    }
+
+    #[test]
+    fn a_single_quote_in_a_path_is_escaped() {
+        assert_eq!(quote_path("/tmp/it's.png"), r"'/tmp/it'\''s.png'");
+    }
+
+    #[test]
+    fn dollar_and_backtick_in_a_path_stay_literal() {
+        assert_eq!(quote_path("/tmp/$HOME`id`.png"), "'/tmp/$HOME`id`.png'");
+    }
+
+    #[test]
+    fn an_empty_path_is_quoted() {
+        assert_eq!(quote_path(""), "''");
+    }
+
+    #[test]
+    fn dropped_paths_get_a_space_before_each_and_one_at_the_end() {
+        let text = paths_text(&[PathBuf::from("/a/b.png"), PathBuf::from("/c d.png")]);
+
+        assert_eq!(text, " /a/b.png '/c d.png' ");
+    }
+
+    #[test]
+    fn no_paths_make_no_text() {
+        assert_eq!(paths_text(&[]), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_that_is_not_utf8_is_skipped() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let bad = PathBuf::from(std::ffi::OsString::from_vec(vec![b'/', 0xff]));
+
+        assert_eq!(paths_text(&[bad, PathBuf::from("/ok")]), " /ok ");
+    }
+
+    fn drop_on_view(cx: &mut gpui::VisualTestContext, names: &[&str]) {
+        let position = gpui::point(px(20.), px(20.));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        cx.simulate_event(gpui::FileDropEvent::Entered {
+            position,
+            paths: paths(names),
+        });
+        cx.simulate_event(gpui::FileDropEvent::Submit { position });
+    }
+
+    #[gpui::test]
+    fn dropping_files_pastes_the_quoted_paths_and_focuses_the_terminal(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(swarm_ui::theme::init);
+        let (channels, emulator) = swarm_term::channels();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            TerminalView::new(channels, "terminal".into(), window, cx)
+        });
+
+        drop_on_view(cx, &["/tmp/a.png", "/tmp/my shot.png"]);
+
+        assert_eq!(
+            pasted_text(&emulator),
+            vec![" /tmp/a.png '/tmp/my shot.png' ".to_owned()]
+        );
+        assert!(cx.update(|window, cx| view.focus_handle(cx).is_focused(window)));
+    }
+
+    #[gpui::test]
+    fn dropping_files_waits_for_the_typing_gate(cx: &mut gpui::TestAppContext) {
+        cx.update(swarm_ui::theme::init);
+        let (channels, emulator) = swarm_term::channels();
+        let (_view, cx) = cx.add_window_view(|window, cx| {
+            let mut view = TerminalView::new(channels, "terminal".into(), window, cx);
+            view.set_typing_gate(|_| false);
+
+            view
+        });
+
+        drop_on_view(cx, &["/tmp/a.png"]);
+
+        assert!(pasted_text(&emulator).is_empty());
+    }
+
+    fn view_with_clipboard(
+        cx: &mut gpui::TestAppContext,
+        item: ClipboardItem,
+        gate_open: bool,
+    ) -> Vec<TerminalInput> {
+        cx.update(swarm_ui::theme::init);
+        let (channels, emulator) = swarm_term::channels();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut view = TerminalView::new(channels, "terminal".into(), window, cx);
+            view.set_typing_gate(move |_| gate_open);
+
+            view
+        });
+        cx.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
+        cx.write_to_clipboard(item);
+
+        cx.dispatch_action(edit::Paste);
+
+        emulator.input.try_iter().collect()
+    }
+
+    fn png(bytes: Vec<u8>) -> ClipboardItem {
+        ClipboardItem::new_image(&gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes))
+    }
+
+    #[gpui::test]
+    fn pasting_an_image_sends_control_v_and_no_paste(cx: &mut gpui::TestAppContext) {
+        let sent = view_with_clipboard(cx, png(vec![1, 2, 3]), true);
+
+        assert!(sent.iter().any(is_control_v));
+        assert!(
+            !sent
+                .iter()
+                .any(|input| matches!(input, TerminalInput::Paste(_)))
+        );
+    }
+
+    #[gpui::test]
+    fn pasting_an_empty_image_sends_nothing(cx: &mut gpui::TestAppContext) {
+        let sent = view_with_clipboard(cx, png(Vec::new()), true);
+
+        assert!(!sent.iter().any(is_control_v));
+    }
+
+    #[gpui::test]
+    fn pasting_an_image_waits_for_the_typing_gate(cx: &mut gpui::TestAppContext) {
+        let sent = view_with_clipboard(cx, png(vec![1, 2, 3]), false);
+
+        assert!(!sent.iter().any(is_control_v));
+    }
+
+    #[gpui::test]
+    fn pasting_files_sends_the_quoted_paths(cx: &mut gpui::TestAppContext) {
+        let item = ClipboardItem::from(ClipboardEntry::ExternalPaths(paths(&[
+            "/tmp/a.png",
+            "/tmp/b c.png",
+        ])));
+
+        let sent = view_with_clipboard(cx, item, true);
+
+        assert!(sent.contains(&TerminalInput::Paste(
+            " /tmp/a.png '/tmp/b c.png' ".to_owned()
+        )));
+    }
+
+    #[gpui::test]
+    fn pasting_files_waits_for_the_typing_gate(cx: &mut gpui::TestAppContext) {
+        let item = ClipboardItem::from(ClipboardEntry::ExternalPaths(paths(&["/tmp/a.png"])));
+
+        let sent = view_with_clipboard(cx, item, false);
+
         assert!(
             !sent
                 .iter()
