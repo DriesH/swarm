@@ -19,8 +19,8 @@ use crate::lifecycle;
 use crate::settings::Page;
 use crate::workspace::Workspace;
 
-/// Where Swarm Help goes. A placeholder until the docs website is live.
-pub(crate) const HELP_URL: &str = "https://docs.swarm.example";
+/// Where Swarm Help goes: the docs website.
+pub(crate) const HELP_URL: &str = "https://driesh.github.io/swarm/docs/";
 
 /// Sets the menu bar and the handlers of the actions no window handles.
 pub(crate) fn install(cx: &mut App) {

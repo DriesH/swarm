@@ -1,10 +1,11 @@
-name: Product website
+name: Websites
 
 on:
   push:
     branches: [main]
     paths:
       - "site/**"
+      - "docs-site/**"
       - "assets/fonts/**"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
@@ -27,12 +28,25 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Assemble the site
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: docs-site/.node-version
+          cache: npm
+          cache-dependency-path: docs-site/package-lock.json
+
+      - name: Build the docs website
+        working-directory: docs-site
+        run: |
+          npm ci
+          npm run build
+
+      - name: Assemble the product website and the docs
         run: |
           mkdir -p _site/fonts
           cp -R site/. _site/
           cp assets/fonts/Geist-Regular.ttf assets/fonts/Geist-Medium.ttf assets/fonts/Geist-SemiBold.ttf \
              assets/fonts/GeistMono-Regular.ttf assets/fonts/GeistMono-Medium.ttf assets/fonts/OFL.txt _site/fonts/
+          cp -R docs-site/dist _site/docs
 
       - uses: actions/configure-pages@v6
 
