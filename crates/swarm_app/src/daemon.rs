@@ -6,6 +6,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
@@ -14,13 +15,15 @@ use gpui::{
 };
 use swarm_protocol::{
     AgentChange, AgentId as DaemonAgentId, AgentInfo, AgentLifecycle, Client, ClientError,
-    CreateTerminal, MessageEvent, Paths, ProjectInfo, ReviewSource, TaskDiff, TaskInfo,
-    TerminalId as DaemonTerminalId, TerminalInfo, TerminalKind as DaemonKind, Usage,
+    CreateTerminal, Host, MessageEvent, Paths, ProjectInfo, ReviewSource, System, TaskDiff,
+    TaskInfo, TerminalId as DaemonTerminalId, TerminalInfo, TerminalKind as DaemonKind, Usage,
+    stop_daemon,
 };
 use swarm_term::{ExitStatus, TerminalChannels, TerminalInput};
 use swarm_term_view::{TerminalEvent, TerminalView, palette_for};
 use swarm_ui::ActiveTheme as _;
 
+use crate::daemon_restart::StaleDaemon;
 use crate::model::{
     Agent, AgentChanges, AgentId, FakeData, ProjectId, TaskFileList, TaskId, TerminalId,
     TerminalKind,
@@ -68,8 +71,10 @@ fn reconnect_delay(attempt: usize) -> Duration {
 /// What the app needs to find or start the daemon again.
 #[derive(Clone)]
 pub(crate) struct DaemonLaunch {
-    paths: Paths,
-    binary: PathBuf,
+    pub(crate) paths: Paths,
+    pub(crate) binary: PathBuf,
+    /// How a daemon that runs gets stopped.
+    pub(crate) host: Arc<dyn Host>,
 }
 
 impl DaemonLaunch {
@@ -80,7 +85,11 @@ impl DaemonLaunch {
             .map_err(|error| format!("cannot find the app binary: {error}"))?
             .with_file_name(DAEMON_BINARY);
 
-        Ok(Self { paths, binary })
+        Ok(Self {
+            paths,
+            binary,
+            host: Arc::new(System),
+        })
     }
 }
 
@@ -167,22 +176,43 @@ impl Workspace {
     }
 
     fn start_connect(&mut self, launch: DaemonLaunch, cx: &mut Context<Self>) {
+        self.begin_connect(launch, false, cx);
+    }
+
+    /// Connects on a background thread. With `replace` the daemon that runs is stopped
+    /// first.
+    pub(crate) fn begin_connect(
+        &mut self,
+        launch: DaemonLaunch,
+        replace: bool,
+        cx: &mut Context<Self>,
+    ) {
         self.daemon_launch = Some(launch.clone());
         self.source = DataSource::Connecting;
         cx.notify();
 
-        let connecting = cx.background_spawn(async move { connect(&launch) });
+        let connecting = cx.background_spawn(async move { connect(&launch, replace) });
 
         cx.spawn(async move |this, cx| {
             let result = connecting.await;
 
             let used = Self::update_with_window(&this, cx, |workspace, window, cx| match result {
                 Ok((client, terminals, projects)) => {
+                    if workspace.check_daemon_build(&client, &projects, cx) {
+                        return;
+                    }
+
                     workspace.use_projects(&projects, cx);
                     workspace.connect_client(client, &terminals, window, cx);
                     Self::watch_daemon(cx);
                 }
-                Err(error) => workspace.daemon_unavailable(error.to_string(), cx),
+                Err(error) => {
+                    if let Some(stale) = StaleDaemon::from_error(&error) {
+                        workspace.stale_daemon = Some(stale);
+                    }
+
+                    workspace.daemon_unavailable(error.to_string(), cx);
+                }
             });
 
             if let Err(error) = used {
@@ -234,7 +264,7 @@ impl Workspace {
                     .background_executor()
                     .spawn({
                         let launch = launch.clone();
-                        async move { connect(&launch) }
+                        async move { connect(&launch, false) }
                     })
                     .await;
 
@@ -242,12 +272,31 @@ impl Workspace {
                     Ok(connected) => connected,
                     Err(error) => {
                         log::warn!("reconnect attempt {} failed: {error}", attempt + 1);
+
+                        if let Some(stale) = StaleDaemon::from_error(&error) {
+                            let shown = Self::update_with_window(&this, cx, |workspace, _, cx| {
+                                workspace.reconnecting = false;
+                                workspace.stale_daemon = Some(stale);
+                                workspace.daemon_unavailable(error.to_string(), cx);
+                            });
+
+                            if let Err(error) = shown {
+                                log::debug!("the workspace is gone while reconnecting: {error}");
+                            }
+
+                            return;
+                        }
+
                         continue;
                     }
                 };
 
                 let used = Self::update_with_window(&this, cx, |workspace, window, cx| {
                     workspace.reconnecting = false;
+                    if workspace.check_daemon_build(&client, &projects, cx) {
+                        return;
+                    }
+
                     workspace.use_projects(&projects, cx);
                     workspace.connect_client(client, &terminals, window, cx);
                 });
@@ -2052,7 +2101,11 @@ pub(crate) fn exit_failed(status: &ExitStatus) -> bool {
     !matches!(status, ExitStatus::Code(0))
 }
 
-fn connect(launch: &DaemonLaunch) -> Result<Connected, ClientError> {
+fn connect(launch: &DaemonLaunch, replace: bool) -> Result<Connected, ClientError> {
+    if replace {
+        stop_daemon(&launch.paths.socket, launch.host.as_ref())?;
+    }
+
     let client = Client::connect_or_spawn(&launch.paths, &launch.binary)?;
     let terminals = client.list()?;
     let projects = client.list_projects()?;
@@ -2100,7 +2153,7 @@ pub(crate) mod tests {
 
     /// Starts the project's Start orchestrator, has no plan draft and lists no terminals,
     /// for any request that asks for it.
-    fn default_reply(request: &Request) -> Option<Event> {
+    pub(crate) fn default_reply(request: &Request) -> Option<Event> {
         match request {
             Request::StartOrchestrator { call, project, .. } => Some(Event::AgentStarted {
                 call: *call,
@@ -2272,6 +2325,7 @@ pub(crate) mod tests {
                     &Event::Hello {
                         version: VERSION,
                         pid: 1,
+                        build: env!("CARGO_PKG_VERSION").to_owned(),
                     },
                 )
                 .ok();
@@ -2353,6 +2407,7 @@ pub(crate) mod tests {
                     &Event::Hello {
                         version: VERSION,
                         pid: 1,
+                        build: env!("CARGO_PKG_VERSION").to_owned(),
                     },
                 )
                 .ok();
@@ -2487,6 +2542,7 @@ pub(crate) mod tests {
         DaemonLaunch {
             paths: Paths::in_dir(folder),
             binary: PathBuf::from("/nonexistent/swarm-daemon"),
+            host: Arc::new(System),
         }
     }
 
@@ -5993,9 +6049,9 @@ pub(crate) mod tests {
     #[gpui::test]
     fn a_refused_close_checks_again_and_confirms_the_new_check(cx: &mut TestAppContext) {
         let (sent, closes) = flume::unbounded();
-        let checks = std::sync::Arc::new(AtomicU64::new(0));
+        let checks = Arc::new(AtomicU64::new(0));
         let socket = fake_daemon_replying({
-            let checks = std::sync::Arc::clone(&checks);
+            let checks = Arc::clone(&checks);
 
             move |request| match request {
                 Request::CheckClose { call, .. } => {

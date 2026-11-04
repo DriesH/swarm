@@ -120,6 +120,15 @@ fn log_end(client: u64, error: &PinnedError) {
     }
 }
 
+/// The daemon's version, protocol and build. Every `Hello` it sends says the same.
+fn hello() -> Event {
+    Event::Hello {
+        version: VERSION,
+        pid: std::process::id(),
+        build: env!("CARGO_PKG_VERSION").to_owned(),
+    }
+}
+
 /// The client must send `Hello` with our version, then answer our challenge with `Prove`.
 fn handshake(
     sink: &ClientSink,
@@ -136,10 +145,7 @@ fn handshake(
                 "client {} speaks protocol version {version}; closing",
                 sink.id()
             );
-            sink.send_event(&Event::Hello {
-                version: VERSION,
-                pid: std::process::id(),
-            });
+            sink.send_event(&hello());
 
             return false;
         }
@@ -155,10 +161,7 @@ fn handshake(
         }
     }
 
-    sink.send_event(&Event::Hello {
-        version: VERSION,
-        pid: std::process::id(),
-    });
+    sink.send_event(&hello());
 
     let Some(nonce) = new_nonce() else {
         log::error!("client {}: cannot make a challenge nonce", sink.id());
@@ -216,10 +219,7 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
 
     match request {
         Request::Hello { .. } => {
-            sink.send_event(&Event::Hello {
-                version: VERSION,
-                pid: std::process::id(),
-            });
+            sink.send_event(&hello());
         }
         Request::Prove { .. } => {
             sink.send_event(&Event::Error {

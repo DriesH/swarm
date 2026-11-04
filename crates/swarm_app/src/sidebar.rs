@@ -331,29 +331,59 @@ fn daemon_status(workspace: &Workspace, cx: &mut Context<Workspace>) -> Option<L
                     .child(Label::new("Connecting").color(Color::Muted)),
             ),
         ),
-        DataSource::Unavailable { reason } => Some(
-            LiveRegion::alert("daemon-status", format!("Daemon not running: {reason}")).child(
-                h_flex()
-                    .debug_selector(|| "daemon-status".to_owned())
-                    .min_h(px(28.))
-                    .gap(px(8.))
-                    .px(px(8.))
-                    .child(
-                        div()
-                            .flex_1()
-                            .child(Label::new("Daemon not running").color(Color::Muted)),
-                    )
-                    .child(
-                        Button::new("retry-daemon", "Retry")
-                            .debug_selector(|| "retry-daemon".to_owned())
-                            .on_click(
-                                cx.listener(|workspace, _, _, cx| workspace.retry_daemon(cx)),
-                            ),
-                    ),
-            ),
-        ),
-        DataSource::Sample | DataSource::Live => None,
+        DataSource::Unavailable { reason } => {
+            let action = if workspace.stale_daemon.is_some() {
+                restart_daemon_button(cx)
+            } else {
+                Button::new("retry-daemon", "Retry")
+                    .debug_selector(|| "retry-daemon".to_owned())
+                    .on_click(cx.listener(|workspace, _, _, cx| workspace.retry_daemon(cx)))
+            };
+
+            Some(
+                LiveRegion::alert("daemon-status", format!("Daemon not running: {reason}")).child(
+                    h_flex()
+                        .debug_selector(|| "daemon-status".to_owned())
+                        .min_h(px(28.))
+                        .gap(px(8.))
+                        .px(px(8.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .child(Label::new("Daemon not running").color(Color::Muted)),
+                        )
+                        .child(action),
+                ),
+            )
+        }
+        DataSource::Live => {
+            let text = workspace.stale_daemon.as_ref()?.status()?;
+
+            Some(
+                LiveRegion::status("daemon-status", text.clone()).child(
+                    h_flex()
+                        .debug_selector(|| "daemon-status".to_owned())
+                        .min_h(px(28.))
+                        .gap(px(8.))
+                        .px(px(8.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(Label::new(text).color(Color::Muted)),
+                        )
+                        .child(restart_daemon_button(cx)),
+                ),
+            )
+        }
+        DataSource::Sample => None,
     }
+}
+
+fn restart_daemon_button(cx: &mut Context<Workspace>) -> Button {
+    Button::new("restart-daemon", "Restart daemon")
+        .debug_selector(|| "restart-daemon".to_owned())
+        .on_click(cx.listener(|workspace, _, window, cx| workspace.ask_restart_daemon(window, cx)))
 }
 
 /// The error text as an alert, so VoiceOver speaks it when it appears.

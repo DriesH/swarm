@@ -16,11 +16,13 @@ use swarm_term::{Palette, Size, TerminalInput, TerminalOutput};
 
 pub mod agent;
 mod client;
+mod daemon_stop;
 
 pub use client::{Client, ClientError, CommentEvent, MessageEvent, PrEvent, ProjectConfigRead};
+pub use daemon_stop::{Host, Signal, StopError, System, stop_daemon};
 
 /// Bumped on every incompatible change; the daemon refuses other versions.
-pub const VERSION: u32 = 23;
+pub const VERSION: u32 = 24;
 
 /// The most messages [`Request::ListMessages`] returns.
 pub const MESSAGES_LISTED: usize = 500;
@@ -1202,9 +1204,12 @@ pub enum Request {
 /// Daemon → client. `Hello` stays first, as in [`Request`].
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum Event {
+    /// `version` and `pid` stay first: an older client reads them and ignores the rest.
     Hello {
         version: u32,
         pid: u32,
+        /// The daemon's build version (the crate version), such as `1.1.0`.
+        build: String,
     },
     Terminals {
         call: CallId,

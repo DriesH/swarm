@@ -274,6 +274,10 @@ pub(crate) struct Workspace {
     pub(crate) default_cell_size: Option<(f32, f32)>,
     pub(crate) daemon_launch: Option<DaemonLaunch>,
     pub(crate) reconnecting: bool,
+    /// The daemon the app should replace, when it found one.
+    pub(crate) stale_daemon: Option<crate::daemon_restart::StaleDaemon>,
+    /// The app restarted the daemon once already.
+    pub(crate) daemon_restarted: bool,
     pub(crate) source: DataSource,
     /// The last failed sidebar action, shown until dismissed.
     pub(crate) sidebar_error: Option<SharedString>,
@@ -460,6 +464,8 @@ impl Workspace {
             default_cell_size: None,
             daemon_launch: None,
             reconnecting: false,
+            stale_daemon: None,
+            daemon_restarted: false,
             source,
             sidebar_error: None,
             orchestrator_input,
