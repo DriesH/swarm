@@ -366,7 +366,7 @@ Swarm updates itself from an S3 bucket (ADR 0010). There is one channel, `stable
 ### Websites
 
 - **Product website**: one page (designed on the canvas, Website page): hero with a workspace preview, three steps with app screenshots, features, harness, download. It uses the "hero left" board. The source is plain HTML and CSS in `site/`, with no build step. `.github/workflows/pages.yml` publishes it to GitHub Pages when `site/` changes on `main`. **Download for macOS** links to the latest GitHub release until the S3 bucket exists.
-- **Docs website**: every explanation that the app leaves out by design, plus the harness reference.
+- **Docs website**: every explanation that the app leaves out by design, plus the harness reference. It is a Starlight (Astro) site in `docs-site/`, with its own `package.json` and Node version (`docs-site/.node-version`). The same workflow builds it and serves it under `/docs/` next to the product website. **Swarm Help** in the app opens it.
 
 ### Project config
 

@@ -1,0 +1,87 @@
+---
+title: How work starts
+description: From a plan to tasks, orchestrators and workers, and how they talk.
+---
+
+This page explains who does what once you send a plan: the Start orchestrator, task orchestrators, workers, and the messages between them.
+
+## From plan to tasks
+
+A **task** is one feature of a project. It has its own branch and its own swarm, which is all the agents working on it.
+
+The **Start orchestrator** reads your plan. It counts the features in it. A feature is one change a user can see or use, that can be built and reviewed on its own.
+
+1. With more than one feature, or when it is unsure, it lists the features in its terminal. You talk with it until you agree on the list.
+2. It makes exactly one task for each agreed feature.
+3. For each task, Swarm makes the task branch and the **task worktree**, a separate checkout of the project. Then it opens a tab and starts that task's orchestrator.
+4. The Start orchestrator waits until every task orchestrator confirms its brief. Then it exits.
+
+The task branch name starts with `swarm/`.
+
+## The brief
+
+The **brief** is the first message a task's orchestrator starts with. It states the goal, the scope and what done means. The Start orchestrator keeps your own requirements and definition of done in the brief of the task they belong to, in your words.
+
+## Orchestrators and workers
+
+The **orchestrator** leads one task. It splits the task, starts **workers** and is the only agent that talks to them. Each worker gets a brief of its own.
+
+- Workers share the task worktree by default. They work on parts that touch different files and commit only their own files.
+- The orchestrator gives a worker its own worktree and branch only with a stated reason. Two reasons exist: parts that must change the same files at the same time, and an experiment it may throw away. The orchestrator merges that branch back into the task branch.
+
+Review sorts the changed files by worktree, then by path. Each file card names the agent of the file's newest commit.
+
+## Start work later
+
+The **+** in the tab bar opens a menu:
+
+- **New task** (⌘T): creates one task without the Start orchestrator.
+- **Plan with orchestrator** (⇧⌘T): opens the project's Start tab with the plan editor. It starts no agent. Send the plan to start the Start orchestrator. A project has one Start tab at a time.
+
+The tab reads **Start** while every task of the project came from the Start orchestrator, or the project has no task yet. It reads **Plan** once a task exists that the Start orchestrator did not make, for example one you made with **New task**.
+
+The **New task** sheet has these fields:
+
+| Field | What it does |
+|---|---|
+| **Name** | Names the task. Required. |
+| **Branch from** | The branch the task starts from. It lists your local branches, so you can pick up the kept branch of a closed task. |
+| **Orchestrator** | Claude Code or Codex. |
+| **First message** | Optional. The orchestrator starts with it. |
+| **Run setup script** | On by default. Runs the project's setup script in the new worktree. |
+
+Click **Create task**. Swarm makes the worktree and the tab, and starts one orchestrator.
+
+## Messages
+
+A **message** is text sent between the orchestrator and a worker through Swarm.
+
+- Workers never message each other. A worker asks or reports to its orchestrator. Only the orchestrator sends messages to workers.
+- You can type into a worker terminal. Swarm tells the orchestrator when you do. The setting **Allow typing in worker terminals** in **Settings › Agents** turns this on or off. It is on by default.
+
+The [Swarm view](/swarm/docs/swarm-view/) shows these messages as edges between agents.
+
+## Your own instructions still apply
+
+Swarm adds its instructions to each agent's own. It does not replace them. Your `CLAUDE.md`, `AGENTS.md`, rules, skills, hooks and MCP servers keep working inside every agent.
+
+## Agent status
+
+Every agent shows a status:
+
+| Status | Meaning |
+|---|---|
+| Unknown | Swarm has no status for the agent yet. |
+| Idle | The agent is not working. |
+| Working | The agent is working. |
+| Done | The agent finished. |
+| Blocked | Waiting on you. The detail says what: **permission**, **question** or **login**. A task with a blocked agent shows **Needs you**. |
+| Error | The agent failed or ended with an error. |
+
+## Close a task
+
+Close a task from the close button on its tab, from **File › Close Task**, or from **Close task** in the command palette (⌘K).
+
+A dialog lists what closing stops and deletes: running agents, terminals and uncommitted files. Then the agents and terminals stop and the worktrees are removed.
+
+Swarm deletes the task branch only when it is already merged into the base branch. Every other branch stays. Only uncommitted work is lost.

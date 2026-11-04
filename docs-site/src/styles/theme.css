@@ -1,0 +1,34 @@
+/* The product site's colors and fonts (site/style.css), mapped to Starlight's tokens. */
+:root {
+  --sl-font: 'Geist Sans', ui-sans-serif, system-ui, sans-serif;
+  --sl-font-mono: 'Geist Mono', ui-monospace, monospace;
+
+  --sl-color-accent-low: #18223d;
+  --sl-color-accent: #6e9bff;
+  --sl-color-accent-high: #c9d8ff;
+  --sl-color-white: #ededef;
+  --sl-color-gray-1: #e4e4e7;
+  --sl-color-gray-2: #c4c4cc;
+  --sl-color-gray-3: #a1a1aa;
+  --sl-color-gray-4: #878790;
+  --sl-color-gray-5: #2a2a30;
+  --sl-color-gray-6: #111113;
+  --sl-color-black: #08080a;
+}
+
+:root[data-theme='light'] {
+  --sl-color-accent-low: #dbe5fb;
+  --sl-color-accent: #285acb;
+  --sl-color-accent-high: #1c3f8f;
+  --sl-color-white: #141416;
+  --sl-color-gray-1: #26262b;
+  --sl-color-gray-2: #3f3f46;
+  --sl-color-gray-3: #5c5c66;
+  --sl-color-gray-4: #696971;
+  --sl-color-gray-5: #e4e4e7;
+  --sl-color-gray-6: #f5f5f6;
+  --sl-color-gray-7: #fafafa;
+  --sl-color-black: #ffffff;
+}
+
+.site-title img { image-rendering: pixelated; }
