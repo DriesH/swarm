@@ -309,6 +309,60 @@ The bees in the eggs are the pixel bee (24×24, two wing frames, a crown for the
 
 Files and folders in the Review tree, the Changes and Files panels and the inspector's Changes tab get icons from vscode-icons (icons CC BY-SA 4.0, code MIT). Branded icons, which are product and company logos under their owners' copyright, are left out: a file whose only icon is a logo gets the generic file icon. `.toml` and `.env` files get the generic config icon, because their icons are project logos. The icons are full-color SVGs rendered as images. The attribution (source, license, what changed) sits in **Settings › General › About** and in a license file next to the icons.
 
+### Updates
+
+Swarm updates itself from an S3 bucket (ADR 0010). There is one channel, `stable`.
+
+**Bucket layout:**
+
+- `stable/latest.json`: the manifest. It is served with `Cache-Control: no-cache`.
+- `stable/Swarm-<version>.zip`: one notarized and stapled `Swarm.app` per release, made with `ditto -c -k --keepParent`. Old zips stay in the bucket.
+
+**Manifest:**
+
+```json
+{
+  "version": "1.2.0",
+  "url": "https://<bucket host>/stable/Swarm-1.2.0.zip",
+  "sha256": "<hex>",
+  "minimum_macos": "13.0",
+  "published": "2026-12-01T10:00:00Z"
+}
+```
+
+**Check:**
+
+- The app reads the manifest at launch and every 6 hours, and when the person picks **Swarm › Check for Updates…**.
+- **Settings › General** has a switch for automatic checks (on by default) and a **Check now** button.
+- The request carries only `Swarm/<version>` as its user agent. Swarm sends no other data.
+- A version that is not higher than the running version, or that needs a newer macOS, is ignored.
+
+**Download and verify:**
+
+1. The app downloads the zip to `~/Library/Caches/Swarm/updates/<version>/` with `NSURLSession`.
+2. It compares the SHA-256 of the zip with the manifest. A mismatch deletes the download.
+3. It unpacks the zip with `ditto -x -k`.
+4. It checks the code signature of the new `Swarm.app` with Security.framework. The requirement is Developer ID, team `P2DG27TUTZ`, bundle ID `com.swarm.app`, and every nested binary signed. A failure deletes the download.
+5. The app shows that an update is ready.
+
+**Install:**
+
+- The status bar shows **Update ready** with a **Restart to update** button. VoiceOver announces it once, as a status.
+- On **Restart to update**, or when the app quits normally, a helper takes over. The helper is a copy of `swarm` in the update folder. It waits until the app exits, moves the old bundle to the Trash, moves the new bundle to the same path, and opens it.
+- If the app folder is not writable, the app does not install. It shows **Download** instead, which opens the zip's URL.
+
+**Daemon:**
+
+- The daemon's hello carries its build version as well as its protocol version.
+- When the new app finds an older daemon, it restarts the daemon at once if no agent is working. Otherwise it shows **Restart daemon** with the number of running agents, and restarts it only on confirmation. A restart ends every agent terminal (ADR 0001).
+- While the old daemon runs, the app talks to it if the protocol version is the same. If the protocol version differs, the app shows **Restart daemon** and nothing else works until the restart.
+
+**Publish (the person runs it, never an agent):**
+
+- `script/publish-update <version>` takes the stapled `Swarm.app` from `script/bundle-mac`, makes the zip, writes `latest.json`, and uploads both with the AWS CLI. It uploads the zip first and the manifest last.
+
+**Not in v1:** delta updates, a beta channel, Intel builds.
+
 ### Websites
 
 - **Product website**: one page (designed on the canvas, Website page): hero with a workspace preview, three steps with app screenshots, features, harness, download.
