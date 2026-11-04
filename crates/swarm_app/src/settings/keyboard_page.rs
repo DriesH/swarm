@@ -100,11 +100,19 @@ fn join_digits(alternatives: Vec<Vec<SharedString>>) -> Vec<Vec<SharedString>> {
     vec![joined]
 }
 
-/// Every action that has a key, in the order of `actions::shortcuts`.
+/// Every action that has a key: the registered bindings, then the keys that controls handle.
 pub(super) fn rows() -> Vec<Row> {
+    rows_of(
+        actions::shortcuts()
+            .into_iter()
+            .chain(actions::listed_shortcuts()),
+    )
+}
+
+fn rows_of(shortcuts: impl IntoIterator<Item = actions::Shortcut>) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
 
-    for shortcut in actions::shortcuts() {
+    for shortcut in shortcuts {
         let keys: Vec<SharedString> = shortcut
             .binding
             .keystrokes()
@@ -226,7 +234,7 @@ mod tests {
     #[test]
     fn plain_keys_and_arrows_have_their_own_caps() {
         assert_eq!(caps_of("Next file"), [["J"]]);
-        assert_eq!(caps_of("Previous line"), [["\u{2191}"]]);
+        assert_eq!(caps_of("Previous line in diff"), [["\u{2191}"]]);
         assert_eq!(caps_of("Cancel comment"), [["esc"]]);
     }
 
@@ -293,7 +301,7 @@ mod tests {
         let held = cx.update(|cx| cx.key_bindings().borrow().bindings().len());
 
         // A range like `1–9` stands for as many bindings as it names.
-        let named: usize = rows()
+        let named: usize = rows_of(actions::shortcuts())
             .iter()
             .flat_map(|row| &row.alternatives)
             .map(|keys| {
@@ -309,13 +317,93 @@ mod tests {
     }
 
     #[test]
-    fn the_groups_are_workspace_terminals_review_and_file_tree() {
+    fn control_tab_moves_focus_out_of_a_terminal() {
+        assert_eq!(caps_of("Next focus stop"), [["\u{2303}", "\u{21e5}"]]);
+        assert_eq!(
+            caps_of("Previous focus stop"),
+            [["\u{2303}", "\u{21e7}", "\u{21e5}"]]
+        );
+    }
+
+    #[test]
+    fn tab_and_back_tab_in_a_terminal_go_to_the_shell() {
+        assert_eq!(caps_of("Tab in terminal"), [["\u{21e5}"]]);
+        assert_eq!(caps_of("Back-tab in terminal"), [["\u{21e7}", "\u{21e5}"]]);
+    }
+
+    #[test]
+    fn keys_the_controls_handle_have_rows() {
+        assert_eq!(caps_of("Open context menu"), [["\u{21e7}", "F10"]]);
+        assert_eq!(caps_of("Post comment or reply"), [["\u{2318}", "\u{21b5}"]]);
+        assert_eq!(caps_of("Close settings"), [["\u{2318}", "W"]]);
+        assert_eq!(caps_of("Next page"), [["\u{2193}"]]);
+        assert_eq!(caps_of("Focus agent tile"), [["\u{21b5}"]]);
+        assert_eq!(caps_of("First row"), [["HOME"]]);
+        assert_eq!(caps_of("Last row"), [["END"]]);
+        assert_eq!(
+            caps_of("Cursor on old side of split"),
+            [["\u{2325}", "\u{2190}"]]
+        );
+        assert_eq!(
+            caps_of("Cursor on new side of split"),
+            [["\u{2325}", "\u{2192}"]]
+        );
+        assert_eq!(caps_of("Make tile shorter"), [["\u{2191}"]]);
+    }
+
+    #[gpui::test]
+    fn listed_keys_are_not_registered(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            swarm_ui::init(cx);
+            actions::bind_keys(cx);
+        });
+
+        let listed: Vec<Vec<SharedString>> = actions::listed_shortcuts()
+            .iter()
+            .map(|shortcut| {
+                shortcut
+                    .binding
+                    .keystrokes()
+                    .iter()
+                    .flat_map(caps)
+                    .collect()
+            })
+            .collect();
+        let placeholders: Vec<Vec<SharedString>> = cx.update(|cx| {
+            cx.key_bindings()
+                .borrow()
+                .bindings()
+                .filter(|binding| binding.action().partial_eq(&gpui::NoAction))
+                .map(|binding| binding.keystrokes().iter().flat_map(caps).collect())
+                .collect()
+        });
+
+        let registered: Vec<_> = listed
+            .iter()
+            .filter(|keys| placeholders.contains(keys))
+            .collect();
+        assert!(!listed.is_empty());
+        assert!(registered.is_empty(), "{registered:?}");
+    }
+
+    #[test]
+    fn the_groups_are_workspace_terminals_swarm_view_review_file_tree_and_settings() {
         let groups: Vec<&str> = ShortcutGroup::ALL
             .iter()
             .map(|group| group.title())
             .collect();
 
-        assert_eq!(groups, ["Workspace", "Terminals", "Review", "File tree"]);
+        assert_eq!(
+            groups,
+            [
+                "Workspace",
+                "Terminals",
+                "Swarm view",
+                "Review",
+                "File tree",
+                "Settings"
+            ]
+        );
         assert!(
             ShortcutGroup::ALL
                 .iter()

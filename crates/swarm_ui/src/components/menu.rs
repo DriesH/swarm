@@ -2,12 +2,15 @@ use std::rc::Rc;
 
 use gpui::{
     AnyElement, App, BoxShadow, ElementId, Entity, FocusHandle, Hsla, Pixels, Role, ScrollHandle,
-    SharedString, Toggled, Window, black, div, point, px,
+    SharedString, Toggled, Window, div, point, px,
 };
 
 use crate::component::{Component, example, example_group};
 use crate::prelude::*;
-use crate::{Confirm, Dismiss, MENU_CONTEXT, SelectNext, SelectPrevious};
+use crate::{
+    Confirm, Dismiss, MENU_CONTEXT, MENU_LIST_CONTEXT, SelectFirst, SelectLast, SelectNext,
+    SelectPrevious,
+};
 
 type Handler = Rc<dyn Fn(&mut Window, &mut App) + 'static>;
 
@@ -20,6 +23,7 @@ const MENU_PADDING: Pixels = px(5.);
 pub struct MenuItem {
     id: ElementId,
     label: SharedString,
+    accessible_label: Option<SharedString>,
     icon: Option<IconName>,
     status: Option<AgentStatus>,
     checked: Option<bool>,
@@ -32,12 +36,25 @@ impl MenuItem {
         Self {
             id: id.into(),
             label: label.into(),
+            accessible_label: None,
             icon: None,
             status: None,
             checked: None,
             disabled: false,
             on_select: None,
         }
+    }
+
+    /// What VoiceOver reads, when it differs from the label on screen, for example to
+    /// add a status that a ring shows.
+    pub fn accessible_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.accessible_label = Some(label.into());
+        self
+    }
+
+    /// What VoiceOver reads for the item.
+    pub(crate) fn spoken_label(&self) -> &SharedString {
+        self.accessible_label.as_ref().unwrap_or(&self.label)
     }
 
     pub fn icon(mut self, icon: IconName) -> Self {
@@ -74,7 +91,8 @@ enum MenuEntry {
     Separator,
 }
 
-/// A list of actions. Arrow keys move the highlight, Enter picks, Escape dismisses.
+/// A list of actions. Arrow keys move the highlight, Home and End jump to the first and last
+/// item, Enter and Space pick, Escape dismisses.
 /// The menu does not close itself: `on_dismiss` tells its owner to remove it.
 #[derive(IntoElement)]
 #[must_use]
@@ -164,13 +182,12 @@ fn choose(select: Option<&Handler>, dismiss: Option<&Handler>, window: &mut Wind
 
 fn move_highlight(
     highlight: &Entity<Option<usize>>,
-    enabled: &[bool],
-    forward: bool,
+    target: impl FnOnce(Option<usize>) -> Option<usize>,
     scroll: &ScrollHandle,
     cx: &mut App,
 ) {
     highlight.update(cx, |current, cx| {
-        *current = step(enabled, *current, forward).or(*current);
+        *current = target(*current).or(*current);
 
         if let Some(index) = *current {
             scroll.scroll_to_item(index);
@@ -178,6 +195,40 @@ fn move_highlight(
 
         cx.notify();
     });
+}
+
+/// Arrows, Home and End move the highlight.
+fn highlight_keys<E: InteractiveElement>(
+    menu: E,
+    highlight: &Entity<Option<usize>>,
+    enabled: &Rc<[bool]>,
+    scroll: &ScrollHandle,
+) -> E {
+    let moves =
+        |highlight: &Entity<Option<usize>>| (highlight.clone(), Rc::clone(enabled), scroll.clone());
+    let (previous, next, first, last) = (
+        moves(highlight),
+        moves(highlight),
+        moves(highlight),
+        moves(highlight),
+    );
+
+    menu.on_action(move |_: &SelectPrevious, _, cx| {
+        let (highlight, enabled, scroll) = &previous;
+        move_highlight(highlight, |from| step(enabled, from, false), scroll, cx);
+    })
+    .on_action(move |_: &SelectNext, _, cx| {
+        let (highlight, enabled, scroll) = &next;
+        move_highlight(highlight, |from| step(enabled, from, true), scroll, cx);
+    })
+    .on_action(move |_: &SelectFirst, _, cx| {
+        let (highlight, enabled, scroll) = &first;
+        move_highlight(highlight, |_| step(enabled, None, true), scroll, cx);
+    })
+    .on_action(move |_: &SelectLast, _, cx| {
+        let (highlight, enabled, scroll) = &last;
+        move_highlight(highlight, |_| step(enabled, None, false), scroll, cx);
+    })
 }
 
 /// How far a scrolling menu must scroll for the entry to show, worked out from the
@@ -203,6 +254,8 @@ fn render_item(
     let select = item.on_select.clone();
     let dismiss = on_dismiss.cloned();
 
+    let accessible_label = item.spoken_label().clone();
+
     let role = if item.checked.is_some() {
         Role::MenuItemCheckBox
     } else {
@@ -212,7 +265,7 @@ fn render_item(
     div()
         .id(item.id)
         .role(role)
-        .aria_label(item.label.clone())
+        .aria_label(accessible_label)
         .when_some(item.checked, |row, checked| {
             row.aria_toggled(if checked {
                 Toggled::True
@@ -326,7 +379,8 @@ fn menu_state(
 impl RenderOnce for Menu {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let colors = cx.theme().colors();
-        let (line, panel, active) = (colors.line, colors.panel, colors.active);
+        let (line, panel, active, shadow) =
+            (colors.line, colors.panel, colors.active, colors.shadow);
 
         let enabled: Rc<[bool]> = self
             .entries
@@ -386,7 +440,7 @@ impl RenderOnce for Menu {
             .role(Role::Menu)
             .aria_label(self.label)
             .debug_selector(move || selector)
-            .key_context(MENU_CONTEXT)
+            .key_context(format!("{MENU_CONTEXT} {MENU_LIST_CONTEXT}").as_str())
             .when_some(self.focus.as_ref(), InteractiveElement::track_focus)
             .occlude()
             .w(self.width)
@@ -396,7 +450,7 @@ impl RenderOnce for Menu {
             .border_color(line)
             .bg(panel)
             .shadow(vec![BoxShadow {
-                color: black().opacity(0.28),
+                color: shadow,
                 offset: point(px(0.), px(12.)),
                 blur_radius: px(32.),
                 spread_radius: px(0.),
@@ -415,19 +469,7 @@ impl RenderOnce for Menu {
                     .overflow_y_scroll()
                     .track_scroll(&scroll)
             })
-            .on_action({
-                let (highlight, enabled) = (highlight.clone(), Rc::clone(&enabled));
-                let scroll = scroll.clone();
-                move |_: &SelectPrevious, _, cx| {
-                    move_highlight(&highlight, &enabled, false, &scroll, cx);
-                }
-            })
-            .on_action({
-                let (highlight, enabled) = (highlight.clone(), Rc::clone(&enabled));
-                move |_: &SelectNext, _, cx| {
-                    move_highlight(&highlight, &enabled, true, &scroll, cx);
-                }
-            })
+            .map(|menu| highlight_keys(menu, &highlight, &enabled, &scroll))
             .on_action(move |_: &Confirm, window, cx| {
                 let Some(index) = *highlight.read(cx) else {
                     return;

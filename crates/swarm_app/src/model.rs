@@ -14,8 +14,8 @@ use swarm_protocol::{
     Usage, UsageWindow,
 };
 use swarm_term::{BlockedKind, ExitStatus};
-use swarm_ui::AgentStatus;
 use swarm_ui::prelude::Color;
+use swarm_ui::{AgentStatus, PROJECT_TILE_COLORS};
 
 /// The clock of fake data: snapshots and tests show times relative to it.
 pub(crate) const SAMPLE_NOW: u64 = 1_800_000_000_000;
@@ -696,8 +696,6 @@ fn sample_usage() -> Usage {
     }
 }
 
-const PROJECT_TILES: [u32; 4] = [0x004f_46e5, 0x000d_7d70, 0x00c2_410c, 0x0015_803d];
-
 fn lines(items: &[(&str, Color)]) -> Vec<FakeLine> {
     items
         .iter()
@@ -1347,7 +1345,7 @@ impl FakeData {
                     .max()
                     .unwrap_or(0),
             );
-            let tile = PROJECT_TILES[self.projects.len() % PROJECT_TILES.len()];
+            let tile = PROJECT_TILE_COLORS[self.projects.len() % PROJECT_TILE_COLORS.len()];
 
             self.projects.push(Project {
                 id,

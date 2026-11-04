@@ -47,10 +47,17 @@ pub(crate) struct NewTaskDialog {
     name: Entity<TextInput>,
     message: Entity<TextArea>,
     focus_handle: FocusHandle,
+    pub(crate) opener: Option<FocusHandle>,
     _subscriptions: [Subscription; 2],
 }
 
 impl EventEmitter<NewTaskEvent> for NewTaskDialog {}
+
+impl gpui::Focusable for NewTaskDialog {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
 
 impl NewTaskDialog {
     /// `branches` are the branches a task can start from; the first is chosen.
@@ -61,6 +68,7 @@ impl NewTaskDialog {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let opener = window.focused(cx);
         let name = cx.new(|cx| {
             let mut input = TextInput::new(cx);
             input.set_label("Name", cx);
@@ -100,6 +108,7 @@ impl NewTaskDialog {
             name,
             message,
             focus_handle: cx.focus_handle(),
+            opener,
             _subscriptions: [on_name, on_message],
         }
     }
@@ -164,7 +173,7 @@ impl NewTaskDialog {
         self.busy
     }
 
-    fn set_busy(&mut self, busy: bool, cx: &mut Context<Self>) {
+    pub(crate) fn set_busy(&mut self, busy: bool, cx: &mut Context<Self>) {
         self.busy = busy;
         if busy {
             self.error = None;
@@ -304,7 +313,8 @@ impl Render for NewTaskDialog {
             .child(
                 Button::new("new-task-create", create_label)
                     .variant(ButtonVariant::Primary)
-                    .disabled(!self.can_create(cx))
+                    .loading(self.busy)
+                    .disabled(!self.busy && !self.can_create(cx))
                     .on_click(cx.listener(|this, _, _, cx| this.create(cx))),
             );
 

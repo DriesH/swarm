@@ -13,6 +13,7 @@ mod icon_button;
 mod kbd;
 mod label;
 mod list_row;
+mod live_region;
 mod menu;
 mod output_block;
 mod panel;
@@ -53,6 +54,7 @@ pub use icon_button::*;
 pub use kbd::*;
 pub use label::*;
 pub use list_row::*;
+pub use live_region::*;
 pub use menu::*;
 pub use output_block::*;
 pub use panel::*;
@@ -109,6 +111,7 @@ pub fn all_components() -> Vec<ComponentEntry> {
         ComponentEntry::of::<SystemCheckRow>(),
         ComponentEntry::of::<OutputBlock>(),
         ComponentEntry::of::<ListRow>(),
+        ComponentEntry::of::<LiveRegion>(),
         ComponentEntry::of::<TreeRow>(),
         ComponentEntry::of::<FileIcon>(),
         ComponentEntry::of::<TrayChip>(),

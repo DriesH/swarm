@@ -1,6 +1,6 @@
 //! The pull request panel: a new pull request, or the status of the one that exists.
 
-use gpui::{AnyElement, Context, FontWeight, Role, SharedString, div, px};
+use gpui::{AnyElement, Context, ElementId, FontWeight, Role, SharedString, div, px};
 use swarm_protocol::{
     CheckState, GithubCheck, GithubCheckState, GithubStatus, LocalCheck, MergeMethod, PrState,
     PullRequest, ReviewState,
@@ -132,11 +132,17 @@ pub(crate) fn base_of(workspace: &Workspace, task: &Task) -> SharedString {
         .unwrap_or_default()
 }
 
+/// A button that starts work shows a spinner while it runs, so it keeps focus. Only a
+/// blocked button that is not running is disabled.
+fn work_state(running: bool, blocked: bool) -> (bool, bool) {
+    (running, blocked && !running)
+}
+
 fn status_label(text: impl Into<SharedString>, color: Color) -> gpui::Stateful<gpui::Div> {
     let text = text.into();
 
     div()
-        .id("pull-request-status")
+        .id((ElementId::from("pull-request-status"), text.clone()))
         .role(Role::Status)
         .aria_label(text.clone())
         .min_w_0()
@@ -354,7 +360,10 @@ fn local_checks(
     };
     let creating = form.create == CreateStatus::Creating;
 
-    let label = if run.is_some() {
+    let (run_loading, run_disabled) = work_state(form.checks_busy, !over || creating);
+    let label = if form.checks_busy {
+        "Running\u{2026}"
+    } else if run.is_some() {
         "Run again"
     } else {
         "Run checks"
@@ -362,7 +371,8 @@ fn local_checks(
     let run_button = Button::new("run-checks", label)
         .variant(ButtonVariant::Secondary)
         .debug_selector(|| "run-checks".to_owned())
-        .disabled(!over || form.checks_busy || creating)
+        .loading(run_loading)
+        .disabled(run_disabled)
         .on_click(cx.listener(|this, _, _, cx| this.run_checks(cx)));
 
     let rows = run.map(|run| {
@@ -695,6 +705,8 @@ fn reviewers(
 ) -> gpui::Div {
     let list = status.map_or(&[][..], |status| status.reviewers.as_slice());
     let asking = !parse_logins(&form.reviewers.read(cx).text()).is_empty();
+    let requesting = form.action == PanelAction::Busy(ActionKind::Review);
+    let (request_loading, request_disabled) = work_state(requesting, !asking || form.busy());
 
     v_flex()
         .gap(px(6.))
@@ -729,14 +741,22 @@ fn reviewers(
                 .gap(px(8.))
                 .child(div().flex_1().min_w_0().child(form.reviewers.clone()))
                 .child(
-                    Button::new("request-review", "Request review")
-                        .variant(ButtonVariant::Secondary)
-                        .debug_selector(|| "request-review".to_owned())
-                        .disabled(!asking || form.busy())
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            let task = this.active_task;
-                            this.request_pr_review(task, cx);
-                        })),
+                    Button::new(
+                        "request-review",
+                        if requesting {
+                            "Requesting\u{2026}"
+                        } else {
+                            "Request review"
+                        },
+                    )
+                    .variant(ButtonVariant::Secondary)
+                    .debug_selector(|| "request-review".to_owned())
+                    .loading(request_loading)
+                    .disabled(request_disabled)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let task = this.active_task;
+                        this.request_pr_review(task, cx);
+                    })),
                 ),
         )
 }
@@ -793,16 +813,27 @@ fn status_footer(
     let mergeable = status.is_some_and(|status| status.mergeable);
     let busy = form.busy();
     let merging = form.action == PanelAction::Busy(ActionKind::Merge);
+    let readying = form.action == PanelAction::Busy(ActionKind::Ready);
     let pushing = form.create == CreateStatus::Creating;
+    let (ready_loading, ready_disabled) = work_state(readying, busy);
+    let (merge_loading, merge_disabled) = work_state(merging, !mergeable || busy || push.is_some());
 
     let ready = draft.then(|| {
         div().flex_1().child(
-            Button::new("ready-for-review", "Ready for review")
-                .size(ButtonSize::Medium)
-                .full_width()
-                .debug_selector(|| "ready-for-review".to_owned())
-                .disabled(busy)
-                .on_click(cx.listener(|this, _, _, cx| this.mark_pr_ready(cx))),
+            Button::new(
+                "ready-for-review",
+                if readying {
+                    "Marking ready\u{2026}"
+                } else {
+                    "Ready for review"
+                },
+            )
+            .size(ButtonSize::Medium)
+            .full_width()
+            .debug_selector(|| "ready-for-review".to_owned())
+            .loading(ready_loading)
+            .disabled(ready_disabled)
+            .on_click(cx.listener(|this, _, _, cx| this.mark_pr_ready(cx))),
         )
     });
 
@@ -812,7 +843,8 @@ fn status_footer(
         .full_width()
         .debug_selector(|| "merge".to_owned())
         // Unpushed commits would stay out of the merge, so they go first.
-        .disabled(!mergeable || busy || push.is_some())
+        .loading(merge_loading)
+        .disabled(merge_disabled)
         .on_click(cx.listener(|this, _, _, cx| this.merge_pull_request(cx)));
 
     let queued = (form.action == PanelAction::MergeQueued).then(|| {
@@ -853,6 +885,7 @@ fn push_row(
         CreateState::Blocked(problem) => ("Push changes", false, Some((problem, Color::Muted))),
     };
     let label = if pushing { "Pushing\u{2026}" } else { label };
+    let (push_loading, push_disabled) = work_state(pushing, !enabled || busy);
 
     h_flex()
         .gap(px(8.))
@@ -870,7 +903,8 @@ fn push_row(
             Button::new("push-changes", label)
                 .variant(ButtonVariant::Secondary)
                 .debug_selector(|| "push-changes".to_owned())
-                .disabled(!enabled || pushing || busy)
+                .loading(push_loading)
+                .disabled(push_disabled)
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.update_pull_request(window, cx);
                 })),
@@ -887,4 +921,29 @@ fn closed_footer(cx: &mut Context<Workspace>) -> gpui::Div {
             .debug_selector(|| "create-pr-again".to_owned())
             .on_click(cx.listener(|this, _, _, cx| this.replace_closed_pull_request(cx))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::Element;
+
+    use super::*;
+
+    #[test]
+    fn a_running_button_is_loading_and_not_disabled() {
+        assert_eq!(work_state(true, true), (true, false));
+    }
+
+    #[test]
+    fn a_blocked_idle_button_is_disabled_and_not_loading() {
+        assert_eq!(work_state(false, true), (false, true));
+    }
+
+    #[test]
+    fn sibling_status_labels_get_different_ids() {
+        let first = Element::id(&status_label("New commits", Color::Warn));
+        let second = Element::id(&status_label("Checks are failing", Color::Muted));
+
+        assert_ne!(first, second);
+    }
 }

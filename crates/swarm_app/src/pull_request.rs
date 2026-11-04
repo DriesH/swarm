@@ -275,6 +275,15 @@ pub(crate) fn toggle_label(link: &PrLink, status: Option<&PullRequest>) -> Strin
     }
 }
 
+/// What VoiceOver reads for the header toggle of a task with a pull request: "Pull request
+/// 42, ready to merge".
+pub(crate) fn toggle_spoken(link: &PrLink, status: Option<&PullRequest>) -> String {
+    match status {
+        Some(status) => format!("Pull request {}, {}", link.number, state_word(status)),
+        None => format!("Pull request {}", link.number),
+    }
+}
+
 /// The logins in a field: separated by commas or spaces, `@` dropped, no repeats.
 pub(crate) fn parse_logins(text: &str) -> Vec<String> {
     let mut logins: Vec<String> = Vec::new();
@@ -559,9 +568,17 @@ pub(crate) struct AnywayDialog {
     problem: Blocker,
     action: PrAction,
     focus_handle: FocusHandle,
+    /// What had the focus before the dialog opened.
+    pub(crate) opener: Option<FocusHandle>,
 }
 
 impl gpui::EventEmitter<AnywayEvent> for AnywayDialog {}
+
+impl gpui::Focusable for AnywayDialog {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
 
 impl AnywayDialog {
     fn new(
@@ -570,6 +587,7 @@ impl AnywayDialog {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let opener = window.focused(cx);
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
 
@@ -577,6 +595,7 @@ impl AnywayDialog {
             problem,
             action,
             focus_handle,
+            opener,
         }
     }
 }
@@ -1929,6 +1948,21 @@ impl Workspace {
         }
     }
 
+    /// What VoiceOver reads for the header's Pull request toggle.
+    pub(crate) fn pull_request_toggle_spoken(&self, task: TaskId) -> Option<SharedString> {
+        let entry = self.data.task(task).filter(|task| !task.is_start)?;
+
+        match &entry.pull_request {
+            Some(link) => {
+                let status = self.data.pull_request_status(task);
+
+                Some(toggle_spoken(link, status).into())
+            }
+            None if entry.approved.is_some() => Some("Pull request".into()),
+            None => None,
+        }
+    }
+
     /// What Review offers on an approved task.
     pub(crate) fn review_offer(&self, task: TaskId) -> PrOffer {
         let has_link = self
@@ -2469,6 +2503,53 @@ mod tests {
             mergeable,
             ..sample_pull_request()
         }
+    }
+
+    #[gpui::test]
+    fn closing_the_create_anyway_dialog_gives_the_focus_back_to_what_had_it(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::daemon::tests::{redraw, setup};
+        use crate::model::TerminalId;
+
+        let (workspace, cx) = setup(cx);
+        redraw(cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.focus_terminal(TerminalId(1), cx);
+        });
+        redraw(cx);
+        let tile = workspace.update(cx, |workspace, cx| {
+            workspace.tile_focus_handle(TerminalId(1), cx)
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.ask_anyway(Blocker::ChecksFailed, PrAction::Create, window, cx);
+        });
+        redraw(cx);
+        cx.simulate_keystrokes("escape");
+        redraw(cx);
+
+        assert!(workspace.read_with(cx, |workspace, _| workspace.overlay.is_none()));
+        assert!(cx.update(|window, _| tile.is_focused(window)));
+    }
+
+    #[test]
+    fn the_header_toggle_is_spoken_as_a_pull_request_with_its_state() {
+        let link = PrLink {
+            number: 42,
+            url: "https://github.com/a/b/pull/42".into(),
+            head: "abc".into(),
+        };
+        let merged = PullRequest {
+            state: PrState::Merged,
+            ..pull_request(&[], false, false)
+        };
+
+        assert_eq!(toggle_spoken(&link, None), "Pull request 42");
+        assert_eq!(
+            toggle_spoken(&link, Some(&merged)),
+            "Pull request 42, merged"
+        );
     }
 
     #[test]

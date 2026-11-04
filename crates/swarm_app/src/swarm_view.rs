@@ -241,6 +241,14 @@ fn card_label(agent: &Agent, in_flight: u32) -> String {
     }
 }
 
+fn view_diff_label(agent: &str) -> String {
+    format!("View diff, {agent}")
+}
+
+fn focus_label(agent: &str) -> String {
+    format!("Focus {agent}")
+}
+
 fn plural(count: u32, one: &str, many: &str) -> String {
     format!("{count} {}", if count == 1 { one } else { many })
 }
@@ -1249,6 +1257,9 @@ fn graph(workspace: &Workspace, data: &SwarmData, cx: &mut Context<Workspace>) -
         ));
 
     let content = div()
+        .id("agent-cards")
+        .role(Role::List)
+        .aria_label("Agents")
         .relative()
         .flex_none()
         .mx_auto()
@@ -1462,6 +1473,16 @@ fn stats_line(workspace: &Workspace, agent: &Agent, zoom: f32, cx: &App) -> gpui
     }
 }
 
+/// A card is an item of the agent list. macOS reports selection on list items, not on
+/// buttons.
+fn card_frame(id: AgentId, label: String, selected: bool) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(("agent-card", id.0 as usize))
+        .role(Role::ListItem)
+        .aria_label(label)
+        .aria_selected(selected)
+}
+
 fn card(
     workspace: &Workspace,
     agent: &Agent,
@@ -1501,11 +1522,7 @@ fn card(
             .child(stats_line(workspace, agent, zoom, cx))
     };
 
-    let mut card = div()
-        .id(("agent-card", id.0 as usize))
-        .role(Role::Button)
-        .aria_label(label)
-        .aria_selected(selected)
+    let mut card = card_frame(id, label, selected)
         .absolute()
         .left(px(left * zoom))
         .top(px(top * zoom))
@@ -1637,14 +1654,15 @@ fn inspector_body(
         .child(StatusPill::new(agent.status))
         .child(div().flex_1())
         .child(
-            Button::new("inspector-diff", "View diff").on_click(cx.listener(
-                move |workspace, _: &ClickEvent, _, cx| {
+            Button::new("inspector-diff", "View diff")
+                .accessible_label(view_diff_label(&agent.name))
+                .on_click(cx.listener(move |workspace, _: &ClickEvent, _, cx| {
                     workspace.view_agent_diff(id, cx);
-                },
-            )),
+                })),
         )
         .child(
             Button::new("inspector-focus", "Focus")
+                .accessible_label(focus_label(&agent.name))
                 .variant(ButtonVariant::Primary)
                 .on_click(cx.listener(move |workspace, _: &ClickEvent, _, cx| {
                     workspace.focus_swarm_agent(id, cx);
@@ -2180,7 +2198,8 @@ fn message_row(row: &MessageRow<'_>, colors: &ThemeColors) -> AnyElement {
 
     let toggle = row.tall.then(|| {
         h_flex().child(fold_toggle(
-            row.index,
+            (row.index, message.id.0),
+            &fold_target(row.names, message),
             row.folded,
             colors.accent,
             Rc::clone(&row.on_toggle),
@@ -2188,7 +2207,7 @@ fn message_row(row: &MessageRow<'_>, colors: &ThemeColors) -> AnyElement {
     });
 
     v_flex()
-        .id(("message", row.index))
+        .id(("message", message.id.0))
         .role(Role::ListItem)
         .w_full()
         .py(px(12.))
@@ -2201,9 +2220,19 @@ fn message_row(row: &MessageRow<'_>, colors: &ThemeColors) -> AnyElement {
         .into_any_element()
 }
 
+/// Names a message for the button that folds it.
+fn fold_target(names: &HashMap<DaemonAgentId, SharedString>, message: &Message) -> String {
+    format!(
+        "message from {} to {}",
+        agent_name(names, message.from),
+        agent_name(names, Some(message.to))
+    )
+}
+
 /// The Show more or Show less button of a long message.
 fn fold_toggle(
-    index: usize,
+    (index, message): (usize, u64),
+    target: &str,
     folded: bool,
     accent: Hsla,
     on_toggle: Rc<dyn Fn(&mut App)>,
@@ -2211,10 +2240,10 @@ fn fold_toggle(
     let label = if folded { "Show more" } else { "Show less" };
 
     div()
-        .id(("message-fold", index))
+        .id(("message-fold", message))
         .debug_selector(|| format!("message-fold-{index}"))
         .role(Role::Button)
-        .aria_label(label)
+        .aria_label(format!("{label}, {target}"))
         .aria_expanded(!folded)
         .focusable()
         .tab_stop(true)
@@ -3068,17 +3097,74 @@ mod tests {
     }
 
     #[test]
+    fn the_selected_card_is_a_selected_list_item_not_a_button() {
+        use gpui::Element as _;
+
+        let frame = card_frame(AgentId(1), "queen-1, Claude Code, Working".to_owned(), true);
+        let mut node = gpui::accesskit::Node::new(Role::Unknown);
+
+        frame.write_a11y_info(&mut node);
+
+        assert_eq!(frame.a11y_role(), Some(Role::ListItem));
+        assert_eq!(node.is_selected(), Some(true));
+    }
+
+    #[test]
+    fn the_inspector_buttons_name_their_target() {
+        assert_eq!(view_diff_label("queen-1"), "View diff, queen-1");
+        assert_eq!(focus_label("queen-1"), "Focus queen-1");
+    }
+
+    #[test]
     fn the_fold_button_says_whether_the_message_is_open() {
         let name = |folded: bool| {
-            let button = fold_toggle(0, folded, Hsla::default(), Rc::new(|_: &mut App| {}));
+            let button = fold_toggle(
+                (0, 7),
+                "message from queen-1 to pty-io",
+                folded,
+                Hsla::default(),
+                Rc::new(|_: &mut App| {}),
+            );
             let mut node = gpui::accesskit::Node::new(button.a11y_role().unwrap_or(Role::Unknown));
             button.write_a11y_info(&mut node);
 
             (node.label().map(str::to_owned), node.is_expanded())
         };
 
-        assert_eq!(name(true), (Some("Show more".to_owned()), Some(false)));
-        assert_eq!(name(false), (Some("Show less".to_owned()), Some(true)));
+        assert_eq!(
+            name(true),
+            (
+                Some("Show more, message from queen-1 to pty-io".to_owned()),
+                Some(false)
+            )
+        );
+        assert_eq!(
+            name(false),
+            (
+                Some("Show less, message from queen-1 to pty-io".to_owned()),
+                Some(true)
+            )
+        );
+    }
+
+    #[test]
+    fn a_message_row_keeps_its_id_when_its_place_in_the_list_moves() {
+        use gpui::Element;
+
+        let toggle = |index: usize, message: u64| {
+            let button = fold_toggle(
+                (index, message),
+                "message",
+                true,
+                Hsla::default(),
+                Rc::new(|_: &mut App| {}),
+            );
+
+            Element::id(&button)
+        };
+
+        assert_eq!(toggle(0, 7), toggle(3, 7));
+        assert_ne!(toggle(0, 7), toggle(0, 8));
     }
 
     #[test]

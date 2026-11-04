@@ -44,6 +44,20 @@ pub(crate) fn deletes_files(count: u32) -> String {
     )
 }
 
+/// Moves focus from Confirm to Cancel when Confirm can no longer take it, so the keyboard
+/// keeps working inside the dialog.
+pub(crate) fn leave_confirm<T: 'static>(
+    confirm: &FocusHandle,
+    cancel: &FocusHandle,
+    window: &mut Window,
+    cx: &mut Context<T>,
+) {
+    if confirm.is_focused(window) {
+        let cancel = cancel.clone();
+        window.defer(cx, move |window, cx| window.focus(&cancel, cx));
+    }
+}
+
 /// The open dialog. It reports what the user chose and leaves closing to its owner.
 pub(crate) struct CloseTaskDialog {
     pub(crate) task: TaskId,
@@ -53,9 +67,18 @@ pub(crate) struct CloseTaskDialog {
     busy: bool,
     error: Option<SharedString>,
     focus_handle: FocusHandle,
+    confirm_focus: FocusHandle,
+    cancel_focus: FocusHandle,
+    pub(crate) opener: Option<FocusHandle>,
 }
 
 impl EventEmitter<CloseTaskEvent> for CloseTaskDialog {}
+
+impl gpui::Focusable for CloseTaskDialog {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
 
 impl CloseTaskDialog {
     pub(crate) fn new(
@@ -65,6 +88,7 @@ impl CloseTaskDialog {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let opener = window.focused(cx);
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
 
@@ -76,6 +100,9 @@ impl CloseTaskDialog {
             busy: false,
             error: None,
             focus_handle,
+            confirm_focus: cx.focus_handle().tab_stop(true),
+            cancel_focus: cx.focus_handle().tab_stop(true),
+            opener,
         }
     }
 
@@ -124,6 +151,11 @@ impl CloseTaskDialog {
         !self.busy && matches!(self.check, CheckState::Ready(_))
     }
 
+    #[cfg(test)]
+    pub(crate) fn focus_handles(&self) -> (FocusHandle, FocusHandle) {
+        (self.confirm_focus.clone(), self.cancel_focus.clone())
+    }
+
     /// The value lines under the title, from what the check found.
     pub(crate) fn lines(&self) -> Vec<(String, Color)> {
         let CheckState::Ready(check) = &self.check else {
@@ -164,9 +196,13 @@ impl CloseTaskDialog {
 }
 
 impl Render for CloseTaskDialog {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let on_dismiss = cx.entity();
         let busy = self.busy;
+
+        if !busy && !self.can_confirm() {
+            leave_confirm(&self.confirm_focus, &self.cancel_focus, window, cx);
+        }
 
         let body = match &self.check {
             CheckState::Checking => div()
@@ -211,20 +247,29 @@ impl Render for CloseTaskDialog {
                 .child(message)
         });
 
+        let (confirm_label, accessible_label) = if busy {
+            ("Closing\u{2026}", format!("Closing task {}", self.name))
+        } else {
+            ("Close task", format!("Close task {}", self.name))
+        };
         let footer = h_flex()
             .gap(px(8.))
             .child(
                 Button::new("close-task-cancel", "Cancel")
                     .variant(ButtonVariant::Secondary)
                     .debug_selector(|| "close-task-cancel".to_owned())
+                    .track_focus(&self.cancel_focus)
                     .disabled(busy)
                     .on_click(cx.listener(|this, _, _, cx| this.dismiss(cx))),
             )
             .child(
-                Button::new("close-task-confirm", "Close task")
+                Button::new("close-task-confirm", confirm_label)
                     .variant(ButtonVariant::Destructive)
+                    .accessible_label(accessible_label)
                     .debug_selector(|| "close-task-confirm".to_owned())
-                    .disabled(!self.can_confirm())
+                    .track_focus(&self.confirm_focus)
+                    .loading(busy)
+                    .disabled(!busy && !self.can_confirm())
                     .on_click(cx.listener(|this, _, _, cx| {
                         if this.can_confirm() {
                             cx.emit(CloseTaskEvent::Confirmed);
@@ -395,4 +440,56 @@ impl Workspace {
 
 pub(crate) fn describe(error: &ClientError) -> SharedString {
     error.to_string().into()
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::{TestAppContext, VisualTestContext};
+
+    use super::*;
+    use crate::daemon::tests::{redraw, setup};
+
+    fn open_dialog(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> Entity<CloseTaskDialog> {
+        let task = workspace.read_with(cx, |workspace, _| workspace.active_task);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_close_task(task, window, cx);
+        });
+        redraw(cx);
+
+        workspace.read_with(cx, |workspace, _| match &workspace.overlay {
+            Some(Overlay::CloseTask { view, .. }) => view.clone(),
+            _ => panic!("the dialog is not open"),
+        })
+    }
+
+    #[gpui::test]
+    fn focus_moves_to_cancel_when_a_new_check_disables_close(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let view = open_dialog(&workspace, cx);
+        let (confirm, cancel) = view.read_with(cx, |dialog, _| dialog.focus_handles());
+
+        cx.update(|window, cx| window.focus(&confirm, cx));
+        view.update(cx, |dialog, cx| dialog.set_check(CheckState::Checking, cx));
+        redraw(cx);
+
+        assert!(cx.update(|window, _| cancel.is_focused(window)));
+        cx.simulate_keystrokes("escape");
+        let closed = workspace.read_with(cx, |workspace, _| workspace.overlay.is_none());
+        assert!(closed, "Escape still closes");
+    }
+
+    #[gpui::test]
+    fn closing_the_dialog_gives_focus_back_to_what_had_it(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let row = workspace.read_with(cx, |workspace, _| workspace.sidebar_focus.clone());
+        cx.update(|window, cx| window.focus(&row, cx));
+
+        open_dialog(&workspace, cx);
+        cx.simulate_keystrokes("escape");
+
+        assert!(cx.update(|window, _| row.is_focused(window)));
+    }
 }

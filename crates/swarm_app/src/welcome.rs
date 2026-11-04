@@ -95,6 +95,9 @@ impl Welcome {
 
                 if open {
                     Workspace::pick_project(window, cx);
+                } else {
+                    // The Skip button is gone: Add project is the next control that is drawn.
+                    window.focus(&workspace.add_project_focus, cx);
                 }
             });
 
@@ -404,6 +407,15 @@ mod tests {
         assert!(!pending, "the flag is not set");
         assert!(!welcome);
         assert!(fixture.cx.debug_bounds("welcome").is_none());
+        let add_project = fixture.workspace.read_with(fixture.cx, |workspace, _| {
+            workspace.add_project_focus.clone()
+        });
+        assert!(
+            fixture
+                .cx
+                .update(|window, _| add_project.is_focused(window)),
+            "focus fell to the window"
+        );
         assert!(fixture.cx.debug_bounds("empty-add-project").is_some());
         assert!(
             !fixture.cx.did_prompt_for_paths(),

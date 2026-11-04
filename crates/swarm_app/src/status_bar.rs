@@ -6,6 +6,7 @@ use swarm_ui::prelude::*;
 use crate::actions::NewTerminal;
 use crate::model::{AgentKind, TerminalId, TerminalKind};
 use crate::review_model::count_comments;
+use crate::views::process_status;
 use crate::workspace::{View, Workspace};
 
 const TRAY_GAP: f32 = 6.;
@@ -175,7 +176,7 @@ fn tray_entry(workspace: &Workspace, id: TerminalId) -> Option<TrayEntry> {
         id,
         title: terminal.title.clone(),
         icon,
-        status: agent.map_or(AgentStatus::Working, |agent| agent.status),
+        status: agent.map_or_else(|| process_status(terminal), |agent| agent.status),
     })
 }
 
@@ -216,7 +217,7 @@ fn tray(
     h_flex()
         .id("tray")
         .debug_selector(|| "tray".to_owned())
-        .role(Role::List)
+        .role(Role::Toolbar)
         .aria_label("Tray")
         .relative()
         .flex_1()
@@ -407,6 +408,24 @@ mod tests {
         assert_eq!(focused, Some(first_hidden));
         assert!(!minimized);
         assert!(cx.debug_bounds("tray-more-items").is_none());
+    }
+
+    #[gpui::test]
+    fn the_tray_is_a_labelled_toolbar(cx: &mut TestAppContext) {
+        use gpui::Element as _;
+
+        let (workspace, cx) = setup(cx);
+
+        let (role, label) = workspace.update(cx, |_, cx| {
+            let element = tray(Vec::new(), Vec::new(), None, cx).into_element();
+            let mut node = gpui::accesskit::Node::new(Role::Unknown);
+            element.write_a11y_info(&mut node);
+
+            (element.a11y_role(), node.label().map(str::to_owned))
+        });
+
+        assert_eq!(role, Some(Role::Toolbar));
+        assert_eq!(label.as_deref(), Some("Tray"));
     }
 
     fn more(_: usize) -> f32 {

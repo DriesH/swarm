@@ -2,18 +2,20 @@
 // (Zed Industries, Apache-2.0).
 
 use std::ops::Range;
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, Div, ElementId,
-    ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, Font,
-    GlobalElementId, HighlightStyle, Hsla, InspectorElementId, KeyBinding, LayoutId, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Role, ScrollEvent,
-    SharedString, Stateful, Style, Task, TextAlign, TextRun, UTF16Selection, UnderlineStyle,
-    Window, WrappedLine, div, fill, point, px, relative, size,
+    A11ySubtreeBuilder, AnyElement, App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle,
+    Div, ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
+    Focusable, Font, GlobalElementId, HighlightStyle, Hsla, InspectorElementId, KeyBinding,
+    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
+    Role, ScrollEvent, SharedString, Stateful, Style, Task, TextAlign, TextRun, UTF16Selection,
+    UnderlineStyle, Window, WrappedLine, accesskit, div, fill, point, px, relative, size,
 };
 use unicode_segmentation::UnicodeSegmentation as _;
 
+use crate::a11y::{ignore_press, track_focus_off_tab};
 use crate::component::{Component, example, example_group};
 use crate::fonts::{MONO_FONT, UI_FONT};
 use crate::motion::reduce_motion;
@@ -223,6 +225,10 @@ pub type Highlighter = fn(&str, &ThemeColors) -> Vec<(Range<usize>, HighlightSty
 
 /// The shared editor behind [`TextInput`] and [`TextArea`].
 /// Set a label: VoiceOver reads it.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "mono, disabled, read-only and selecting are independent"
+)]
 pub struct TextField<const MULTILINE: bool> {
     focus_handle: FocusHandle,
     buffer: Buffer,
@@ -230,6 +236,7 @@ pub struct TextField<const MULTILINE: bool> {
     label: SharedString,
     mono: bool,
     disabled: bool,
+    read_only: bool,
     rows: usize,
     height: Height,
     size: TextFieldSize,
@@ -239,6 +246,7 @@ pub struct TextField<const MULTILINE: bool> {
     role: TextFieldRole,
     expanded: Option<bool>,
     char_filter: Option<fn(char) -> bool>,
+    popup: Option<Popup>,
     highlights: Highlights,
     /// A mouse button is down and dragging extends the selection.
     selecting: bool,
@@ -249,6 +257,9 @@ pub struct TextField<const MULTILINE: bool> {
     layout: Option<FieldLayout>,
     blink: Blink,
 }
+
+/// Builds the elements a field renders inside its focused element.
+type Popup = Rc<dyn Fn(&mut Window, &mut App) -> Vec<AnyElement>>;
 
 #[derive(Default)]
 struct Scroll {
@@ -293,6 +304,7 @@ impl<const MULTILINE: bool> TextField<MULTILINE> {
             label: SharedString::default(),
             mono: false,
             disabled: false,
+            read_only: false,
             rows: DEFAULT_ROWS,
             height: Height::Rows,
             size: TextFieldSize::default(),
@@ -302,6 +314,7 @@ impl<const MULTILINE: bool> TextField<MULTILINE> {
             role: TextFieldRole::default(),
             expanded: None,
             char_filter: None,
+            popup: None,
             highlights: Highlights::default(),
             selecting: false,
             scroll: Scroll::default(),
@@ -379,11 +392,26 @@ impl<const MULTILINE: bool> TextField<MULTILINE> {
         self.disabled
     }
 
-    /// A disabled field is dimmed, cannot be focused and ignores input.
+    /// A disabled field is dimmed and ignores input. It keeps its focus handle, so focus
+    /// does not drop, but it is not a Tab stop.
     pub fn set_disabled(&mut self, disabled: bool, cx: &mut Context<Self>) {
         self.disabled = disabled;
         self.selecting = false;
         cx.notify();
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// A read-only field can be focused, selected and copied, but not edited.
+    pub fn set_read_only(&mut self, read_only: bool, cx: &mut Context<Self>) {
+        self.read_only = read_only;
+        cx.notify();
+    }
+
+    fn editable(&self) -> bool {
+        !self.disabled && !self.read_only
     }
 
     pub fn set_size(&mut self, size: TextFieldSize, cx: &mut Context<Self>) {
@@ -420,6 +448,18 @@ impl<const MULTILINE: bool> TextField<MULTILINE> {
     /// Whether the popup this field controls is open. `None` leaves it unset.
     pub fn set_expanded(&mut self, expanded: Option<bool>, cx: &mut Context<Self>) {
         self.expanded = expanded;
+        cx.notify();
+    }
+
+    /// Renders `build`'s elements inside the focused element, after the text line.
+    /// Position them absolutely. Give the active one a role, an id and
+    /// `aria_active_descendant()`: GPUI honours that only under a focused ancestor.
+    pub fn set_popup(
+        &mut self,
+        build: Option<impl Fn(&mut Window, &mut App) -> Vec<AnyElement> + 'static>,
+        cx: &mut Context<Self>,
+    ) {
+        self.popup = build.map(|build| Rc::new(build) as Popup);
         cx.notify();
     }
 
@@ -658,6 +698,10 @@ impl<const MULTILINE: bool> TextField<MULTILINE> {
     }
 
     fn insert(&mut self, text: &str, kind: EditKind, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.editable() {
+            return;
+        }
+
         let Some(text) = self.accept(text) else {
             return;
         };
@@ -677,6 +721,10 @@ impl<const MULTILINE: bool> TextField<MULTILINE> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.editable() {
+            return;
+        }
+
         if delete(&mut self.buffer) {
             self.text_changed(window, cx);
         } else {
@@ -748,7 +796,7 @@ impl<const MULTILINE: bool> TextField<MULTILINE> {
     }
 
     fn cut(&mut self, _: &action::Cut, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.buffer.selection.is_empty() {
+        if self.editable() && !self.buffer.selection.is_empty() {
             let selected = self.buffer.selected_text().to_owned();
             cx.write_to_clipboard(ClipboardItem::new_string(selected));
             self.buffer
@@ -764,13 +812,13 @@ impl<const MULTILINE: bool> TextField<MULTILINE> {
     }
 
     fn undo(&mut self, _: &action::Undo, window: &mut Window, cx: &mut Context<Self>) {
-        if self.buffer.undo() {
+        if self.editable() && self.buffer.undo() {
             self.text_changed(window, cx);
         }
     }
 
     fn redo(&mut self, _: &action::Redo, window: &mut Window, cx: &mut Context<Self>) {
-        if self.buffer.redo() {
+        if self.editable() && self.buffer.redo() {
             self.text_changed(window, cx);
         }
     }
@@ -904,12 +952,22 @@ impl<const MULTILINE: bool> Render for TextField<MULTILINE> {
         let ring_focus = bordered && self.focus_style == FocusStyle::Ring;
         let placeholder = self.placeholder.clone();
         let fill = MULTILINE && self.height == Height::Fill;
+        let popup = self
+            .popup
+            .as_ref()
+            .map(|build| build(window, cx))
+            .unwrap_or_default();
 
         let field = div()
             .id("text-field")
             .role(role)
             .aria_label(self.label.clone())
             .aria_value(self.text())
+            .a11y_synthetic_children(a11y_text_children(
+                &self.buffer.text,
+                &self.buffer.selection,
+                self.buffer.reversed,
+            ))
             .when(!placeholder.is_empty(), |field| {
                 field.aria_placeholder(placeholder)
             })
@@ -948,21 +1006,27 @@ impl<const MULTILINE: bool> Render for TextField<MULTILINE> {
                     .min_w_0()
                     .when(fill, Styled::h_full)
                     .child(FieldText { field: cx.entity() }),
-            );
+            )
+            .children(popup);
 
-        if self.disabled {
-            field.opacity(0.5)
+        let field = if self.disabled {
+            ignore_press(track_focus_off_tab(field.opacity(0.5), &self.focus_handle))
         } else {
             Self::on_actions(field, cx)
                 .track_focus(&self.focus_handle)
                 .cursor(CursorStyle::IBeam)
-                .when(ring_focus, |field| {
-                    field.focus(|style| focus_ring(style, accent))
-                })
-                .when(border_focus, |field| {
-                    field.focus(|style| style.border_color(accent))
-                })
-        }
+        };
+
+        field
+            .when(ring_focus, |field| {
+                field.focus(|style| focus_ring(style, accent))
+            })
+            .when(border_focus, |field| {
+                field.focus(|style| style.border_color(accent))
+            })
+            .a11y_flags()
+            .disabled(self.disabled)
+            .read_only(self.read_only)
     }
 }
 
@@ -1018,7 +1082,7 @@ impl<const MULTILINE: bool> EntityInputHandler for TextField<MULTILINE> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.disabled {
+        if !self.editable() {
             return;
         }
 
@@ -1042,7 +1106,7 @@ impl<const MULTILINE: bool> EntityInputHandler for TextField<MULTILINE> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.disabled {
+        if !self.editable() {
             return;
         }
 
@@ -1130,7 +1194,105 @@ impl<const MULTILINE: bool> EntityInputHandler for TextField<MULTILINE> {
     }
 
     fn accepts_text_input(&self, _: &mut Window, _: &mut Context<Self>) -> bool {
-        !self.disabled
+        self.editable()
+    }
+}
+
+/// One line of the text as an accessibility text run. A line break belongs to the line it ends.
+#[derive(Debug, PartialEq, Eq)]
+struct TextRunInfo {
+    value: String,
+    character_lengths: Vec<u8>,
+}
+
+/// The text as runs, with the selection as `(run, character in run)` for each end.
+#[derive(Debug, PartialEq, Eq)]
+struct A11yText {
+    runs: Vec<TextRunInfo>,
+    anchor: (usize, usize),
+    focus: (usize, usize),
+}
+
+fn a11y_text(text: &str, selection: &Range<usize>, reversed: bool) -> A11yText {
+    let mut starts = Vec::new();
+    let mut runs: Vec<TextRunInfo> = Vec::new();
+    let mut offset = 0;
+
+    for line in text.split_inclusive('\n') {
+        starts.push(offset);
+        offset += line.len();
+        runs.push(run_info(line));
+    }
+
+    // Nothing after a final line break, or no text at all: the cursor still needs a run.
+    if text.is_empty() || text.ends_with('\n') {
+        starts.push(text.len());
+        runs.push(run_info(""));
+    }
+
+    let position = |offset: usize| {
+        let run = starts
+            .partition_point(|start| *start <= offset)
+            .saturating_sub(1);
+        let within = text
+            .get(starts[run]..offset)
+            .map_or(0, |part| part.chars().count());
+
+        (run, within)
+    };
+
+    let (start, end) = (position(selection.start), position(selection.end));
+    let (anchor, focus) = if reversed { (end, start) } else { (start, end) };
+
+    A11yText {
+        runs,
+        anchor,
+        focus,
+    }
+}
+
+fn run_info(line: &str) -> TextRunInfo {
+    TextRunInfo {
+        value: line.to_owned(),
+        character_lengths: line
+            .chars()
+            .map(|character| u8::try_from(character.len_utf8()).unwrap_or(u8::MAX))
+            .collect(),
+    }
+}
+
+/// Text runs for the field's node and the selection, so a screen reader can read the
+/// text by line and follow the caret.
+fn a11y_text_children(
+    text: &str,
+    selection: &Range<usize>,
+    reversed: bool,
+) -> impl FnOnce(&mut A11ySubtreeBuilder) + 'static {
+    let described = a11y_text(text, selection, reversed);
+
+    move |builder| {
+        let ids: Vec<accesskit::NodeId> = (0..described.runs.len())
+            .map(|index| builder.synthetic_node_id(index))
+            .collect();
+
+        for (id, run) in ids.iter().zip(described.runs) {
+            let mut node = accesskit::Node::new(Role::TextRun);
+            node.set_value(run.value);
+            node.set_character_lengths(run.character_lengths);
+            builder.push_child(*id, node);
+        }
+
+        let position = |(run, character_index): (usize, usize)| accesskit::TextPosition {
+            node: ids[run],
+            character_index,
+        };
+
+        builder
+            .parent_node()
+            .set_text_selection(accesskit::TextSelection {
+                anchor: position(described.anchor),
+                focus: position(described.focus),
+            });
     }
 }
 
@@ -2192,6 +2354,75 @@ mod tests {
         assert!(input.read_with(cx, |input, _| input.blink.visible));
     }
 
+    #[test]
+    fn a_text_with_two_lines_is_two_runs_and_the_break_ends_the_first() {
+        let described = a11y_text("ab\ncd", &(0..0), false);
+        let values: Vec<_> = described
+            .runs
+            .iter()
+            .map(|run| run.value.as_str())
+            .collect();
+
+        assert_eq!(values, ["ab\n", "cd"]);
+    }
+
+    #[test]
+    fn a_run_lists_the_byte_length_of_each_character() {
+        let described = a11y_text("a\u{e9}\u{1f41d}", &(0..0), false);
+
+        assert_eq!(described.runs[0].character_lengths, [1, 2, 4]);
+    }
+
+    #[test]
+    fn empty_text_is_one_empty_run_with_the_caret_in_it() {
+        let described = a11y_text("", &(0..0), false);
+
+        assert_eq!(described.runs.len(), 1);
+        assert_eq!((described.anchor, described.focus), ((0, 0), (0, 0)));
+    }
+
+    #[test]
+    fn a_caret_at_the_start_of_the_second_line_is_in_the_second_run() {
+        let described = a11y_text("ab\ncd", &(3..3), false);
+
+        assert_eq!(described.focus, (1, 0));
+    }
+
+    #[test]
+    fn a_caret_after_a_final_line_break_gets_an_empty_run() {
+        let described = a11y_text("ab\n", &(3..3), false);
+
+        assert_eq!((described.runs.len(), described.focus), (2, (1, 0)));
+    }
+
+    #[test]
+    fn the_caret_counts_characters_not_bytes() {
+        let described = a11y_text("\u{e9}\u{e9}x", &(4..4), false);
+
+        assert_eq!(described.focus, (0, 2));
+    }
+
+    #[test]
+    fn a_selection_puts_the_anchor_at_its_start_and_the_focus_at_its_end() {
+        let described = a11y_text("hello world", &(0..5), false);
+
+        assert_eq!((described.anchor, described.focus), ((0, 0), (0, 5)));
+    }
+
+    #[test]
+    fn a_reversed_selection_puts_the_focus_at_its_start() {
+        let described = a11y_text("hello world", &(0..5), true);
+
+        assert_eq!((described.anchor, described.focus), ((0, 5), (0, 0)));
+    }
+
+    #[test]
+    fn a_selection_can_cross_lines() {
+        let described = a11y_text("ab\ncd", &(1..4), false);
+
+        assert_eq!((described.anchor, described.focus), ((0, 1), (1, 1)));
+    }
+
     fn buffer(text: &str, cursor: usize) -> Buffer {
         Buffer {
             text: text.to_owned(),
@@ -2416,6 +2647,44 @@ mod tests {
                 .as_ref()
                 .map(|layout| layout.bounds.size.height)
         })
+    }
+
+    #[gpui::test]
+    fn popup_children_render_inside_the_focused_element(cx: &mut TestAppContext) {
+        let (input, cx) = framed::<false>(px(40.), cx);
+        let child = cx.update(|_, cx| cx.focus_handle());
+        let child_handle = child.clone();
+
+        input.update(cx, |input, cx| {
+            input.set_popup(
+                Some(move |_: &mut Window, _: &mut App| {
+                    vec![
+                        div()
+                            .id("popup-child")
+                            .track_focus(&child_handle)
+                            .into_any_element(),
+                    ]
+                }),
+                cx,
+            );
+        });
+        draw(cx);
+        cx.update(|window, cx| window.focus(&child, cx));
+
+        let contains = input.read_with(cx, |input, _| input.focus_handle.clone());
+        assert!(cx.update(|window, cx| contains.contains_focused(window, cx)));
+    }
+
+    #[gpui::test]
+    fn a_field_without_a_popup_does_not_contain_other_focus(cx: &mut TestAppContext) {
+        let (input, cx) = framed::<false>(px(40.), cx);
+        let other = cx.update(|_, cx| cx.focus_handle());
+
+        draw(cx);
+        cx.update(|window, cx| window.focus(&other, cx));
+
+        let handle = input.read_with(cx, |input, _| input.focus_handle.clone());
+        assert!(!cx.update(|window, cx| handle.contains_focused(window, cx)));
     }
 
     #[gpui::test]

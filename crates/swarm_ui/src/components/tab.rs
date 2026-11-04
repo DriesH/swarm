@@ -218,6 +218,7 @@ impl RenderOnce for Tab {
             .when_some(self.on_close, |tab, on_close| {
                 let button = IconButton::new(close_id, IconName::Close, close_label)
                     .on_click(on_close)
+                    .skip_tab_stop()
                     .when_some(close_selector, |button, selector| {
                         button.debug_selector(move || selector)
                     });

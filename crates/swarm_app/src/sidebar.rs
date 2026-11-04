@@ -12,6 +12,7 @@ use crate::actions::ToggleCommandPalette;
 use crate::model::{Agent, AgentKind, Project, ProjectId, TaskStatus, Terminal};
 use crate::settings::Page;
 use crate::usage_text::{UsageSection, WindowRow, usage_sections};
+use crate::views::process_status;
 use crate::window_drag::drag_region;
 use crate::workspace::{DataSource, Workspace};
 
@@ -213,7 +214,7 @@ fn terminal_button(workspace: &Workspace, row: Row<'_>, cx: &mut Context<Workspa
                 terminal_icon(),
             )
             .tooltip(label)
-            .badge(Some(AgentStatus::Working))
+            .badge(Some(process_status(terminal)))
             .debug_selector(move || format!("rail-process-{}", id.0));
 
             (button, id)
@@ -223,7 +224,7 @@ fn terminal_button(workspace: &Workspace, row: Row<'_>, cx: &mut Context<Workspa
 
             let button = RailButton::new(
                 ("rail-user", id.0 as usize),
-                user_label(terminal),
+                user_label(workspace, terminal),
                 terminal_icon(),
             )
             .tooltip(terminal.title.clone())
@@ -271,6 +272,7 @@ fn daemon_status(workspace: &Workspace, cx: &mut Context<Workspace>) -> Option<g
                 )
                 .child(
                     Button::new("retry-daemon", "Retry")
+                        .debug_selector(|| "retry-daemon".to_owned())
                         .on_click(cx.listener(|workspace, _, _, cx| workspace.retry_daemon(cx))),
                 )
                 .into_any_element(),
@@ -302,9 +304,11 @@ fn error_message(workspace: &Workspace, cx: &mut Context<Workspace>) -> Option<i
                     .child(message),
             )
             .child(
-                IconButton::new("dismiss-error", IconName::Close, "Dismiss message").on_click(
-                    cx.listener(|workspace, _, _, cx| workspace.dismiss_sidebar_error(cx)),
-                ),
+                IconButton::new("dismiss-error", IconName::Close, "Dismiss message")
+                    .debug_selector(|| "dismiss-error".to_owned())
+                    .on_click(
+                        cx.listener(|workspace, _, _, cx| workspace.dismiss_sidebar_error(cx)),
+                    ),
             ),
     )
 }
@@ -627,24 +631,31 @@ fn process_row(
                 .size(IconSize::Large)
                 .color(Color::Muted),
         )
-        .end_slot(StatusDot::new(AgentStatus::Working))
+        .end_slot(StatusDot::new(process_status(terminal)))
         .on_click(cx.listener(move |workspace, _, _, cx| {
             workspace.focus_terminal(id, cx);
         }))
         .into_any_element()
 }
 
-/// What VoiceOver reads for a process terminal and the agent that started it.
+/// What VoiceOver reads for a process terminal, the agent that started it and how it is
+/// doing.
 fn process_label(terminal: &Terminal, owner: &str) -> String {
+    let status = process_status(terminal).label().to_lowercase();
+
     if owner.is_empty() {
-        format!("{}, process terminal", terminal.title)
+        format!("{}, process terminal, {status}", terminal.title)
     } else {
-        format!("{}, started by {owner}, running", terminal.title)
+        format!("{}, started by {owner}, {status}", terminal.title)
     }
 }
 
-fn user_label(terminal: &Terminal) -> String {
-    format!("{}, your terminal", terminal.title)
+fn user_label(workspace: &Workspace, terminal: &Terminal) -> String {
+    format!(
+        "{}, your terminal {}",
+        terminal.title,
+        workspace.user_terminal_number(terminal.id)
+    )
 }
 
 fn user_row(
@@ -673,7 +684,7 @@ fn user_row(
 
     ListRow::new(("user-terminal", id.0 as usize), terminal.title.clone())
         .debug_selector(move || format!("user-row-{}", id.0))
-        .accessible_label(user_label(terminal))
+        .accessible_label(user_label(workspace, terminal))
         .compact(true)
         .toggle_state(workspace.focused_terminal == Some(id))
         .start_slot(
@@ -1105,6 +1116,95 @@ mod tests {
 
         assert!(hidden);
         assert!(shown("sidebar-error", cx));
+    }
+
+    fn process_with_exit(exit: Option<swarm_term::ExitStatus>) -> Terminal {
+        Terminal {
+            id: crate::model::TerminalId(1),
+            kind: crate::model::TerminalKind::Process,
+            title: "cargo watch".into(),
+            meta: None,
+            owner: None,
+            daemon_owner: None,
+            link: None,
+            exit,
+            lines: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_process_row_says_how_the_process_is_doing() {
+        let label = |exit| process_label(&process_with_exit(exit), "pty-io");
+
+        assert_eq!(label(None), "cargo watch, started by pty-io, working");
+        assert_eq!(
+            label(Some(swarm_term::ExitStatus::Code(0))),
+            "cargo watch, started by pty-io, done"
+        );
+        assert_eq!(
+            label(Some(swarm_term::ExitStatus::Code(1))),
+            "cargo watch, started by pty-io, error"
+        );
+    }
+
+    /// True when the row of the open project has the keyboard focus.
+    fn open_project_row_has_focus(
+        workspace: &gpui::Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> bool {
+        let row = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .project_focus
+                .get(&workspace.active_project)
+                .cloned()
+        });
+
+        row.is_some_and(|row| cx.update(|window, _| row.is_focused(window)))
+    }
+
+    fn click_center(selector: &'static str, cx: &mut VisualTestContext) {
+        let bounds = cx.debug_bounds(selector).expect("the control is on screen");
+
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+    }
+
+    #[gpui::test]
+    fn dismissing_the_error_moves_the_focus_to_the_row_of_the_open_project(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = setup(cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.report_sidebar_error("not a git repository".to_owned(), cx);
+        });
+        redraw(cx);
+
+        click_center("dismiss-error", cx);
+        redraw(cx);
+        redraw(cx);
+
+        assert!(!shown("sidebar-error", cx));
+        assert!(open_project_row_has_focus(&workspace, cx));
+    }
+
+    #[gpui::test]
+    fn retrying_the_daemon_moves_the_focus_to_the_row_of_the_open_project(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.daemon_launch = Some(crate::daemon::tests::unreachable_launch());
+            workspace.daemon_unavailable("no daemon".to_owned(), cx);
+        });
+        redraw(cx);
+
+        click_center("retry-daemon", cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.source = DataSource::Connecting;
+            cx.notify();
+        });
+        redraw(cx);
+        redraw(cx);
+
+        assert!(!shown("retry-daemon", cx));
+        assert!(open_project_row_has_focus(&workspace, cx));
     }
 
     #[gpui::test]

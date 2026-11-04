@@ -5,14 +5,16 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    App, AppContext as _, Context, Div, Entity, EventEmitter, FocusHandle, Focusable as _,
-    HighlightStyle, Role, SharedString, StyledText, Window, div, px, relative,
+    App, AppContext as _, Context, Div, Entity, EventEmitter, FocusHandle, HighlightStyle, Role,
+    SharedString, StyledText, Window, div, px, relative,
 };
 use swarm_protocol::{Client, RemoveCheck, TaskCloseCheck};
 use swarm_ui::fonts::{MONO_FONT, UI_FONT};
 use swarm_ui::prelude::*;
 
-use crate::close_task::{CheckState, deletes_files, describe, stops_agents, stops_terminals};
+use crate::close_task::{
+    CheckState, deletes_files, describe, leave_confirm, stops_agents, stops_terminals,
+};
 use crate::daemon::NOT_RUNNING;
 use crate::model::ProjectId;
 use crate::palette::Overlay;
@@ -36,9 +38,19 @@ pub(crate) struct RemoveProjectDialog {
     busy: bool,
     error: Option<SharedString>,
     focus_handle: FocusHandle,
+    confirm_focus: FocusHandle,
+    cancel_focus: FocusHandle,
+    /// What had the focus before the dialog opened.
+    pub(crate) opener: Option<FocusHandle>,
 }
 
 impl EventEmitter<RemoveProjectEvent> for RemoveProjectDialog {}
+
+impl gpui::Focusable for RemoveProjectDialog {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
 
 impl RemoveProjectDialog {
     pub(crate) fn new(
@@ -48,6 +60,7 @@ impl RemoveProjectDialog {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let opener = window.focused(cx);
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
 
@@ -59,7 +72,15 @@ impl RemoveProjectDialog {
             busy: false,
             error: None,
             focus_handle,
+            confirm_focus: cx.focus_handle().tab_stop(true),
+            cancel_focus: cx.focus_handle().tab_stop(true),
+            opener,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn focus_handles(&self) -> (FocusHandle, FocusHandle) {
+        (self.confirm_focus.clone(), self.cancel_focus.clone())
     }
 
     pub(crate) fn set_check(&mut self, check: CheckState<RemoveCheck>, cx: &mut Context<Self>) {
@@ -242,9 +263,13 @@ fn wrapping(text: impl Into<SharedString>, color: Color, cx: &App) -> Div {
 }
 
 impl Render for RemoveProjectDialog {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let on_dismiss = cx.entity();
         let busy = self.busy;
+
+        if !busy && !matches!(self.check, CheckState::Ready(_)) {
+            leave_confirm(&self.confirm_focus, &self.cancel_focus, window, cx);
+        }
 
         let (text, mono) = self.info();
         let mut styled = StyledText::new(text.clone());
@@ -320,6 +345,7 @@ impl Render for RemoveProjectDialog {
                 Button::new("remove-project-cancel", "Cancel")
                     .variant(ButtonVariant::Secondary)
                     .debug_selector(|| "remove-project-cancel".to_owned())
+                    .track_focus(&self.cancel_focus)
                     .disabled(busy)
                     .on_click(cx.listener(|this, _, _, cx| this.dismiss(cx))),
             )
@@ -328,6 +354,7 @@ impl Render for RemoveProjectDialog {
                     .variant(ButtonVariant::Destructive)
                     .accessible_label(accessible)
                     .debug_selector(|| "remove-project-confirm".to_owned())
+                    .track_focus(&self.confirm_focus)
                     .loading(busy)
                     .disabled(!matches!(self.check, CheckState::Ready(_)))
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -406,8 +433,8 @@ impl Workspace {
         self.check_remove_project(&view, cx);
     }
 
-    /// Closes the dialog and gives focus back to the project's row, or to the window when
-    /// the row is gone.
+    /// Closes the dialog and gives focus back to the project's row. A project that is gone
+    /// has no row, so focus goes to what had it before, else to a control that is drawn.
     fn close_remove_project(
         &mut self,
         dialog: &Entity<RemoveProjectDialog>,
@@ -415,13 +442,13 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let project = dialog.read(cx).project;
+        let opener = dialog.read(cx).opener.clone();
+        let row = self.project_focus.get(&project).cloned();
 
-        self.overlay = None;
-        match self.project_focus.get(&project).cloned() {
-            Some(row) => window.focus(&row, cx),
-            None => window.focus(&self.focus_handle(cx), cx),
-        }
-        cx.notify();
+        self.close_overlay(window, cx);
+
+        let target = row.or(opener).unwrap_or_else(|| self.landing_handle(cx));
+        window.focus(&target, cx);
     }
 
     /// Fills the dialog with what removing would throw away: the daemon's answer, or the
@@ -940,6 +967,44 @@ mod tests {
             workspace.project_focus.get(&ProjectId(3)).cloned()
         });
         assert!(row.is_some_and(|row| cx.update(|window, _| row.is_focused(window))));
+    }
+
+    #[gpui::test]
+    fn focus_moves_to_cancel_when_a_new_check_disables_remove(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        open_dialog(3, &workspace, cx);
+        let Some(view) = dialog(&workspace, cx) else {
+            panic!("the dialog is not open");
+        };
+        let (confirm, cancel) = view.read_with(cx, |dialog, _| dialog.focus_handles());
+
+        cx.update(|window, cx| window.focus(&confirm, cx));
+        view.update(cx, |dialog, cx| dialog.set_check(CheckState::Checking, cx));
+        redraw(cx);
+
+        assert!(cx.update(|window, _| cancel.is_focused(window)));
+        cx.simulate_keystrokes("escape");
+        assert!(dialog(&workspace, cx).is_none(), "Escape still closes");
+    }
+
+    #[gpui::test]
+    fn removing_the_project_gives_the_focus_back_to_what_had_it(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        redraw(cx);
+        let opener = workspace
+            .read_with(cx, |workspace, _| {
+                workspace.project_focus.get(&ProjectId(0)).cloned()
+            })
+            .expect("the first project has a row");
+        cx.update(|window, cx| window.focus(&opener, cx));
+        redraw(cx);
+
+        open_dialog(3, &workspace, cx);
+        click("remove-project-confirm", cx);
+        redraw(cx);
+
+        assert!(dialog(&workspace, cx).is_none());
+        assert!(cx.update(|window, _| opener.is_focused(window)));
     }
 
     #[gpui::test]

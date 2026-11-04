@@ -1,5 +1,11 @@
 //! `swarm`: the Swarm app.
 
+// The frame-stats run replaces the normal start-up, so most of the app is never called.
+#![cfg_attr(
+    feature = "frame-stats",
+    allow(dead_code, reason = "frame-stats replaces the normal start-up")
+)]
+
 mod actions;
 mod app_menus;
 mod close_task;

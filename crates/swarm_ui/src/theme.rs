@@ -128,6 +128,10 @@ pub struct ThemeColors {
     pub knob_off: Hsla,
     /// Dimmed backdrop behind a dialog.
     pub scrim: Hsla,
+    /// Drop shadow under a toast or tooltip.
+    pub shadow: Hsla,
+    /// The stronger drop shadow under a dialog.
+    pub shadow_strong: Hsla,
     /// Claude Code brand mark. Same in both themes.
     pub claude: Hsla,
     /// Letter on a project tile, which has a saturated per-project color.
@@ -179,6 +183,8 @@ impl ThemeColors {
             knob_on,
             knob_off,
             scrim,
+            shadow,
+            shadow_strong,
             claude,
             on_tile,
             ansi,
@@ -218,6 +224,8 @@ impl ThemeColors {
             ("knob_on", *knob_on),
             ("knob_off", *knob_off),
             ("scrim", *scrim),
+            ("shadow", *shadow),
+            ("shadow_strong", *shadow_strong),
             ("claude", *claude),
             ("on_tile", *on_tile),
         ];
@@ -279,6 +287,8 @@ impl Theme {
                 knob_on: rgb(0x111113).into(),
                 knob_off: rgb(0xa1a1aa).into(),
                 scrim: rgba(0x0000008c).into(),
+                shadow: rgba(0x00000040).into(),
+                shadow_strong: rgba(0x00000059).into(),
                 claude: rgb(0xd97757).into(),
                 on_tile: rgb(0xffffff).into(),
                 ansi: [
@@ -345,6 +355,8 @@ impl Theme {
                 knob_on: rgb(0xffffff).into(),
                 knob_off: rgb(0xffffff).into(),
                 scrim: rgba(0x00000066).into(),
+                shadow: rgba(0x00000040).into(),
+                shadow_strong: rgba(0x00000059).into(),
                 claude: rgb(0xd97757).into(),
                 on_tile: rgb(0xffffff).into(),
                 ansi: [
@@ -607,7 +619,10 @@ mod tests {
     fn only_tint_tokens_are_translucent() {
         for theme in themes() {
             for (name, color) in theme.colors().tokens() {
-                let tint = name.ends_with("_bg") || name == "scrim" || name == "selection";
+                let tint = name.ends_with("_bg")
+                    || name == "scrim"
+                    || name == "selection"
+                    || name.starts_with("shadow");
                 assert_eq!(
                     color.a < 1.0,
                     tint,

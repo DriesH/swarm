@@ -7,8 +7,9 @@ use std::rc::Rc;
 
 use gpui::{
     AnyElement, App, ClickEvent, Context, Div, Entity, FocusHandle, Focusable as _, FontWeight,
-    ListAlignment, ListOffset, ListState, Role, ScrollStrategy, SharedString, Stateful,
-    StyleRefinement, UniformListScrollHandle, WeakEntity, Window, div, list, px, uniform_list,
+    KeyDownEvent, ListAlignment, ListOffset, ListState, Role, ScrollStrategy, SharedString,
+    Stateful, StyleRefinement, UniformListScrollHandle, WeakEntity, Window, div, list, px,
+    uniform_list,
 };
 use swarm_protocol::{
     CommentId, DiffLine, DiffLineKind, DiffSide, FileChange, FileDiff, Fold, ReviewComment,
@@ -22,7 +23,7 @@ use swarm_ui::{StatusPill, TagTone, ThemeColors};
 use crate::actions::{
     CancelComment, CommentOnLine, CreatePullRequest, FILE_TREE_CONTEXT, NextFile, NextLine,
     PreviousFile, PreviousLine, REVIEW_BODY_CONTEXT, REVIEW_CONTEXT, SetUpGithub, ToggleViewed,
-    TreeActivate, TreeCollapse, TreeExpand, TreeNext, TreePrevious,
+    TreeActivate, TreeCollapse, TreeExpand, TreeFirst, TreeLast, TreeNext, TreePrevious,
 };
 use crate::file_tree::{self, Entry, EntryKind, Key, Mark, Move};
 use crate::markdown::Markdown;
@@ -154,6 +155,8 @@ pub(crate) struct ReviewView {
     focus_body: bool,
     /// Focus a reply field or its button at the next frame.
     focus_reply: Option<ReplyFocus>,
+    /// Focus the folded card of a thread once it folds.
+    focus_folded: Option<CommentId>,
     /// Redraws the relative times of delivered comments.
     clock: Option<gpui::Task<()>>,
 }
@@ -240,6 +243,7 @@ impl ReviewView {
             focus_composer: false,
             focus_body: false,
             focus_reply: None,
+            focus_folded: None,
             clock: None,
         }
     }
@@ -500,6 +504,15 @@ impl ReviewView {
         let (Some(task), Some(info)) = (self.task(), self.infos.get(file)) else {
             return false;
         };
+
+        // A line cursor left on another file would pull the next arrow key back to it.
+        if self
+            .cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.key != info.key)
+        {
+            self.cursor = None;
+        }
 
         self.selected.insert(task, info.key.clone());
         self.tree_cursor.insert(task, Mark::File(info.key.clone()));
@@ -824,6 +837,83 @@ fn counts(additions: u32, deletions: u32, size: LabelSize) -> Div {
         )
 }
 
+/// What a screen reader says for a file header: the colors and tags say the rest.
+fn header_label(
+    path: &str,
+    file: &FileDiff,
+    agent: Option<&str>,
+    comments: u32,
+    fold: Option<&str>,
+) -> String {
+    let change = match file.change {
+        FileChange::Added => Some("Added".to_owned()),
+        FileChange::Deleted => Some("Deleted".to_owned()),
+        FileChange::Modified => None,
+    };
+
+    [
+        Some(path.to_owned()),
+        change,
+        Some(plural(file.additions, "addition", "additions")),
+        Some(plural(file.deletions, "deletion", "deletions")),
+        agent.map(|agent| format!("by {agent}")),
+        (comments > 0).then(|| plural(comments, "comment", "comments")),
+        fold.map(str::to_owned),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(", ")
+}
+
+/// The button's text, and what a screen reader says instead of the dot.
+fn request_changes_labels(pending: u32) -> (String, String) {
+    if pending == 0 {
+        return ("Request changes".to_owned(), "Request changes".to_owned());
+    }
+
+    (
+        format!("Request changes \u{b7} {pending}"),
+        format!(
+            "Request changes, {}",
+            plural(pending, "comment", "comments")
+        ),
+    )
+}
+
+/// How much of the diff the user has viewed.
+fn progress_bar(viewed: usize, total: usize, colors: &ThemeColors) -> Stateful<Div> {
+    let fraction = if total == 0 {
+        0.
+    } else {
+        f32::from(u16::try_from(viewed).unwrap_or(u16::MAX))
+            / f32::from(u16::try_from(total).unwrap_or(u16::MAX))
+    };
+    let count = |value: usize| f64::from(u32::try_from(value).unwrap_or(u32::MAX));
+
+    div()
+        .id("review-progress")
+        .debug_selector(|| "review-progress".to_owned())
+        .role(Role::ProgressIndicator)
+        .aria_label(format!("{viewed} of {total} files viewed"))
+        .aria_min_numeric_value(0.)
+        .aria_max_numeric_value(count(total))
+        .aria_numeric_value(count(viewed))
+        .mx(px(8.))
+        .mt(px(4.))
+        .mb(px(10.))
+        .h(px(3.))
+        .rounded(px(2.))
+        .bg(colors.soft)
+        .child(
+            div()
+                .h(px(3.))
+                .w(gpui::relative(fraction))
+                .rounded(px(2.))
+                .bg(colors.fg),
+        )
+}
+
 fn centered(text: &'static str) -> Div {
     div()
         .size_full()
@@ -859,7 +949,19 @@ impl Render for ReviewView {
             .on_action(cx.listener(|this, _: &CancelComment, _, cx| this.cancel_composer(cx)));
 
         let Some(input) = self.input.clone() else {
-            return root.child(centered("No changes")).into_any_element();
+            let accent = colors.accent;
+
+            return root
+                .child(
+                    centered("No changes")
+                        .id("review-body")
+                        .debug_selector(|| "review-empty".to_owned())
+                        .role(Role::Group)
+                        .aria_label("No changes")
+                        .track_focus(&self.body_focus)
+                        .focus_visible(move |style| focus_ring(style, accent)),
+                )
+                .into_any_element();
         };
 
         root.child(self.nav_panel(&input, &colors, cx))
@@ -876,10 +978,6 @@ impl Render for ReviewView {
 }
 
 impl ReviewView {
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one flat element tree reads best in one place"
-    )]
     fn nav_panel(
         &self,
         input: &ReviewInput,
@@ -888,12 +986,6 @@ impl ReviewView {
     ) -> AnyElement {
         let total = self.shown.len();
         let viewed = self.viewed_count();
-        let fraction = if total == 0 {
-            0.
-        } else {
-            f32::from(u16::try_from(viewed).unwrap_or(u16::MAX))
-                / f32::from(u16::try_from(total).unwrap_or(u16::MAX))
-        };
         let workspace = self.workspace.clone();
 
         let summary = h_flex()
@@ -916,28 +1008,12 @@ impl ReviewView {
                     .color(Color::Faint),
             );
 
-        let progress = div()
-            .id("review-progress")
-            .debug_selector(|| "review-progress".to_owned())
-            .role(Role::ProgressIndicator)
-            .aria_label(format!("{viewed} of {total} files viewed"))
-            .mx(px(8.))
-            .mt(px(4.))
-            .mb(px(10.))
-            .h(px(3.))
-            .rounded(px(2.))
-            .bg(colors.soft)
-            .child(
-                div()
-                    .h(px(3.))
-                    .w(gpui::relative(fraction))
-                    .rounded(px(2.))
-                    .bg(colors.fg),
-            );
+        let progress = progress_bar(viewed, total, colors);
 
         let chip = input.filter.as_ref().map(|agent| {
             let name = agent.name.clone();
             let workspace = workspace.clone();
+            let nav_focus = self.nav_focus.clone();
 
             h_flex().px(px(8.)).pb(px(8.)).child(
                 h_flex()
@@ -962,7 +1038,9 @@ impl ReviewView {
                         let accent = colors.accent;
                         move |style| focus_ring(style, accent)
                     })
-                    .on_click(move |_, _, cx| {
+                    .on_click(move |_, window, cx| {
+                        // The chip goes away, so focus moves on to the file tree.
+                        window.focus(&nav_focus, cx);
                         update_workspace(&workspace, cx, |workspace, cx| {
                             workspace.clear_review_agent(cx);
                         });
@@ -996,6 +1074,8 @@ impl ReviewView {
             .on_action(cx.listener(|this, _: &TreeNext, _, cx| this.move_tree(Key::Down, cx)))
             .on_action(cx.listener(|this, _: &TreeCollapse, _, cx| this.move_tree(Key::Left, cx)))
             .on_action(cx.listener(|this, _: &TreeExpand, _, cx| this.move_tree(Key::Right, cx)))
+            .on_action(cx.listener(|this, _: &TreeFirst, _, cx| this.move_tree(Key::First, cx)))
+            .on_action(cx.listener(|this, _: &TreeLast, _, cx| this.move_tree(Key::Last, cx)))
             .on_action(cx.listener(|this, _: &TreeActivate, _, cx| this.activate_cursor(cx)))
             .flex_1()
             .min_h_0()
@@ -1241,13 +1321,10 @@ impl ReviewView {
 
         let request_workspace = self.workspace.clone();
         let request = merged.then(|| {
-            let label = if pending == 0 {
-                "Request changes".to_owned()
-            } else {
-                format!("Request changes \u{b7} {pending}")
-            };
+            let (label, spoken) = request_changes_labels(pending);
 
             Button::new("review-request-changes", label)
+                .accessible_label(spoken)
                 .variant(ButtonVariant::Secondary)
                 .debug_selector(|| "review-request-changes".to_owned())
                 .disabled(pending == 0 || input.requesting)
@@ -1350,31 +1427,63 @@ impl ReviewView {
         };
 
         if let Some(message) = message {
-            return area.child(centered(message)).into_any_element();
+            return area
+                .child(self.empty_body(message, colors))
+                .into_any_element();
         }
 
         let rows = list(
             self.body_list.clone(),
-            cx.processor(|this, index: usize, _, cx| this.body_row(index, cx)),
+            cx.processor(|this, index: usize, window, cx| this.body_row(index, window, cx)),
         )
         .size_full();
+        let accent = colors.accent;
 
         area.child(
             div()
                 .id("review-body")
-                .role(Role::Group)
+                .role(Role::List)
                 .aria_label("Diff")
                 .key_context(REVIEW_BODY_CONTEXT)
                 .track_focus(&self.body_focus)
+                .focus_visible(move |style| focus_ring(style, accent))
                 .on_action(cx.listener(|this, _: &PreviousLine, _, cx| this.move_cursor(-1, cx)))
                 .on_action(cx.listener(|this, _: &NextLine, _, cx| this.move_cursor(1, cx)))
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                    if let Some(side) = comments::side_of_key(&event.keystroke) {
+                        this.switch_side(side, cx);
+                        cx.stop_propagation();
+                    }
+                }))
                 .size_full()
                 .child(rows),
         )
         .into_any_element()
     }
 
-    fn body_row(&mut self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+    /// The message that stands in for the diff. It holds the body's focus, so the keyboard
+    /// has a drawn target while the diff loads or is empty.
+    fn empty_body(&self, message: &'static str, colors: &ThemeColors) -> Stateful<Div> {
+        let accent = colors.accent;
+
+        centered(message)
+            .id("review-body")
+            .debug_selector(|| "review-empty".to_owned())
+            .role(Role::Group)
+            .aria_label(message)
+            .track_focus(&self.body_focus)
+            .focus_visible(move |style| focus_ring(style, accent))
+    }
+
+    /// The line cursor, while the diff holds focus. Its ring goes away with the focus.
+    fn shown_cursor(&self, window: &Window, cx: &App) -> Option<LinePos> {
+        self.cursor
+            .as_ref()
+            .filter(|_| self.body_focus.contains_focused(window, cx))
+            .map(|cursor| cursor.pos)
+    }
+
+    fn body_row(&mut self, index: usize, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let body = Rc::clone(&self.body);
         let Some(row) = body.rows.get(index).copied() else {
             return div().into_any_element();
@@ -1391,7 +1500,7 @@ impl ReviewView {
             return div().into_any_element();
         };
 
-        let cursor = self.cursor.as_ref().map(|cursor| cursor.pos);
+        let cursor = self.shown_cursor(window, cx);
         let view = cx.entity();
         let line_ctx = |file: u32, hunk: u32, line: u32| LineCtx {
             view: view.clone(),
@@ -1478,12 +1587,12 @@ impl ReviewView {
         let fold = data.fold.map(fold_label);
         let comments = self.open_counts.get(file).copied().unwrap_or(0);
 
-        let summary = format!(
-            "{}, {}, {}{}",
-            info.path,
-            plural(data.additions, "addition", "additions"),
-            plural(data.deletions, "deletion", "deletions"),
-            fold.map_or_else(String::new, |fold| format!(", {fold}"))
+        let summary = header_label(
+            &info.path,
+            data,
+            agent.as_ref().map(|agent| agent.name.as_ref()),
+            comments,
+            fold,
         );
 
         let tag = match data.change {
@@ -1804,14 +1913,19 @@ fn number_cell(number: u32, right_padding: f32, colors: &ThemeColors) -> Div {
 
 /// What a screen reader says for a line: "Line 85, added, let cell = …".
 fn line_label(kind: DiffLineKind, number: u32, text: &str) -> String {
-    let word = match kind {
-        DiffLineKind::Context => "unchanged",
-        DiffLineKind::Added => "added",
-        DiffLineKind::Deleted => "deleted",
-        DiffLineKind::NoNewline => return NO_NEWLINE.to_owned(),
-    };
+    match kind_word(kind) {
+        Some(word) => format!("Line {number}, {word}, {text}"),
+        None => NO_NEWLINE.to_owned(),
+    }
+}
 
-    format!("Line {number}, {word}, {text}")
+fn kind_word(kind: DiffLineKind) -> Option<&'static str> {
+    match kind {
+        DiffLineKind::Context => Some("unchanged"),
+        DiffLineKind::Added => Some("added"),
+        DiffLineKind::Deleted => Some("deleted"),
+        DiffLineKind::NoNewline => None,
+    }
 }
 
 /// What a line row needs to take part in comments.
@@ -1844,6 +1958,21 @@ fn cursor_ring<E: Styled>(mut element: E, colors: &ThemeColors) -> E {
     element
 }
 
+fn side_word(side: DiffSide) -> &'static str {
+    match side {
+        DiffSide::Old => "old",
+        DiffSide::New => "new",
+    }
+}
+
+fn select_label(side: DiffSide, number: u32) -> String {
+    format!("Select {} line {number}", side_word(side))
+}
+
+fn comment_label(side: DiffSide, number: u32) -> String {
+    format!("Comment on {} line {number}", side_word(side))
+}
+
 /// A line number that moves the line cursor to its line when clicked.
 fn pick_cell(
     id: (&'static str, usize),
@@ -1860,7 +1989,7 @@ fn pick_cell(
         .id(id)
         .debug_selector(move || format!("{}-{}", id.0, id.1))
         .role(Role::Button)
-        .aria_label(format!("Select line {number}"))
+        .aria_label(select_label(side, number))
         .cursor_pointer()
         .on_click(move |_, window, cx| {
             let handle = view.read(cx).body_focus.clone();
@@ -1886,7 +2015,7 @@ fn add_button(
         .left(px(2.))
         .top(px(-1.5))
         .child(
-            IconButton::new(id, IconName::Plus, format!("Comment on line {number}"))
+            IconButton::new(id, IconName::Plus, comment_label(side, number))
                 .debug_selector(move || format!("{}-{}", id.0, id.1))
                 .reveal_with_group(group.clone())
                 .skip_tab_stop()
@@ -1997,12 +2126,9 @@ fn pair_label(
 ) -> (String, bool) {
     let describe = |side: Option<Side>, word: &str| {
         side.and_then(|side| {
-            hunk_line(diff, file, hunk, side.line).map(|line| {
-                if line.kind == DiffLineKind::NoNewline {
-                    format!("{word}: {NO_NEWLINE}")
-                } else {
-                    format!("{word} {}: {}", side.number, line.text)
-                }
+            hunk_line(diff, file, hunk, side.line).map(|line| match kind_word(line.kind) {
+                Some(kind) => format!("{word} {}, {kind}: {}", side.number, line.text),
+                None => format!("{word}: {NO_NEWLINE}"),
             })
         })
     };
@@ -2587,6 +2713,23 @@ mod tests {
         review.read_with(cx, |review, _| review.tree_cursor_row())
     }
 
+    #[gpui::test]
+    fn home_and_end_move_the_tree_cursor_to_the_first_and_last_row(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = open_review(&workspace, cx);
+        focus_tree(&review, cx);
+        put_cursor(&review, 2, cx);
+        let rows = review.read_with(cx, |review, _| review.tree_rows().len());
+
+        cx.simulate_keystrokes("end");
+        let last = cursor_row(&review, cx);
+        cx.simulate_keystrokes("home");
+        let first = cursor_row(&review, cx);
+
+        assert_eq!(last, Some(rows - 1));
+        assert_eq!(first, Some(0));
+    }
+
     fn row_named(review: &Entity<ReviewView>, name: &str, cx: &VisualTestContext) -> usize {
         review.read_with(cx, |review, _| {
             review
@@ -3103,6 +3246,256 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(first, back);
         assert_eq!(viewed, 1);
+    }
+
+    #[gpui::test]
+    fn down_after_j_stays_on_the_new_file(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = open_review(&workspace, cx);
+
+        cx.simulate_keystrokes("down");
+        cx.simulate_keystrokes("j");
+        cx.simulate_keystrokes("down");
+
+        let (selected, cursor) = review.read_with(cx, |review, _| {
+            (
+                review.selected_file(),
+                review.cursor_pos().map(|pos| pos.file as usize),
+            )
+        });
+
+        assert!(selected.is_some());
+        assert_eq!(cursor, selected);
+    }
+
+    fn node_of_element(element: impl IntoElement) -> gpui::accesskit::Node {
+        use gpui::Element as _;
+
+        let element = element.into_element();
+        let mut node = gpui::accesskit::Node::new(element.a11y_role().unwrap_or(Role::Unknown));
+
+        element.write_a11y_info(&mut node);
+
+        node
+    }
+
+    #[gpui::test]
+    fn the_review_controls_carry_their_names(cx: &mut TestAppContext) {
+        use gpui::RenderOnce as _;
+
+        let (workspace, cx) = setup(cx);
+        open_review(&workspace, cx);
+        let colors = cx.update(|_, cx| cx.theme().colors().clone());
+
+        let progress = node_of_element(progress_bar(1, 4, &colors));
+        let approve = cx.update(|window, cx| {
+            let button = next_step_button(false, true, PrOffer::None, workspace.downgrade());
+
+            node_of_element(button.render(window, cx))
+        });
+
+        assert_eq!(progress.label(), Some("1 of 4 files viewed"));
+        assert_eq!(approve.label(), Some("Approve"));
+        assert_eq!(approve.role(), Role::Button);
+    }
+
+    #[gpui::test]
+    fn the_progress_bar_has_a_value_between_a_minimum_and_a_maximum(cx: &mut TestAppContext) {
+        let (_workspace, cx) = setup(cx);
+        let colors = cx.update(|_, cx| cx.theme().colors().clone());
+
+        let node = node_of_element(progress_bar(3, 8, &colors));
+
+        assert_eq!(node.role(), Role::ProgressIndicator);
+        assert_eq!(node.numeric_value(), Some(3.));
+        assert_eq!(node.min_numeric_value(), Some(0.));
+        assert_eq!(node.max_numeric_value(), Some(8.));
+    }
+
+    #[test]
+    fn request_changes_reads_the_count_as_comments() {
+        assert_eq!(
+            request_changes_labels(2),
+            (
+                "Request changes \u{b7} 2".to_owned(),
+                "Request changes, 2 comments".to_owned()
+            )
+        );
+        assert_eq!(request_changes_labels(1).1, "Request changes, 1 comment");
+        assert_eq!(request_changes_labels(0).1, "Request changes");
+    }
+
+    fn file_diff(change: FileChange) -> FileDiff {
+        FileDiff {
+            worktree: PathBuf::from("/w"),
+            path: PathBuf::from("src/a.rs"),
+            agent: None,
+            change,
+            mode_change: None,
+            additions: 3,
+            deletions: 1,
+            binary: false,
+            hunks: Vec::new(),
+            truncated: false,
+            digest: 0,
+            fold: None,
+        }
+    }
+
+    #[test]
+    fn a_file_header_names_the_change_the_agent_and_the_comments() {
+        let added = header_label(
+            "src/a.rs",
+            &file_diff(FileChange::Added),
+            Some("pty-io"),
+            2,
+            None,
+        );
+        let deleted = header_label("src/a.rs", &file_diff(FileChange::Deleted), None, 0, None);
+        let plain = header_label("src/a.rs", &file_diff(FileChange::Modified), None, 0, None);
+
+        assert_eq!(
+            added,
+            "src/a.rs, Added, 3 additions, 1 deletion, by pty-io, 2 comments"
+        );
+        assert_eq!(deleted, "src/a.rs, Deleted, 3 additions, 1 deletion");
+        assert_eq!(plain, "src/a.rs, 3 additions, 1 deletion");
+    }
+
+    #[test]
+    fn the_two_gutter_buttons_of_a_line_say_what_they_do() {
+        assert_eq!(select_label(DiffSide::Old, 12), "Select old line 12");
+        assert_eq!(comment_label(DiffSide::Old, 12), "Comment on old line 12");
+        assert_ne!(
+            select_label(DiffSide::New, 12),
+            comment_label(DiffSide::New, 12)
+        );
+        assert_ne!(
+            select_label(DiffSide::Old, 12),
+            select_label(DiffSide::New, 12)
+        );
+    }
+
+    #[gpui::test]
+    fn the_cursor_ring_shows_only_while_the_diff_has_focus(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = open_review(&workspace, cx);
+
+        cx.simulate_keystrokes("down");
+        let in_diff = cx.update(|window, cx| review.read(cx).shown_cursor(window, cx));
+        focus_tree(&review, cx);
+        let in_tree = cx.update(|window, cx| review.read(cx).shown_cursor(window, cx));
+
+        assert!(in_diff.is_some());
+        assert!(in_tree.is_none());
+    }
+
+    #[gpui::test]
+    fn the_diff_holds_focus_when_review_opens(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = open_review(&workspace, cx);
+        let body = review.read_with(cx, |review, _| review.body_focus().clone());
+
+        assert!(focused(&body, cx));
+        assert!(cx.debug_bounds("review-progress").is_some());
+    }
+
+    #[gpui::test]
+    fn an_empty_review_still_draws_the_diff_focus_target(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = open_review(&workspace, cx);
+
+        review.update(cx, ReviewView::clear);
+        redraw(cx);
+
+        assert!(
+            cx.debug_bounds("review-empty").is_some() || cx.debug_bounds("review-body").is_some()
+        );
+    }
+
+    #[gpui::test]
+    fn alt_arrows_switch_the_side_of_the_split_cursor(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = open_review(&workspace, cx);
+        review.update(cx, |review, cx| review.set_style(DiffStyle::Split, cx));
+        redraw(cx);
+
+        cx.simulate_keystrokes("down");
+        cx.simulate_keystrokes("alt-right");
+        let right = review.read_with(cx, |review, _| review.cursor_pos().map(|pos| pos.side));
+        cx.simulate_keystrokes("alt-left");
+        let left = review.read_with(cx, |review, _| review.cursor_pos().map(|pos| pos.side));
+
+        assert_eq!(right, Some(DiffSide::New));
+        assert_eq!(left, Some(DiffSide::Old));
+    }
+
+    #[gpui::test]
+    fn resolving_a_thread_moves_focus_to_its_folded_card(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = thread_three(&workspace, cx);
+        let card = review.update(cx, |review, cx| review.folded_focus(CommentId(3), cx));
+
+        click("comment-resolve-3", cx);
+        redraw(cx);
+
+        assert!(focused(&card, cx));
+    }
+
+    #[gpui::test]
+    fn folding_a_thread_moves_focus_to_its_folded_card(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = thread_three(&workspace, cx);
+        let card = review.update(cx, |review, cx| review.folded_focus(CommentId(3), cx));
+        click("comment-resolve-3", cx);
+        click("comment-folded-3", cx);
+
+        click("comment-fold-3", cx);
+        redraw(cx);
+
+        assert!(focused(&card, cx));
+    }
+
+    #[gpui::test]
+    fn deleting_a_comment_does_not_drop_focus_to_the_window(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = thread_three(&workspace, cx);
+        change_comment(
+            &workspace,
+            CommentId(3),
+            |comment| {
+                comment.state = swarm_protocol::CommentState::Pending;
+                comment.sent_at = None;
+                comment.delivered_at = None;
+            },
+            cx,
+        );
+
+        click("comment-delete-3", cx);
+        redraw(cx);
+
+        let landed = cx.update(|window, cx| {
+            let body = review.read(cx).body_focus().clone();
+
+            window.focused(cx).is_some() && body.contains_focused(window, cx)
+        });
+        assert!(landed);
+    }
+
+    #[gpui::test]
+    fn removing_the_filter_chip_moves_focus_to_the_file_tree(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let pty_io = agent_named(&workspace, "pty-io", cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.view_file_diff(pty_io, PathBuf::from("crates/swarm-term/src/pty.rs"), cx);
+        });
+        redraw(cx);
+        let review = workspace.read_with(cx, |workspace, _| workspace.review.clone());
+        let tree = review.read_with(cx, |review, _| review.tree_focus().clone());
+
+        click("review-filter", cx);
+
+        assert!(focused(&tree, cx));
     }
 
     #[gpui::test]
@@ -5128,7 +5521,11 @@ mod tests {
             old_label
                 .is_some_and(|label| label.starts_with(&format!("Line {}, unchanged", numbers.0)))
         );
-        assert!(none_label.is_some_and(|label| label.starts_with("Old line")));
+        assert!(
+            none_label
+                .as_deref()
+                .is_some_and(|label| label.starts_with("Old line") && label.contains("unchanged"))
+        );
     }
 
     #[test]

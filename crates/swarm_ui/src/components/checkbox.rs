@@ -5,6 +5,7 @@ use gpui::{
     div, px,
 };
 
+use crate::a11y::{accessible, ignore_press, track_focus_off_tab};
 use crate::component::{Component, example, example_group};
 use crate::prelude::*;
 use crate::styles::{filled_focus_ring, focus_ring};
@@ -73,11 +74,12 @@ impl Disableable for Checkbox {
 impl RenderOnce for Checkbox {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let focus_handle = window
-            .use_keyed_state((self.id.clone(), "focus"), cx, |_, cx| cx.focus_handle())
+            .use_keyed_state((self.id.clone(), "focus"), cx, |_, cx| {
+                cx.focus_handle().tab_stop(true)
+            })
             .read(cx)
             .clone();
-        let ring =
-            !self.disabled && focus_handle.is_focused(window) && window.last_input_was_keyboard();
+        let ring = focus_handle.is_focused(window) && window.last_input_was_keyboard();
 
         let colors = cx.theme().colors();
         let (accent, ground) = (colors.accent, colors.ground);
@@ -112,10 +114,8 @@ impl RenderOnce for Checkbox {
                 square
             });
 
-        div()
-            .id(self.id)
-            .role(Role::CheckBox)
-            .aria_label(self.label.clone())
+        let disabled = self.disabled;
+        accessible(div().id(self.id), Role::CheckBox, self.label.clone())
             .aria_toggled(if checked {
                 Toggled::True
             } else {
@@ -130,17 +130,19 @@ impl RenderOnce for Checkbox {
                 row.child(Label::new(self.display_label.unwrap_or(self.label)))
             })
             .map(|row| {
-                if self.disabled {
-                    row.opacity(0.5)
+                if disabled {
+                    ignore_press(track_focus_off_tab(row, &focus_handle).opacity(0.5))
                 } else {
-                    row.track_focus(&focus_handle)
-                        .tab_stop(true)
-                        .cursor_pointer()
-                        .when_some(self.on_toggle, |row, handler| {
+                    row.track_focus(&focus_handle).cursor_pointer().when_some(
+                        self.on_toggle,
+                        |row, handler| {
                             row.on_click(move |_, window, cx| handler(!checked, window, cx))
-                        })
+                        },
+                    )
                 }
             })
+            .a11y_flags()
+            .disabled(disabled)
     }
 }
 

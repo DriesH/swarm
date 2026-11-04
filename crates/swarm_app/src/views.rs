@@ -2,8 +2,8 @@
 
 use gpui::{
     AnyElement, AppContext as _, Bounds, Context, Div, Entity, FontWeight, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Role, SharedString, Size, Stateful,
-    Subscription, Window, div, px,
+    MouseButton, MouseDownEvent, MouseMoveEvent, Orientation, Pixels, Role, SharedString, Size,
+    Stateful, Subscription, Window, div, px,
 };
 use swarm_layout::{Activity, Layout, LayoutStyle, Rect, TileId, TileKind, TileSpec};
 use swarm_term_view::TerminalView;
@@ -85,6 +85,7 @@ fn empty_state(workspace: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
         .child(Label::new("No projects").color(Color::Faint))
         .child(
             Button::new("empty-add-project", "Add project")
+                .track_focus(&workspace.add_project_focus)
                 .debug_selector(|| "empty-add-project".to_owned())
                 .icon(IconName::Plus)
                 .disabled(!live)
@@ -182,6 +183,15 @@ fn process_activity(terminal: &Terminal) -> Activity {
         Activity::Attention
     } else {
         Activity::Running
+    }
+}
+
+/// What a process terminal is doing: running, ended well, or ended with a failure.
+pub(crate) fn process_status(terminal: &Terminal) -> AgentStatus {
+    match &terminal.exit {
+        None => AgentStatus::Working,
+        Some(exit) if exit_failed(exit) => AgentStatus::Error,
+        Some(_) => AgentStatus::Done,
     }
 }
 
@@ -483,7 +493,7 @@ impl Workspace {
         self.minimized.remove(&terminal);
         self.forget_recent_focus(terminal);
         if self.focused_terminal == Some(terminal) {
-            self.focused_terminal = None;
+            self.focused_terminal = self.neighbor_tile(terminal);
         }
 
         cx.notify();
@@ -505,6 +515,31 @@ impl Workspace {
             });
 
         size.max(&MIN_TILE)
+    }
+
+    /// The number of a user terminal among the user terminals of its task, from 1.
+    pub(crate) fn user_terminal_number(&self, terminal: TerminalId) -> usize {
+        self.data
+            .tasks
+            .iter()
+            .find_map(|task| task.user_terminals.iter().position(|id| *id == terminal))
+            .map_or(1, |position| position + 1)
+    }
+
+    /// The tile beside `terminal` in the layout: the one after it, else the one before it.
+    /// Focus moves there when the tile goes away.
+    pub(crate) fn neighbor_tile(&self, terminal: TerminalId) -> Option<TerminalId> {
+        let placed = &self.layout.placed;
+        let position = placed.iter().position(|(tile, _)| tile.0 == terminal.0)?;
+
+        placed
+            .get(position + 1)
+            .or_else(|| {
+                position
+                    .checked_sub(1)
+                    .and_then(|before| placed.get(before))
+            })
+            .map(|(tile, _)| TerminalId(tile.0))
     }
 
     /// Opens a real terminal once the app has reached a daemon, else a fake one.
@@ -564,10 +599,19 @@ impl Workspace {
         self.minimized.remove(&terminal);
         self.forget_recent_focus(terminal);
         if self.focused_terminal == Some(terminal) {
-            self.focused_terminal = None;
+            self.focused_terminal = self.neighbor_tile(terminal);
         }
 
         cx.notify();
+    }
+
+    /// The biggest a user terminal tile grows.
+    fn largest_user_tile(&self) -> Size<Pixels> {
+        self.terminal_area_size()
+            .map_or(FIRST_FRAME_AREA, |area| Size {
+                width: area.width - px(20.),
+                height: area.height - px(20.),
+            })
     }
 
     pub(crate) fn resize_user_terminal(
@@ -576,13 +620,7 @@ impl Workspace {
         size: Size<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        let largest = self
-            .terminal_area_size()
-            .map_or(FIRST_FRAME_AREA, |area| Size {
-                width: area.width - px(20.),
-                height: area.height - px(20.),
-            });
-        let size = size.min(&largest).max(&MIN_TILE);
+        let size = size.min(&self.largest_user_tile()).max(&MIN_TILE);
 
         if self.user_sizes.get(&terminal) != Some(&size) {
             self.user_sizes.insert(terminal, size);
@@ -763,8 +801,19 @@ fn tile(
         .resizing
         .filter(|resizing| resizing.terminal == id);
     // A Start tab keeps its terminals at the height of the band: a handle would fight it.
-    let handle = (terminal.kind == TerminalKind::User && !workspace.active_task().is_start)
-        .then(|| resize_handle(id, resizing.is_some(), cx));
+    let handle =
+        (terminal.kind == TerminalKind::User && !workspace.active_task().is_start).then(|| {
+            let label = format!(
+                "Resize your terminal {}",
+                workspace.user_terminal_number(id)
+            );
+            let range = (
+                f32::from(MIN_TILE.height),
+                f32::from(workspace.largest_user_tile().height),
+            );
+
+            resize_handle(id, &label, size.height, range, resizing.is_some(), cx).into_any_element()
+        });
     let badge = resizing.map(|_| size_badge(size, workspace.cell_size, cx));
 
     Some(
@@ -859,7 +908,7 @@ fn agent_frame(
     }
 
     if terminal.kind == TerminalKind::Process {
-        frame = frame.accessible_label(format!("{name} process terminal"));
+        frame = frame.accessible_label(process_tile_label(terminal));
     }
     if let Some(meta) = meta {
         frame = frame.meta(meta);
@@ -876,7 +925,7 @@ fn agent_frame(
     frame = match (terminal.kind, agent) {
         (TerminalKind::Orchestrator, Some(agent)) => frame.status_ring(agent.status),
         (_, Some(agent)) => frame.status(agent.status),
-        (_, None) if terminal.link.is_none() => frame.status(AgentStatus::Working),
+        (_, None) if terminal.link.is_none() => frame.status(process_status(terminal)),
         (_, None) => frame,
     };
 
@@ -919,9 +968,9 @@ fn live_process_frame(
     let name = terminal.title.clone();
 
     let mut frame = TileFrame::new(("tile", id.0), IconName::Terminal, name.clone())
-        .accessible_label(format!("{name} process terminal"))
+        .accessible_label(process_tile_label(terminal))
         .focused(workspace.focused_terminal == Some(id))
-        .status(AgentStatus::Working);
+        .status(process_status(terminal));
 
     if let Some(meta) = terminal.meta.clone() {
         frame = frame.meta(meta);
@@ -947,6 +996,15 @@ fn live_process_frame(
     }
 }
 
+/// What VoiceOver reads for the tile of a process terminal: its name and how it is doing.
+fn process_tile_label(terminal: &Terminal) -> String {
+    format!(
+        "{} process terminal, {}",
+        terminal.title,
+        process_status(terminal).label().to_lowercase()
+    )
+}
+
 /// What the mark on a user terminal's tile says, and what a screen reader starts with.
 const MINE: &str = "Mine";
 
@@ -970,6 +1028,22 @@ fn mine_mark(id: TerminalId) -> Stateful<Div> {
         )
 }
 
+/// What VoiceOver reads for the tile of a user terminal: its number among the user terminals
+/// of the task, its name, and "disconnected" when the daemon connection is gone.
+fn user_tile_label(workspace: &Workspace, terminal: &Terminal) -> String {
+    let disconnected = if workspace.disconnected.contains(&terminal.id) {
+        ", disconnected"
+    } else {
+        ""
+    };
+
+    format!(
+        "Your terminal {}, {}{disconnected}",
+        workspace.user_terminal_number(terminal.id),
+        terminal.title
+    )
+}
+
 fn user_frame(
     workspace: &Workspace,
     terminal: &Terminal,
@@ -979,7 +1053,7 @@ fn user_frame(
     let focused = workspace.focused_terminal == Some(id);
 
     let mut frame = TileFrame::new(("tile", id.0), IconName::Terminal, terminal.title.clone())
-        .accessible_label(format!("Your terminal, {}", terminal.title))
+        .accessible_label(user_tile_label(workspace, terminal))
         .ring(TileRing::Fg)
         .focused(focused)
         .name_suffix(mine_mark(id));
@@ -1027,15 +1101,30 @@ fn user_frame(
     }
 }
 
-fn resize_handle(id: TerminalId, dragging: bool, cx: &mut Context<Workspace>) -> AnyElement {
+/// The handle on the bottom edge of a user terminal's tile. It reads its height in pixels
+/// between `range`, and the arrow keys change it.
+fn resize_handle(
+    id: TerminalId,
+    label: &str,
+    height: Pixels,
+    range: (f32, f32),
+    dragging: bool,
+    cx: &mut Context<Workspace>,
+) -> Stateful<Div> {
     let colors = cx.theme().colors();
     let (accent, ground) = (colors.accent, colors.ground);
+    let height = f32::from(height);
 
     div()
         .id(("resize", id.0))
         .debug_selector(move || format!("resize-{}", id.0))
         .role(Role::Splitter)
-        .aria_label("Resize your terminal")
+        .aria_label(label.to_owned())
+        .aria_orientation(Orientation::Horizontal)
+        .aria_value(format!("{} pixels", height.round()))
+        .aria_numeric_value(f64::from(height))
+        .aria_min_numeric_value(f64::from(range.0))
+        .aria_max_numeric_value(f64::from(range.1))
         .focusable()
         .tab_stop(true)
         .absolute()
@@ -1066,7 +1155,6 @@ fn resize_handle(id: TerminalId, dragging: bool, cx: &mut Context<Workspace>) ->
         .when(dragging, |handle| {
             handle.child(div().w(px(36.)).h(px(4.)).rounded(px(2.)).bg(ground))
         })
-        .into_any_element()
 }
 
 fn size_badge(size: Size<Pixels>, cell: Option<(f32, f32)>, cx: &Context<Workspace>) -> AnyElement {
@@ -2150,6 +2238,113 @@ mod tests {
 
         assert_eq!(element.a11y_role(), Some(AccessRole::Group));
         assert_eq!(node.label(), Some("Mine, agents have no access"));
+    }
+
+    fn process_with_exit(exit: Option<ExitStatus>) -> Terminal {
+        Terminal {
+            id: TerminalId(1),
+            kind: TerminalKind::Process,
+            title: "cargo watch".into(),
+            meta: None,
+            owner: None,
+            daemon_owner: None,
+            link: None,
+            exit,
+            lines: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_process_that_failed_is_in_error_and_one_that_ended_well_is_done() {
+        let status = |exit| process_status(&process_with_exit(exit));
+
+        assert_eq!(status(None), AgentStatus::Working);
+        assert_eq!(status(Some(ExitStatus::Code(0))), AgentStatus::Done);
+        assert_eq!(status(Some(ExitStatus::Code(101))), AgentStatus::Error);
+        assert_eq!(
+            status(Some(ExitStatus::Signal("SIGKILL".to_owned()))),
+            AgentStatus::Error
+        );
+    }
+
+    #[test]
+    fn the_tile_of_a_failed_process_says_so() {
+        let label = process_tile_label(&process_with_exit(Some(ExitStatus::Code(101))));
+
+        assert_eq!(label, "cargo watch process terminal, error");
+    }
+
+    #[gpui::test]
+    fn user_terminals_are_numbered_so_no_two_labels_match(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        cx.dispatch_action(NewTerminal);
+        cx.dispatch_action(NewTerminal);
+        redraw(cx);
+
+        let labels = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .active_task()
+                .user_terminals
+                .iter()
+                .filter_map(|id| workspace.data.terminal(*id))
+                .map(|terminal| user_tile_label(workspace, terminal))
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(labels, ["Your terminal 1, zsh", "Your terminal 2, zsh"]);
+    }
+
+    #[gpui::test]
+    fn the_tile_of_a_disconnected_user_terminal_says_so(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        cx.dispatch_action(NewTerminal);
+        redraw(cx);
+
+        let label = workspace.update(cx, |workspace, _| {
+            let id = *workspace
+                .active_task()
+                .user_terminals
+                .last()
+                .expect("a user terminal");
+            workspace.disconnected.insert(id);
+            let terminal = workspace.data.terminal(id).expect("the terminal");
+
+            user_tile_label(workspace, terminal)
+        });
+
+        assert_eq!(label, "Your terminal 1, zsh, disconnected");
+    }
+
+    #[gpui::test]
+    fn the_resize_handle_reads_its_height_and_names_its_terminal(cx: &mut TestAppContext) {
+        use gpui::Element as _;
+        use gpui::accesskit::{Node, Orientation as AccessOrientation, Role as AccessRole};
+
+        let (workspace, _) = setup(cx);
+
+        let (role, node) = workspace.update(cx, |_, cx| {
+            let element = resize_handle(
+                TerminalId(14),
+                "Resize your terminal 2",
+                px(300.),
+                (160., 780.),
+                false,
+                cx,
+            )
+            .into_element();
+            let mut node = Node::new(AccessRole::Unknown);
+            element.write_a11y_info(&mut node);
+
+            (element.a11y_role(), node)
+        });
+
+        assert_eq!(role, Some(AccessRole::Splitter));
+        assert_eq!(node.label(), Some("Resize your terminal 2"));
+        assert_eq!(node.value(), Some("300 pixels"));
+        assert_eq!(node.numeric_value(), Some(300.));
+        assert_eq!(node.min_numeric_value(), Some(160.));
+        assert_eq!(node.max_numeric_value(), Some(780.));
+        assert_eq!(node.orientation(), Some(AccessOrientation::Horizontal));
     }
 
     #[gpui::test]

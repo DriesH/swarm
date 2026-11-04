@@ -6,13 +6,14 @@ use std::rc::Rc;
 
 use gpui::{
     AnyElement, ClickEvent, Context, Entity, FocusHandle, FontWeight, Role, ScrollStrategy,
-    SharedString, UniformListScrollHandle, WeakEntity, Window, div, px, uniform_list,
+    SharedString, Subscription, UniformListScrollHandle, WeakEntity, Window, div, px, uniform_list,
 };
 use swarm_protocol::{ReviewSource, TaskDiff};
 use swarm_ui::prelude::*;
 
 use crate::actions::{
-    FILE_TREE_CONTEXT, TreeActivate, TreeCollapse, TreeExpand, TreeNext, TreePrevious,
+    FILE_TREE_CONTEXT, TreeActivate, TreeCollapse, TreeExpand, TreeFirst, TreeLast, TreeNext,
+    TreePrevious,
 };
 use crate::file_tree::{self, Entry, EntryKind, Key, Mark, Move};
 use crate::model::{FileMark, TaskId, TreeEntry};
@@ -424,6 +425,8 @@ impl Render for ChangesList {
             .on_action(cx.listener(|this, _: &TreeExpand, _, cx| {
                 this.move_cursor(Key::Right, cx);
             }))
+            .on_action(cx.listener(|this, _: &TreeFirst, _, cx| this.move_cursor(Key::First, cx)))
+            .on_action(cx.listener(|this, _: &TreeLast, _, cx| this.move_cursor(Key::Last, cx)))
             .on_action(cx.listener(|this, _: &TreeActivate, _, cx| {
                 if let Some(row) = this.cursor_row() {
                     this.activate_row(row, cx);
@@ -476,10 +479,83 @@ fn visible_rows(tree: &[TreeEntry]) -> Vec<usize> {
     rows
 }
 
-fn files(workspace: &Workspace, window: &mut Window, cx: &mut Context<Workspace>) -> AnyElement {
-    let colors = cx.theme().colors();
-    let (line, raised) = (colors.line, colors.raised);
+/// Rows to show for a filter. A match keeps the folders above it, open or not.
+fn matching_rows(tree: &[TreeEntry], query: &str) -> Vec<usize> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return visible_rows(tree);
+    }
 
+    let mut shown = vec![false; tree.len()];
+
+    for (index, entry) in tree.iter().enumerate() {
+        if entry.is_dir || !entry.path.to_lowercase().contains(&query) {
+            continue;
+        }
+
+        if let Some(slot) = shown.get_mut(index) {
+            *slot = true;
+        }
+
+        let mut depth = entry.depth;
+        for (above, parent) in tree.iter().enumerate().take(index).rev() {
+            if depth == 0 {
+                break;
+            }
+            if parent.is_dir && parent.depth < depth {
+                depth = parent.depth;
+                if let Some(slot) = shown.get_mut(above) {
+                    *slot = true;
+                }
+            }
+        }
+    }
+
+    (0..tree.len())
+        .filter(|index| shown.get(*index) == Some(&true))
+        .collect()
+}
+
+/// The row's spoken name: the mark is a letter and a color on screen.
+fn row_label(name: &SharedString, mark: Option<FileMark>) -> SharedString {
+    match mark {
+        Some(FileMark::Modified) => format!("{name}, Modified").into(),
+        Some(FileMark::Added) => format!("{name}, Added").into(),
+        None => name.clone(),
+    }
+}
+
+/// The search field above the file tree.
+struct FilesFilter {
+    input: Entity<TextInput>,
+    _subscription: Subscription,
+}
+
+impl FilesFilter {
+    fn new(workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
+        let input = cx.new(|cx| {
+            let mut input = TextInput::new(cx);
+            input.set_label("Filter files", cx);
+            input.set_placeholder("Filter files", cx);
+            input
+        });
+
+        let subscription = cx.subscribe(&input, move |_, _, event, cx| {
+            if matches!(event, TextInputEvent::Changed(_))
+                && let Err(error) = workspace.update(cx, |_, cx| cx.notify())
+            {
+                log::debug!("the window closed before the file filter changed: {error}");
+            }
+        });
+
+        Self {
+            input,
+            _subscription: subscription,
+        }
+    }
+}
+
+fn files(workspace: &Workspace, window: &mut Window, cx: &mut Context<Workspace>) -> AnyElement {
     let tree = &workspace.data.file_tree;
     let first_modified = tree
         .iter()
@@ -488,6 +564,12 @@ fn files(workspace: &Workspace, window: &mut Window, cx: &mut Context<Workspace>
     let selected_state: Entity<usize> =
         window.use_keyed_state("files-selected", cx, |_, _| first_modified);
     let selected = *selected_state.read(cx);
+
+    let weak = cx.entity().downgrade();
+    let filter_state: Entity<FilesFilter> =
+        window.use_keyed_state("files-filter", cx, |_, cx| FilesFilter::new(weak, cx));
+    let input = filter_state.read(cx).input.clone();
+    let query = input.read(cx).text();
 
     let mut list = v_flex()
         .id("file-tree")
@@ -499,7 +581,7 @@ fn files(workspace: &Workspace, window: &mut Window, cx: &mut Context<Workspace>
         .px(px(4.))
         .py(px(4.));
 
-    for index in visible_rows(tree) {
+    for index in matching_rows(tree, &query) {
         let Some(entry) = tree.get(index) else {
             continue;
         };
@@ -530,7 +612,9 @@ fn files(workspace: &Workspace, window: &mut Window, cx: &mut Context<Workspace>
             FileIconName::for_file(&name)
         };
 
+        let label = row_label(&name, entry.mark);
         let row = TreeRow::new(("file", index), name)
+            .accessible_label(label)
             .debug_selector(|| format!("files-row-{index}"))
             .file_icon(file_icon)
             .level(usize::from(entry.depth))
@@ -566,28 +650,12 @@ fn files(workspace: &Workspace, window: &mut Window, cx: &mut Context<Workspace>
         });
     }
 
-    let filter = h_flex()
+    let filter = div()
         .flex_none()
         .mt(px(8.))
         .mx(px(10.))
         .mb(px(4.))
-        .h(px(30.))
-        .px(px(10.))
-        .gap(px(8.))
-        .rounded(px(7.))
-        .border_1()
-        .border_color(line)
-        .bg(raised)
-        .child(
-            Icon::new(IconName::Search)
-                .size(IconSize::Custom(px(13.)))
-                .color(Color::Faint),
-        )
-        .child(
-            Label::new("Filter files")
-                .size(LabelSize::Small)
-                .color(Color::Faint),
-        );
+        .child(input);
 
     v_flex()
         .size_full()
@@ -639,6 +707,49 @@ mod tests {
 
         let view = workspace.read_with(cx, |workspace, _| workspace.view);
         assert_eq!(view, View::Review);
+    }
+
+    #[test]
+    fn a_marked_row_names_its_mark() {
+        let name = SharedString::new("main.rs");
+
+        assert_eq!(
+            row_label(&name, Some(FileMark::Modified)).as_ref(),
+            "main.rs, Modified"
+        );
+        assert_eq!(
+            row_label(&name, Some(FileMark::Added)).as_ref(),
+            "main.rs, Added"
+        );
+        assert_eq!(row_label(&name, None).as_ref(), "main.rs");
+    }
+
+    #[test]
+    fn a_filter_keeps_matches_and_the_folders_above_them() {
+        let data = crate::model::FakeData::sample();
+        let Some(file) = data.file_tree.iter().find(|entry| !entry.is_dir) else {
+            panic!("the sample tree has no file");
+        };
+        let query = file.path.rsplit('/').next().unwrap_or_default();
+
+        let rows = matching_rows(&data.file_tree, query);
+
+        assert!(rows.len() < data.file_tree.len());
+        assert!(rows.iter().any(|index| {
+            data.file_tree
+                .get(*index)
+                .is_some_and(|entry| entry.path == file.path)
+        }));
+    }
+
+    #[test]
+    fn an_empty_filter_shows_the_visible_rows() {
+        let data = crate::model::FakeData::sample();
+
+        assert_eq!(
+            matching_rows(&data.file_tree, "  "),
+            visible_rows(&data.file_tree)
+        );
     }
 
     #[test]

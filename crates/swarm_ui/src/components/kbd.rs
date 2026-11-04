@@ -56,7 +56,8 @@ impl RenderOnce for Kbd {
         h_flex()
             .id(self.id)
             .role(Role::Label)
-            .aria_label(spoken)
+            .aria_label(spoken.clone())
+            .aria_value(spoken)
             .flex_none()
             .gap(px(3.))
             .children(self.keys.into_iter().map(|key| {

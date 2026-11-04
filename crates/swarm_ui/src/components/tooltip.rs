@@ -1,6 +1,6 @@
 use gpui::{
-    AnyElement, AnyView, App, BoxShadow, Context, Render, Role, SharedString, Window, black, div,
-    point, px,
+    AnyElement, AnyView, App, BoxShadow, Context, Render, Role, SharedString, Window, div, point,
+    px,
 };
 
 use crate::component::{Component, example, example_group};
@@ -40,7 +40,7 @@ impl Render for Tooltip {
             .font_family(MONO_FONT)
             .text_size(px(11.))
             .shadow(vec![BoxShadow {
-                color: black().opacity(0.28),
+                color: colors.shadow,
                 offset: point(px(0.), px(6.)),
                 blur_radius: px(16.),
                 spread_radius: px(0.),

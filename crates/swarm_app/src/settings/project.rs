@@ -1363,6 +1363,7 @@ impl SettingsWindow {
         project: usize,
         list: List,
         index: usize,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if let Some(inputs) = self.inputs.projects.get_mut(project)
@@ -1374,6 +1375,18 @@ impl SettingsWindow {
         self.name_rows(project, list, cx);
         self.state
             .update(cx, |state, cx| state.remove_item(project, list, index, cx));
+
+        // The remove button is gone: focus the row that took its place, or the last one.
+        let neighbour = self.inputs.projects.get(project).and_then(|inputs| {
+            let rows = inputs.list(list);
+
+            rows.get(index).or(rows.last())
+        });
+        let target = neighbour.map_or_else(
+            || self.remove_focus.clone(),
+            |row| row.input.focus_handle(cx),
+        );
+        window.focus(&target, cx);
     }
 
     /// Writes the state of a project into its inputs, and makes them read-only while the
@@ -2474,6 +2487,11 @@ mod tests {
         let folder = rig.project().worktree_folder;
 
         rig.click("reload-config");
+        let focus = rig
+            .window
+            .read_with(&rig.cx, |settings, _| settings.remove_focus.clone())
+            .expect("the settings window is open");
+        let kept_focus = rig.cx.update(|window, _| focus.is_focused(window));
         let ready = rig.wait_for_project(|project| project.load == Load::Ready);
         redraw(&mut rig.cx);
         let after = (
@@ -2481,6 +2499,7 @@ mod tests {
             rig.is_on_screen("config-error"),
         );
 
+        assert!(kept_focus, "focus fell off the Reload button");
         assert_eq!(
             error,
             Load::Unreadable("TOML parse error at line 3, column 1".into())
@@ -2626,6 +2645,66 @@ mod tests {
 
         assert!(asked);
         assert_eq!(run_requests(&seen), [DaemonTaskId(7)]);
+    }
+
+    #[gpui::test]
+    fn the_run_checks_button_keeps_focus_while_the_checks_run(cx: &mut TestAppContext) {
+        let (socket, seen) = daemon(project_reply);
+        let mut rig = rig(&socket, vec![task_info(7, 5, "login")], Vec::new(), cx);
+        rig.show(0);
+        assert!(rig.wait_for_project(|project| project.load == Load::Ready));
+
+        rig.click("run-checks");
+        let button = rig.cx.update(|window, cx| window.focused(cx));
+        assert!(rig.wait_for_requests(&seen, |seen| !run_requests(seen).is_empty()));
+        rig.state.update(&mut rig.cx, |state, cx| {
+            state.projects[0].checking = ChecksStatus::Checking {
+                task: DaemonTaskId(7),
+                requesting: true,
+                run: None,
+            };
+            cx.notify();
+        });
+        rig.window
+            .update(&mut rig.cx, |_, _, cx| cx.notify())
+            .expect("the settings window is open");
+        redraw(&mut rig.cx);
+
+        // A button that stops taking focus sends it to the list.
+        let list = rig
+            .window
+            .read_with(&rig.cx, |settings, _| settings.nav_focus.clone())
+            .expect("the settings window is open");
+        let focused = rig.cx.update(|window, cx| window.focused(cx));
+        assert!(button.as_ref().is_some_and(|focus| !list.contains(focus)));
+        assert_eq!(focused, button);
+    }
+
+    #[gpui::test]
+    fn removing_a_row_moves_focus_to_the_row_that_took_its_place(cx: &mut TestAppContext) {
+        let (mut rig, _seen) = loaded(cx);
+
+        rig.click("copy-remove-0");
+
+        let next = rig.input(|inputs| inputs.copy[0].input.clone());
+        let focus = next.read_with(&rig.cx, Focusable::focus_handle);
+        assert!(rig.cx.update(|window, _| focus.is_focused(window)));
+    }
+
+    #[gpui::test]
+    fn cmd_w_closes_the_window_from_inside_the_remove_dialog(cx: &mut TestAppContext) {
+        let (mut rig, _) = two_projects(cx);
+        rig.show(0);
+        open_remove_dialog(&mut rig);
+
+        rig.cx.simulate_keystrokes("cmd-w");
+
+        let open = rig
+            .cx
+            .windows()
+            .into_iter()
+            .any(|window| window.downcast::<SettingsWindow>().is_some());
+        assert!(!open, "the settings window stayed open");
     }
 
     #[gpui::test]

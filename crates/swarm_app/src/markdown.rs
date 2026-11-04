@@ -5,13 +5,14 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, BorderStyle, Bounds, ElementId, FontStyle, FontWeight, HighlightStyle, Hsla,
-    InteractiveText, Pixels, SharedString, StyledText, UnderlineStyle, canvas, div, point, px,
-    quad, relative,
+    AnyElement, AvailableSpace, BorderStyle, Bounds, ClickEvent, ElementId, FontStyle, FontWeight,
+    HighlightStyle, Hsla, InteractiveText, Pixels, Role, SharedString, StyledText, UnderlineStyle,
+    canvas, div, point, px, quad, relative, size,
 };
 use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 use swarm_ui::fonts::MONO_FONT;
 use swarm_ui::prelude::*;
+use swarm_ui::styles::focus_ring;
 use swarm_ui::{ThemeColors, Tooltip};
 
 /// A folded message draws this many blocks. Ten blocks are always taller than the folded
@@ -464,7 +465,14 @@ fn render_inline(inline: &Inline, id: ElementId, colors: &ThemeColors) -> AnyEle
             .collect();
         let (opened, shown) = (Rc::clone(&inline.links), Rc::clone(&inline.links));
 
-        InteractiveText::new(id, styled)
+        let stops = link_stops(
+            id.clone(),
+            layout.clone(),
+            inline.text.clone(),
+            Rc::clone(&inline.links),
+            colors.accent,
+        );
+        let text = InteractiveText::new(id, styled)
             .on_click(ranges, move |index, _, cx| {
                 if let Some((_, url)) = opened.get(index) {
                     cx.open_url(url);
@@ -472,8 +480,9 @@ fn render_inline(inline: &Inline, id: ElementId, colors: &ThemeColors) -> AnyEle
             })
             .tooltip(move |index, _, cx| {
                 link_at(&shown, index).map(|url| Tooltip::text(url.to_owned(), cx))
-            })
-            .into_any_element()
+            });
+
+        div().relative().child(text).child(stops).into_any_element()
     };
 
     if inline.boxes.is_empty() {
@@ -562,6 +571,70 @@ fn code_lines(layout: &gpui::TextLayout, text: &str, range: &Range<usize>) -> Ve
     }
 
     lines
+}
+
+/// One keyboard stop over each link: it takes focus, shows a ring, and opens the link on
+/// Enter or Space. The mouse is left to the text itself.
+fn link_stops(
+    id: ElementId,
+    layout: gpui::TextLayout,
+    text: SharedString,
+    links: Rc<[(Range<usize>, String)]>,
+    accent: Hsla,
+) -> impl IntoElement {
+    canvas(
+        move |_, window, cx| {
+            let mut stops = Vec::new();
+
+            for (index, (range, url)) in links.iter().enumerate() {
+                let (Some(line), Some(name)) = (
+                    code_lines(&layout, &text, range).into_iter().next(),
+                    text.get(range.clone()),
+                ) else {
+                    continue;
+                };
+                let (width, height) = (line.right - line.left, layout.line_height());
+                let url = url.clone();
+
+                let mut stop = div()
+                    .id((id.clone(), SharedString::from(format!("link-{index}"))))
+                    .role(Role::Link)
+                    .aria_label(name.to_owned())
+                    .focusable()
+                    .tab_stop(true)
+                    .w(width)
+                    .h(height)
+                    .rounded(px(2.))
+                    .focus_visible(move |style| focus_ring(style, accent))
+                    .on_click(move |event, _, cx| {
+                        if matches!(event, ClickEvent::Keyboard(_)) {
+                            cx.open_url(&url);
+                        }
+                    })
+                    .into_any_element();
+
+                stop.prepaint_as_root(
+                    point(line.left, line.top),
+                    size(
+                        AvailableSpace::Definite(width),
+                        AvailableSpace::Definite(height),
+                    ),
+                    window,
+                    cx,
+                );
+                stops.push(stop);
+            }
+
+            stops
+        },
+        |_, mut stops, window, cx| {
+            for stop in &mut stops {
+                stop.paint(window, cx);
+            }
+        },
+    )
+    .absolute()
+    .size_full()
 }
 
 fn paint_code_box(
@@ -825,6 +898,60 @@ mod tests {
         let start = WRAPPED.find(needle).expect("the needle");
 
         code_lines(layout, WRAPPED, &(start..start + needle.len()))
+    }
+
+    struct LinkProbe {
+        markdown: Markdown,
+    }
+
+    impl Render for LinkProbe {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let colors = cx.theme().colors().clone();
+
+            div()
+                .w(px(300.))
+                .child(render(&self.markdown, false, &colors))
+        }
+    }
+
+    /// Draws a message with a link, then moves focus to its first stop.
+    fn focus_the_link(cx: &mut TestAppContext) -> &mut gpui::VisualTestContext {
+        cx.update(swarm_ui::init);
+        let (_, cx) = cx.add_window_view(|_, _| LinkProbe {
+            markdown: parse("Read [the docs](https://example.com/docs) now"),
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(Window::focus_next);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        cx
+    }
+
+    /// A key press: GPUI turns Enter and Space into a click on the key up.
+    fn press(key: &'static str, cx: &mut gpui::VisualTestContext) {
+        cx.simulate_keystrokes(key);
+
+        if let Ok(keystroke) = gpui::Keystroke::parse(key) {
+            cx.simulate_event(gpui::KeyUpEvent { keystroke });
+        }
+    }
+
+    #[gpui::test]
+    fn enter_opens_a_link_that_has_keyboard_focus(cx: &mut TestAppContext) {
+        let cx = focus_the_link(cx);
+
+        press("enter", cx);
+
+        assert_eq!(cx.opened_url().as_deref(), Some("https://example.com/docs"));
+    }
+
+    #[gpui::test]
+    fn space_opens_a_link_that_has_keyboard_focus(cx: &mut TestAppContext) {
+        let cx = focus_the_link(cx);
+
+        press("space", cx);
+
+        assert_eq!(cx.opened_url().as_deref(), Some("https://example.com/docs"));
     }
 
     #[gpui::test]

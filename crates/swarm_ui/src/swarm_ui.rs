@@ -3,6 +3,7 @@
 //! Call [`init`] once at startup. Components read colors with
 //! `cx.theme().colors()` and never use raw colors.
 
+pub mod a11y;
 pub mod component;
 pub mod components;
 pub mod contrast;
@@ -11,7 +12,11 @@ pub mod fonts;
 mod markdown_highlight;
 pub mod motion;
 pub mod prelude;
+pub mod reveal;
+pub mod roving;
 pub mod styles;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod theme;
 pub mod traits;
 
@@ -30,6 +35,8 @@ actions!(
         Dismiss,
         SelectPrevious,
         SelectNext,
+        SelectFirst,
+        SelectLast,
         Confirm,
         ShowContextMenu
     ]
@@ -43,6 +50,10 @@ pub const DIALOG_CONTEXT: &str = "Dialog";
 
 /// Key context of an open menu or list popup.
 pub const MENU_CONTEXT: &str = "Menu";
+
+/// Key context [`Menu`] adds beside [`MENU_CONTEXT`], for the keys a list popup with a
+/// text field must not take: Space, Home and End.
+pub const MENU_LIST_CONTEXT: &str = "MenuList";
 
 /// Key context of a confirm row that can be dismissed.
 pub const CONFIRM_CONTEXT: &str = "ConfirmRow";
@@ -67,6 +78,9 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("up", SelectPrevious, Some(MENU_CONTEXT)),
         KeyBinding::new("down", SelectNext, Some(MENU_CONTEXT)),
         KeyBinding::new("enter", Confirm, Some(MENU_CONTEXT)),
+        KeyBinding::new("space", Confirm, Some(MENU_LIST_CONTEXT)),
+        KeyBinding::new("home", SelectFirst, Some(MENU_LIST_CONTEXT)),
+        KeyBinding::new("end", SelectLast, Some(MENU_LIST_CONTEXT)),
         KeyBinding::new("shift-f10", ShowContextMenu, Some(ROOT_CONTEXT)),
     ]);
 }

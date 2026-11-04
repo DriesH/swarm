@@ -2,7 +2,7 @@ use std::rc::Rc;
 
 use gpui::{
     AnyElement, App, BoxShadow, ClickEvent, ElementId, FocusHandle, FontWeight, Role, SharedString,
-    Window, black, point, px,
+    Window, point, px,
 };
 
 use crate::component::{Component, example, example_group};
@@ -161,7 +161,8 @@ impl RenderOnce for Toast {
         h_flex()
             .id(self.id)
             .role(Role::Status)
-            .aria_label(label)
+            .aria_label(label.clone())
+            .aria_value(label)
             .when_some(selector, |toast, selector| {
                 toast.debug_selector(move || selector)
             })
@@ -185,7 +186,7 @@ impl RenderOnce for Toast {
             .border_1()
             .border_color(line)
             .shadow(vec![BoxShadow {
-                color: black().opacity(0.18),
+                color: colors.shadow,
                 offset: point(px(0.), px(8.)),
                 blur_radius: px(24.),
                 spread_radius: px(0.),
@@ -195,6 +196,8 @@ impl RenderOnce for Toast {
             .child(text)
             .children(action)
             .children(dismiss)
+            .a11y_flags()
+            .live(Live::Polite)
     }
 }
 

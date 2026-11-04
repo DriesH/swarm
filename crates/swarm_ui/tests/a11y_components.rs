@@ -342,7 +342,7 @@ fn the_buttons_of_a_stepper_are_named_for_what_they_change() {
 }
 
 #[test]
-fn a_button_at_a_limit_cannot_be_focused() {
+fn a_button_at_a_limit_is_dimmed_but_keeps_focus() {
     with_window(|window, cx| {
         let [decrease, increase] = Stepper::new("size", "Font size", 20, 11, 20).buttons();
 
@@ -350,7 +350,9 @@ fn a_button_at_a_limit_cannot_be_focused() {
         let increase = a11y_info(increase, window, cx);
 
         assert!(decrease.node.supports_action(Action::Focus));
-        assert!(!increase.node.supports_action(Action::Focus));
+        assert!(!decrease.node.is_disabled());
+        assert!(increase.node.supports_action(Action::Focus));
+        assert!(increase.node.is_disabled());
     });
 }
 
