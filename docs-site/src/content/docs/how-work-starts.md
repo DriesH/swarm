@@ -78,6 +78,32 @@ Every agent shows a status:
 | Blocked | Waiting on you. The detail says what: **permission**, **question** or **login**. A task with a blocked agent shows **Needs you**. |
 | Error | The agent failed or ended with an error. |
 
+## Idle stop and resume
+
+An agent that stays **Idle** or **Done** for the time in **Settings › Agents › Stop idle agents after** (30 minutes by default) stops. Its conversation is kept, so it can resume. Its row in the sidebar then says **resumable**.
+
+Idle stop never stops:
+
+- the Start orchestrator
+- an orchestrator while one of its workers runs
+- an agent with a process terminal of its own that still runs
+- an agent you are typing into
+- an agent with messages it has not read yet
+
+A resumable agent starts again with its saved conversation (`claude --resume` or `codex resume`) when:
+
+- a message arrives for it, from its orchestrator, a worker or a review comment. Swarm types the message in once the agent is ready.
+- you select **Resume** in its inspector in the [Swarm view](/swarm/docs/swarm-view/).
+- you run **Resume agent “name”** from the command palette (⌘K).
+
+Agents that were running when the Mac restarted, or when the daemon crashed, become resumable the same way. They wait for a message or for you.
+
+An agent that has no saved conversation cannot resume. An agent that crashes is not resumed for messages that are already waiting. It resumes with the next message.
+
+## Agent limits
+
+**Settings › Agents** limits how many agents run at the same time: 6 per task and 16 in total by default. Swarm refuses to start or resume an agent past a limit. The agent or message that asked for it gets an error that names the limit, such as `the task has 6 agents running, the limit is 6 (Settings › Agents)`.
+
 ## Close a task
 
 Close a task from the close button on its tab, from **File › Close Task**, or from **Close task** in the command palette (⌘K).

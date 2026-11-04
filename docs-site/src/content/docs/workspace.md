@@ -82,6 +82,12 @@ An agent starts a process terminal with `swarm terminal spawn`, for a dev server
 - When the process exits with code 0, the tile closes after about 3 seconds.
 - When it exits with another code, or a signal ends it, the tile stays with the exit code and grows. Close it yourself.
 
+## Files panel
+
+The **Files** button opens a panel with the files of the task worktree as a folder tree: every file git tracks, and new files git does not ignore. Changed files are marked. The list updates when the task's changes change.
+
+The panel lists at most 20 000 files. A longer list ends with a row such as **30 more files**. A worktree without files shows **No files**.
+
 ## Changes panel
 
 The **Changes** button opens a panel with the task's changed files as a folder tree. Each file shows its additions and deletions, and the agent of its newest commit. Click a file to open [Review](/swarm/docs/review/) at that file. The **Review** button opens Review itself.
@@ -90,7 +96,7 @@ The panel is available in the Terminals view only. Review has its own file tree.
 
 ## Status bar
 
-The left side has the tray and the **Terminal** button. The right side shows, with icons, the task's branch, its agent count, its process count, its user terminal count (when above zero) and ⌘K. In Review, the bar also shows how many comments are sent, pending and resolved.
+The left side has the tray and the **Terminal** button. The right side shows, with icons, the task's branch, its agent count, its process count, its user terminal count (when above zero), **permissions skipped** when **Skip permission prompts** is on in **Settings › Agents**, and ⌘K. In Review, the bar also shows how many comments are sent, pending and resolved.
 
 ## Command palette
 
@@ -100,7 +106,7 @@ Press ⌘K, or use the search button in the sidebar. Type to filter by name, use
 |---|---|
 | **Suggested** | **Review changes** ⇧⌘R, **Focus orchestrator** ⌘1, **New task** ⌘T, **Plan with orchestrator** ⇧⌘T, and **Create pull request** when the task can have one |
 | **Tasks** | Every task of the project, with its status |
-| **Agents** | Every worker, with its status and ⌘2 to ⌘9 |
+| **Agents** | Every worker, with its status and ⌘2 to ⌘9, and **Resume agent “name”** for each resumable agent |
 | **Swarm** | **Close task**, **New terminal** ⌥⌘T, **Settings** ⌘, and, in Review, **Next file**, **Previous file**, **Toggle viewed** and **Comment on line** |
 
 ## Keys inside a terminal

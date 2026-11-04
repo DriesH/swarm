@@ -13,14 +13,13 @@ App settings live in `~/.config/swarm/settings.toml`. Edit it by hand or in the 
 
 Swarm reads the file when the app starts. The daemon, which runs your agents (see [Install](/swarm/docs/install/#the-background-daemon)), reads it each time it starts an agent, so a new value applies to agents you start afterwards.
 
+A value that is not valid, such as `skip_permissions = "yes"`, falls back to that key's default. The other keys still load. The page that holds the key shows a warning that names it. The next change you make in Settings writes a corrected file.
+
+A `font_size` outside 11–20 moves to the nearest value in that range.
+
 :::caution
-A value of the wrong type, such as `skip_permissions = "yes"`, makes the file invalid. The Settings window shows the error and does not overwrite the file. Swarm does not start new agents until you fix it.
+A file that is not valid TOML at all, for example with a missing quote, does not load. The Settings window shows the error and does not overwrite the file. Swarm and its agents use the defaults until you fix it.
 :::
-
-Two cases are forgiving:
-
-- In `[notifications]`, a value that is not valid falls back to its default.
-- A `font_size` outside 11–20 moves to the nearest value in that range.
 
 ## General
 
@@ -34,7 +33,7 @@ The system check also runs when you open Settings and when the window becomes ac
 
 ## Agents
 
-One section for each agent kind, **Claude Code** and **Codex**, then a **Workers** section.
+One section for each agent kind, **Claude Code** and **Codex**, then a **Workers** section. Each agent kind shows the version the system check found, or **Not found**.
 
 | Control | Default | What it does |
 |---|---|---|
@@ -44,10 +43,15 @@ One section for each agent kind, **Claude Code** and **Codex**, then a **Workers
 | **Orchestrator agent** | Claude Code | The agent kind of new orchestrators: Claude Code or Codex. |
 | **Skip permission prompts** | Off | Starts agents without permission prompts: `--dangerously-skip-permissions` for Claude Code, `--dangerously-bypass-approvals-and-sandbox` for Codex. |
 | **Allow typing in worker terminals** | On | Lets you type into a worker's terminal. When you do, Swarm tells the orchestrator. |
+| **Stop idle agents after** | 30 minutes | **10 minutes**, **30 minutes**, **1 hour** or **Never**. An agent that stays idle or done this long stops, and resumes later. See [Idle stop](/swarm/docs/how-work-starts/#idle-stop-and-resume). |
+| **Max agents per task** | 6 | How many agents of one task can run at the same time. |
+| **Max agents in total** | 16 | How many agents of all tasks can run at the same time. |
 
 :::caution
-With **Skip permission prompts** on, agents run commands and edit files without asking you.
+With **Skip permission prompts** on, agents run commands and edit files without asking you. The status bar then shows **permissions skipped**.
 :::
+
+A limit must be a whole number of at least 1. Another value shows an error on the field and is not saved. When starting an agent would go over a limit, Swarm refuses it. The agent that asked gets an error such as `6 agents are running, the limit is 6 (Settings › Agents)`.
 
 ## Terminals
 
@@ -106,7 +110,7 @@ How Swarm tells you that a task needs you. [Notifications and usage](/swarm/docs
 
 | Control | Default | What it does |
 |---|---|---|
-| **Theme** | System | **Light**, **Dark** or **System** (follows macOS). Swarm does not store this choice in `settings.toml`. |
+| **Theme** | System | **Light**, **Dark** or **System** (follows macOS). |
 | **Accent** | Blue | **Blue** or **Honey**. |
 | **Easter eggs** | On | Off turns off every easter egg. |
 | **Honeycomb behind the Swarm view** | Off | Draws a honeycomb in place of the dots behind the [Swarm view](/swarm/docs/swarm-view/). Needs **Easter eggs** on. |
@@ -123,6 +127,8 @@ Read-only list of every shortcut. You cannot change them. See [Keyboard shortcut
 
 Each page edits the project's `.swarm/config.toml`. Every field, its default and its effect are in [Project config](/swarm/docs/project-config/).
 
+When the repository has a git pre-push hook, the checks section shows a **Git pre-push hook** row with the tool (`husky`, `lefthook` or `pre-push`) and **Detected**. Swarm does not run the hook itself; git runs it when Swarm pushes.
+
 ## Example file
 
 All keys with their defaults:
@@ -131,6 +137,9 @@ All keys with their defaults:
 [agents]
 orchestrator = "claude-code"   # or "codex"
 skip_permissions = false
+idle_stop_minutes = 30         # 0 = never
+max_agents_per_task = 6
+max_agents_total = 16
 
 [agents.claude_code]
 command = "claude"
@@ -162,6 +171,7 @@ menu_bar_dot = true
 "/Users/you/code/app" = "errors_only"
 
 [appearance]
+theme = "system"               # or "light", "dark"
 easter_eggs = true
 accent = "blue"                # or "honey"
 swarm_view_honeycomb = false

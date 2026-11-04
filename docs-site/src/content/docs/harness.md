@@ -154,6 +154,12 @@ The `swarm` MCP server lists only the tools your role may call. A tool has the n
 | `terminal_kill` | Everyone | `id`\*, `signal` |
 | `terminal_resize` | Everyone | `id`\*, `size`\* (ignored) |
 
+## Limits and resumable agents
+
+- `spawn` and `task create` fail when a start would go over an [agent limit](/swarm/docs/how-work-starts/#agent-limits). The error is `the task has N agents running, the limit is M (Settings › Agents)` or `N agents are running, the limit is M (Settings › Agents)`.
+- A worker that [idle stop](/swarm/docs/how-work-starts/#idle-stop-and-resume) stopped is resumable. `swarm agents` still lists it. Idle stop sends no `worker stopped` message.
+- `send`, `ask` and `report` to a resumable agent resume it first. Swarm types the message in once the agent is ready. When the resume is refused, for example by a limit, the command fails with the reason.
+
 ## Messages from Swarm
 
 Swarm sends these messages itself. They arrive like any other message, through `read`, `wait` or the terminal, and each has a kind.
