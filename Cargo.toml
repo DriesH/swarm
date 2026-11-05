@@ -23,7 +23,7 @@ members = [
 default-members = ["crates/gallery", "crates/swarm_ui"]
 
 [workspace.package]
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 publish = false
 
