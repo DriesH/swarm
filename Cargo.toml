@@ -15,6 +15,7 @@ members = [
     "crates/swarm_term_view",
     "crates/swarm_term_vt",
     "crates/swarm_ui",
+    "crates/swarm_update",
     "crates/swarm_usage",
 ]
 default-members = ["crates/gallery", "crates/swarm_ui"]
@@ -34,9 +35,12 @@ swarm_term = { path = "crates/swarm_term" }
 swarm_term_view = { path = "crates/swarm_term_view" }
 swarm_term_vt = { path = "crates/swarm_term_vt" }
 swarm_ui = { path = "crates/swarm_ui" }
+swarm_update = { path = "crates/swarm_update" }
 swarm_usage = { path = "crates/swarm_usage" }
 
 anyhow = "1"
+# Same version gpui_macos uses at the pinned rev, so it is built once.
+block2 = "0.6.2"
 clap = { version = "4.6", features = ["derive"] }
 # Same version gpui uses, so it is built once.
 core-foundation = "0.10"
@@ -48,6 +52,29 @@ libghostty-vt = "0.2.2"
 log = "0.4"
 # Same version gpui_macos uses at the pinned rev, so it is built once.
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSAccessibility", "NSWorkspace"] }
+# NSURLSession and NSFileManager for the updater (ADR 0010).
+objc2 = "0.6.5"
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "block2",
+    "NSArray",
+    "NSData",
+    "NSDate",
+    "NSDictionary",
+    "NSError",
+    "NSFileManager",
+    "NSHTTPCookieStorage",
+    "NSObject",
+    "NSOperation",
+    "NSProcessInfo",
+    "NSString",
+    "NSURL",
+    "NSURLCache",
+    "NSURLCredentialStorage",
+    "NSURLRequest",
+    "NSURLResponse",
+    "NSURLSession",
+] }
 portable-pty = "0.9"
 postcard = { version = "1.1", features = ["use-std"] }
 # Only the parser: the app draws the text itself, so the HTML renderer stays out.

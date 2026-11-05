@@ -1632,3 +1632,63 @@ fn help_does_not_list_the_buzz_command() {
         assert!(!text.contains("buzz"), "buzz is listed:\n{text}");
     }
 }
+
+#[test]
+fn update_install_without_a_new_app_fails_and_leaves_the_old_app() {
+    let folder = std::env::temp_dir().join(format!("swarm-update-install-{}", std::process::id()));
+    let old = folder.join("Swarm.app");
+    std::fs::create_dir_all(&old).expect("old app");
+    std::fs::write(old.join("mark"), "old").expect("mark");
+    let mut finished = Command::new("/usr/bin/true").spawn().expect("spawn");
+    let pid = finished.id();
+    finished.wait().expect("wait");
+
+    let output = swarm()
+        .env("HOME", &folder)
+        .args(["update-install", "--pid", &pid.to_string(), "--old"])
+        .arg(&old)
+        .arg("--new")
+        .arg(folder.join("missing/Swarm.app"))
+        .args(["--version", "1.2.0"])
+        .output()
+        .expect("run");
+
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let mark = std::fs::read_to_string(old.join("mark"));
+    std::fs::remove_dir_all(&folder).ok();
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("cannot find"), "{stderr}");
+    assert_eq!(mark.expect("mark"), "old");
+}
+
+#[test]
+fn update_install_refuses_a_new_app_that_is_not_in_the_cache() {
+    let folder = std::env::temp_dir().join(format!("swarm-update-place-{}", std::process::id()));
+    let old = folder.join("Swarm.app");
+    let new = folder.join("elsewhere/Swarm.app");
+    let cached = folder.join("Library/Caches/Swarm/updates/1.2.0");
+    for app in [&old, &new, &cached] {
+        std::fs::create_dir_all(app).expect("folders");
+    }
+    std::fs::write(new.join("mark"), "new").expect("mark");
+    let mut finished = Command::new("/usr/bin/true").spawn().expect("spawn");
+    let pid = finished.id();
+    finished.wait().expect("wait");
+
+    let output = swarm()
+        .env("HOME", &folder)
+        .args(["update-install", "--pid", &pid.to_string(), "--old"])
+        .arg(&old)
+        .arg("--new")
+        .arg(&new)
+        .args(["--version", "1.2.0"])
+        .output()
+        .expect("run");
+
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let mark = std::fs::read_to_string(new.join("mark"));
+    std::fs::remove_dir_all(&folder).ok();
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("is not in the update folder"), "{stderr}");
+    assert_eq!(mark.expect("mark"), "new");
+}

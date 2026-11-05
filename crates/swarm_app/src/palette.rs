@@ -20,6 +20,7 @@ use crate::announce::announce;
 use crate::close_task::CloseTaskDialog;
 use crate::close_terminal::CloseTerminalDialog;
 use crate::daemon::is_resumable;
+use crate::daemon_restart::RestartDaemonDialog;
 use crate::model::{AgentId, AgentKind, FakeData, ProjectId, TaskId, TaskStatus, TerminalId};
 use crate::new_task::NewTaskDialog;
 use crate::pull_request::AnywayDialog;
@@ -837,6 +838,10 @@ pub(crate) enum Overlay {
         view: Entity<RemoveProjectDialog>,
         _subscription: Subscription,
     },
+    RestartDaemon {
+        view: Entity<RestartDaemonDialog>,
+        _subscription: Subscription,
+    },
 }
 
 impl Overlay {
@@ -849,6 +854,7 @@ impl Overlay {
             Self::CloseTerminal { view, .. } => view.read(cx).opener.clone(),
             Self::CreateAnyway { view, .. } => view.read(cx).opener.clone(),
             Self::RemoveProject { view, .. } => view.read(cx).opener.clone(),
+            Self::RestartDaemon { view, .. } => view.read(cx).opener.clone(),
         }
     }
 
@@ -861,6 +867,7 @@ impl Overlay {
             Self::CloseTerminal { view, .. } => view.focus_handle(cx),
             Self::CreateAnyway { view, .. } => view.focus_handle(cx),
             Self::RemoveProject { view, .. } => view.focus_handle(cx),
+            Self::RestartDaemon { view, .. } => view.focus_handle(cx),
         }
     }
 
@@ -872,6 +879,7 @@ impl Overlay {
             Self::CloseTerminal { view, .. } => view.clone().into_any_element(),
             Self::CreateAnyway { view, .. } => view.clone().into_any_element(),
             Self::RemoveProject { view, .. } => view.clone().into_any_element(),
+            Self::RestartDaemon { view, .. } => view.clone().into_any_element(),
         }
     }
 }

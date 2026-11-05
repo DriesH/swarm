@@ -41,7 +41,11 @@ impl Fake {
 
     fn handshake(&mut self, version: u32) {
         assert_eq!(self.request(), Some(Request::Hello { version: VERSION }));
-        self.send(&Event::Hello { version, pid: 1 });
+        self.send(&Event::Hello {
+            version,
+            pid: 1,
+            build: "9.9.9".to_owned(),
+        });
 
         if version == VERSION {
             self.challenge("fake-nonce");
@@ -166,6 +170,7 @@ fn connect_answers_the_challenge_with_its_nonce() {
         fake.send(&Event::Hello {
             version: VERSION,
             pid: 1,
+            build: "9.9.9".to_owned(),
         });
         fake.send(&Event::Challenge {
             nonce: "abc123".to_owned(),
@@ -193,6 +198,7 @@ fn connect_fails_when_the_daemon_skips_the_challenge() {
         fake.send(&Event::Hello {
             version: VERSION,
             pid: 1,
+            build: "9.9.9".to_owned(),
         });
         fake.send(&Event::Done { call: CallId(1) });
         fake.drain();
@@ -211,7 +217,77 @@ fn connect_refuses_another_protocol_version() {
 
     assert!(matches!(
         result,
-        Err(ClientError::Version { daemon }) if daemon == VERSION + 1
+        Err(ClientError::Version { daemon, .. }) if daemon == VERSION + 1
+    ));
+}
+
+#[test]
+fn a_protocol_mismatch_carries_the_daemons_build() {
+    let socket = serve(|fake| fake.handshake(VERSION + 1));
+
+    let result = Client::connect(&socket);
+
+    assert!(matches!(
+        result,
+        Err(ClientError::Version { build: Some(build), .. }) if build == "9.9.9"
+    ));
+}
+
+#[test]
+fn the_client_knows_the_build_of_a_daemon_it_talks_to() {
+    let socket = serve(|fake| {
+        fake.handshake(VERSION);
+        fake.drain();
+    });
+
+    let client = Client::connect(&socket).expect("connect");
+
+    assert_eq!(client.daemon_build(), "9.9.9");
+}
+
+/// The first reply of a daemon from before the build field: only `Hello`, two fields.
+#[derive(serde::Serialize, serde::Deserialize)]
+enum LegacyEvent {
+    Hello { version: u32, pid: u32 },
+}
+
+#[test]
+fn a_daemon_from_before_the_build_field_reports_its_protocol_version() {
+    let socket = serve(|fake| {
+        assert_eq!(fake.request(), Some(Request::Hello { version: VERSION }));
+        write(
+            &mut fake.writer,
+            &LegacyEvent::Hello {
+                version: VERSION - 1,
+                pid: 1,
+            },
+        )
+        .expect("fake daemon can write");
+        fake.writer.flush().expect("fake daemon can flush");
+    });
+
+    let result = Client::connect(&socket);
+
+    assert!(matches!(
+        result,
+        Err(ClientError::Version { daemon, build: None }) if daemon == VERSION - 1
+    ));
+}
+
+#[test]
+fn an_older_client_still_reads_the_version_and_pid_of_the_new_hello() {
+    let hello = Event::Hello {
+        version: VERSION,
+        pid: 7,
+        build: "1.2.3".to_owned(),
+    };
+    let frame = postcard::to_stdvec(&hello).expect("encode");
+
+    let old: LegacyEvent = postcard::from_bytes(&frame).expect("an older client decodes it");
+
+    assert!(matches!(
+        old,
+        LegacyEvent::Hello { version, pid: 7 } if version == VERSION
     ));
 }
 

@@ -21,6 +21,7 @@ actions!(
         ToggleCommandPalette,
         Quit,
         About,
+        CheckForUpdates,
         AddProject,
         CloseTask,
         ToggleSidebar,

@@ -1,5 +1,7 @@
 # Swarm updates itself from a manifest on S3
 
+The source changed: updates now come from GitHub Releases (ADR 0011). The updater itself is as described here.
+
 Swarm checks a small JSON manifest in an S3 bucket, downloads the new notarized build, checks its hash and its code signature, and swaps the app bundle when the app quits. We wrote this updater in Rust and did not use Sparkle. Sparkle brings an embedded framework with its own XPC services, and the release rules allow system libraries only (`docs/release.md`). Its update window is also AppKit, not our design system. The updater uses macOS networking (`NSURLSession`) and Security.framework, so the bundle still links system libraries only.
 
 ## Considered options

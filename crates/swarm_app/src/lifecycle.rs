@@ -31,6 +31,7 @@ pub(crate) fn start(cx: &mut App) -> anyhow::Result<()> {
     crate::settings::follow_appearance(workspace.clone(), cx);
     crate::settings::follow_skip_permissions(workspace.clone(), cx);
     crate::menu_bar::install(workspace.clone(), cx);
+    crate::updates::install(workspace.clone(), cx);
     crate::notifications::install(workspace, cx);
     cx.activate(true);
 

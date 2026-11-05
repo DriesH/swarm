@@ -22,6 +22,7 @@ pub struct Settings {
     pub terminals: TerminalSettings,
     pub notifications: NotificationSettings,
     pub appearance: AppearanceSettings,
+    pub updates: UpdateSettings,
 }
 
 impl<'de> Deserialize<'de> for Settings {
@@ -52,6 +53,7 @@ impl Settings {
             terminals: TerminalSettings::read(root.child("terminals")),
             notifications: NotificationSettings::read(root.child("notifications")),
             appearance: AppearanceSettings::read(root.child("appearance")),
+            updates: UpdateSettings::read(root.child("updates")),
         }
     }
 }
@@ -136,6 +138,30 @@ impl<'a> Section<'a> {
 
                 default
             }
+        }
+    }
+}
+
+/// How the app looks for new versions of itself.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpdateSettings {
+    /// Checks for an update after launch and every few hours. Off leaves only the manual
+    /// checks.
+    pub auto_check: bool,
+}
+
+impl Default for UpdateSettings {
+    fn default() -> Self {
+        Self { auto_check: true }
+    }
+}
+
+impl UpdateSettings {
+    fn read(mut section: Section<'_>) -> Self {
+        let defaults = Self::default();
+
+        Self {
+            auto_check: section.take("auto_check", defaults.auto_check, BOOL),
         }
     }
 }
@@ -723,6 +749,11 @@ pub fn save(path: &Path, settings: &Settings) -> Result<(), SettingsError> {
         table_mut(document.as_table_mut(), "appearance"),
         settings.appearance,
     );
+    set_value(
+        table_mut(document.as_table_mut(), "updates"),
+        "auto_check",
+        Value::from(settings.updates.auto_check),
+    );
 
     if let Some(folder) = path.parent() {
         std::fs::create_dir_all(folder).map_err(io_error)?;
@@ -1028,6 +1059,39 @@ mod tests {
         assert!(text.contains("easter_eggs = false"));
         assert!(text.contains("accent = \"honey\""));
         assert_eq!(loaded.appearance, settings.appearance);
+    }
+
+    #[test]
+    fn updates_check_automatically_by_default() {
+        let settings: Settings = toml::from_str("").unwrap();
+
+        assert!(settings.updates.auto_check);
+    }
+
+    #[test]
+    fn a_bad_auto_check_falls_back_and_the_other_sections_still_load() {
+        let settings: Settings =
+            toml::from_str("[updates]\nauto_check = \"yes\"\n[terminals]\nfont_size = 15\n")
+                .unwrap();
+
+        assert!(settings.updates.auto_check);
+        assert_eq!(settings.terminals.font_size, 15);
+    }
+
+    #[test]
+    fn auto_check_round_trips_through_a_file() {
+        let folder = temp_folder("updates");
+        let path = folder.join("settings.toml");
+        let mut settings = Settings::default();
+        settings.updates.auto_check = false;
+
+        save(&path, &settings).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let loaded = load(&path).unwrap();
+        std::fs::remove_dir_all(&folder).unwrap();
+
+        assert!(text.contains("auto_check = false"), "{text}");
+        assert_eq!(loaded.updates, settings.updates);
     }
 
     fn temp_folder(name: &str) -> PathBuf {

@@ -14,6 +14,7 @@
 
    The script uses the profile `swarm-notary`. Another name goes in `--notary-profile` or `$SWARM_NOTARY_PROFILE`.
 3. **Tools.** The Rust toolchain from `rust-toolchain.toml`, Zig 0.15 on `PATH`, and the Xcode command line tools.
+4. **Publishing.** `gh`, signed in with write access to `DriesH/swarm` (`gh auth status`), and git-cliff (`cargo install git-cliff`).
 
 ## Run it
 
@@ -58,6 +59,19 @@ Then start the signed app and make sure that the daemon accepts it. The daemon l
 - The app connects and shows its projects.
 - `--identity` with an Apple Development certificate gives an app that the daemon refuses. The app socket accepts Developer ID only.
 
+## Publish a release
+
+A release is a GitHub release of `DriesH/swarm` (ADR 0011). Installed apps find it through its `latest.json` (Updates in `PLAN.md`).
+
+1. On an up-to-date `main`, run `script/prepare-release 1.2.0`. It opens the PR `task(release): v1.2.0` with the new version in `Cargo.toml` and the new section of `CHANGELOG.md`. Read the section: it lists the titles of the `feat`, `fix` and `perf` PRs since the last release. Fix a title that does not read well for a user in `CHANGELOG.md` in that PR. Run it without a version to see the version git-cliff suggests.
+2. Merge the PR, then pull `main`.
+3. Run `script/bundle-mac`.
+4. Run `script/publish-update target/bundle/<folder>`. It checks the build, tags `v1.2.0`, and publishes the release with `Swarm-1.2.0.zip`, `Swarm.dmg` and `latest.json`.
+
+For the first release, pass `--notes-file <file>` to `publish-update` with a short hand-written note.
+
+If `publish-update` stops halfway, the release stays a draft and the app does not see it. Fix the cause and run it again: it reuses its own draft and tag. If it stopped after tagging, check out the tag (`git checkout v1.2.0`) and run it again: the script accepts `HEAD` at the commit of the tag even when `origin/main` has moved on.
+
 ## Entitlements
 
 There is none: no `Swarm.entitlements` file, and the script signs without `--entitlements`. The hardened runtime needs one only for code that the Swarm binaries do not have:
@@ -77,10 +91,30 @@ Add `crates/swarm_app/resources/Swarm.entitlements` and pass `--entitlements` in
 cargo run -p app_icon -- --png assets/app-icon/icon-1024.png
 ```
 
+### The macOS 26 icon
+
+macOS 26 and later show an icon that is not in Apple's new format small, on a gray tile. That icon is `assets/app-icon/Swarm.icon`, made in Icon Composer (it comes with Xcode 26 and later). `script/bundle-mac` compiles it with `actool` into `Assets.car` and sets `CFBundleIconName`. `Swarm.icns` stays the icon of macOS 13 to 15. Without `Swarm.icon`, the script prints a note and makes the app with `Swarm.icns` only.
+
+Make or update `Swarm.icon` after the sprite changes:
+
+1. Write the two layers:
+
+   ```sh
+   mkdir -p target/icon-layers
+   cargo run -p app_icon -- --layer background target/icon-layers/background.png
+   cargo run -p app_icon -- --layer bee target/icon-layers/bee.png
+   ```
+
+2. Open Icon Composer (Xcode › Open Developer Tool › Icon Composer) and make a new icon.
+3. Drag `background.png` in as the bottom layer and `bee.png` as the layer above it. Both are 1024 px and full bleed, so do not move or scale them.
+4. On the bee layer, turn off the glass effects (specular and blur) and the shadow, so the pixel edges stay hard. The background layer draws its own shadow under the bee.
+5. Check the preview in the light, dark and tinted appearances.
+6. Save it as `assets/app-icon/Swarm.icon` and commit it.
+
 ## Known limits
 
 - Apple Silicon only. There is no Intel or universal build.
-- No updates yet.
+- The updater and the publish scripts have not run against a real release yet.
 - No test on a clean Mac yet.
 - A Finder launch gives the app a short `PATH`. Besides `PATH`, Swarm looks for agents and `gh` only in `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin` and `~/.claude/local`. A tool in another folder, such as one of a version manager, is not found. Not tried yet on a Finder launch.
 - `CFBundleVersion` is the same as the version until updates need a build number.

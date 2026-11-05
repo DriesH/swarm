@@ -20,8 +20,8 @@ use crate::{
     CreateTask, CreateTerminal, Event, FileDiff, FrameError, GH_SECS, GithubStatus, MergeMethod,
     MessageId, MessageInfo, NewComment, Notice, PUSH_SECS, Paths, PlanDraft, PrDraft, PrPanel,
     ProjectConfigFields, ProjectId, ProjectInfo, PromptInfo, PullRequest, RemoveCheck, Request,
-    ReviewComment, ReviewSource, SwarmStats, SystemCheck, TaskDiff, TaskId, TaskInfo, TerminalId,
-    TerminalInfo, Usage, VERSION, check_private_dir, read, write,
+    ReviewComment, ReviewSource, StopError, SwarmStats, SystemCheck, TaskDiff, TaskId, TaskInfo,
+    TerminalId, TerminalInfo, Usage, VERSION, check_private_dir, read, write,
 };
 
 /// A project's config file as the daemon read it.
@@ -91,12 +91,16 @@ pub enum ClientError {
     Io(#[from] io::Error),
     #[error("protocol error: {0}")]
     Frame(#[from] FrameError),
-    #[error(
-        "the daemon speaks protocol version {daemon}, this app speaks {VERSION}; stop it with `pkill -x swarm-daemon`"
-    )]
-    Version { daemon: u32 },
-    #[error("the daemon speaks an older protocol; stop it with `pkill -x swarm-daemon`")]
+    #[error("the daemon speaks protocol version {daemon}, this app speaks {VERSION}")]
+    Version {
+        daemon: u32,
+        /// The daemon's build version. `None` from a daemon that does not tell.
+        build: Option<String>,
+    },
+    #[error("the daemon speaks an older protocol")]
     Incompatible,
+    #[error("cannot stop the old daemon: {0}")]
+    Stop(#[from] StopError),
     #[error("the socket folder {} is not private: {source}", dir.display())]
     UnsafeSocketDir { dir: PathBuf, source: io::Error },
     #[error("the daemon did not start, see {}", log.display())]
@@ -182,6 +186,7 @@ struct Inner {
     writer: flume::Sender<Request>,
     shared: Arc<Shared>,
     daemon_pid: u32,
+    daemon_build: String,
     agent_events: flume::Receiver<AgentInfo>,
     task_events: flume::Receiver<TaskInfo>,
     terminal_events: flume::Receiver<TerminalInfo>,
@@ -254,8 +259,12 @@ impl Client {
         let mut buffer = Vec::new();
         let hello: Event = read_handshake_frame(&mut reader, &mut buffer)?;
 
-        let daemon_pid = match hello {
-            Event::Hello { version, pid } if version == VERSION => {
+        let (daemon_pid, daemon_build) = match hello {
+            Event::Hello {
+                version,
+                pid,
+                build,
+            } if version == VERSION => {
                 let challenge: Event = read_handshake_frame(&mut reader, &mut buffer)?;
                 let Event::Challenge { nonce } = challenge else {
                     return Err(ClientError::Daemon(format!(
@@ -267,9 +276,14 @@ impl Client {
                 writer.flush()?;
 
                 stream.set_read_timeout(None)?;
-                pid
+                (pid, build)
             }
-            Event::Hello { version, .. } => return Err(ClientError::Version { daemon: version }),
+            Event::Hello { version, build, .. } => {
+                return Err(ClientError::Version {
+                    daemon: version,
+                    build: Some(build).filter(|build| !build.is_empty()),
+                });
+            }
             Event::Error { message, .. } => return Err(ClientError::Daemon(message)),
             other => {
                 return Err(ClientError::Daemon(format!(
@@ -335,6 +349,7 @@ impl Client {
                 writer: request_sender,
                 shared,
                 daemon_pid,
+                daemon_build,
                 agent_events: agent_receiver,
                 task_events: task_receiver,
                 terminal_events: terminal_receiver,
@@ -352,6 +367,11 @@ impl Client {
 
     pub fn daemon_pid(&self) -> u32 {
         self.inner.daemon_pid
+    }
+
+    /// The daemon's build version, such as `1.1.0`.
+    pub fn daemon_build(&self) -> &str {
+        &self.inner.daemon_build
     }
 
     /// Every `AgentChanged` the daemon sends. Clones of the receiver share the events,
@@ -1161,17 +1181,34 @@ fn read_handshake_frame(
     reader: &mut BufReader<UnixStream>,
     buffer: &mut Vec<u8>,
 ) -> Result<Event, ClientError> {
-    read(reader, buffer).map_err(|error| match error {
-        FrameError::Io(io_error)
+    match read(reader, buffer) {
+        Ok(event) => Ok(event),
+        Err(FrameError::Io(io_error))
             if matches!(
                 io_error.kind(),
                 io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
             ) =>
         {
-            ClientError::Timeout
+            Err(ClientError::Timeout)
         }
-        FrameError::Codec(_) => ClientError::Incompatible,
-        other => ClientError::Frame(other),
+        Err(FrameError::Codec(_)) => legacy_hello(buffer).ok_or(ClientError::Incompatible),
+        Err(other) => Err(ClientError::Frame(other)),
+    }
+}
+
+/// What a daemon sends first before it tells its build: `Hello` without the build.
+#[derive(serde::Deserialize)]
+enum LegacyEvent {
+    Hello { version: u32, pid: u32 },
+}
+
+/// Reads the `Hello` of a daemon that predates the build field, as one with no build.
+fn legacy_hello(frame: &[u8]) -> Option<Event> {
+    let LegacyEvent::Hello { version, pid } = postcard::from_bytes(frame).ok()?;
+    Some(Event::Hello {
+        version,
+        pid,
+        build: String::new(),
     })
 }
 

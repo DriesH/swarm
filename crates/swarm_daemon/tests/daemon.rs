@@ -464,6 +464,34 @@ fn a_wrong_version_gets_the_daemons_version() {
 }
 
 #[test]
+fn the_hello_reply_carries_the_daemons_build_version() {
+    let daemon = Daemon::start();
+    let mut client = daemon.connect();
+
+    client.send(&Request::Hello { version: VERSION });
+
+    assert!(matches!(
+        client.next(),
+        Event::Hello { build, .. } if build == env!("CARGO_PKG_VERSION")
+    ));
+}
+
+#[test]
+fn a_wrong_version_still_gets_the_build_version() {
+    let daemon = Daemon::start();
+    let mut client = daemon.connect();
+
+    client.send(&Request::Hello {
+        version: VERSION + 1,
+    });
+
+    assert!(matches!(
+        client.next(),
+        Event::Hello { build, .. } if build == env!("CARGO_PKG_VERSION")
+    ));
+}
+
+#[test]
 fn a_request_instead_of_prove_closes_the_connection() {
     let daemon = Daemon::start();
     let mut client = daemon.connect();

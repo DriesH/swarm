@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+# Publishes a signed build as a GitHub release and the update manifest. See docs/release.md.
+#
+# Usage: script/publish-update <bundle folder> [--notes-file <file>]
+#
+# <bundle folder> is a folder that script/bundle-mac made. The script writes release/ inside it,
+# tags the version, and makes the release as a draft that it publishes last. It never deletes
+# a release or a tag. After a stop, run it again: it reuses its own tag, draft and release/.
+set -euo pipefail
+
+REPO="DriesH/swarm"
+TEAM_ID="P2DG27TUTZ"
+BUNDLE_ID="com.swarm.app"
+
+usage() {
+    cat <<'USAGE'
+Usage: script/publish-update <bundle folder> [--notes-file <file>]
+
+  <bundle folder>      a folder from script/bundle-mac, with Swarm.app and Swarm.dmg
+  --notes-file <file>  release notes; default: the git-cliff section of this version
+USAGE
+}
+
+fail() {
+    printf 'publish-update: %s\n' "$*" >&2
+    exit 1
+}
+
+step() {
+    printf '\n==> %s\n' "$*"
+}
+
+bundle=""
+notes_file=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --notes-file)
+            [[ $# -ge 2 ]] || fail "--notes-file needs a file"
+            notes_file="$2"
+            shift
+            ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        -*) fail "unknown option: $1 (see --help)" ;;
+        *)
+            [[ -z $bundle ]] || fail "give one bundle folder only"
+            bundle="$1"
+            ;;
+    esac
+    shift
+done
+
+[[ -n $bundle ]] || {
+    usage >&2
+    exit 1
+}
+[[ -d $bundle ]] || fail "$bundle is not a folder"
+bundle="$(cd "$bundle" && pwd)"
+
+if [[ -n $notes_file ]]; then
+    [[ -f $notes_file ]] || fail "$notes_file is not a file"
+    notes_file="$(cd "$(dirname "$notes_file")" && pwd)/$(basename "$notes_file")"
+fi
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$root"
+
+[[ -f Cargo.toml && -f cliff.toml && -d .git ]] || fail "run this in the Swarm repository (found no Cargo.toml, cliff.toml and .git in $root)"
+
+# The workspace version in Cargo.toml.
+version="$(awk '
+    /^\[workspace\.package\]/ { in_package = 1; next }
+    /^\[/ { in_package = 0 }
+    in_package && /^version[[:space:]]*=/ {
+        gsub(/^[^"]*"/, "")
+        gsub(/".*$/, "")
+        print
+        exit
+    }
+' Cargo.toml)"
+[[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "cannot read the workspace version from Cargo.toml (got '$version')"
+tag="v$version"
+
+step "Checking the repository"
+command -v gh >/dev/null || fail "gh is not installed"
+command -v git-cliff >/dev/null || fail "git-cliff is not installed (cargo install git-cliff)"
+gh auth status >/dev/null 2>&1 || fail "gh is not signed in (gh auth login)"
+
+git fetch --quiet origin --tags
+
+# A run that stopped after tagging may start again from the tag, even when main moved on.
+head_commit="$(git rev-parse HEAD)"
+tag_commit="$(git rev-parse -q --verify "refs/tags/$tag^{commit}" || true)"
+if [[ $head_commit != "$(git rev-parse origin/main)" && $head_commit != "$tag_commit" ]]; then
+    fail "HEAD is neither origin/main nor the commit of $tag; check out an up-to-date main, or the tag to run a stopped release again"
+fi
+[[ -z "$(git status --porcelain)" ]] || fail "the working tree is not clean"
+
+# Without an earlier release, git-cliff lists every commit of the project.
+earlier_tags="$(git tag --list 'v*' | grep -vx "$tag" || true)"
+if [[ -z $notes_file && -z $earlier_tags ]]; then
+    fail "there is no release before $tag, so the notes would list every commit; pass --notes-file <file>"
+fi
+
+app="$bundle/Swarm.app"
+dmg="$bundle/Swarm.dmg"
+[[ -d $app ]] || fail "no Swarm.app in $bundle"
+[[ -f $dmg ]] || fail "no Swarm.dmg in $bundle"
+
+step "Checking the build"
+plist="$app/Contents/Info.plist"
+app_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")"
+[[ $app_version == "$version" ]] || fail "the app is version $app_version, the workspace is $version; run script/bundle-mac again"
+minimum_macos="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$plist")"
+[[ -n $minimum_macos ]] || fail "the app has no LSMinimumSystemVersion"
+
+codesign --verify --strict --deep --verbose=2 "$app"
+spctl --assess --type execute -vv "$app"
+xcrun stapler validate "$app"
+spctl --assess --type open --context context:primary-signature -vv "$dmg"
+xcrun stapler validate "$dmg"
+
+details="$(codesign -dv --verbose=4 "$app" 2>&1)"
+grep -qx "TeamIdentifier=$TEAM_ID" <<<"$details" || fail "the app is not signed by team $TEAM_ID"
+grep -qx "Identifier=$BUNDLE_ID" <<<"$details" || fail "the app identifier is not $BUNDLE_ID"
+
+step "Checking the release"
+# A release that is already published is final: stop before any change.
+draft_exists=0
+if is_draft="$(gh release view "$tag" --repo "$REPO" --json isDraft --jq .isDraft 2>/dev/null)"; then
+    [[ $is_draft == "true" ]] || fail "the release $tag is published already; nothing to do"
+    draft_exists=1
+    printf 'Found the draft of %s; reusing it\n' "$tag"
+fi
+
+# The tag must be new, or already on HEAD (a re-run).
+if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+    [[ "$(git rev-parse "$tag^{commit}")" == "$(git rev-parse HEAD)" ]] || fail "the tag $tag exists, but not at HEAD"
+    tag_exists=1
+else
+    tag_exists=0
+fi
+
+step "Making the release files"
+release_dir="$bundle/release"
+zip="$release_dir/Swarm-$version.zip"
+manifest="$release_dir/latest.json"
+
+if [[ -e $release_dir ]]; then
+    # Only a run of the same version may leave this folder.
+    [[ -f $zip && -f $manifest ]] || fail "$release_dir exists and is not from a run of $version"
+    [[ "$(plutil -extract version raw -o - "$manifest")" == "$version" ]] || fail "$release_dir is from another version"
+
+    sha="$(shasum -a 256 "$zip" | awk '{ print $1 }')"
+    [[ "$(plutil -extract sha256 raw -o - "$manifest")" == "$sha" ]] || fail "the zip in $release_dir does not match its latest.json"
+    printf 'Reusing %s\n' "$release_dir"
+else
+    mkdir "$release_dir"
+    (cd "$bundle" && ditto -c -k --keepParent Swarm.app "$zip")
+    sha="$(shasum -a 256 "$zip" | awk '{ print $1 }')"
+
+    cat >"$manifest" <<MANIFEST
+{
+  "version": "$version",
+  "url": "https://github.com/$REPO/releases/download/$tag/Swarm-$version.zip",
+  "sha256": "$sha",
+  "minimum_macos": "$minimum_macos",
+  "published": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "notes_url": "https://github.com/$REPO/releases/tag/$tag"
+}
+MANIFEST
+fi
+plutil -lint "$manifest" >/dev/null
+cat "$manifest"
+
+step "Release notes"
+if [[ -n $notes_file ]]; then
+    notes="$notes_file"
+else
+    notes="$(mktemp)"
+    trap 'rm -f "$notes"' EXIT
+
+    # The tag is not there on the first run, so ask for the unreleased commits as that tag.
+    # After the tag exists (a re-run), the latest tag is this version.
+    if [[ $tag_exists -eq 1 ]]; then
+        git cliff --latest --strip all >"$notes"
+    else
+        git cliff --unreleased --tag "$tag" --strip all >"$notes"
+    fi
+fi
+[[ -n "$(tr -d '[:space:]' <"$notes")" ]] || fail "the release notes are empty; pass --notes-file <file>"
+cat "$notes"
+
+step "Tagging $tag"
+if [[ $tag_exists -eq 0 ]]; then
+    git tag --annotate --message "Swarm $version" "$tag" HEAD
+fi
+git push origin "refs/tags/$tag"
+
+step "Making the draft release"
+if [[ $draft_exists -eq 0 ]]; then
+    gh release create "$tag" --repo "$REPO" --draft --verify-tag --title "Swarm $version" --notes-file "$notes"
+fi
+gh release upload "$tag" "$zip" "$dmg" "$manifest" --repo "$REPO" --clobber
+
+step "Publishing"
+gh release edit "$tag" --repo "$REPO" --draft=false --latest
+
+printf '\nRelease: https://github.com/%s/releases/tag/%s\n' "$REPO" "$tag"
+printf 'Manifest: https://github.com/%s/releases/latest/download/latest.json\n' "$REPO"

@@ -26,6 +26,7 @@ swarm_settings.workspace = true
 swarm_term.workspace = true
 swarm_term_view.workspace = true
 swarm_ui.workspace = true
+swarm_update.workspace = true
 
 # The status item and the notification checks: AppKit and UserNotifications through objc2,
 # the same versions gpui_macos builds. The icon is the bee SVG drawn by the resvg that gpui

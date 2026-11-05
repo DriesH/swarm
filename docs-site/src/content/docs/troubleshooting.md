@@ -40,17 +40,17 @@ The account row waits for the GitHub CLI. Install the GitHub CLI first. Its **Si
 
 The app cannot reach the daemon. Click **Retry**. The app starts the daemon from its own folder. If the daemon does not start, its log is `~/Library/Application Support/Swarm/daemon.log`.
 
-### **Retry** keeps failing after an update
+### The sidebar shows **Restart daemon**
 
-An older daemon can still run after you update the app. The new app cannot talk to it. Stop it in a terminal, then click **Retry**:
+An older daemon can still run after you update the app. If the daemon speaks a different protocol version, the new app cannot talk to it. The sidebar then shows **Restart daemon** in place of **Retry**. Click it and confirm. The app stops the old daemon, starts the new one and connects to it.
 
-```sh
-pkill -x swarm-daemon
-```
+If the daemon is older but the app can still talk to it, the app restarts it for you when no agent works and no terminal runs. Otherwise the sidebar shows the daemon version and the number of running agents and terminals, next to **Restart daemon**. You choose when to restart.
 
 :::caution
-Stopping the daemon stops every running agent. Agents with a saved conversation become resumable. See [Idle stop and resume](/swarm/docs/how-work-starts/#idle-stop-and-resume).
+Restarting the daemon stops every running agent. Agents with a saved conversation become resumable. See [Idle stop and resume](/swarm/docs/how-work-starts/#idle-stop-and-resume).
 :::
+
+If **Restart daemon** fails, the sidebar shows the reason under **Daemon not running**. The app only stops a process named `swarm-daemon` that belongs to you.
 
 ## Agents
 

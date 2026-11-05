@@ -3,6 +3,9 @@
 //! `app-icon <folder>` writes the PNG files of an `.iconset`, which `iconutil` turns into
 //! `Swarm.icns`. `app-icon --png <file>` writes the 1024 px icon alone. Every size is drawn
 //! at its own size: nothing is scaled down from the big one.
+//!
+//! `app-icon --layer bee|background <file>` writes one full-bleed 1024 px layer for Icon
+//! Composer, which makes `assets/app-icon/Swarm.icon` (the macOS 26 icon format).
 
 use std::error::Error;
 use std::path::Path;
@@ -10,7 +13,7 @@ use std::path::Path;
 use image::{Rgba, RgbaImage};
 use swarm_sprite::{Frame, RIM_DARK, Rgb, SIZE, Wings};
 
-const USAGE: &str = "usage: app-icon <iconset folder> | app-icon --png <file>";
+const USAGE: &str = "usage: app-icon <iconset folder> | app-icon --png <file> | app-icon --layer bee|background <file>";
 
 /// The files `iconutil` expects in an `.iconset`: the name and the width in pixels.
 const ICONSET: [(&str, u32); 10] = [
@@ -78,6 +81,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     match arguments {
         [flag, file] if flag == "--png" => render(PREVIEW).save(file)?,
+        [flag, layer, file] if flag == "--layer" => match layer.as_str() {
+            "bee" => render_layer(PREVIEW, Layer::Bee).save(file)?,
+            "background" => render_layer(PREVIEW, Layer::Background).save(file)?,
+            _ => return Err(USAGE.into()),
+        },
         [folder] if !folder.starts_with('-') => write_iconset(Path::new(folder))?,
         _ => return Err(USAGE.into()),
     }
@@ -114,6 +122,33 @@ fn render(size: u32) -> RgbaImage {
     })
 }
 
+/// One layer of the Icon Composer icon.
+#[derive(Clone, Copy)]
+enum Layer {
+    /// The bee and its ring; transparent around it.
+    Bee,
+    /// The tile, the honeycomb and the shadow, to the edges. macOS cuts the shape itself.
+    Background,
+}
+
+/// A layer on a square canvas of `size` pixels, with no margin and no rounded corners.
+fn render_layer(size: u32, layer: Layer) -> RgbaImage {
+    let icon = Icon::full_bleed(size);
+
+    RgbaImage::from_fn(size, size, |column, row| match layer {
+        Layer::Bee => icon
+            .bee_pixel(column, row)
+            .map_or(Rgba([0, 0, 0, 0]), |[red, green, blue]| {
+                Rgba([red, green, blue, 255])
+            }),
+        Layer::Background => {
+            let [red, green, blue] = icon.background(column, row).map(channel);
+
+            Rgba([red, green, blue, 255])
+        }
+    })
+}
+
 /// Where everything sits on one canvas.
 struct Icon {
     size: u32,
@@ -129,8 +164,18 @@ struct Icon {
 
 impl Icon {
     fn new(size: u32) -> Self {
+        let margin = whole(MARGIN * float(size) / CANVAS);
+
+        Self::with_margin(size, margin)
+    }
+
+    /// The tile fills the canvas, as Icon Composer layers do.
+    fn full_bleed(size: u32) -> Self {
+        Self::with_margin(size, 0)
+    }
+
+    fn with_margin(size: u32, margin: u32) -> Self {
         let scale = float(size) / CANVAS;
-        let margin = whole(MARGIN * scale);
         let tile = size.saturating_sub(2 * margin);
         let bee_side = bee_side(tile);
         let bee_left = margin + tile.saturating_sub(bee_side) / 2;
@@ -641,10 +686,58 @@ mod tests {
             &["-x"],
             &["a", "b"],
             &["--png", "a", "b"],
+            &["--layer", "wings", "a.png"],
+            &["--layer", "bee"],
         ] {
             let error = run(&arguments(words)).expect_err("a wrong command line");
 
             assert_eq!(error.to_string(), USAGE, "{words:?}");
         }
+    }
+
+    #[test]
+    fn the_bee_layer_is_the_bee_alone_in_the_middle() {
+        let layer = render_layer(PREVIEW, Layer::Bee);
+        let middle = PREVIEW / 2;
+
+        assert_eq!(layer.get_pixel(0, 0)[3], 0, "transparent in the corner");
+        assert_eq!(
+            layer.get_pixel(middle, 0)[3],
+            0,
+            "transparent at the top edge"
+        );
+
+        let opaque = layer.pixels().filter(|pixel| pixel[3] == 255).count();
+        let others = layer
+            .pixels()
+            .filter(|pixel| pixel[3] != 0 && pixel[3] != 255)
+            .count();
+
+        assert!(opaque > 0, "the bee is drawn");
+        assert_eq!(others, 0, "hard edges only");
+    }
+
+    #[test]
+    fn the_background_layer_fills_the_canvas_to_its_corners() {
+        let layer = render_layer(PREVIEW, Layer::Background);
+        let last = PREVIEW - 1;
+
+        for (column, row) in [(0, 0), (last, 0), (0, last), (last, last)] {
+            assert_eq!(layer.get_pixel(column, row)[3], 255, "({column}, {row})");
+        }
+
+        assert!(
+            layer.pixels().all(|pixel| pixel[3] == 255),
+            "opaque everywhere, so macOS cuts the shape"
+        );
+    }
+
+    #[test]
+    fn the_bee_layer_lines_up_with_the_shadow_of_the_background_layer() {
+        let icon = Icon::full_bleed(PREVIEW);
+
+        assert_eq!(icon.margin, 0);
+        assert_eq!(icon.tile, PREVIEW);
+        assert_eq!(icon.bee_left, (PREVIEW - icon.bee_side) / 2);
     }
 }

@@ -331,29 +331,73 @@ fn daemon_status(workspace: &Workspace, cx: &mut Context<Workspace>) -> Option<L
                     .child(Label::new("Connecting").color(Color::Muted)),
             ),
         ),
-        DataSource::Unavailable { reason } => Some(
-            LiveRegion::alert("daemon-status", format!("Daemon not running: {reason}")).child(
-                h_flex()
-                    .debug_selector(|| "daemon-status".to_owned())
-                    .min_h(px(28.))
-                    .gap(px(8.))
-                    .px(px(8.))
-                    .child(
-                        div()
-                            .flex_1()
-                            .child(Label::new("Daemon not running").color(Color::Muted)),
-                    )
-                    .child(
-                        Button::new("retry-daemon", "Retry")
-                            .debug_selector(|| "retry-daemon".to_owned())
-                            .on_click(
-                                cx.listener(|workspace, _, _, cx| workspace.retry_daemon(cx)),
-                            ),
-                    ),
-            ),
-        ),
-        DataSource::Sample | DataSource::Live => None,
+        DataSource::Unavailable { reason } => {
+            let action = if workspace.stale_daemon.is_some() {
+                restart_daemon_button(cx)
+            } else {
+                Button::new("retry-daemon", "Retry")
+                    .debug_selector(|| "retry-daemon".to_owned())
+                    .on_click(cx.listener(|workspace, _, _, cx| workspace.retry_daemon(cx)))
+            };
+
+            let muted = Color::Muted.hsla(cx);
+
+            Some(
+                LiveRegion::alert("daemon-status", format!("Daemon not running: {reason}")).child(
+                    v_flex()
+                        .gap(px(2.))
+                        .child(
+                            h_flex()
+                                .debug_selector(|| "daemon-status".to_owned())
+                                .min_h(px(28.))
+                                .gap(px(8.))
+                                .px(px(8.))
+                                .child(
+                                    div().flex_1().child(
+                                        Label::new("Daemon not running").color(Color::Muted),
+                                    ),
+                                )
+                                .child(action),
+                        )
+                        .child(
+                            div()
+                                .debug_selector(|| "daemon-reason".to_owned())
+                                .mx(px(8.))
+                                .text_size(px(12.))
+                                .text_color(muted)
+                                .child(reason.clone()),
+                        ),
+                ),
+            )
+        }
+        DataSource::Live => {
+            let text = workspace.stale_daemon.as_ref()?.status()?;
+
+            Some(
+                LiveRegion::status("daemon-status", text.clone()).child(
+                    h_flex()
+                        .debug_selector(|| "daemon-status".to_owned())
+                        .min_h(px(28.))
+                        .gap(px(8.))
+                        .px(px(8.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(Label::new(text).color(Color::Muted)),
+                        )
+                        .child(restart_daemon_button(cx)),
+                ),
+            )
+        }
+        DataSource::Sample => None,
     }
+}
+
+fn restart_daemon_button(cx: &mut Context<Workspace>) -> Button {
+    Button::new("restart-daemon", "Restart daemon")
+        .debug_selector(|| "restart-daemon".to_owned())
+        .on_click(cx.listener(|workspace, _, window, cx| workspace.ask_restart_daemon(window, cx)))
 }
 
 /// The error text as an alert, so VoiceOver speaks it when it appears.
@@ -1350,6 +1394,27 @@ mod tests {
 
         assert!(!shown("retry-daemon", cx));
         assert!(open_project_row_has_focus(&workspace, cx));
+    }
+
+    #[gpui::test]
+    fn a_missing_daemon_shows_its_reason_as_visible_text(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.daemon_unavailable("the daemon did not stop".to_owned(), cx);
+        });
+
+        redraw(cx);
+
+        assert!(shown("daemon-reason", cx));
+    }
+
+    #[gpui::test]
+    fn a_running_daemon_shows_no_reason(cx: &mut TestAppContext) {
+        let (_workspace, cx) = setup(cx);
+
+        redraw(cx);
+
+        assert!(!shown("daemon-reason", cx));
     }
 
     #[gpui::test]

@@ -6,7 +6,7 @@ use swarm_ui::prelude::*;
 use swarm_ui::styles::focus_ring;
 
 use super::SettingsWindow;
-use super::pages::{PageBlocks, page_title, plain_row, section};
+use super::pages::{PageBlocks, page_title, plain_row, section, switch_row};
 use crate::system_check::SystemCheckView;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -132,8 +132,42 @@ fn about() -> impl IntoElement {
     section("About", Panel::new().row(version).row(icons).row(changes))
 }
 
+/// The Updates section: the switch, the status line and the Check now button.
+fn updates(state: &gpui::Entity<super::SettingsState>, cx: &App) -> impl IntoElement {
+    let auto_check = state.read(cx).settings.updates.auto_check;
+    let status = crate::updates::status(cx);
+
+    let switch = switch_row(
+        state,
+        "auto-check-updates",
+        "Check for updates automatically",
+        auto_check,
+        |state, on| state.settings.updates.auto_check = on,
+    );
+
+    let check_now = Button::new("check-now", "Check now")
+        .debug_selector(|| "check-now".to_owned())
+        .on_click(|_, _, cx| crate::updates::check_now(cx));
+
+    let status_row = PanelRow::new("Status").end_slot(
+        h_flex()
+            .gap(px(10.))
+            .child(
+                div()
+                    .debug_selector(|| "update-status-line".to_owned())
+                    .child(
+                        LiveRegion::status("update-status-text", status.clone())
+                            .child(Label::new(status).size(LabelSize::Small)),
+                    ),
+            )
+            .child(check_now),
+    );
+
+    section("Updates", Panel::new().row(switch).row(status_row))
+}
+
 impl SettingsWindow {
-    pub(super) fn general_page(&self, _cx: &Context<Self>) -> PageBlocks {
+    pub(super) fn general_page(&self, cx: &Context<Self>) -> PageBlocks {
         let check = self.system_check.clone();
 
         let check_again = Button::new("check-again", "Check again")
@@ -162,6 +196,7 @@ impl SettingsWindow {
         PageBlocks::new(26.)
             .child(page_title("General"))
             .child(system)
+            .child(updates(&self.state, cx))
             .child(about())
     }
 }
@@ -326,6 +361,91 @@ mod tests {
             prefer_character_input: false,
         });
         settings.simulate_event(KeyUpEvent { keystroke });
+    }
+
+    fn with_updater(
+        build: swarm_update::RunningBuild,
+        workspace: &gpui::Entity<crate::workspace::Workspace>,
+        main: &mut VisualTestContext,
+    ) -> Arc<crate::updates::tests::FakeSource> {
+        use crate::updates::tests::{FakeHost, FakeSource, install_fake};
+
+        let source = FakeSource::with_update();
+        let host = FakeHost::new(true);
+        main.update(|_, cx| install_fake(workspace, &source, &host, build, cx));
+
+        source
+    }
+
+    #[gpui::test]
+    fn the_updates_section_shows_the_switch_the_status_and_check_now(cx: &mut TestAppContext) {
+        let (workspace, main) = setup(cx);
+        with_updater(crate::updates::tests::signed_build(), &workspace, main);
+        main.dispatch_action(OpenSettings);
+        let window = settings_window(main);
+        let mut settings = open_general(window, main);
+        redraw(&mut settings);
+
+        let mut shown = |selector| settings.debug_bounds(selector).is_some();
+
+        assert!(shown("auto-check-updates"));
+        assert!(shown("update-status-line"));
+        assert!(shown("check-now"));
+    }
+
+    #[gpui::test]
+    fn check_now_checks_and_the_status_line_follows(cx: &mut TestAppContext) {
+        let (workspace, main) = setup(cx);
+        let source = with_updater(crate::updates::tests::signed_build(), &workspace, main);
+        main.dispatch_action(OpenSettings);
+        let window = settings_window(main);
+        let mut settings = open_general(window, main);
+        redraw(&mut settings);
+
+        click_on("check-now", &mut settings);
+        redraw(&mut settings);
+
+        assert_eq!(source.fetched(), 1);
+        assert_eq!(
+            settings.update(|_, cx| crate::updates::status(cx)),
+            "Update ready: 1.2.0"
+        );
+    }
+
+    #[gpui::test]
+    fn check_now_on_an_unsigned_build_only_shows_the_status(cx: &mut TestAppContext) {
+        let (workspace, main) = setup(cx);
+        let source = with_updater(crate::updates::tests::unsigned_build(), &workspace, main);
+        main.dispatch_action(OpenSettings);
+        let window = settings_window(main);
+        let mut settings = open_general(window, main);
+        redraw(&mut settings);
+
+        click_on("check-now", &mut settings);
+        redraw(&mut settings);
+
+        assert_eq!(source.fetched(), 0);
+        assert_eq!(
+            settings.update(|_, cx| crate::updates::status(cx)),
+            "Updates need a signed build"
+        );
+    }
+
+    #[gpui::test]
+    fn the_switch_turns_automatic_checks_off(cx: &mut TestAppContext) {
+        let (workspace, main) = setup(cx);
+        with_updater(crate::updates::tests::signed_build(), &workspace, main);
+        main.dispatch_action(OpenSettings);
+        let window = settings_window(main);
+        let mut settings = open_general(window, main);
+        redraw(&mut settings);
+        let before = settings.update(|_, cx| crate::settings::auto_check_updates(cx));
+
+        click_on("auto-check-updates", &mut settings);
+        redraw(&mut settings);
+
+        assert!(before, "on by default");
+        assert!(!settings.update(|_, cx| crate::settings::auto_check_updates(cx)));
     }
 
     #[gpui::test]

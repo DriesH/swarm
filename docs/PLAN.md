@@ -311,24 +311,31 @@ Files and folders in the Review tree, the Changes and Files panels and the inspe
 
 ### Updates
 
-Swarm updates itself from an S3 bucket (ADR 0010). There is one channel, `stable`.
+Swarm updates itself with its own updater (ADR 0010) from GitHub Releases of `DriesH/swarm` (ADR 0011). There is one channel, `stable`.
 
-**Bucket layout:**
+**A release** is the tag `v<version>` with these assets:
 
-- `stable/latest.json`: the manifest. It is served with `Cache-Control: no-cache`.
-- `stable/Swarm-<version>.zip`: one notarized and stapled `Swarm.app` per release, made with `ditto -c -k --keepParent`. Old zips stay in the bucket.
+- `Swarm-<version>.zip`: the notarized and stapled `Swarm.app`, made with `ditto -c -k --keepParent`.
+- `Swarm.dmg`: the notarized DMG. Its name has no version, so the website links to `releases/latest/download/Swarm.dmg`.
+- `latest.json`: the manifest. The app reads it at `https://github.com/DriesH/swarm/releases/latest/download/latest.json`. GitHub redirects that link to the newest published release.
+
+The release notes are the git-cliff section of that version (see Publish).
 
 **Manifest:**
 
 ```json
 {
   "version": "1.2.0",
-  "url": "https://<bucket host>/stable/Swarm-1.2.0.zip",
+  "url": "https://github.com/DriesH/swarm/releases/download/v1.2.0/Swarm-1.2.0.zip",
   "sha256": "<hex>",
   "minimum_macos": "13.0",
-  "published": "2026-12-01T10:00:00Z"
+  "published": "2026-12-01T10:00:00Z",
+  "notes_url": "https://github.com/DriesH/swarm/releases/tag/v1.2.0"
 }
 ```
+
+- `url` and `notes_url` must start with `https://github.com/DriesH/swarm/`. The app ignores a manifest that points elsewhere.
+- The app follows HTTPS redirects only (GitHub serves assets from its CDN).
 
 **Check:**
 
@@ -347,25 +354,38 @@ Swarm updates itself from an S3 bucket (ADR 0010). There is one channel, `stable
 
 **Install:**
 
-- The status bar shows **Update ready** with a **Restart to update** button. VoiceOver announces it once, as a status.
-- On **Restart to update**, or when the app quits normally, a helper takes over. The helper is a copy of `swarm` in the update folder. It waits until the app exits, moves the old bundle to the Trash, moves the new bundle to the same path, and opens it.
-- If the app folder is not writable, the app does not install. It shows **Download** instead, which opens the zip's URL.
+- The status bar shows **Update ready** with a **Restart to update** button and a **Release notes** link that opens `notes_url`. VoiceOver announces it once, as a status.
+- On **Restart to update**, or when the app quits normally, a helper takes over. The helper is a copy of `swarm` in the update folder, named `swarm-installer-<pid>` after the app's process id, with the log `install-<pid>.log` next to it. A second app never rewrites a helper that runs.
+- The helper trusts nothing it is given. It gets the version with `--version`. After the app has exited and the helper holds the lock, it checks everything again: the new bundle must be a folder directly inside `<cache root>/updates/<version>/` (links resolved) and pass the code signature check with that version; the old bundle must have the identifier `com.swarm.app` and a lower version. Any failed check refuses the install and exits non-zero.
+- The swap is atomic. `renamex_np` with `RENAME_SWAP` exchanges the new and the old bundle in one step, so there is never a moment without an app. Then the helper moves the old bundle, which now sits in the update folder, to the Trash. A swap that fails changes nothing. A swap across two volumes is not possible and fails with a clear message.
+- When any step fails, and the helper was started with reopen, the helper opens the old bundle again with plain `open`, so the person still has Swarm. It opens only a bundle with the identifier `com.swarm.app`. It writes the reason to `install-failed` in the version folder. On the next launch the app sees that file: it shows **Update failed: <reason>** with **Download** (opens `notes_url`) in place of **Restart to update** for that version, and it does not start the helper for it.
+- A lock keeps two apps and the helper apart. `prepare`, the clean-up of old updates and the helper each hold an exclusive `flock` on `<cache root>/updates/.lock`. The helper takes it after the wait for the app to exit.
+- The app removes the folders of `updates/<version>/` at or below the running version, once after launch, off the UI thread and under the lock. It touches nothing else.
+- If the app bundle or its folder is not writable, the app does not install. It shows **Download** instead, which opens `notes_url` (the release page, where the DMG is).
 
 **Daemon:**
 
 - The daemon's hello carries its build version as well as its protocol version.
-- When the new app finds an older daemon, it restarts the daemon at once if no agent is working. Otherwise it shows **Restart daemon** with the number of running agents, and restarts it only on confirmation. A restart ends every agent terminal (ADR 0001).
+- When the new app finds an older daemon, it restarts the daemon at once if no agent is working and no user terminal or process terminal runs. Otherwise it shows **Restart daemon** with the counts, for example `Daemon 1.1.0 · 2 agents, 1 terminal running`, and restarts it only on confirmation. A restart ends every terminal (ADR 0001). If **Restart daemon** fails, the sidebar shows the reason.
+- The restart stops a process only when its program is named `swarm-daemon` and it belongs to the same user. The folder does not matter, so a daemon of an app moved to the Trash can be stopped.
 - While the old daemon runs, the app talks to it if the protocol version is the same. If the protocol version differs, the app shows **Restart daemon** and nothing else works until the restart.
 
 **Publish (the person runs it, never an agent):**
 
-- `script/publish-update <version>` takes the stapled `Swarm.app` from `script/bundle-mac`, makes the zip, writes `latest.json`, and uploads both with the AWS CLI. It uploads the zip first and the manifest last.
+Release notes and `CHANGELOG.md` come from git-cliff (`cliff.toml`): `feat` PRs under **Added**, `fix` under **Fixed**, `perf` under **Faster**; `task` and the other types are left out. The PR title is the line, so it says what changed for the person using Swarm.
+
+1. `script/prepare-release <version>` on an up-to-date `main`: makes the branch `release-v<version>`, sets the workspace version in `Cargo.toml`, prepends the git-cliff section to `CHANGELOG.md` (`git cliff --unreleased --tag v<version> --prepend CHANGELOG.md`), commits `task(release): v<version>`, pushes and opens the PR. Without a version it prints the one `git cliff --bumped-version` suggests and stops.
+2. Merge the PR.
+3. `script/bundle-mac` on `main`.
+4. `script/publish-update <bundle folder>`: checks that `HEAD` is `origin/main` (or, to run a stopped release again, the commit of the `v<version>` tag), that the bundle's version is the workspace version and has no tag yet, and that the app is signed, notarized and stapled. It makes the zip and `latest.json`, tags `v<version>` and pushes the tag, creates the GitHub release as a draft with the notes from `git cliff --latest --strip all`, uploads `Swarm-<version>.zip`, `Swarm.dmg` and `latest.json`, and then publishes the release. It never deletes a release or a tag.
+
+The first release, `v1.0.0`, gets a short hand-written note (`--notes-file`) instead of every PR so far. `publish-update` stops when there is no earlier `v*` tag and no `--notes-file`. git-cliff takes over from the next release.
 
 **Not in v1:** delta updates, a beta channel, Intel builds.
 
 ### Websites
 
-- **Product website**: one page (designed on the canvas, Website page): hero with a workspace preview, three steps with app screenshots, features, harness, download. It uses the "hero left" board. The source is plain HTML and CSS in `site/`, with no build step. `.github/workflows/pages.yml` publishes it to GitHub Pages when `site/` changes on `main`. **Download for macOS** links to the latest GitHub release until the S3 bucket exists.
+- **Product website**: one page (designed on the canvas, Website page): hero with a workspace preview, three steps with app screenshots, features, harness, download. It uses the "hero left" board. The source is plain HTML and CSS in `site/`, with no build step. `.github/workflows/pages.yml` publishes it to GitHub Pages when `site/` changes on `main`. **Download for macOS** links to the latest GitHub release.
 - **Docs website**: every explanation that the app leaves out by design, plus the harness reference. It is a Starlight (Astro) site in `docs-site/`, with its own `package.json` and Node version (`docs-site/.node-version`). The same workflow builds it and serves it under `/docs/` next to the product website. **Swarm Help** in the app opens it.
 
 ### Project config
