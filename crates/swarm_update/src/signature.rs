@@ -13,7 +13,7 @@ use security_framework::os::macos::code_signing::{Flags, SecCode, SecRequirement
 use crate::{Error, Result, Version};
 
 /// Code identifier of `Swarm.app` (its bundle identifier).
-const APP_IDENTIFIER: &str = "com.swarm.app";
+pub(crate) const APP_IDENTIFIER: &str = "com.swarm.app";
 
 /// The Developer ID team that signs Swarm.
 const TEAM: &str = "P2DG27TUTZ";
@@ -82,8 +82,13 @@ fn check_bundle_version(app: &Path, expected: &Version) -> Result<()> {
 }
 
 fn bundle_version(app: &Path) -> Option<String> {
+    bundle_string(app, "CFBundleShortVersionString")
+}
+
+/// A text value of the bundle's `Info.plist`.
+pub(crate) fn bundle_string(app: &Path, key: &'static str) -> Option<String> {
     let bundle = CFBundle::new(CFURL::from_path(app, true)?)?;
-    let key = CFString::from_static_string("CFBundleShortVersionString");
+    let key = CFString::from_static_string(key);
     let value = bundle
         .info_dictionary()
         .find(&key)?
@@ -265,6 +270,25 @@ mod tests {
         let app = bundle(&folder, "3.4.5", false);
 
         assert_eq!(bundle_version(&app).as_deref(), Some("3.4.5"));
+    }
+
+    #[test]
+    fn the_bundle_identifier_is_read_from_the_plist() {
+        let folder = TempFolder::new("identifier");
+        let app = bundle(&folder, "3.4.5", false);
+
+        assert_eq!(
+            bundle_string(&app, "CFBundleIdentifier").as_deref(),
+            Some(APP_IDENTIFIER)
+        );
+    }
+
+    #[test]
+    fn a_missing_key_is_none() {
+        let folder = TempFolder::new("missing-key");
+        let app = bundle(&folder, "3.4.5", false);
+
+        assert_eq!(bundle_string(&app, "NoSuchKey"), None);
     }
 
     #[test]

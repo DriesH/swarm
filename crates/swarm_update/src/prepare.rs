@@ -4,12 +4,20 @@ use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use sha2::{Digest as _, Sha256};
 
+use crate::lock::{UpdateLock, updates_folder};
 use crate::{Error, Fetcher, Manifest, Result, SignatureVerifier, Version, user_agent};
 
 const APP_NAME: &str = "Swarm.app";
+
+/// The file in a version folder where the install helper says why it failed.
+pub(crate) const FAILURE_FILE: &str = "install-failed";
+
+/// How long a download, or a clean-up, waits for another process in the update folders.
+const LOCK_WAIT: Duration = Duration::from_mins(15);
 
 /// A new `Swarm.app` that is downloaded and checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,30 +26,38 @@ pub struct Prepared {
     /// The checked `Swarm.app` in the update folder.
     pub app: PathBuf,
     pub notes_url: String,
+    /// Why the install helper failed to install this version before. The app must
+    /// not start it again for this version.
+    pub install_failure: Option<String>,
 }
 
 /// Makes the new `Swarm.app` ready in `<cache_root>/updates/<version>/`.
 ///
 /// A folder that holds a verified `Swarm.app` of that version is reused. Any
-/// other failure removes the folder and returns the error.
+/// other failure removes the folder and returns the error. Holds the lock on the
+/// update folders meanwhile.
 pub fn prepare(
     manifest: &Manifest,
     cache_root: &Path,
     fetcher: &impl Fetcher,
     verifier: &impl SignatureVerifier,
 ) -> Result<Prepared> {
-    let folder = cache_root
-        .join("updates")
-        .join(manifest.version.to_string());
+    let _lock = UpdateLock::acquire(cache_root, LOCK_WAIT)?;
+
+    let folder = updates_folder(cache_root).join(manifest.version.to_string());
     let app = folder.join(APP_NAME);
     let prepared = Prepared {
         version: manifest.version,
         app: app.clone(),
         notes_url: manifest.notes_url.clone(),
+        install_failure: None,
     };
 
     if app.is_dir() && verifier.verify(&app, &manifest.version).is_ok() {
-        return Ok(prepared);
+        return Ok(Prepared {
+            install_failure: read_failure(&folder),
+            ..prepared
+        });
     }
 
     // Whatever is left in the folder is from an attempt that did not finish.
@@ -57,6 +73,48 @@ pub fn prepare(
             Err(error)
         }
     }
+}
+
+/// The reason in the failure file of a version folder, if the file is there.
+fn read_failure(folder: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(folder.join(FAILURE_FILE)).ok()?;
+    let reason = text.lines().next().unwrap_or_default().trim();
+
+    Some(if reason.is_empty() {
+        "unknown reason".to_owned()
+    } else {
+        reason.to_owned()
+    })
+}
+
+/// Removes the update folders of versions at or below `running`: the app has
+/// installed them or never will. Anything else in `<cache_root>/updates/` stays.
+pub fn clean_up(cache_root: &Path, running: &Version) -> Result<()> {
+    let _lock = UpdateLock::acquire(cache_root, LOCK_WAIT)?;
+
+    let folder = updates_folder(cache_root);
+    let list_error = |error| Error::io("cannot list the update folders", error);
+
+    for entry in std::fs::read_dir(&folder).map_err(list_error)? {
+        let entry = entry.map_err(list_error)?;
+
+        let old_version = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<Version>().ok())
+            .is_some_and(|version| version <= *running);
+        // `file_type` does not follow a link, so a link is never removed through.
+        let is_folder = entry.file_type().is_ok_and(|kind| kind.is_dir());
+
+        if old_version
+            && is_folder
+            && let Err(error) = std::fs::remove_dir_all(entry.path())
+        {
+            log::warn!("cannot remove {}: {error}", entry.path().display());
+        }
+    }
+
+    Ok(())
 }
 
 fn fetch_and_unpack(
@@ -146,8 +204,8 @@ mod tests {
     use std::cell::{Cell, RefCell};
 
     use super::*;
-    use crate::SystemFetcher;
     use crate::test_support::{Reply, TempFolder, TestServer};
+    use crate::{SystemFetcher, UpdateLock};
 
     /// Records its calls and answers with a fixed result.
     struct FakeVerifier {
@@ -244,6 +302,7 @@ mod tests {
                 version: Version::new(1, 2, 0),
                 app: app.clone(),
                 notes_url: "https://example.test/notes".to_owned(),
+                install_failure: None,
             }
         );
         assert!(app.join("Contents/Info.plist").is_file());
@@ -432,6 +491,202 @@ mod tests {
         assert!(second.is_err());
         assert_eq!(server.requests().len(), asked + 1);
         assert!(!update_folder(&cache).exists());
+    }
+
+    /// Tries the update lock from inside the download, and downloads nothing.
+    struct LockProbe<'a> {
+        cache_root: &'a Path,
+        lock_result: RefCell<Option<Result<()>>>,
+    }
+
+    impl Fetcher for LockProbe<'_> {
+        fn get(&self, _: &str, _: &str) -> Result<Vec<u8>> {
+            Err(Error::Fetch("not used".to_owned()))
+        }
+
+        fn download(&self, _: &str, _: &str, _: &Path) -> Result<()> {
+            let attempt = UpdateLock::acquire(self.cache_root, Duration::from_millis(200));
+            *self.lock_result.borrow_mut() = Some(attempt.map(|_| ()));
+
+            Err(Error::Fetch("stop here".to_owned()))
+        }
+    }
+
+    #[test]
+    fn the_update_lock_is_held_while_the_download_runs() {
+        let cache = TempFolder::new("prepare-lock");
+        let server = TestServer::start([]);
+        let manifest = manifest_for(&server, b"zip");
+        let probe = LockProbe {
+            cache_root: cache.path(),
+            lock_result: RefCell::new(None),
+        };
+
+        prepare(&manifest, cache.path(), &probe, &FakeVerifier::accepting()).ok();
+
+        assert!(matches!(probe.lock_result.take(), Some(Err(Error::Busy))));
+    }
+
+    #[test]
+    fn the_update_lock_is_free_after_prepare() {
+        let zip = zip_of(&["Swarm.app"]);
+        let server = TestServer::start([("/Swarm-1.2.0.zip", Reply::Body(zip.clone()))]);
+        let cache = TempFolder::new("prepare-lock-free");
+
+        prepare(
+            &manifest_for(&server, &zip),
+            cache.path(),
+            &SystemFetcher::loopback(),
+            &FakeVerifier::accepting(),
+        )
+        .expect("prepared");
+
+        assert!(UpdateLock::acquire(cache.path(), Duration::from_millis(200)).is_ok());
+    }
+
+    #[test]
+    fn a_failure_file_in_a_reused_folder_is_reported() {
+        let zip = zip_of(&["Swarm.app"]);
+        let server = TestServer::start([("/Swarm-1.2.0.zip", Reply::Body(zip.clone()))]);
+        let cache = TempFolder::new("prepare-failure");
+        let manifest = manifest_for(&server, &zip);
+        prepare(
+            &manifest,
+            cache.path(),
+            &SystemFetcher::loopback(),
+            &FakeVerifier::accepting(),
+        )
+        .expect("first");
+        std::fs::write(
+            update_folder(&cache).join(FAILURE_FILE),
+            "cannot swap the app\nmore\n",
+        )
+        .expect("failure file");
+
+        let second = prepare(
+            &manifest,
+            cache.path(),
+            &SystemFetcher::loopback(),
+            &FakeVerifier::accepting(),
+        )
+        .expect("second");
+
+        assert_eq!(
+            second.install_failure.as_deref(),
+            Some("cannot swap the app")
+        );
+    }
+
+    #[test]
+    fn an_empty_failure_file_still_reports_a_failure() {
+        let folder = TempFolder::new("failure-empty");
+        std::fs::write(folder.path().join(FAILURE_FILE), "\n").expect("failure file");
+
+        assert_eq!(
+            read_failure(folder.path()).as_deref(),
+            Some("unknown reason")
+        );
+    }
+
+    #[test]
+    fn a_folder_without_a_failure_file_reports_none() {
+        let folder = TempFolder::new("failure-none");
+
+        assert_eq!(read_failure(folder.path()), None);
+    }
+
+    #[test]
+    fn a_fresh_download_has_no_failure() {
+        let zip = zip_of(&["Swarm.app"]);
+        let server = TestServer::start([("/Swarm-1.2.0.zip", Reply::Body(zip.clone()))]);
+        let cache = TempFolder::new("prepare-fresh");
+
+        let prepared = prepare(
+            &manifest_for(&server, &zip),
+            cache.path(),
+            &SystemFetcher::loopback(),
+            &FakeVerifier::accepting(),
+        )
+        .expect("prepared");
+
+        assert_eq!(prepared.install_failure, None);
+    }
+
+    fn make_update_folder(cache: &TempFolder, name: &str) {
+        let app = cache.path().join("updates").join(name).join("Swarm.app");
+        std::fs::create_dir_all(&app).expect("update folder");
+        std::fs::write(app.join("mark"), name).expect("mark");
+    }
+
+    fn update_folders(cache: &TempFolder) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(cache.path().join("updates"))
+            .expect("updates")
+            .map(|entry| entry.expect("entry").file_name().to_string_lossy().into())
+            .collect();
+        names.sort();
+
+        names
+    }
+
+    #[test]
+    fn clean_up_removes_versions_at_or_below_the_running_one() {
+        let cache = TempFolder::new("clean-versions");
+        for name in ["1.0.0", "1.1.0", "1.2.0", "1.10.0"] {
+            make_update_folder(&cache, name);
+        }
+
+        clean_up(cache.path(), &Version::new(1, 2, 0)).expect("clean up");
+
+        assert_eq!(update_folders(&cache), [".lock", "1.10.0"]);
+    }
+
+    #[test]
+    fn clean_up_keeps_what_is_not_a_version_folder() {
+        let cache = TempFolder::new("clean-others");
+        make_update_folder(&cache, "1.0.0");
+        make_update_folder(&cache, "notes");
+        std::fs::write(cache.path().join("updates/0.1.0"), "a file").expect("file");
+
+        clean_up(cache.path(), &Version::new(2, 0, 0)).expect("clean up");
+
+        assert_eq!(update_folders(&cache), [".lock", "0.1.0", "notes"]);
+    }
+
+    #[test]
+    fn clean_up_does_not_follow_a_link_out_of_the_updates_folder() {
+        let cache = TempFolder::new("clean-link");
+        let outside = TempFolder::new("clean-outside");
+        std::fs::write(outside.path().join("keep"), "x").expect("file");
+        std::fs::create_dir_all(cache.path().join("updates")).expect("updates");
+        std::os::unix::fs::symlink(outside.path(), cache.path().join("updates/1.0.0"))
+            .expect("link");
+
+        clean_up(cache.path(), &Version::new(2, 0, 0)).expect("clean up");
+
+        assert!(outside.path().join("keep").is_file());
+    }
+
+    #[test]
+    fn clean_up_waits_for_the_update_lock() {
+        let cache = TempFolder::new("clean-lock");
+        make_update_folder(&cache, "1.0.0");
+        let held = UpdateLock::acquire(cache.path(), Duration::from_secs(1)).expect("lock");
+
+        let root = cache.path().to_owned();
+        let cleaner = std::thread::spawn(move || clean_up(&root, &Version::new(2, 0, 0)));
+        std::thread::park_timeout(Duration::from_millis(400));
+
+        assert!(cache.path().join("updates/1.0.0").is_dir());
+        drop(held);
+        cleaner.join().expect("thread").expect("clean up");
+        assert!(!cache.path().join("updates/1.0.0").exists());
+    }
+
+    #[test]
+    fn clean_up_with_no_updates_folder_is_fine() {
+        let cache = TempFolder::new("clean-empty");
+
+        assert!(clean_up(cache.path(), &Version::new(1, 0, 0)).is_ok());
     }
 
     #[test]

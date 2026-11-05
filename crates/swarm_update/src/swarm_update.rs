@@ -9,26 +9,36 @@
 //! 3. For an [`Offer::Available`], [`prepare`] downloads, checks and unpacks the
 //!    new `Swarm.app`.
 //! 4. On restart, [`launch_helper`] starts `swarm update-install`. The helper
-//!    calls [`install`] after the app has exited.
+//!    calls [`install`] after the app has exited. It checks the new app, the old
+//!    app and the place of the new app again, swaps the two in one step and
+//!    opens the old app again if anything fails.
+//! 5. [`clean_up`] removes the folders of versions that are installed.
+//!
+//! [`prepare`], [`clean_up`] and [`install`] hold the [`UpdateLock`], so two
+//! apps never work in `<cache root>/updates/` at the same time.
 //!
 //! Every function blocks. The app calls them from a background thread.
 
 mod fetch;
 mod install;
+mod lock;
 mod manifest;
 mod prepare;
 mod signature;
 
+use std::ffi::OsStr;
 use std::io;
+use std::path::{Path, PathBuf};
 
 use objc2_foundation::NSProcessInfo;
 
 pub use crate::fetch::{Fetcher, SystemFetcher};
 pub use crate::install::{
-    InstallRequest, InstallSteps, SystemSteps, can_replace, install, launch_helper,
+    BundleInfo, InstallRequest, InstallSteps, SystemSteps, can_replace, install, launch_helper,
 };
+pub use crate::lock::UpdateLock;
 pub use crate::manifest::{Manifest, Offer, Version, VersionParseError, evaluate, parse_manifest};
-pub use crate::prepare::{Prepared, prepare};
+pub use crate::prepare::{Prepared, clean_up, prepare};
 pub use crate::signature::{DeveloperIdVerifier, RunningBuild, SignatureVerifier, running_build};
 
 /// Where the app reads the manifest. GitHub redirects it to the newest release.
@@ -57,6 +67,8 @@ pub enum Error {
     Signature(String),
     #[error("cannot install: {0}")]
     Install(String),
+    #[error("another update is in progress")]
+    Busy,
     #[error("{context}: {source}")]
     Io { context: String, source: io::Error },
 }
@@ -70,6 +82,20 @@ impl Error {
             source,
         }
     }
+}
+
+/// `~/Library/Caches/Swarm`, where downloaded updates wait. `None` without `HOME`.
+pub fn cache_root() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+
+    cache_root_in(&home)
+}
+
+fn cache_root_in(home: &OsStr) -> Option<PathBuf> {
+    let home = Path::new(home);
+
+    home.is_absolute()
+        .then(|| home.join("Library/Caches/Swarm"))
 }
 
 /// The only thing a request to GitHub says about us: `Swarm/<version>`.
@@ -255,6 +281,20 @@ mod tests {
     #[test]
     fn the_user_agent_carries_only_the_app_version() {
         assert_eq!(user_agent(), format!("Swarm/{}", env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn the_cache_root_is_under_the_home_folder() {
+        assert_eq!(
+            cache_root_in(OsStr::new("/Users/me")),
+            Some(PathBuf::from("/Users/me/Library/Caches/Swarm"))
+        );
+    }
+
+    #[test]
+    fn a_home_that_is_not_absolute_gives_no_cache_root() {
+        assert_eq!(cache_root_in(OsStr::new("")), None);
+        assert_eq!(cache_root_in(OsStr::new("relative")), None);
     }
 
     #[test]

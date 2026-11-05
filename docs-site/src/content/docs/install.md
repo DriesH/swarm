@@ -54,7 +54,9 @@ Swarm downloads the new version in the background and checks its signature. The 
 
 An unsigned build, such as one you built yourself, never updates. If Swarm cannot replace itself in its folder, the button reads **Download** and opens the release page.
 
-After an update, the daemon restarts when no agent works. Else Swarm shows **Restart daemon**, and the daemon restarts only when you confirm. A restart stops every agent terminal.
+Before it swaps the apps, the installer checks the new app and the old app again. If anything fails, your old Swarm opens again. The status bar then shows **Update failed** with the reason, and the button reads **Download** for that version. Swarm removes the downloads of versions that you run already.
+
+After an update, the daemon restarts when no agent works and no terminal runs. Else Swarm shows **Restart daemon**, and the daemon restarts only when you confirm. A restart stops every terminal.
 
 ## The background daemon
 

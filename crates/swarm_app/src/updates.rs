@@ -42,6 +42,9 @@ pub(crate) trait UpdateSource: Send + Sync + 'static {
 
     /// The macOS this process runs on.
     fn macos(&self) -> Version;
+
+    /// Removes the downloads of versions up to the running one.
+    fn clean_up(&self, running: &Version);
 }
 
 /// The real source: GitHub Releases, checked with the Developer ID requirement.
@@ -68,6 +71,12 @@ where
 
     fn macos(&self) -> Version {
         macos_version()
+    }
+
+    fn clean_up(&self, running: &Version) {
+        if let Err(error) = swarm_update::clean_up(&self.cache_root, running) {
+            log::warn!("cannot clean up old updates: {error}");
+        }
     }
 }
 
@@ -133,7 +142,10 @@ impl UpdateState {
             Self::Idle => "Up to date".into(),
             Self::Checking => "Checking\u{2026}".into(),
             Self::Downloading(version) => format!("Downloading {version}\u{2026}").into(),
-            Self::Ready(prepared) => format!("Update ready: {}", prepared.version).into(),
+            Self::Ready(prepared) => match &prepared.install_failure {
+                Some(reason) => format!("Update failed: {}", shorten(reason)).into(),
+                None => format!("Update ready: {}", prepared.version).into(),
+            },
             Self::Failed(reason) => format!("Check failed: {reason}").into(),
             Self::NeedsMacos { version, needs } => {
                 format!("Swarm {version} needs macOS {}", macos_text(*needs)).into()
@@ -154,7 +166,11 @@ fn macos_text(version: Version) -> String {
 
 /// The first line of the error, cut short.
 fn short_reason(error: &swarm_update::Error) -> SharedString {
-    let text = error.to_string();
+    shorten(&error.to_string())
+}
+
+/// The first line of the text, cut short.
+fn shorten(text: &str) -> SharedString {
     let line = text.lines().next().unwrap_or_default();
 
     if line.chars().count() <= REASON_LIMIT {
@@ -219,20 +235,37 @@ impl Updater {
         }
     }
 
-    /// Checks 30 seconds from now, then every 6 hours, while the setting is on.
+    /// Cleans up 30 seconds from now, and checks then and every 6 hours, while the
+    /// setting is on.
     fn start(&mut self, cx: &mut Context<Self>) {
         self.schedule = Some(cx.spawn(async move |this, cx| {
-            let mut wait = FIRST_CHECK;
+            cx.background_executor().timer(FIRST_CHECK).await;
+            if this.update(cx, Self::clean_up).is_err() {
+                return;
+            }
 
             loop {
-                cx.background_executor().timer(wait).await;
-                wait = CHECK_EVERY;
-
                 if this.update(cx, Self::scheduled_check).is_err() {
                     break;
                 }
+
+                cx.background_executor().timer(CHECK_EVERY).await;
             }
         }));
+    }
+
+    /// Removes the downloads of versions up to the running one. A build that cannot
+    /// update has none.
+    fn clean_up(&mut self, cx: &mut Context<Self>) {
+        if self.state == UpdateState::Unsigned {
+            return;
+        }
+
+        let source = Arc::clone(&self.source);
+        let running = self.build.version;
+
+        cx.background_spawn(async move { source.clean_up(&running) })
+            .detach();
     }
 
     fn scheduled_check(&mut self, cx: &mut Context<Self>) {
@@ -321,11 +354,13 @@ impl Updater {
     fn prepared(&mut self, prepared: swarm_update::Result<Prepared>, cx: &mut Context<Self>) {
         self.state = match prepared {
             Ok(prepared) => {
-                self.replaceable = self
-                    .build
-                    .bundle
-                    .as_deref()
-                    .is_some_and(|bundle| self.host.can_replace(bundle));
+                // A version that failed to install once is not tried again.
+                self.replaceable = prepared.install_failure.is_none()
+                    && self
+                        .build
+                        .bundle
+                        .as_deref()
+                        .is_some_and(|bundle| self.host.can_replace(bundle));
 
                 UpdateState::Ready(prepared)
             }
@@ -405,7 +440,7 @@ pub(crate) fn updater(cx: &App) -> Option<Entity<Updater>> {
 
 /// Starts the updater of the running app: GitHub Releases and the Developer ID check.
 pub(crate) fn install(workspace: Entity<Workspace>, cx: &mut App) {
-    let Some(home) = std::env::var_os("HOME") else {
+    let Some(cache_root) = swarm_update::cache_root() else {
         log::warn!("no HOME, so no updates");
         return;
     };
@@ -413,7 +448,7 @@ pub(crate) fn install(workspace: Entity<Workspace>, cx: &mut App) {
     let source = SystemSource {
         fetcher: SystemFetcher::new(),
         verifier: DeveloperIdVerifier,
-        cache_root: PathBuf::from(home).join("Library/Caches/Swarm"),
+        cache_root,
     };
 
     start(
@@ -470,6 +505,8 @@ pub(crate) struct ReadyUpdate {
     pub(crate) notes_url: SharedString,
     /// The app can replace itself. Else the button opens the release notes.
     pub(crate) replaceable: bool,
+    /// Why the install of this version failed before.
+    pub(crate) failure: Option<SharedString>,
 }
 
 pub(crate) fn ready(cx: &App) -> Option<ReadyUpdate> {
@@ -480,6 +517,7 @@ pub(crate) fn ready(cx: &App) -> Option<ReadyUpdate> {
         UpdateState::Ready(prepared) => Some(ReadyUpdate {
             notes_url: prepared.notes_url.clone().into(),
             replaceable: updater.replaceable,
+            failure: prepared.install_failure.as_deref().map(shorten),
         }),
         _ => None,
     }
@@ -514,6 +552,15 @@ pub(crate) mod tests {
             version,
             app: PathBuf::from(format!("/cache/updates/{version}/Swarm.app")),
             notes_url: format!("{REPO_PREFIX}releases/tag/v{version}"),
+            install_failure: None,
+        }
+    }
+
+    /// A download whose install failed before.
+    pub(crate) fn failed_install(version: Version, reason: &str) -> Prepared {
+        Prepared {
+            install_failure: Some(reason.to_owned()),
+            ..prepared(version)
         }
     }
 
@@ -527,6 +574,7 @@ pub(crate) mod tests {
         prepares: Mutex<VecDeque<swarm_update::Result<Prepared>>>,
         pub(crate) fetches: AtomicUsize,
         pub(crate) macos: Version,
+        cleanups: Mutex<Vec<Version>>,
     }
 
     impl FakeSource {
@@ -539,7 +587,23 @@ pub(crate) mod tests {
                 prepares: Mutex::new(prepares.into()),
                 fetches: AtomicUsize::new(0),
                 macos: Version::new(15, 0, 0),
+                cleanups: Mutex::new(Vec::new()),
             })
+        }
+
+        /// A release 1.2.0 that downloads fine, but failed to install before.
+        pub(crate) fn with_failed_install(reason: &str) -> Arc<Self> {
+            let version = Version::new(1, 2, 0);
+
+            Self::new(
+                vec![Ok(manifest(version, Version::new(13, 0, 0)))],
+                vec![Ok(failed_install(version, reason))],
+            )
+        }
+
+        /// The running versions the updater asked to clean up for.
+        fn cleaned_up(&self) -> Vec<Version> {
+            self.cleanups.lock().expect("cleanups").clone()
         }
 
         /// A release 1.2.0 that downloads fine.
@@ -578,6 +642,10 @@ pub(crate) mod tests {
 
         fn macos(&self) -> Version {
             self.macos
+        }
+
+        fn clean_up(&self, running: &Version) {
+            self.cleanups.lock().expect("cleanups").push(*running);
         }
     }
 
@@ -727,6 +795,51 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    fn old_downloads_are_cleaned_up_after_the_first_delay(cx: &mut TestAppContext) {
+        let source = FakeSource::new(Vec::new(), Vec::new());
+        let _updater = updater_with(&source, &FakeHost::new(true), signed_build(), cx);
+
+        pass(FIRST_CHECK.saturating_sub(Duration::from_secs(1)), cx);
+        let before = source.cleaned_up();
+        pass(Duration::from_secs(1), cx);
+
+        assert_eq!(before, []);
+        assert_eq!(source.cleaned_up(), [RUNNING]);
+    }
+
+    #[gpui::test]
+    fn old_downloads_are_cleaned_up_once_per_launch(cx: &mut TestAppContext) {
+        let source = FakeSource::new(Vec::new(), Vec::new());
+        let _updater = updater_with(&source, &FakeHost::new(true), signed_build(), cx);
+
+        pass(FIRST_CHECK, cx);
+        pass(CHECK_EVERY, cx);
+
+        assert_eq!(source.cleaned_up(), [RUNNING]);
+    }
+
+    #[gpui::test]
+    fn old_downloads_are_cleaned_up_with_auto_check_off(cx: &mut TestAppContext) {
+        cx.update(|cx| crate::settings::change_updates(|updates| updates.auto_check = false, cx));
+        let source = FakeSource::new(Vec::new(), Vec::new());
+        let _updater = updater_with(&source, &FakeHost::new(true), signed_build(), cx);
+
+        pass(FIRST_CHECK, cx);
+
+        assert_eq!(source.cleaned_up(), [RUNNING]);
+    }
+
+    #[gpui::test]
+    fn an_unsigned_build_cleans_up_nothing(cx: &mut TestAppContext) {
+        let source = FakeSource::new(Vec::new(), Vec::new());
+        let _updater = updater_with(&source, &FakeHost::new(true), unsigned_build(), cx);
+
+        pass(FIRST_CHECK, cx);
+
+        assert_eq!(source.cleaned_up(), []);
+    }
+
+    #[gpui::test]
     fn scheduled_checks_stop_when_auto_check_is_off(cx: &mut TestAppContext) {
         cx.update(|cx| crate::settings::change_updates(|updates| updates.auto_check = false, cx));
         let source = FakeSource::new(Vec::new(), Vec::new());
@@ -799,6 +912,10 @@ pub(crate) mod tests {
                 "Downloading 1.2.0\u{2026}",
             ),
             (UpdateState::Ready(prepared(version)), "Update ready: 1.2.0"),
+            (
+                UpdateState::Ready(failed_install(version, "cannot swap the apps")),
+                "Update failed: cannot swap the apps",
+            ),
             (
                 UpdateState::NeedsMacos {
                     version,
@@ -970,6 +1087,68 @@ pub(crate) mod tests {
             cx.opened_url().as_deref(),
             Some("https://github.com/DriesH/swarm/releases/tag/v1.2.0")
         );
+    }
+
+    #[gpui::test]
+    fn an_update_that_failed_to_install_opens_the_release_notes_and_starts_no_helper(
+        cx: &mut TestAppContext,
+    ) {
+        let source = FakeSource::with_failed_install("the signature is wrong");
+        let host = FakeHost::new(true);
+        let updater = updater_with(&source, &host, signed_build(), cx);
+        check(&updater, cx);
+
+        updater.update(cx, Updater::restart_to_update);
+
+        assert!(host.launches.borrow().is_empty());
+        assert_eq!(host.quits.get(), 0);
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some("https://github.com/DriesH/swarm/releases/tag/v1.2.0")
+        );
+    }
+
+    #[gpui::test]
+    fn the_ready_update_carries_the_reason_of_a_failed_install(cx: &mut TestAppContext) {
+        cx.update(swarm_ui::init);
+        let (workspace, cx) = cx.add_window_view(Workspace::with_sample);
+        let source = FakeSource::with_failed_install("the signature is wrong");
+        let host = FakeHost::new(true);
+        let updater =
+            cx.update(|_, cx| install_fake(&workspace, &source, &host, signed_build(), cx));
+        updater.update(cx, Updater::check);
+        cx.run_until_parked();
+
+        let ready = cx.update(|_, cx| ready(cx)).expect("ready");
+
+        assert_eq!(ready.failure.as_deref(), Some("the signature is wrong"));
+        assert!(!ready.replaceable);
+    }
+
+    #[gpui::test]
+    fn quitting_with_an_update_that_failed_to_install_starts_no_helper(cx: &mut TestAppContext) {
+        let source = FakeSource::with_failed_install("the signature is wrong");
+        let host = FakeHost::new(true);
+        let updater = updater_with(&source, &host, signed_build(), cx);
+        check(&updater, cx);
+
+        cx.update(App::shutdown);
+
+        assert!(host.launches.borrow().is_empty());
+    }
+
+    #[gpui::test]
+    fn a_failed_install_shows_its_reason_in_the_status_and_cannot_replace(cx: &mut TestAppContext) {
+        let source = FakeSource::with_failed_install("the signature is wrong");
+        let updater = updater_with(&source, &FakeHost::new(true), signed_build(), cx);
+        check(&updater, cx);
+
+        let (state, replaceable) = updater.read_with(cx, |updater, _| {
+            (updater.state.status(), updater.replaceable)
+        });
+
+        assert_eq!(state, "Update failed: the signature is wrong");
+        assert!(!replaceable);
     }
 
     #[gpui::test]

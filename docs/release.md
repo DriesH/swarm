@@ -70,7 +70,7 @@ A release is a GitHub release of `DriesH/swarm` (ADR 0011). Installed apps find 
 
 For the first release, pass `--notes-file <file>` to `publish-update` with a short hand-written note.
 
-If `publish-update` stops halfway, the release stays a draft and the app does not see it. Fix the cause and run it again: it reuses its own draft and tag.
+If `publish-update` stops halfway, the release stays a draft and the app does not see it. Fix the cause and run it again: it reuses its own draft and tag. If it stopped after tagging, check out the tag (`git checkout v1.2.0`) and run it again: the script accepts `HEAD` at the commit of the tag even when `origin/main` has moved on.
 
 ## Entitlements
 
@@ -90,6 +90,26 @@ Add `crates/swarm_app/resources/Swarm.entitlements` and pass `--entitlements` in
 ```sh
 cargo run -p app_icon -- --png assets/app-icon/icon-1024.png
 ```
+
+### The macOS 26 icon
+
+macOS 26 and later show an icon that is not in Apple's new format small, on a gray tile. That icon is `assets/app-icon/Swarm.icon`, made in Icon Composer (it comes with Xcode 26 and later). `script/bundle-mac` compiles it with `actool` into `Assets.car` and sets `CFBundleIconName`. `Swarm.icns` stays the icon of macOS 13 to 15. Without `Swarm.icon`, the script prints a note and makes the app with `Swarm.icns` only.
+
+Make or update `Swarm.icon` after the sprite changes:
+
+1. Write the two layers:
+
+   ```sh
+   mkdir -p target/icon-layers
+   cargo run -p app_icon -- --layer background target/icon-layers/background.png
+   cargo run -p app_icon -- --layer bee target/icon-layers/bee.png
+   ```
+
+2. Open Icon Composer (Xcode › Open Developer Tool › Icon Composer) and make a new icon.
+3. Drag `background.png` in as the bottom layer and `bee.png` as the layer above it. Both are 1024 px and full bleed, so do not move or scale them.
+4. On the bee layer, turn off the glass effects (specular and blur) and the shadow, so the pixel edges stay hard. The background layer draws its own shadow under the bee.
+5. Check the preview in the light, dark and tinted appearances.
+6. Save it as `assets/app-icon/Swarm.icon` and commit it.
 
 ## Known limits
 

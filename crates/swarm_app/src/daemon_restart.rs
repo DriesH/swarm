@@ -2,7 +2,10 @@
 //! Restart daemon dialog and the restart itself.
 
 use gpui::{AppContext as _, Context, EventEmitter, FocusHandle, Window, div, px};
-use swarm_protocol::{AgentInfo, AgentLifecycle, AgentStatus, Client, ClientError, ProjectInfo};
+use swarm_protocol::{
+    AgentInfo, AgentLifecycle, AgentStatus, Client, ClientError, ProjectInfo, TerminalInfo,
+    TerminalKind,
+};
 use swarm_ui::prelude::*;
 
 use crate::palette::Overlay;
@@ -12,6 +15,8 @@ use crate::workspace::Workspace;
 const APP_BUILD: &str = env!("CARGO_PKG_VERSION");
 const LINE_WITH_RESUME: &str =
     "Every agent terminal stops. Agents with a saved conversation can resume.";
+const LINE_WITH_TERMINALS: &str =
+    "Every terminal stops. Agents with a saved conversation can resume.";
 const LINE: &str = "Every agent terminal stops.";
 
 /// A daemon the app should replace.
@@ -22,6 +27,9 @@ pub(crate) struct StaleDaemon {
     /// How many agents run. `None` when the app cannot talk to the daemon, so it
     /// cannot count them.
     pub(crate) running: Option<usize>,
+    /// How many user terminals and process terminals run. Zero when the app cannot
+    /// count them.
+    pub(crate) terminals: usize,
 }
 
 impl StaleDaemon {
@@ -31,10 +39,12 @@ impl StaleDaemon {
             ClientError::Version { build, .. } => Some(Self {
                 build: build.clone(),
                 running: None,
+                terminals: 0,
             }),
             ClientError::Incompatible => Some(Self {
                 build: None,
                 running: None,
+                terminals: 0,
             }),
             _ => None,
         }
@@ -43,30 +53,50 @@ impl StaleDaemon {
     /// The sidebar's status text, for a daemon the app still works with.
     pub(crate) fn status(&self) -> Option<String> {
         let (build, running) = (self.build.as_ref()?, self.running?);
-        let agents = if running == 1 { "agent" } else { "agents" };
 
-        Some(format!("Daemon {build} \u{b7} {running} {agents} running"))
+        let mut counts = Vec::new();
+        if running > 0 {
+            let agents = if running == 1 { "agent" } else { "agents" };
+            counts.push(format!("{running} {agents}"));
+        }
+        if self.terminals > 0 {
+            let terminals = if self.terminals == 1 {
+                "terminal"
+            } else {
+                "terminals"
+            };
+            counts.push(format!("{} {terminals}", self.terminals));
+        }
+
+        Some(format!(
+            "Daemon {build} \u{b7} {} running",
+            counts.join(", ")
+        ))
     }
 
     fn dialog_line(&self) -> &'static str {
-        if self.running.is_some() {
-            LINE_WITH_RESUME
-        } else {
+        if self.running.is_none() {
             LINE
+        } else if self.terminals > 0 {
+            LINE_WITH_TERMINALS
+        } else {
+            LINE_WITH_RESUME
         }
     }
 }
 
-/// What the daemon's agents are doing, from the projects it listed.
+/// What the daemon is running, from the projects and terminals it listed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AgentLoad {
     running: usize,
-    /// An agent works or starts, so a restart would cut it off.
+    /// User terminals and process terminals that run.
+    terminals: usize,
+    /// An agent works or starts, or a terminal runs: a restart would cut it off.
     busy: bool,
 }
 
 impl AgentLoad {
-    fn of(projects: &[ProjectInfo]) -> Self {
+    fn of(projects: &[ProjectInfo], terminals: &[TerminalInfo]) -> Self {
         let agents = projects.iter().flat_map(|project| {
             let tasks = project.tasks.iter().flat_map(|task| task.agents.iter());
 
@@ -75,8 +105,13 @@ impl AgentLoad {
 
         let mut load = Self {
             running: 0,
+            terminals: terminals
+                .iter()
+                .filter(|terminal| terminal.kind != TerminalKind::Agent && terminal.exit.is_none())
+                .count(),
             busy: false,
         };
+        load.busy = load.terminals > 0;
         for agent in agents {
             load.add(agent);
         }
@@ -205,12 +240,14 @@ impl Render for RestartDaemonDialog {
 
 impl Workspace {
     /// Looks at the build of the daemon just connected. An older one is replaced at
-    /// once when no agent works, and offered for replacement otherwise. Returns true
+    /// once when no agent works and no terminal runs, and offered for replacement
+    /// otherwise. Returns true
     /// when the restart began, so the caller drops the connection.
     pub(crate) fn check_daemon_build(
         &mut self,
         client: &Client,
         projects: &[ProjectInfo],
+        terminals: &[TerminalInfo],
         cx: &mut Context<Self>,
     ) -> bool {
         self.stale_daemon = None;
@@ -221,7 +258,7 @@ impl Workspace {
             return false;
         }
 
-        let load = AgentLoad::of(projects);
+        let load = AgentLoad::of(projects, terminals);
         if !load.busy {
             log::info!("the daemon is build {build}, the app {APP_BUILD}: restarting it");
             self.restart_daemon(cx);
@@ -232,6 +269,7 @@ impl Workspace {
         self.stale_daemon = Some(StaleDaemon {
             build: Some(build.to_owned()),
             running: Some(load.running),
+            terminals: load.terminals,
         });
         cx.notify();
 
@@ -290,13 +328,14 @@ mod tests {
 
     use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext};
     use swarm_protocol::{
-        AgentStatus as DaemonAgentStatus, Event, Host, Paths, Request, Signal, VERSION, read, write,
+        AgentStatus as DaemonAgentStatus, Event, Host, Paths, Request, Signal,
+        TerminalKind as DaemonKind, VERSION, read, write,
     };
 
     use super::*;
     use crate::daemon::{
         DaemonLaunch,
-        tests::{agent_info, default_reply, project_info, redraw, task_info},
+        tests::{agent_info, default_reply, info, project_info, redraw, task_info},
     };
     use crate::workspace::DataSource;
 
@@ -330,6 +369,10 @@ mod tests {
             Some(PathBuf::from(self.program))
         }
 
+        fn is_ours(&self, _: u32) -> bool {
+            true
+        }
+
         fn is_running(&self, pid: u32) -> bool {
             !self
                 .signals
@@ -351,6 +394,15 @@ mod tests {
     /// A daemon that serves one connection per entry of `builds`, in order, each with
     /// that build and the same projects. A version of `None` uses the protocol's own.
     fn fake_daemon(builds: Vec<(&'static str, Option<u32>)>, projects: Vec<ProjectInfo>) -> Paths {
+        fake_daemon_with_terminals(builds, projects, Vec::new())
+    }
+
+    /// Like [`fake_daemon`], and lists `terminals` too.
+    fn fake_daemon_with_terminals(
+        builds: Vec<(&'static str, Option<u32>)>,
+        projects: Vec<ProjectInfo>,
+        terminals: Vec<TerminalInfo>,
+    ) -> Paths {
         let folder = PathBuf::from(format!(
             "/tmp/swd-{}-{}",
             std::process::id(),
@@ -368,9 +420,9 @@ mod tests {
                 let Ok((stream, _)) = listener.accept() else {
                     return;
                 };
-                let projects = projects.clone();
+                let (projects, terminals) = (projects.clone(), terminals.clone());
 
-                std::thread::spawn(move || serve(stream, build, version, &projects));
+                std::thread::spawn(move || serve(stream, build, version, &projects, &terminals));
             }
         });
 
@@ -382,6 +434,7 @@ mod tests {
         build: &str,
         version: Option<u32>,
         projects: &[ProjectInfo],
+        terminals: &[TerminalInfo],
     ) {
         let Ok(clone) = stream.try_clone() else {
             return;
@@ -422,6 +475,10 @@ mod tests {
                 Request::ListProjects { call } => Some(Event::Projects {
                     call,
                     projects: projects.to_vec(),
+                }),
+                Request::List { call } => Some(Event::Terminals {
+                    call,
+                    terminals: terminals.to_vec(),
                 }),
                 other => default_reply(&other),
             };
@@ -518,6 +575,7 @@ mod tests {
         let stale = StaleDaemon {
             build: Some("1.1.0".to_owned()),
             running: Some(3),
+            terminals: 0,
         };
 
         assert_eq!(
@@ -531,6 +589,7 @@ mod tests {
         let stale = StaleDaemon {
             build: Some("1.1.0".to_owned()),
             running: Some(1),
+            terminals: 0,
         };
 
         assert_eq!(
@@ -540,23 +599,78 @@ mod tests {
     }
 
     #[test]
+    fn the_status_text_counts_the_terminals_after_the_agents() {
+        let stale = StaleDaemon {
+            build: Some("1.1.0".to_owned()),
+            running: Some(2),
+            terminals: 1,
+        };
+
+        assert_eq!(
+            stale.status().as_deref(),
+            Some("Daemon 1.1.0 \u{b7} 2 agents, 1 terminal running")
+        );
+    }
+
+    #[test]
+    fn terminals_are_plural_in_the_status_text() {
+        let stale = StaleDaemon {
+            build: Some("1.1.0".to_owned()),
+            running: Some(1),
+            terminals: 3,
+        };
+
+        assert_eq!(
+            stale.status().as_deref(),
+            Some("Daemon 1.1.0 \u{b7} 1 agent, 3 terminals running")
+        );
+    }
+
+    #[test]
+    fn terminals_alone_are_counted_in_the_status_text() {
+        let stale = StaleDaemon {
+            build: Some("1.1.0".to_owned()),
+            running: Some(0),
+            terminals: 1,
+        };
+
+        assert_eq!(
+            stale.status().as_deref(),
+            Some("Daemon 1.1.0 \u{b7} 1 terminal running")
+        );
+    }
+
+    #[test]
     fn a_daemon_the_app_cannot_count_has_no_status_text() {
         let stale = StaleDaemon {
             build: Some("1.1.0".to_owned()),
             running: None,
+            terminals: 0,
         };
 
         assert_eq!(stale.status(), None);
     }
 
     #[test]
+    fn the_dialog_line_says_every_terminal_stops_when_terminals_run() {
+        let stale = StaleDaemon {
+            build: Some("1.1.0".to_owned()),
+            running: Some(1),
+            terminals: 2,
+        };
+
+        assert_eq!(stale.dialog_line(), LINE_WITH_TERMINALS);
+    }
+
+    #[test]
     fn a_working_agent_makes_the_load_busy() {
-        let load = AgentLoad::of(&busy_with(DaemonAgentStatus::Working));
+        let load = AgentLoad::of(&busy_with(DaemonAgentStatus::Working), &[]);
 
         assert_eq!(
             load,
             AgentLoad {
                 running: 1,
+                terminals: 0,
                 busy: true
             }
         );
@@ -564,12 +678,13 @@ mod tests {
 
     #[test]
     fn an_idle_agent_still_counts_as_running_but_not_busy() {
-        let load = AgentLoad::of(&busy_with(DaemonAgentStatus::Idle));
+        let load = AgentLoad::of(&busy_with(DaemonAgentStatus::Idle), &[]);
 
         assert_eq!(
             load,
             AgentLoad {
                 running: 1,
+                terminals: 0,
                 busy: false
             }
         );
@@ -580,7 +695,7 @@ mod tests {
         let mut projects = busy_with(DaemonAgentStatus::Idle);
         projects[0].tasks[0].agents[0].lifecycle = AgentLifecycle::Starting;
 
-        assert!(AgentLoad::of(&projects).busy);
+        assert!(AgentLoad::of(&projects, &[]).busy);
     }
 
     #[test]
@@ -589,12 +704,51 @@ mod tests {
         projects[0].tasks[0].agents[0].lifecycle = AgentLifecycle::Resumable;
 
         assert_eq!(
-            AgentLoad::of(&projects),
+            AgentLoad::of(&projects, &[]),
             AgentLoad {
                 running: 0,
+                terminals: 0,
                 busy: false
             }
         );
+    }
+
+    #[test]
+    fn a_user_terminal_makes_the_load_busy() {
+        let terminals = [info(1, DaemonKind::User, "login")];
+
+        let load = AgentLoad::of(&busy_with(DaemonAgentStatus::Idle), &terminals);
+
+        assert_eq!(
+            load,
+            AgentLoad {
+                running: 1,
+                terminals: 1,
+                busy: true
+            }
+        );
+    }
+
+    #[test]
+    fn a_process_terminal_makes_the_load_busy() {
+        let terminals = [info(1, DaemonKind::Process, "login")];
+
+        assert!(AgentLoad::of(&[], &terminals).busy);
+    }
+
+    #[test]
+    fn an_agent_terminal_is_counted_as_its_agent_not_as_a_terminal() {
+        let terminals = [info(1, DaemonKind::Agent, "login")];
+
+        assert_eq!(AgentLoad::of(&[], &terminals).terminals, 0);
+    }
+
+    #[test]
+    fn a_terminal_that_ended_does_not_make_the_load_busy() {
+        let mut ended = info(1, DaemonKind::Process, "login");
+        ended.exit = Some(swarm_term::ExitStatus::Code(0));
+
+        assert!(!AgentLoad::of(&[], &[ended]).busy);
     }
 
     #[gpui::test]
@@ -617,6 +771,89 @@ mod tests {
         });
         assert_eq!(host.sent(), [(31_337, Signal::Terminate)]);
         assert_eq!((source, stale, restarted), (DataSource::Live, None, true));
+    }
+
+    #[gpui::test]
+    fn an_older_daemon_with_a_running_terminal_offers_the_restart_and_keeps_working(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = setup_real(cx);
+        let host = FakeHost::new("/x/swarm-daemon");
+        let paths = fake_daemon_with_terminals(
+            vec![("0.0.1", None)],
+            busy_with(DaemonAgentStatus::Idle),
+            vec![info(900, DaemonKind::User, "login")],
+        );
+
+        connect(&workspace, launch(paths, &host), cx);
+
+        let (source, stale) = workspace.read_with(cx, |workspace, _| {
+            (workspace.source.clone(), workspace.stale_daemon.clone())
+        });
+        assert!(host.sent().is_empty());
+        assert_eq!(source, DataSource::Live);
+        assert_eq!(
+            stale.and_then(|stale| stale.status()).as_deref(),
+            Some("Daemon 0.0.1 \u{b7} 1 agent, 1 terminal running")
+        );
+        assert!(cx.debug_bounds("restart-daemon").is_some());
+    }
+
+    #[gpui::test]
+    fn an_older_daemon_with_only_a_process_terminal_offers_the_restart(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup_real(cx);
+        let host = FakeHost::new("/x/swarm-daemon");
+        let paths = fake_daemon_with_terminals(
+            vec![("0.0.1", None)],
+            Vec::new(),
+            vec![info(900, DaemonKind::Process, "login")],
+        );
+
+        connect(&workspace, launch(paths, &host), cx);
+
+        let stale = workspace.read_with(cx, |workspace, _| workspace.stale_daemon.clone());
+        assert!(host.sent().is_empty());
+        assert_eq!(
+            stale.and_then(|stale| stale.status()).as_deref(),
+            Some("Daemon 0.0.1 \u{b7} 1 terminal running")
+        );
+    }
+
+    #[gpui::test]
+    fn the_dialog_with_running_terminals_says_that_every_terminal_stops(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup_real(cx);
+        let host = FakeHost::new("/x/swarm-daemon");
+        let paths = fake_daemon_with_terminals(
+            vec![("0.0.1", None)],
+            busy_with(DaemonAgentStatus::Idle),
+            vec![info(900, DaemonKind::User, "login")],
+        );
+        connect(&workspace, launch(paths, &host), cx);
+
+        click("restart-daemon", cx);
+
+        let dialog = dialog(&workspace, cx).expect("the dialog is open");
+        assert_eq!(
+            dialog.read_with(cx, |dialog, _| dialog.line),
+            LINE_WITH_TERMINALS
+        );
+    }
+
+    #[gpui::test]
+    fn an_older_daemon_with_an_ended_terminal_restarts_at_once(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup_real(cx);
+        let host = FakeHost::new("/x/swarm-daemon");
+        let mut ended = info(900, DaemonKind::Process, "login");
+        ended.exit = Some(swarm_term::ExitStatus::Code(0));
+        let paths = fake_daemon_with_terminals(
+            vec![("0.0.1", None), (APP_BUILD, None)],
+            busy_with(DaemonAgentStatus::Idle),
+            vec![ended],
+        );
+
+        connect(&workspace, launch(paths, &host), cx);
+
+        assert_eq!(host.sent(), [(31_337, Signal::Terminate)]);
     }
 
     #[gpui::test]
@@ -770,7 +1007,8 @@ mod tests {
             stale,
             Some(StaleDaemon {
                 build: Some("0.0.1".to_owned()),
-                running: None
+                running: None,
+                terminals: 0
             })
         );
         assert!(cx.debug_bounds("restart-daemon").is_some());

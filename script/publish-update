@@ -90,8 +90,20 @@ command -v git-cliff >/dev/null || fail "git-cliff is not installed (cargo insta
 gh auth status >/dev/null 2>&1 || fail "gh is not signed in (gh auth login)"
 
 git fetch --quiet origin --tags
-[[ "$(git rev-parse HEAD)" == "$(git rev-parse origin/main)" ]] || fail "HEAD is not origin/main; check out an up-to-date main"
+
+# A run that stopped after tagging may start again from the tag, even when main moved on.
+head_commit="$(git rev-parse HEAD)"
+tag_commit="$(git rev-parse -q --verify "refs/tags/$tag^{commit}" || true)"
+if [[ $head_commit != "$(git rev-parse origin/main)" && $head_commit != "$tag_commit" ]]; then
+    fail "HEAD is neither origin/main nor the commit of $tag; check out an up-to-date main, or the tag to run a stopped release again"
+fi
 [[ -z "$(git status --porcelain)" ]] || fail "the working tree is not clean"
+
+# Without an earlier release, git-cliff lists every commit of the project.
+earlier_tags="$(git tag --list 'v*' | grep -vx "$tag" || true)"
+if [[ -z $notes_file && -z $earlier_tags ]]; then
+    fail "there is no release before $tag, so the notes would list every commit; pass --notes-file <file>"
+fi
 
 app="$bundle/Swarm.app"
 dmg="$bundle/Swarm.dmg"

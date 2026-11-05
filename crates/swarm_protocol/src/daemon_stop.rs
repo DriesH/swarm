@@ -22,6 +22,8 @@ pub enum StopError {
     Socket(io::Error),
     #[error("the process behind the socket is not {DAEMON_NAME}")]
     NotDaemon,
+    #[error("the {DAEMON_NAME} behind the socket belongs to another user")]
+    OtherUser,
     #[error("cannot signal the daemon: {0}")]
     Signal(io::Error),
     #[error("the daemon did not stop")]
@@ -40,6 +42,9 @@ pub trait Host: Send + Sync {
     fn socket_owner(&self, socket: &Path) -> io::Result<u32>;
 
     fn executable(&self, pid: u32) -> Option<PathBuf>;
+
+    /// The process runs as the user who runs this one.
+    fn is_ours(&self, pid: u32) -> bool;
 
     fn is_running(&self, pid: u32) -> bool;
 
@@ -77,6 +82,38 @@ impl Host for System {
         buffer.truncate(written);
 
         Some(PathBuf::from(OsString::from_vec(buffer)))
+    }
+
+    fn is_ours(&self, pid: u32) -> bool {
+        let Ok(pid) = libc::c_int::try_from(pid) else {
+            return false;
+        };
+        let size = size_of::<libc::proc_bsdinfo>();
+        let Ok(size_as_int) = libc::c_int::try_from(size) else {
+            return false;
+        };
+
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+
+        // SAFETY: proc_pidinfo writes at most `size` bytes into `info`.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size_as_int,
+            )
+        };
+        if usize::try_from(written) != Ok(size) {
+            return false;
+        }
+
+        // SAFETY: the call filled the whole struct, and zeroed memory is valid for it.
+        let owner = unsafe { info.assume_init() }.pbi_uid;
+
+        // SAFETY: getuid takes no arguments and cannot fail.
+        owner == unsafe { libc::getuid() }
     }
 
     fn is_running(&self, pid: u32) -> bool {
@@ -155,7 +192,8 @@ fn is_daemon_program(path: &Path) -> bool {
 
 /// Stops the daemon that listens on `socket`: SIGTERM, then SIGKILL after 10 s. Returns
 /// once the process is gone. A socket with no daemon behind it is nothing to stop.
-/// Refuses a process that is not `swarm-daemon`.
+/// Refuses a process that is not `swarm-daemon` or not ours. The daemon's folder does
+/// not matter: an app moved to the Trash leaves its daemon running from there.
 pub fn stop_daemon(socket: &Path, host: &dyn Host) -> Result<(), StopError> {
     let pid = match host.socket_owner(socket) {
         Ok(pid) => pid,
@@ -175,6 +213,9 @@ pub fn stop_daemon(socket: &Path, host: &dyn Host) -> Result<(), StopError> {
         .is_some_and(|program| is_daemon_program(&program));
     if !is_daemon {
         return Err(StopError::NotDaemon);
+    }
+    if !host.is_ours(pid) {
+        return Err(StopError::OtherUser);
     }
 
     host.signal(pid, Signal::Terminate)
@@ -217,6 +258,7 @@ mod tests {
         program: &'static str,
         refused: Option<io::ErrorKind>,
         ends_on_term: bool,
+        ours: bool,
         signals: Mutex<Vec<(u32, Signal)>>,
         gone: AtomicBool,
     }
@@ -227,6 +269,7 @@ mod tests {
                 program,
                 refused: None,
                 ends_on_term,
+                ours: true,
                 signals: Mutex::new(Vec::new()),
                 gone: AtomicBool::new(false),
             }
@@ -247,6 +290,10 @@ mod tests {
 
         fn executable(&self, _: u32) -> Option<PathBuf> {
             Some(PathBuf::from(self.program))
+        }
+
+        fn is_ours(&self, _: u32) -> bool {
+            self.ours
         }
 
         fn is_running(&self, _: u32) -> bool {
@@ -301,6 +348,64 @@ mod tests {
 
         assert!(matches!(result, Err(StopError::NotDaemon)));
         assert!(host.sent().is_empty());
+    }
+
+    #[test]
+    fn a_daemon_in_the_trash_is_stopped_like_any_other() {
+        let host = Fake::new(
+            "/Users/me/.Trash/Swarm.app/Contents/MacOS/swarm-daemon",
+            true,
+        );
+
+        let result = stop_daemon(socket(), &host);
+
+        assert!(result.is_ok());
+        assert_eq!(host.sent(), [(4242, Signal::Terminate)]);
+    }
+
+    #[test]
+    fn a_daemon_of_another_user_gets_no_signal() {
+        let mut host = Fake::new("/Applications/Swarm.app/Contents/MacOS/swarm-daemon", true);
+        host.ours = false;
+
+        let result = stop_daemon(socket(), &host);
+
+        assert!(matches!(result, Err(StopError::OtherUser)), "{result:?}");
+        assert!(host.sent().is_empty());
+    }
+
+    #[test]
+    fn a_program_named_like_the_daemon_but_longer_is_not_the_daemon() {
+        let host = Fake::new("/x/not-swarm-daemon", true);
+
+        let result = stop_daemon(socket(), &host);
+
+        assert!(matches!(result, Err(StopError::NotDaemon)), "{result:?}");
+        assert!(host.sent().is_empty());
+    }
+
+    #[test]
+    fn the_real_system_says_this_process_is_ours() {
+        assert!(System.is_ours(std::process::id()));
+    }
+
+    #[test]
+    fn the_real_system_says_the_first_process_is_not_ours() {
+        // SAFETY: getuid takes no arguments and cannot fail.
+        let root = unsafe { libc::getuid() } == 0;
+
+        assert!(root || !System.is_ours(1));
+    }
+
+    #[test]
+    fn the_real_system_says_a_missing_process_is_not_ours() {
+        let mut child = std::process::Command::new("/usr/bin/true")
+            .spawn()
+            .expect("spawn");
+        let pid = child.id();
+        child.wait().expect("wait");
+
+        assert!(!System.is_ours(pid));
     }
 
     #[test]

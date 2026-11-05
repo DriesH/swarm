@@ -198,7 +198,7 @@ impl Workspace {
 
             let used = Self::update_with_window(&this, cx, |workspace, window, cx| match result {
                 Ok((client, terminals, projects)) => {
-                    if workspace.check_daemon_build(&client, &projects, cx) {
+                    if workspace.check_daemon_build(&client, &projects, &terminals, cx) {
                         return;
                     }
 
@@ -293,7 +293,7 @@ impl Workspace {
 
                 let used = Self::update_with_window(&this, cx, |workspace, window, cx| {
                     workspace.reconnecting = false;
-                    if workspace.check_daemon_build(&client, &projects, cx) {
+                    if workspace.check_daemon_build(&client, &projects, &terminals, cx) {
                         return;
                     }
 

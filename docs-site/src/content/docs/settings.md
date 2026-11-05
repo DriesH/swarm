@@ -29,7 +29,7 @@ A file that is not valid TOML at all, for example with a missing quote, does not
 | **Check again** | – | Runs the system check again. |
 | **Check for updates automatically** | On | Checks GitHub Releases 30 seconds after launch and every 6 hours. Off leaves only **Check now** and **Swarm › Check for Updates…**. |
 | **Check now** | – | Checks for an update now. |
-| **Updates** status | – | One line: **Up to date**, **Checking…**, **Downloading 1.2.0…**, **Update ready: 1.2.0**, **Swarm 1.2.0 needs macOS 14.0**, **Updates need a signed build** or **Check failed** with the reason. |
+| **Updates** status | – | One line: **Up to date**, **Checking…**, **Downloading 1.2.0…**, **Update ready: 1.2.0**, **Update failed** with the reason, **Swarm 1.2.0 needs macOS 14.0**, **Updates need a signed build** or **Check failed** with the reason. |
 | **About** | – | Shows the app version and the credit for the file icons, with links to their repository and licence. |
 
 The system check also runs when you open Settings and when the window becomes active. See [Install](/swarm/docs/install/#updates) for how updates work.

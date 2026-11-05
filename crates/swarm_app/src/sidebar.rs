@@ -340,19 +340,33 @@ fn daemon_status(workspace: &Workspace, cx: &mut Context<Workspace>) -> Option<L
                     .on_click(cx.listener(|workspace, _, _, cx| workspace.retry_daemon(cx)))
             };
 
+            let muted = Color::Muted.hsla(cx);
+
             Some(
                 LiveRegion::alert("daemon-status", format!("Daemon not running: {reason}")).child(
-                    h_flex()
-                        .debug_selector(|| "daemon-status".to_owned())
-                        .min_h(px(28.))
-                        .gap(px(8.))
-                        .px(px(8.))
+                    v_flex()
+                        .gap(px(2.))
+                        .child(
+                            h_flex()
+                                .debug_selector(|| "daemon-status".to_owned())
+                                .min_h(px(28.))
+                                .gap(px(8.))
+                                .px(px(8.))
+                                .child(
+                                    div().flex_1().child(
+                                        Label::new("Daemon not running").color(Color::Muted),
+                                    ),
+                                )
+                                .child(action),
+                        )
                         .child(
                             div()
-                                .flex_1()
-                                .child(Label::new("Daemon not running").color(Color::Muted)),
-                        )
-                        .child(action),
+                                .debug_selector(|| "daemon-reason".to_owned())
+                                .mx(px(8.))
+                                .text_size(px(12.))
+                                .text_color(muted)
+                                .child(reason.clone()),
+                        ),
                 ),
             )
         }
@@ -1380,6 +1394,27 @@ mod tests {
 
         assert!(!shown("retry-daemon", cx));
         assert!(open_project_row_has_focus(&workspace, cx));
+    }
+
+    #[gpui::test]
+    fn a_missing_daemon_shows_its_reason_as_visible_text(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.daemon_unavailable("the daemon did not stop".to_owned(), cx);
+        });
+
+        redraw(cx);
+
+        assert!(shown("daemon-reason", cx));
+    }
+
+    #[gpui::test]
+    fn a_running_daemon_shows_no_reason(cx: &mut TestAppContext) {
+        let (_workspace, cx) = setup(cx);
+
+        redraw(cx);
+
+        assert!(!shown("daemon-reason", cx));
     }
 
     #[gpui::test]

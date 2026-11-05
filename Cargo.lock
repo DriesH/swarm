@@ -5278,6 +5278,7 @@ dependencies = [
  "swarm_term",
  "swarm_term_view",
  "swarm_ui",
+ "swarm_update",
 ]
 
 [[package]]

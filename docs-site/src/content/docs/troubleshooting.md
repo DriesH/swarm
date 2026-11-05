@@ -44,13 +44,13 @@ The app cannot reach the daemon. Click **Retry**. The app starts the daemon from
 
 An older daemon can still run after you update the app. If the daemon speaks a different protocol version, the new app cannot talk to it. The sidebar then shows **Restart daemon** in place of **Retry**. Click it and confirm. The app stops the old daemon, starts the new one and connects to it.
 
-If the daemon is older but the app can still talk to it, the app restarts it for you when no agent works. Otherwise the sidebar shows the daemon version and the number of running agents, next to **Restart daemon**. You choose when to restart.
+If the daemon is older but the app can still talk to it, the app restarts it for you when no agent works and no terminal runs. Otherwise the sidebar shows the daemon version and the number of running agents and terminals, next to **Restart daemon**. You choose when to restart.
 
 :::caution
 Restarting the daemon stops every running agent. Agents with a saved conversation become resumable. See [Idle stop and resume](/swarm/docs/how-work-starts/#idle-stop-and-resume).
 :::
 
-If **Restart daemon** fails, the sidebar says why. The app only stops a process named `swarm-daemon`.
+If **Restart daemon** fails, the sidebar shows the reason under **Daemon not running**. The app only stops a process named `swarm-daemon` that belongs to you.
 
 ## Agents
 

@@ -151,10 +151,13 @@ enum Action {
         /// The installed `Swarm.app`.
         #[arg(long)]
         old: std::path::PathBuf,
-        /// The checked `Swarm.app` that replaces it.
+        /// The downloaded `Swarm.app` that replaces it.
         #[arg(long)]
         new: std::path::PathBuf,
-        /// Open the new app when done.
+        /// The version of the new app, which the helper checks again.
+        #[arg(long)]
+        version: swarm_update::Version,
+        /// Open the app when done.
         #[arg(long)]
         reopen: bool,
     },
@@ -527,10 +530,11 @@ fn main() -> ExitCode {
         pid,
         old,
         new,
+        version,
         reopen,
     } = &cli.command
     {
-        return update_install::run(*pid, old, new, *reopen);
+        return update_install::run(*pid, old, new, *version, *reopen);
     }
 
     run(cli)
@@ -1083,15 +1087,18 @@ mod tests {
             "/Applications/Swarm.app",
             "--new",
             "/tmp/Swarm.app",
+            "--version",
+            "1.2.0",
             "--reopen",
         ])
         .expect("parse")
         .command;
         assert!(matches!(
             &action,
-            Action::UpdateInstall { pid: 42, reopen: true, old, new }
+            Action::UpdateInstall { pid: 42, reopen: true, old, new, version }
                 if old == std::path::Path::new("/Applications/Swarm.app")
                     && new == std::path::Path::new("/tmp/Swarm.app")
+                    && *version == swarm_update::Version::new(1, 2, 0)
         ));
         assert!(action.command(&mut std::io::empty()).expect("ok").is_none());
 
@@ -1111,11 +1118,41 @@ mod tests {
     }
 
     #[test]
-    fn update_install_needs_pid_old_and_new() {
+    fn update_install_needs_pid_old_new_and_version() {
+        let full = [
+            "update-install",
+            "--pid",
+            "1",
+            "--old",
+            "/a",
+            "--new",
+            "/b",
+            "--version",
+            "1.2.0",
+        ];
+
         assert!(parse(&["update-install"]).is_err());
         assert!(parse(&["update-install", "--pid", "1", "--old", "/a"]).is_err());
         assert!(parse(&["update-install", "--pid", "x", "--old", "/a", "--new", "/b"]).is_err());
-        assert!(parse(&["update-install", "--pid", "1", "--old", "/a", "--new", "/b"]).is_ok());
+        assert!(parse(&["update-install", "--pid", "1", "--old", "/a", "--new", "/b"]).is_err());
+        assert!(parse(&full).is_ok());
+    }
+
+    #[test]
+    fn update_install_refuses_a_version_that_is_not_major_minor_patch() {
+        let arguments = [
+            "update-install",
+            "--pid",
+            "1",
+            "--old",
+            "/a",
+            "--new",
+            "/b",
+            "--version",
+            "1.2",
+        ];
+
+        assert!(parse(&arguments).is_err());
     }
 
     #[test]

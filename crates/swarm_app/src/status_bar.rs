@@ -140,11 +140,17 @@ pub(crate) fn render(
         .into_any_element()
 }
 
-/// "Update ready" with its two buttons while an update waits. The live region is always
-/// drawn, so VoiceOver speaks its value once, when the update becomes ready.
+/// "Update ready" with its two buttons while an update waits. After a failed install it
+/// says "Update failed" with the reason, and **Download** in place of **Restart to
+/// update**. The live region is always drawn, so VoiceOver speaks its value once, when
+/// the update becomes ready.
 fn update_notice(cx: &App) -> impl IntoElement + use<> {
     let ready = crate::updates::ready(cx);
-    let spoken = spoken(ready.is_some());
+    let text: Option<SharedString> = ready.as_ref().map(|ready| match &ready.failure {
+        Some(reason) => format!("Update failed: {reason}").into(),
+        None => "Update ready".into(),
+    });
+    let spoken = spoken(text.as_ref());
 
     h_flex()
         .flex_none()
@@ -154,11 +160,16 @@ fn update_notice(cx: &App) -> impl IntoElement + use<> {
             "update-status",
             LiveRegion::status("update-ready-status", spoken),
         ))
-        .children(ready.map(|ready| {
+        .children(ready.zip(text).map(|(ready, text)| {
             let action = if ready.replaceable {
                 "Restart to update"
             } else {
                 "Download"
+            };
+            let color = if ready.failure.is_some() {
+                Color::Warn
+            } else {
+                Color::Accent
             };
             let notes_url = ready.notes_url;
             let download_url = notes_url.clone();
@@ -166,13 +177,9 @@ fn update_notice(cx: &App) -> impl IntoElement + use<> {
             h_flex()
                 .id("update-ready")
                 .role(Role::Group)
-                .aria_label("Update ready")
+                .aria_label(text.clone())
                 .gap(px(6.))
-                .child(
-                    Label::new("Update ready")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Accent),
-                )
+                .child(Label::new(text).size(LabelSize::XSmall).color(color))
                 .child(
                     Button::new("update-restart", action)
                         .debug_selector(|| "update-restart".to_owned())
@@ -196,8 +203,8 @@ fn update_notice(cx: &App) -> impl IntoElement + use<> {
 }
 
 /// What the live region says: nothing, until an update is ready.
-fn spoken(ready: bool) -> &'static str {
-    if ready { "Update ready" } else { "" }
+fn spoken(notice: Option<&SharedString>) -> SharedString {
+    notice.cloned().unwrap_or_default()
 }
 
 fn permissions_note() -> Label {
@@ -605,6 +612,48 @@ mod tests {
         );
     }
 
+    /// An updater with a release 1.2.0 whose install failed before.
+    fn failed_update(
+        workspace: &gpui::Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> std::rc::Rc<crate::updates::tests::FakeHost> {
+        use crate::updates::tests::{FakeHost, FakeSource, install_fake, signed_build};
+
+        let host = FakeHost::new(true);
+        let source = FakeSource::with_failed_install("the signature is wrong");
+        let updater =
+            cx.update(|_, cx| install_fake(workspace, &source, &host, signed_build(), cx));
+        updater.update(cx, crate::updates::Updater::check);
+        redraw(cx);
+
+        host
+    }
+
+    #[gpui::test]
+    fn a_failed_install_offers_download_in_place_of_restart(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let host = failed_update(&workspace, cx);
+
+        let button = bounds_of("update-restart", cx);
+        cx.simulate_click(button.center(), Modifiers::none());
+
+        assert!(host.launches.borrow().is_empty());
+        assert_eq!(host.quits.get(), 0);
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some("https://github.com/DriesH/swarm/releases/tag/v1.2.0")
+        );
+    }
+
+    #[gpui::test]
+    fn a_failed_install_still_offers_the_release_notes(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        failed_update(&workspace, cx);
+
+        assert!(cx.debug_bounds("update-restart").is_some());
+        assert!(cx.debug_bounds("update-notes").is_some());
+    }
+
     #[gpui::test]
     fn the_update_announcement_is_drawn_before_and_while_the_update_is_ready(
         cx: &mut TestAppContext,
@@ -633,9 +682,11 @@ mod tests {
         let (_, cx) = setup(cx);
 
         let quiet =
-            crate::live_probe::see_in(LiveRegion::status("update-ready-status", spoken(false)), cx);
-        let ready =
-            crate::live_probe::see_in(LiveRegion::status("update-ready-status", spoken(true)), cx);
+            crate::live_probe::see_in(LiveRegion::status("update-ready-status", spoken(None)), cx);
+        let ready = crate::live_probe::see_in(
+            LiveRegion::status("update-ready-status", spoken(Some(&"Update ready".into()))),
+            cx,
+        );
 
         assert_eq!(quiet.role, Some(Role::Status));
         assert!(crate::live_probe::is_quiet(&quiet));
