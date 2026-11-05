@@ -201,6 +201,30 @@ done
 cargo run --quiet --release --locked -p app_icon -- "$work/Swarm.iconset"
 iconutil --convert icns --output "$app/Contents/Resources/Swarm.icns" "$work/Swarm.iconset"
 
+# macOS 26 and later draw an icon that is not in the new format small, on a gray tile.
+# The Icon Composer file becomes Assets.car with CFBundleIconName; Swarm.icns stays the
+# icon of macOS 13 to 15 (CFBundleIconFile).
+icon_source="$root/assets/app-icon/Swarm.icon"
+if [[ -d $icon_source ]]; then
+    actool_version="$(xcrun actool --version | plutil -extract 'com\.apple\.actool\.version.short-bundle-version' raw -o - -)"
+    [[ ${actool_version%%.*} -ge 26 ]] || fail "actool $actool_version cannot compile Swarm.icon: it needs Xcode 26 or later"
+
+    mkdir "$work/assets"
+    xcrun actool "$icon_source" --compile "$work/assets" \
+        --output-format human-readable-text --notices --warnings \
+        --output-partial-info-plist "$work/assets/partial-info.plist" \
+        --app-icon Swarm --include-all-app-icons \
+        --enable-on-demand-resources NO --development-region en \
+        --target-device mac --platform macosx --minimum-deployment-target 26.0
+    [[ -f $work/assets/Assets.car ]] || fail "actool made no Assets.car"
+
+    install -m 0644 "$work/assets/Assets.car" "$app/Contents/Resources/Assets.car"
+    /usr/libexec/PlistBuddy -c "Add :CFBundleIconName string Swarm" "$app/Contents/Info.plist"
+    plutil -lint "$app/Contents/Info.plist"
+else
+    printf 'note: no %s yet, so macOS 26 and later show the icon on a gray tile\n' "$icon_source"
+fi
+
 step "Signing with ${sign_identity}"
 sign "$app/Contents/MacOS/swarm-daemon" "$BUNDLE_ID.daemon"
 sign "$app/Contents/MacOS/swarm" "$BUNDLE_ID.cli"
