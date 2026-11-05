@@ -98,6 +98,7 @@ impl Dialog {
         let close_disabled = self.close_disabled;
 
         let panel = accessible(v_flex().id("dialog-panel"), Role::Dialog, title.clone())
+            .debug_selector(|| "dialog-panel".to_owned())
             .key_context(DIALOG_CONTEXT)
             .track_focus(&self.focus_handle)
             .when_some(on_action, |panel, handler| {
@@ -105,6 +106,7 @@ impl Dialog {
             })
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .w(self.width)
+            .max_h_full()
             .overflow_hidden()
             .rounded(px(14.))
             .border_1()
@@ -178,7 +180,8 @@ impl RenderOnce for Dialog {
             .flex()
             .flex_col()
             .items_center()
-            .pt(px(120.))
+            .justify_center()
+            .p(px(32.))
             .bg(colors.scrim)
             .occlude()
             .on_mouse_down(MouseButton::Left, move |_, window, cx| {

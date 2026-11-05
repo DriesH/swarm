@@ -22,7 +22,7 @@ Only the projects and agents scroll. At the bottom of the sidebar stay the usage
 
 Below about 700 points of window height, the usage card folds to one line with the highest window of each agent kind, for example `Claude 61% · Codex 18%`. Click it, or press Space on it, to open the card. Click it again to fold it. Swarm remembers your choice until you close the window. VoiceOver reads every window in both states.
 
-Press ⌘B, or use the **Toggle sidebar** button in the title bar, to shrink the sidebar to a narrow rail. The rail keeps search, one tile per project, **+**, and one icon per agent, process terminal and user terminal. At the bottom it has a ring for the highest usage window (hover for the numbers), a divider, and one button each for **Settings**, **Field guide** and **Report an issue**. With no usage numbers yet, the card and the ring are left out.
+Press ⌘B, or use the **Toggle sidebar** button in the title bar, to shrink the sidebar to a narrow rail. The rail keeps search, one tile per project, **+**, and one icon per agent, process terminal and user terminal. At the bottom it has a ring for the highest usage window (hover it to see the full usage card), a divider, and one button each for **Settings**, **Field guide** and **Report an issue**. With no usage numbers yet, the card and the ring are left out.
 
 ## Tabs
 
@@ -104,7 +104,7 @@ The panel is available in the Terminals view only. Review has its own file tree.
 
 ## Status bar
 
-The left side has the tray and the **Terminal** button. The right side shows, with icons, the task's branch, its agent count, its process count, its user terminal count (when above zero), **permissions skipped** when **Skip permission prompts** is on in **Settings › Agents**, and ⌘K. In Review, the bar also shows how many comments are sent, pending and resolved.
+The left side has the tray and the **Terminal** button. The right side shows, with icons, the task's branch, its agent count, its process count, its user terminal count (when above zero), **permissions skipped** when **Skip permission prompts** is on in **Settings › Agents**. In Review, the bar also shows how many comments are sent, pending and resolved.
 
 ## Command palette
 

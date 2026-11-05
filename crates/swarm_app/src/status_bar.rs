@@ -31,12 +31,6 @@ pub(crate) fn render(
             .px(px(10.))
             .child(div().flex_1())
             .child(update_notice(cx))
-            .child(
-                Label::new("⌘K")
-                    .mono()
-                    .size(LabelSize::XSmall)
-                    .color(Color::Faint),
-            )
             .into_any_element();
     }
 
@@ -134,8 +128,7 @@ pub(crate) fn render(
                             .debug_selector(|| "permissions-skipped".to_owned())
                             .child(permissions_note()),
                     )
-                })
-                .child(mono("⌘K".into())),
+                }),
         )
         .into_any_element()
 }
