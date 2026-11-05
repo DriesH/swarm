@@ -1,0 +1,3 @@
+# Scratches live outside projects
+
+Quick work, like a question for Claude Code or a script, does not belong to a project and often has no git repository. So Home holds scratches: tabs with terminals in a plain folder (`~` by default), with no branch and no worktree. A scratch is its own record in the daemon, not a task of a hidden "Home" project, because everything a task has (branch, worktree, Review, pull request, setup script) needs git. Agents in a scratch work alone, without the orchestrator and worker roles. **Make project** adds the folder a scratch terminal is in as a project and moves no files, because moving a folder would break the running terminals and Claude Code sessions, which are stored by folder path.

@@ -8,6 +8,18 @@ Swarm runs a group of coding agents on one task. One agent leads, the others do 
 A git repository opened in Swarm.
 _Avoid_: Workspace, space, repo
 
+**Home**:
+The place above Projects for quick work outside a project. Its tabs are scratches.
+_Avoid_: Hub, scratchpad, dashboard
+
+**Scratch**:
+One Home tab: terminals that start in the scratch folder, with no branch or worktree. It has its own agents, which work alone.
+_Avoid_: Scratchpad, playground, sandbox, session
+
+**Make project**:
+Adding the folder of a scratch's terminal as a project, with a git repository and a first commit when it has none. No files move.
+_Avoid_: Promote, convert, graduate
+
 **Task**:
 One feature inside a project, with its own branch and its own swarm.
 _Avoid_: Job, session, thread
