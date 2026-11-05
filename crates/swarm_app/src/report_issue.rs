@@ -28,6 +28,9 @@ const REPOSITORY: &str = "github.com/DriesH/swarm";
 /// GitHub answers `414 URI Too Long` above a server limit it does not publish.
 pub(crate) const MAX_URL_LENGTH: usize = 6000;
 pub(crate) const LOG_LINES: usize = 200;
+
+/// Under the daemon log checkbox: the log is never sent, the person pastes it.
+const LOG_BANNER: &str = "Please manually copy paste the daemon log into the GitHub issue if you are sure there are no secrets in it.";
 /// A log line is far shorter than this, so the tail holds the last lines.
 const LOG_TAIL_BYTES: u64 = 256 * 1024;
 const CUT_MARK: &str = "\u{2026}";
@@ -239,35 +242,6 @@ pub(crate) struct Link {
     pub(crate) fields: Vec<Field>,
 }
 
-impl Link {
-    /// The text under "Show what is sent".
-    pub(crate) fn disclosure(&self, with_log: bool) -> String {
-        let mut sections: Vec<String> = self
-            .fields
-            .iter()
-            .map(|field| format!("{}\n{}", field.label, field.text()))
-            .collect();
-
-        if with_log {
-            sections.push(format!(
-                "Daemon log\nThe last {LOG_LINES} lines go to the clipboard, not to the address"
-            ));
-        }
-
-        let cut: Vec<&str> = self
-            .fields
-            .iter()
-            .filter(|field| field.cut)
-            .map(|field| field.label)
-            .collect();
-        if !cut.is_empty() {
-            sections.push(format!("Cut to fit the address\n{}", cut.join(", ")));
-        }
-
-        sections.join("\n\n")
-    }
-}
-
 impl Draft {
     fn fields(&self) -> Vec<Field> {
         [
@@ -419,11 +393,6 @@ pub(crate) struct ReportIssueDialog {
     steps: Entity<TextArea>,
     include_versions: bool,
     include_log: bool,
-    details_open: bool,
-    /// The text under "Show what is sent", made once for each change of the form.
-    disclosure: Option<String>,
-    #[cfg(test)]
-    disclosures_made: usize,
     versions: Versions,
     log_path: Option<PathBuf>,
     error: Option<SharedString>,
@@ -485,10 +454,6 @@ impl ReportIssueDialog {
             steps,
             include_versions: true,
             include_log: false,
-            details_open: false,
-            disclosure: None,
-            #[cfg(test)]
-            disclosures_made: 0,
             versions: Versions::of_swarm(),
             log_path,
             error: None,
@@ -505,7 +470,7 @@ impl ReportIssueDialog {
         cx: &mut Context<Self>,
     ) {
         match event {
-            TextInputEvent::Changed(_) => self.changed(cx),
+            TextInputEvent::Changed(_) => cx.notify(),
             TextInputEvent::Submitted(_) => self.open(cx),
         }
     }
@@ -519,7 +484,7 @@ impl ReportIssueDialog {
         cx: &mut Context<Self>,
     ) {
         match event {
-            TextInputEvent::Changed(_) => self.changed(cx),
+            TextInputEvent::Changed(_) => cx.notify(),
             TextInputEvent::Submitted(_) if window.modifiers().platform => self.open(cx),
             TextInputEvent::Submitted(_) => {
                 let description = self.description.focus_handle(cx);
@@ -529,36 +494,16 @@ impl ReportIssueDialog {
         }
     }
 
-    /// The form changed: what is sent changed with it.
-    fn changed(&mut self, cx: &mut Context<Self>) {
-        self.disclosure = None;
-        cx.notify();
-    }
-
     pub(crate) fn set_versions(&mut self, versions: Versions, cx: &mut Context<Self>) {
         self.versions = versions;
-        self.changed(cx);
+        cx.notify();
     }
 
     fn set_kind(&mut self, kind: Kind, cx: &mut Context<Self>) {
         self.kind = kind;
         self.description
             .update(cx, |area, cx| area.set_label(kind.description_label(), cx));
-        self.changed(cx);
-    }
-
-    /// The text under "Show what is sent", made again only after a change.
-    fn disclosure_text(&mut self, cx: &App) -> String {
-        if self.disclosure.is_none() {
-            #[cfg(test)]
-            {
-                self.disclosures_made += 1;
-            }
-
-            self.disclosure = Some(self.draft(cx).link().disclosure(self.include_log));
-        }
-
-        self.disclosure.clone().unwrap_or_default()
+        cx.notify();
     }
 
     pub(crate) fn draft(&self, cx: &App) -> Draft {
@@ -633,11 +578,6 @@ impl ReportIssueDialog {
         self.description
             .update(cx, |area, cx| area.set_text(description.to_owned(), cx));
     }
-
-    #[cfg(test)]
-    pub(crate) fn details_are_open(&self) -> bool {
-        self.details_open
-    }
 }
 
 fn field(label: &'static str, control: impl IntoElement) -> gpui::Div {
@@ -649,7 +589,7 @@ fn field(label: &'static str, control: impl IntoElement) -> gpui::Div {
 }
 
 impl ReportIssueDialog {
-    /// The group under "Include": what goes along, and the disclosure of what is sent.
+    /// The group under "Include": the versions, and the daemon log for the clipboard.
     fn include_group(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let line = cx.theme().colors().line;
         let this = cx.entity();
@@ -663,7 +603,7 @@ impl ReportIssueDialog {
                     .on_toggle(move |checked, _, cx| {
                         on_versions.update(cx, |this, cx| {
                             this.include_versions = checked;
-                            this.changed(cx);
+                            cx.notify();
                         });
                     }),
             )
@@ -674,42 +614,40 @@ impl ReportIssueDialog {
                     .color(Color::Faint)
                     .truncate(),
             );
-        let log = Checkbox::new("report-log", "Last 200 lines of the daemon log")
-            .toggle_state(self.include_log)
-            .on_toggle(move |checked, _, cx| {
-                on_log.update(cx, |this, cx| {
-                    this.include_log = checked;
-                    this.error = None;
-                    this.changed(cx);
-                });
-            });
-        let details = Button::new("report-details", "Show what is sent")
-            .variant(ButtonVariant::Ghost)
-            .expanded(self.details_open)
-            .debug_selector(|| "report-details".to_owned())
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.details_open = !this.details_open;
+        let log = Checkbox::new(
+            "report-log",
+            "Copy last 200 lines of the daemon log to clipboard",
+        )
+        .toggle_state(self.include_log)
+        .on_toggle(move |checked, _, cx| {
+            on_log.update(cx, |this, cx| {
+                this.include_log = checked;
+                this.error = None;
                 cx.notify();
-            }));
-
-        let text = self.details_open.then(|| self.disclosure_text(cx));
-        let sent = text.map(|text| {
-            div()
-                .id("report-sent")
-                .role(Role::Group)
-                .aria_label("What is sent")
-                .debug_selector(|| "report-sent".to_owned())
-                .max_h(px(160.))
-                .overflow_y_scroll()
-                .p(px(10.))
-                .rounded(px(8.))
-                .border_1()
-                .border_color(line)
-                .child(Label::new(text).mono().size(LabelSize::XSmall))
+            });
         });
+
+        let colors = cx.theme().colors();
+        let banner = h_flex()
+            .debug_selector(|| "report-log-banner".to_owned())
+            .items_start()
+            .gap(px(8.))
+            .px(px(10.))
+            .py(px(8.))
+            .rounded(px(8.))
+            .bg(colors.warn_bg)
+            .child(Icon::new(IconName::Alert).color(Color::Warn))
+            .child(
+                div().flex_1().min_w_0().child(
+                    Label::new(LOG_BANNER)
+                        .size(LabelSize::Small)
+                        .color(Color::Default),
+                ),
+            );
 
         v_flex()
             .id("report-include")
+            .debug_selector(|| "report-include".to_owned())
             .role(Role::Group)
             .aria_label("Include")
             .gap(px(8.))
@@ -724,8 +662,7 @@ impl ReportIssueDialog {
             )
             .child(versions)
             .child(log)
-            .child(div().flex().child(details))
-            .children(sent)
+            .children(self.include_log.then_some(banner))
     }
 
     fn footer(cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -780,7 +717,7 @@ impl Render for ReportIssueDialog {
             .on_dismiss(move |_, cx| {
                 on_dismiss.update(cx, |_, cx| cx.emit(ReportIssueEvent::Dismissed));
             })
-            .child(kinds)
+            .child(h_flex().child(kinds))
             .child(field("Title", self.title.clone()))
             .child(field(
                 self.kind.description_label(),
@@ -1027,27 +964,6 @@ mod tests {
     }
 
     #[test]
-    fn the_disclosure_lists_the_fields_the_cut_and_the_log() {
-        let mut long = draft(Kind::Bug);
-        long.description = "x".repeat(8000);
-
-        let text = long.link().disclosure(true);
-
-        assert!(text.starts_with("Title\nThe button stays"));
-        assert!(text.contains("Versions\nSwarm 1.0.0"));
-        assert!(text.contains("Daemon log\nThe last 200 lines go to the clipboard"));
-        assert!(text.ends_with("Cut to fit the address\nWhat happened"));
-    }
-
-    #[test]
-    fn the_disclosure_says_nothing_of_the_log_when_it_stays_out() {
-        let text = draft(Kind::Bug).link().disclosure(false);
-
-        assert!(!text.contains("Daemon log"));
-        assert!(!text.contains("Cut to fit"));
-    }
-
-    #[test]
     fn the_versions_text_skips_what_is_unknown() {
         let versions = Versions {
             swarm: "1.0.0".to_owned(),
@@ -1168,6 +1084,53 @@ mod dialog_tests {
         assert_eq!(kind, Kind::Bug);
         assert!(cx.update(|window, _| title.is_focused(window)));
         assert!(cx.debug_bounds("report-steps").is_some());
+    }
+
+    #[gpui::test]
+    fn the_secrets_warning_shows_only_while_the_log_is_copied(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let view = open(None, None, &workspace, cx);
+        let before = cx.debug_bounds("report-log-banner").is_some();
+
+        view.update(cx, |dialog, cx| {
+            dialog.include_log = true;
+            cx.notify();
+        });
+        redraw(cx);
+
+        assert!(!before);
+        assert!(cx.debug_bounds("report-log-banner").is_some());
+        assert!(cx.debug_bounds("report-details").is_none());
+        assert!(cx.debug_bounds("report-sent").is_none());
+    }
+
+    #[gpui::test]
+    fn the_kind_tabs_keep_their_own_width(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        open(None, None, &workspace, cx);
+
+        let tabs = cx.debug_bounds("report-kind").expect("the kind tabs");
+        let include = cx
+            .debug_bounds("report-include")
+            .expect("the include group");
+
+        assert!(
+            tabs.size.width < include.size.width * 0.75,
+            "{tabs:?} {include:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn the_dialog_sits_in_the_middle_of_the_window(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        open(None, None, &workspace, cx);
+
+        let panel = cx.debug_bounds("dialog-panel").expect("the dialog panel");
+        let window = cx.update(|window, _| window.viewport_size());
+        let above = panel.origin.y;
+        let below = window.height - (panel.origin.y + panel.size.height);
+
+        assert!((above - below).abs() <= px(1.), "{above:?} {below:?}");
     }
 
     #[gpui::test]
@@ -1296,6 +1259,7 @@ mod dialog_tests {
         let missing = std::env::temp_dir().join("swarm-report-missing/daemon.log");
         let view = open(None, Some(missing), &workspace, cx);
         view.update(cx, |dialog, _| dialog.include_log(true));
+        redraw(cx);
 
         click("report-open", cx);
         redraw(cx);
@@ -1306,47 +1270,6 @@ mod dialog_tests {
             Some("Cannot read the daemon log".to_owned())
         );
         assert!(workspace.read_with(cx, |workspace, _| workspace.overlay.is_some()));
-    }
-
-    #[gpui::test]
-    fn show_what_is_sent_lists_the_exact_text(cx: &mut TestAppContext) {
-        let (workspace, cx) = setup(cx);
-        let view = open(None, None, &workspace, cx);
-        view.update(cx, |dialog, cx| dialog.fill("Tabs jump", "On click", cx));
-        redraw(cx);
-        let closed = cx.debug_bounds("report-sent").is_none();
-
-        click("report-details", cx);
-        redraw(cx);
-
-        assert!(closed);
-        assert!(view.read_with(cx, |dialog, _| dialog.details_are_open()));
-        assert!(cx.debug_bounds("report-sent").is_some());
-    }
-
-    fn made(view: &Entity<ReportIssueDialog>, cx: &VisualTestContext) -> usize {
-        view.read_with(cx, |dialog, _| dialog.disclosures_made)
-    }
-
-    #[gpui::test]
-    fn the_sent_text_is_made_once_for_each_change_not_for_each_draw(cx: &mut TestAppContext) {
-        let (workspace, cx) = setup(cx);
-        let view = open(None, None, &workspace, cx);
-        click("report-details", cx);
-
-        redraw(cx);
-        redraw(cx);
-        view.update(cx, |_, cx| cx.notify());
-        redraw(cx);
-        let before = made(&view, cx);
-        let title = view.read_with(cx, |dialog, cx| dialog.title.focus_handle(cx));
-        cx.update(|window, cx| window.focus(&title, cx));
-        cx.simulate_input("T");
-        redraw(cx);
-        redraw(cx);
-
-        assert_eq!(before, 1);
-        assert_eq!(made(&view, cx), 2);
     }
 
     #[gpui::test]

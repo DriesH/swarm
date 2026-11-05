@@ -2,12 +2,15 @@
 
 use std::path::Path;
 use std::rc::Rc;
+use std::time::Duration;
 
 use gpui::{
-    Context, ElementId, FocusHandle, FontWeight, Global, Hsla, KeyDownEvent, Pixels, Role,
-    SharedString, WeakEntity, Window, div, px,
+    Anchor, Animation, AnimationExt, AnyView, App, Context, ElementId, FocusHandle, FontWeight,
+    Global, Hsla, KeyDownEvent, Pixels, Render, Role, SharedString, WeakEntity, Window, anchored,
+    deferred, div, ease_out_quint, px, relative,
 };
 use swarm_ui::a11y::accessible;
+use swarm_ui::motion::reduce_motion;
 use swarm_ui::prelude::*;
 use swarm_ui::roving::RovingFocus;
 use swarm_ui::styles::focus_ring;
@@ -201,12 +204,22 @@ pub(crate) fn render_rail(
                         .gap(px(4.))
                         .children(projects)
                         .child(
-                            IconButton::new("rail-add-project", IconName::Plus, "Add project")
-                                .size(IconButtonSize::Medium)
-                                .debug_selector(|| "rail-add-project".to_owned())
-                                .on_click(cx.listener(|_, _, window, cx| {
+                            // A rail button like the projects, so both share one size and
+                            // one active and hover background.
+                            RailButton::new(
+                                "rail-add-project",
+                                "Add project",
+                                Icon::new(IconName::Plus)
+                                    .size(IconSize::Large)
+                                    .color(Color::Muted),
+                            )
+                            .tooltip("Add project")
+                            .debug_selector(|| "rail-add-project".to_owned())
+                            .on_click(cx.listener(
+                                |_, _, window, cx| {
                                     Workspace::pick_project(window, cx);
-                                })),
+                                },
+                            )),
                         )
                         .when(!terminals.is_empty(), |list| {
                             list.child(rail_divider(line)).children(terminals)
@@ -221,15 +234,43 @@ fn rail_footer(workspace: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
     let line = cx.theme().colors().line;
     let sections = usage_sections(&workspace.data.usage, workspace.now_ms() / 1_000);
 
+    let hovered = workspace.rail_usage_hovered;
     let ring = highest_window(&sections).map(|(kind, window)| {
-        UsageRing::new(
+        let ring = UsageRing::new(
             "rail-usage",
             window.fraction(),
             ring_label(kind, window, &sections),
         )
-        .tooltip(shown_usage(&sections))
         .tone(window.tone())
-        .debug_selector(|| "rail-usage".to_owned())
+        .debug_selector(|| "rail-usage".to_owned());
+
+        // The card's bottom-left corner sits next to the ring's bottom, so it grows up.
+        let card = hovered.then(|| {
+            div()
+                .absolute()
+                .left(relative(1.))
+                .bottom_0()
+                .ml(px(8.))
+                .child(
+                    deferred(
+                        anchored()
+                            .anchor(Anchor::BottomLeft)
+                            .snap_to_window_with_margin(px(8.))
+                            .child(UsageHoverCard::view(sections.clone(), cx)),
+                    )
+                    .priority(1),
+                )
+        });
+
+        div()
+            .id("rail-usage-hover")
+            .relative()
+            .on_hover(cx.listener(|workspace, hovered: &bool, _, cx| {
+                workspace.rail_usage_hovered = *hovered;
+                cx.notify();
+            }))
+            .child(ring)
+            .children(card)
     });
 
     let caught = workspace.data.caught_creatures.len();
@@ -1269,6 +1310,44 @@ fn usage_summary(
             .color(Color::Faint),
     )
     .on_click(cx.listener(|workspace, _, _, cx| workspace.toggle_usage_card(cx)))
+}
+
+/// How long the rail ring's usage card takes to slide in.
+const HOVER_CARD_IN: Duration = Duration::from_millis(140);
+
+/// The full usage card, shown on hover over the rail's usage ring.
+struct UsageHoverCard {
+    sections: Vec<UsageSection>,
+}
+
+impl UsageHoverCard {
+    fn view(sections: Vec<UsageSection>, cx: &mut App) -> AnyView {
+        cx.new(|_| Self { sections }).into()
+    }
+}
+
+impl Render for UsageHoverCard {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let card = div()
+            .id("usage-hover-card")
+            .role(Role::Tooltip)
+            .aria_label(shown_usage(&self.sections))
+            .debug_selector(|| "usage-hover-card".to_owned())
+            .relative()
+            .w(px(232.))
+            .children(usage_card(&self.sections));
+
+        if reduce_motion(cx) {
+            return card.into_any_element();
+        }
+
+        card.with_animation(
+            "usage-hover-card-in",
+            Animation::new(HOVER_CARD_IN).with_easing(ease_out_quint()),
+            |card, progress| card.opacity(progress).left(px((1. - progress) * -6.)),
+        )
+        .into_any_element()
+    }
 }
 
 fn usage_card(sections: &[UsageSection]) -> Option<impl IntoElement + use<>> {
@@ -2582,6 +2661,41 @@ mod tests {
         ] {
             assert!(shown(selector, cx), "{selector}");
         }
+    }
+
+    #[gpui::test]
+    fn hovering_the_rail_ring_shows_the_whole_usage_card(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        collapse(&workspace, cx);
+        let ring = cx.debug_bounds("rail-usage").expect("the ring");
+
+        cx.simulate_mouse_move(ring.center(), None, gpui::Modifiers::none());
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+
+        let card = cx.debug_bounds("usage-hover-card").expect("the usage card");
+        assert!(cx.debug_bounds("usage-card").is_some());
+        assert!(card.left() > ring.right(), "{card:?} {ring:?}");
+        assert!(
+            (card.bottom() - ring.bottom()).abs() <= px(1.),
+            "{card:?} {ring:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn the_rail_add_button_is_as_large_as_a_project_and_the_tile_leaves_room(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = setup(cx);
+        collapse(&workspace, cx);
+        let project = workspace.read_with(cx, |workspace, _| workspace.active_project.0);
+
+        let add = cx.debug_bounds("rail-add-project").expect("the add button");
+        let selector: &'static str = format!("rail-project-{project}").leak();
+        let tile = cx.debug_bounds(selector).expect("the project button");
+
+        assert_eq!(add.size, tile.size);
+        assert!(tile.size.width - px(22.) >= px(12.), "{tile:?}");
     }
 
     #[gpui::test]

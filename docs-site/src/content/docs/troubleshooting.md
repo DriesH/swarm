@@ -111,9 +111,9 @@ The dialog has the tabs **Bug**, **Feature request** and **Feedback**, and a **T
 Under **Include**:
 
 - **Versions** is on. It adds the versions of Swarm, macOS, Claude Code and Codex.
-- **Last 200 lines of the daemon log** is off. When on, Swarm copies the lines to the clipboard. They are not in the address, because GitHub refuses very long addresses. Paste them into the form's **Daemon log** field. When Swarm cannot read the log, nothing opens and the dialog says so.
+- **Copy last 200 lines of the daemon log to clipboard** is off. When on, Swarm copies the lines to the clipboard; they never go into the address. Read them first: paste them into the form's **Daemon log** field only when they hold no secrets. When Swarm cannot read the log, nothing opens and the dialog says so.
 
-**Show what is sent** lists the exact text that goes into the address. The address stays under 6000 characters. A field that is too long is cut and ends with "…", and the list names it.
+The address stays under 6000 characters. A field that is too long is cut and ends with "…". You see every field on GitHub before you submit.
 
 **Open on GitHub** opens `https://github.com/DriesH/swarm/issues/new` with the form of your tab, `bug.yml`, `feature.yml` or `feedback.yml`, and closes the dialog. The three forms are in `.github/ISSUE_TEMPLATE/`. Each sets its own label: `bug`, `enhancement` or `question`.
 

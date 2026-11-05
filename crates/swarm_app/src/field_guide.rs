@@ -1045,6 +1045,9 @@ impl FieldGuideView {
             .justify_center()
             .border_b_1()
             .border_color(colors.line)
+            // GPUI clips children to a rectangle, so the paper rounds its own top corners
+            // inside the card's 12 px corner and 1 px border.
+            .rounded_t(px(11.))
             .bg(paint_color(PAPER))
             .children(art);
 
@@ -1156,7 +1159,8 @@ impl Render for FieldGuideView {
 
         let viewport = window.viewport_size();
         let width = (f32::from(viewport.width) - 64.).clamp(560., 1040.);
-        let height = (f32::from(viewport.height) - 260.).max(240.);
+        // The dialog is centered with 32 px around it; its title and padding take about 100.
+        let height = (f32::from(viewport.height) - 64. - 100.).max(240.);
 
         let mut content: Vec<AnyElement> = Vec::new();
         let mut row_of = vec![0; CREATURES.len()];
