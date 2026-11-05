@@ -30,6 +30,7 @@ use crate::remove_project::RemoveProjectDialog;
 use crate::report_issue::ReportIssueDialog;
 use crate::review_view::ReviewView;
 use crate::workspace::{View, Workspace};
+use swarm_layout::Direction;
 
 const KEY_COMMAND: &str = "\u{2318}";
 const KEY_SHIFT: &str = "\u{21e7}";
@@ -48,6 +49,7 @@ pub(crate) enum Command {
     PreviousFile,
     ToggleViewed,
     CommentOnLine,
+    MoveTile(Direction),
     CloseTask,
     CreatePullRequest,
     ReportIssue,
@@ -77,17 +79,25 @@ enum Group {
     Suggested,
     Tasks,
     Agents,
+    Tile,
     Swarm,
 }
 
 impl Group {
-    const ALL: [Self; 4] = [Self::Suggested, Self::Tasks, Self::Agents, Self::Swarm];
+    const ALL: [Self; 5] = [
+        Self::Suggested,
+        Self::Tasks,
+        Self::Agents,
+        Self::Tile,
+        Self::Swarm,
+    ];
 
     fn title(self) -> &'static str {
         match self {
             Self::Suggested => "Suggested",
             Self::Tasks => "Tasks",
             Self::Agents => "Agents",
+            Self::Tile => "Tile",
             Self::Swarm => "Swarm",
         }
     }
@@ -211,7 +221,13 @@ fn task_status(status: TaskStatus) -> (AgentStatus, Option<&'static str>) {
     clippy::too_many_lines,
     reason = "one flat list of rows reads best in one place"
 )]
-pub(crate) fn rows(data: &FakeData, project: ProjectId, task: TaskId, view: View) -> Vec<Row> {
+pub(crate) fn rows(
+    data: &FakeData,
+    project: ProjectId,
+    task: TaskId,
+    view: View,
+    tile_movable: bool,
+) -> Vec<Row> {
     let stat = data.live_stat(task);
     let (additions, deletions) = (stat.additions, stat.deletions);
 
@@ -340,6 +356,25 @@ pub(crate) fn rows(data: &FakeData, project: ProjectId, task: TaskId, view: View
             )
             .keys(&["C"]),
         ]);
+    }
+
+    if view == View::Terminals && tile_movable {
+        rows.extend(
+            [
+                ("Move tile left", Direction::Left),
+                ("Move tile right", Direction::Right),
+                ("Move tile up", Direction::Up),
+                ("Move tile down", Direction::Down),
+            ]
+            .map(|(label, direction)| {
+                Row::new(
+                    Group::Tile,
+                    IconName::Terminal,
+                    label,
+                    Command::MoveTile(direction),
+                )
+            }),
+        );
     }
 
     if data.task(task).is_some_and(|task| !task.is_start) {
@@ -931,7 +966,13 @@ impl Workspace {
             return;
         }
 
-        let mut rows = rows(&self.data, self.active_project, self.active_task, self.view);
+        let mut rows = rows(
+            &self.data,
+            self.active_project,
+            self.active_task,
+            self.view,
+            self.can_move_tile(),
+        );
         if let Some(name) = self.field_guide.visitor_name() {
             rows.insert(
                 0,
@@ -1016,6 +1057,7 @@ impl Workspace {
             Command::PreviousFile => self.review.update(cx, ReviewView::previous_file),
             Command::ToggleViewed => self.review.update(cx, ReviewView::toggle_selected_viewed),
             Command::CommentOnLine => self.review.update(cx, ReviewView::comment_on_line),
+            Command::MoveTile(direction) => self.move_tile(direction, window, cx),
             Command::CloseTask => self.open_close_task(self.active_task, window, cx),
             Command::CreatePullRequest => window.dispatch_action(Box::new(CreatePullRequest), cx),
             Command::ReportIssue => self.open_report_issue(None, window, cx),
@@ -1043,6 +1085,7 @@ mod tests {
             ProjectId(0),
             TaskId(0),
             View::Terminals,
+            false,
         )
     }
 
@@ -1057,7 +1100,7 @@ mod tests {
     fn comment_on_line_is_in_the_palette_only_while_review_is_open() {
         let data = FakeData::sample();
         let has = |view| {
-            rows(&data, ProjectId(0), TaskId(0), view)
+            rows(&data, ProjectId(0), TaskId(0), view, false)
                 .iter()
                 .any(|row| row.command == Command::CommentOnLine)
         };

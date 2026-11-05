@@ -4,8 +4,11 @@
 //! output. It has no GPUI dependency; `swarm_app` converts its rects to
 //! pixels. The rules are listed in this crate's `README.md`.
 
+mod order;
 #[cfg(test)]
 mod tests;
+
+pub use order::{Direction, move_before, neighbour};
 
 /// Slack for float rounding when checking whether something fits.
 const EPSILON: f32 = 0.01;

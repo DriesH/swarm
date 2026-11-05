@@ -6320,6 +6320,7 @@ pub(crate) mod tests {
             ProjectId(0),
             workspace.read_with(cx, |workspace, _| workspace.active_task),
             View::Terminals,
+            false,
         );
         assert!(opened);
         assert!(!lines.is_empty());

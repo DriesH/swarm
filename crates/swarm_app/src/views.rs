@@ -10,10 +10,12 @@ use swarm_ui::fonts::MONO_FONT;
 use swarm_ui::prelude::*;
 use swarm_ui::{FocusStyle, Nudge, ResizeAxis, TILE_RADIUS, TextFieldSize, TileRing};
 
+use crate::announce::announce;
 use crate::daemon::{CHROME_HEIGHT, CHROME_WIDTH, exit_failed, has_ended, is_resumable};
 use crate::model::{Agent, AgentKind, FakeLine, Terminal, TerminalId, TerminalKind};
 use crate::sidebar::update_workspace;
 use crate::swarm_view::resume_label;
+use crate::tile_order::arranged;
 use crate::workspace::{DataSource, View, Workspace};
 
 /// The padding a terminal view leaves around its grid.
@@ -272,10 +274,16 @@ pub(crate) fn tile_specs(workspace: &Workspace) -> Vec<TileSpec> {
         .filter_map(|id| data.terminal(*id))
         .map(|terminal| (terminal, process_activity(terminal), false));
 
-    agents
+    let specs = agents
         .chain(others)
         .map(|(terminal, activity, large)| tile_spec(workspace, terminal, activity, large))
-        .collect()
+        .collect();
+    let stored = workspace
+        .tile_order
+        .get(&task.id)
+        .map_or(&[][..], Vec::as_slice);
+
+    arranged(stored, specs)
 }
 
 pub(crate) fn compute_layout(workspace: &Workspace) -> Layout {
@@ -785,6 +793,10 @@ fn terminals(workspace: &Workspace, cx: &mut Context<Workspace>) -> impl IntoEle
         })
         .children(editor)
         .children(tiles)
+        .child(announce(
+            "tile-status",
+            LiveRegion::status("tile-status", workspace.tile_status.clone()),
+        ))
 }
 
 fn tile(

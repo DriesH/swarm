@@ -1,4 +1,4 @@
-//! The menu bar: Swarm, File, Edit, View, Window and Help.
+//! The menu bar: Swarm, File, Edit, View, Tile, Window and Help.
 //!
 //! Every item is an action. The shortcut next to an item comes from the keymap
 //! (`actions::shortcuts`), so a key is bound once and the menu cannot disagree with it.
@@ -11,9 +11,10 @@ use swarm_ui::edit;
 
 use crate::actions::{
     About, AddProject, BringAllToFront, CheckForUpdates, CloseTask, FocusAgent, Hide, HideOthers,
-    Minimize, NewTask, NewTerminal, OpenHelp, OpenSettings, PlanWithOrchestrator, Quit,
-    ReportIssue, ShowAll, ShowReview, ShowSwarm, ShowTerminals, ToggleChanges,
-    ToggleCommandPalette, ToggleFiles, ToggleFullScreen, ToggleSidebar, Zoom,
+    Minimize, MoveTileDown, MoveTileLeft, MoveTileRight, MoveTileUp, NewTask, NewTerminal,
+    OpenHelp, OpenSettings, PlanWithOrchestrator, Quit, ReportIssue, ShowAll, ShowReview,
+    ShowSwarm, ShowTerminals, ToggleChanges, ToggleCommandPalette, ToggleFiles, ToggleFullScreen,
+    ToggleSidebar, Zoom,
 };
 use crate::lifecycle;
 use crate::settings::Page;
@@ -104,6 +105,12 @@ fn menus_for(full_screen: bool) -> Vec<Menu> {
             MenuItem::separator(),
             MenuItem::action(full_screen_label, ToggleFullScreen),
         ]),
+        Menu::new("Tile").items([
+            MenuItem::action("Move Tile Left", MoveTileLeft),
+            MenuItem::action("Move Tile Right", MoveTileRight),
+            MenuItem::action("Move Tile Up", MoveTileUp),
+            MenuItem::action("Move Tile Down", MoveTileDown),
+        ]),
         // GPUI hands the menu named "Window" to macOS, which lists the open windows in it.
         Menu::new("Window").items([
             MenuItem::action("Minimize", Minimize),
@@ -193,6 +200,10 @@ fn on_workspace_actions(cx: &mut App) {
     forward::<FocusAgent>(cx);
     forward::<AddProject>(cx);
     forward::<CloseTask>(cx);
+    forward::<MoveTileLeft>(cx);
+    forward::<MoveTileRight>(cx);
+    forward::<MoveTileUp>(cx);
+    forward::<MoveTileDown>(cx);
 }
 
 fn forward<A: Action>(cx: &mut App) {
@@ -368,7 +379,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn the_menu_bar_has_the_six_menus_in_order(cx: &mut TestAppContext) {
+    fn the_menu_bar_has_the_seven_menus_in_order(cx: &mut TestAppContext) {
         let (_workspace, cx) = app(cx);
 
         let names: Vec<_> = menus_set(cx)
@@ -377,7 +388,10 @@ mod tests {
             .collect();
 
         // macOS lists the open windows in the menu GPUI finds by this name.
-        assert_eq!(names, ["Swarm", "File", "Edit", "View", "Window", "Help"]);
+        assert_eq!(
+            names,
+            ["Swarm", "File", "Edit", "View", "Tile", "Window", "Help"]
+        );
     }
 
     #[gpui::test]
@@ -437,6 +451,15 @@ mod tests {
                 "Command Palette",
                 "-",
                 "Enter Full Screen"
+            ]
+        );
+        assert_eq!(
+            items("Tile"),
+            [
+                "Move Tile Left",
+                "Move Tile Right",
+                "Move Tile Up",
+                "Move Tile Down"
             ]
         );
         assert_eq!(
