@@ -40,6 +40,7 @@ Focus an element when the window opens. With nothing focused, GPUI sends Tab now
 | `Panel`, `PanelRow` | `Group` with `.accessible(id, label)` |
 | `PixelBee` | none: decoration, hidden from VoiceOver. Flaps only with `.flap(true)`; still under Reduce Motion |
 | `BeeFlight` | none. Bees fly across the parent once; nothing shows under Reduce Motion |
+| `DotGrid` | none: decoration. Faint 1 px dots at every grid cell corner (`dot` token); pointer events pass through |
 | `HoneyFill` | none. Seven cells fill once; all filled under Reduce Motion |
 | `Toast` | `Status`, "title, message". The action and the dismiss button are in the Tab order; Escape dismisses |
 | `TileFrame` | `Group`, "name terminal" |

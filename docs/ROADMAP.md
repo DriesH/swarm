@@ -176,4 +176,5 @@ Six parts (1–3 done): 1. Settings pages (Projects, Terminals, Prompts, Usage, 
 ## Parked
 
 - Tile controls: drag, minimize, maximize and lock tiles, with a layout engine that works around locked tiles. Spec in [`specs/tile-controls.md`](specs/tile-controls.md).
+  - [x] The tile grid: every tile sits on whole 8 px grid cells, a resize snaps to cells (↑/↓ 1 cell, ⇧ 5 cells) and dots show the grid while it runs (slice 0)
 - Multi-repo projects: a project that groups several repositories, such as a server and its client SDKs. First related repositories that orchestrators can read, then tasks with a worktree in each repository. Spec in [`specs/multi-repo-projects.md`](specs/multi-repo-projects.md).

@@ -4,7 +4,10 @@ use gpui::{
     AnyElement, AppContext as _, Bounds, Context, Div, DragMoveEvent, Entity, FocusHandle,
     MouseButton, Pixels, Role, SharedString, Size, Stateful, Subscription, Window, div, px,
 };
-use swarm_layout::{Activity, Layout, LayoutStyle, Rect, TileId, TileKind, TileSpec};
+use swarm_layout::{
+    Activity, CELL, Cells, Layout, LayoutStyle, Rect, TileId, TileKind, TileSpec, cells_nearest,
+    cells_up, content_rect,
+};
 use swarm_term_view::TerminalView;
 use swarm_ui::fonts::MONO_FONT;
 use swarm_ui::prelude::*;
@@ -27,19 +30,15 @@ const HANDLE_HEIGHT: f32 = 4.;
 const SMALL_TILE_ROWS: u16 = 12;
 /// The rows of the terminal a process tile shows.
 const PROCESS_TILE_ROWS: u16 = 8;
-const KEY_STEP: f32 = 20.;
-const MIN_TILE: Size<Pixels> = Size {
-    width: px(260.),
-    height: px(160.),
-};
+/// Cells an arrow key moves a resize, and with Shift.
+const KEY_CELLS: u16 = 1;
+const KEY_CELLS_LARGE: u16 = 5;
 const FIRST_FRAME_AREA: Size<Pixels> = Size {
     width: px(1030.),
     height: px(790.),
 };
-const DEFAULT_USER_SIZE: Size<Pixels> = Size {
-    width: px(650.),
-    height: px(470.),
-};
+/// The size a new user terminal starts with: about 650 × 470 px.
+const DEFAULT_USER_SIZE: Cells = Cells::new(81, 59);
 
 /// A drag on a user terminal's bottom edge.
 #[derive(Clone, Copy, Debug)]
@@ -49,7 +48,7 @@ pub(crate) struct Resizing {
 
 /// The payload of a drag on a user terminal's resize handle.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct TileDrag(TerminalId);
+pub(crate) struct ResizeDrag(TerminalId);
 
 pub(crate) fn render(
     workspace: &Workspace,
@@ -132,10 +131,6 @@ pub(crate) fn orchestrator_input(cx: &mut Context<Workspace>) -> (Entity<TextInp
     (input, subscription)
 }
 
-fn to_layout_size(size: Size<Pixels>) -> swarm_layout::Size {
-    swarm_layout::Size::new(f32::from(size.width), f32::from(size.height))
-}
-
 fn to_rect(size: Size<Pixels>) -> Rect {
     Rect::new(0., 0., f32::from(size.width), f32::from(size.height))
 }
@@ -149,12 +144,13 @@ fn rows_height(cell: Option<(f32, f32)>, rows: u16) -> f32 {
 }
 
 /// The layout style with a small tile that shows [`SMALL_TILE_ROWS`] rows and a process
-/// tile that shows [`PROCESS_TILE_ROWS`] rows of the default font. A tile keeps its pixels
-/// when the font size changes, and the terminal inside gets fewer rows.
+/// tile that shows [`PROCESS_TILE_ROWS`] rows of the default font, rounded up to whole
+/// cells. A tile keeps its cells when the font size changes, and the terminal inside gets
+/// fewer rows.
 pub(crate) fn layout_style(workspace: &Workspace) -> LayoutStyle {
     LayoutStyle {
-        small_tile_height: rows_height(workspace.default_cell_size, SMALL_TILE_ROWS),
-        process_tile_height: rows_height(workspace.default_cell_size, PROCESS_TILE_ROWS),
+        small_tile_height: cells_up(rows_height(workspace.default_cell_size, SMALL_TILE_ROWS)),
+        process_tile_height: cells_up(rows_height(workspace.default_cell_size, PROCESS_TILE_ROWS)),
         ..LayoutStyle::default()
     }
 }
@@ -223,11 +219,7 @@ fn tile_spec(
     spec.large = large;
 
     if terminal.kind == TerminalKind::User {
-        spec.fixed = workspace
-            .user_sizes
-            .get(&terminal.id)
-            .copied()
-            .map(to_layout_size);
+        spec.fixed = workspace.user_sizes.get(&terminal.id).copied();
     }
 
     spec
@@ -278,8 +270,25 @@ pub(crate) fn tile_specs(workspace: &Workspace) -> Vec<TileSpec> {
         .collect()
 }
 
+/// The area the tiles are laid out in: the terminal area, or a default before it is measured.
+fn layout_area(workspace: &Workspace) -> Size<Pixels> {
+    workspace.terminal_area_size().unwrap_or(FIRST_FRAME_AREA)
+}
+
+/// The content area of the terminal area in whole cells: what the tiles may use.
+fn content_cells(workspace: &Workspace) -> Cells {
+    let content = content_rect(to_rect(layout_area(workspace)), &layout_style(workspace));
+
+    Cells::nearest(content.size)
+}
+
+/// The smallest a user terminal tile gets.
+fn min_tile() -> Cells {
+    LayoutStyle::default().min_tile
+}
+
 pub(crate) fn compute_layout(workspace: &Workspace) -> Layout {
-    let area = workspace.terminal_area_size().unwrap_or(FIRST_FRAME_AREA);
+    let area = layout_area(workspace);
 
     let specs = tile_specs(workspace);
 
@@ -346,6 +355,8 @@ impl StartRegions {
         style: &LayoutStyle,
     ) -> Self {
         let (pad_x, pad_y) = main.padding();
+        let (gap, small_height) = (cell_px(style.gap), cell_px(style.small_tile_height));
+        let min_tile = style.min_tile.to_size();
         let width = (f32::from(area.width) - 2. * pad_x).clamp(0., main.max_width());
         let height = (f32::from(area.height) - 2. * pad_y).max(0.);
         let x = (f32::from(area.width) - width) / 2.;
@@ -353,29 +364,34 @@ impl StartRegions {
         let shown = u16::try_from(waiting)
             .unwrap_or(u16::MAX)
             .min(slots_in(width, style));
-        let band_top = pad_y + height - style.small_tile_height;
-        let main_height = band_top - style.gap - pad_y;
-        if shown == 0 || main_height < style.min_tile.height {
+        let band_top = pad_y + height - small_height;
+        let main_height = band_top - gap - pad_y;
+        if shown == 0 || main_height < min_tile.height {
             return Self {
                 main: Rect::new(x, pad_y, width, height),
                 band: Vec::new(),
             };
         }
 
-        let band_height = style.small_tile_height;
-        let tile_width = (width - f32::from(shown - 1) * style.gap) / f32::from(shown);
+        let band_height = small_height;
+        let tile_width = (width - f32::from(shown - 1) * gap) / f32::from(shown);
 
         Self {
             main: Rect::new(x, pad_y, width, main_height),
             band: (0..shown)
                 .map(|index| {
-                    let left = x + f32::from(index) * (tile_width + style.gap);
+                    let left = x + f32::from(index) * (tile_width + gap);
 
                     Rect::new(left, band_top, tile_width, band_height)
                 })
                 .collect(),
         }
     }
+}
+
+/// Whole cells in pixels.
+fn cell_px(cells: u16) -> f32 {
+    Cells::new(cells, 0).to_size().width
 }
 
 /// How many tiles of the smallest width fit side by side in `width`.
@@ -385,7 +401,8 @@ impl StartRegions {
     reason = "the count is clamped to the range of u16"
 )]
 fn slots_in(width: f32, style: &LayoutStyle) -> u16 {
-    let slots = ((width + style.gap) / (style.min_tile.width + style.gap)).floor();
+    let gap = cell_px(style.gap);
+    let slots = ((width + gap) / (style.min_tile.to_size().width + gap)).floor();
 
     slots.clamp(0., f32::from(u16::MAX)) as u16
 }
@@ -514,16 +531,28 @@ impl Workspace {
         self.close_process(terminal, cx);
     }
 
-    /// The size a new user terminal tile starts with.
-    pub(crate) fn planned_user_size(&self) -> Size<Pixels> {
-        let size = self
-            .terminal_area_size()
-            .map_or(DEFAULT_USER_SIZE, |area| Size {
-                width: DEFAULT_USER_SIZE.width.min(area.width - px(350.)),
-                height: DEFAULT_USER_SIZE.height.min(area.height - px(20.)),
-            });
+    /// The size a new user terminal tile starts with: the default, at most the content area
+    /// less room for the orchestrator column, at least the smallest tile.
+    pub(crate) fn planned_user_size(&self) -> Cells {
+        let style = LayoutStyle::default();
+        let size = if self.terminal_area_size().is_some() {
+            let content = content_cells(self);
+            let column = style.min_orchestrator.width + style.gap;
 
-        size.max(&MIN_TILE)
+            Cells::new(
+                DEFAULT_USER_SIZE
+                    .width
+                    .min(content.width.saturating_sub(column)),
+                DEFAULT_USER_SIZE.height.min(content.height),
+            )
+        } else {
+            DEFAULT_USER_SIZE
+        };
+
+        Cells::new(
+            size.width.max(style.min_tile.width),
+            size.height.max(style.min_tile.height),
+        )
     }
 
     /// The number of a user terminal among the user terminals of its task, from 1.
@@ -615,22 +644,22 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The biggest a user terminal tile grows.
-    fn largest_user_tile(&self) -> Size<Pixels> {
-        self.terminal_area_size()
-            .map_or(FIRST_FRAME_AREA, |area| Size {
-                width: area.width - px(20.),
-                height: area.height - px(20.),
-            })
+    /// The biggest a user terminal tile grows: the content area.
+    fn largest_user_tile(&self) -> Cells {
+        content_cells(self)
     }
 
     pub(crate) fn resize_user_terminal(
         &mut self,
         terminal: TerminalId,
-        size: Size<Pixels>,
+        size: Cells,
         cx: &mut Context<Self>,
     ) {
-        let size = size.min(&self.largest_user_tile()).max(&MIN_TILE);
+        let (largest, smallest) = (self.largest_user_tile(), min_tile());
+        let size = Cells::new(
+            size.width.min(largest.width).max(smallest.width),
+            size.height.min(largest.height).max(smallest.height),
+        );
 
         if self.user_sizes.get(&terminal) != Some(&size) {
             self.user_sizes.insert(terminal, size);
@@ -681,7 +710,7 @@ impl Workspace {
     }
 
     /// The tile reaches from its top to the pointer, wherever the pointer is in the window.
-    fn drag_resize(&mut self, event: &DragMoveEvent<TileDrag>, cx: &mut Context<Self>) {
+    fn drag_resize(&mut self, event: &DragMoveEvent<ResizeDrag>, cx: &mut Context<Self>) {
         if event.event.pressed_button != Some(MouseButton::Left) {
             self.end_resize(cx);
             return;
@@ -697,10 +726,11 @@ impl Workspace {
             cx.notify();
         }
 
-        let size = Size {
-            width: px(rect.size.width),
-            height: event.event.position.y - event.bounds.top() - px(rect.origin.y),
-        };
+        let height = event.event.position.y - event.bounds.top() - px(rect.origin.y);
+        let size = Cells::new(
+            cells_nearest(rect.size.width),
+            cells_nearest(f32::from(height)),
+        );
         self.resize_user_terminal(terminal, size, cx);
     }
 
@@ -710,24 +740,30 @@ impl Workspace {
         }
     }
 
-    /// Up and Down change the height by a step. Home and End go to the limits.
+    /// Up and Down change the height by a cell, and by five with Shift. Home and End go to
+    /// the limits.
     fn nudge_resize(&mut self, terminal: TerminalId, nudge: Nudge, cx: &mut Context<Self>) {
         let Some(rect) = self.layout.rect(TileId(terminal.0)) else {
             return;
         };
 
+        let height = cells_nearest(rect.size.height);
         let height = match nudge {
-            Nudge::Left => px(rect.size.height - KEY_STEP),
-            Nudge::Right => px(rect.size.height + KEY_STEP),
-            Nudge::Smallest => MIN_TILE.height,
+            Nudge::Left => height.saturating_sub(KEY_CELLS),
+            Nudge::LeftLarge => height.saturating_sub(KEY_CELLS_LARGE),
+            Nudge::Right => height.saturating_add(KEY_CELLS),
+            Nudge::RightLarge => height.saturating_add(KEY_CELLS_LARGE),
+            Nudge::Smallest => min_tile().height,
             Nudge::Largest => self.largest_user_tile().height,
         };
 
-        let size = Size {
-            width: px(rect.size.width),
-            height,
-        };
+        let size = Cells::new(cells_nearest(rect.size.width), height);
         self.resize_user_terminal(terminal, size, cx);
+    }
+
+    /// Whether the content area shows the grid: while a tile is being resized.
+    pub(crate) fn grid_visible(&self) -> bool {
+        self.resizing.is_some()
     }
 }
 
@@ -766,7 +802,7 @@ fn terminals(workspace: &Workspace, cx: &mut Context<Workspace>) -> impl IntoEle
         .relative()
         .when(on_terminal, |area| area.bg(term))
         .on_drag_move(
-            cx.listener(|workspace, event: &DragMoveEvent<TileDrag>, _, cx| {
+            cx.listener(|workspace, event: &DragMoveEvent<ResizeDrag>, _, cx| {
                 workspace.drag_resize(event, cx);
             }),
         )
@@ -780,11 +816,28 @@ fn terminals(workspace: &Workspace, cx: &mut Context<Workspace>) -> impl IntoEle
         )
         // Fills the area so its bounds are the layout area.
         .child(div().absolute().size_full())
+        .when(workspace.grid_visible(), |area| {
+            area.child(dot_grid(workspace))
+        })
         .when(on_terminal && crate::settings::easter_eggs(cx), |area| {
             area.child(honeycomb_behind(workspace))
         })
         .children(editor)
         .children(tiles)
+}
+
+/// The grid dots over the content area, behind the tiles.
+fn dot_grid(workspace: &Workspace) -> impl IntoElement + use<> {
+    let content = content_rect(to_rect(layout_area(workspace)), &layout_style(workspace));
+
+    div()
+        .debug_selector(|| "tile-dot-grid".to_owned())
+        .absolute()
+        .left(px(content.origin.x))
+        .top(px(content.origin.y))
+        .w(px(content.size.width))
+        .h(px(content.size.height))
+        .child(DotGrid::new(CELL))
 }
 
 fn tile(
@@ -818,8 +871,8 @@ fn tile(
                 workspace.user_terminal_number(id)
             );
             let range = (
-                f32::from(MIN_TILE.height),
-                f32::from(workspace.largest_user_tile().height),
+                min_tile().to_size().height,
+                workspace.largest_user_tile().to_size().height,
             );
 
             let focus = workspace.resize_focus.get(&id)?;
@@ -1190,7 +1243,7 @@ fn tile_resize_handle(
         .corner_radius(TILE_RADIUS)
         .value(f32::from(height), range.0, range.1)
         .dragging(dragging)
-        .on_drag(TileDrag(id))
+        .on_drag(ResizeDrag(id))
         .on_nudge(move |nudge, _, cx| {
             update_workspace(&workspace, cx, |workspace, cx| {
                 workspace.nudge_resize(id, nudge, cx);
@@ -1224,6 +1277,12 @@ mod tests {
 
     use super::*;
     use crate::actions::{self, NewTerminal, PlanWithOrchestrator};
+
+    /// Whole cells in pixels.
+    fn px_of(cells: u16) -> f32 {
+        f32::from(cells) * CELL
+    }
+
     use crate::model::{AgentId, TaskId};
 
     /// The first terminal the app adds to the sample data.
@@ -1347,8 +1406,9 @@ mod tests {
 
         let (cell, height) = measured;
         assert_eq!(cell.map(|(_, height)| height), Some(17.));
-        assert!((height - 276.).abs() < 0.01);
-        assert!((larger - 336.).abs() < 0.01);
+        // 276 px is 34.5 cells, 336 px is 42.
+        assert_eq!(height, 35);
+        assert_eq!(larger, 42);
     }
 
     #[gpui::test]
@@ -1377,7 +1437,7 @@ mod tests {
         cx.update(|window, cx| {
             let body = Size {
                 width: px(300.),
-                height: px(height - CHROME_HEIGHT),
+                height: px(px_of(height) - CHROME_HEIGHT),
             };
             let grid = TerminalView::size_for(body, 13., window, cx);
 
@@ -1403,8 +1463,9 @@ mod tests {
             let area = workspace
                 .terminal_area_size()
                 .expect("the area is measured");
-            let content = f32::from(area.width) - 20.;
-            let small = layout_style(workspace).small_tile_height;
+            let style = layout_style(workspace);
+            let content = content_rect(to_rect(area), &style).size;
+            let small = px_of(style.small_tile_height);
             let orchestrator = workspace
                 .active_task()
                 .orchestrator
@@ -1412,8 +1473,10 @@ mod tests {
                 .map(|agent| rect_of(workspace, agent.terminal))
                 .expect("the sample has an orchestrator");
 
-            assert!((orchestrator.size.width - 0.65 * content).abs() < 1.);
-            assert!((orchestrator.size.height - (f32::from(area.height) - 20.)).abs() < 1.);
+            // 65 % of the content width, in whole cells rounded down.
+            let share = (content.width / CELL * 0.65).floor() * CELL;
+            assert!((orchestrator.size.width - share).abs() < f32::EPSILON);
+            assert!((orchestrator.size.height - content.height).abs() < f32::EPSILON);
 
             let working = workspace
                 .active_task()
@@ -1459,8 +1522,9 @@ mod tests {
             cx.notify();
         });
         redraw(cx);
-        let small =
-            workspace.read_with(cx, |workspace, _| layout_style(workspace).small_tile_height);
+        let small = workspace.read_with(cx, |workspace, _| {
+            px_of(layout_style(workspace).small_tile_height)
+        });
 
         assert!(grown > small + 50.);
         assert!((height(cx) - small).abs() < 0.5);
@@ -1482,7 +1546,7 @@ mod tests {
                 .map(|agent| rect_of(workspace, agent.terminal))
                 .expect("the sample has a blocked worker");
             let style = layout_style(workspace);
-            let tall = 2. * style.small_tile_height + style.gap;
+            let tall = px_of(2 * style.small_tile_height + style.gap);
             assert!((blocked.size.height - tall).abs() < 0.5);
 
             let below: Vec<Rect> = workspace
@@ -1745,11 +1809,7 @@ mod tests {
         let user = user.unwrap_or(TerminalId(u32::MAX));
 
         workspace.update(cx, |workspace, cx| {
-            let size = Size {
-                width: px(500.),
-                height: px(300.),
-            };
-            workspace.resize_user_terminal(user, size, cx);
+            workspace.resize_user_terminal(user, Cells::new(63, 38), cx);
         });
         redraw(cx);
 
@@ -1759,7 +1819,7 @@ mod tests {
                 .rect(TileId(user.0))
                 .map(|rect| rect.size.height)
         });
-        assert_eq!(height, Some(300.));
+        assert_eq!(height, Some(px_of(38)));
     }
 
     #[gpui::test]
@@ -1820,9 +1880,13 @@ mod tests {
 
     fn start_style() -> LayoutStyle {
         LayoutStyle {
-            small_tile_height: 276.,
+            small_tile_height: cells_up(276.),
             ..LayoutStyle::default()
         }
+    }
+
+    fn start_gap() -> f32 {
+        cell_px(start_style().gap)
     }
 
     fn area_of(width: f32, height: f32) -> Size<Pixels> {
@@ -1860,9 +1924,9 @@ mod tests {
 
         let band = regions.band.first().copied().expect("one tile in the band");
 
-        assert_eq!(band, Rect::new(160., 596., 880., 276.));
-        assert_eq!(regions.main, Rect::new(160., 28., 880., 558.));
-        assert!((regions.main.bottom() + start_style().gap - band.origin.y).abs() < 0.01);
+        assert_eq!(band, Rect::new(160., 592., 880., 280.));
+        assert_eq!(regions.main, Rect::new(160., 28., 880., 556.));
+        assert!((regions.main.bottom() + start_gap() - band.origin.y).abs() < 0.01);
     }
 
     #[test]
@@ -1871,8 +1935,8 @@ mod tests {
 
         let band = regions.band.first().copied().expect("one tile in the band");
 
-        assert_eq!(band, Rect::new(220., 604., 760., 276.));
-        assert_eq!(regions.main, Rect::new(220., 20., 760., 574.));
+        assert_eq!(band, Rect::new(220., 600., 760., 280.));
+        assert_eq!(regions.main, Rect::new(220., 20., 760., 572.));
     }
 
     #[test]
@@ -1883,8 +1947,8 @@ mod tests {
         let lefts: Vec<f32> = regions.band.iter().map(|rect| rect.origin.x).collect();
         let widths: Vec<f32> = regions.band.iter().map(|rect| rect.size.width).collect();
 
-        assert_eq!(lefts, [160., 605.]);
-        assert_eq!(widths, [435., 435.]);
+        assert_eq!(lefts, [160., 604.]);
+        assert_eq!(widths, [436., 436.]);
     }
 
     #[test]
@@ -1898,7 +1962,7 @@ mod tests {
             regions
                 .band
                 .iter()
-                .all(|rect| rect.size.width >= style.min_tile.width)
+                .all(|rect| rect.size.width >= style.min_tile.to_size().width)
         );
     }
 
@@ -1931,16 +1995,16 @@ mod tests {
     fn the_band_stays_while_the_main_area_keeps_the_height_of_the_smallest_tile() {
         let style = start_style();
 
-        let regions = StartRegions::new(area_of(1200., 502.), StartMain::Terminal, 1, &style);
+        let regions = StartRegions::new(area_of(1200., 504.), StartMain::Terminal, 1, &style);
 
         assert_eq!(regions.band.len(), 1);
-        assert!((regions.main.size.height - style.min_tile.height).abs() < f32::EPSILON);
+        assert!((regions.main.size.height - style.min_tile.to_size().height).abs() < f32::EPSILON);
     }
 
     #[test]
     fn the_band_goes_when_the_main_area_would_get_less_than_the_smallest_tile() {
         let regions =
-            StartRegions::new(area_of(1200., 501.), StartMain::Terminal, 1, &start_style());
+            StartRegions::new(area_of(1200., 503.), StartMain::Terminal, 1, &start_style());
 
         assert!(regions.band.is_empty());
     }
@@ -2335,7 +2399,7 @@ mod tests {
         let (workspace, cx) = start_with_terminals(1, cx);
         let terminal = user_terminals(&workspace, cx)[0];
         workspace.update(cx, |workspace, cx| {
-            workspace.resize_user_terminal(terminal, area_of(500., 400.), cx);
+            workspace.resize_user_terminal(terminal, Cells::new(63, 50), cx);
         });
         redraw(cx);
 
@@ -2344,7 +2408,7 @@ mod tests {
 
             (
                 rect.map(|rect| rect.size.height),
-                layout_style(workspace).small_tile_height,
+                px_of(layout_style(workspace).small_tile_height),
             )
         });
 
@@ -2536,9 +2600,9 @@ mod tests {
         cx.simulate_keystrokes("home");
         let smallest = tile_height(&workspace, user, cx);
 
-        assert!((after_down - (start + KEY_STEP)).abs() < 0.5);
-        assert!((after_up - (start - KEY_STEP)).abs() < 0.5);
-        assert!((smallest - f32::from(MIN_TILE.height)).abs() < 0.5);
+        assert!((after_down - (start + CELL)).abs() < f32::EPSILON);
+        assert!((after_up - (start - CELL)).abs() < f32::EPSILON);
+        assert!((smallest - min_tile().to_size().height).abs() < f32::EPSILON);
     }
 
     #[gpui::test]
@@ -2567,6 +2631,88 @@ mod tests {
         );
 
         assert!((dragged - 320.).abs() < 0.5);
+    }
+
+    fn drag_to(cx: &mut VisualTestContext, x: Pixels, y: Pixels) {
+        cx.simulate_mouse_move(
+            gpui::point(x, y),
+            MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+    }
+
+    #[gpui::test]
+    fn a_resize_by_pointer_lands_on_the_nearest_whole_cell(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let (user, _) = focused_resize_handle(&workspace, cx);
+        let handle = cx.debug_bounds("resize-14").expect("the handle");
+        let slot = cx.debug_bounds("tile-slot-14").expect("the tile");
+        let x = handle.center().x;
+
+        cx.simulate_mouse_down(handle.center(), MouseButton::Left, gpui::Modifiers::none());
+        // The first move starts the drag.
+        drag_to(cx, x, slot.top() + px(300.));
+        // 301 px is 37.6 cells; 299 px is 37.4 cells.
+        drag_to(cx, x, slot.top() + px(301.));
+        let above = tile_height(&workspace, user, cx);
+        drag_to(cx, x, slot.top() + px(299.));
+        let below = tile_height(&workspace, user, cx);
+        cx.simulate_mouse_up(
+            gpui::point(x, slot.top() + px(299.)),
+            MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+
+        assert!((above - px_of(38)).abs() < f32::EPSILON, "{above}");
+        assert!((below - px_of(37)).abs() < f32::EPSILON, "{below}");
+    }
+
+    #[gpui::test]
+    fn the_arrows_step_one_cell_and_shift_steps_five(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let (user, start) = focused_resize_handle(&workspace, cx);
+
+        cx.simulate_keystrokes("shift-down");
+        let larger = tile_height(&workspace, user, cx);
+        cx.simulate_keystrokes("shift-up shift-up");
+        let smaller = tile_height(&workspace, user, cx);
+        cx.simulate_keystrokes("up");
+        let one_up = tile_height(&workspace, user, cx);
+
+        assert!((larger - (start + 5. * CELL)).abs() < f32::EPSILON);
+        assert!((smaller - (start - 5. * CELL)).abs() < f32::EPSILON);
+        assert!((one_up - (start - 6. * CELL)).abs() < f32::EPSILON);
+    }
+
+    #[gpui::test]
+    fn the_dot_grid_shows_only_while_a_resize_runs(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let (user, _) = focused_resize_handle(&workspace, cx);
+        let handle = cx.debug_bounds("resize-14").expect("the handle");
+        let slot = cx.debug_bounds("tile-slot-14").expect("the tile");
+        let x = handle.center().x;
+        assert!(cx.debug_bounds("tile-dot-grid").is_none());
+
+        cx.simulate_mouse_down(handle.center(), MouseButton::Left, gpui::Modifiers::none());
+        drag_to(cx, x, slot.top() + px(300.));
+        drag_to(cx, x, slot.top() + px(320.));
+        tile_height(&workspace, user, cx);
+        let during = cx.debug_bounds("tile-dot-grid");
+        cx.simulate_mouse_up(
+            gpui::point(x, slot.top() + px(320.)),
+            MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        tile_height(&workspace, user, cx);
+        let after = cx.debug_bounds("tile-dot-grid");
+
+        let content = workspace.read_with(cx, |workspace, _| {
+            content_rect(to_rect(layout_area(workspace)), &layout_style(workspace))
+        });
+        let during = during.expect("the dot grid shows during the drag");
+        assert!((f32::from(during.size.width) - content.size.width).abs() < 0.5);
+        assert!((f32::from(during.size.height) - content.size.height).abs() < 0.5);
+        assert!(after.is_none());
     }
 
     #[gpui::test]
@@ -2730,14 +2876,14 @@ mod tests {
             rig.workspace.read_with(cx, |workspace, _| {
                 let style = layout_style(workspace);
                 let height = rect_of(workspace, terminal(workspace)).size.height;
-                let tall = 2. * style.small_tile_height + style.gap;
+                let tall = px_of(2 * style.small_tile_height + style.gap);
                 let is = |expected: f32| (height - expected).abs() < 0.5;
 
-                if is(style.small_tile_height) {
+                if is(px_of(style.small_tile_height)) {
                     Height::Small
                 } else if is(tall) {
                     Height::Tall
-                } else if is(style.process_tile_height) {
+                } else if is(px_of(style.process_tile_height)) {
                     Height::Process
                 } else {
                     Height::Other(height)
@@ -2912,18 +3058,19 @@ mod tests {
             ask(&rig, API, true, cx);
             let beside_a_large_worker = orchestrator_rect(&rig, cx);
 
-            let (area, share) = rig.workspace.read_with(cx, |workspace, _| {
+            let (content, share) = rig.workspace.read_with(cx, |workspace, _| {
                 let area = workspace
                     .terminal_area_size()
                     .expect("the area is measured");
+                let content = content_rect(to_rect(area), &layout_style(workspace)).size;
 
-                (area, 0.65 * (f32::from(area.width) - 20.))
+                (content, (content.width / CELL * 0.65).floor() * CELL)
             });
             assert_eq!(asked, before);
             assert!(nothing_kept);
             assert_eq!(beside_a_large_worker, before);
-            assert!((before.size.width - share).abs() < 1.);
-            assert!((before.size.height - (f32::from(area.height) - 20.)).abs() < 1.);
+            assert!((before.size.width - share).abs() < f32::EPSILON);
+            assert!((before.size.height - content.height).abs() < f32::EPSILON);
         }
 
         #[gpui::test]

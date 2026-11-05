@@ -257,7 +257,7 @@ pub(crate) struct Workspace {
     pub(crate) layout: swarm_layout::Layout,
     /// The width of the tray in the status bar at the last paint, once known.
     pub(crate) tray_width: Option<Pixels>,
-    pub(crate) user_sizes: HashMap<TerminalId, Size<Pixels>>,
+    pub(crate) user_sizes: HashMap<TerminalId, swarm_layout::Cells>,
     pub(crate) resizing: Option<Resizing>,
     pub(crate) daemon: Option<Client>,
     pub(crate) live_terminals: HashMap<TerminalId, LiveTerminal>,
