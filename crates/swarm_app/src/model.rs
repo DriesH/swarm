@@ -8,10 +8,10 @@ use gpui::{Hsla, SharedString, rgb};
 use swarm_protocol::{
     AgentId as DaemonAgentId, AgentInfo, AgentLifecycle, AgentRole,
     AgentStatus as DaemonAgentStatus, CheckState, ChecksRun, CommentEvent, DiffStat, FileStat,
-    GithubCheck, GithubCheckState, GithubStatus, LocalCheck, MessageId, MessageInfo, MessageKind,
-    PrDraft, PrLink, PrState, ProjectInfo, PullRequest, ReviewComment, ReviewSource, ReviewState,
-    Reviewer, SubscriptionUsage, TaskDiff, TaskInfo, TerminalId as DaemonTerminalId, TerminalInfo,
-    Usage, UsageWindow,
+    GithubCheck, GithubCheckState, GithubStatus, LocalCheck, MergeState, MessageId, MessageInfo,
+    MessageKind, PrDraft, PrLink, PrState, ProjectInfo, PullRequest, ReviewComment, ReviewSource,
+    ReviewState, Reviewer, SubscriptionUsage, TaskDiff, TaskInfo, TerminalId as DaemonTerminalId,
+    TerminalInfo, Usage, UsageWindow,
 };
 use swarm_term::{BlockedKind, ExitStatus};
 use swarm_ui::prelude::Color;
@@ -539,6 +539,7 @@ pub(crate) fn sample_pull_request() -> PullRequest {
             },
         ],
         mergeable: false,
+        merge_state: MergeState::Unknown,
         read_at: SAMPLE_NOW,
     }
 }
@@ -2762,6 +2763,7 @@ mod tests {
                     checks: Vec::new(),
                     reviewers: Vec::new(),
                     mergeable: true,
+                    merge_state: MergeState::Clean,
                     read_at: 0,
                 },
             );

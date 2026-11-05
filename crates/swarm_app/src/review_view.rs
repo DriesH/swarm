@@ -112,7 +112,12 @@ impl ReviewInput {
 pub(crate) struct MarksSync {
     /// The tasks whose stored marks were asked for.
     asked: HashSet<swarm_protocol::TaskId>,
-    /// Tasks with a read or a save on its way; `true` when marks changed since it began.
+    /// The tasks whose stored marks arrived. A save replaces the stored marks, so none
+    /// goes out before this.
+    loaded: HashSet<swarm_protocol::TaskId>,
+    /// The tasks with marks that were not sent. They go out after the next load.
+    unsent: HashSet<swarm_protocol::TaskId>,
+    /// Tasks with a save on its way; `true` when marks changed since it began.
     saving: HashMap<swarm_protocol::TaskId, bool>,
 }
 
@@ -1566,7 +1571,9 @@ impl ReviewView {
         let file = self.body.rows.get(top.item_ix)?.file()?;
         let header = (*self.body.headers.get(file)?)?;
 
-        if top.item_ix <= header {
+        // The header row itself, partly scrolled off, is replaced by the sticky one so it
+        // never jumps.
+        if top.item_ix < header || (top.item_ix == header && top.offset_in_item == px(0.)) {
             return None;
         }
 
@@ -2480,8 +2487,8 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Reads the marks the daemon stored for a task, once per session. A save waits for the
-    /// read, so it never replaces stored marks that the app has not seen yet.
+    /// Reads the marks the daemon stored for a task, until a read works. A save waits for
+    /// it, so it never replaces stored marks that the app has not seen yet.
     fn load_review_marks_if_needed(
         &mut self,
         task: TaskId,
@@ -2494,24 +2501,25 @@ impl Workspace {
         if !self.marks_sync.asked.insert(id) {
             return;
         }
-        self.marks_sync.saving.insert(id, false);
 
         let reading = cx.background_spawn(async move { client.review_marks(id) });
 
         cx.spawn(async move |this, cx| {
             let result = reading.await;
-            let updated = this.update(cx, |workspace, cx| {
-                match result {
-                    Ok(marks) => {
-                        workspace
-                            .review
-                            .update(cx, |review, cx| review.load_marks(task, marks, cx));
-                    }
-                    Err(error) => log::debug!("cannot read the review marks: {error}"),
-                }
+            let updated = this.update(cx, |workspace, cx| match result {
+                Ok(marks) => {
+                    workspace
+                        .review
+                        .update(cx, |review, cx| review.load_marks(task, marks, cx));
+                    workspace.marks_sync.loaded.insert(id);
 
-                if workspace.marks_sync.saving.remove(&id).unwrap_or(false) {
-                    workspace.save_review_marks(task, cx);
+                    if workspace.marks_sync.unsent.remove(&id) {
+                        workspace.save_review_marks(task, cx);
+                    }
+                }
+                Err(error) => {
+                    log::debug!("cannot read the review marks: {error}");
+                    workspace.marks_sync.asked.remove(&id);
                 }
             });
 
@@ -2528,9 +2536,20 @@ impl Workspace {
         let Some(id) = self.data.diff_id(task) else {
             return;
         };
+        // Marks that cannot go out wait for the next read, which merges them with the
+        // stored ones.
         let Some(client) = self.daemon.clone().filter(Client::is_connected) else {
+            self.marks_sync.unsent.insert(id);
+            self.marks_sync.loaded.remove(&id);
+            self.marks_sync.asked.remove(&id);
+
             return;
         };
+        if !self.marks_sync.loaded.contains(&id) {
+            self.marks_sync.unsent.insert(id);
+
+            return;
+        }
 
         if let Some(changed) = self.marks_sync.saving.get_mut(&id) {
             *changed = true;
@@ -6299,11 +6318,37 @@ mod tests {
         &mut VisualTestContext,
         flume::Receiver<Vec<ReviewMark>>,
     ) {
+        marks_workspace_failing(stored, 0, cx)
+    }
+
+    /// As [`marks_workspace`], with the first `failing_reads` reads of the stored marks
+    /// answered with an error.
+    fn marks_workspace_failing(
+        stored: Vec<ReviewMark>,
+        failing_reads: usize,
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<Workspace>,
+        Entity<ReviewView>,
+        &mut VisualTestContext,
+        flume::Receiver<Vec<ReviewMark>>,
+    ) {
         use crate::daemon::tests::{fake_daemon_replying, real_task_workspace};
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use swarm_protocol::{Event, Request};
 
         let (sent, saved) = flume::unbounded();
+        let reads = AtomicUsize::new(0);
         let socket = fake_daemon_replying(move |request| match request {
+            Request::ReviewMarks { call, .. }
+                if reads.fetch_add(1, Ordering::SeqCst) < failing_reads =>
+            {
+                Some(Event::Error {
+                    call: Some(call),
+                    id: None,
+                    message: "no marks".to_owned(),
+                })
+            }
             Request::ReviewMarks { call, .. } => Some(Event::ReviewMarks {
                 call,
                 marks: stored.clone(),
@@ -6415,6 +6460,50 @@ mod tests {
         assert!(!second, "only the stored file is viewed");
     }
 
+    fn stored_first_file() -> Vec<ReviewMark> {
+        vec![ReviewMark {
+            worktree: PathBuf::from("/w"),
+            path: PathBuf::from("src/a.rs"),
+            viewed: Some(11),
+            folded: Some(11),
+        }]
+    }
+
+    #[gpui::test]
+    fn a_failed_read_of_the_stored_marks_never_lets_a_save_replace_them(cx: &mut TestAppContext) {
+        let (_workspace, review, cx, saved) =
+            marks_workspace_failing(stored_first_file(), usize::MAX, cx);
+        crate::daemon::tests::wait_a_little();
+        redraw(cx);
+
+        review.update(cx, |review, cx| review.toggle_viewed(1, cx));
+        let sent = next_saved(&saved, cx);
+
+        assert_eq!(sent, None);
+    }
+
+    #[gpui::test]
+    fn marks_made_while_disconnected_are_saved_after_the_next_load(cx: &mut TestAppContext) {
+        let (workspace, review, cx, saved) = marks_workspace(stored_first_file(), cx);
+        crate::daemon::tests::wait_until(cx, |cx| {
+            redraw(cx);
+            review.read_with(cx, |review, _| review.is_file_viewed(0))
+        });
+        let client = workspace.read_with(cx, |workspace, _| workspace.daemon.clone());
+
+        workspace.update(cx, |workspace, _| workspace.daemon = None);
+        review.update(cx, |review, cx| review.toggle_viewed(1, cx));
+        let while_disconnected = saved.try_recv().ok();
+        workspace.update(cx, |workspace, cx| {
+            workspace.daemon = client;
+            cx.notify();
+        });
+
+        let after = next_saved(&saved, cx).expect("the marks were sent after the reload");
+        assert_eq!(while_disconnected, None);
+        assert_eq!(after.len(), 2, "{after:?}");
+    }
+
     /// Scrolls the body so that this row is the first one in view.
     fn scroll_body_to(review: &Entity<ReviewView>, row: usize, cx: &mut VisualTestContext) {
         review.update(cx, |review, cx| {
@@ -6453,6 +6542,31 @@ mod tests {
             pushed.is_some_and(|(file, push)| file == 0 && push < px(0.)),
             "{pushed:?}"
         );
+    }
+
+    #[gpui::test]
+    fn a_header_row_that_is_partly_scrolled_off_already_sticks(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = open_review(&workspace, cx);
+        let header = review.read_with(cx, |review, _| {
+            review
+                .body
+                .range_of(0)
+                .expect("the first file has rows")
+                .start
+        });
+
+        review.update(cx, |review, cx| {
+            review.body_list.scroll_to(ListOffset {
+                item_ix: header,
+                offset_in_item: px(4.),
+            });
+            cx.notify();
+        });
+        redraw(cx);
+        let sticking = review.read_with(cx, |review, _| review.sticky_header());
+
+        assert_eq!(sticking, Some((0, px(0.))));
     }
 
     #[gpui::test]

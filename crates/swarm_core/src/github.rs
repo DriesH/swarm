@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Deserializer};
 use swarm_protocol::{
-    GH_SECS, GithubCheck, GithubCheckState, GithubStatus, MergeMethod, PrLink, PrState,
+    GH_SECS, GithubCheck, GithubCheckState, GithubStatus, MergeMethod, MergeState, PrLink, PrState,
     PullRequest, ReviewState, Reviewer,
 };
 
@@ -718,12 +718,12 @@ pub fn parse_pull_request(json: &str, read_at: u64) -> Result<PullRequest, Error
         .map_err(|error| Error::Invalid(format!("gh printed JSON that cannot be read: {error}")))?;
 
     let state = pr_state(&view.state);
+    let merge_state = merge_state(&view.mergeable, &view.merge_state_status);
     let mergeable = state == PrState::Open
         && !view.is_draft
-        && view.mergeable == "MERGEABLE"
         && matches!(
-            view.merge_state_status.as_str(),
-            "CLEAN" | "UNSTABLE" | "HAS_HOOKS"
+            merge_state,
+            MergeState::Clean | MergeState::Unstable | MergeState::HasHooks
         );
 
     Ok(PullRequest {
@@ -735,8 +735,29 @@ pub fn parse_pull_request(json: &str, read_at: u64) -> Result<PullRequest, Error
         checks: view.rollup.into_iter().map(github_check).collect(),
         reviewers: reviewers(view.requests, view.reviews),
         mergeable,
+        merge_state,
         read_at,
     })
+}
+
+/// GitHub's `mergeable` is `UNKNOWN` while it computes, so only `MERGEABLE` and
+/// `CONFLICTING` say anything. `UNSTABLE` and `HAS_HOOKS` can merge by GitHub's docs.
+fn merge_state(mergeable: &str, status: &str) -> MergeState {
+    if mergeable == "CONFLICTING" || status == "DIRTY" {
+        return MergeState::Conflicts;
+    }
+    if mergeable != "MERGEABLE" {
+        return MergeState::Unknown;
+    }
+
+    match status {
+        "CLEAN" => MergeState::Clean,
+        "UNSTABLE" => MergeState::Unstable,
+        "HAS_HOOKS" => MergeState::HasHooks,
+        "BEHIND" => MergeState::Behind,
+        "BLOCKED" => MergeState::Blocked,
+        _ => MergeState::Unknown,
+    }
 }
 
 #[derive(Deserialize)]
@@ -1242,6 +1263,26 @@ mod tests {
         assert!(!mergeable("OPEN", false, "UNKNOWN", "CLEAN"));
         assert!(!mergeable("OPEN", true, "MERGEABLE", "CLEAN"));
         assert!(!mergeable("MERGED", false, "MERGEABLE", "CLEAN"));
+    }
+
+    #[test]
+    fn the_merge_state_follows_github_s_words() {
+        let state = |mergeable, merge_state| {
+            parse_pull_request(&view_with("OPEN", false, mergeable, merge_state), 0)
+                .expect("parse")
+                .merge_state
+        };
+
+        assert_eq!(state("MERGEABLE", "CLEAN"), MergeState::Clean);
+        assert_eq!(state("MERGEABLE", "UNSTABLE"), MergeState::Unstable);
+        assert_eq!(state("MERGEABLE", "HAS_HOOKS"), MergeState::HasHooks);
+        assert_eq!(state("MERGEABLE", "BEHIND"), MergeState::Behind);
+        assert_eq!(state("MERGEABLE", "BLOCKED"), MergeState::Blocked);
+        assert_eq!(state("CONFLICTING", "DIRTY"), MergeState::Conflicts);
+        assert_eq!(state("CONFLICTING", "UNKNOWN"), MergeState::Conflicts);
+        assert_eq!(state("UNKNOWN", "UNKNOWN"), MergeState::Unknown);
+        assert_eq!(state("UNKNOWN", "BLOCKED"), MergeState::Unknown);
+        assert_eq!(state("MERGEABLE", "DRAFT"), MergeState::Unknown);
     }
 
     #[test]

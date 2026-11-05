@@ -655,6 +655,7 @@ fn open_pull_request_update(
     if let Some(status) = workspace.data.pull_requests.get_mut(&id) {
         status.draft = false;
         status.mergeable = true;
+        status.merge_state = swarm_protocol::MergeState::Clean;
         status.checks.clear();
     }
     workspace

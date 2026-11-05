@@ -23,7 +23,7 @@ pub use client::{Client, ClientError, CommentEvent, MessageEvent, PrEvent, Proje
 pub use daemon_stop::{Host, Signal, StopError, System, stop_daemon};
 
 /// Bumped on every incompatible change; the daemon refuses other versions.
-pub const VERSION: u32 = 25;
+pub const VERSION: u32 = 26;
 
 /// The most messages [`Request::ListMessages`] returns.
 pub const MESSAGES_LISTED: usize = 500;
@@ -686,6 +686,26 @@ pub struct Reviewer {
     pub state: ReviewState,
 }
 
+/// Whether GitHub can merge the pull request, from its `mergeable` and
+/// `mergeStateStatus`.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeState {
+    /// Mergeable with passing checks.
+    Clean,
+    /// Mergeable, but a commit status is not passing.
+    Unstable,
+    /// Mergeable, with pre-receive hooks.
+    HasHooks,
+    /// The branch has merge conflicts.
+    Conflicts,
+    /// The base branch moved on.
+    Behind,
+    /// A rule stops the merge, like a missing review.
+    Blocked,
+    /// GitHub is still working it out, or the pull request is a draft.
+    Unknown,
+}
+
 /// The pull request as GitHub reports it now.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct PullRequest {
@@ -698,6 +718,7 @@ pub struct PullRequest {
     pub reviewers: Vec<Reviewer>,
     /// GitHub would merge it now: no conflicts, required checks and reviews passed.
     pub mergeable: bool,
+    pub merge_state: MergeState,
     /// Milliseconds since the Unix epoch.
     pub read_at: u64,
 }

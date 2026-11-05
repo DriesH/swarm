@@ -121,7 +121,7 @@ Press ⌘K, or use the search button in the sidebar. Type to filter by name, use
 | ⌘⌫ | Deletes to the start of the line |
 | ⌃C, ⌃D | In an agent terminal, ⌃D and a second ⌃C within 2 seconds of the first do nothing. The first ⌃C and Esc still reach the agent. |
 
-An agent that quits by itself, for example after `/exit`, stops taking keys at once. It shows as resumable.
+An agent that quits by itself, for example after `/exit`, stops taking keys at once. It shows as resumable when it has a saved conversation, and as stopped when it has none. An orchestrator keeps its tile, which shows the status and a **Resume** button when it can resume. A worker leaves the tile layout.
 
 The [Keyboard](/swarm/docs/keyboard/) page lists every shortcut.
 

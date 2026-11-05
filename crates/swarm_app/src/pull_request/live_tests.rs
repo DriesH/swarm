@@ -2882,6 +2882,7 @@ fn merge_waits_for_running_checks_failed_checks_and_conflicts_in_that_order() {
     assert_eq!(
         merge_block(&PullRequest {
             mergeable: false,
+            merge_state: MergeState::Conflicts,
             ..clean.clone()
         }),
         Some(MergeBlock::Conflicts)
@@ -2890,11 +2891,70 @@ fn merge_waits_for_running_checks_failed_checks_and_conflicts_in_that_order() {
         merge_block(&PullRequest {
             draft: true,
             mergeable: false,
+            merge_state: MergeState::Conflicts,
             ..clean
         }),
         None,
         "a draft has its own button"
     );
+}
+
+#[test]
+fn every_merge_state_has_its_status_and_only_a_clean_one_merges() {
+    let state = |merge_state, approved: bool| PullRequest {
+        draft: false,
+        mergeable: matches!(
+            merge_state,
+            MergeState::Clean | MergeState::Unstable | MergeState::HasHooks
+        ),
+        merge_state,
+        checks: Vec::new(),
+        reviewers: approved
+            .then(|| swarm_protocol::Reviewer {
+                login: "jonas".to_owned(),
+                state: ReviewState::Approved,
+            })
+            .into_iter()
+            .collect(),
+        ..open_pull_request(42)
+    };
+    let shown = |merge_state, approved| {
+        let status = state(merge_state, approved);
+        (merge_block(&status), can_merge(&status))
+    };
+
+    assert_eq!(shown(MergeState::Clean, false), (None, true));
+    assert_eq!(shown(MergeState::HasHooks, false), (None, true));
+    assert_eq!(shown(MergeState::Unstable, false), (None, true));
+    assert_eq!(shown(MergeState::Unknown, false), (None, false));
+    assert_eq!(
+        shown(MergeState::Conflicts, false),
+        (Some(MergeBlock::Conflicts), false)
+    );
+    assert_eq!(
+        shown(MergeState::Behind, false),
+        (Some(MergeBlock::Behind), false)
+    );
+    assert_eq!(
+        shown(MergeState::Blocked, false),
+        (Some(MergeBlock::ReviewRequired), false)
+    );
+    assert_eq!(
+        shown(MergeState::Blocked, true),
+        (Some(MergeBlock::Blocked), false)
+    );
+}
+
+#[test]
+fn the_merge_blocks_read_as_status_words() {
+    let labels = [
+        MergeBlock::Conflicts,
+        MergeBlock::ReviewRequired,
+        MergeBlock::Behind,
+    ]
+    .map(MergeBlock::label);
+
+    assert_eq!(labels, ["Conflicts", "Review required", "Behind base"]);
 }
 
 #[gpui::test]
@@ -2911,8 +2971,9 @@ fn merge_is_off_with_its_reason_while_checks_run_or_failed_or_github_cannot_merg
         .lock()
         .map(|status| status.clone())
         .expect("status");
-    let blocked = |state, mergeable| PullRequest {
-        mergeable,
+    let blocked = |state, merge_state| PullRequest {
+        mergeable: merge_state == MergeState::Clean,
+        merge_state,
         checks: vec![github_check("build", state)],
         ..clean.clone()
     };
@@ -2921,9 +2982,11 @@ fn merge_is_off_with_its_reason_while_checks_run_or_failed_or_github_cannot_merg
     let ready = cx.debug_bounds("merge-blocked").is_none();
 
     for status in [
-        blocked(GithubCheckState::Running, true),
-        blocked(GithubCheckState::Failed, true),
-        blocked(GithubCheckState::Passed, false),
+        blocked(GithubCheckState::Running, MergeState::Clean),
+        blocked(GithubCheckState::Failed, MergeState::Clean),
+        blocked(GithubCheckState::Passed, MergeState::Conflicts),
+        blocked(GithubCheckState::Passed, MergeState::Behind),
+        blocked(GithubCheckState::Passed, MergeState::Blocked),
     ] {
         show_status(&workspace, status, cx);
 

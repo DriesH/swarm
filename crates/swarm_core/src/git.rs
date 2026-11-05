@@ -2191,13 +2191,14 @@ pub fn track_origin(worktree: &Path, branch: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// Whether the local `branch` tracks a remote branch.
-pub fn has_upstream(root: &Path, branch: &str) -> Result<bool, Error> {
+/// Whether the local `branch` tracks a remote branch of the same name. A branch cut
+/// from `origin/<other>` tracks that one automatically, which is not a push.
+pub fn tracks_own_name(root: &Path, branch: &str) -> Result<bool, Error> {
     let key = format!("branch.{branch}.merge");
     let (arguments, output) = execute(root, ["config", "--get", &key])?;
 
     match (output.success, output.code) {
-        (true, _) => Ok(true),
+        (true, _) => Ok(output.stdout.trim() == format!("refs/heads/{branch}")),
         (false, Some(1)) => Ok(false),
         (false, _) => Err(failure(&arguments, &output)),
     }

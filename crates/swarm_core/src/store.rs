@@ -707,6 +707,10 @@ impl Store {
                 &format!("DELETE FROM comments WHERE task IN ({of_project})"),
                 params![project],
             )?;
+            store.connection.execute(
+                &format!("DELETE FROM review_marks WHERE task IN ({of_project})"),
+                params![project],
+            )?;
             // Merges stay: the count outlives the project, and no later task gets an id
             // of a deleted one.
             store
@@ -999,6 +1003,10 @@ impl Store {
             "UPDATE tasks SET closed_at = ?1 WHERE id = ?2 AND closed_at IS NULL",
             params![now_millis(), to_row(task.0)?],
         )?;
+        self.connection.execute(
+            "DELETE FROM review_marks WHERE task = ?1",
+            params![to_row(task.0)?],
+        )?;
 
         let mut changed = Vec::new();
         for mut agent in self.list_agents(task)? {
@@ -1030,6 +1038,10 @@ impl Store {
 
     /// Removes a task that never started.
     pub fn delete_task(&self, id: TaskId) -> Result<(), Error> {
+        self.connection.execute(
+            "DELETE FROM review_marks WHERE task = ?1",
+            params![to_row(id.0)?],
+        )?;
         self.connection
             .execute("DELETE FROM tasks WHERE id = ?1", params![to_row(id.0)?])?;
 
@@ -3407,6 +3419,39 @@ mod tests {
 
         assert_eq!(rows(&store, "agents"), 0);
         assert_eq!(rows(&store, "messages"), 0);
+    }
+
+    fn a_mark(task_path: &str) -> ReviewMark {
+        ReviewMark {
+            worktree: PathBuf::from("/w"),
+            path: PathBuf::from(task_path),
+            viewed: Some(1),
+            folded: None,
+        }
+    }
+
+    #[test]
+    fn removing_a_project_removes_the_review_marks_of_its_tasks() {
+        let (mut store, project, task) = project_with_a_closed_task();
+        store
+            .set_review_marks(task, &[a_mark("a.rs")])
+            .expect("marks");
+
+        store.remove_project(project.id).expect("removed");
+
+        assert_eq!(rows(&store, "review_marks"), 0);
+    }
+
+    #[test]
+    fn closing_a_task_removes_its_review_marks() {
+        let (mut store, task) = store_with_task();
+        store
+            .set_review_marks(task, &[a_mark("a.rs")])
+            .expect("marks");
+
+        store.close_task(task).expect("close");
+
+        assert_eq!(rows(&store, "review_marks"), 0);
     }
 
     #[test]

@@ -359,7 +359,14 @@ impl Projects {
         // A task without a name is named after a creature, like its branch.
         let (name, slug) = match request.name.trim() {
             "" => {
-                let slug = creatures::pick_slug(creatures::random_seed(), taken)?;
+                let slug = creatures::pick_slug(creatures::random_seed(), &taken)?;
+
+                (slug.clone(), slug)
+            }
+            // A creature name that is taken (the field's suggestion went stale) gets another
+            // creature, not a number.
+            given if creatures::is_creature_slug(given) && taken(given)? => {
+                let slug = creatures::pick_slug(creatures::random_seed(), &taken)?;
 
                 (slug.clone(), slug)
             }
@@ -428,7 +435,9 @@ impl Projects {
                 "the task has a pull request, so its name stays".to_owned(),
             ));
         }
-        if git::has_upstream(&root, &task.branch)? || git::origin_has_branch(&root, &task.branch)? {
+        if git::tracks_own_name(&root, &task.branch)?
+            || git::origin_has_branch(&root, &task.branch)?
+        {
             return Err(Error::Invalid(
                 "the branch was pushed, so its name stays".to_owned(),
             ));

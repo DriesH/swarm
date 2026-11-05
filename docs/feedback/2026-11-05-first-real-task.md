@@ -165,6 +165,7 @@ Collected while using Swarm 1.0.0 on a real project. Fix after the list is compl
   - out (closed or timed out): fade out and scale down a little (to about 95 %), about 120–150 ms
   - notices below or above move to their new place smoothly when one leaves
 - **Rules:** with Reduce Motion on, they appear and leave without movement (a short fade at most). Use GPUI's animation pattern as Zed does (`docs/research/zed-architecture.md`), and find the notice component in `swarm_ui` or `swarm_app` first.
+- **Done:** slide in and fade out; the scale-down needs a GPUI transform for elements, which the pinned GPUI does not have.
 
 ## 19. Pull request status: GitHub's colors, and no Merge while checks run
 
@@ -194,6 +195,10 @@ Collected while using Swarm 1.0.0 on a real project. Fix after the list is compl
 - **12/16:** when new work makes an approved draft outdated, the PR form is cleared; the orchestrator writes a fresh draft on the next Approve. (No "keep as outdated".)
 - **8:** a task without a name gets a Latin name from all 20 creatures, skipping names in use.
 - **7:** the collection is called **Field guide** and the daemon stores what was caught (SQLite).
+- **6:** the user terminal shows the terminal icon with a small honey lock badge and a quiet **Mine** pill, in the tile header and the sidebar row (canvas board "Point 6").
+- **17, 20:** the canvas designs are approved as drawn (boards "Point 17" and "Point 20").
+- **Sidebar footer (new):** the sidebar bottom gets the usage card, a divider, then **Settings**, **Field guide** (with the caught count) and **Report an issue**; below about 700 px of window height the usage card folds to one line; the rail gets a usage ring and the three footer buttons (board "Sidebar: usage card and footer").
+- **Report an issue (new):** a dialog (Bug, Feature request, Feedback) that opens a filled-in GitHub issue form in the browser; three issue forms in `.github/ISSUE_TEMPLATE/`; versions included, the daemon log optional via the clipboard; no token (board "Proposal: report an issue on GitHub").
 
 ## Plan
 

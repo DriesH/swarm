@@ -1001,7 +1001,7 @@ fn status_footer(
     let blocked = block.map(|block| {
         status_label(
             block.label(),
-            if block == MergeBlock::ChecksFailed || block == MergeBlock::Conflicts {
+            if matches!(block, MergeBlock::ChecksFailed | MergeBlock::Conflicts) {
                 Color::Warn
             } else {
                 Color::Muted
@@ -1115,6 +1115,7 @@ mod tests {
             checks: Vec::new(),
             reviewers: Vec::new(),
             mergeable: false,
+            merge_state: swarm_protocol::MergeState::Unknown,
             read_at: 0,
         }
     }

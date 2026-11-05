@@ -383,6 +383,35 @@ fn unnamed_tasks_skip_branches_in_use_and_then_get_a_number() {
 }
 
 #[test]
+fn a_taken_creature_name_gets_another_creature_not_a_number() {
+    let repo = Repo::new("");
+    let projects = projects();
+    let project = projects.add(&repo.root).expect("add");
+    projects
+        .create_task(&request(project.id, "apis-mellifera"))
+        .expect("first");
+    repo.git(&["branch", "swarm/bombus-terrestris"]);
+    std::fs::create_dir_all(repo.root.join(".worktrees/xylocopa-violacea")).expect("folder");
+
+    for _ in 0..3 {
+        let made = projects
+            .create_task(&request(project.id, "apis-mellifera"))
+            .expect("task");
+
+        assert!(
+            creatures::is_creature_slug(&made.task.name),
+            "{}",
+            made.task.name
+        );
+        assert_eq!(made.task.branch, format!("swarm/{}", made.task.name));
+        assert!(
+            !["apis-mellifera", "bombus-terrestris", "xylocopa-violacea"]
+                .contains(&made.task.name.as_str())
+        );
+    }
+}
+
+#[test]
 fn no_setup_is_returned_when_not_asked_for() {
     let repo = Repo::new(CONFIG);
     let projects = projects();
@@ -1837,4 +1866,29 @@ fn a_pushed_branch_keeps_its_name() {
 
     assert!(matches!(result, Err(Error::Invalid(_))));
     assert!(repo.branches().contains(&"swarm/one".to_owned()));
+}
+
+#[test]
+fn a_branch_with_an_automatic_upstream_can_be_renamed() {
+    let repo = Repo::new("");
+    let projects = projects();
+    let task = task_named(&projects, &repo, "one");
+    repo.git(&["config", "branch.swarm/one.remote", "origin"]);
+    repo.git(&["config", "branch.swarm/one.merge", "refs/heads/feature"]);
+
+    let renamed = projects.rename_task(task.id, "two").expect("rename");
+
+    assert_eq!(renamed.branch, "swarm/two");
+}
+
+#[test]
+fn a_branch_that_exists_on_origin_keeps_its_name() {
+    let repo = Repo::new("");
+    let projects = projects();
+    let task = task_named(&projects, &repo, "one");
+    repo.git(&["update-ref", "refs/remotes/origin/swarm/one", "HEAD"]);
+
+    let result = projects.rename_task(task.id, "two");
+
+    assert!(matches!(result, Err(Error::Invalid(_))));
 }

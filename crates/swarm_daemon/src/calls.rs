@@ -96,6 +96,11 @@ impl Calls {
             .collect()
     }
 
+    #[cfg(test)]
+    pub(crate) fn services_for_test(&self) -> &Arc<Services> {
+        &self.services
+    }
+
     /// Room for one more waiting call, so short calls and hooks always find a place.
     fn wait_slot(&self) -> Result<Slot, Failure> {
         Slot::take(&self.waits, MAX_WAITS).ok_or_else(|| {
@@ -531,6 +536,8 @@ impl Calls {
         if name.trim().is_empty() {
             return refuse("a task needs a name");
         }
+
+        let _busy = self.services.pull_requests.begin(task.id)?;
 
         let renamed = self.services.projects.rename_task(task.id, name)?;
         self.services

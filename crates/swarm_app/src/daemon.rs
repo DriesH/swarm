@@ -3811,7 +3811,7 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
-    fn a_worker_gets_a_live_view_and_keeps_its_tile_when_it_stops(cx: &mut TestAppContext) {
+    fn a_worker_gets_a_live_view_and_leaves_the_layout_when_it_stops(cx: &mut TestAppContext) {
         let socket = fake_daemon_replying(|_| None);
         let (workspace, cx, _client) = real_task_workspace(&socket, cx);
         let mut running = worker_info(2, 7, "api", DaemonAgentStatus::Working);
@@ -3825,7 +3825,7 @@ pub(crate) mod tests {
 
         let still_live = workspace.read_with(cx, |workspace, _| workspace.live_terminals.len());
         assert_eq!((live, still_live), (1, 0));
-        assert_eq!(tile_titles(&workspace, cx), ["api"]);
+        assert!(tile_titles(&workspace, cx).is_empty());
     }
 
     #[gpui::test]

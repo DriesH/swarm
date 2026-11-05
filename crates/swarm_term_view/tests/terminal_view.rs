@@ -1156,6 +1156,20 @@ fn an_agent_terminal_passes_a_control_c_after_two_seconds(cx: &mut TestAppContex
 }
 
 #[gpui::test]
+fn a_held_back_control_c_does_not_restart_the_two_second_window(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    guard_agent(&mut setup);
+
+    setup.cx.simulate_keystrokes("ctrl-c");
+    setup.cx.executor().advance_clock(DOUBLE_INTERRUPT * 3 / 4);
+    setup.cx.simulate_keystrokes("ctrl-c");
+    setup.cx.executor().advance_clock(DOUBLE_INTERRUPT * 3 / 4);
+    setup.cx.simulate_keystrokes("ctrl-c");
+
+    assert_eq!(control_keys(&setup), ["c", "c"]);
+}
+
+#[gpui::test]
 fn an_agent_terminal_holds_back_control_d(cx: &mut TestAppContext) {
     let mut setup = setup(cx);
     guard_agent(&mut setup);

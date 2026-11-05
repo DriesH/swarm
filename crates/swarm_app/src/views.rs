@@ -11,9 +11,10 @@ use swarm_ui::fonts::MONO_FONT;
 use swarm_ui::prelude::*;
 use swarm_ui::{FocusStyle, Nudge, ResizeAxis, TILE_RADIUS, TextFieldSize, TileRing};
 
-use crate::daemon::{CHROME_HEIGHT, CHROME_WIDTH, exit_failed, is_resumable};
+use crate::daemon::{CHROME_HEIGHT, CHROME_WIDTH, exit_failed, has_ended, is_resumable};
 use crate::model::{Agent, AgentKind, FakeLine, Terminal, TerminalId, TerminalKind};
 use crate::sidebar::update_workspace;
+use crate::swarm_view::resume_label;
 use crate::workspace::{DataSource, View, Workspace};
 
 /// The padding a terminal view leaves around its grid.
@@ -256,7 +257,7 @@ pub(crate) fn tile_specs(workspace: &Workspace) -> Vec<TileSpec> {
         .into_iter()
         .chain(task.workers.iter().copied())
         .filter_map(|id| data.agent(id))
-        .filter(|agent| task.orchestrator == Some(agent.id) || !is_resumable(agent))
+        .filter(|agent| task.orchestrator == Some(agent.id) || !has_ended(agent))
         .filter_map(|agent| {
             let terminal = data.terminal(agent.terminal)?;
             Some((terminal, activity_of(agent.status), agent.tile_large))
@@ -970,6 +971,10 @@ fn agent_frame(
         return frame.child(div().size_full().child(live.view.clone()));
     }
 
+    if let Some(agent) = agent.filter(|agent| has_ended(agent)) {
+        return frame.child(ended_placeholder(agent, cx));
+    }
+
     frame = frame.children(lines(terminal, cx));
 
     if terminal.kind == TerminalKind::Orchestrator && !is_live_agent {
@@ -977,6 +982,36 @@ fn agent_frame(
     }
 
     frame
+}
+
+/// What an ended agent's tile shows in place of a terminal: its status, and Resume when
+/// the daemon can start it again.
+fn ended_placeholder(agent: &Agent, cx: &mut Context<Workspace>) -> AnyElement {
+    let id = agent.id;
+    let resumable = is_resumable(agent);
+    let status = if resumable { "Resumable" } else { "Stopped" };
+
+    v_flex()
+        .size_full()
+        .items_center()
+        .justify_center()
+        .gap(px(10.))
+        .child(
+            div()
+                .debug_selector(|| "tile-ended-status".to_owned())
+                .child(Label::new(status).color(Color::Muted)),
+        )
+        .when(resumable, |column| {
+            column.child(
+                Button::new(("tile-resume", id.0 as usize), "Resume")
+                    .accessible_label(resume_label(&agent.name))
+                    .debug_selector(|| "tile-resume".to_owned())
+                    .on_click(cx.listener(move |workspace, _, _, cx| {
+                        workspace.resume_agent(id, cx);
+                    })),
+            )
+        })
+        .into_any_element()
 }
 
 fn live_process_frame(
@@ -1586,13 +1621,12 @@ mod tests {
         assert!(workspace.read_with(cx, |workspace, _| is_placed(workspace, worker)));
     }
 
-    #[gpui::test]
-    fn a_stopped_worker_leaves_the_tile_layout_and_the_tray(cx: &mut TestAppContext) {
-        let (workspace, cx) = setup(cx);
-        let worker = workspace.read_with(cx, |workspace, _| terminal_of(workspace, 0));
-        let id = workspace.read_with(cx, |workspace, _| workspace.active_task().workers[0]);
-        assert!(workspace.read_with(cx, |workspace, _| is_placed(workspace, worker)));
-
+    fn end_agent(
+        workspace: &Entity<Workspace>,
+        id: AgentId,
+        lifecycle: swarm_protocol::AgentLifecycle,
+        cx: &mut VisualTestContext,
+    ) {
         workspace.update(cx, |workspace, cx| {
             if let Some(agent) = workspace
                 .data
@@ -1607,7 +1641,7 @@ mod tests {
                     terminal: None,
                     status: swarm_protocol::AgentStatus::Idle,
                     message: None,
-                    lifecycle: swarm_protocol::AgentLifecycle::Resumable,
+                    lifecycle,
                     revision: 1,
                     worktree: std::path::PathBuf::new(),
                     branch: "swarm/x".into(),
@@ -1616,11 +1650,61 @@ mod tests {
             cx.notify();
         });
         redraw(cx);
+    }
 
-        let (placed, tray) = workspace.read_with(cx, |workspace, _| {
-            (is_placed(workspace, worker), in_tray(workspace, worker))
+    #[gpui::test]
+    fn a_resumable_or_stopped_worker_leaves_the_tile_layout_and_the_tray(cx: &mut TestAppContext) {
+        use swarm_protocol::AgentLifecycle;
+
+        let (workspace, cx) = setup(cx);
+        let ids = workspace.read_with(cx, |workspace, _| workspace.active_task().workers.clone());
+        let terminals: Vec<_> = (0..2)
+            .map(|index| workspace.read_with(cx, |workspace, _| terminal_of(workspace, index)))
+            .collect();
+        assert!(workspace.read_with(cx, |workspace, _| {
+            terminals
+                .iter()
+                .all(|terminal| is_placed(workspace, *terminal))
+        }));
+
+        end_agent(&workspace, ids[0], AgentLifecycle::Resumable, cx);
+        end_agent(&workspace, ids[1], AgentLifecycle::Stopped, cx);
+
+        let gone = workspace.read_with(cx, |workspace, _| {
+            terminals
+                .iter()
+                .all(|terminal| !is_placed(workspace, *terminal) && !in_tray(workspace, *terminal))
         });
-        assert!(!placed && !tray);
+        assert!(gone);
+    }
+
+    #[gpui::test]
+    fn a_resumable_orchestrator_tile_shows_its_status_and_resume(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let id = workspace.read_with(cx, |workspace, _| workspace.active_task().orchestrator);
+        let id = id.unwrap_or(AgentId(u32::MAX));
+
+        end_agent(
+            &workspace,
+            id,
+            swarm_protocol::AgentLifecycle::Resumable,
+            cx,
+        );
+
+        assert!(cx.debug_bounds("tile-ended-status").is_some());
+        assert!(cx.debug_bounds("tile-resume").is_some());
+    }
+
+    #[gpui::test]
+    fn a_stopped_orchestrator_tile_shows_its_status_without_resume(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let id = workspace.read_with(cx, |workspace, _| workspace.active_task().orchestrator);
+        let id = id.unwrap_or(AgentId(u32::MAX));
+
+        end_agent(&workspace, id, swarm_protocol::AgentLifecycle::Stopped, cx);
+
+        assert!(cx.debug_bounds("tile-ended-status").is_some());
+        assert!(cx.debug_bounds("tile-resume").is_none());
     }
 
     #[gpui::test]

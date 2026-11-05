@@ -71,7 +71,7 @@ New commits after the pull request exists, for example a CI fix, show **New comm
 ### Merge
 
 - **Ready for review** takes a draft out of draft.
-- **Merge** merges only the commit Swarm pushed. It stays off while a GitHub check runs or failed, while GitHub says it cannot merge, and while **New commits** wait to be pushed. A line above it gives the reason: **Checks running**, **Checks failed** or **Conflicts**. The daemon refuses a merge while a check runs or failed, whatever the app shows. When the pull request can merge, **Merge** is GitHub's merge green.
+- **Merge** merges only the commit Swarm pushed. It stays off while a GitHub check runs or failed, while GitHub says it cannot merge or has not worked it out yet, and while **New commits** wait to be pushed. A line above it gives the reason: **Checks running**, **Checks failed**, **Conflicts**, **Review required**, **Behind base** or **Blocked**. Swarm turns **Merge** on only when GitHub reports the pull request as clean, with hooks, or with a failing check that is not required, and no check Swarm can see runs or failed. The daemon also refuses a merge while a check runs or failed. When the daemon cannot read the checks before the merge, it asks GitHub to merge anyway, and GitHub decides. When the pull request can merge, **Merge** is GitHub's merge green.
 - **Merge method** is **Squash** by default. **Merge** and **Rebase** are the other choices.
 
 Swarm checks that GitHub really merged the commit. A merge queue can leave the pull request open, and the panel then shows **Merge queued**. After a merge, Swarm deletes the remote branch.

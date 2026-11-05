@@ -10,8 +10,8 @@ use gpui::{
 };
 use swarm_protocol::{
     CheckState, ChecksRun, Client, ClientError, GithubCheckState, GithubStatus, MergeMethod,
-    PrDraft, PrEvent, PrLink, PrPanel, PrState, PullRequest, TaskId as DaemonTaskId,
-    TerminalId as DaemonTerminalId,
+    MergeState, PrDraft, PrEvent, PrLink, PrPanel, PrState, PullRequest, ReviewState,
+    TaskId as DaemonTaskId, TerminalId as DaemonTerminalId,
 };
 use swarm_term::ExitStatus;
 use swarm_ui::prelude::*;
@@ -228,6 +228,9 @@ pub(crate) enum MergeBlock {
     ChecksRunning,
     ChecksFailed,
     Conflicts,
+    ReviewRequired,
+    Behind,
+    Blocked,
 }
 
 impl MergeBlock {
@@ -236,12 +239,16 @@ impl MergeBlock {
             Self::ChecksRunning => "Checks running",
             Self::ChecksFailed => "Checks failed",
             Self::Conflicts => "Conflicts",
+            Self::ReviewRequired => "Review required",
+            Self::Behind => "Behind base",
+            Self::Blocked => "Blocked",
         }
     }
 }
 
-/// What stops a merge: a check that runs or failed, or GitHub saying it cannot merge.
-/// A draft has its own button and no reason here.
+/// What stops a merge: a check that runs or failed, or GitHub saying why it cannot merge.
+/// A draft has its own button and no reason here, and a merge state GitHub has not worked
+/// out yet has none either; Merge stays off for it ([`can_merge`]).
 pub(crate) fn merge_block(pull_request: &PullRequest) -> Option<MergeBlock> {
     if checks_running(pull_request) {
         Some(MergeBlock::ChecksRunning)
@@ -251,11 +258,27 @@ pub(crate) fn merge_block(pull_request: &PullRequest) -> Option<MergeBlock> {
         .any(|check| check.state == GithubCheckState::Failed)
     {
         Some(MergeBlock::ChecksFailed)
-    } else if !pull_request.draft && !pull_request.mergeable {
-        Some(MergeBlock::Conflicts)
-    } else {
+    } else if pull_request.draft {
         None
+    } else {
+        match pull_request.merge_state {
+            MergeState::Conflicts => Some(MergeBlock::Conflicts),
+            MergeState::Behind => Some(MergeBlock::Behind),
+            MergeState::Blocked if !approved(pull_request) => Some(MergeBlock::ReviewRequired),
+            MergeState::Blocked => Some(MergeBlock::Blocked),
+            MergeState::Clean
+            | MergeState::Unstable
+            | MergeState::HasHooks
+            | MergeState::Unknown => None,
+        }
     }
+}
+
+fn approved(pull_request: &PullRequest) -> bool {
+    pull_request
+        .reviewers
+        .iter()
+        .any(|reviewer| reviewer.state == ReviewState::Approved)
 }
 
 /// The pull request can merge now: open, not a draft, no check running or failed, and
@@ -1920,7 +1943,7 @@ impl Workspace {
                     status.reviewers.extend(asked.into_iter().map(|login| {
                         swarm_protocol::Reviewer {
                             login,
-                            state: swarm_protocol::ReviewState::Requested,
+                            state: ReviewState::Requested,
                         }
                     }));
                 }
