@@ -8,7 +8,7 @@
 - **Codex 0.154.0 has no OSC 7501.** It first shipped in Codex 0.163.0. All Codex status runs used 0.166.0 (see "Incident" below).
 - **Resume works for both CLIs**: `claude --resume <id>` and `codex resume <id>` continued the conversation.
 
-Code: [`spikes/agent-status`](../../spikes/agent-status). It is the spike-2 daemon plus an OSC 7501 parser, a status merger, hook wiring and a CLI (`swarm-ctl`), without the GPUI app.
+Code: `spikes/agent-status` in the tag `v1.0.1` (removed since). It is the spike-2 daemon plus an OSC 7501 parser, a status merger, hook wiring and a CLI (`swarm-ctl`), without the GPUI app.
 
 ## Incident: Codex was upgraded from 0.154.0 to 0.166.0 by accident
 

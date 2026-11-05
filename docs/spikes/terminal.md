@@ -4,7 +4,7 @@
 
 One limit: all input was driven in-process through GPUI's key dispatch (see "How it was tested"). Do a two-minute hands-on check with a real keyboard before closing this spike.
 
-Code: [`spikes/terminal`](../../spikes/terminal) (about 1,100 lines).
+Code: `spikes/terminal` in the tag `v1.0.1` (removed since), about 1,100 lines.
 
 ## Pass criteria
 

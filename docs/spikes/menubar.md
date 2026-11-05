@@ -2,7 +2,7 @@
 
 **Verdict: pass, with one open item.** A GPUI app can own a menu bar status item, show a GPUI popover under it, read Claude and Codex usage, and keep working with the main window closed. GPUI posts notifications with action buttons and tag replacement from a bundled `.app`. macOS denied notification permission on this machine without showing a prompt that we could see, so the click on **Open** / **Dismiss** and `on_system_notification_response` are not proven yet (see [Notifications](#notifications)).
 
-Code: [`spikes/menubar`](../../spikes/menubar). Run notes: its README.
+Code: `spikes/menubar` in the tag `v1.0.1` (removed since). Run notes: its README.
 
 ## Results
 
