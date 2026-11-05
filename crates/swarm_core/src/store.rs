@@ -318,6 +318,10 @@ const MIGRATIONS: &[&str] = &[
     "CREATE TABLE creature_visits (
         started_at INTEGER PRIMARY KEY
     )",
+    // A stop's SIGHUP made Claude Code exit with 129, which showed as an error.
+    "UPDATE agents SET status = '\"Unknown\"', message = NULL
+     WHERE status = '\"Error\"' AND message = 'Exited with code 129'
+       AND lifecycle IN ('\"Resumable\"', '\"Stopped\"')",
 ];
 
 /// The hundredth merge is the one that makes the queen bee.
@@ -2424,6 +2428,36 @@ mod tests {
             store.agent(agent.id).expect("agent").expect("row").info,
             agent
         );
+    }
+
+    #[test]
+    fn the_hangup_migration_clears_errors_of_ended_agents_stopped_with_129() {
+        let (store, task) = store_with_task();
+        let ended = |lifecycle, message: &str| {
+            let mut agent = store.add_agent(&new_agent(task)).expect("agent");
+            agent.lifecycle = lifecycle;
+            agent.status = AgentStatus::Error;
+            agent.message = Some(message.to_owned());
+            store.save_agent(&agent).expect("save");
+
+            agent.id
+        };
+        let stopped = ended(AgentLifecycle::Resumable, "Exited with code 129");
+        let crashed = ended(AgentLifecycle::Resumable, "Exited with code 1");
+        let running = ended(AgentLifecycle::Running, "Exited with code 129");
+        let before = i64::try_from(MIGRATIONS.len() - 1).expect("count");
+        store
+            .connection
+            .pragma_update(None, "user_version", before)
+            .expect("version");
+
+        let store = Store::migrated(store.connection).expect("migrate");
+        let info = |id| store.agent(id).expect("query").expect("agent").info;
+
+        assert_eq!(info(stopped).status, AgentStatus::Unknown);
+        assert_eq!(info(stopped).message, None);
+        assert_eq!(info(crashed).status, AgentStatus::Error);
+        assert_eq!(info(running).status, AgentStatus::Error);
     }
 
     #[test]
