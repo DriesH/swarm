@@ -2,6 +2,11 @@
 
 Every release of Swarm. The newest is on top.
 
+## 1.0.2 (2026-11-05)
+
+### Added
+
+- Update card in the sidebar and Update now in Settings ([#65](https://github.com/DriesH/swarm/pull/65))
 ## 1.0.1 (2026-11-05)
 
 ### Added
