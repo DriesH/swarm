@@ -10,7 +10,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use swarm_protocol::agent::InboxMessage;
 use swarm_protocol::{
-    AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, CommentAnchor,
+    AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, Catch, CommentAnchor,
     CommentId, CommentState, CreateTerminal, MessageId, MessageInfo, MessageKind, NewComment,
     PrLink, ProjectId, ReviewComment, ReviewMark, TaskId, TaskInfo, TerminalId, TerminalKind,
 };
@@ -307,6 +307,16 @@ const MIGRATIONS: &[&str] = &[
         viewed INTEGER,
         folded INTEGER,
         PRIMARY KEY (task, worktree, path)
+    )",
+    // The Field guide: one row for each creature the user caught.
+    "CREATE TABLE catches (
+        creature TEXT PRIMARY KEY,
+        first_caught_at INTEGER NOT NULL,
+        count INTEGER NOT NULL
+    )",
+    // When each creature of the Field guide came, so the daily cap holds across restarts.
+    "CREATE TABLE creature_visits (
+        started_at INTEGER PRIMARY KEY
     )",
 ];
 
@@ -1680,6 +1690,77 @@ impl Store {
             .optional()?;
 
         at.map(from_row).transpose()
+    }
+
+    /// The creatures the user caught, the first caught first.
+    pub fn catches(&self) -> Result<Vec<Catch>, Error> {
+        let mut statement = self.connection.prepare(
+            "SELECT creature, first_caught_at, count FROM catches
+             ORDER BY first_caught_at, creature",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+
+        let mut catches = Vec::new();
+        for row in rows {
+            let (creature, first_caught_at, count) = row?;
+
+            catches.push(Catch {
+                creature,
+                first_caught_at: from_row(first_caught_at)?,
+                count: u32::try_from(count)
+                    .map_err(|_| Error::Invalid(format!("catch count {count} is out of range")))?,
+            });
+        }
+
+        Ok(catches)
+    }
+
+    /// Records one more catch of the creature and returns the row after it. The first catch
+    /// sets the time and a count of 1.
+    pub fn record_catch(&self, creature: &str) -> Result<Catch, Error> {
+        self.connection.execute(
+            "INSERT INTO catches (creature, first_caught_at, count) VALUES (?1, ?2, 1)
+             ON CONFLICT (creature) DO UPDATE SET count = count + 1",
+            params![creature, now_millis()],
+        )?;
+
+        self.catches()?
+            .into_iter()
+            .find(|catch| catch.creature == creature)
+            .ok_or_else(|| Error::Invalid(format!("the catch of {creature} was not saved")))
+    }
+
+    /// Records that a creature came at `at`, in milliseconds since the Unix epoch. Visits
+    /// more than 24 hours older than this one are forgotten.
+    pub fn record_visit(&self, at: u64) -> Result<(), Error> {
+        let day = 24 * 60 * 60 * 1000;
+
+        self.connection.execute(
+            "INSERT OR IGNORE INTO creature_visits (started_at) VALUES (?1)",
+            params![to_row(at)?],
+        )?;
+        self.connection.execute(
+            "DELETE FROM creature_visits WHERE started_at < ?1",
+            params![to_row(at.saturating_sub(day))?],
+        )?;
+
+        Ok(())
+    }
+
+    /// When the creatures came since `since`, the first first.
+    pub fn visits_since(&self, since: u64) -> Result<Vec<u64>, Error> {
+        let mut statement = self.connection.prepare(
+            "SELECT started_at FROM creature_visits WHERE started_at >= ?1 ORDER BY started_at",
+        )?;
+        let rows = statement.query_map(params![to_row(since)?], |row| row.get::<_, i64>(0))?;
+
+        rows.map(|row| from_row(row?)).collect()
     }
 
     /// The ports of every task and every worker that has not stopped, in every project.
@@ -3129,6 +3210,75 @@ mod tests {
             .expect("list");
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].text, "kept");
+    }
+
+    #[test]
+    fn no_creature_is_caught_in_a_new_database() {
+        let store = Store::open_in_memory().expect("store");
+
+        assert!(store.catches().expect("catches").is_empty());
+    }
+
+    #[test]
+    fn the_first_catch_counts_one_and_each_next_catch_one_more() {
+        let store = Store::open_in_memory().expect("store");
+
+        let first = store.record_catch("apis-mellifera").expect("first catch");
+        let second = store.record_catch("apis-mellifera").expect("second catch");
+
+        assert_eq!((first.count, second.count), (1, 2));
+        assert_eq!(first.first_caught_at, second.first_caught_at);
+    }
+
+    #[test]
+    fn each_creature_has_its_own_catch() {
+        let store = Store::open_in_memory().expect("store");
+
+        store.record_catch("vespa-crabro").expect("hornet");
+        store.record_catch("apis-mellifera").expect("bee");
+        store.record_catch("vespa-crabro").expect("hornet again");
+
+        let counts: Vec<(String, u32)> = store
+            .catches()
+            .expect("catches")
+            .into_iter()
+            .map(|catch| (catch.creature, catch.count))
+            .collect();
+
+        assert_eq!(counts.len(), 2);
+        assert!(counts.contains(&("vespa-crabro".to_owned(), 2)));
+        assert!(counts.contains(&("apis-mellifera".to_owned(), 1)));
+    }
+
+    const DAY: u64 = 24 * 60 * 60 * 1000;
+
+    #[test]
+    fn visits_are_kept_and_listed_the_first_first() {
+        let store = Store::open_in_memory().expect("store");
+
+        store.record_visit(3_000).expect("third");
+        store.record_visit(1_000).expect("first");
+
+        assert_eq!(store.visits_since(0).expect("visits"), [1_000, 3_000]);
+    }
+
+    #[test]
+    fn visits_before_the_time_asked_for_are_left_out() {
+        let store = Store::open_in_memory().expect("store");
+        store.record_visit(1_000).expect("old");
+        store.record_visit(5_000).expect("new");
+
+        assert_eq!(store.visits_since(2_000).expect("visits"), [5_000]);
+    }
+
+    #[test]
+    fn a_visit_forgets_the_visits_more_than_a_day_older() {
+        let store = Store::open_in_memory().expect("store");
+        store.record_visit(1_000).expect("old");
+
+        store.record_visit(1_000 + DAY + 1).expect("new");
+
+        assert_eq!(store.visits_since(0).expect("visits"), [1_000 + DAY + 1]);
     }
 
     /// The migration that adds the `merges` table is the seventeenth.

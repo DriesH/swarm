@@ -14,7 +14,15 @@ The sidebar has two lists.
 
 Right-click a project row, or press ⇧F10 on it, for **Show in Finder**, **Project settings** and **Remove project…**. See [Review](/swarm/docs/review/#remove-a-project) for the last one.
 
-Press ⌘B, or use the **Toggle sidebar** button in the title bar, to shrink the sidebar to a narrow rail. The rail keeps search, one tile per project, **+**, and one icon per agent, process terminal and user terminal.
+Only the projects and agents scroll. At the bottom of the sidebar stay the usage card, a divider and three rows:
+
+- **Settings** opens [Settings](/swarm/docs/settings/).
+- **Field guide** shows how many creatures you caught, for example `7/20`.
+- **Report an issue** starts a report.
+
+Below about 700 points of window height, the usage card folds to one line with the highest window of each agent kind, for example `Claude 61% · Codex 18%`. Click it, or press Space on it, to open the card. Click it again to fold it. Swarm remembers your choice until you close the window. VoiceOver reads every window in both states.
+
+Press ⌘B, or use the **Toggle sidebar** button in the title bar, to shrink the sidebar to a narrow rail. The rail keeps search, one tile per project, **+**, and one icon per agent, process terminal and user terminal. At the bottom it has a ring for the highest usage window (hover for the numbers), a divider, and one button each for **Settings**, **Field guide** and **Report an issue**. With no usage numbers yet, the card and the ring are left out.
 
 ## Tabs
 
@@ -69,7 +77,7 @@ To move a worker or process terminal to the tray yourself, use **Move … to tra
 
 A user terminal is your own shell. Open one with the **Terminal** button in the status bar, **File › New Terminal**, ⌥⌘T, or **New terminal** in the palette.
 
-User terminals are off-limits to agents. No agent can see, read, type into, resize or close them, so a secret you type there never reaches an agent. Their tile header shows a user icon and **Mine** after the name.
+User terminals are off-limits to agents. No agent can see, read, type into, resize or close them, so a secret you type there never reaches an agent. Their tile header and their sidebar row show the terminal icon with a small honey lock, then the name, then a grey **Mine** pill. VoiceOver reads "mine, agents have no access".
 
 - **Resize**: drag the bottom edge of the tile. The edge follows the rounded corners and changes color on hover, focus and drag. With the edge focused, use ↑ and ↓, or Home and End.
 - **Close**: use the close button on the tile or on its sidebar row. If a program still runs, Swarm asks **Close terminal “name”?** and says "The program in it stops." Focus starts on **Cancel**, and Esc cancels. Tick **Do not show this again** to stop the question. You can turn it back on with **Ask before closing a terminal** in Settings › Terminals.

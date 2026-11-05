@@ -8,11 +8,11 @@ pub use crate::components::{
     AgentStatus, BrandMark, Button, ButtonSize, ButtonVariant, CheckRow, CheckStatus, Checkbox,
     ConfirmRow, ContextMenu, Dialog, Dropdown, FileIcon, Highlighter, HoneyFill, Honeycomb, Icon,
     IconButton, IconButtonSize, IconName, IconSize, Kbd, Label, LabelSize, ListRow, LiveRegion,
-    Menu, MenuItem, OutputBlock, Panel, PanelRow, PixelBee, PopoverMenu, ProjectTile, RailButton,
-    ResizeHandle, SegmentedControl, StatusDot, StatusPill, StatusRing, Stepper, Switch,
-    SystemCheckRow, SystemCheckState, Tab, TabBar, TabStrip, Tag, TagTone, TextArea, TextInput,
-    TextInputEvent, TileFrame, Toast, TrayChip, TrayMore, TreeRow, UsageDetailMeter, UsageMeter,
-    UsageSurface, UsageTone,
+    LockedTerminalIcon, Menu, MenuItem, OutputBlock, Panel, PanelRow, PixelBee, PopoverMenu,
+    ProjectTile, RailButton, ResizeHandle, SegmentedControl, StatusDot, StatusPill, StatusRing,
+    Stepper, Switch, SystemCheckRow, SystemCheckState, Tab, TabBar, TabStrip, Tag, TagTone,
+    TextArea, TextInput, TextInputEvent, TileFrame, Toast, TrayChip, TrayMore, TreeRow,
+    UsageDetailMeter, UsageMeter, UsageRing, UsageSurface, UsageTone,
 };
 pub use crate::file_icons::FileIconName;
 pub use crate::markdown_highlight::markdown_highlights;

@@ -7,14 +7,16 @@ use gpui::{
     Context, ElementId, FocusHandle, FontWeight, Global, Hsla, KeyDownEvent, Pixels, Role,
     SharedString, WeakEntity, Window, div, px,
 };
+use swarm_ui::a11y::accessible;
 use swarm_ui::prelude::*;
 use swarm_ui::roving::RovingFocus;
+use swarm_ui::styles::focus_ring;
 
-use crate::actions::ToggleCommandPalette;
+use crate::actions::{OpenFieldGuide, OpenSettings, ReportIssue, ToggleCommandPalette};
 use crate::daemon::is_resumable;
 use crate::model::{Agent, AgentKind, Project, ProjectId, TaskStatus, Terminal};
 use crate::settings::Page;
-use crate::usage_text::{UsageSection, WindowRow, usage_sections};
+use crate::usage_text::{UsageKind, UsageSection, WindowRow, usage_sections};
 use crate::views::process_status;
 use crate::window_drag::drag_region;
 use crate::workspace::{DataSource, Workspace};
@@ -45,14 +47,8 @@ pub(crate) fn render(
         agent_rows(workspace, cx)
     };
 
-    v_flex()
-        .id("sidebar")
-        .track_focus(&workspace.sidebar_focus)
-        .role(Role::Navigation)
-        .aria_label("Projects and agents")
-        .size_full()
+    let scrolling = v_flex()
         .gap(px(2.))
-        .child(logo_row(window, cx))
         .child(
             heading("projects-heading", "Projects", 14.)
                 .h(px(30.))
@@ -105,9 +101,25 @@ pub(crate) fn render(
                         }))
                         .children(agents),
                 )
-        })
-        .child(div().flex_1())
-        .children(usage_card(workspace))
+        });
+
+    v_flex()
+        .id("sidebar")
+        .track_focus(&workspace.sidebar_focus)
+        .role(Role::Navigation)
+        .aria_label("Projects and agents")
+        .size_full()
+        .gap(px(2.))
+        .child(logo_row(window, cx))
+        .child(
+            div()
+                .id("sidebar-scroll")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .child(scrolling),
+        )
+        .child(footer(workspace, window, cx))
 }
 
 /// The sidebar collapsed to a column of buttons: search, the projects and the open task's
@@ -201,6 +213,55 @@ pub(crate) fn render_rail(
                         }),
                 ),
         )
+        .child(rail_footer(workspace, cx))
+}
+
+/// The usage ring of the highest window, then a divider and the three footer buttons.
+fn rail_footer(workspace: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement + use<> {
+    let line = cx.theme().colors().line;
+    let sections = usage_sections(&workspace.data.usage, workspace.now_ms() / 1_000);
+
+    let ring = highest_window(&sections).map(|(kind, window)| {
+        UsageRing::new(
+            "rail-usage",
+            window.fraction(),
+            ring_label(kind, window, &sections),
+        )
+        .tooltip(shown_usage(&sections))
+        .tone(window.tone())
+        .debug_selector(|| "rail-usage".to_owned())
+    });
+
+    let caught = workspace.data.caught_creatures.len();
+    let buttons = FooterLink::ALL.map(|link| {
+        let label = link.label();
+        let tooltip = match link {
+            FooterLink::FieldGuide => format!("{label}, {}", caught_text(caught)),
+            _ => label.to_owned(),
+        };
+
+        RailButton::new(
+            ("rail-footer", link.index()),
+            link.spoken(caught),
+            Icon::new(link.icon())
+                .size(IconSize::Large)
+                .color(Color::Muted),
+        )
+        .tooltip(tooltip)
+        .debug_selector(move || format!("rail-{}", link.slug()))
+        .on_click(move |_, window, cx| link.dispatch(window, cx))
+    });
+
+    v_flex()
+        .id("rail-footer")
+        .role(Role::Group)
+        .aria_label("App")
+        .flex_none()
+        .items_center()
+        .gap(px(4.))
+        .children(ring)
+        .child(rail_divider(line))
+        .children(buttons)
 }
 
 fn rail_divider(line: Hsla) -> gpui::Div {
@@ -297,7 +358,11 @@ fn terminal_button(
             let button = RailButton::new(
                 ("rail-user", id.0 as usize),
                 user_label(workspace, terminal),
-                terminal_icon(),
+                LockedTerminalIcon::new().cutout(if workspace.focused_terminal == Some(id) {
+                    cx.theme().colors().active
+                } else {
+                    cx.theme().colors().ground
+                }),
             )
             .tooltip(terminal.title.clone())
             .debug_selector(move || format!("rail-user-{}", id.0));
@@ -811,7 +876,7 @@ fn process_label(terminal: &Terminal, owner: &str) -> String {
 
 fn user_label(workspace: &Workspace, terminal: &Terminal) -> String {
     format!(
-        "{}, your terminal {}",
+        "{}, your terminal {}, mine, agents have no access",
         terminal.title,
         workspace.user_terminal_number(terminal.id)
     )
@@ -820,35 +885,39 @@ fn user_label(workspace: &Workspace, terminal: &Terminal) -> String {
 fn user_row(workspace: &Workspace, terminal: &Terminal, cx: &mut Context<Workspace>) -> ListRow {
     let id = terminal.id;
 
-    let end = h_flex()
-        .gap(px(4.))
-        .child(Icon::new(IconName::User).color(Color::Faint))
-        .child(
-            IconButton::new(
-                ("close-user-terminal", id.0 as usize),
-                IconName::Close,
-                format!("Close {}", terminal.title),
-            )
-            .debug_selector(move || format!("sidebar-close-terminal-{}", id.0))
-            .skip_tab_stop()
-            .on_click(cx.listener(move |workspace, _, window, cx| {
-                // The row under the button must not select the terminal as well.
-                cx.stop_propagation();
-                workspace.request_close_terminal(id, window, cx);
-            })),
-        );
+    let colors = cx.theme().colors();
+    let selected = workspace.focused_terminal == Some(id);
+    let cutout = if selected {
+        colors.active
+    } else {
+        colors.ground
+    };
+
+    let close = IconButton::new(
+        ("close-user-terminal", id.0 as usize),
+        IconName::Close,
+        format!("Close {}", terminal.title),
+    )
+    .debug_selector(move || format!("sidebar-close-terminal-{}", id.0))
+    .skip_tab_stop()
+    .on_click(cx.listener(move |workspace, _, window, cx| {
+        // The row under the button must not select the terminal as well.
+        cx.stop_propagation();
+        workspace.request_close_terminal(id, window, cx);
+    }));
 
     ListRow::new(("user-terminal", id.0 as usize), terminal.title.clone())
         .debug_selector(move || format!("user-row-{}", id.0))
         .accessible_label(user_label(workspace, terminal))
         .compact(true)
-        .toggle_state(workspace.focused_terminal == Some(id))
-        .start_slot(
-            Icon::new(IconName::Terminal)
-                .size(IconSize::Large)
-                .color(Color::Muted),
+        .toggle_state(selected)
+        .start_slot(LockedTerminalIcon::new().cutout(cutout))
+        .name_suffix(
+            div()
+                .debug_selector(move || format!("user-mine-{}", id.0))
+                .child(Tag::new("Mine")),
         )
-        .end_slot(end)
+        .end_slot(close)
         .on_click(cx.listener(move |workspace, _, _, cx| {
             workspace.focus_terminal(id, cx);
         }))
@@ -923,8 +992,286 @@ pub(crate) fn queen_crown(agent: &Agent) -> gpui::Div {
     )
 }
 
-fn usage_card(workspace: &Workspace) -> Option<impl IntoElement + use<>> {
+/// Below this window height the usage card folds to one line.
+const FOLD_BELOW: Pixels = px(700.);
+
+/// How many creatures the Field guide holds.
+const FIELD_GUIDE_TOTAL: usize = swarm_protocol::creatures::CREATURES.len();
+
+/// True when a window of this height folds the usage card unless the user opened it.
+fn usage_can_fold(height: Pixels) -> bool {
+    height < FOLD_BELOW
+}
+
+impl Workspace {
+    /// Opens or folds the usage card of a short window. The choice stays while the window
+    /// lives.
+    pub(crate) fn toggle_usage_card(&mut self, cx: &mut Context<Self>) {
+        self.usage_expanded = !self.usage_expanded;
+        cx.notify();
+    }
+}
+
+/// The places the footer of the sidebar and the rail lead to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FooterLink {
+    Settings,
+    FieldGuide,
+    ReportIssue,
+}
+
+impl FooterLink {
+    /// In the order they show.
+    const ALL: [Self; 3] = [Self::Settings, Self::FieldGuide, Self::ReportIssue];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Settings => "Settings",
+            Self::FieldGuide => "Field guide",
+            Self::ReportIssue => "Report an issue",
+        }
+    }
+
+    /// For element ids and test selectors.
+    fn slug(self) -> &'static str {
+        match self {
+            Self::Settings => "settings",
+            Self::FieldGuide => "field-guide",
+            Self::ReportIssue => "report-issue",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Settings => 0,
+            Self::FieldGuide => 1,
+            Self::ReportIssue => 2,
+        }
+    }
+
+    fn icon(self) -> IconName {
+        match self {
+            Self::Settings => IconName::Settings,
+            Self::FieldGuide => IconName::Book,
+            Self::ReportIssue => IconName::Feedback,
+        }
+    }
+
+    /// What VoiceOver reads.
+    fn spoken(self, caught: usize) -> String {
+        match self {
+            Self::FieldGuide => format!("Field guide, {caught} of {FIELD_GUIDE_TOTAL} caught"),
+            _ => self.label().to_owned(),
+        }
+    }
+
+    fn dispatch(self, window: &mut Window, cx: &mut App) {
+        match self {
+            Self::Settings => window.dispatch_action(Box::new(OpenSettings), cx),
+            Self::FieldGuide => window.dispatch_action(Box::new(OpenFieldGuide), cx),
+            Self::ReportIssue => window.dispatch_action(Box::new(ReportIssue), cx),
+        }
+    }
+}
+
+fn caught_text(caught: usize) -> String {
+    format!("{caught}/{FIELD_GUIDE_TOTAL}")
+}
+
+/// The window with the highest used share of every kind, and the kind it belongs to.
+fn highest_window(sections: &[UsageSection]) -> Option<(UsageKind, &WindowRow)> {
+    sections
+        .iter()
+        .flat_map(|section| section.windows.iter().map(|window| (section.kind, window)))
+        .max_by_key(|(_, window)| window.percent)
+}
+
+/// The highest window of each kind that has one.
+fn highest_per_kind(sections: &[UsageSection]) -> Vec<(UsageKind, &WindowRow)> {
+    sections
+        .iter()
+        .filter_map(|section| {
+            let window = section.windows.iter().max_by_key(|window| window.percent)?;
+
+            Some((section.kind, window))
+        })
+        .collect()
+}
+
+/// What VoiceOver reads for the usage of every window, folded or not.
+fn spoken_usage(sections: &[UsageSection]) -> String {
+    let windows: Vec<&str> = sections
+        .iter()
+        .flat_map(|section| section.windows.iter())
+        .map(|window| window.spoken.as_str())
+        .collect();
+
+    windows.join(". ")
+}
+
+/// What VoiceOver reads for the rail's ring: the highest window, then every window.
+fn ring_label(kind: UsageKind, highest: &WindowRow, sections: &[UsageSection]) -> String {
+    format!(
+        "Usage, highest window {} {} percent. {}",
+        kind.name(),
+        highest.percent,
+        spoken_usage(sections)
+    )
+}
+
+/// Every window on one line, for a tooltip.
+fn shown_usage(sections: &[UsageSection]) -> String {
+    let kinds: Vec<String> = sections
+        .iter()
+        .filter(|section| !section.windows.is_empty())
+        .map(|section| {
+            let windows: Vec<String> = section
+                .windows
+                .iter()
+                .map(|window| format!("{} {}%", window.name, window.percent))
+                .collect();
+
+            format!("{} {}", section.kind.name(), windows.join(", "))
+        })
+        .collect();
+
+    kinds.join(" \u{b7} ")
+}
+
+/// The usage, a divider and the three places to go. A short window folds the usage to one
+/// line until the user opens it.
+fn footer(
+    workspace: &Workspace,
+    window: &Window,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement + use<> {
+    let line = cx.theme().colors().line;
     let sections = usage_sections(&workspace.data.usage, workspace.now_ms() / 1_000);
+
+    let foldable = usage_can_fold(window.viewport_size().height);
+    let open = !foldable || workspace.usage_expanded;
+
+    let summary = (foldable && !sections.is_empty()).then(|| usage_summary(&sections, open, cx));
+    let card = if open { usage_card(&sections) } else { None };
+
+    let caught = workspace.data.caught_creatures.len();
+    let links = v_flex()
+        .id("sidebar-links")
+        .role(Role::List)
+        .aria_label("App")
+        .gap(px(2.))
+        .children(FooterLink::ALL.map(|link| footer_row(link, caught)));
+
+    v_flex()
+        .id("sidebar-footer")
+        .flex_none()
+        .gap(px(8.))
+        .pt(px(8.))
+        .children(summary)
+        .children(card)
+        .child(
+            div()
+                .debug_selector(|| "sidebar-divider".to_owned())
+                .h(px(1.))
+                .mx(px(2.))
+                .bg(line),
+        )
+        .child(links)
+}
+
+fn footer_row(link: FooterLink, caught: usize) -> ListRow {
+    let slug = link.slug();
+
+    ListRow::new(("footer", link.index()), link.label())
+        .debug_selector(move || format!("footer-{slug}"))
+        .accessible_label(link.spoken(caught))
+        .start_slot(
+            Icon::new(link.icon())
+                .size(IconSize::Medium)
+                .color(Color::Muted),
+        )
+        .when(link == FooterLink::FieldGuide, |row| {
+            row.end_slot(
+                div()
+                    .debug_selector(|| "footer-field-guide-count".to_owned())
+                    .child(
+                        Label::new(caught_text(caught))
+                            .mono()
+                            .size(LabelSize::XSmall)
+                            .color(Color::Faint),
+                    ),
+            )
+        })
+        .on_click(move |_, window, cx| link.dispatch(window, cx))
+}
+
+/// The one-line usage: the highest window of each agent kind. A button that folds and opens
+/// the card.
+fn usage_summary(
+    sections: &[UsageSection],
+    open: bool,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement + use<> {
+    let colors = cx.theme().colors();
+    let (line, raised, active, accent) = (colors.line, colors.raised, colors.active, colors.accent);
+
+    let kinds = highest_per_kind(sections)
+        .into_iter()
+        .map(|(kind, window)| {
+            let dot = match kind {
+                UsageKind::Claude => colors.claude,
+                UsageKind::Codex => colors.fg,
+            };
+
+            h_flex()
+                .gap(px(5.))
+                .child(div().size(px(7.)).rounded_full().bg(dot))
+                .child(Label::new(kind.name()).size(LabelSize::Small))
+                .child(
+                    Label::new(format!("{}%", window.percent))
+                        .mono()
+                        .size(LabelSize::Small),
+                )
+        });
+
+    let chevron = if open {
+        IconName::ChevronDown
+    } else {
+        IconName::ChevronUp
+    };
+
+    accessible(
+        div().id("usage-fold"),
+        Role::Button,
+        format!("Usage: {}", spoken_usage(sections)),
+    )
+    .aria_expanded(open)
+    .debug_selector(|| "usage-fold".to_owned())
+    .focusable()
+    .tab_stop(true)
+    .cursor_pointer()
+    .flex()
+    .items_center()
+    .gap(px(10.))
+    .h(px(34.))
+    .px(px(10.))
+    .rounded(px(10.))
+    .border_1()
+    .border_color(line)
+    .bg(raised)
+    .hover(|style| style.bg(active))
+    .focus_visible(|style| focus_ring(style, accent))
+    .children(kinds)
+    .child(div().flex_1())
+    .child(
+        Icon::new(chevron)
+            .size(IconSize::XSmall)
+            .color(Color::Faint),
+    )
+    .on_click(cx.listener(|workspace, _, _, cx| workspace.toggle_usage_card(cx)))
+}
+
+fn usage_card(sections: &[UsageSection]) -> Option<impl IntoElement + use<>> {
     if sections.is_empty() {
         return None;
     }
@@ -1864,6 +2211,480 @@ mod tests {
         });
 
         assert_eq!(card_rows(&workspace, cx), (false, false, false));
+    }
+
+    fn counting<A: gpui::Action>(cx: &mut VisualTestContext) -> Rc<std::cell::Cell<usize>> {
+        let count = Rc::new(std::cell::Cell::new(0));
+        let seen = Rc::clone(&count);
+
+        cx.update(|_, cx| {
+            cx.on_action(move |_: &A, _| seen.set(seen.get() + 1));
+        });
+
+        count
+    }
+
+    fn resize_to_height(
+        height: f32,
+        workspace: &gpui::Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) {
+        cx.simulate_resize(gpui::size(px(1_000.), px(height)));
+        workspace.update(cx, |_, cx| cx.notify());
+        redraw(cx);
+    }
+
+    fn top_of(selector: &'static str, cx: &mut VisualTestContext) -> Pixels {
+        cx.debug_bounds(selector)
+            .map_or(Pixels::MAX, |bounds| bounds.top())
+    }
+
+    #[gpui::test]
+    fn the_user_terminal_row_shows_the_lock_icon_and_the_mine_pill(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        with_user_terminal(&workspace, cx);
+        redraw(cx);
+
+        let row = cx.debug_bounds("user-row-14").expect("the row is drawn");
+        let pill = cx.debug_bounds("user-mine-14").expect("the pill is drawn");
+
+        assert!(row.contains(&pill.center()));
+    }
+
+    #[gpui::test]
+    fn the_mine_pill_comes_after_the_name_and_before_the_close_button(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        with_user_terminal(&workspace, cx);
+        redraw(cx);
+
+        let pill = cx.debug_bounds("user-mine-14").expect("the pill is drawn");
+        let close = cx
+            .debug_bounds("sidebar-close-terminal-14")
+            .expect("the close button is drawn");
+
+        assert!(pill.right() < close.left());
+    }
+
+    #[gpui::test]
+    fn the_user_terminal_row_is_labelled_as_mine_with_no_access_for_agents(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = setup(cx);
+        let user = with_user_terminal(&workspace, cx);
+
+        let label = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .data
+                .terminal(user)
+                .map(|terminal| (terminal.title.to_string(), user_label(workspace, terminal)))
+        });
+
+        let (title, label) = label.expect("the user terminal exists");
+        assert_eq!(
+            label,
+            format!("{title}, your terminal 1, mine, agents have no access")
+        );
+    }
+
+    #[gpui::test]
+    fn the_footer_shows_the_usage_card_a_divider_then_the_three_places_in_order(
+        cx: &mut TestAppContext,
+    ) {
+        let (_, cx) = setup(cx);
+        redraw(cx);
+
+        let card = cx.debug_bounds("usage-card").expect("the card is drawn");
+        let tops: Vec<Pixels> = [
+            "sidebar-divider",
+            "footer-settings",
+            "footer-field-guide",
+            "footer-report-issue",
+        ]
+        .map(|selector| top_of(selector, cx))
+        .to_vec();
+
+        assert!(card.bottom() <= tops[0]);
+        assert!(tops.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[gpui::test]
+    fn the_footer_stays_at_the_bottom_when_the_list_is_short(cx: &mut TestAppContext) {
+        let (_, cx) = setup(cx);
+        redraw(cx);
+
+        let sidebar = cx.debug_bounds("sidebar-column").expect("the sidebar");
+        let last = cx
+            .debug_bounds("footer-report-issue")
+            .expect("the last row");
+
+        assert!(sidebar.bottom() - last.bottom() < px(24.));
+    }
+
+    #[test]
+    fn the_field_guide_row_says_how_many_creatures_were_caught() {
+        assert_eq!(caught_text(7), "7/20");
+        assert_eq!(
+            FooterLink::FieldGuide.spoken(7),
+            "Field guide, 7 of 20 caught"
+        );
+        assert_eq!(FooterLink::Settings.spoken(7), "Settings");
+    }
+
+    #[gpui::test]
+    fn the_field_guide_row_shows_the_count_of_the_caught_creatures(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.data.caught_creatures = vec!["a".to_owned(), "b".to_owned()];
+            cx.notify();
+        });
+        redraw(cx);
+
+        let spoken = workspace.read_with(cx, |workspace, _| {
+            FooterLink::FieldGuide.spoken(workspace.data.caught_creatures.len())
+        });
+
+        assert!(shown("footer-field-guide-count", cx));
+        assert_eq!(spoken, "Field guide, 2 of 20 caught");
+    }
+
+    #[gpui::test]
+    fn the_field_guide_row_dispatches_open_field_guide(cx: &mut TestAppContext) {
+        let (_, cx) = setup(cx);
+        redraw(cx);
+        let opened = counting::<OpenFieldGuide>(cx);
+
+        click_center("footer-field-guide", cx);
+
+        assert_eq!(opened.get(), 1);
+    }
+
+    #[gpui::test]
+    fn the_report_an_issue_row_dispatches_report_issue(cx: &mut TestAppContext) {
+        let (_, cx) = setup(cx);
+        redraw(cx);
+        let reported = counting::<ReportIssue>(cx);
+
+        click_center("footer-report-issue", cx);
+
+        assert_eq!(reported.get(), 1);
+    }
+
+    #[gpui::test]
+    fn the_settings_row_opens_settings(cx: &mut TestAppContext) {
+        let (_, cx) = crate::daemon::tests::setup(cx);
+        redraw(cx);
+
+        click_center("footer-settings", cx);
+        redraw(cx);
+
+        assert!(cx.update(|_, cx| crate::settings::shown_page(cx)).is_some());
+    }
+
+    #[gpui::test]
+    fn enter_on_a_focused_footer_row_does_what_a_click_does(cx: &mut TestAppContext) {
+        let (workspace, cx) = keyed_setup(cx);
+        redraw(cx);
+        let reported = counting::<ReportIssue>(cx);
+
+        tab_to("ListItem Report an issue", &workspace, cx);
+        press("enter", cx);
+
+        assert_eq!(reported.get(), 1);
+    }
+
+    /// A key press with its release, which is what activates a focused control.
+    fn press(key: &'static str, cx: &mut VisualTestContext) {
+        cx.simulate_keystrokes(key);
+
+        if let Ok(keystroke) = gpui::Keystroke::parse(key) {
+            cx.simulate_event(gpui::KeyUpEvent { keystroke });
+        }
+    }
+
+    /// A workspace whose key bindings are in place, so Tab and Space work.
+    fn keyed_setup(cx: &mut TestAppContext) -> (gpui::Entity<Workspace>, &mut VisualTestContext) {
+        crate::daemon::tests::setup(cx)
+    }
+
+    /// Presses Tab from the start of the window until the stop is called `name`, or starts
+    /// with it.
+    fn tab_to(name: &str, workspace: &gpui::Entity<Workspace>, cx: &mut VisualTestContext) {
+        let root = workspace.read_with(cx, |workspace, _| workspace.sidebar_focus.clone());
+        cx.update(|window, cx| window.focus(&root, cx));
+
+        for _ in 0..60 {
+            cx.simulate_keystrokes("tab");
+
+            if swarm_ui::test_support::focused_stop(cx, &root).starts_with(name) {
+                return;
+            }
+        }
+
+        panic!("Tab never reached {name}");
+    }
+
+    #[test]
+    fn a_window_below_700_points_folds_the_usage_card() {
+        assert!(usage_can_fold(px(699.)));
+        assert!(!usage_can_fold(px(700.)));
+    }
+
+    #[gpui::test]
+    fn a_tall_window_shows_the_card_and_no_fold_button(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        resize_to_height(800., &workspace, cx);
+
+        assert!(shown("usage-card", cx));
+        assert!(!shown("usage-fold", cx));
+    }
+
+    #[gpui::test]
+    fn a_short_window_folds_the_card_to_one_line(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        resize_to_height(600., &workspace, cx);
+
+        assert!(!shown("usage-card", cx));
+        assert!(shown("usage-fold", cx));
+        assert!(shown("footer-settings", cx));
+    }
+
+    #[gpui::test]
+    fn clicking_the_fold_line_opens_the_card_and_clicking_again_folds_it(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        resize_to_height(600., &workspace, cx);
+
+        click_center("usage-fold", cx);
+        redraw(cx);
+        let opened = shown("usage-card", cx);
+
+        click_center("usage-fold", cx);
+        redraw(cx);
+
+        assert!(opened);
+        assert!(!shown("usage-card", cx));
+    }
+
+    #[gpui::test]
+    fn space_on_the_focused_fold_line_toggles_the_card(cx: &mut TestAppContext) {
+        let (workspace, cx) = keyed_setup(cx);
+        resize_to_height(600., &workspace, cx);
+        tab_to("Button Usage", &workspace, cx);
+
+        press("space", cx);
+        redraw(cx);
+        let opened = shown("usage-card", cx);
+
+        press("space", cx);
+        redraw(cx);
+
+        assert!(opened);
+        assert!(!shown("usage-card", cx));
+    }
+
+    #[gpui::test]
+    fn the_choice_to_open_the_card_stays_when_the_window_grows_and_shrinks(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = setup(cx);
+        resize_to_height(600., &workspace, cx);
+        click_center("usage-fold", cx);
+
+        resize_to_height(900., &workspace, cx);
+        resize_to_height(600., &workspace, cx);
+
+        assert!(shown("usage-card", cx));
+    }
+
+    #[gpui::test]
+    fn the_fold_line_shows_the_highest_window_of_each_agent_kind(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+
+        let line = workspace.read_with(cx, |workspace, _| {
+            let sections = usage_sections(&workspace.data.usage, workspace.now_ms() / 1_000);
+
+            highest_per_kind(&sections)
+                .into_iter()
+                .map(|(kind, window)| format!("{} {}%", kind.name(), window.percent))
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(line, ["Claude 61%", "Codex 18%"]);
+    }
+
+    fn fold_line_a11y(
+        workspace: &gpui::Entity<Workspace>,
+        open: bool,
+        cx: &mut VisualTestContext,
+    ) -> (Option<Role>, Option<String>, Option<bool>) {
+        use gpui::accesskit::Node;
+        use gpui::{Element as _, IntoElement as _};
+
+        let sections = workspace.read_with(cx, |workspace, _| {
+            usage_sections(&workspace.data.usage, workspace.now_ms() / 1_000)
+        });
+
+        workspace.update(cx, |_, cx| {
+            let element = usage_summary(&sections, open, cx).into_element();
+            let mut node = Node::new(Role::Unknown);
+            element.write_a11y_info(&mut node);
+
+            (
+                element.a11y_role(),
+                node.label().map(str::to_owned),
+                node.is_expanded(),
+            )
+        })
+    }
+
+    #[gpui::test]
+    fn the_fold_line_is_a_button_that_says_whether_the_card_is_open(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+
+        let (role, _, folded) = fold_line_a11y(&workspace, false, cx);
+        let (_, _, opened) = fold_line_a11y(&workspace, true, cx);
+
+        assert_eq!(role, Some(Role::Button));
+        assert_eq!(folded, Some(false));
+        assert_eq!(opened, Some(true));
+    }
+
+    #[gpui::test]
+    fn the_fold_line_is_read_with_every_window_in_both_states(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+
+        let (_, folded, _) = fold_line_a11y(&workspace, false, cx);
+        let (_, opened, _) = fold_line_a11y(&workspace, true, cx);
+        let folded = folded.unwrap_or_default();
+
+        for window in [
+            "Claude session",
+            "Claude weekly",
+            "Codex session",
+            "Codex weekly",
+        ] {
+            assert!(folded.contains(window), "{window}: {folded}");
+        }
+        assert_eq!(Some(folded), opened);
+    }
+
+    #[gpui::test]
+    fn the_rail_shows_a_ring_for_the_highest_window_and_the_three_footer_buttons(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = setup(cx);
+        collapse(&workspace, cx);
+
+        for selector in [
+            "rail-usage",
+            "rail-settings",
+            "rail-field-guide",
+            "rail-report-issue",
+        ] {
+            assert!(shown(selector, cx), "{selector}");
+        }
+    }
+
+    #[gpui::test]
+    fn the_rail_has_the_ring_above_the_footer_buttons(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        collapse(&workspace, cx);
+
+        let tops: Vec<Pixels> = [
+            "rail-usage",
+            "rail-settings",
+            "rail-field-guide",
+            "rail-report-issue",
+        ]
+        .map(|selector| top_of(selector, cx))
+        .to_vec();
+
+        assert!(tops.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[gpui::test]
+    fn the_rail_leaves_out_the_ring_without_usage_numbers_and_keeps_the_buttons(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = setup(cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.usage_changed(Usage::default(), cx);
+        });
+        collapse(&workspace, cx);
+
+        assert!(!shown("rail-usage", cx));
+        assert!(shown("rail-settings", cx));
+    }
+
+    #[gpui::test]
+    fn without_usage_numbers_the_sidebar_leaves_out_the_card_and_keeps_the_footer(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = setup(cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.usage_changed(Usage::default(), cx);
+        });
+        resize_to_height(600., &workspace, cx);
+
+        assert!(!shown("usage-card", cx));
+        assert!(!shown("usage-fold", cx));
+        assert!(shown("sidebar-divider", cx));
+        assert!(shown("footer-settings", cx));
+    }
+
+    #[gpui::test]
+    fn the_rail_footer_buttons_dispatch_their_actions(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        collapse(&workspace, cx);
+        let guide = counting::<OpenFieldGuide>(cx);
+        let report = counting::<ReportIssue>(cx);
+
+        click_center("rail-field-guide", cx);
+        click_center("rail-report-issue", cx);
+
+        assert_eq!((guide.get(), report.get()), (1, 1));
+    }
+
+    #[gpui::test]
+    fn the_rail_ring_is_read_with_the_highest_window_and_every_window(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+
+        let label = workspace.read_with(cx, |workspace, _| {
+            let sections = usage_sections(&workspace.data.usage, workspace.now_ms() / 1_000);
+
+            highest_window(&sections)
+                .map(|(kind, window)| ring_label(kind, window, &sections))
+                .unwrap_or_default()
+        });
+
+        assert!(label.starts_with("Usage, highest window Claude 61 percent. "));
+        assert!(label.contains("Codex weekly"));
+    }
+
+    #[gpui::test]
+    fn the_rail_ring_tooltip_lists_every_window(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+
+        let tooltip = workspace.read_with(cx, |workspace, _| {
+            shown_usage(&usage_sections(
+                &workspace.data.usage,
+                workspace.now_ms() / 1_000,
+            ))
+        });
+
+        assert_eq!(
+            tooltip,
+            "Claude Session 42%, Weekly 61% \u{b7} Codex Session 18%, Weekly 9%"
+        );
+    }
+
+    #[gpui::test]
+    fn the_sidebar_keeps_the_footer_in_view_while_the_projects_scroll(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        resize_to_height(400., &workspace, cx);
+
+        let footer = cx.debug_bounds("footer-report-issue");
+
+        assert!(footer.is_some_and(|footer| footer.bottom() <= px(400.)));
     }
 
     #[gpui::test]

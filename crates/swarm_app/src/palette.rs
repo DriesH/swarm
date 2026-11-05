@@ -21,10 +21,13 @@ use crate::close_task::CloseTaskDialog;
 use crate::close_terminal::CloseTerminalDialog;
 use crate::daemon::is_resumable;
 use crate::daemon_restart::RestartDaemonDialog;
+use crate::field_guide::FieldGuideView;
 use crate::model::{AgentId, AgentKind, FakeData, ProjectId, TaskId, TaskStatus, TerminalId};
 use crate::new_task::NewTaskDialog;
+use crate::pr_description::PrDescriptionTile;
 use crate::pull_request::AnywayDialog;
 use crate::remove_project::RemoveProjectDialog;
+use crate::report_issue::ReportIssueDialog;
 use crate::review_view::ReviewView;
 use crate::workspace::{View, Workspace};
 
@@ -47,6 +50,10 @@ pub(crate) enum Command {
     CommentOnLine,
     CloseTask,
     CreatePullRequest,
+    ReportIssue,
+    OpenFieldGuide,
+    /// Only while a creature is in the title bar.
+    CatchCreature,
     Buzz,
     /// Debug builds only.
     ShowWelcome,
@@ -359,6 +366,18 @@ pub(crate) fn rows(data: &FakeData, project: ProjectId, task: TaskId, view: View
             Command::Settings,
         )
         .keys(&[KEY_COMMAND, ","]),
+        Row::new(
+            Group::Swarm,
+            IconName::Book,
+            "Field guide",
+            Command::OpenFieldGuide,
+        ),
+        Row::new(
+            Group::Swarm,
+            IconName::Feedback,
+            "Report an issue",
+            Command::ReportIssue,
+        ),
     ]);
 
     rows
@@ -842,6 +861,18 @@ pub(crate) enum Overlay {
         view: Entity<RestartDaemonDialog>,
         _subscription: Subscription,
     },
+    FieldGuide {
+        view: Entity<FieldGuideView>,
+        _subscription: Subscription,
+    },
+    ReportIssue {
+        view: Entity<ReportIssueDialog>,
+        _subscription: Subscription,
+    },
+    PrDescription {
+        view: Entity<PrDescriptionTile>,
+        _subscription: Subscription,
+    },
 }
 
 impl Overlay {
@@ -855,6 +886,9 @@ impl Overlay {
             Self::CreateAnyway { view, .. } => view.read(cx).opener.clone(),
             Self::RemoveProject { view, .. } => view.read(cx).opener.clone(),
             Self::RestartDaemon { view, .. } => view.read(cx).opener.clone(),
+            Self::ReportIssue { view, .. } => view.read(cx).opener.clone(),
+            Self::FieldGuide { view, .. } => view.read(cx).opener.clone(),
+            Self::PrDescription { view, .. } => view.read(cx).opener.clone(),
         }
     }
 
@@ -868,6 +902,9 @@ impl Overlay {
             Self::CreateAnyway { view, .. } => view.focus_handle(cx),
             Self::RemoveProject { view, .. } => view.focus_handle(cx),
             Self::RestartDaemon { view, .. } => view.focus_handle(cx),
+            Self::ReportIssue { view, .. } => view.focus_handle(cx),
+            Self::FieldGuide { view, .. } => view.focus_handle(cx),
+            Self::PrDescription { view, .. } => view.focus_handle(cx),
         }
     }
 
@@ -880,6 +917,9 @@ impl Overlay {
             Self::CreateAnyway { view, .. } => view.clone().into_any_element(),
             Self::RemoveProject { view, .. } => view.clone().into_any_element(),
             Self::RestartDaemon { view, .. } => view.clone().into_any_element(),
+            Self::ReportIssue { view, .. } => view.clone().into_any_element(),
+            Self::FieldGuide { view, .. } => view.clone().into_any_element(),
+            Self::PrDescription { view, .. } => view.clone().into_any_element(),
         }
     }
 }
@@ -892,6 +932,17 @@ impl Workspace {
         }
 
         let mut rows = rows(&self.data, self.active_project, self.active_task, self.view);
+        if let Some(name) = self.field_guide.visitor_name() {
+            rows.insert(
+                0,
+                Row::new(
+                    Group::Suggested,
+                    IconName::Bee,
+                    format!("Catch the {name}"),
+                    Command::CatchCreature,
+                ),
+            );
+        }
         if crate::settings::easter_eggs(cx) {
             rows.push(Row::new(Group::Swarm, IconName::Bee, "Buzz", Command::Buzz).secret());
         }
@@ -967,6 +1018,9 @@ impl Workspace {
             Command::CommentOnLine => self.review.update(cx, ReviewView::comment_on_line),
             Command::CloseTask => self.open_close_task(self.active_task, window, cx),
             Command::CreatePullRequest => window.dispatch_action(Box::new(CreatePullRequest), cx),
+            Command::ReportIssue => self.open_report_issue(None, window, cx),
+            Command::OpenFieldGuide => self.open_field_guide(window, cx),
+            Command::CatchCreature => self.catch_creature(cx),
             Command::Buzz => self.start_buzz(cx),
             Command::ShowWelcome => self.show_welcome(cx),
             #[cfg(debug_assertions)]

@@ -25,6 +25,7 @@ pub enum TileRing {
 /// actions, and a body slot for the terminal itself.
 #[derive(IntoElement)]
 #[must_use]
+#[expect(clippy::struct_excessive_bools, reason = "one flag per header state")]
 pub struct TileFrame {
     id: ElementId,
     icon: IconName,
@@ -37,6 +38,7 @@ pub struct TileFrame {
     body: Vec<AnyElement>,
     footer: Option<AnyElement>,
     name_suffix: Option<AnyElement>,
+    locked: bool,
     ring: TileRing,
     focused: bool,
     attention: bool,
@@ -58,6 +60,7 @@ impl TileFrame {
             body: Vec::new(),
             footer: None,
             name_suffix: None,
+            locked: false,
             ring: TileRing::default(),
             focused: false,
             attention: false,
@@ -106,6 +109,13 @@ impl TileFrame {
     /// Shown right after the name, before the meta.
     pub fn name_suffix(mut self, suffix: impl IntoElement) -> Self {
         self.name_suffix = Some(suffix.into_any_element());
+        self
+    }
+
+    /// Draws the terminal icon with a lock badge instead of the icon, for the user's own
+    /// terminal.
+    pub fn locked(mut self, locked: bool) -> Self {
+        self.locked = locked;
         self
     }
 
@@ -182,7 +192,21 @@ impl RenderOnce for TileFrame {
             .bg(panel)
             .border_b_1()
             .border_color(line)
-            .child(Icon::new(self.icon).size(IconSize::Large).color(icon_color))
+            .child(if self.locked {
+                let selector = self.debug_selector.clone();
+
+                LockedTerminalIcon::new()
+                    .cutout(panel)
+                    .when_some(selector, |icon, selector| {
+                        icon.debug_selector(move || format!("{selector}-lock"))
+                    })
+                    .into_any_element()
+            } else {
+                Icon::new(self.icon)
+                    .size(IconSize::Large)
+                    .color(icon_color)
+                    .into_any_element()
+            })
             .child(Label::new(self.name).weight(FontWeight::MEDIUM))
             .children(self.name_suffix)
             .when_some(self.meta, |header, meta| {
@@ -316,16 +340,8 @@ impl Component for TileFrame {
                         "User terminal",
                         tile("user-wrap").child(
                             TileFrame::new("user-terminal", IconName::Terminal, "zsh")
-                                .name_suffix(
-                                    h_flex()
-                                        .gap(px(5.))
-                                        .child(
-                                            Icon::new(IconName::User)
-                                                .size(IconSize::Custom(px(13.)))
-                                                .color(Color::Muted),
-                                        )
-                                        .child(Label::new("Mine").size(LabelSize::XSmall)),
-                                )
+                                .locked(true)
+                                .name_suffix(Tag::new("Mine"))
                                 .meta("~/swarm")
                                 .ring(TileRing::Fg)
                                 .focused(true)

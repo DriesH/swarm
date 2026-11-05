@@ -16,6 +16,7 @@ Keys follow the macOS order: ⌃ Control, ⌥ Option, ⇧ Shift, ⌘ Command.
 | ⌘K | Open the command palette |
 | ⇧⌘R | Open Review |
 | ⌘B | Show or hide the sidebar |
+| ⇧⌘D | Open the pull request description large, while the pull request panel shows a new pull request |
 | ⌘, | Open Settings |
 | ⌃⌘F | Enter or exit full screen |
 | ⌘M | Minimize the window |
@@ -126,4 +127,4 @@ The menus show the shortcut next to each item.
 | **View** | **Review** ⇧⌘R · **Toggle Sidebar** ⌘B · **Command Palette** ⌘K · **Enter Full Screen** ⌃⌘F |
 | **Window** | **Minimize** ⌘M |
 
-These items have no shortcut: **About Swarm**, **Show All**, **Add Project…**, **Close Task**, **Terminals**, **Swarm**, **Files**, **Changes**, **Zoom**, **Bring All to Front** and **Swarm Help**. Open **Swarm Help** to reach this site. **Terminals**, **Swarm** and **Review** also open from the view switcher in the window.
+These items have no shortcut: **About Swarm**, **Show All**, **Add Project…**, **Close Task**, **Terminals**, **Swarm**, **Files**, **Changes**, **Zoom**, **Bring All to Front**, **Swarm Help** and **Report an Issue…**. Open **Swarm Help** to reach this site. **Terminals**, **Swarm** and **Review** also open from the view switcher in the window.

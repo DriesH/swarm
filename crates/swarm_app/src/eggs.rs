@@ -34,9 +34,19 @@ const TOAST_RIGHT: f32 = 24.;
 /// Clears the status bar.
 const TOAST_BOTTOM: f32 = 62.;
 
-/// The toast for a task that is ready for review.
+/// A creature the toast tells about: its place in the list and how often it was caught.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Caught {
+    pub creature: usize,
+    pub count: u32,
+}
+
+/// The toast for a task that is ready for review, or for a creature that was caught.
 pub(crate) struct HoneyToast {
-    pub notice: Notice,
+    /// The notice behind a ready-for-review toast. A catch has none.
+    pub notice: Option<Notice>,
+    pub caught: Option<Caught>,
+    /// The title: the task, or the creature and "caught".
     pub task: SharedString,
     /// Counts up, so the honeycomb fills again for each toast.
     serial: usize,
@@ -68,6 +78,8 @@ pub(crate) struct Eggs {
     /// Goes up with each stats event, so an answer that came late does not win.
     stats_revision: u64,
     pub toast: Option<HoneyToast>,
+    /// Catches that wait for a ready-for-review toast to go.
+    queued_catches: Vec<Caught>,
     pub flight: Option<Flight>,
     serial: usize,
     /// Redraws the sidebar when the queen's day ends.
@@ -128,7 +140,11 @@ impl Workspace {
         self.watch_queen_expiry(cx);
         cx.notify();
     }
+}
 
+/// The trigger for the toast also exists in tests of release builds.
+#[cfg(any(debug_assertions, test))]
+impl Workspace {
     /// Shows the "Honey's ready" toast for the open task, as if its workers all finished.
     pub(crate) fn show_honey_toast_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(task) = self.data.task(self.active_task) else {
@@ -285,6 +301,44 @@ impl Workspace {
         &mut self,
         notice: &Notice,
         task: SharedString,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        self.put_toast(Some(notice.clone()), None, task, window, cx);
+    }
+
+    /// Puts the toast for a catch up: "<name> caught", and "New" for the first time.
+    pub(crate) fn place_catch_toast(
+        &mut self,
+        creature: usize,
+        count: u32,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(creature_info) = swarm_protocol::creatures::CREATURES.get(creature) else {
+            return;
+        };
+
+        if self
+            .eggs
+            .toast
+            .as_ref()
+            .is_some_and(|toast| toast.notice.is_some())
+        {
+            self.eggs.queued_catches.push(Caught { creature, count });
+            return;
+        }
+
+        let title = SharedString::from(format!("{} caught", creature_info.english));
+
+        self.put_toast(None, Some(Caught { creature, count }), title, window, cx);
+    }
+
+    fn put_toast(
+        &mut self,
+        notice: Option<Notice>,
+        caught: Option<Caught>,
+        task: SharedString,
         mut window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
@@ -298,7 +352,8 @@ impl Workspace {
         let serial = self.eggs.serial;
 
         self.eggs.toast = Some(HoneyToast {
-            notice: notice.clone(),
+            notice,
+            caught,
             task,
             serial,
             focus: cx.focus_handle(),
@@ -352,8 +407,20 @@ impl Workspace {
             self.run_toast_phase(cx);
         } else {
             self.eggs.toast = None;
+            self.show_queued_catch(cx);
         }
         cx.notify();
+    }
+
+    /// Shows the oldest catch that waited for a toast to go.
+    fn show_queued_catch(&mut self, cx: &mut Context<Self>) {
+        if self.eggs.queued_catches.is_empty() {
+            return;
+        }
+
+        let Caught { creature, count } = self.eggs.queued_catches.remove(0);
+
+        self.place_catch_toast(creature, count, None, cx);
     }
 
     /// Starts the exit of the toast. Under Reduce Motion it is gone at once.
@@ -374,6 +441,7 @@ impl Workspace {
             self.run_toast_phase(cx);
         } else {
             self.eggs.toast = None;
+            self.show_queued_catch(cx);
         }
         cx.notify();
     }
@@ -457,15 +525,15 @@ impl Workspace {
 
     /// The Review button of the toast: opens the task in Review.
     fn review_from_toast(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(toast) = self
+        let Some(notice) = self
             .eggs
             .toast
             .as_ref()
             .filter(|toast| !toast.phase.is_leaving())
+            .and_then(|toast| toast.notice.clone())
         else {
             return;
         };
-        let notice = toast.notice.clone();
 
         self.leave_toast(Some(window), cx);
         self.close_toast(cx);
@@ -567,52 +635,59 @@ impl Workspace {
         let dismissed = workspace.clone();
         let hover_target = workspace.clone();
         let serial = toast.serial;
-        let decorated = settings::easter_eggs(cx);
+        let decorated = settings::easter_eggs(cx) && toast.caught.is_none();
+        let reviewable = toast.notice.is_some();
+        let message = match toast.caught {
+            Some(caught) => crate::field_guide::catch_message(caught.count),
+            None => "Ready for review".to_owned(),
+        };
+        let picture = toast
+            .caught
+            .and_then(|caught| crate::field_guide::toast_art(caught.creature));
 
-        Toast::new(
-            ("honey-toast", toast.serial),
-            toast.task.clone(),
-            "Ready for review",
-        )
-        .debug_selector(|| "honey-toast".to_owned())
-        .track_focus(&toast.focus)
-        .on_hover(move |hovered, _, cx| {
-            update(
-                &hover_target,
-                move |workspace, _| {
-                    if let Some(toast) = workspace
-                        .eggs
-                        .toast
-                        .as_mut()
-                        .filter(|toast| toast.serial == serial)
-                    {
-                        toast.hovered = hovered;
-                    }
-                },
-                cx,
-            );
-        })
-        .when(decorated, |element| {
-            element.leading(
-                div()
-                    .debug_selector(|| "honey-fill".to_owned())
-                    .child(HoneyFill::new(("honey-fill", toast.serial))),
-            )
-        })
-        .action("Review", move |_, window, cx| {
-            update(
-                &workspace,
-                |workspace, cx| workspace.review_from_toast(window, cx),
-                cx,
-            );
-        })
-        .on_dismiss(move |window, cx| {
-            update(
-                &dismissed,
-                |workspace, cx| workspace.dismiss_toast(Some(window), cx),
-                cx,
-            );
-        })
+        Toast::new(("honey-toast", toast.serial), toast.task.clone(), message)
+            .debug_selector(|| "honey-toast".to_owned())
+            .track_focus(&toast.focus)
+            .on_hover(move |hovered, _, cx| {
+                update(
+                    &hover_target,
+                    move |workspace, _| {
+                        if let Some(toast) = workspace
+                            .eggs
+                            .toast
+                            .as_mut()
+                            .filter(|toast| toast.serial == serial)
+                        {
+                            toast.hovered = hovered;
+                        }
+                    },
+                    cx,
+                );
+            })
+            .when(decorated, |element| {
+                element.leading(
+                    div()
+                        .debug_selector(|| "honey-fill".to_owned())
+                        .child(HoneyFill::new(("honey-fill", toast.serial))),
+                )
+            })
+            .when_some(picture, Toast::leading)
+            .when(reviewable, |element| {
+                element.action("Review", move |_, window, cx| {
+                    update(
+                        &workspace,
+                        |workspace, cx| workspace.review_from_toast(window, cx),
+                        cx,
+                    );
+                })
+            })
+            .on_dismiss(move |window, cx| {
+                update(
+                    &dismissed,
+                    |workspace, cx| workspace.dismiss_toast(Some(window), cx),
+                    cx,
+                );
+            })
     }
 }
 
@@ -1024,6 +1099,63 @@ mod tests {
 
         assert_eq!(shown, Some(ToastPhase::Shown));
         assert_eq!(removed, None);
+    }
+
+    fn toast_title(
+        workspace: &gpui::Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> Option<String> {
+        workspace.read_with(cx, |workspace, _| {
+            workspace
+                .eggs
+                .toast
+                .as_ref()
+                .map(|toast| toast.task.to_string())
+        })
+    }
+
+    #[gpui::test]
+    fn a_catch_does_not_replace_a_ready_for_review_toast(cx: &mut TestAppContext) {
+        let (workspace, cx) = open_projects(cx);
+        receive(&workspace, &ready_for_review(), cx);
+        let before = toast_title(&workspace, cx);
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.place_catch_toast(2, 1, None, cx);
+        });
+
+        assert_eq!(toast_title(&workspace, cx), before);
+        assert_ne!(before.as_deref(), Some("Buff-tailed bumblebee caught"));
+    }
+
+    #[gpui::test]
+    fn a_catch_that_waited_shows_when_the_review_toast_is_gone(cx: &mut TestAppContext) {
+        let (workspace, cx) = open_projects(cx);
+        receive(&workspace, &ready_for_review(), cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.place_catch_toast(2, 1, None, cx);
+        });
+
+        workspace.update(cx, |workspace, cx| workspace.dismiss_toast(None, cx));
+
+        assert_eq!(
+            toast_title(&workspace, cx).as_deref(),
+            Some("Buff-tailed bumblebee caught")
+        );
+    }
+
+    #[gpui::test]
+    fn a_catch_replaces_a_catch_toast_at_once(cx: &mut TestAppContext) {
+        let (workspace, cx) = open_projects(cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.place_catch_toast(2, 1, None, cx);
+            workspace.place_catch_toast(0, 1, None, cx);
+        });
+
+        assert_eq!(
+            toast_title(&workspace, cx).as_deref(),
+            Some("Western honey bee caught")
+        );
     }
 
     fn focus_is_on_the_workspace(

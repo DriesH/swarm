@@ -11,9 +11,9 @@ use swarm_ui::edit;
 
 use crate::actions::{
     About, AddProject, BringAllToFront, CheckForUpdates, CloseTask, FocusAgent, Hide, HideOthers,
-    Minimize, NewTask, NewTerminal, OpenHelp, OpenSettings, PlanWithOrchestrator, Quit, ShowAll,
-    ShowReview, ShowSwarm, ShowTerminals, ToggleChanges, ToggleCommandPalette, ToggleFiles,
-    ToggleFullScreen, ToggleSidebar, Zoom,
+    Minimize, NewTask, NewTerminal, OpenHelp, OpenSettings, PlanWithOrchestrator, Quit,
+    ReportIssue, ShowAll, ShowReview, ShowSwarm, ShowTerminals, ToggleChanges,
+    ToggleCommandPalette, ToggleFiles, ToggleFullScreen, ToggleSidebar, Zoom,
 };
 use crate::lifecycle;
 use crate::settings::Page;
@@ -111,7 +111,10 @@ fn menus_for(full_screen: bool) -> Vec<Menu> {
             MenuItem::separator(),
             MenuItem::action("Bring All to Front", BringAllToFront),
         ]),
-        Menu::new("Help").items([MenuItem::action("Swarm Help", OpenHelp)]),
+        Menu::new("Help").items([
+            MenuItem::action("Swarm Help", OpenHelp),
+            MenuItem::action("Report an Issue\u{2026}", ReportIssue),
+        ]),
     ]
 }
 
@@ -126,6 +129,8 @@ fn on_app_actions(cx: &mut App) {
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
     cx.on_action(|_: &BringAllToFront, cx| cx.activate(true));
     cx.on_action(|_: &OpenHelp, cx| cx.open_url(HELP_URL));
+    crate::report_issue::register(cx);
+    crate::field_guide::register(cx);
     cx.on_action(|_: &Minimize, cx| {
         cx.defer(|cx| on_front_window(cx, Window::minimize_window));
     });
@@ -438,7 +443,7 @@ mod tests {
             items("Window"),
             ["Minimize", "Zoom", "-", "Bring All to Front"]
         );
-        assert_eq!(items("Help"), ["Swarm Help"]);
+        assert_eq!(items("Help"), ["Swarm Help", "Report an Issue\u{2026}"]);
     }
 
     #[gpui::test]
@@ -671,6 +676,18 @@ mod tests {
         assert!(overlay_is(&workspace, cx, |overlay| matches!(
             overlay,
             Overlay::CloseTask { .. }
+        )));
+    }
+
+    #[gpui::test]
+    fn report_an_issue_in_the_help_menu_opens_the_report(cx: &mut TestAppContext) {
+        let (workspace, cx) = app(cx);
+
+        choose("Help", "Report an Issue\u{2026}", cx);
+
+        assert!(overlay_is(&workspace, cx, |overlay| matches!(
+            overlay,
+            Overlay::ReportIssue { .. }
         )));
     }
 

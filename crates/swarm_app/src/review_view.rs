@@ -4,12 +4,13 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui::{
     AnyElement, App, ClickEvent, Context, Div, Entity, FocusHandle, Focusable as _, FontWeight,
     KeyDownEvent, ListAlignment, ListOffset, ListState, Role, ScrollStrategy, SharedString,
-    Stateful, StyleRefinement, UniformListScrollHandle, WeakEntity, Window, div, list, px,
-    uniform_list,
+    Stateful, StyleRefinement, StyledText, UniformListScrollHandle, WeakEntity, Window, div, list,
+    px, uniform_list,
 };
 use swarm_protocol::{
     Client, CommentId, DiffLine, DiffLineKind, DiffSide, FileChange, FileDiff, Fold, ReviewComment,
@@ -41,8 +42,10 @@ use crate::workspace::{View, Workspace};
 use swarm_ui::a11y::accessible;
 
 mod comments;
+mod highlight;
 
 use comments::{Composer, ReplyBox, ReplyFocus};
+use highlight::{FileHighlights, Highlights};
 
 const NAV_WIDTH: f32 = 272.;
 const HEADER_HEIGHT: f32 = 46.;
@@ -186,6 +189,10 @@ pub(crate) struct ReviewView {
     focus_folded: Option<CommentId>,
     /// Redraws the relative times of delivered comments.
     clock: Option<gpui::Task<()>>,
+    /// The daemon, which sends the file texts the colors are made from.
+    client: Option<Client>,
+    /// The syntax colors of the files whose lines were drawn.
+    highlights: Highlights,
 }
 
 fn update_workspace(
@@ -272,7 +279,14 @@ impl ReviewView {
             focus_reply: None,
             focus_folded: None,
             clock: None,
+            client: None,
+            highlights: Highlights::default(),
         }
+    }
+
+    /// Gives the view the daemon connection, or takes it away.
+    pub(crate) fn set_client(&mut self, client: Option<Client>) {
+        self.client = client;
     }
 
     /// The handle that gets focus when Review opens: the diff body.
@@ -298,6 +312,10 @@ impl ReviewView {
         let same_scope = previous
             .as_ref()
             .is_some_and(|old| old.task == input.task && old.source == input.source);
+
+        if !same_scope {
+            self.highlights.clear();
+        }
 
         if previous
             .as_ref()
@@ -1023,6 +1041,8 @@ impl Render for ReviewView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
 
+        self.settle_colors(cx);
+
         if std::mem::take(&mut self.focus_composer) {
             window.focus(&self.composer.input.focus_handle(cx), cx);
         } else if std::mem::take(&mut self.focus_body) {
@@ -1664,6 +1684,11 @@ impl ReviewView {
             return div().into_any_element();
         };
 
+        let code = match row {
+            Row::Line { file, .. } | Row::Pair { file, .. } => self.colors_of(file as usize, cx),
+            _ => None,
+        };
+
         let cursor = self.shown_cursor(window, cx);
         let view = cx.entity();
         let line_ctx = |file: u32, hunk: u32, line: u32| LineCtx {
@@ -1674,6 +1699,7 @@ impl ReviewView {
             cursor: cursor
                 .filter(|at| at.file == file && at.hunk == hunk && at.line == line)
                 .map(|at| at.side),
+            code: code.clone(),
         };
 
         let content = match row {
@@ -2111,6 +2137,41 @@ struct LineCtx {
     line: u32,
     /// The side the line cursor sits on, when it sits on this line.
     cursor: Option<DiffSide>,
+    /// The syntax colors of the file, once they are ready.
+    code: Option<Arc<FileHighlights>>,
+}
+
+/// The text of a line with syntax colors, when the colors of its file are ready and the
+/// line is the one they were made for.
+fn colored_text(
+    line: &DiffLine,
+    side: DiffSide,
+    number: u32,
+    code: Option<&FileHighlights>,
+    colors: &ThemeColors,
+) -> Option<StyledText> {
+    if line.kind == DiffLineKind::NoNewline {
+        return None;
+    }
+
+    let ranges = code?.line(side, number, &line.text, colors)?;
+
+    Some(StyledText::new(line_text(line)).with_highlights(ranges))
+}
+
+/// The text of a line, colored when it can be, and the color of the text between tokens.
+/// A colored added or deleted line is plain text on its tint, as on GitHub.
+fn code_child(
+    line: &DiffLine,
+    side: DiffSide,
+    number: u32,
+    ctx: &LineCtx,
+    (text_color, colors): (gpui::Hsla, &ThemeColors),
+) -> (gpui::Hsla, AnyElement) {
+    match colored_text(line, side, number, ctx.code.as_deref(), colors) {
+        Some(text) => (colors.fg, text.into_any_element()),
+        None => (text_color, line_text(line).into_any_element()),
+    }
 }
 
 impl LineCtx {
@@ -2253,6 +2314,7 @@ fn unified_row(
     } else {
         DiffSide::New
     };
+    let (code_color, code) = code_child(line, side, number, ctx, (text_color, colors));
 
     let old_cell = if commentable && old > 0 {
         pick_cell(("review-old", index), old, 6., colors, ctx, DiffSide::Old).into_any_element()
@@ -2295,8 +2357,8 @@ fn unified_row(
                 .flex_1()
                 .min_w_0()
                 .whitespace_normal()
-                .text_color(text_color)
-                .child(line_text(line)),
+                .text_color(code_color)
+                .child(code),
         )
         .when(commentable, |row| {
             row.child(add_button(
@@ -2376,6 +2438,8 @@ fn split_line(
                 let (text_color, tint, sign) = line_style(line.kind, colors);
                 let commentable = line.kind != DiffLineKind::NoNewline;
                 let group: SharedString = format!("review-half-{index}-{position}").into();
+                let (code_color, code) =
+                    code_child(line, diff_side, number, ctx, (text_color, colors));
                 let cell = if commentable {
                     pick_cell(
                         ("review-pick", index * 2 + position),
@@ -2415,8 +2479,8 @@ fn split_line(
                             .flex_1()
                             .min_w_0()
                             .whitespace_normal()
-                            .text_color(text_color)
-                            .child(line_text(line)),
+                            .text_color(code_color)
+                            .child(code),
                     )
                     .when(commentable, |half| {
                         half.child(add_button(
@@ -2675,7 +2739,11 @@ impl Workspace {
             fixed_now: self.fixed_now,
         };
 
-        self.review.update(cx, |review, cx| review.show(input, cx));
+        let client = self.daemon.clone();
+        self.review.update(cx, |review, cx| {
+            review.set_client(client);
+            review.show(input, cx);
+        });
     }
 
     /// Approves the Merged diff the view shows.
@@ -5747,6 +5815,7 @@ mod tests {
                 hunk: 0,
                 line: 0,
                 cursor,
+                code: None,
             };
 
             unified_row(0, Some(&line), (0, 85), &colors, &ctx).map(a11y_of)
@@ -5812,6 +5881,7 @@ mod tests {
             hunk: hunk_at,
             line: u32::try_from(at).unwrap_or(0),
             cursor,
+            code: None,
         };
         let read = |cursor: Option<DiffSide>| {
             let (left, right) = (ctx(cursor), ctx(cursor));

@@ -210,6 +210,8 @@ pub(crate) struct Workspace {
     pub right_panel: Option<RightPanel>,
     /// True when the sidebar shows as a narrow rail of buttons.
     pub(crate) sidebar_collapsed: bool,
+    /// True when the user opened the usage card in a window short enough to fold it.
+    pub(crate) usage_expanded: bool,
     /// The running collapse or expand animation, if any.
     pub(crate) sidebar_motion: Option<SidebarMotion>,
     /// Tracks focus inside the sidebar and the rail, so a toggle can take focus back.
@@ -326,6 +328,8 @@ pub(crate) struct Workspace {
     pub(crate) review_worktree: Option<PathBuf>,
     /// The tasks whose approval is on its way to the daemon.
     pub(crate) review_approving: HashSet<TaskId>,
+    /// The tasks that close: their surface shows the cleanup screen.
+    pub(crate) cleanups: crate::cleanup::Cleanups,
     pub(crate) review_error: Option<(TaskId, SharedString)>,
     /// The tasks whose Request changes is on its way to the daemon.
     pub(crate) review_requesting: HashSet<TaskId>,
@@ -354,6 +358,8 @@ pub(crate) struct Workspace {
     pub(crate) welcome_forced: bool,
     /// What the easter eggs keep: the swarm's stats, the toast and the flying bees.
     pub(crate) eggs: crate::eggs::Eggs,
+    /// The creature in the title bar, the catches and the schedule of visits.
+    pub(crate) field_guide: crate::field_guide::FieldGuide,
     /// The honeycomb behind the empty state and, when the settings ask, the Swarm view.
     pub(crate) honeycomb: Entity<Honeycomb>,
     /// How often the window told the workspace it was activated or deactivated.
@@ -438,6 +444,7 @@ impl Workspace {
             view: View::Terminals,
             right_panel: Some(RightPanel::Changes),
             sidebar_collapsed: false,
+            usage_expanded: false,
             sidebar_motion: None,
             sidebar_focus: cx.focus_handle(),
             add_project_focus: cx.focus_handle().tab_stop(true),
@@ -510,6 +517,7 @@ impl Workspace {
             review_jump_serial: 0,
             review_worktree: None,
             review_approving: HashSet::new(),
+            cleanups: crate::cleanup::Cleanups::new(),
             review_error: None,
             review_requesting: HashSet::new(),
             comments_listed: None,
@@ -526,6 +534,7 @@ impl Workspace {
             welcome: None,
             welcome_forced: false,
             eggs: crate::eggs::Eggs::default(),
+            field_guide: crate::field_guide::FieldGuide::default(),
             honeycomb: cx.new(|_| Honeycomb::new()),
             #[cfg(test)]
             activation_changes: 0,
@@ -1198,6 +1207,11 @@ impl Workspace {
                 .on_action(cx.listener(|this, _: &CreatePullRequest, _, cx| {
                     this.open_pull_request(cx);
                 }))
+                .on_action(cx.listener(
+                    |this, _: &crate::actions::ExpandDescription, window, cx| {
+                        this.open_pr_description(window, cx);
+                    },
+                ))
                 .on_action(cx.listener(|this, _: &SetUpGithub, window, cx| {
                     this.start_github_setup(window, cx);
                 }))
@@ -1429,6 +1443,7 @@ impl Render for Workspace {
         let status_bar = status_bar::render(self, window, cx);
         let right_panel = self
             .visible_panel()
+            .filter(|_| !self.is_cleaning(self.active_task))
             .map(|_| panels::render(self, window, cx));
         let overlay = self.overlay.as_ref().map(Overlay::element);
         let panel_label = match self.visible_panel() {
@@ -2755,7 +2770,7 @@ mod tests {
             cx.add_window_view(Workspace::with_sample)
         }
 
-        const OPEN: [&str; 24] = [
+        const OPEN: [&str; 27] = [
             "Button Toggle sidebar",
             "Tab terminal-renderer, Working",
             "Button New tab",
@@ -2766,6 +2781,9 @@ mod tests {
             "Button Add project",
             "ListItem swarm, 3 tasks, needs you",
             "ListItem orchestrator, Claude Code, working",
+            "ListItem Settings",
+            "ListItem Field guide, 0 of 20 caught",
+            "ListItem Report an issue",
             "TextInput Message the orchestrator",
             "Group term-render terminal",
             "Button Move term-render to tray",
@@ -2782,7 +2800,7 @@ mod tests {
             "Button Terminal",
         ];
 
-        const COLLAPSED: [&str; 24] = [
+        const COLLAPSED: [&str; 27] = [
             "Button Toggle sidebar",
             "Tab terminal-renderer, Working",
             "Button New tab",
@@ -2793,6 +2811,9 @@ mod tests {
             "Button swarm, 3 tasks, needs you",
             "Button Add project",
             "Button orchestrator, Claude Code, working",
+            "Button Settings",
+            "Button Field guide, 0 of 20 caught",
+            "Button Report an issue",
             "TextInput Message the orchestrator",
             "Group term-render terminal",
             "Button Move term-render to tray",

@@ -38,6 +38,7 @@ mod tooltip;
 mod tray_chip;
 mod tree_row;
 mod usage_meter;
+mod usage_ring;
 
 pub use brand_mark::*;
 pub use button::*;
@@ -79,6 +80,7 @@ pub use tooltip::*;
 pub use tray_chip::*;
 pub use tree_row::*;
 pub use usage_meter::*;
+pub use usage_ring::*;
 
 use crate::component::ComponentEntry;
 
@@ -119,6 +121,7 @@ pub fn all_components() -> Vec<ComponentEntry> {
         ComponentEntry::of::<Panel>(),
         ComponentEntry::of::<UsageMeter>(),
         ComponentEntry::of::<UsageDetailMeter>(),
+        ComponentEntry::of::<UsageRing>(),
         ComponentEntry::of::<BrandMark>(),
         ComponentEntry::of::<Honeycomb>(),
         ComponentEntry::of::<HoneyFill>(),

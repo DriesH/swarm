@@ -3,7 +3,7 @@ title: Settings
 description: Every page of the Settings window, every control on it and its default.
 ---
 
-Open Settings with ⌘, or **Swarm › Settings…**. The left list has one entry per page. Under **Projects** it has one entry per [project](/swarm/docs/first-project/), for the settings of that project's `.swarm/config.toml`.
+Open Settings with ⌘, **Swarm › Settings…**, or **Settings** at the bottom of the sidebar. The left list has one entry per page. Under **Projects** it has one entry per [project](/swarm/docs/first-project/), for the settings of that project's `.swarm/config.toml`.
 
 The app saves a change about 300 ms after you stop editing. There is no save button.
 

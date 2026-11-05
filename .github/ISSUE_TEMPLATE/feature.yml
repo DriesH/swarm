@@ -1,0 +1,16 @@
+# Swarm's Report an issue dialog opens this form with the field ids below as query keys.
+# Syntax: https://docs.github.com/en/communities/using-templates-to-encourage-useful-issues-and-pull-requests/syntax-for-issue-forms
+name: Feature request
+description: Something you want Swarm to do
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: what-you-want
+    attributes:
+      label: What you want
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions

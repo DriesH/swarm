@@ -673,14 +673,8 @@ pub(crate) fn merge(services: &Services, id: TaskId, method: MergeMethod) -> Res
         return broadcast_task(services, id);
     }
 
-    tasks::close(services, id, &check)
+    tasks::close_with_branch(services, id, &check, Some(&task.branch))
         .context("the pull request is merged, but the task did not close")?;
-    if let Err(error) = services
-        .projects
-        .delete_merged_branch(task.project, &task.branch)
-    {
-        log::warn!("cannot delete the merged branch {}: {error}", task.branch);
-    }
 
     Ok(())
 }

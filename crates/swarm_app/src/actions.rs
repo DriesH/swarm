@@ -32,7 +32,13 @@ actions!(
         Minimize,
         Zoom,
         BringAllToFront,
-        ToggleFullScreen
+        ToggleFullScreen,
+        /// Opens the Field guide of caught creatures.
+        OpenFieldGuide,
+        /// Starts a report of an issue with Swarm.
+        ReportIssue,
+        /// Opens the pull request description as a large tile.
+        ExpandDescription
     ]
 );
 
@@ -199,6 +205,11 @@ pub(crate) fn shortcuts() -> Vec<Shortcut> {
             Workspace,
             "Toggle sidebar",
             KeyBinding::new("cmd-b", ToggleSidebar, root),
+        ),
+        shortcut(
+            Workspace,
+            "Expand pull request description",
+            KeyBinding::new("cmd-shift-d", ExpandDescription, root),
         ),
         shortcut(Workspace, "Quit", KeyBinding::new("cmd-q", Quit, None)),
         shortcut(

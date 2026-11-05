@@ -1,0 +1,6 @@
+# https://docs.github.com/en/communities/using-templates-to-encourage-useful-issues-and-pull-requests/configuring-issue-templates-for-your-repository
+blank_issues_enabled: false
+contact_links:
+  - name: Swarm documentation
+    url: https://driesh.github.io/swarm/docs/
+    about: How Swarm works and how to fix common problems

@@ -31,6 +31,8 @@ pub(crate) fn render(
         return drag_region("tab-bar-drag", window, cx)
             .flex_1()
             .h_full()
+            .relative()
+            .children(workspace.field_guide.visitor_element())
             .into_any_element();
     }
 
@@ -53,7 +55,9 @@ pub(crate) fn render(
                 .debug_selector(|| "tab-bar-drag".to_owned())
                 .flex_1()
                 .h_full()
-                .min_w(MIN_DRAG_WIDTH),
+                .min_w(MIN_DRAG_WIDTH)
+                .relative()
+                .children(workspace.field_guide.visitor_element()),
         )
         .child(
             h_flex()
@@ -171,13 +175,22 @@ pub(crate) fn ring_status(status: TaskStatus) -> AgentStatus {
     }
 }
 
+/// The ring of a tab. A task that closes spins, whatever its agents do.
+pub(crate) fn tab_status(workspace: &Workspace, task: &Task) -> AgentStatus {
+    if workspace.is_cleaning(task.id) {
+        AgentStatus::Working
+    } else {
+        ring_status(task.status)
+    }
+}
+
 fn task_tab(workspace: &Workspace, task: &Task, cx: &mut Context<Workspace>) -> Tab {
     let id = task.id;
 
     Tab::new(
         ("task", id.0 as usize),
         workspace.data.tab_label(task),
-        ring_status(task.status),
+        tab_status(workspace, task),
     )
     .debug_selector(move || format!("tab-{}", id.0))
     .when(!task.is_start, |tab| {

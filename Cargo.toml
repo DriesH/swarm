@@ -6,11 +6,13 @@ members = [
     "crates/swarm_app",
     "crates/swarm_cli",
     "crates/swarm_core",
+    "crates/swarm_creatures",
     "crates/swarm_daemon",
     "crates/swarm_layout",
     "crates/swarm_protocol",
     "crates/swarm_settings",
     "crates/swarm_sprite",
+    "crates/swarm_syntax",
     "crates/swarm_term",
     "crates/swarm_term_view",
     "crates/swarm_term_vt",
@@ -27,10 +29,12 @@ publish = false
 
 [workspace.dependencies]
 swarm_core = { path = "crates/swarm_core" }
+swarm_creatures = { path = "crates/swarm_creatures" }
 swarm_layout = { path = "crates/swarm_layout" }
 swarm_protocol = { path = "crates/swarm_protocol" }
 swarm_settings = { path = "crates/swarm_settings" }
 swarm_sprite = { path = "crates/swarm_sprite" }
+swarm_syntax = { path = "crates/swarm_syntax" }
 swarm_term = { path = "crates/swarm_term" }
 swarm_term_view = { path = "crates/swarm_term_view" }
 swarm_term_vt = { path = "crates/swarm_term_vt" }
@@ -88,6 +92,22 @@ serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
 toml = "1.1"
+# Syntax highlighting in Review: one core, one grammar per language.
+tree-sitter = "0.27.1"
+tree-sitter-highlight = "0.27.1"
+tree-sitter-bash = "0.25.1"
+tree-sitter-css = "0.25.0"
+tree-sitter-go = "0.25.0"
+tree-sitter-html = "0.23.2"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-json = "0.24.8"
+tree-sitter-md = "0.5.4"
+tree-sitter-php = "0.25.1"
+tree-sitter-python = "0.25.0"
+tree-sitter-rust = "0.24.2"
+tree-sitter-toml-ng = "0.7.0"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-yaml = "0.7.2"
 toml_edit = "0.25.17"
 # One Zed rev for every GPUI crate. Bump it together with rust-toolchain.toml.
 gpui = { git = "https://github.com/zed-industries/zed", rev = "70b1b91b73ee12930b4e3375d68657e9591b1921" }

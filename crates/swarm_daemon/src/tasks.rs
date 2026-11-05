@@ -11,9 +11,9 @@ use swarm_core::prompts::{self, PromptFile};
 use swarm_core::store::NewMessage;
 use swarm_core::{PreparedTask, PreparedWorker};
 use swarm_protocol::{
-    AgentId, AgentInfo, AgentKind, AgentRole, CloseCheck, CreateTask, CreateTerminal, Event,
-    MessageKind, PlanDraft, ProjectId, RemoveCheck, TaskCloseCheck, TaskId, TaskInfo, TerminalId,
-    TerminalKind,
+    AgentId, AgentInfo, AgentKind, AgentRole, CloseCheck, CloseFailure, CloseStep, CreateTask,
+    CreateTerminal, Event, MessageKind, PlanDraft, ProjectId, RemoveCheck, TaskCloseCheck, TaskId,
+    TaskInfo, TerminalId, TerminalKind,
 };
 use swarm_term::TerminalInput;
 use swarm_term::{ExitStatus, Palette, Rgb, Size};
@@ -189,17 +189,43 @@ pub(crate) fn close_check(services: &Services, id: TaskId) -> Result<CloseCheck>
 /// and tells every client. Nothing new starts in the task from the first step on.
 /// `confirmed` is the check the user saw; closing refuses when it would lose more.
 pub(crate) fn close(services: &Services, id: TaskId, confirmed: &CloseCheck) -> Result<()> {
+    close_with_branch(services, id, confirmed, None)
+}
+
+/// Like [`close`], and deletes `merged_branch` too, before the clients learn that the
+/// task closed. Every client hears each step, and a failure.
+pub(crate) fn close_with_branch(
+    services: &Services,
+    id: TaskId,
+    confirmed: &CloseCheck,
+    merged_branch: Option<&str>,
+) -> Result<()> {
     services.projects.task(id)?;
     if !services.agents.begin_close(id) {
         bail!("task {} is closing already", id.0);
     }
+    report_step(services, id, CloseStep::StoppingAgents);
 
-    let result = stop_and_close(services, id, confirmed);
-    if result.is_err() {
+    let result = stop_and_close(services, id, confirmed, merged_branch);
+    if let Err(error) = &result {
         services.agents.abort_close(id);
+        let reason = match error.downcast_ref::<CloseFailure>() {
+            Some(CloseFailure::WouldLoseMore) => CloseFailure::WouldLoseMore,
+            _ => CloseFailure::Other(format!("{error:#}")),
+        };
+
+        services
+            .clients
+            .broadcast(&Event::CloseFailed { task: id, reason });
     }
 
     result
+}
+
+fn report_step(services: &Services, id: TaskId, step: CloseStep) {
+    services
+        .clients
+        .broadcast(&Event::CloseProgress { task: id, step });
 }
 
 /// Closes a task the user asked to close, alone or with its project. The close is refused
@@ -221,17 +247,38 @@ fn loses_more(confirmed: &CloseCheck, now: &CloseCheck) -> bool {
             .any(|name| !confirmed.unmerged_workers.contains(name))
 }
 
-fn stop_and_close(services: &Services, id: TaskId, confirmed: &CloseCheck) -> Result<()> {
+fn stop_and_close(
+    services: &Services,
+    id: TaskId,
+    confirmed: &CloseCheck,
+    merged_branch: Option<&str>,
+) -> Result<()> {
     if !stop_processes(services, Scope::Task(id)) {
         bail!("some processes of the task did not end; try again");
     }
 
     let now = close_check(services, id)?;
     if loses_more(confirmed, &now) {
-        bail!("more would be lost than shown; check again");
+        bail!(CloseFailure::WouldLoseMore);
     }
 
-    let closed = services.projects.close_task(id)?;
+    let mut deleting = false;
+    let closed = services.projects.close_task_reporting(id, &mut |step| {
+        deleting |= step == CloseStep::DeletingBranch;
+        report_step(services, id, step);
+    })?;
+
+    if let Some(branch) = merged_branch {
+        if !deleting {
+            report_step(services, id, CloseStep::DeletingBranch);
+        }
+        if let Err(error) = services
+            .projects
+            .delete_merged_branch(closed.task.project, branch)
+        {
+            log::warn!("cannot delete the merged branch {branch}: {error}");
+        }
+    }
 
     for agent in closed.stopped {
         services.clients.broadcast(&Event::AgentChanged { agent });
@@ -405,7 +452,7 @@ pub(crate) fn remove_project(
             bail!("a task opened since; check again");
         };
         if loses_more(&shown.check, &close_check(services, task.id)?) {
-            bail!("more would be lost than shown; check again");
+            bail!(CloseFailure::WouldLoseMore);
         }
 
         to_close.push((task, &shown.check));

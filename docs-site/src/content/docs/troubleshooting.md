@@ -1,6 +1,6 @@
 ---
 title: Troubleshooting
-description: Fixes for system check failures, the daemon, agents, settings, notifications and usage numbers.
+description: Fixes for system check failures, the daemon, agents, settings, notifications and usage numbers, and how to report an issue.
 ---
 
 Each entry names what you see and what to do.
@@ -94,3 +94,27 @@ Check these in order:
 Swarm gets Claude usage only from Claude Code agents that Swarm runs. With no Claude Code agent running, it shows the last numbers it has. After 10 minutes the line **Updated … ago** shows how old they are. A usage window whose reset time has passed shows 0%.
 
 Start a Claude Code agent to get new numbers.
+
+## Report an issue
+
+Bugs, feature requests and feedback go to the issues of [github.com/DriesH/swarm](https://github.com/DriesH/swarm/issues). Swarm fills in the form and opens it in your browser. You read it there and submit it with your own GitHub account. Swarm uses no token and sends nothing in the background.
+
+Open the dialog from:
+
+- **Help › Report an Issue…**
+- **Report an issue** in the command palette (⌘K)
+- **Report an issue** at the bottom of the sidebar, next to **Settings** and **Field guide**
+- a failure screen. The [cleanup screen](/swarm/docs/review/#the-cleanup-screen) has a **Report an issue** button that fills in the error
+
+The dialog has the tabs **Bug**, **Feature request** and **Feedback**, and a **Title**. The next field is **What happened**, **What you want** or **Your feedback**, by the tab. A bug also asks for **Steps to reproduce**.
+
+Under **Include**:
+
+- **Versions** is on. It adds the versions of Swarm, macOS, Claude Code and Codex.
+- **Last 200 lines of the daemon log** is off. When on, Swarm copies the lines to the clipboard. They are not in the address, because GitHub refuses very long addresses. Paste them into the form's **Daemon log** field. When Swarm cannot read the log, nothing opens and the dialog says so.
+
+**Show what is sent** lists the exact text that goes into the address. The address stays under 6000 characters. A field that is too long is cut and ends with "…", and the list names it.
+
+**Open on GitHub** opens `https://github.com/DriesH/swarm/issues/new` with the form of your tab, `bug.yml`, `feature.yml` or `feedback.yml`, and closes the dialog. The three forms are in `.github/ISSUE_TEMPLATE/`. Each sets its own label: `bug`, `enhancement` or `question`.
+
+Enter in the **Title** moves to the next field. ⌘↩ in any field opens GitHub, like **Open on GitHub**.

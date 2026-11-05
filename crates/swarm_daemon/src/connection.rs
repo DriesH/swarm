@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 
 use anyhow::Result;
+use swarm_core::Projects;
 use swarm_core::github::Github;
 use swarm_core::prompts;
 use swarm_core::system_check::{self, AgentCommands, Tools};
@@ -282,6 +283,10 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
         }
         Request::SystemCheck { call } => system_check(services, sink, call),
         Request::Stats { call } => send_stats(services, sink, call),
+        Request::Catches { call } => send_catches(services, sink, call),
+        Request::RecordCatch { call, creature } => record_catch(services, sink, call, &creature),
+        Request::Visits { call } => send_visits(services, sink, call),
+        Request::RecordVisit { call, at } => record_visit(services, sink, call, at),
         Request::Usage { call } => {
             sink.send_event(&Event::Usage {
                 call,
@@ -300,6 +305,7 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
         | Request::ResetPrompt { .. }) => handle_settings(services, sink, request),
         request @ (Request::TaskDiff { .. }
         | Request::FileHunks { .. }
+        | Request::FileTexts { .. }
         | Request::ApproveTask { .. }
         | Request::ReviewMarks { .. }
         | Request::SetReviewMarks { .. }
@@ -363,6 +369,42 @@ fn send_stats(services: &Services, sink: &ClientSink, call: CallId) {
     match stats::current(services) {
         Ok(stats) => {
             sink.send_event(&Event::Stats { call, stats });
+        }
+        Err(error) => send_error(sink, call, &error),
+    }
+}
+
+fn send_catches(services: &Services, sink: &ClientSink, call: CallId) {
+    match stats::catches(services) {
+        Ok(catches) => {
+            sink.send_event(&Event::Catches { call, catches });
+        }
+        Err(error) => send_error(sink, call, &error),
+    }
+}
+
+fn send_visits(services: &Services, sink: &ClientSink, call: CallId) {
+    match stats::visits(services) {
+        Ok(starts) => {
+            sink.send_event(&Event::Visits { call, starts });
+        }
+        Err(error) => send_error(sink, call, &error),
+    }
+}
+
+fn record_visit(services: &Services, sink: &ClientSink, call: CallId, at: u64) {
+    match stats::record_visit(services, at) {
+        Ok(()) => {
+            sink.send_event(&Event::Done { call });
+        }
+        Err(error) => send_error(sink, call, &error),
+    }
+}
+
+fn record_catch(services: &Services, sink: &ClientSink, call: CallId, creature: &str) {
+    match stats::record_catch(services, creature) {
+        Ok(caught) => {
+            sink.send_event(&Event::CatchRecorded { call, caught });
         }
         Err(error) => send_error(sink, call, &error),
     }
@@ -646,6 +688,34 @@ fn handle_settings(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Re
     }
 }
 
+/// Sends both sides of a file for syntax highlighting, off the connection thread.
+fn send_file_texts(
+    projects: &Arc<Projects>,
+    sink: &Arc<ClientSink>,
+    call: CallId,
+    (task, source, worktree, path): (
+        swarm_protocol::TaskId,
+        swarm_protocol::ReviewSource,
+        PathBuf,
+        PathBuf,
+    ),
+) {
+    let projects = Arc::clone(projects);
+
+    run_slow(sink, "file-texts", call, move |sink| {
+        match projects.file_texts(task, source, &worktree, &path) {
+            Ok(texts) => {
+                sink.send_event(&Event::FileTexts {
+                    call,
+                    old: texts.old,
+                    new: texts.new,
+                });
+            }
+            Err(error) => send_error(sink, call, &error),
+        }
+    });
+}
+
 /// Review and close: the requests that read a diff, approve or close a task.
 fn handle_review(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
     let projects = &services.projects;
@@ -698,6 +768,13 @@ fn handle_review(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Requ
                 }
             });
         }
+        Request::FileTexts {
+            call,
+            task,
+            source,
+            worktree,
+            path,
+        } => send_file_texts(projects, sink, call, (task, source, worktree, path)),
         Request::ApproveTask {
             call,
             task,

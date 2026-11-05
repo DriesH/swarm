@@ -246,6 +246,8 @@ impl Workspace {
             return;
         }
 
+        self.fail_working_cleanups(cx);
+
         let Some(launch) = self.daemon_launch.clone() else {
             log::warn!("the daemon connection is lost and cannot be restored");
             return;
@@ -403,6 +405,9 @@ impl Workspace {
 
         self.load_usage(client.clone(), cx);
         self.load_stats(client.clone(), cx);
+        self.load_catches(client.clone(), cx);
+        Self::load_visits(client.clone(), cx);
+        self.start_field_guide(cx);
         self.load_message_history(client, cx);
 
         cx.notify();
@@ -790,6 +795,7 @@ impl Workspace {
         self.swarm_selection.remove(&task);
         self.previous_tabs.retain(|_, other| *other != task);
         self.review_approving.remove(&task);
+        self.cleanups.remove(&task);
         self.review_requesting.remove(&task);
         self.pull_requests.forget_task(task);
 
@@ -2219,6 +2225,11 @@ pub(crate) mod tests {
                 call: *call,
                 file: None,
             }),
+            Request::FileTexts { call, .. } => Some(Event::FileTexts {
+                call: *call,
+                old: None,
+                new: None,
+            }),
             Request::TaskFiles { call, .. } => Some(Event::TaskFiles {
                 call: *call,
                 files: Vec::new(),
@@ -2236,6 +2247,10 @@ pub(crate) mod tests {
                 call: *call,
                 stats: swarm_protocol::SwarmStats::default(),
             }),
+            Request::Catches { .. }
+            | Request::RecordCatch { .. }
+            | Request::Visits { .. }
+            | Request::RecordVisit { .. } => field_guide_reply(request),
             Request::GithubStatus { call, .. } => Some(Event::GithubStatus {
                 call: *call,
                 status: swarm_protocol::GithubStatus::default(),
@@ -2287,6 +2302,30 @@ pub(crate) mod tests {
                 call: *call,
                 id: DaemonTerminalId(NEXT_TERMINAL.fetch_add(1, Ordering::Relaxed)),
             }),
+            _ => None,
+        }
+    }
+
+    /// The Field guide requests: no catches, no visits, and each record accepted.
+    fn field_guide_reply(request: &Request) -> Option<Event> {
+        match request {
+            Request::Catches { call } => Some(Event::Catches {
+                call: *call,
+                catches: Vec::new(),
+            }),
+            Request::RecordCatch { call, creature } => Some(Event::CatchRecorded {
+                call: *call,
+                caught: swarm_protocol::Catch {
+                    creature: creature.clone(),
+                    first_caught_at: 0,
+                    count: 1,
+                },
+            }),
+            Request::Visits { call } => Some(Event::Visits {
+                call: *call,
+                starts: Vec::new(),
+            }),
+            Request::RecordVisit { call, .. } => Some(Event::Done { call: *call }),
             _ => None,
         }
     }
@@ -2811,6 +2850,48 @@ pub(crate) mod tests {
             )
         });
         assert_eq!((tiles, live), (0, 0));
+    }
+
+    #[gpui::test]
+    fn a_lost_daemon_fails_every_working_cleanup_so_the_way_back_shows(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let (socket, leave) = fake_daemon_that_leaves();
+        cx.executor().allow_parking();
+        let client = Client::connect(&socket).expect("connect");
+        use_projects(
+            &workspace,
+            &[project_info(5, "demo", vec![task_info(7, 5, "login")])],
+            cx,
+        );
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.use_daemon(client.clone(), &[], window, cx);
+        });
+        workspace.update(cx, |workspace, cx| {
+            workspace.close_step(
+                DaemonTaskId(7),
+                swarm_protocol::CloseStep::StoppingAgents,
+                cx,
+            );
+        });
+        leave.send(()).expect("the fake daemon is waiting");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while client.is_connected() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+
+        workspace.update(cx, Workspace::reconnect_daemon);
+        redraw(cx);
+
+        let phase = workspace.read_with(cx, |workspace, _| {
+            let task = workspace.active_task;
+
+            workspace.cleanups[&task].progress.phase().clone()
+        });
+        assert_eq!(
+            phase,
+            crate::cleanup::Phase::Failed("Not connected to the daemon".into())
+        );
+        assert!(cx.debug_bounds("cleanup-back").is_some());
     }
 
     #[gpui::test]
@@ -5938,7 +6019,9 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
-    fn cancel_closes_the_dialog_and_a_failed_close_shows_its_error(cx: &mut TestAppContext) {
+    fn a_refused_close_shows_its_reason_on_the_cleanup_screen_and_back_keeps_the_task(
+        cx: &mut TestAppContext,
+    ) {
         let socket = fake_daemon_replying(|request| match request {
             Request::CheckClose { call, .. } => Some(Event::CloseCheck {
                 call,
@@ -5970,14 +6053,26 @@ pub(crate) mod tests {
         );
         let failed = wait_until(cx, |cx| {
             redraw(cx);
-            dialog(&workspace, cx).is_some_and(|dialog| {
-                dialog.read_with(cx, |dialog, _| dialog.error_text().is_some())
-            })
+            cx.debug_bounds("cleanup-retry").is_some()
         });
-        cx.simulate_keystrokes("escape");
+        let reason = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .cleanups
+                .get(&task)
+                .map(|cleanup| cleanup.progress.phase().clone())
+        });
+        let open_before_back = dialog(&workspace, cx).is_some();
+
+        click_selector("cleanup-back", cx);
+        redraw(cx);
 
         assert!(failed);
-        assert!(dialog(&workspace, cx).is_none());
+        assert!(
+            matches!(reason, Some(crate::cleanup::Phase::Failed(message)) if message.contains("teardown failed"))
+        );
+        assert!(!open_before_back, "the dialog closes when the close starts");
+        assert!(workspace.read_with(cx, |workspace, _| !workspace.is_cleaning(task)));
+        assert!(cx.debug_bounds("cleanup").is_none());
         assert!(workspace.read_with(cx, |workspace, _| {
             workspace.data.has_daemon_task(DaemonTaskId(7))
         }));
@@ -6066,44 +6161,102 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
-    fn cancel_and_escape_do_nothing_while_the_close_runs(cx: &mut TestAppContext) {
-        let (socket, _closes) = close_daemon(swarm_protocol::CloseCheck::default());
+    fn confirming_swaps_the_surface_for_the_cleanup_screen_before_the_daemon_answers(
+        cx: &mut TestAppContext,
+    ) {
+        let socket = fake_daemon_replying(|request| match request {
+            Request::CheckClose { call, .. } => Some(Event::CloseCheck {
+                call,
+                check: swarm_protocol::CloseCheck::default(),
+            }),
+            Request::CloseTask { call, .. } => {
+                answer_late();
+
+                Some(Event::Done { call })
+            }
+            _ => None,
+        });
         let (workspace, cx, _client) = real_task_workspace(&socket, cx);
         open_dialog_and_wait(&workspace, cx);
-        let Some(view) = dialog(&workspace, cx) else {
-            panic!("the dialog is not open");
-        };
-        let events = Rc::new(std::cell::RefCell::new(Vec::new()));
-        let seen = Rc::clone(&events);
-        cx.update(|_, app| {
-            app.subscribe(
-                &view,
-                move |_, event: &crate::close_task::CloseTaskEvent, _| {
-                    seen.borrow_mut().push(event.clone());
-                },
+        redraw(cx);
+        let screen_before = cx.debug_bounds("cleanup").is_some();
+
+        click_selector("close-task-confirm", cx);
+        redraw(cx);
+
+        let (cleaning, spinning) = workspace.read_with(cx, |workspace, _| {
+            let task = workspace.active_task();
+
+            (
+                workspace.is_cleaning(task.id),
+                crate::tab_bar::tab_status(workspace, task),
             )
-            .detach();
         });
-
-        view.update(cx, crate::close_task::CloseTaskDialog::set_busy);
-        redraw(cx);
-        click_selector("close-task-cancel", cx);
-        cx.simulate_keystrokes("escape");
-        let while_busy = events.borrow().len();
-        let open = dialog(&workspace, cx).is_some();
-
-        view.update(cx, |dialog, cx| dialog.fail("refused".into(), cx));
-        redraw(cx);
-        click_selector("close-task-cancel", cx);
-
-        assert_eq!(while_busy, 0, "Cancel or Escape dismissed a running close");
-        assert!(open);
+        assert!(!screen_before);
         assert!(dialog(&workspace, cx).is_none());
+        assert!(cleaning);
+        assert!(cx.debug_bounds("cleanup").is_some());
+        assert_eq!(spinning, AgentStatus::Working);
     }
 
     #[gpui::test]
-    fn a_refused_close_checks_again_and_confirms_the_new_check(cx: &mut TestAppContext) {
+    fn retrying_a_refused_close_sends_what_the_user_confirmed_again(cx: &mut TestAppContext) {
         let (sent, closes) = flume::unbounded();
+        let asks = Arc::new(AtomicU64::new(0));
+        let socket = fake_daemon_replying({
+            let asks = Arc::clone(&asks);
+
+            move |request| match request {
+                Request::CheckClose { call, .. } => Some(Event::CloseCheck {
+                    call,
+                    check: swarm_protocol::CloseCheck {
+                        uncommitted_files: 1,
+                        ..swarm_protocol::CloseCheck::default()
+                    },
+                }),
+                Request::CloseTask {
+                    call, confirmed, ..
+                } => {
+                    sent.send(confirmed.uncommitted_files).ok();
+
+                    if asks.fetch_add(1, Ordering::Relaxed) == 0 {
+                        Some(Event::Error {
+                            call: Some(call),
+                            id: None,
+                            message: "worktree is busy".into(),
+                        })
+                    } else {
+                        Some(Event::Done { call })
+                    }
+                }
+                _ => None,
+            }
+        });
+        let (workspace, cx, _client) = real_task_workspace(&socket, cx);
+        open_dialog_and_wait(&workspace, cx);
+
+        click_selector("close-task-confirm", cx);
+        let refused = wait_until(cx, |cx| {
+            redraw(cx);
+            cx.debug_bounds("cleanup-retry").is_some()
+        });
+        click_selector("cleanup-retry", cx);
+        redraw(cx);
+        let working_again = workspace.read_with(cx, |workspace, _| {
+            workspace.cleanups.values().all(|cleanup| {
+                matches!(cleanup.progress.phase(), crate::cleanup::Phase::Working(_))
+            })
+        });
+        let second = wait_until(cx, |_| closes.len() >= 2);
+
+        assert!(refused);
+        assert!(working_again);
+        assert!(second);
+        assert_eq!(closes.try_iter().collect::<Vec<_>>(), [1, 1]);
+    }
+
+    #[gpui::test]
+    fn going_back_after_a_refusal_lets_the_next_close_check_again(cx: &mut TestAppContext) {
         let checks = Arc::new(AtomicU64::new(0));
         let socket = fake_daemon_replying({
             let checks = Arc::clone(&checks);
@@ -6120,54 +6273,30 @@ pub(crate) mod tests {
                         },
                     })
                 }
-                Request::CloseTask {
-                    call, confirmed, ..
-                } => {
-                    sent.send(confirmed.clone()).ok();
-
-                    if confirmed.uncommitted_files < 2 {
-                        Some(Event::Error {
-                            call: Some(call),
-                            id: None,
-                            message: "more files changed".into(),
-                        })
-                    } else {
-                        Some(Event::Done { call })
-                    }
-                }
+                Request::CloseTask { call, .. } => Some(Event::Error {
+                    call: Some(call),
+                    id: None,
+                    message: "more files changed".into(),
+                }),
                 _ => None,
             }
         });
         let (workspace, cx, _client) = real_task_workspace(&socket, cx);
         open_dialog_and_wait(&workspace, cx);
-
         click_selector("close-task-confirm", cx);
-        let refreshed = wait_until(cx, |cx| {
+        wait_until(cx, |cx| {
             redraw(cx);
-            dialog(&workspace, cx).is_some_and(|dialog| {
-                dialog.read_with(cx, |dialog, _| {
-                    dialog.error_text().is_some()
-                        && dialog
-                            .confirmed()
-                            .is_some_and(|check| check.uncommitted_files == 2)
-                })
-            })
+            cx.debug_bounds("cleanup-back").is_some()
         });
+        click_selector("cleanup-back", cx);
+        redraw(cx);
+
+        open_dialog_and_wait(&workspace, cx);
+
         let lines = dialog(&workspace, cx)
             .map(|dialog| dialog.read_with(cx, |dialog, _| dialog.lines()))
             .unwrap_or_default();
-
-        click_selector("close-task-confirm", cx);
-        let second = wait_until(cx, |_| closes.len() >= 2);
-
-        let asked: Vec<_> = closes
-            .try_iter()
-            .map(|check| check.uncommitted_files)
-            .collect();
-        assert!(refreshed, "the dialog did not show the new check");
         assert_eq!(lines[0].0, "Deletes 2 uncommitted files");
-        assert!(second);
-        assert_eq!(asked, [1, 2]);
     }
 
     #[gpui::test]

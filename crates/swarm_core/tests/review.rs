@@ -1804,3 +1804,79 @@ fn file_hunks_for_an_unknown_task_is_an_error() {
 
     assert!(matches!(unknown, Err(Error::Invalid(_))), "{unknown:?}");
 }
+
+#[test]
+fn a_burst_of_file_text_requests_builds_one_diff_plan() {
+    let setup = setup("");
+    setup.write("a.rs", "fn a() {}\n");
+    setup.write("b.rs", "fn b() {}\n");
+    setup.commit_all();
+
+    std::thread::scope(|scope| {
+        for path in ["a.rs", "b.rs", "a.rs", "b.rs", "a.rs", "b.rs"] {
+            scope.spawn(|| {
+                setup
+                    .projects
+                    .file_texts(
+                        setup.task.id,
+                        ReviewSource::Merged,
+                        &setup.task.worktree,
+                        Path::new(path),
+                    )
+                    .expect("texts");
+            });
+        }
+    });
+
+    assert_eq!(setup.projects.plans_built(), 1);
+}
+
+#[test]
+fn a_diff_read_after_a_commit_gives_the_file_texts_the_new_plan() {
+    let setup = setup("");
+    setup.write("a.rs", "fn one() {}\n");
+    setup.commit_all();
+    let read = || {
+        setup
+            .projects
+            .file_texts(
+                setup.task.id,
+                ReviewSource::Merged,
+                &setup.task.worktree,
+                Path::new("a.rs"),
+            )
+            .expect("texts")
+    };
+    read();
+
+    setup.write("a.rs", "fn two() {}\n");
+    setup.commit_all();
+    setup.merged();
+    let after = read();
+
+    assert_eq!(after.new.as_deref(), Some(&["fn two() {}".to_owned()][..]));
+}
+
+#[test]
+fn file_texts_still_read_both_sides_with_a_reused_plan() {
+    let setup = setup_with("", &[("a.rs", b"fn old() {}\n")]);
+    setup.write("a.rs", "fn new() {}\n");
+    setup.commit_all();
+    let read = || {
+        setup
+            .projects
+            .file_texts(
+                setup.task.id,
+                ReviewSource::Merged,
+                &setup.task.worktree,
+                Path::new("a.rs"),
+            )
+            .expect("texts")
+    };
+
+    let first = read();
+    let second = read();
+
+    assert_eq!(first.old.as_deref(), Some(&["fn old() {}".to_owned()][..]));
+    assert_eq!(second.new.as_deref(), Some(&["fn new() {}".to_owned()][..]));
+}

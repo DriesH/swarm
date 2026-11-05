@@ -21,7 +21,7 @@ export default defineConfig({
       ],
       sidebar: [
         { label: 'Start here', items: ['install', 'first-project'] },
-        { label: 'Using Swarm', items: ['how-work-starts', 'workspace', 'swarm-view', 'review', 'pull-requests', 'notifications-and-usage'] },
+        { label: 'Using Swarm', items: ['how-work-starts', 'workspace', 'swarm-view', 'review', 'pull-requests', 'notifications-and-usage', 'field-guide'] },
         { label: 'Configure', items: ['settings', 'project-config', 'keyboard'] },
         { label: 'Reference', items: ['harness', 'troubleshooting'] },
       ],

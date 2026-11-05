@@ -21,13 +21,15 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use swarm_protocol::{
-    AgentChange, AgentId, AgentInfo, AgentLifecycle, AgentRole, CloseCheck, CreateTask, DIFF_FILES,
-    DiffStat, FileChange, FileDiff, GithubStatus, PrLink, ProjectConfigFields, ProjectId,
-    ProjectInfo, ReviewMark, ReviewSource, TaskDiff, TaskId, TaskInfo, TerminalId,
+    AgentChange, AgentId, AgentInfo, AgentLifecycle, AgentRole, CloseCheck, CloseStep, CreateTask,
+    DIFF_FILES, DiffStat, FileChange, FileDiff, FileTexts, GithubStatus, PrLink,
+    ProjectConfigFields, ProjectId, ProjectInfo, ReviewMark, ReviewSource, TaskDiff, TaskId,
+    TaskInfo, TerminalId,
 };
 use swarm_term::ExitStatus;
 
@@ -127,6 +129,37 @@ pub struct Projects {
     creating: Mutex<()>,
     /// One comment change runs at a time in a task, so a comment is never sent twice.
     comments: comments::TaskLocks,
+    /// The diff plans that file text requests reuse for a short time.
+    plans: Mutex<Vec<CachedPlan>>,
+    /// How many diff plans were built, so a test can tell that a burst built one.
+    plans_built: AtomicUsize,
+}
+
+/// How long file text requests of one task reuse a diff plan: a burst of requests builds
+/// it once.
+const PLAN_REUSE: Duration = Duration::from_secs(2);
+
+struct CachedPlan {
+    task: TaskId,
+    source: ReviewSource,
+    built: Instant,
+    plan: Arc<DiffPlan>,
+}
+
+/// Keeps `plan` as the plan of the task, instead of an older one.
+fn store_plan(
+    plans: &mut Vec<CachedPlan>,
+    task: TaskId,
+    source: ReviewSource,
+    plan: &Arc<DiffPlan>,
+) {
+    plans.retain(|cached| !(cached.task == task && cached.source == source));
+    plans.push(CachedPlan {
+        task,
+        source,
+        built: Instant::now(),
+        plan: Arc::clone(plan),
+    });
 }
 
 impl Projects {
@@ -135,7 +168,41 @@ impl Projects {
             store,
             creating: Mutex::new(()),
             comments: comments::TaskLocks::default(),
+            plans: Mutex::new(Vec::new()),
+            plans_built: AtomicUsize::new(0),
         }
+    }
+
+    /// How many diff plans were built since this value was made.
+    pub fn plans_built(&self) -> usize {
+        self.plans_built.load(Ordering::Relaxed)
+    }
+
+    /// The plan of the task's diff at `HEAD`. Requests that come within [`PLAN_REUSE`] of
+    /// each other share one plan; the lock is held while it is built, so a burst of
+    /// parallel requests builds it once.
+    fn reused_plan(&self, id: TaskId, source: ReviewSource) -> Result<Arc<DiffPlan>, Error> {
+        let mut plans = lock(&self.plans);
+        plans.retain(|cached| cached.built.elapsed() < PLAN_REUSE);
+
+        if let Some(cached) = plans
+            .iter()
+            .find(|cached| cached.task == id && cached.source == source)
+        {
+            return Ok(Arc::clone(&cached.plan));
+        }
+
+        let plan = Arc::new(self.plan_diff(id, source, None)?);
+        self.plans_built.fetch_add(1, Ordering::Relaxed);
+        store_plan(&mut plans, id, source, &plan);
+
+        Ok(plan)
+    }
+
+    /// A diff of the task at `HEAD` just read the plan fresh: later file text requests
+    /// take it instead of the older one.
+    fn keep_plan(&self, id: TaskId, source: ReviewSource, plan: &Arc<DiffPlan>) {
+        store_plan(&mut lock(&self.plans), id, source, plan);
     }
 
     pub fn list(&self) -> Result<Vec<ProjectInfo>, Error> {
@@ -759,6 +826,44 @@ impl Projects {
         Ok(Some(file.diff))
     }
 
+    /// The lines of a file on the old side (the base) and the new side (the commit
+    /// `Merged` reads, or the worktree for `Live`), for syntax highlighting. A side is
+    /// `None` when the file is missing there, binary, over 1 MB or unreadable. `path` is
+    /// the [`FileDiff::path`] and must stay inside the worktree.
+    pub fn file_texts(
+        &self,
+        id: TaskId,
+        source: ReviewSource,
+        worktree: &Path,
+        path: &Path,
+    ) -> Result<FileTexts, Error> {
+        let inside = path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)));
+        if !inside {
+            return Ok(FileTexts::default());
+        }
+
+        let plan = self.reused_plan(id, source)?;
+        let Some(section) = plan
+            .sections
+            .iter()
+            .find(|section| section.worktree == worktree)
+        else {
+            return Ok(FileTexts::default());
+        };
+
+        let old = git::blob_lines(&section.worktree, &section.base, path)?;
+        let new = match source {
+            ReviewSource::Live => git::working_file_lines(&section.worktree, path),
+            ReviewSource::Merged => {
+                git::blob_lines(&section.worktree, section.tip(&plan.head), path)?
+            }
+        };
+
+        Ok(FileTexts { old, new })
+    }
+
     /// Like [`Projects::task_diff`]. With `commit`, `Merged` reads that commit instead of
     /// the current `HEAD` of the task worktree.
     fn diff_at(
@@ -767,7 +872,11 @@ impl Projects {
         source: ReviewSource,
         commit: Option<&str>,
     ) -> Result<TaskDiff, Error> {
-        let plan = self.plan_diff(id, source, commit)?;
+        let plan = Arc::new(self.plan_diff(id, source, commit)?);
+        if commit.is_none() {
+            self.keep_plan(id, source, &plan);
+        }
+
         let scope = scope_of(source);
         let names = unique_names(&plan.agents);
         let mut budget = git::DiffBudget::default();
@@ -821,7 +930,7 @@ impl Projects {
             task: id,
             source,
             fingerprint: fingerprint.finish(),
-            head: plan.head,
+            head: plan.head.clone(),
             stat,
             files,
         })
@@ -1159,7 +1268,16 @@ impl Projects {
     /// the base branch and marks the task closed. The caller stopped the task's processes first. A failure leaves the
     /// task marked as closing, so a retry or the next daemon start finishes it.
     pub fn close_task(&self, id: TaskId) -> Result<ClosedTask, Error> {
-        self.finish_close(id, true)
+        self.close_task_reporting(id, &mut |_| {})
+    }
+
+    /// Like [`Self::close_task`], and calls `report` as each step starts.
+    pub fn close_task_reporting(
+        &self,
+        id: TaskId,
+        report: &mut dyn FnMut(CloseStep),
+    ) -> Result<ClosedTask, Error> {
+        self.finish_close(id, true, report)
     }
 
     /// Finishes every close that did not end, for example after a crash. No teardown
@@ -1175,14 +1293,19 @@ impl Projects {
         };
 
         for task in tasks {
-            match self.finish_close(task, false) {
+            match self.finish_close(task, false, &mut |_| {}) {
                 Ok(_) => log::info!("finished closing task {}", task.0),
                 Err(error) => log::error!("cannot finish closing task {}: {error}", task.0),
             }
         }
     }
 
-    fn finish_close(&self, id: TaskId, teardown: bool) -> Result<ClosedTask, Error> {
+    fn finish_close(
+        &self,
+        id: TaskId,
+        teardown: bool,
+        report: &mut dyn FnMut(CloseStep),
+    ) -> Result<ClosedTask, Error> {
         let (task, root) = {
             let store = lock(&self.store);
             let task = store
@@ -1200,6 +1323,7 @@ impl Projects {
         };
 
         lock(&self.store).begin_closing(id)?;
+        report(CloseStep::RemovingWorktrees);
 
         let LoadedConfig { config, .. } = config::load(&root);
         if teardown
@@ -1229,6 +1353,10 @@ impl Projects {
         // Checked again now: a branch merged since the check loses nothing either.
         match merged_branches(&root, &task) {
             Ok(branches) => {
+                if !branches.is_empty() {
+                    report(CloseStep::DeletingBranch);
+                }
+
                 for branch in branches {
                     if let Err(error) = git::branch_delete(&root, &branch) {
                         log::warn!("cannot delete the merged branch {branch}: {error}");

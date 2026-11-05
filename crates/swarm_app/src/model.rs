@@ -769,6 +769,8 @@ pub(crate) struct FakeData {
     pub loaded: crate::review_model::LoadedFiles,
     /// The review comments of each task, oldest first, under [`FakeData::diff_id`].
     pub comments: HashMap<swarm_protocol::TaskId, Rc<[ReviewComment]>>,
+    /// The slugs of the Field guide creatures the user has caught.
+    pub caught_creatures: Vec<String>,
 }
 
 /// What an agent changed: the totals and the files, most changed lines first.

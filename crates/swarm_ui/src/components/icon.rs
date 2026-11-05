@@ -1,5 +1,5 @@
 use gpui::{
-    AnyElement, App, ElementId, Pixels, Role, SharedString, Transformation, Window, div, px,
+    AnyElement, App, ElementId, Hsla, Pixels, Role, SharedString, Transformation, Window, div, px,
     radians, svg,
 };
 
@@ -14,15 +14,19 @@ pub enum IconName {
     Agent,
     Alert,
     Bee,
+    Book,
     Branch,
     Check,
     ChevronDown,
     ChevronRight,
+    ChevronUp,
     ClaudeCode,
     Close,
     Codex,
     Diff,
+    Expand,
     ExternalLink,
+    Feedback,
     File,
     Folder,
     Lock,
@@ -63,19 +67,23 @@ macro_rules! fill_icon {
 }
 
 impl IconName {
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 31] = [
         Self::Agent,
         Self::Alert,
         Self::Bee,
+        Self::Book,
         Self::Branch,
         Self::Check,
         Self::ChevronDown,
         Self::ChevronRight,
+        Self::ChevronUp,
         Self::ClaudeCode,
         Self::Close,
         Self::Codex,
         Self::Diff,
+        Self::Expand,
         Self::ExternalLink,
+        Self::Feedback,
         Self::File,
         Self::Folder,
         Self::Lock,
@@ -98,15 +106,19 @@ impl IconName {
             Self::Agent => "agent",
             Self::Alert => "alert",
             Self::Bee => "bee",
+            Self::Book => "book",
             Self::Branch => "branch",
             Self::Check => "check",
             Self::ChevronDown => "chevron_down",
             Self::ChevronRight => "chevron_right",
+            Self::ChevronUp => "chevron_up",
             Self::ClaudeCode => "claude_code",
             Self::Close => "close",
             Self::Codex => "codex",
             Self::Diff => "diff",
+            Self::Expand => "expand",
             Self::ExternalLink => "external_link",
+            Self::Feedback => "feedback",
             Self::File => "file",
             Self::Folder => "folder",
             Self::Lock => "lock",
@@ -139,6 +151,10 @@ impl IconName {
                 "2",
                 r#"<path d="M12 9c-1.6-3.6-6.4-4.4-7.2-1.8C4.1 9.6 8 10.6 12 9z"/><path d="M12 9c1.6-3.6 6.4-4.4 7.2-1.8.7 2.4-3.2 3.4-7.2 1.8z"/><ellipse cx="12" cy="15" rx="4.5" ry="5.5"/><path d="M7.7 13.5h8.6M7.9 16.8h8.2M12 20.5V22"/>"#
             ),
+            Self::Book => stroke_icon!(
+                "1.9",
+                r#"<path d="M4 5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2z"/><path d="M4 19V5M9 7h6"/>"#
+            ),
             Self::Branch => stroke_icon!(
                 "1.8",
                 r#"<circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="8" r="2.5"/><path d="M6 8.5v7M18 10.5c0 4-5 4-10 6"/>"#
@@ -146,6 +162,7 @@ impl IconName {
             Self::Check => stroke_icon!("2.6", r#"<path d="m5 12 5 5 9-10"/>"#),
             Self::ChevronDown => stroke_icon!("2", r#"<path d="m6 9 6 6 6-6"/>"#),
             Self::ChevronRight => stroke_icon!("2", r#"<path d="m9 6 6 6-6 6"/>"#),
+            Self::ChevronUp => stroke_icon!("2", r#"<path d="m6 15 6-6 6 6"/>"#),
             Self::ClaudeCode => fill_icon!(
                 "M20.998 10.949H24v3.102h-3v3.028h-1.487V20H18v-2.921h-1.487V20H15v-2.921H9V20H7.488v-2.921H6V20H4.487v-2.921H3V14.05H0V10.95h3V5h17.998v5.949zM6 10.949h1.488V8.102H6v2.847zm10.51 0H18V8.102h-1.49v2.847z"
             ),
@@ -157,9 +174,16 @@ impl IconName {
                 "1.8",
                 r#"<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M12 11v6M9 14h6"/>"#
             ),
+            Self::Expand => {
+                stroke_icon!("2", r#"<path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/>"#)
+            }
             Self::ExternalLink => stroke_icon!(
                 "1.8",
                 r#"<path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/>"#
+            ),
+            Self::Feedback => stroke_icon!(
+                "1.9",
+                r#"<path d="M21 15a2 2 0 0 1-2 2H8l-5 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><path d="M12 7v4M12 14h.01"/>"#
             ),
             Self::File => stroke_icon!(
                 "1.8",
@@ -319,6 +343,82 @@ impl RenderOnce for Icon {
     }
 }
 
+/// The terminal icon with a small honey lock on a cut-out: the mark of a terminal that
+/// agents cannot use. A decoration: the row or tile that holds it says what it means.
+#[derive(IntoElement)]
+#[must_use]
+pub struct LockedTerminalIcon {
+    cutout: Option<Hsla>,
+    debug_selector: Option<String>,
+}
+
+impl LockedTerminalIcon {
+    pub fn new() -> Self {
+        Self {
+            cutout: None,
+            debug_selector: None,
+        }
+    }
+
+    /// Name for `VisualTestContext::debug_bounds`. Only recorded in test builds.
+    pub fn debug_selector(mut self, selector: impl FnOnce() -> String) -> Self {
+        self.debug_selector = Some(selector());
+        self
+    }
+
+    /// The color of the surface behind the icon, which the lock's cut-out takes. Defaults to
+    /// the panel color.
+    pub fn cutout(mut self, color: Hsla) -> Self {
+        self.cutout = Some(color);
+        self
+    }
+}
+
+impl Default for LockedTerminalIcon {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RenderOnce for LockedTerminalIcon {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let cutout = self.cutout.unwrap_or_else(|| cx.theme().colors().panel);
+
+        div()
+            .when_some(self.debug_selector, |icon, selector| {
+                icon.debug_selector(move || selector)
+            })
+            .relative()
+            .flex_none()
+            .size(px(18.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                Icon::new(IconName::Terminal)
+                    .size(IconSize::Large)
+                    .color(Color::Muted),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .right(px(-3.))
+                    .bottom(px(-3.))
+                    .size(px(11.))
+                    .rounded_full()
+                    .bg(cutout)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        Icon::new(IconName::Lock)
+                            .size(IconSize::Custom(px(8.)))
+                            .color(Color::Warn),
+                    ),
+            )
+    }
+}
+
 impl Component for Icon {
     fn name() -> &'static str {
         "Icon"
@@ -380,6 +480,10 @@ impl Component for Icon {
                             .accessible("codex", "Codex"),
                     ),
                 ],
+            ))
+            .child(example_group(
+                "Locked terminal",
+                [example("Mine", LockedTerminalIcon::new())],
             ))
             .into_any_element()
     }
