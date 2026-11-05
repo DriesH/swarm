@@ -27,9 +27,12 @@ A file that is not valid TOML at all, for example with a missing quote, does not
 |---|---|---|
 | **System** | – | Lists Git, Claude Code, Codex, GitHub CLI, GitHub account and Notifications, each with its state. A row that is not ready has a button that fixes it. |
 | **Check again** | – | Runs the system check again. |
+| **Check for updates automatically** | On | Checks GitHub Releases 30 seconds after launch and every 6 hours. Off leaves only **Check now** and **Swarm › Check for Updates…**. |
+| **Check now** | – | Checks for an update now. |
+| **Updates** status | – | One line: **Up to date**, **Checking…**, **Downloading 1.2.0…**, **Update ready: 1.2.0**, **Swarm 1.2.0 needs macOS 14.0**, **Updates need a signed build** or **Check failed** with the reason. |
 | **About** | – | Shows the app version and the credit for the file icons, with links to their repository and licence. |
 
-The system check also runs when you open Settings and when the window becomes active.
+The system check also runs when you open Settings and when the window becomes active. See [Install](/swarm/docs/install/#updates) for how updates work.
 
 ## Agents
 
@@ -175,4 +178,7 @@ theme = "system"               # or "light", "dark"
 easter_eggs = true
 accent = "blue"                # or "honey"
 swarm_view_honeycomb = false
+
+[updates]
+auto_check = true
 ```

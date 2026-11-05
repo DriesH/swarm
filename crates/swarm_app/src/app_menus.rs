@@ -10,10 +10,10 @@ use gpui::{Action, App, Context, Global, Menu, MenuItem, OsAction, SystemMenuTyp
 use swarm_ui::edit;
 
 use crate::actions::{
-    About, AddProject, BringAllToFront, CloseTask, FocusAgent, Hide, HideOthers, Minimize, NewTask,
-    NewTerminal, OpenHelp, OpenSettings, PlanWithOrchestrator, Quit, ShowAll, ShowReview,
-    ShowSwarm, ShowTerminals, ToggleChanges, ToggleCommandPalette, ToggleFiles, ToggleFullScreen,
-    ToggleSidebar, Zoom,
+    About, AddProject, BringAllToFront, CheckForUpdates, CloseTask, FocusAgent, Hide, HideOthers,
+    Minimize, NewTask, NewTerminal, OpenHelp, OpenSettings, PlanWithOrchestrator, Quit, ShowAll,
+    ShowReview, ShowSwarm, ShowTerminals, ToggleChanges, ToggleCommandPalette, ToggleFiles,
+    ToggleFullScreen, ToggleSidebar, Zoom,
 };
 use crate::lifecycle;
 use crate::settings::Page;
@@ -64,6 +64,7 @@ fn menus_for(full_screen: bool) -> Vec<Menu> {
     vec![
         Menu::new("Swarm").items([
             MenuItem::action("About Swarm", About),
+            MenuItem::action("Check for Updates…", CheckForUpdates),
             MenuItem::action("Settings…", OpenSettings),
             MenuItem::separator(),
             MenuItem::os_submenu("Services", SystemMenuType::Services),
@@ -134,6 +135,14 @@ fn on_app_actions(cx: &mut App) {
     // The settings window may be the one in front, and the main window may be closed.
     cx.on_action(|_: &OpenSettings, cx| cx.defer(|cx| open_settings(None, cx)));
     cx.on_action(|_: &About, cx| cx.defer(|cx| open_settings(Some(Page::General), cx)));
+
+    // The status line of the check is on the General page.
+    cx.on_action(|_: &CheckForUpdates, cx| {
+        cx.defer(|cx| {
+            crate::updates::check_now(cx);
+            open_settings(Some(Page::General), cx);
+        });
+    });
 }
 
 fn on_front_window(cx: &mut App, act: impl FnOnce(&Window)) {
@@ -383,6 +392,7 @@ mod tests {
             items("Swarm"),
             [
                 "About Swarm",
+                "Check for Updates…",
                 "Settings…",
                 "-",
                 "Services",
@@ -860,6 +870,37 @@ mod tests {
     }
 
     #[gpui::test]
+    fn check_for_updates_checks_and_shows_the_general_page(cx: &mut TestAppContext) {
+        use crate::updates::tests::{FakeHost, FakeSource, install_fake, signed_build};
+
+        let (workspace, cx) = app(cx);
+        let (source, host) = (FakeSource::new(Vec::new(), Vec::new()), FakeHost::new(true));
+        cx.update(|_, cx| install_fake(&workspace, &source, &host, signed_build(), cx));
+
+        choose("Swarm", "Check for Updates…", cx);
+
+        assert_eq!(source.fetched(), 1);
+        assert_eq!(settings_page(cx), Page::General);
+    }
+
+    #[gpui::test]
+    fn check_for_updates_does_not_fetch_on_a_build_that_cannot_update(cx: &mut TestAppContext) {
+        use crate::updates::tests::{FakeHost, FakeSource, install_fake, unsigned_build};
+
+        let (workspace, cx) = app(cx);
+        let (source, host) = (FakeSource::new(Vec::new(), Vec::new()), FakeHost::new(true));
+        cx.update(|_, cx| install_fake(&workspace, &source, &host, unsigned_build(), cx));
+
+        choose("Swarm", "Check for Updates…", cx);
+
+        assert_eq!(source.fetched(), 0);
+        assert_eq!(
+            cx.update(|_, cx| crate::updates::status(cx)),
+            "Updates need a signed build"
+        );
+    }
+
+    #[gpui::test]
     fn about_shows_the_general_page_of_a_settings_window_that_is_open(cx: &mut TestAppContext) {
         let (_workspace, cx) = app(cx);
         choose("Swarm", "Settings…", cx);
@@ -892,6 +933,7 @@ mod tests {
 
         // The test platform cannot hide, minimize, zoom or quit, so the actions are not sent.
         for (menu, label) in [
+            ("Swarm", "Check for Updates…"),
             ("Swarm", "Hide Swarm"),
             ("Swarm", "Hide Others"),
             ("Swarm", "Show All"),

@@ -19,7 +19,7 @@ use gpui::{
 };
 use swarm_settings::{
     AccentSetting, AppearanceSettings, CliSettings, NotificationSettings, ProjectMode, Settings,
-    ThemeSetting,
+    ThemeSetting, UpdateSettings,
 };
 use swarm_ui::a11y::ignore_press;
 use swarm_ui::fonts::UI_FONT;
@@ -658,6 +658,11 @@ impl SettingsWindow {
             },
             cx,
         );
+
+        // The Updates section shows the status of the updater.
+        if let Some(updater) = crate::updates::updater(cx) {
+            subscriptions.push(cx.observe(&updater, |_, _, cx| cx.notify()));
+        }
 
         let (system_check, check_again_focus) = Self::system_check_for(&state, window, cx);
         // The Agents page shows the versions this check finds.
@@ -1338,6 +1343,25 @@ pub(crate) fn follow_skip_permissions(workspace: Entity<Workspace>, cx: &mut App
         }
     })
     .detach();
+}
+
+/// Whether the app checks for updates by itself. On until the settings say otherwise.
+pub(crate) fn auto_check_updates(cx: &App) -> bool {
+    cx.try_global::<Registry>().map_or_else(
+        || UpdateSettings::default().auto_check,
+        |registry| registry.state.read(cx).settings.updates.auto_check,
+    )
+}
+
+/// Changes the update settings the way the page does.
+#[cfg(test)]
+pub(crate) fn change_updates(edit: impl FnOnce(&mut UpdateSettings), cx: &mut App) {
+    let state = shared_state(None, cx);
+
+    state.update(cx, |state, cx| {
+        edit(&mut state.settings.updates);
+        cx.notify();
+    });
 }
 
 /// Changes the agent settings the way the page does.
@@ -2184,6 +2208,8 @@ mod tests {
                 "ListItem General",
                 "Button Check again",
                 "Button Allow notifications",
+                "Switch Check for updates automatically",
+                "Button Check now",
                 "Link Repository, vscode-icons on GitHub",
                 "Link License, CC BY-SA 4.0",
             ]

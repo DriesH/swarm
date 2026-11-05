@@ -94,7 +94,7 @@ cargo run -p app_icon -- --png assets/app-icon/icon-1024.png
 ## Known limits
 
 - Apple Silicon only. There is no Intel or universal build.
-- The updater and the publish scripts are not built yet (ADR 0011).
+- The updater and the publish scripts have not run against a real release yet.
 - No test on a clean Mac yet.
 - A Finder launch gives the app a short `PATH`. Besides `PATH`, Swarm looks for agents and `gh` only in `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin` and `~/.claude/local`. A tool in another folder, such as one of a version manager, is not found. Not tried yet on a Finder launch.
 - `CFBundleVersion` is the same as the version until updates need a build number.

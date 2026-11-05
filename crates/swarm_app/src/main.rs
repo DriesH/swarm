@@ -36,6 +36,7 @@ mod status_bar;
 mod swarm_view;
 mod system_check;
 mod tab_bar;
+mod updates;
 mod usage_pace;
 mod usage_text;
 mod views;

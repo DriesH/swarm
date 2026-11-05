@@ -46,6 +46,16 @@ Without `gh`, Review and **Approve** still work. The pull request button reads *
 
 Both mean the screen does not show again. The same check stays in **Settings › General**, under **System**. A fix that still runs when you close the welcome screen stops.
 
+## Updates
+
+Swarm checks [GitHub Releases](https://github.com/DriesH/swarm/releases) for a newer version. It checks 30 seconds after launch and then every 6 hours. Turn this off in **Settings › General**. **Check now** and **Swarm › Check for Updates…** always check.
+
+Swarm downloads the new version in the background and checks its signature. The status bar then shows **Update ready**, with **Restart to update** and **Release notes**. Swarm installs the update when you press **Restart to update** or when you quit. The old app goes to the Trash.
+
+An unsigned build, such as one you built yourself, never updates. If Swarm cannot replace itself in its folder, the button reads **Download** and opens the release page.
+
+After an update, the daemon restarts when no agent works. Else Swarm shows **Restart daemon**, and the daemon restarts only when you confirm. A restart stops every agent terminal.
+
 ## The background daemon
 
 Swarm starts a background process, the daemon, when you open the app. The daemon owns every agent and every terminal. The app is a window onto it.
