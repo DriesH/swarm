@@ -192,7 +192,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "app_icon"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "image",
  "swarm_sprite",
@@ -1841,7 +1841,7 @@ dependencies = [
 
 [[package]]
 name = "gallery"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "env_logger",
@@ -5256,7 +5256,7 @@ dependencies = [
 
 [[package]]
 name = "swarm_app"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "block2 0.6.2",
@@ -5283,7 +5283,7 @@ dependencies = [
 
 [[package]]
 name = "swarm_cli"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "clap",
  "serde",
@@ -5296,7 +5296,7 @@ dependencies = [
 
 [[package]]
 name = "swarm_core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "libc",
  "log",
@@ -5313,7 +5313,7 @@ dependencies = [
 
 [[package]]
 name = "swarm_daemon"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "core-foundation",
@@ -5335,11 +5335,11 @@ dependencies = [
 
 [[package]]
 name = "swarm_layout"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "swarm_protocol"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "flume",
  "libc",
@@ -5353,7 +5353,7 @@ dependencies = [
 
 [[package]]
 name = "swarm_settings"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "log",
  "serde",
@@ -5365,11 +5365,11 @@ dependencies = [
 
 [[package]]
 name = "swarm_sprite"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "swarm_term"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "flume",
  "serde",
@@ -5377,7 +5377,7 @@ dependencies = [
 
 [[package]]
 name = "swarm_term_view"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "flume",
  "gpui",
@@ -5390,7 +5390,7 @@ dependencies = [
 
 [[package]]
 name = "swarm_term_vt"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "flume",
@@ -5404,7 +5404,7 @@ dependencies = [
 
 [[package]]
 name = "swarm_ui"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "gpui",
  "log",
@@ -5417,7 +5417,7 @@ dependencies = [
 
 [[package]]
 name = "swarm_update"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "block2 0.6.2",
  "core-foundation",
@@ -5434,7 +5434,7 @@ dependencies = [
 
 [[package]]
 name = "swarm_usage"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "libc",
  "log",
