@@ -145,9 +145,7 @@ fn updates(state: &gpui::Entity<super::SettingsState>, cx: &App) -> impl IntoEle
         |state, on| state.settings.updates.auto_check = on,
     );
 
-    let check_now = Button::new("check-now", "Check now")
-        .debug_selector(|| "check-now".to_owned())
-        .on_click(|_, _, cx| crate::updates::check_now(cx));
+    let button = update_button(cx);
 
     let status_row = PanelRow::new("Status").end_slot(
         h_flex()
@@ -160,10 +158,32 @@ fn updates(state: &gpui::Entity<super::SettingsState>, cx: &App) -> impl IntoEle
                             .child(Label::new(status).size(LabelSize::Small)),
                     ),
             )
-            .child(check_now),
+            .child(button),
     );
 
     section("Updates", Panel::new().row(switch).row(status_row))
+}
+
+/// **Check now**, with a spinner while a check or a download runs. When an update is ready:
+/// **Update now**, or **Download** when the app cannot replace itself.
+fn update_button(cx: &App) -> Button {
+    if let Some(ready) = crate::updates::ready(cx) {
+        if ready.replaceable {
+            return Button::new("check-now", "Update now")
+                .variant(ButtonVariant::Primary)
+                .debug_selector(|| "update-now".to_owned())
+                .on_click(|_, _, cx| crate::updates::restart_to_update(cx));
+        }
+
+        return Button::new("check-now", "Download")
+            .debug_selector(|| "update-download".to_owned())
+            .on_click(move |_, _, cx| cx.open_url(&ready.notes_url));
+    }
+
+    Button::new("check-now", "Check now")
+        .debug_selector(|| "check-now".to_owned())
+        .loading(crate::updates::busy(cx))
+        .on_click(|_, _, cx| crate::updates::check_now(cx))
 }
 
 impl SettingsWindow {
@@ -429,6 +449,158 @@ mod tests {
             settings.update(|_, cx| crate::updates::status(cx)),
             "Updates need a signed build"
         );
+    }
+
+    /// A started updater with a release 1.2.0 to find, and the host it installs through.
+    fn updater_with_host(
+        replaceable: bool,
+        workspace: &gpui::Entity<crate::workspace::Workspace>,
+        main: &mut VisualTestContext,
+    ) -> (
+        gpui::Entity<crate::updates::Updater>,
+        std::rc::Rc<crate::updates::tests::FakeHost>,
+    ) {
+        use crate::updates::tests::{FakeHost, FakeSource, install_fake, signed_build};
+
+        let (source, host) = (FakeSource::with_update(), FakeHost::new(replaceable));
+        let updater =
+            main.update(|_, cx| install_fake(workspace, &source, &host, signed_build(), cx));
+
+        (updater, host)
+    }
+
+    /// The name and the busy flag of the button `update_button` builds for the updater's
+    /// state right now.
+    fn update_button_seen(main: &mut VisualTestContext) -> (Option<String>, bool) {
+        use gpui::{Element as _, IntoElement as _, RenderOnce as _};
+
+        main.update(|window, cx| {
+            let element = super::update_button(cx).render(window, cx).into_element();
+            let mut node = gpui::accesskit::Node::new(gpui::accesskit::Role::Unknown);
+            element.write_a11y_info(&mut node);
+
+            (node.label().map(str::to_owned), node.is_busy())
+        })
+    }
+
+    fn draw(settings: &mut VisualTestContext) {
+        settings.update(|window, cx| window.draw(cx).clear(cx));
+    }
+
+    #[gpui::test]
+    fn the_button_shows_a_spinner_while_the_updater_checks(cx: &mut TestAppContext) {
+        let (workspace, main) = setup(cx);
+        let (updater, _host) = updater_with_host(true, &workspace, main);
+        main.dispatch_action(OpenSettings);
+        let window = settings_window(main);
+        let mut settings = open_general(window, main);
+        redraw(&mut settings);
+        let before = update_button_seen(&mut settings);
+
+        updater.update(&mut settings, crate::updates::Updater::check);
+        draw(&mut settings);
+        let during = update_button_seen(&mut settings);
+
+        assert_eq!(before, (Some("Check now".to_owned()), false));
+        assert_eq!(during, (Some("Check now".to_owned()), true));
+        assert!(settings.debug_bounds("check-now").is_some());
+    }
+
+    #[gpui::test]
+    fn the_button_shows_a_spinner_while_the_updater_downloads(cx: &mut TestAppContext) {
+        use crate::updates::UpdateState;
+
+        let (workspace, main) = setup(cx);
+        let (updater, _host) = updater_with_host(true, &workspace, main);
+        main.dispatch_action(OpenSettings);
+        let window = settings_window(main);
+        let mut settings = open_general(window, main);
+        redraw(&mut settings);
+
+        crate::updates::tests::show_state(
+            &updater,
+            UpdateState::Downloading(swarm_update::Version::new(1, 2, 0)),
+            &mut settings,
+        );
+        draw(&mut settings);
+
+        assert_eq!(
+            update_button_seen(&mut settings),
+            (Some("Check now".to_owned()), true)
+        );
+        assert!(settings.debug_bounds("check-now").is_some());
+    }
+
+    #[gpui::test]
+    fn a_ready_update_turns_the_button_into_update_now_and_it_installs(cx: &mut TestAppContext) {
+        let (workspace, main) = setup(cx);
+        let (_updater, host) = updater_with_host(true, &workspace, main);
+        main.dispatch_action(OpenSettings);
+        let window = settings_window(main);
+        let mut settings = open_general(window, main);
+        redraw(&mut settings);
+        let before = settings.debug_bounds("update-now").is_some();
+
+        click_on("check-now", &mut settings);
+        redraw(&mut settings);
+        let after = settings.debug_bounds("update-now").is_some();
+        let old_button = settings.debug_bounds("check-now").is_some();
+        click_on("update-now", &mut settings);
+
+        assert!(!before);
+        assert!(after, "the button did not turn into Update now");
+        assert!(!old_button);
+        assert_eq!(
+            update_button_seen(&mut settings),
+            (Some("Update now".to_owned()), false)
+        );
+        assert_eq!(host.launches.borrow().len(), 1);
+        assert!(host.launches.borrow()[0].1, "the app reopens");
+        assert_eq!(host.quits.get(), 1);
+    }
+
+    #[gpui::test]
+    fn an_app_that_cannot_replace_itself_gets_a_download_button(cx: &mut TestAppContext) {
+        let (workspace, main) = setup(cx);
+        let (_updater, host) = updater_with_host(false, &workspace, main);
+        main.dispatch_action(OpenSettings);
+        let window = settings_window(main);
+        let mut settings = open_general(window, main);
+        redraw(&mut settings);
+
+        click_on("check-now", &mut settings);
+        redraw(&mut settings);
+        let shown = settings.debug_bounds("update-download").is_some();
+        click_on("update-download", &mut settings);
+
+        assert!(shown);
+        assert!(settings.debug_bounds("update-now").is_none());
+        assert!(host.launches.borrow().is_empty());
+        assert_eq!(host.quits.get(), 0);
+        assert_eq!(
+            settings.opened_url().as_deref(),
+            Some("https://github.com/DriesH/swarm/releases/tag/v1.2.0")
+        );
+    }
+
+    #[gpui::test]
+    fn a_failed_install_gets_a_download_button(cx: &mut TestAppContext) {
+        use crate::updates::tests::{FakeHost, FakeSource, install_fake, signed_build};
+
+        let (workspace, main) = setup(cx);
+        let source = FakeSource::with_failed_install("the signature is wrong");
+        let host = FakeHost::new(true);
+        main.update(|_, cx| install_fake(&workspace, &source, &host, signed_build(), cx));
+        main.dispatch_action(OpenSettings);
+        let window = settings_window(main);
+        let mut settings = open_general(window, main);
+        redraw(&mut settings);
+
+        click_on("check-now", &mut settings);
+        redraw(&mut settings);
+
+        assert!(settings.debug_bounds("update-download").is_some());
+        assert!(settings.debug_bounds("update-now").is_none());
     }
 
     #[gpui::test]

@@ -40,6 +40,7 @@ mod status_bar;
 mod swarm_view;
 mod system_check;
 mod tab_bar;
+mod update_card;
 mod updates;
 mod usage_pace;
 mod usage_text;

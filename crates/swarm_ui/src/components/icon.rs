@@ -24,6 +24,7 @@ pub enum IconName {
     Close,
     Codex,
     Diff,
+    Download,
     Expand,
     ExternalLink,
     Feedback,
@@ -67,7 +68,7 @@ macro_rules! fill_icon {
 }
 
 impl IconName {
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 32] = [
         Self::Agent,
         Self::Alert,
         Self::Bee,
@@ -81,6 +82,7 @@ impl IconName {
         Self::Close,
         Self::Codex,
         Self::Diff,
+        Self::Download,
         Self::Expand,
         Self::ExternalLink,
         Self::Feedback,
@@ -116,6 +118,7 @@ impl IconName {
             Self::Close => "close",
             Self::Codex => "codex",
             Self::Diff => "diff",
+            Self::Download => "download",
             Self::Expand => "expand",
             Self::ExternalLink => "external_link",
             Self::Feedback => "feedback",
@@ -173,6 +176,10 @@ impl IconName {
             Self::Diff => stroke_icon!(
                 "1.8",
                 r#"<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M12 11v6M9 14h6"/>"#
+            ),
+            Self::Download => stroke_icon!(
+                "1.9",
+                r#"<path d="M12 4v11M7.5 10.5 12 15l4.5-4.5M5 19h14"/>"#
             ),
             Self::Expand => {
                 stroke_icon!("2", r#"<path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/>"#)

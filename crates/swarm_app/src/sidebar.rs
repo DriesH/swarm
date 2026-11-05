@@ -273,6 +273,10 @@ fn rail_footer(workspace: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
             .children(card)
     });
 
+    let update = workspace
+        .shown_update(cx)
+        .map(|ready| crate::update_card::rail_entry(workspace, &ready, cx));
+
     let caught = workspace.data.caught_creatures.len();
     let buttons = FooterLink::ALL.map(|link| {
         let label = link.label();
@@ -300,6 +304,7 @@ fn rail_footer(workspace: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
         .flex_none()
         .items_center()
         .gap(px(4.))
+        .children(update)
         .children(ring)
         .child(rail_divider(line))
         .children(buttons)
@@ -1189,6 +1194,10 @@ fn footer(
     let line = cx.theme().colors().line;
     let sections = usage_sections(&workspace.data.usage, workspace.now_ms() / 1_000);
 
+    let update = workspace
+        .shown_update(cx)
+        .map(|ready| crate::update_card::card(&ready, cx));
+
     let foldable = usage_can_fold(window.viewport_size().height);
     let open = !foldable || workspace.usage_expanded;
 
@@ -1208,6 +1217,7 @@ fn footer(
         .flex_none()
         .gap(px(8.))
         .pt(px(8.))
+        .children(update)
         .children(summary)
         .children(card)
         .child(
@@ -1312,8 +1322,11 @@ fn usage_summary(
     .on_click(cx.listener(|workspace, _, _, cx| workspace.toggle_usage_card(cx)))
 }
 
-/// How long the rail ring's usage card takes to slide in.
-const HOVER_CARD_IN: Duration = Duration::from_millis(140);
+/// How long the rail ring's usage card and the update card take to slide in.
+pub(crate) const HOVER_CARD_IN: Duration = Duration::from_millis(140);
+
+/// The width of a card in a popover of the rail: the usage card and the update card.
+pub(crate) const CARD_WIDTH: Pixels = px(232.);
 
 /// The full usage card, shown on hover over the rail's usage ring.
 struct UsageHoverCard {
@@ -1334,7 +1347,7 @@ impl Render for UsageHoverCard {
             .aria_label(shown_usage(&self.sections))
             .debug_selector(|| "usage-hover-card".to_owned())
             .relative()
-            .w(px(232.))
+            .w(CARD_WIDTH)
             .children(usage_card(&self.sections));
 
         if reduce_motion(cx) {

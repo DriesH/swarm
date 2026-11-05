@@ -20,7 +20,7 @@ use swarm_update::{
 use crate::workspace::Workspace;
 
 /// The first check comes this long after launch.
-const FIRST_CHECK: Duration = Duration::from_secs(30);
+const FIRST_CHECK: Duration = Duration::from_secs(3);
 
 /// The time between two scheduled checks.
 const CHECK_EVERY: Duration = Duration::from_hours(6);
@@ -235,7 +235,7 @@ impl Updater {
         }
     }
 
-    /// Cleans up 30 seconds from now, and checks then and every 6 hours, while the
+    /// Cleans up 3 seconds from now, and checks then and every 6 hours, while the
     /// setting is on.
     fn start(&mut self, cx: &mut Context<Self>) {
         self.schedule = Some(cx.spawn(async move |this, cx| {
@@ -500,13 +500,24 @@ pub(crate) fn status(cx: &App) -> SharedString {
     )
 }
 
-/// What the status bar shows for an update that is ready.
+/// What the update card and Settings show for an update that is ready.
 pub(crate) struct ReadyUpdate {
+    pub(crate) version: Version,
     pub(crate) notes_url: SharedString,
     /// The app can replace itself. Else the button opens the release notes.
     pub(crate) replaceable: bool,
     /// Why the install of this version failed before.
     pub(crate) failure: Option<SharedString>,
+}
+
+/// True while a check or a download runs.
+pub(crate) fn busy(cx: &App) -> bool {
+    updater(cx).is_some_and(|updater| {
+        matches!(
+            updater.read(cx).state,
+            UpdateState::Checking | UpdateState::Downloading(_)
+        )
+    })
 }
 
 pub(crate) fn ready(cx: &App) -> Option<ReadyUpdate> {
@@ -515,6 +526,7 @@ pub(crate) fn ready(cx: &App) -> Option<ReadyUpdate> {
 
     match &updater.state {
         UpdateState::Ready(prepared) => Some(ReadyUpdate {
+            version: prepared.version,
             notes_url: prepared.notes_url.clone().into(),
             replaceable: updater.replaceable,
             failure: prepared.install_failure.as_deref().map(shorten),
@@ -757,6 +769,18 @@ pub(crate) mod tests {
         updater.read_with(cx, |updater, _| updater.state.clone())
     }
 
+    /// Shows `state`, for a test that needs a state the fakes pass through too fast to see.
+    pub(crate) fn show_state(
+        updater: &Entity<Updater>,
+        state: UpdateState,
+        cx: &mut impl gpui::AppContext,
+    ) {
+        updater.update(cx, |updater, cx| {
+            updater.state = state;
+            cx.notify();
+        });
+    }
+
     fn pass(time: Duration, cx: &mut TestAppContext) {
         cx.executor().advance_clock(time);
         cx.run_until_parked();
@@ -768,11 +792,11 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
-    fn the_first_check_comes_30_seconds_after_launch(cx: &mut TestAppContext) {
+    fn the_first_check_comes_3_seconds_after_launch(cx: &mut TestAppContext) {
         let source = FakeSource::new(Vec::new(), Vec::new());
         let _updater = updater_with(&source, &FakeHost::new(true), signed_build(), cx);
 
-        pass(FIRST_CHECK.saturating_sub(Duration::from_secs(1)), cx);
+        pass(Duration::from_secs(2), cx);
         let before = source.fetched();
         pass(Duration::from_secs(1), cx);
 
@@ -1123,6 +1147,59 @@ pub(crate) mod tests {
 
         assert_eq!(ready.failure.as_deref(), Some("the signature is wrong"));
         assert!(!ready.replaceable);
+    }
+
+    #[gpui::test]
+    fn the_ready_update_carries_its_version(cx: &mut TestAppContext) {
+        cx.update(swarm_ui::init);
+        let (workspace, cx) = cx.add_window_view(Workspace::with_sample);
+        let updater = cx.update(|_, cx| {
+            install_fake(
+                &workspace,
+                &FakeSource::with_update(),
+                &FakeHost::new(true),
+                signed_build(),
+                cx,
+            )
+        });
+        updater.update(cx, Updater::check);
+        cx.run_until_parked();
+
+        let version = cx.update(|_, cx| ready(cx)).map(|ready| ready.version);
+
+        assert_eq!(version, Some(Version::new(1, 2, 0)));
+    }
+
+    #[gpui::test]
+    fn the_updater_is_busy_while_it_checks_and_downloads_only(cx: &mut TestAppContext) {
+        cx.update(swarm_ui::init);
+        let (workspace, cx) = cx.add_window_view(Workspace::with_sample);
+        let updater = cx.update(|_, cx| {
+            install_fake(
+                &workspace,
+                &FakeSource::with_update(),
+                &FakeHost::new(true),
+                signed_build(),
+                cx,
+            )
+        });
+        let busy_in = |state: UpdateState, cx: &mut gpui::VisualTestContext| {
+            show_state(&updater, state, cx);
+
+            cx.update(|_, cx| busy(cx))
+        };
+        let version = Version::new(1, 2, 0);
+
+        let idle = busy_in(UpdateState::Idle, cx);
+        let checking = busy_in(UpdateState::Checking, cx);
+        let downloading = busy_in(UpdateState::Downloading(version), cx);
+        let ready = busy_in(UpdateState::Ready(prepared(version)), cx);
+        let failed = busy_in(UpdateState::Failed("offline".into()), cx);
+
+        assert_eq!(
+            [idle, checking, downloading, ready, failed],
+            [false, true, true, false, false]
+        );
     }
 
     #[gpui::test]
