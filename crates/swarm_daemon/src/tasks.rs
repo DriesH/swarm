@@ -11,9 +11,9 @@ use swarm_core::prompts::{self, PromptFile};
 use swarm_core::store::NewMessage;
 use swarm_core::{PreparedTask, PreparedWorker};
 use swarm_protocol::{
-    AgentId, AgentInfo, AgentKind, AgentRole, CloseCheck, CloseStep, CreateTask, CreateTerminal,
-    Event, MessageKind, PlanDraft, ProjectId, RemoveCheck, TaskCloseCheck, TaskId, TaskInfo,
-    TerminalId, TerminalKind,
+    AgentId, AgentInfo, AgentKind, AgentRole, CloseCheck, CloseFailure, CloseStep, CreateTask,
+    CreateTerminal, Event, MessageKind, PlanDraft, ProjectId, RemoveCheck, TaskCloseCheck, TaskId,
+    TaskInfo, TerminalId, TerminalKind,
 };
 use swarm_term::TerminalInput;
 use swarm_term::{ExitStatus, Palette, Rgb, Size};
@@ -209,10 +209,14 @@ pub(crate) fn close_with_branch(
     let result = stop_and_close(services, id, confirmed, merged_branch);
     if let Err(error) = &result {
         services.agents.abort_close(id);
-        services.clients.broadcast(&Event::CloseFailed {
-            task: id,
-            message: format!("{error:#}"),
-        });
+        let reason = match error.downcast_ref::<CloseFailure>() {
+            Some(CloseFailure::WouldLoseMore) => CloseFailure::WouldLoseMore,
+            _ => CloseFailure::Other(format!("{error:#}")),
+        };
+
+        services
+            .clients
+            .broadcast(&Event::CloseFailed { task: id, reason });
     }
 
     result
@@ -255,7 +259,7 @@ fn stop_and_close(
 
     let now = close_check(services, id)?;
     if loses_more(confirmed, &now) {
-        bail!("more would be lost than shown; check again");
+        bail!(CloseFailure::WouldLoseMore);
     }
 
     let mut deleting = false;
@@ -448,7 +452,7 @@ pub(crate) fn remove_project(
             bail!("a task opened since; check again");
         };
         if loses_more(&shown.check, &close_check(services, task.id)?) {
-            bail!("more would be lost than shown; check again");
+            bail!(CloseFailure::WouldLoseMore);
         }
 
         to_close.push((task, &shown.check));

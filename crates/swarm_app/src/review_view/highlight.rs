@@ -7,7 +7,7 @@ use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 
-use gpui::{AppContext as _, Context, HighlightStyle, Hsla};
+use gpui::{Context, HighlightStyle, Hsla, Task};
 use swarm_protocol::{Client, DiffSide, FileDiff, FileTexts};
 use swarm_syntax::{Language, Span, Token};
 use swarm_ui::ThemeColors;
@@ -136,24 +136,164 @@ pub(super) fn token_color(token: Token, colors: &ThemeColors) -> Hsla {
     }
 }
 
+/// At most this many files are read at the same time.
+const MAX_IN_FLIGHT: usize = 4;
+
 /// Where the colors of a file stand.
 enum State {
-    /// Asked for; the lines draw plain until they arrive.
-    Pending,
+    /// Asked for, and waiting for a free place; the lines draw plain meanwhile.
+    Queued,
+    /// On its way. Dropping the task cancels the request.
+    Running(Task<()>),
     Ready(Arc<FileHighlights>),
     /// The texts could not be read.
     Plain,
 }
 
-/// The colors of the files of the diff, each for the digest it was made for.
+/// A file that waits for a free place.
+struct Wanted {
+    key: LoadKey,
+    digest: u64,
+    language: Language,
+    /// The place of the file in the diff.
+    place: usize,
+}
+
+/// A file ready to be read.
+pub(super) struct Start {
+    key: LoadKey,
+    digest: u64,
+    language: Language,
+}
+
+/// The colors of the files of the diff, each for the digest it was made for. Only files
+/// whose lines are on screen are read, a few at a time.
 #[derive(Default)]
 pub(super) struct Highlights {
     files: HashMap<LoadKey, (u64, State)>,
+    queue: Vec<Wanted>,
+    /// The files whose lines the frame that is being drawn shows, with their place in the
+    /// diff.
+    drawing: HashMap<LoadKey, usize>,
+    /// The same for the frame before.
+    drawn: HashMap<LoadKey, usize>,
+    /// The most files that were read at the same time.
+    #[cfg(test)]
+    peak_running: usize,
 }
 
 impl Highlights {
     pub(super) fn clear(&mut self) {
         self.files.clear();
+        self.queue.clear();
+        self.drawing.clear();
+        self.drawn.clear();
+    }
+
+    /// Notes that a line of the file is on screen in the frame that is being drawn.
+    pub(super) fn see(&mut self, key: &LoadKey, place: usize) {
+        self.drawing.insert(key.clone(), place);
+    }
+
+    /// Starts a new frame. A file that was asked for and was on screen in no line of the
+    /// frame before has left the viewport: its request is dropped, and so is its place in
+    /// the queue.
+    pub(super) fn settle(&mut self) {
+        self.drawn = std::mem::take(&mut self.drawing);
+
+        let drawn = &self.drawn;
+        self.files.retain(|key, (_, state)| {
+            !matches!(state, State::Queued | State::Running(_)) || drawn.contains_key(key)
+        });
+        self.queue.retain(|wanted| drawn.contains_key(&wanted.key));
+    }
+
+    /// Asks for the colors of a file. False when this digest was asked for already.
+    pub(super) fn ask(
+        &mut self,
+        key: &LoadKey,
+        digest: u64,
+        language: Language,
+        place: usize,
+    ) -> bool {
+        if !self.begin(key, digest) {
+            return false;
+        }
+
+        self.queue.push(Wanted {
+            key: key.clone(),
+            digest,
+            language,
+            place,
+        });
+
+        true
+    }
+
+    /// The queued file nearest to the top of the screen, when a place is free.
+    pub(super) fn next_to_start(&mut self) -> Option<Start> {
+        if self.running() >= MAX_IN_FLIGHT {
+            return None;
+        }
+
+        let top = self
+            .drawing
+            .values()
+            .chain(self.drawn.values())
+            .min()
+            .copied()
+            .unwrap_or_default();
+        let nearest = self
+            .queue
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, wanted)| wanted.place.abs_diff(top))
+            .map(|(index, _)| index)?;
+        let wanted = self.queue.remove(nearest);
+
+        Some(Start {
+            key: wanted.key,
+            digest: wanted.digest,
+            language: wanted.language,
+        })
+    }
+
+    /// Keeps the task that reads a file, as long as the file is wanted.
+    pub(super) fn run(&mut self, start: &Start, task: Task<()>) {
+        match self.files.get_mut(&start.key) {
+            Some((digest, state)) if *digest == start.digest => *state = State::Running(task),
+            _ => drop(task),
+        }
+
+        #[cfg(test)]
+        {
+            self.peak_running = self.peak_running.max(self.running());
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn peak_running(&self) -> usize {
+        self.peak_running
+    }
+
+    pub(super) fn running(&self) -> usize {
+        self.files
+            .values()
+            .filter(|(_, state)| matches!(state, State::Running(_)))
+            .count()
+    }
+
+    #[cfg(test)]
+    pub(super) fn queued(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// True while the file is queued or on its way.
+    #[cfg(test)]
+    pub(super) fn is_wanted(&self, key: &LoadKey) -> bool {
+        self.files
+            .get(key)
+            .is_some_and(|(_, state)| matches!(state, State::Queued | State::Running(_)))
     }
 
     /// The colors of a file, when they are ready for this `digest`.
@@ -176,7 +316,8 @@ impl Highlights {
             return false;
         }
 
-        self.files.insert(key.clone(), (digest, State::Pending));
+        self.files.insert(key.clone(), (digest, State::Queued));
+        self.queue.retain(|wanted| wanted.key != *key);
 
         true
     }
@@ -190,10 +331,15 @@ impl Highlights {
             return;
         }
 
-        *state = match highlights {
+        let done = match highlights {
             Some(highlights) => State::Ready(Arc::new(highlights)),
             None => State::Plain,
         };
+
+        // The task that calls this is the one in `Running`: let it end by itself.
+        if let State::Running(task) = std::mem::replace(state, done) {
+            task.detach();
+        }
     }
 }
 
@@ -229,35 +375,50 @@ impl ReviewView {
             return Some(ready);
         }
 
-        let client = self.client.clone().filter(Client::is_connected);
-        if let (Some(language), Some(client)) = (language_of(data), client)
-            && self.highlights.begin(&key, data.digest)
-        {
-            Self::read_colors(key, data.digest, language, client, cx);
+        self.highlights.see(&key, file);
+        if let Some(language) = language_of(data) {
+            self.highlights.ask(&key, data.digest, language, file);
         }
+        self.start_colors(cx);
 
         None
     }
 
-    /// Reads both sides of the file and colors them on the background executor.
-    fn read_colors(
-        key: LoadKey,
-        digest: u64,
-        language: Language,
-        client: Client,
-        cx: &mut Context<Self>,
-    ) {
-        let reading = {
-            let key = key.clone();
+    /// A new frame begins: the files that left the viewport stop being read.
+    pub(super) fn settle_colors(&mut self, cx: &mut Context<Self>) {
+        self.highlights.settle();
+        self.start_colors(cx);
+    }
 
-            cx.background_spawn(async move {
-                let texts = client.file_texts(key.0, key.1, key.2, key.3)?;
-
-                Ok::<_, swarm_protocol::ClientError>(FileHighlights::compute(language, &texts))
-            })
+    /// Starts the files that wait, nearest to the top first, while a place is free.
+    fn start_colors(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone().filter(Client::is_connected) else {
+            return;
         };
 
+        while let Some(start) = self.highlights.next_to_start() {
+            let task = Self::read_colors(&start, client.clone(), cx);
+
+            self.highlights.run(&start, task);
+        }
+    }
+
+    /// Reads both sides of the file and colors them on the background executor. Dropping
+    /// the task ends the wait for the answer.
+    fn read_colors(start: &Start, client: Client, cx: &mut Context<Self>) -> Task<()> {
+        let (key, digest, language) = (start.key.clone(), start.digest, start.language);
+
         cx.spawn(async move |this, cx| {
+            let reading = cx.background_executor().spawn({
+                let key = key.clone();
+
+                async move {
+                    let texts = client.file_texts(key.0, key.1, key.2, key.3)?;
+
+                    Ok::<_, swarm_protocol::ClientError>(FileHighlights::compute(language, &texts))
+                }
+            });
+
             let answer = reading.await;
             if let Err(error) = &answer {
                 log::warn!("cannot read a file to color it: {error}");
@@ -265,13 +426,47 @@ impl ReviewView {
 
             let updated = this.update(cx, |this, cx| {
                 this.highlights.finish(&key, digest, answer.ok());
+                this.start_colors(cx);
                 cx.notify();
             });
             if let Err(error) = updated {
                 log::debug!("the window closed before the colors arrived: {error}");
             }
         })
-        .detach();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn colors_running(&self) -> usize {
+        self.highlights.running()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn colors_queued(&self) -> usize {
+        self.highlights.queued()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn colors_peak_running(&self) -> usize {
+        self.highlights.peak_running()
+    }
+
+    /// True while the colors of the file are queued or on their way.
+    #[cfg(test)]
+    pub(crate) fn colors_wanted(&self, file: usize) -> bool {
+        let Some(diff) = self.diff() else {
+            return false;
+        };
+        let Some(data) = diff.files.get(file) else {
+            return false;
+        };
+        let key: LoadKey = (
+            diff.task,
+            diff.source,
+            data.worktree.clone(),
+            data.path.clone(),
+        );
+
+        self.highlights.is_wanted(&key)
     }
 
     #[cfg(test)]
@@ -296,6 +491,8 @@ impl ReviewView {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     fn rust_texts(new: &[&str]) -> FileTexts {
@@ -408,6 +605,107 @@ mod tests {
         assert!(highlights.get(&key, 2).is_none());
     }
 
+    fn key_of(path: &str) -> LoadKey {
+        (
+            swarm_protocol::TaskId(1),
+            swarm_protocol::ReviewSource::Live,
+            "wt".into(),
+            path.into(),
+        )
+    }
+
+    /// Asks for `count` files that are on screen and starts every one that may start.
+    fn start_all(highlights: &mut Highlights, count: usize) -> Vec<Start> {
+        for place in 0..count {
+            let key = key_of(&format!("{place}.rs"));
+            highlights.see(&key, place);
+            highlights.ask(&key, 1, Language::Rust, place);
+        }
+
+        let mut started = Vec::new();
+        while let Some(start) = highlights.next_to_start() {
+            highlights.run(&start, Task::ready(()));
+            started.push(start);
+        }
+
+        started
+    }
+
+    #[test]
+    fn at_most_four_files_are_read_at_once() {
+        let mut highlights = Highlights::default();
+
+        let started = start_all(&mut highlights, 6);
+
+        assert_eq!(started.len(), MAX_IN_FLIGHT);
+        assert_eq!(highlights.running(), MAX_IN_FLIGHT);
+        assert_eq!(highlights.queued(), 2);
+    }
+
+    #[test]
+    fn a_finished_file_frees_a_place_for_the_next() {
+        let mut highlights = Highlights::default();
+        let started = start_all(&mut highlights, 6);
+
+        highlights.finish(&started[0].key, 1, Some(FileHighlights::default()));
+        let next = highlights.next_to_start();
+
+        assert!(next.is_some());
+    }
+
+    #[test]
+    fn the_file_nearest_to_the_top_of_the_screen_starts_first() {
+        let mut highlights = Highlights::default();
+        for place in [9, 3, 6] {
+            let key = key_of(&format!("{place}.rs"));
+            highlights.see(&key, place);
+            highlights.ask(&key, 1, Language::Rust, place);
+        }
+
+        let order: Vec<PathBuf> = std::iter::from_fn(|| highlights.next_to_start())
+            .map(|start| start.key.3)
+            .collect();
+
+        assert_eq!(
+            order,
+            [
+                PathBuf::from("3.rs"),
+                PathBuf::from("6.rs"),
+                PathBuf::from("9.rs")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_file_that_left_the_viewport_stops_being_read_and_leaves_the_queue() {
+        let mut highlights = Highlights::default();
+        start_all(&mut highlights, 6);
+        highlights.settle();
+        let (gone, kept) = (key_of("0.rs"), key_of("5.rs"));
+
+        highlights.see(&kept, 5);
+        highlights.settle();
+
+        assert!(!highlights.is_wanted(&gone));
+        assert!(highlights.is_wanted(&kept));
+        assert_eq!(highlights.running(), 0);
+        assert_eq!(highlights.queued(), 1);
+    }
+
+    #[test]
+    fn a_file_that_has_its_colors_stays_when_it_leaves_the_viewport() {
+        let mut highlights = Highlights::default();
+        let key = key_of("0.rs");
+        highlights.see(&key, 0);
+        highlights.ask(&key, 1, Language::Rust, 0);
+        highlights.finish(&key, 1, Some(FileHighlights::default()));
+
+        highlights.settle();
+        highlights.settle();
+
+        assert!(highlights.get(&key, 1).is_some());
+    }
+
     #[test]
     fn a_file_is_asked_for_once_per_digest() {
         let key: LoadKey = (
@@ -436,7 +734,7 @@ mod daemon_tests {
 
     use super::*;
     use crate::daemon::tests::{
-        diff_of, fake_daemon_replying, real_task_workspace, redraw, wait_until,
+        default_reply, diff_of, fake_daemon_replying, real_task_workspace, redraw, wait_until,
     };
     use crate::review_view::ReviewView;
     use crate::workspace::View;
@@ -525,6 +823,96 @@ mod daemon_tests {
 
     fn colored(review: &Entity<ReviewView>, cx: &gpui::VisualTestContext) -> bool {
         review.read_with(cx, |review, _| review.has_colors(0))
+    }
+
+    /// Review of `count` Rust files. Without `connected` the review has no daemon, so the
+    /// files it asks for wait in the queue.
+    fn many_files_review(
+        count: usize,
+        connected: bool,
+        cx: &mut TestAppContext,
+    ) -> (Entity<ReviewView>, &mut gpui::VisualTestContext) {
+        let socket = fake_daemon_replying(move |request| match request {
+            Request::FileTexts { call, .. } => Some(Event::FileTexts {
+                call,
+                old: None,
+                new: Some(vec!["fn main() {}".to_owned()]),
+            }),
+            other => default_reply(&other),
+        });
+        let (workspace, cx, _client) = real_task_workspace(&socket, cx);
+        if !connected {
+            workspace.update(cx, |workspace, _| workspace.daemon = None);
+        }
+        let mut diff = diff_of(7, ReviewSource::Live, 1);
+        diff.files = (0..count)
+            .map(|number| changed_file(&format!("src/file{number}.rs"), 5, None))
+            .collect();
+        diff.stat.files = u32::try_from(count).unwrap_or(u32::MAX);
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.data.store_diff(diff);
+            workspace.set_view(View::Review, cx);
+            workspace.set_review_source(ReviewSource::Live, cx);
+        });
+        redraw(cx);
+
+        let review = workspace.read_with(cx, |workspace, _| workspace.review.clone());
+
+        (review, cx)
+    }
+
+    #[gpui::test]
+    fn no_more_than_four_files_are_read_at_once_and_all_get_their_colors(cx: &mut TestAppContext) {
+        let (review, cx) = many_files_review(6, true, cx);
+
+        let all = wait_until(cx, |cx| {
+            redraw(cx);
+            (0..6).all(|file| review.read_with(cx, |review, _| review.has_colors(file)))
+        });
+
+        let peak = review.read_with(cx, |review, _| review.colors_peak_running());
+        assert!(all, "a file never got its colors");
+        assert_eq!(peak, 4);
+    }
+
+    #[gpui::test]
+    fn the_files_on_screen_wait_for_a_place_when_four_are_read(cx: &mut TestAppContext) {
+        let (review, cx) = many_files_review(6, false, cx);
+        redraw(cx);
+
+        let (running, queued) = review.read_with(cx, |review, _| {
+            (review.colors_running(), review.colors_queued())
+        });
+
+        assert_eq!((running, queued), (0, 6));
+    }
+
+    #[gpui::test]
+    fn files_that_scroll_out_of_view_stop_being_wanted(cx: &mut TestAppContext) {
+        let (review, cx) = many_files_review(60, false, cx);
+        redraw(cx);
+        let before = review.read_with(cx, |review, _| review.colors_wanted(0));
+
+        review.update(cx, |review, cx| {
+            let last = review.body.rows.len().saturating_sub(1);
+            review.body_list.scroll_to(gpui::ListOffset {
+                item_ix: last,
+                offset_in_item: gpui::px(0.),
+            });
+            cx.notify();
+        });
+        redraw(cx);
+        // Each frame of a scroll redraws the view.
+        review.update(cx, |_, cx| cx.notify());
+        redraw(cx);
+
+        let after = review.read_with(cx, |review, _| review.colors_wanted(0));
+        assert!(before, "the first file was never asked for");
+        assert!(
+            !after,
+            "the first file is still wanted after it left the viewport"
+        );
     }
 
     #[gpui::test]

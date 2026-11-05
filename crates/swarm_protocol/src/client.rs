@@ -16,10 +16,10 @@ use std::time::{Duration, Instant};
 use swarm_term::{TerminalChannels, TerminalInput, TerminalOutput};
 
 use crate::{
-    AgentChange, AgentId, AgentInfo, AgentKind, CallId, ChecksRun, CloseCheck, CloseStep,
-    CommentId, CreateTask, CreateTerminal, Event, FileDiff, FileTexts, FrameError, GH_SECS,
-    GithubStatus, MergeMethod, MessageId, MessageInfo, NewComment, Notice, PUSH_SECS, Paths,
-    PlanDraft, PrDraft, PrPanel, ProjectConfigFields, ProjectId, ProjectInfo, PromptInfo,
+    AgentChange, AgentId, AgentInfo, AgentKind, CallId, ChecksRun, CloseCheck, CloseFailure,
+    CloseStep, CommentId, CreateTask, CreateTerminal, Event, FileDiff, FileTexts, FrameError,
+    GH_SECS, GithubStatus, MergeMethod, MessageId, MessageInfo, NewComment, Notice, PUSH_SECS,
+    Paths, PlanDraft, PrDraft, PrPanel, ProjectConfigFields, ProjectId, ProjectInfo, PromptInfo,
     PullRequest, RemoveCheck, Request, ReviewComment, ReviewMark, ReviewSource, StopError,
     SwarmStats, SystemCheck, TaskDiff, TaskId, TaskInfo, TerminalId, TerminalInfo, Usage, VERSION,
     check_private_dir, read, write,
@@ -42,7 +42,7 @@ pub enum PrEvent {
     Checks(Box<ChecksRun>),
     Draft { task: TaskId, draft: PrDraft },
     CloseStep { task: TaskId, step: CloseStep },
-    CloseFailed { task: TaskId, message: String },
+    CloseFailed { task: TaskId, reason: CloseFailure },
 }
 
 /// A review comment was added, changed or deleted.
@@ -450,6 +450,22 @@ impl Client {
         match self.call(|call| Request::RecordCatch { call, creature }, None)? {
             Event::CatchRecorded { caught, .. } => Ok(caught),
             other => Err(unexpected("CatchRecorded", &other)),
+        }
+    }
+
+    /// When the creatures of the last 24 hours came, in milliseconds since the Unix epoch.
+    pub fn visits(&self) -> Result<Vec<u64>, ClientError> {
+        match self.call(|call| Request::Visits { call }, None)? {
+            Event::Visits { starts, .. } => Ok(starts),
+            other => Err(unexpected("Visits", &other)),
+        }
+    }
+
+    /// Records that a creature came at `at`, in milliseconds since the Unix epoch.
+    pub fn record_visit(&self, at: u64) -> Result<(), ClientError> {
+        match self.call(|call| Request::RecordVisit { call, at }, None)? {
+            Event::Done { .. } => Ok(()),
+            other => Err(unexpected("Done", &other)),
         }
     }
 
@@ -1505,10 +1521,10 @@ fn read_events(
                     log::debug!("close event has no listener");
                 }
             }
-            Event::CloseFailed { task, message } => {
+            Event::CloseFailed { task, reason } => {
                 if shared
                     .pull_requests
-                    .send(PrEvent::CloseFailed { task, message })
+                    .send(PrEvent::CloseFailed { task, reason })
                     .is_err()
                 {
                     log::debug!("close event has no listener");
@@ -1538,6 +1554,9 @@ fn read_events(
             }
             Event::CatchRecorded { call, caught } => {
                 deliver(shared, call, Event::CatchRecorded { call, caught });
+            }
+            Event::Visits { call, starts } => {
+                deliver(shared, call, Event::Visits { call, starts });
             }
             Event::StatsChanged { stats } => {
                 if shared.stats.send(stats).is_err() {

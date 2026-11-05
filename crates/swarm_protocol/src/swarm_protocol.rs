@@ -23,7 +23,7 @@ pub use client::{Client, ClientError, CommentEvent, MessageEvent, PrEvent, Proje
 pub use daemon_stop::{Host, Signal, StopError, System, stop_daemon};
 
 /// Bumped on every incompatible change; the daemon refuses other versions.
-pub const VERSION: u32 = 27;
+pub const VERSION: u32 = 28;
 
 /// The most messages [`Request::ListMessages`] returns.
 pub const MESSAGES_LISTED: usize = 500;
@@ -918,6 +918,16 @@ pub enum CloseStep {
     DeletingBranch,
 }
 
+/// Why a close of a task stopped. The text is what the user reads.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CloseFailure {
+    /// Closing would lose more than the check the user saw showed.
+    #[error("more would be lost than shown; check again")]
+    WouldLoseMore,
+    #[error("{0}")]
+    Other(String),
+}
+
 /// What closing one open task of a project would throw away.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct TaskCloseCheck {
@@ -1101,6 +1111,16 @@ pub enum Request {
     RecordCatch {
         call: CallId,
         creature: String,
+    },
+    /// When the creatures of the last 24 hours came. Answered with [`Event::Visits`].
+    Visits {
+        call: CallId,
+    },
+    /// Records that a creature came at `at`, in milliseconds since the Unix epoch.
+    /// Answered with [`Event::Done`].
+    RecordVisit {
+        call: CallId,
+        at: u64,
     },
     /// Stops every running agent of every project, as the user's choice: an agent
     /// with a session becomes `Resumable`, and no orchestrator is told. Answered with
@@ -1459,6 +1479,12 @@ pub enum Event {
         call: CallId,
         caught: Catch,
     },
+    /// When the creatures of the last 24 hours came, in milliseconds since the Unix epoch,
+    /// the first first.
+    Visits {
+        call: CallId,
+        starts: Vec<u64>,
+    },
     /// Sent to every client when an agent asked for a large or a small worker tile.
     TileRequest {
         agent: AgentId,
@@ -1515,7 +1541,7 @@ pub enum Event {
     /// Sent to every client when a close of the task stopped. The task stays open.
     CloseFailed {
         task: TaskId,
-        message: String,
+        reason: CloseFailure,
     },
     PrStatus {
         call: CallId,

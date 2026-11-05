@@ -26,7 +26,7 @@ With **Reduce motion** on in macOS, the creature does not move. It sits in the t
 - Click the creature.
 - Or press ⌘K and choose **Catch the** and the creature's name. This row is there only while the creature is.
 
-A toast at the bottom right says `<name> caught`. It adds **New** the first time you catch that creature, and how often you caught it after that.
+A toast at the bottom right says `<name> caught`. It adds **New** the first time you catch that creature, and how often you caught it after that. A catch never replaces a **Ready for review** toast. It shows after that toast has gone.
 
 VoiceOver says `<name> appeared` once when a creature comes. This needs **Easter eggs** on, like everything else here.
 
@@ -56,6 +56,12 @@ With **Reduce motion** on in macOS, the sprites show a still frame.
 ## Where it is kept
 
 The daemon keeps what you caught in its database. It stays when you close the app or restart Swarm. It is not in `settings.toml`.
+
+The daemon also keeps when each creature came for the last 24 hours. The limit of 4 creatures and the gap of 45 minutes hold after a restart too.
+
+If you catch a creature while the app has no connection to the daemon, the catch shows at once and goes to the daemon when the connection is back.
+
+On a screen that is not Retina, the creature in the title bar and in the toast is drawn from every second pixel of its sprite, so no part of it drops out.
 
 ## The creatures
 

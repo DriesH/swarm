@@ -5475,8 +5475,8 @@ fn a_refused_close_reports_the_reason_to_every_client() {
 
     assert!(seen.iter().any(|event| matches!(
         event,
-        Event::CloseFailed { task: failed, message }
-            if *failed == task.id && message == "more would be lost than shown; check again"
+        Event::CloseFailed { task: failed, reason }
+            if *failed == task.id && *reason == swarm_protocol::CloseFailure::WouldLoseMore
     )));
 }
 
@@ -12126,6 +12126,60 @@ fn a_catch_is_recorded_and_counted_again_and_kept_across_clients() {
     assert_eq!(catches.len(), 1);
     assert_eq!(catches[0].creature, "vespa-crabro");
     assert_eq!(catches[0].count, 2);
+}
+
+impl Client {
+    fn visits(&mut self) -> Vec<u64> {
+        self.send(&Request::Visits { call: CALL });
+
+        self.wait_for(|event| match event {
+            Event::Visits { call: CALL, starts } => Some(starts.clone()),
+            _ => None,
+        })
+    }
+
+    fn record_visit(&mut self, at: u64) {
+        self.send(&Request::RecordVisit { call: CALL, at });
+
+        self.wait_for(|event| match event {
+            Event::Done { call: CALL } => Some(()),
+            _ => None,
+        });
+    }
+}
+
+#[test]
+fn a_visit_is_kept_across_clients_and_a_restart() {
+    let fixture = Fixture::new("sleep 30");
+    let mut daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let soon = unix_millis().saturating_sub(60_000);
+    assert!(client.visits().is_empty());
+
+    client.record_visit(soon);
+    let mut other = daemon.connect();
+    other.hello();
+    let before = other.visits();
+    drop(client);
+    drop(other);
+    let restarted = restart(&mut daemon, &fixture);
+    let mut again = restarted.connect();
+    again.hello();
+
+    assert_eq!(before, [soon]);
+    assert_eq!(again.visits(), [soon]);
+}
+
+#[test]
+fn a_visit_older_than_a_day_is_not_listed() {
+    let daemon = Daemon::start();
+    let mut client = daemon.connect();
+    client.hello();
+
+    client.record_visit(1_000);
+
+    assert!(client.visits().is_empty());
 }
 
 #[test]

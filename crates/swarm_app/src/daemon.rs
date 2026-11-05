@@ -246,6 +246,8 @@ impl Workspace {
             return;
         }
 
+        self.fail_working_cleanups(cx);
+
         let Some(launch) = self.daemon_launch.clone() else {
             log::warn!("the daemon connection is lost and cannot be restored");
             return;
@@ -403,7 +405,8 @@ impl Workspace {
 
         self.load_usage(client.clone(), cx);
         self.load_stats(client.clone(), cx);
-        Self::load_catches(client.clone(), cx);
+        self.load_catches(client.clone(), cx);
+        Self::load_visits(client.clone(), cx);
         self.start_field_guide(cx);
         self.load_message_history(client, cx);
 
@@ -2244,18 +2247,10 @@ pub(crate) mod tests {
                 call: *call,
                 stats: swarm_protocol::SwarmStats::default(),
             }),
-            Request::Catches { call } => Some(Event::Catches {
-                call: *call,
-                catches: Vec::new(),
-            }),
-            Request::RecordCatch { call, creature } => Some(Event::CatchRecorded {
-                call: *call,
-                caught: swarm_protocol::Catch {
-                    creature: creature.clone(),
-                    first_caught_at: 0,
-                    count: 1,
-                },
-            }),
+            Request::Catches { .. }
+            | Request::RecordCatch { .. }
+            | Request::Visits { .. }
+            | Request::RecordVisit { .. } => field_guide_reply(request),
             Request::GithubStatus { call, .. } => Some(Event::GithubStatus {
                 call: *call,
                 status: swarm_protocol::GithubStatus::default(),
@@ -2307,6 +2302,30 @@ pub(crate) mod tests {
                 call: *call,
                 id: DaemonTerminalId(NEXT_TERMINAL.fetch_add(1, Ordering::Relaxed)),
             }),
+            _ => None,
+        }
+    }
+
+    /// The Field guide requests: no catches, no visits, and each record accepted.
+    fn field_guide_reply(request: &Request) -> Option<Event> {
+        match request {
+            Request::Catches { call } => Some(Event::Catches {
+                call: *call,
+                catches: Vec::new(),
+            }),
+            Request::RecordCatch { call, creature } => Some(Event::CatchRecorded {
+                call: *call,
+                caught: swarm_protocol::Catch {
+                    creature: creature.clone(),
+                    first_caught_at: 0,
+                    count: 1,
+                },
+            }),
+            Request::Visits { call } => Some(Event::Visits {
+                call: *call,
+                starts: Vec::new(),
+            }),
+            Request::RecordVisit { call, .. } => Some(Event::Done { call: *call }),
             _ => None,
         }
     }
@@ -2831,6 +2850,48 @@ pub(crate) mod tests {
             )
         });
         assert_eq!((tiles, live), (0, 0));
+    }
+
+    #[gpui::test]
+    fn a_lost_daemon_fails_every_working_cleanup_so_the_way_back_shows(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let (socket, leave) = fake_daemon_that_leaves();
+        cx.executor().allow_parking();
+        let client = Client::connect(&socket).expect("connect");
+        use_projects(
+            &workspace,
+            &[project_info(5, "demo", vec![task_info(7, 5, "login")])],
+            cx,
+        );
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.use_daemon(client.clone(), &[], window, cx);
+        });
+        workspace.update(cx, |workspace, cx| {
+            workspace.close_step(
+                DaemonTaskId(7),
+                swarm_protocol::CloseStep::StoppingAgents,
+                cx,
+            );
+        });
+        leave.send(()).expect("the fake daemon is waiting");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while client.is_connected() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+
+        workspace.update(cx, Workspace::reconnect_daemon);
+        redraw(cx);
+
+        let phase = workspace.read_with(cx, |workspace, _| {
+            let task = workspace.active_task;
+
+            workspace.cleanups[&task].progress.phase().clone()
+        });
+        assert_eq!(
+            phase,
+            crate::cleanup::Phase::Failed("Not connected to the daemon".into())
+        );
+        assert!(cx.debug_bounds("cleanup-back").is_some());
     }
 
     #[gpui::test]

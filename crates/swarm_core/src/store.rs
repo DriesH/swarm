@@ -314,6 +314,10 @@ const MIGRATIONS: &[&str] = &[
         first_caught_at INTEGER NOT NULL,
         count INTEGER NOT NULL
     )",
+    // When each creature of the Field guide came, so the daily cap holds across restarts.
+    "CREATE TABLE creature_visits (
+        started_at INTEGER PRIMARY KEY
+    )",
 ];
 
 /// The hundredth merge is the one that makes the queen bee.
@@ -1730,6 +1734,33 @@ impl Store {
             .into_iter()
             .find(|catch| catch.creature == creature)
             .ok_or_else(|| Error::Invalid(format!("the catch of {creature} was not saved")))
+    }
+
+    /// Records that a creature came at `at`, in milliseconds since the Unix epoch. Visits
+    /// more than 24 hours older than this one are forgotten.
+    pub fn record_visit(&self, at: u64) -> Result<(), Error> {
+        let day = 24 * 60 * 60 * 1000;
+
+        self.connection.execute(
+            "INSERT OR IGNORE INTO creature_visits (started_at) VALUES (?1)",
+            params![to_row(at)?],
+        )?;
+        self.connection.execute(
+            "DELETE FROM creature_visits WHERE started_at < ?1",
+            params![to_row(at.saturating_sub(day))?],
+        )?;
+
+        Ok(())
+    }
+
+    /// When the creatures came since `since`, the first first.
+    pub fn visits_since(&self, since: u64) -> Result<Vec<u64>, Error> {
+        let mut statement = self.connection.prepare(
+            "SELECT started_at FROM creature_visits WHERE started_at >= ?1 ORDER BY started_at",
+        )?;
+        let rows = statement.query_map(params![to_row(since)?], |row| row.get::<_, i64>(0))?;
+
+        rows.map(|row| from_row(row?)).collect()
     }
 
     /// The ports of every task and every worker that has not stopped, in every project.
@@ -3217,6 +3248,37 @@ mod tests {
         assert_eq!(counts.len(), 2);
         assert!(counts.contains(&("vespa-crabro".to_owned(), 2)));
         assert!(counts.contains(&("apis-mellifera".to_owned(), 1)));
+    }
+
+    const DAY: u64 = 24 * 60 * 60 * 1000;
+
+    #[test]
+    fn visits_are_kept_and_listed_the_first_first() {
+        let store = Store::open_in_memory().expect("store");
+
+        store.record_visit(3_000).expect("third");
+        store.record_visit(1_000).expect("first");
+
+        assert_eq!(store.visits_since(0).expect("visits"), [1_000, 3_000]);
+    }
+
+    #[test]
+    fn visits_before_the_time_asked_for_are_left_out() {
+        let store = Store::open_in_memory().expect("store");
+        store.record_visit(1_000).expect("old");
+        store.record_visit(5_000).expect("new");
+
+        assert_eq!(store.visits_since(2_000).expect("visits"), [5_000]);
+    }
+
+    #[test]
+    fn a_visit_forgets_the_visits_more_than_a_day_older() {
+        let store = Store::open_in_memory().expect("store");
+        store.record_visit(1_000).expect("old");
+
+        store.record_visit(1_000 + DAY + 1).expect("new");
+
+        assert_eq!(store.visits_since(0).expect("visits"), [1_000 + DAY + 1]);
     }
 
     /// The migration that adds the `merges` table is the seventeenth.

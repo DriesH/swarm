@@ -31,8 +31,6 @@ pub(crate) const LOG_LINES: usize = 200;
 /// A log line is far shorter than this, so the tail holds the last lines.
 const LOG_TAIL_BYTES: u64 = 256 * 1024;
 const CUT_MARK: &str = "\u{2026}";
-/// The most an address spends on one character: four UTF-8 bytes, three characters each.
-const MOST_ENCODED_PER_CHAR: usize = 12;
 const VERSIONS_KEY: &str = "versions";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,6 +160,19 @@ pub(crate) struct Draft {
     pub(crate) versions: Option<String>,
 }
 
+/// What a character spends in the address: see [`percent_encode`].
+fn encoded_len(character: char) -> usize {
+    if character.is_ascii_alphanumeric() || matches!(character, '-' | '.' | '_' | '~') {
+        1
+    } else {
+        3 * character.len_utf8()
+    }
+}
+
+fn encoded_len_of(text: &str) -> usize {
+    text.chars().map(encoded_len).sum()
+}
+
 /// One query key of the address.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Field {
@@ -169,6 +180,8 @@ pub(crate) struct Field {
     key: &'static str,
     body: String,
     pub(crate) cut: bool,
+    /// What [`Field::text`] spends in the address.
+    encoded: usize,
 }
 
 impl Field {
@@ -180,6 +193,7 @@ impl Field {
             key,
             body: body.to_owned(),
             cut: false,
+            encoded: encoded_len_of(body),
         })
     }
 
@@ -192,14 +206,29 @@ impl Field {
         }
     }
 
-    /// Drops characters from the end, enough for `excess` bytes at least when they are
-    /// plain text. A field that is empty already cannot be cut.
-    fn cut_by(&mut self, excess: usize) {
-        let drop = (excess / MOST_ENCODED_PER_CHAR).max(1);
-        let keep = self.body.chars().count().saturating_sub(drop);
+    /// Drops characters from the end until the address is `excess` bytes shorter, or the
+    /// field is empty. The first cut adds the mark, which costs bytes too. Returns how many
+    /// bytes the address lost.
+    fn cut_by(&mut self, excess: usize) -> usize {
+        let mark = if self.cut {
+            0
+        } else {
+            encoded_len_of(CUT_MARK)
+        };
+        let wanted = excess + mark;
+        let mut freed = 0;
 
-        self.body = self.body.chars().take(keep).collect();
         self.cut = true;
+        while freed < wanted {
+            let Some(last) = self.body.pop() else {
+                break;
+            };
+
+            freed += encoded_len(last);
+        }
+        self.encoded = (self.encoded + mark).saturating_sub(freed);
+
+        freed.saturating_sub(mark)
     }
 }
 
@@ -265,24 +294,18 @@ impl Draft {
     /// the longest field is cut first and ends with "…".
     pub(crate) fn link(&self) -> Link {
         let mut fields = self.fields();
+        let mut excess = url_length(self.kind, &fields).saturating_sub(MAX_URL_LENGTH);
 
-        loop {
-            let excess = url_of(self.kind, &fields)
-                .len()
-                .saturating_sub(MAX_URL_LENGTH);
-            if excess == 0 {
-                break;
-            }
-
+        while excess > 0 {
             let longest = fields
                 .iter_mut()
                 .filter(|field| field.key != VERSIONS_KEY && !field.body.is_empty())
-                .max_by_key(|field| percent_encode(&field.text()).len());
+                .max_by_key(|field| field.encoded);
             let Some(field) = longest else {
                 break;
             };
 
-            field.cut_by(excess);
+            excess = excess.saturating_sub(field.cut_by(excess));
         }
 
         Link {
@@ -290,6 +313,17 @@ impl Draft {
             fields,
         }
     }
+}
+
+/// How long [`url_of`] is, without building it.
+fn url_length(kind: Kind, fields: &[Field]) -> usize {
+    let start = NEW_ISSUE_URL.len() + "?template=".len() + kind.template().len();
+
+    start
+        + fields
+            .iter()
+            .map(|field| "&=".len() + field.key.len() + field.encoded)
+            .sum::<usize>()
 }
 
 fn url_of(kind: Kind, fields: &[Field]) -> String {
@@ -386,6 +420,10 @@ pub(crate) struct ReportIssueDialog {
     include_versions: bool,
     include_log: bool,
     details_open: bool,
+    /// The text under "Show what is sent", made once for each change of the form.
+    disclosure: Option<String>,
+    #[cfg(test)]
+    disclosures_made: usize,
     versions: Versions,
     log_path: Option<PathBuf>,
     error: Option<SharedString>,
@@ -436,7 +474,7 @@ impl ReportIssueDialog {
         }
         window.focus(&title.focus_handle(cx), cx);
 
-        let on_title = cx.subscribe(&title, Self::field_event);
+        let on_title = cx.subscribe_in(&title, window, Self::title_event);
         let on_description = cx.subscribe(&description, Self::field_event);
         let on_steps = cx.subscribe(&steps, Self::field_event);
 
@@ -448,6 +486,9 @@ impl ReportIssueDialog {
             include_versions: true,
             include_log: false,
             details_open: false,
+            disclosure: None,
+            #[cfg(test)]
+            disclosures_made: 0,
             versions: Versions::of_swarm(),
             log_path,
             error: None,
@@ -464,21 +505,60 @@ impl ReportIssueDialog {
         cx: &mut Context<Self>,
     ) {
         match event {
-            TextInputEvent::Changed(_) => cx.notify(),
+            TextInputEvent::Changed(_) => self.changed(cx),
             TextInputEvent::Submitted(_) => self.open(cx),
         }
     }
 
+    /// Enter in the title goes on to the description. Only ⌘↩ opens GitHub.
+    fn title_event(
+        &mut self,
+        _title: &Entity<TextInput>,
+        event: &TextInputEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            TextInputEvent::Changed(_) => self.changed(cx),
+            TextInputEvent::Submitted(_) if window.modifiers().platform => self.open(cx),
+            TextInputEvent::Submitted(_) => {
+                let description = self.description.focus_handle(cx);
+
+                window.focus(&description, cx);
+            }
+        }
+    }
+
+    /// The form changed: what is sent changed with it.
+    fn changed(&mut self, cx: &mut Context<Self>) {
+        self.disclosure = None;
+        cx.notify();
+    }
+
     pub(crate) fn set_versions(&mut self, versions: Versions, cx: &mut Context<Self>) {
         self.versions = versions;
-        cx.notify();
+        self.changed(cx);
     }
 
     fn set_kind(&mut self, kind: Kind, cx: &mut Context<Self>) {
         self.kind = kind;
         self.description
             .update(cx, |area, cx| area.set_label(kind.description_label(), cx));
-        cx.notify();
+        self.changed(cx);
+    }
+
+    /// The text under "Show what is sent", made again only after a change.
+    fn disclosure_text(&mut self, cx: &App) -> String {
+        if self.disclosure.is_none() {
+            #[cfg(test)]
+            {
+                self.disclosures_made += 1;
+            }
+
+            self.disclosure = Some(self.draft(cx).link().disclosure(self.include_log));
+        }
+
+        self.disclosure.clone().unwrap_or_default()
     }
 
     pub(crate) fn draft(&self, cx: &App) -> Draft {
@@ -570,7 +650,7 @@ fn field(label: &'static str, control: impl IntoElement) -> gpui::Div {
 
 impl ReportIssueDialog {
     /// The group under "Include": what goes along, and the disclosure of what is sent.
-    fn include_group(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn include_group(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let line = cx.theme().colors().line;
         let this = cx.entity();
         let (on_versions, on_log) = (this.clone(), this);
@@ -583,7 +663,7 @@ impl ReportIssueDialog {
                     .on_toggle(move |checked, _, cx| {
                         on_versions.update(cx, |this, cx| {
                             this.include_versions = checked;
-                            cx.notify();
+                            this.changed(cx);
                         });
                     }),
             )
@@ -600,7 +680,7 @@ impl ReportIssueDialog {
                 on_log.update(cx, |this, cx| {
                     this.include_log = checked;
                     this.error = None;
-                    cx.notify();
+                    this.changed(cx);
                 });
             });
         let details = Button::new("report-details", "Show what is sent")
@@ -612,9 +692,8 @@ impl ReportIssueDialog {
                 cx.notify();
             }));
 
-        let sent = self.details_open.then(|| {
-            let text = self.draft(cx).link().disclosure(self.include_log);
-
+        let text = self.details_open.then(|| self.disclosure_text(cx));
+        let sent = text.map(|text| {
             div()
                 .id("report-sent")
                 .role(Role::Group)
@@ -808,6 +887,39 @@ fn open_in_main_window(cx: &mut App) {
     }
 }
 
+/// A folder in the temp folder that goes away with the value.
+#[cfg(test)]
+struct TempFolder(PathBuf);
+
+#[cfg(test)]
+impl TempFolder {
+    fn new(name: &str) -> Self {
+        let folder =
+            std::env::temp_dir().join(format!("swarm-report-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&folder).expect("folder");
+
+        Self(folder)
+    }
+
+    /// A `daemon.log` of `lines` lines in the folder.
+    fn log(&self, lines: usize) -> PathBuf {
+        let path = self.0.join("daemon.log");
+        let text: Vec<String> = (0..lines).map(|number| format!("log {number}")).collect();
+        std::fs::write(&path, text.join("\n")).expect("log");
+
+        path
+    }
+}
+
+#[cfg(test)]
+impl Drop for TempFolder {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.0) {
+            log::warn!("cannot remove {}: {error}", self.0.display());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -958,18 +1070,56 @@ mod tests {
 
     #[test]
     fn the_log_tail_holds_the_last_200_lines_of_a_big_file() {
-        let folder = std::env::temp_dir().join(format!("swarm-report-{}", std::process::id()));
-        std::fs::create_dir_all(&folder).expect("folder");
-        let path = folder.join("daemon.log");
-        let lines: Vec<String> = (0..20_000).map(|number| format!("line {number}")).collect();
-        std::fs::write(&path, lines.join("\n")).expect("log");
+        let folder = TempFolder::new("tail");
+        let path = folder.log(20_000);
 
         let tail = read_log_tail(&path).expect("tail");
 
         let kept: Vec<&str> = tail.lines().collect();
         assert_eq!(kept.len(), LOG_LINES);
-        assert_eq!(kept.last().copied(), Some("line 19999"));
-        assert_eq!(kept.first().copied(), Some("line 19800"));
+        assert_eq!(kept.last().copied(), Some("log 19999"));
+        assert_eq!(kept.first().copied(), Some("log 19800"));
+    }
+
+    #[test]
+    fn a_temp_folder_is_gone_when_the_test_ends() {
+        let folder = TempFolder::new("gone");
+        let path = folder.0.clone();
+
+        drop(folder);
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_huge_field_is_cut_in_one_quick_pass() {
+        let mut huge = draft(Kind::Bug);
+        huge.description = "word ".repeat(40_000);
+        huge.steps = "step\u{1f41d} ".repeat(5_000);
+
+        let started = std::time::Instant::now();
+        let link = huge.link();
+
+        assert!(link.url.len() <= MAX_URL_LENGTH, "{}", link.url.len());
+        assert!(link.fields.iter().any(|field| field.cut));
+        // A loose bound: the old cut took over a hundred passes; a loaded machine must not fail it.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn the_kept_length_of_a_field_matches_its_encoded_text() {
+        let mut huge = draft(Kind::Feedback);
+        huge.description = "\u{e9}a b\u{1f41d}".repeat(3_000);
+
+        let link = huge.link();
+
+        for field in &link.fields {
+            assert_eq!(field.encoded, percent_encode(&field.text()).len());
+        }
     }
 }
 
@@ -1004,17 +1154,6 @@ mod dialog_tests {
             bounds.map_or_else(Default::default, |bounds| bounds.center()),
             gpui::Modifiers::none(),
         );
-    }
-
-    fn log_file(name: &str, lines: usize) -> PathBuf {
-        let folder =
-            std::env::temp_dir().join(format!("swarm-report-{}-{name}", std::process::id()));
-        std::fs::create_dir_all(&folder).expect("folder");
-        let path = folder.join("daemon.log");
-        let text: Vec<String> = (0..lines).map(|number| format!("log {number}")).collect();
-        std::fs::write(&path, text.join("\n")).expect("log");
-
-        path
     }
 
     #[gpui::test]
@@ -1114,8 +1253,8 @@ mod dialog_tests {
     #[gpui::test]
     fn the_daemon_log_goes_to_the_clipboard_and_not_into_the_address(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
-        let path = log_file("clipboard", 300);
-        let view = open(None, Some(path), &workspace, cx);
+        let folder = TempFolder::new("clipboard");
+        let view = open(None, Some(folder.log(300)), &workspace, cx);
         view.update(cx, |dialog, cx| {
             dialog.fill("Title", "Text", cx);
             dialog.include_log(true);
@@ -1142,8 +1281,8 @@ mod dialog_tests {
     fn without_the_log_option_the_clipboard_stays_alone(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
         cx.write_to_clipboard(ClipboardItem::new_string("mine".to_owned()));
-        let path = log_file("untouched", 10);
-        open(None, Some(path), &workspace, cx);
+        let folder = TempFolder::new("untouched");
+        open(None, Some(folder.log(10)), &workspace, cx);
 
         click("report-open", cx);
 
@@ -1183,6 +1322,58 @@ mod dialog_tests {
         assert!(closed);
         assert!(view.read_with(cx, |dialog, _| dialog.details_are_open()));
         assert!(cx.debug_bounds("report-sent").is_some());
+    }
+
+    fn made(view: &Entity<ReportIssueDialog>, cx: &VisualTestContext) -> usize {
+        view.read_with(cx, |dialog, _| dialog.disclosures_made)
+    }
+
+    #[gpui::test]
+    fn the_sent_text_is_made_once_for_each_change_not_for_each_draw(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let view = open(None, None, &workspace, cx);
+        click("report-details", cx);
+
+        redraw(cx);
+        redraw(cx);
+        view.update(cx, |_, cx| cx.notify());
+        redraw(cx);
+        let before = made(&view, cx);
+        let title = view.read_with(cx, |dialog, cx| dialog.title.focus_handle(cx));
+        cx.update(|window, cx| window.focus(&title, cx));
+        cx.simulate_input("T");
+        redraw(cx);
+        redraw(cx);
+
+        assert_eq!(before, 1);
+        assert_eq!(made(&view, cx), 2);
+    }
+
+    #[gpui::test]
+    fn enter_in_the_title_moves_on_to_the_description_and_opens_nothing(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let view = open(None, None, &workspace, cx);
+        view.update(cx, |dialog, cx| dialog.fill("Tabs jump", "On click", cx));
+        let description = view.read_with(cx, |dialog, cx| dialog.description.focus_handle(cx));
+
+        cx.simulate_keystrokes("enter");
+
+        assert!(cx.update(|window, _| description.is_focused(window)));
+        assert_eq!(cx.opened_url(), None);
+        assert!(workspace.read_with(cx, |workspace, _| workspace.overlay.is_some()));
+    }
+
+    #[gpui::test]
+    fn command_enter_in_the_title_opens_the_form(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let view = open(None, None, &workspace, cx);
+        view.update(cx, |dialog, cx| dialog.fill("Tabs jump", "On click", cx));
+        cx.update(|window, _| window.set_modifiers(gpui::Modifiers::command()));
+
+        cx.simulate_keystrokes("cmd-enter");
+
+        let url = cx.opened_url().expect("a page opened");
+        assert!(url.contains("&title=Tabs%20jump"));
     }
 
     #[gpui::test]
@@ -1244,6 +1435,6 @@ mod template_tests {
     fn each_form_sets_its_own_label() {
         assert!(form(Kind::Bug).contains("labels: [\"bug\"]"));
         assert!(form(Kind::Feature).contains("labels: [\"enhancement\"]"));
-        assert!(form(Kind::Feedback).contains("labels: [\"feedback\"]"));
+        assert!(form(Kind::Feedback).contains("labels: [\"question\"]"));
     }
 }

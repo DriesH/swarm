@@ -12,10 +12,10 @@ use std::time::{Duration, Instant};
 
 use swarm_protocol::{
     AgentChange, AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, CallId,
-    Client, ClientError, CloseStep, CreateTask, CreateTerminal, DiffStat, Event, FileStat,
-    GridSize, MessageEvent, MessageId, MessageInfo, MessageKind, PlanDraft, PrEvent, ProjectId,
-    ProjectInfo, Request, TaskId, TaskInfo, TerminalId, TerminalInfo, TerminalKind, VERSION, read,
-    write,
+    Client, ClientError, CloseFailure, CloseStep, CreateTask, CreateTerminal, DiffStat, Event,
+    FileStat, GridSize, MessageEvent, MessageId, MessageInfo, MessageKind, PlanDraft, PrEvent,
+    ProjectId, ProjectInfo, Request, TaskId, TaskInfo, TerminalId, TerminalInfo, TerminalKind,
+    VERSION, read, write,
 };
 use swarm_term::{Palette, Rgb, Size, TerminalInput, TerminalOutput};
 
@@ -986,7 +986,7 @@ fn close_steps_and_a_failed_close_reach_the_pull_request_listener() {
         });
         fake.send(&Event::CloseFailed {
             task: TaskId(4),
-            message: "git: busy".to_owned(),
+            reason: CloseFailure::Other("git: busy".to_owned()),
         });
         fake.drain();
     });
@@ -1006,7 +1006,7 @@ fn close_steps_and_a_failed_close_reach_the_pull_request_listener() {
         failed,
         PrEvent::CloseFailed {
             task: TaskId(4),
-            message: "git: busy".to_owned()
+            reason: CloseFailure::Other("git: busy".to_owned())
         }
     );
 }

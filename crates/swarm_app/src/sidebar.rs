@@ -996,7 +996,7 @@ pub(crate) fn queen_crown(agent: &Agent) -> gpui::Div {
 const FOLD_BELOW: Pixels = px(700.);
 
 /// How many creatures the Field guide holds.
-const FIELD_GUIDE_TOTAL: usize = 20;
+const FIELD_GUIDE_TOTAL: usize = swarm_protocol::creatures::CREATURES.len();
 
 /// True when a window of this height folds the usage card unless the user opened it.
 fn usage_can_fold(height: Pixels) -> bool {

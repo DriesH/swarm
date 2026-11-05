@@ -297,7 +297,7 @@ impl Workspace {
         let Some(entry) = self.data.task(task).filter(|entry| !entry.is_start) else {
             return;
         };
-        if !self.can_work() {
+        if !self.can_work() || self.cleanup_is_working(task) {
             return;
         }
 
@@ -365,11 +365,9 @@ impl Workspace {
             return;
         };
 
-        let deletes_branch = !confirmed.merged_branches.is_empty();
-
         self.close_overlay(window, cx);
-        self.begin_cleanup(task, deletes_branch, Some(confirmed.clone()), cx);
-        self.send_close(task, daemon_id, Some(confirmed), cx);
+        self.begin_cleanup(task, Some(confirmed.clone()), cx);
+        self.send_close(task, daemon_id, confirmed, cx);
     }
 }
 

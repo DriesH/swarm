@@ -2,7 +2,7 @@
 # Syntax: https://docs.github.com/en/communities/using-templates-to-encourage-useful-issues-and-pull-requests/syntax-for-issue-forms
 name: Feedback
 description: What works, what does not, what you would change
-labels: ["feedback"]
+labels: ["question"]
 body:
   - type: textarea
     id: feedback

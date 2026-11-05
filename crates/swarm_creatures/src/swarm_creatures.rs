@@ -42,34 +42,56 @@ pub struct Run {
     pub color: Rgb,
 }
 
-/// One frame: a color or nothing for each of the 64 × 64 pixels.
+/// A frame made from every second pixel is this many pixels wide and high.
+pub const HALF_SIDE: usize = SIDE / 2;
+
+/// One frame: a color or nothing for each of the 64 × 64 pixels. It also holds the runs of
+/// each row and the frame of every second pixel, so a paint allocates nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame {
+    side: usize,
     pixels: Vec<Option<Rgb>>,
+    runs: Vec<Vec<Run>>,
+    half: Option<Box<Frame>>,
 }
 
 impl Frame {
     pub(crate) fn new(pixels: Vec<Option<Rgb>>) -> Self {
         debug_assert_eq!(pixels.len(), SIDE * SIDE);
 
-        Self { pixels }
+        let half = Self::sampled(&pixels, HALF_SIDE);
+
+        Self::with_half(SIDE, pixels, Some(Box::new(half)))
     }
 
-    /// The pixel at a column and a row, or `None` when it is empty or off the frame.
-    pub fn pixel(&self, column: usize, row: usize) -> Option<Rgb> {
-        if column >= SIDE || row >= SIDE {
-            return None;
+    fn with_half(side: usize, pixels: Vec<Option<Rgb>>, half: Option<Box<Self>>) -> Self {
+        let runs = (0..side)
+            .map(|row| Self::row_runs(&pixels, side, row))
+            .collect();
+
+        Self {
+            side,
+            pixels,
+            runs,
+            half,
         }
-
-        self.pixels.get(row * SIDE + column).copied().flatten()
     }
 
-    /// The filled pixels of a row as runs, so a neighbor of one color is one quad.
-    pub fn runs(&self, row: usize) -> Vec<Run> {
+    /// The frame of a `side` of pixels made from every second pixel of `pixels`.
+    fn sampled(pixels: &[Option<Rgb>], side: usize) -> Self {
+        let taken = (0..side)
+            .flat_map(|row| (0..side).map(move |column| (column, row)))
+            .map(|(column, row)| pixels.get(row * 2 * SIDE + column * 2).copied().flatten())
+            .collect();
+
+        Self::with_half(side, taken, None)
+    }
+
+    fn row_runs(pixels: &[Option<Rgb>], side: usize, row: usize) -> Vec<Run> {
         let mut runs: Vec<Run> = Vec::new();
 
-        for column in 0..SIDE {
-            let Some(color) = self.pixel(column, row) else {
+        for column in 0..side {
+            let Some(color) = pixels.get(row * side + column).copied().flatten() else {
                 continue;
             };
 
@@ -86,6 +108,31 @@ impl Frame {
         }
 
         runs
+    }
+
+    /// How many pixels wide and high the frame is.
+    pub fn side(&self) -> usize {
+        self.side
+    }
+
+    /// The frame made from every second pixel, 32 × 32, for a screen that cannot show a
+    /// pixel of the full frame. The half of a half frame is itself.
+    pub fn halved(&self) -> &Self {
+        self.half.as_deref().unwrap_or(self)
+    }
+
+    /// The pixel at a column and a row, or `None` when it is empty or off the frame.
+    pub fn pixel(&self, column: usize, row: usize) -> Option<Rgb> {
+        if column >= self.side || row >= self.side {
+            return None;
+        }
+
+        self.pixels.get(row * self.side + column).copied().flatten()
+    }
+
+    /// The filled pixels of a row as runs, so a neighbor of one color is one quad.
+    pub fn runs(&self, row: usize) -> &[Run] {
+        self.runs.get(row).map_or(&[], Vec::as_slice)
     }
 }
 

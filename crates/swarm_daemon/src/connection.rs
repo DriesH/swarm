@@ -285,6 +285,8 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
         Request::Stats { call } => send_stats(services, sink, call),
         Request::Catches { call } => send_catches(services, sink, call),
         Request::RecordCatch { call, creature } => record_catch(services, sink, call, &creature),
+        Request::Visits { call } => send_visits(services, sink, call),
+        Request::RecordVisit { call, at } => record_visit(services, sink, call, at),
         Request::Usage { call } => {
             sink.send_event(&Event::Usage {
                 call,
@@ -376,6 +378,24 @@ fn send_catches(services: &Services, sink: &ClientSink, call: CallId) {
     match stats::catches(services) {
         Ok(catches) => {
             sink.send_event(&Event::Catches { call, catches });
+        }
+        Err(error) => send_error(sink, call, &error),
+    }
+}
+
+fn send_visits(services: &Services, sink: &ClientSink, call: CallId) {
+    match stats::visits(services) {
+        Ok(starts) => {
+            sink.send_event(&Event::Visits { call, starts });
+        }
+        Err(error) => send_error(sink, call, &error),
+    }
+}
+
+fn record_visit(services: &Services, sink: &ClientSink, call: CallId, at: u64) {
+    match stats::record_visit(services, at) {
+        Ok(()) => {
+            sink.send_event(&Event::Done { call });
         }
         Err(error) => send_error(sink, call, &error),
     }

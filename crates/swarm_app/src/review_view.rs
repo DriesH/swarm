@@ -1041,6 +1041,8 @@ impl Render for ReviewView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
 
+        self.settle_colors(cx);
+
         if std::mem::take(&mut self.focus_composer) {
             window.focus(&self.composer.input.focus_handle(cx), cx);
         } else if std::mem::take(&mut self.focus_body) {

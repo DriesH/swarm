@@ -8,7 +8,8 @@ use gpui::{
     Animation, AnimationExt as _, AnyElement, Context, FocusHandle, FontWeight, Role, SharedString,
     Window, div, px,
 };
-use swarm_protocol::{CloseCheck, CloseStep};
+use swarm_protocol::{CloseCheck, CloseFailure, CloseStep};
+use swarm_ui::motion::reduce_motion;
 use swarm_ui::prelude::*;
 
 use crate::announce::announce;
@@ -19,6 +20,7 @@ use crate::workspace::Workspace;
 
 const TITLE_WORKING: &str = "Cleaning up the swarm";
 const TITLE_FAILED: &str = "Cleanup stopped";
+const NOT_CONNECTED: &str = "Not connected to the daemon";
 /// Logical pixels for each sprite pixel: the bee is 130 pixels wide.
 const BEE_SCALE: u8 = 5;
 const DRIFT_PERIOD: Duration = Duration::from_millis(4800);
@@ -68,16 +70,24 @@ pub(crate) fn step_label(step: CloseStep) -> &'static str {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Progress {
     phase: Phase,
-    /// "Deleting the merged branch" is part of this close.
+    /// The daemon began "Deleting the merged branch" in this close.
     deletes_branch: bool,
+    /// The close stopped because it would lose more than the user saw.
+    stale_check: bool,
 }
 
 impl Progress {
-    pub(crate) fn new(deletes_branch: bool) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             phase: Phase::Working(CloseStep::StoppingAgents),
-            deletes_branch,
+            deletes_branch: false,
+            stale_check: false,
         }
+    }
+
+    /// True when a retry has to show the user a fresh check first.
+    pub(crate) fn needs_new_check(&self) -> bool {
+        self.stale_check
     }
 
     pub(crate) fn phase(&self) -> &Phase {
@@ -132,9 +142,20 @@ impl Progress {
         true
     }
 
+    /// Like [`Self::fail`], for the daemon's typed reason.
+    pub(crate) fn fail_with(&mut self, reason: &CloseFailure) -> bool {
+        let changed = self.fail(reason.to_string().into());
+        if *reason == CloseFailure::WouldLoseMore && matches!(self.phase, Phase::Failed(_)) {
+            self.stale_check = true;
+        }
+
+        changed
+    }
+
     /// Starts again from the first step.
     pub(crate) fn restart(&mut self) {
         self.phase = Phase::Working(CloseStep::StoppingAgents);
+        self.stale_check = false;
     }
 
     /// What a screen reader speaks for the state: the step that runs, or the reason.
@@ -166,13 +187,9 @@ pub(crate) struct Cleanup {
 }
 
 impl Cleanup {
-    fn new<T: 'static>(
-        deletes_branch: bool,
-        confirmed: Option<CloseCheck>,
-        cx: &mut Context<T>,
-    ) -> Self {
+    fn new<T: 'static>(confirmed: Option<CloseCheck>, cx: &mut Context<T>) -> Self {
         Self {
-            progress: Progress::new(deletes_branch),
+            progress: Progress::new(),
             confirmed,
             focus_request: Cell::new(Some(FocusRequest::Screen)),
             screen_focus: cx.focus_handle(),
@@ -213,15 +230,21 @@ impl Workspace {
         self.cleanups.contains_key(&task)
     }
 
+    /// True while the daemon closes the task, not after the close stopped.
+    pub(crate) fn cleanup_is_working(&self, task: TaskId) -> bool {
+        self.cleanups
+            .get(&task)
+            .is_some_and(|cleanup| matches!(cleanup.progress.phase(), Phase::Working(_)))
+    }
+
     /// Replaces the surface of the task with the cleanup screen.
     pub(crate) fn begin_cleanup(
         &mut self,
         task: TaskId,
-        deletes_branch: bool,
         confirmed: Option<CloseCheck>,
         cx: &mut Context<Self>,
     ) {
-        let cleanup = Cleanup::new(deletes_branch, confirmed, cx);
+        let cleanup = Cleanup::new(confirmed, cx);
 
         self.cleanups.insert(task, cleanup);
         cx.notify();
@@ -239,12 +262,7 @@ impl Workspace {
         };
 
         if !self.is_cleaning(task) {
-            let after_merge = self
-                .data
-                .task(task)
-                .is_some_and(|task| task.close_after_merge);
-
-            self.begin_cleanup(task, after_merge, None, cx);
+            self.begin_cleanup(task, None, cx);
         }
         if let Some(cleanup) = self.cleanups.get_mut(&task) {
             cleanup.progress.reach(step);
@@ -257,14 +275,14 @@ impl Workspace {
     pub(crate) fn close_failed(
         &mut self,
         daemon_task: swarm_protocol::TaskId,
-        message: String,
+        reason: CloseFailure,
         cx: &mut Context<Self>,
     ) {
         let Some(task) = self.data.task_with_daemon_id(daemon_task) else {
             return;
         };
 
-        self.cleanup_failed(task, message.into(), cx);
+        self.cleanup_stopped(task, &reason, cx);
     }
 
     pub(crate) fn cleanup_failed(
@@ -273,39 +291,50 @@ impl Workspace {
         message: SharedString,
         cx: &mut Context<Self>,
     ) {
+        self.cleanup_stopped(task, &CloseFailure::Other(message.to_string()), cx);
+    }
+
+    fn cleanup_stopped(&mut self, task: TaskId, reason: &CloseFailure, cx: &mut Context<Self>) {
         let Some(cleanup) = self.cleanups.get_mut(&task) else {
             return;
         };
 
-        if cleanup.progress.fail(message) {
+        if cleanup.progress.fail_with(reason) {
             cleanup.focus_request.set(Some(FocusRequest::Retry));
             cx.notify();
         }
     }
 
-    /// Asks the daemon to close the task, with what the user confirmed or, for a close
-    /// that began with a merge, with a fresh check. The answer is the failure, if any:
-    /// a close that works ends with the daemon's report that the task closed.
+    /// The daemon connection is gone: no cleanup can go on, so each one offers the way back.
+    pub(crate) fn fail_working_cleanups(&mut self, cx: &mut Context<Self>) {
+        let working: Vec<TaskId> = self
+            .cleanups
+            .iter()
+            .filter(|(_, cleanup)| matches!(cleanup.progress.phase(), Phase::Working(_)))
+            .map(|(task, _)| *task)
+            .collect();
+
+        for task in working {
+            self.cleanup_failed(task, NOT_CONNECTED.into(), cx);
+        }
+    }
+
+    /// Asks the daemon to close the task, with the check the user saw. The answer is the
+    /// failure, if any: a close that works ends with the daemon's report that the task
+    /// closed.
     pub(crate) fn send_close(
         &mut self,
         task: TaskId,
         daemon_id: swarm_protocol::TaskId,
-        confirmed: Option<CloseCheck>,
+        confirmed: CloseCheck,
         cx: &mut Context<Self>,
     ) {
         let Some(client) = self.daemon.clone() else {
-            self.cleanup_failed(task, "Not connected to the daemon".into(), cx);
+            self.cleanup_failed(task, NOT_CONNECTED.into(), cx);
             return;
         };
 
-        let closing = cx.background_spawn(async move {
-            let check = match confirmed {
-                Some(check) => check,
-                None => client.check_close(daemon_id)?,
-            };
-
-            client.close_task(daemon_id, check)
-        });
+        let closing = cx.background_spawn(async move { client.close_task(daemon_id, confirmed) });
 
         cx.spawn(async move |this, cx| {
             let Err(error) = closing.await else {
@@ -323,20 +352,80 @@ impl Workspace {
         .detach();
     }
 
-    pub(crate) fn retry_cleanup(&mut self, task: TaskId, cx: &mut Context<Self>) {
+    /// Tries the close again. A close that would lose more than the user saw, and a close
+    /// that began with a merge, show the Close task dialog first when work would be lost.
+    pub(crate) fn retry_cleanup(
+        &mut self,
+        task: TaskId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(daemon_id) = self.data.diff_id(task) else {
             return;
         };
-        let Some(cleanup) = self.cleanups.get_mut(&task) else {
+        let Some(cleanup) = self.cleanups.get(&task) else {
             return;
         };
 
-        cleanup.progress.restart();
-        cleanup.focus_request.set(Some(FocusRequest::Screen));
-        let confirmed = cleanup.confirmed.clone();
+        if cleanup.progress.needs_new_check() {
+            self.open_close_task(task, window, cx);
+            return;
+        }
+
+        match cleanup.confirmed.clone() {
+            Some(confirmed) => self.restart_close(task, daemon_id, confirmed, cx),
+            None => self.check_then_close(task, daemon_id, window, cx),
+        }
+    }
+
+    fn restart_close(
+        &mut self,
+        task: TaskId,
+        daemon_id: swarm_protocol::TaskId,
+        confirmed: CloseCheck,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(cleanup) = self.cleanups.get_mut(&task) {
+            cleanup.progress.restart();
+            cleanup.focus_request.set(Some(FocusRequest::Screen));
+        }
 
         cx.notify();
         self.send_close(task, daemon_id, confirmed, cx);
+    }
+
+    /// A close nobody confirmed: it sends only when the fresh check loses nothing.
+    fn check_then_close(
+        &mut self,
+        task: TaskId,
+        daemon_id: swarm_protocol::TaskId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.daemon.clone() else {
+            return;
+        };
+
+        let checking = cx.background_spawn(async move { client.check_close(daemon_id) });
+
+        cx.spawn_in(window, async move |this, cx| {
+            let result = checking.await;
+            let updated = this.update_in(cx, |workspace, window, cx| match result {
+                Ok(check) if check.uncommitted_files > 0 || !check.unmerged_workers.is_empty() => {
+                    workspace.open_close_task(task, window, cx);
+                }
+                Ok(check) => workspace.restart_close(task, daemon_id, check, cx),
+                Err(error) => {
+                    log::warn!("cannot check what closing the task does: {error}");
+                    workspace.cleanup_failed(task, describe(&error), cx);
+                }
+            });
+
+            if let Err(error) = updated {
+                log::debug!("the window closed before the close check ended: {error}");
+            }
+        })
+        .detach();
     }
 
     /// Leaves the screen. The task stays open.
@@ -384,12 +473,13 @@ pub(crate) fn screen(
         None => {}
     }
 
-    let bee = if failed {
+    let bee = if failed || reduce_motion(cx) {
         PixelBee::new("cleanup-bee")
             .scale(BEE_SCALE)
             .into_any_element()
     } else {
         div()
+            .debug_selector(|| "cleanup-bee-drift".to_owned())
             .child(PixelBee::new("cleanup-bee").scale(BEE_SCALE).flap(true))
             .with_animation(
                 "cleanup-drift",
@@ -532,8 +622,8 @@ fn failure(
                         .variant(ButtonVariant::Primary)
                         .track_focus(&cleanup.retry_focus)
                         .debug_selector(|| "cleanup-retry".to_owned())
-                        .on_click(cx.listener(move |workspace, _, _, cx| {
-                            workspace.retry_cleanup(task, cx);
+                        .on_click(cx.listener(move |workspace, _, window, cx| {
+                            workspace.retry_cleanup(task, window, cx);
                         })),
                 )
                 .child(
@@ -567,23 +657,23 @@ mod tests {
 
     #[test]
     fn a_new_close_starts_with_stopping_agents_in_progress() {
-        let progress = Progress::new(true);
+        let progress = Progress::new();
 
-        assert_eq!(marks(&progress), [Mark::InProgress, Mark::Next, Mark::Next]);
+        assert_eq!(marks(&progress), [Mark::InProgress, Mark::Next]);
     }
 
     #[test]
     fn each_step_marks_the_ones_before_it_done() {
-        let mut progress = Progress::new(true);
+        let mut progress = Progress::new();
 
         progress.reach(CloseStep::RemovingWorktrees);
 
-        assert_eq!(marks(&progress), [Mark::Done, Mark::InProgress, Mark::Next]);
+        assert_eq!(marks(&progress), [Mark::Done, Mark::InProgress]);
     }
 
     #[test]
-    fn a_step_that_does_not_apply_is_left_out() {
-        let progress = Progress::new(false);
+    fn the_branch_step_is_left_out_until_the_daemon_begins_it() {
+        let progress = Progress::new();
 
         let steps: Vec<CloseStep> = progress.steps().into_iter().map(|(step, _)| step).collect();
 
@@ -595,7 +685,7 @@ mod tests {
 
     #[test]
     fn a_reported_branch_step_joins_the_list() {
-        let mut progress = Progress::new(false);
+        let mut progress = Progress::new();
 
         progress.reach(CloseStep::DeletingBranch);
 
@@ -604,7 +694,7 @@ mod tests {
 
     #[test]
     fn a_step_never_goes_back() {
-        let mut progress = Progress::new(true);
+        let mut progress = Progress::new();
         progress.reach(CloseStep::DeletingBranch);
 
         progress.reach(CloseStep::StoppingAgents);
@@ -614,7 +704,7 @@ mod tests {
 
     #[test]
     fn the_first_failure_stays() {
-        let mut progress = Progress::new(true);
+        let mut progress = Progress::new();
 
         let first = progress.fail("first".into());
         let second = progress.fail("second".into());
@@ -626,7 +716,7 @@ mod tests {
 
     #[test]
     fn a_failed_close_shows_no_step_as_running() {
-        let mut progress = Progress::new(true);
+        let mut progress = Progress::new();
         progress.fail("busy".into());
 
         assert!(marks(&progress).iter().all(|mark| *mark == Mark::Next));
@@ -634,7 +724,7 @@ mod tests {
 
     #[test]
     fn a_retry_starts_from_the_first_step() {
-        let mut progress = Progress::new(true);
+        let mut progress = Progress::new();
         progress.reach(CloseStep::RemovingWorktrees);
         progress.fail("busy".into());
 
@@ -645,7 +735,7 @@ mod tests {
 
     #[test]
     fn a_step_after_a_failure_starts_the_screen_working_again() {
-        let mut progress = Progress::new(true);
+        let mut progress = Progress::new();
         progress.fail("busy".into());
 
         progress.reach(CloseStep::RemovingWorktrees);
@@ -658,13 +748,41 @@ mod tests {
 
     #[test]
     fn the_screen_reader_hears_the_step_that_runs_and_then_the_reason() {
-        let mut progress = Progress::new(true);
+        let mut progress = Progress::new();
         progress.reach(CloseStep::RemovingWorktrees);
         let step = progress.spoken();
         progress.fail("worktree is dirty".into());
 
         assert_eq!(step, "Removing worktrees");
         assert_eq!(progress.spoken(), "worktree is dirty");
+    }
+
+    #[test]
+    fn a_close_that_would_lose_more_asks_for_a_new_check_on_retry() {
+        let mut progress = Progress::new();
+
+        progress.fail_with(&CloseFailure::WouldLoseMore);
+
+        assert!(progress.needs_new_check());
+    }
+
+    #[test]
+    fn any_other_failure_retries_without_a_new_check() {
+        let mut progress = Progress::new();
+
+        progress.fail_with(&CloseFailure::Other("busy".to_owned()));
+
+        assert!(!progress.needs_new_check());
+    }
+
+    #[test]
+    fn a_retry_forgets_the_stale_check() {
+        let mut progress = Progress::new();
+        progress.fail_with(&CloseFailure::WouldLoseMore);
+
+        progress.restart();
+
+        assert!(!progress.needs_new_check());
     }
 
     #[test]
@@ -691,7 +809,7 @@ mod tests {
 #[cfg(test)]
 mod screen_tests {
     use gpui::{Entity, TestAppContext, VisualTestContext};
-    use swarm_protocol::{PrEvent, TaskId as DaemonTaskId};
+    use swarm_protocol::{Event, PrEvent, Request, TaskId as DaemonTaskId};
 
     use super::*;
     use crate::daemon::tests::{
@@ -752,19 +870,57 @@ mod screen_tests {
     }
 
     #[gpui::test]
-    fn a_close_after_a_merge_lists_the_branch_step_and_one_without_leaves_it_out(
+    fn the_branch_step_joins_the_list_only_after_the_daemon_begins_it(cx: &mut TestAppContext) {
+        let (workspace, cx, _client) = workspace_with_task(cx);
+        let task = active_task(&workspace, cx);
+
+        let count = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |workspace, _| {
+                workspace.cleanups[&task].progress.steps().len()
+            })
+        };
+        workspace.update(cx, |workspace, cx| {
+            workspace.close_step(DaemonTaskId(7), CloseStep::StoppingAgents, cx);
+        });
+        let before = count(&workspace, cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.close_step(DaemonTaskId(7), CloseStep::DeletingBranch, cx);
+        });
+
+        assert_eq!(before, 2);
+        assert_eq!(count(&workspace, cx), 3);
+    }
+
+    #[gpui::test]
+    fn a_close_that_confirmed_a_merged_branch_lists_no_branch_step_at_first(
         cx: &mut TestAppContext,
     ) {
         let (workspace, cx, _client) = workspace_with_task(cx);
         let task = active_task(&workspace, cx);
-        let mut after_merge = task_info(7, 5, "login");
-        after_merge.close_after_merge = true;
-        workspace.update_in(cx, |workspace, window, cx| {
-            workspace.task_changed(&after_merge, Some(window), cx);
-        });
+        let confirmed = CloseCheck {
+            merged_branches: vec!["swarm/login".to_owned()],
+            ..CloseCheck::default()
+        };
 
         workspace.update(cx, |workspace, cx| {
+            workspace.begin_cleanup(task, Some(confirmed), cx);
+        });
+
+        let steps = workspace.read_with(cx, |workspace, _| {
+            workspace.cleanups[&task].progress.steps().len()
+        });
+        assert_eq!(steps, 2);
+    }
+
+    #[gpui::test]
+    fn the_steps_of_a_close_after_a_merge_are_listed_as_the_daemon_reports_them(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx, _client) = workspace_with_task(cx);
+        let task = active_task(&workspace, cx);
+        workspace.update(cx, |workspace, cx| {
             workspace.close_step(DaemonTaskId(7), CloseStep::StoppingAgents, cx);
+            workspace.close_step(DaemonTaskId(7), CloseStep::DeletingBranch, cx);
         });
 
         let steps = workspace.read_with(cx, |workspace, _| {
@@ -810,7 +966,11 @@ mod screen_tests {
         let task = active_task(&workspace, cx);
         workspace.update(cx, |workspace, cx| {
             workspace.close_step(DaemonTaskId(7), CloseStep::RemovingWorktrees, cx);
-            workspace.close_failed(DaemonTaskId(7), "worktree has changes".to_owned(), cx);
+            workspace.close_failed(
+                DaemonTaskId(7),
+                CloseFailure::Other("worktree has changes".to_owned()),
+                cx,
+            );
         });
         redraw(cx);
         let buttons = [
@@ -856,7 +1016,7 @@ mod screen_tests {
         let on_screen = cx.update(|window, _| screen.is_focused(window));
 
         workspace.update(cx, |workspace, cx| {
-            workspace.close_failed(DaemonTaskId(7), "busy".to_owned(), cx);
+            workspace.close_failed(DaemonTaskId(7), CloseFailure::Other("busy".to_owned()), cx);
         });
         redraw(cx);
 
@@ -870,7 +1030,7 @@ mod screen_tests {
         let task = active_task(&workspace, cx);
         workspace.update(cx, |workspace, cx| {
             workspace.close_step(DaemonTaskId(7), CloseStep::StoppingAgents, cx);
-            workspace.close_failed(DaemonTaskId(7), "first".to_owned(), cx);
+            workspace.close_failed(DaemonTaskId(7), CloseFailure::Other("first".to_owned()), cx);
             workspace.cleanup_failed(task, "second".into(), cx);
         });
 
@@ -896,6 +1056,154 @@ mod screen_tests {
 
         assert!(workspace.read_with(cx, |workspace, _| workspace.cleanups.is_empty()));
         assert!(cx.debug_bounds("cleanup").is_none());
+    }
+
+    fn socket_with_check(check: CloseCheck) -> (std::path::PathBuf, flume::Receiver<CloseCheck>) {
+        let (sent, closes) = flume::unbounded();
+        let socket = fake_daemon_replying(move |request| match request {
+            Request::CheckClose { call, .. } => Some(Event::CloseCheck {
+                call,
+                check: check.clone(),
+            }),
+            Request::CloseTask {
+                call, confirmed, ..
+            } => {
+                sent.send(confirmed).ok();
+
+                Some(Event::Done { call })
+            }
+            _ => None,
+        });
+
+        (socket, closes)
+    }
+
+    fn click(selector: &'static str, cx: &mut VisualTestContext) {
+        let center = cx
+            .debug_bounds(selector)
+            .map_or_else(Default::default, |bounds| bounds.center());
+
+        cx.simulate_click(center, gpui::Modifiers::none());
+    }
+
+    fn fail_and_click_retry(
+        workspace: &Entity<Workspace>,
+        reason: CloseFailure,
+        cx: &mut VisualTestContext,
+    ) {
+        workspace.update(cx, |workspace, cx| {
+            workspace.close_step(DaemonTaskId(7), CloseStep::StoppingAgents, cx);
+            workspace.close_failed(DaemonTaskId(7), reason, cx);
+        });
+        redraw(cx);
+
+        click("cleanup-retry", cx);
+    }
+
+    fn dialog_is_open(workspace: &Entity<Workspace>, cx: &VisualTestContext) -> bool {
+        workspace.read_with(cx, |workspace, _| {
+            matches!(workspace.overlay, Some(Overlay::CloseTask { .. }))
+        })
+    }
+
+    #[gpui::test]
+    fn retrying_a_close_from_a_merge_with_work_to_lose_opens_the_dialog_and_sends_nothing(
+        cx: &mut TestAppContext,
+    ) {
+        let (socket, closes) = socket_with_check(CloseCheck {
+            uncommitted_files: 2,
+            ..CloseCheck::default()
+        });
+        let (workspace, cx, _client) = real_task_workspace(&socket, cx);
+
+        fail_and_click_retry(&workspace, CloseFailure::Other("busy".to_owned()), cx);
+        let opened = wait_until(cx, |cx| {
+            redraw(cx);
+            dialog_is_open(&workspace, cx)
+        });
+
+        assert!(opened);
+        assert!(closes.try_recv().is_err(), "the close was sent");
+    }
+
+    #[gpui::test]
+    fn retrying_a_close_from_a_merge_with_nothing_to_lose_sends_the_fresh_check(
+        cx: &mut TestAppContext,
+    ) {
+        let (socket, closes) = socket_with_check(CloseCheck::default());
+        let (workspace, cx, _client) = real_task_workspace(&socket, cx);
+
+        fail_and_click_retry(&workspace, CloseFailure::Other("busy".to_owned()), cx);
+        let sent = wait_until(cx, |_| !closes.is_empty());
+
+        assert!(sent);
+        assert!(!dialog_is_open(&workspace, cx));
+    }
+
+    #[gpui::test]
+    fn retrying_after_the_daemon_found_more_to_lose_opens_the_dialog_with_a_fresh_check(
+        cx: &mut TestAppContext,
+    ) {
+        let (socket, closes) = socket_with_check(CloseCheck::default());
+        let (workspace, cx, _client) = real_task_workspace(&socket, cx);
+        let task = active_task(&workspace, cx);
+        let confirmed = CloseCheck::default();
+        workspace.update(cx, |workspace, cx| {
+            workspace.begin_cleanup(task, Some(confirmed), cx);
+            workspace.close_failed(DaemonTaskId(7), CloseFailure::WouldLoseMore, cx);
+        });
+        redraw(cx);
+
+        click("cleanup-retry", cx);
+        let opened = wait_until(cx, |cx| {
+            redraw(cx);
+            dialog_is_open(&workspace, cx)
+        });
+
+        assert!(opened);
+        assert!(closes.try_recv().is_err(), "the old check was sent again");
+    }
+
+    #[gpui::test]
+    fn the_close_dialog_does_not_open_over_a_cleanup_that_is_working(cx: &mut TestAppContext) {
+        let (workspace, cx, _client) = workspace_with_task(cx);
+        let task = active_task(&workspace, cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.close_step(DaemonTaskId(7), CloseStep::StoppingAgents, cx);
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_close_task(task, window, cx);
+        });
+
+        assert!(!dialog_is_open(&workspace, cx));
+    }
+
+    #[gpui::test]
+    fn the_bee_does_not_drift_under_reduce_motion(cx: &mut TestAppContext) {
+        let (workspace, cx, _client) = workspace_with_task(cx);
+        cx.update(|_, cx| crate::workspace::follow_test_reduce_motion(true, cx));
+        workspace.update(cx, |workspace, cx| {
+            workspace.close_step(DaemonTaskId(7), CloseStep::StoppingAgents, cx);
+        });
+
+        redraw(cx);
+
+        assert!(cx.debug_bounds("cleanup").is_some());
+        assert!(cx.debug_bounds("cleanup-bee-drift").is_none());
+    }
+
+    #[gpui::test]
+    fn the_bee_drifts_while_motion_is_allowed(cx: &mut TestAppContext) {
+        let (workspace, cx, _client) = workspace_with_task(cx);
+        cx.update(|_, cx| crate::workspace::follow_test_reduce_motion(false, cx));
+        workspace.update(cx, |workspace, cx| {
+            workspace.close_step(DaemonTaskId(7), CloseStep::StoppingAgents, cx);
+        });
+
+        redraw(cx);
+
+        assert!(cx.debug_bounds("cleanup-bee-drift").is_some());
     }
 
     #[gpui::test]

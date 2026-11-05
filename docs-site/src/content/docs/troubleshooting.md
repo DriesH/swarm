@@ -115,4 +115,6 @@ Under **Include**:
 
 **Show what is sent** lists the exact text that goes into the address. The address stays under 6000 characters. A field that is too long is cut and ends with "…", and the list names it.
 
-**Open on GitHub** opens `https://github.com/DriesH/swarm/issues/new` with the form of your tab, `bug.yml`, `feature.yml` or `feedback.yml`, and closes the dialog. The three forms are in `.github/ISSUE_TEMPLATE/`. Each sets its own label: `bug`, `enhancement` or `feedback`.
+**Open on GitHub** opens `https://github.com/DriesH/swarm/issues/new` with the form of your tab, `bug.yml`, `feature.yml` or `feedback.yml`, and closes the dialog. The three forms are in `.github/ISSUE_TEMPLATE/`. Each sets its own label: `bug`, `enhancement` or `question`.
+
+Enter in the **Title** moves to the next field. ⌘↩ in any field opens GitHub, like **Open on GitHub**.

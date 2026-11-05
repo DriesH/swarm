@@ -456,7 +456,8 @@ impl Render for PrDescriptionTile {
             .absolute()
             .child(panel);
 
-        let panel = match (self.from, self.phase) {
+        let from = self.from.filter(|_| !swarm_ui::motion::reduce_motion(cx));
+        let panel = match (from, self.phase) {
             (None, _) => place(target)(frame).into_any_element(),
             (Some(from), Phase::Opening) => frame
                 .with_animation(
@@ -601,5 +602,56 @@ mod tests {
         assert_eq!(word_count("## What\n\n- one two  three"), "6 words");
         assert_eq!(word_count("one"), "1 word");
         assert_eq!(word_count(""), "0 words");
+    }
+}
+
+#[cfg(test)]
+mod screen_tests {
+    use gpui::{TestAppContext, VisualTestContext};
+
+    use super::*;
+    use crate::workspace::follow_test_reduce_motion;
+
+    fn field() -> Bounds<Pixels> {
+        Bounds {
+            origin: point(px(1000.), px(300.)),
+            size: size(px(200.), px(100.)),
+        }
+    }
+
+    fn open_tile(reduced: bool, cx: &mut TestAppContext) -> &mut VisualTestContext {
+        cx.update(|cx| {
+            swarm_ui::init(cx);
+            follow_test_reduce_motion(reduced, cx);
+        });
+
+        let (_tile, cx) = cx.add_window_view(|window, cx| {
+            let title = cx.new(TextInput::new);
+            let description = cx.new(TextArea::new);
+
+            PrDescriptionTile::new(title, description, Some(field()), window, cx)
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        cx
+    }
+
+    #[gpui::test]
+    fn the_tile_opens_at_once_under_reduce_motion(cx: &mut TestAppContext) {
+        let cx = open_tile(true, cx);
+
+        let bounds = cx.debug_bounds("pr-description");
+
+        let target = cx.update(|window, _| target_bounds(window.viewport_size()));
+        assert_eq!(bounds, Some(target));
+    }
+
+    #[gpui::test]
+    fn the_tile_grows_from_the_field_when_motion_is_allowed(cx: &mut TestAppContext) {
+        let cx = open_tile(false, cx);
+
+        let bounds = cx.debug_bounds("pr-description");
+
+        assert_eq!(bounds, Some(field()));
     }
 }

@@ -42,7 +42,8 @@ const WAIT: (Duration, Duration) = (Duration::from_mins(1), Duration::from_mins(
 const TICK: Duration = Duration::from_secs(15);
 
 /// Each sprite pixel in the title bar is half a logical pixel: 32 pixels for the sprite,
-/// which fits the 40 pixel bar and is one device pixel on a Retina screen.
+/// which fits the 40 pixel bar and is one device pixel on a Retina screen. Below that, the
+/// frame of every second pixel is drawn.
 const BAR_UNIT: f32 = 0.5;
 
 /// Space above the sprite in the title bar.
@@ -87,6 +88,13 @@ impl Schedule {
 
         self.starts.len() < MAX_PER_DAY
             && last.is_none_or(|last| now.saturating_sub(last) >= millis(MIN_GAP))
+    }
+
+    /// Takes the start times the daemon kept, so the cap and the gap hold after a restart.
+    pub(crate) fn remember(&mut self, starts: &[u64]) {
+        self.starts.extend(starts);
+        self.starts.sort_unstable();
+        self.starts.dedup();
     }
 
     /// The wait before a creature comes, from `random`.
@@ -162,9 +170,42 @@ fn paint_color(rgb: Rgb) -> Hsla {
     Hsla::from(gpui::rgb(packed))
 }
 
-/// Paints one frame. `origin` is the top left corner and each sprite pixel is `unit`
-/// logical pixels. Every edge is snapped to a device pixel, so the art stays sharp and has
-/// no seams. With `tint` every pixel has that color: a silhouette.
+/// The quads of one frame, each with its color. `origin` is the top left corner and each
+/// sprite pixel is `unit` logical pixels. The origin and every edge are snapped to a device
+/// pixel, so the art stays sharp and has no seams. When a sprite pixel is smaller than a
+/// device pixel, the frame of every second pixel is drawn at twice the unit: no run drops.
+fn sprite_quads(
+    frame: &Frame,
+    origin: Point<Pixels>,
+    unit: f32,
+    factor: f32,
+) -> impl Iterator<Item = (Bounds<Pixels>, Rgb)> + '_ {
+    let (frame, unit) = if unit * factor < 1. {
+        (frame.halved(), unit * 2.)
+    } else {
+        (frame, unit)
+    };
+    let snap = move |value: f32| (value * factor).round() / factor;
+    let (left, top) = (snap(f32::from(origin.x)), snap(f32::from(origin.y)));
+
+    (0..frame.side()).flat_map(move |row| {
+        let upper = snap(top + float(row) * unit);
+        let lower = snap(top + float(row + 1) * unit);
+
+        frame.runs(row).iter().map(move |run| {
+            let start = snap(left + float(run.column) * unit);
+            let end = snap(left + float(run.column + run.length) * unit);
+            let bounds = Bounds::new(
+                point(px(start), px(upper)),
+                size(px(end - start), px(lower - upper)),
+            );
+
+            (bounds, run.color)
+        })
+    })
+}
+
+/// Paints one frame. With `tint` every pixel has that color: a silhouette.
 fn paint_frame(
     window: &mut Window,
     origin: Point<Pixels>,
@@ -172,26 +213,8 @@ fn paint_frame(
     frame: &Frame,
     tint: Option<Rgb>,
 ) {
-    let factor = window.scale_factor();
-    let snap = |value: f32| (value * factor).round() / factor;
-    let (left, top) = (f32::from(origin.x), f32::from(origin.y));
-
-    for row in 0..SIDE {
-        let upper = snap(top + float(row) * unit);
-        let lower = snap(top + float(row + 1) * unit);
-
-        for run in frame.runs(row) {
-            let start = snap(left + float(run.column) * unit);
-            let end = snap(left + float(run.column + run.length) * unit);
-
-            window.paint_quad(fill(
-                Bounds::new(
-                    point(px(start), px(upper)),
-                    size(px(end - start), px(lower - upper)),
-                ),
-                paint_color(tint.unwrap_or(run.color)),
-            ));
-        }
+    for (bounds, color) in sprite_quads(frame, origin, unit, window.scale_factor()) {
+        window.paint_quad(fill(bounds, paint_color(tint.unwrap_or(color))));
     }
 }
 
@@ -392,6 +415,8 @@ pub(crate) struct FieldGuide {
     visit: Option<ActiveVisit>,
     /// The creatures caught, as the daemon last told.
     catches: Vec<Catch>,
+    /// Catches made while the daemon was away: sent when it is back.
+    queued: Vec<&'static str>,
     serial: usize,
     ticker: Option<Task<()>>,
 }
@@ -422,6 +447,27 @@ impl FieldGuide {
     pub(crate) fn catch_of(&self, slug: &str) -> Option<&Catch> {
         self.catches.iter().find(|catch| catch.creature == slug)
     }
+}
+
+/// The catches the daemon has, and the ones we know that it has not, or not yet: for each
+/// creature the higher count and the earlier first catch.
+fn merge_catches(daemon: Vec<Catch>, known: &[Catch]) -> Vec<Catch> {
+    let mut merged = daemon;
+
+    for catch in known {
+        match merged
+            .iter_mut()
+            .find(|other| other.creature == catch.creature)
+        {
+            Some(other) => {
+                other.count = other.count.max(catch.count);
+                other.first_caught_at = other.first_caught_at.min(catch.first_caught_at);
+            }
+            None => merged.push(catch.clone()),
+        }
+    }
+
+    merged
 }
 
 impl Workspace {
@@ -474,7 +520,47 @@ impl Workspace {
 
         if self.field_guide.schedule.tick(now, eligible, random()) {
             self.spawn_creature(pick_creature(random()), cx);
+            self.keep_visit(now, cx);
         }
+    }
+
+    /// Tells the daemon a creature came, so the limits hold after a restart.
+    fn keep_visit(&self, at: u64, cx: &mut Context<Self>) {
+        let Some(client) = self.daemon.clone().filter(Client::is_connected) else {
+            return;
+        };
+
+        cx.background_spawn(async move {
+            if let Err(error) = client.record_visit(at) {
+                log::warn!("cannot record the visit of the creature: {error}");
+            }
+        })
+        .detach();
+    }
+
+    /// Takes the start times the daemon kept.
+    pub(crate) fn load_visits(client: Client, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let asking = cx
+                .background_executor()
+                .spawn(async move { client.visits() });
+
+            let starts = match asking.await {
+                Ok(starts) => starts,
+                Err(error) => {
+                    log::warn!("cannot read when the creatures came: {error}");
+                    return;
+                }
+            };
+
+            let kept = this.update(cx, |workspace, _| {
+                workspace.field_guide.schedule.remember(&starts);
+            });
+            if let Err(error) = kept {
+                log::debug!("the workspace closed before the visits came: {error}");
+            }
+        })
+        .detach();
     }
 
     /// Puts the creature at this place in the list in the title bar for [`VISIT`].
@@ -549,6 +635,7 @@ impl Workspace {
                 .find(|catch| catch.creature == slug)
                 .map_or_else(|| self.now_ms(), |catch| catch.first_caught_at);
 
+            self.field_guide.queued.push(slug);
             self.catch_recorded(
                 Catch {
                     creature: slug.to_owned(),
@@ -620,23 +707,41 @@ impl Workspace {
             .collect();
     }
 
-    /// Takes the catches the daemon has.
-    pub(crate) fn load_catches(client: Client, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            let asking = cx
-                .background_executor()
-                .spawn(async move { client.catches() });
+    /// Sends the catches made while the daemon was away, then takes the catches it has. A
+    /// catch that is not sent stays queued, and the ones we know stay in the list.
+    pub(crate) fn load_catches(&mut self, client: Client, cx: &mut Context<Self>) {
+        let queued = std::mem::take(&mut self.field_guide.queued);
 
-            let catches = match asking.await {
+        cx.spawn(async move |this, cx| {
+            let asking = cx.background_executor().spawn(async move {
+                let unsent: Vec<&'static str> = queued
+                    .into_iter()
+                    .filter(|slug| {
+                        client
+                            .record_catch(slug)
+                            .inspect_err(|error| {
+                                log::warn!("cannot record the catch of {slug}: {error}");
+                            })
+                            .is_err()
+                    })
+                    .collect();
+
+                (unsent, client.catches())
+            });
+
+            let (unsent, catches) = asking.await;
+            let catches = match catches {
                 Ok(catches) => catches,
                 Err(error) => {
                     log::warn!("cannot read the caught creatures: {error}");
-                    return;
+                    Vec::new()
                 }
             };
 
             let shown = this.update(cx, |workspace, cx| {
-                workspace.field_guide.catches = catches;
+                workspace.field_guide.queued.extend(unsent);
+                workspace.field_guide.catches =
+                    merge_catches(catches, &workspace.field_guide.catches);
                 workspace.sync_caught_creatures();
                 cx.notify();
             });
@@ -1028,6 +1133,23 @@ impl FieldGuideView {
     }
 }
 
+/// A row of cards. The cards are list items, so the row is the list that holds them.
+fn card_row(
+    position: usize,
+    label: String,
+    cards: Vec<AnyElement>,
+    spacers: usize,
+) -> gpui::Stateful<gpui::Div> {
+    h_flex()
+        .id(("field-guide-row", position))
+        .role(Role::List)
+        .aria_label(label)
+        .gap(px(12.))
+        .p(px(2.))
+        .children(cards)
+        .children((0..spacers).map(|_| div().flex_1().min_w_0()))
+}
+
 impl Render for FieldGuideView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.roving.sync(CREATURES.len(), cx);
@@ -1087,17 +1209,9 @@ impl Render for FieldGuideView {
                     .collect();
                 let spacers = COLUMNS.saturating_sub(cards.len());
 
-                content.push(
-                    h_flex()
-                        .id(("field-guide-row", content.len()))
-                        .role(Role::Group)
-                        .aria_label(format!("{}, row {}", tier_name(tier), number + 1))
-                        .gap(px(12.))
-                        .p(px(2.))
-                        .children(cards)
-                        .children((0..spacers).map(|_| div().flex_1().min_w_0()))
-                        .into_any_element(),
-                );
+                let label = format!("{}, row {}", tier_name(tier), number + 1);
+
+                content.push(card_row(content.len(), label, cards, spacers).into_any_element());
             }
         }
         self.row_of = row_of;
@@ -1227,6 +1341,80 @@ mod tests {
         assert_eq!(Schedule::wait(0), least);
         assert_eq!(Schedule::wait(most - least), most);
         assert_eq!(Schedule::wait(most - least + 1), least);
+    }
+
+    #[test]
+    fn a_row_of_cards_is_the_list_that_holds_the_list_items() {
+        use gpui::Element as _;
+
+        let row = card_row(0, "Common, row 1".to_owned(), Vec::new(), 0);
+
+        assert_eq!(row.a11y_role(), Some(Role::List));
+    }
+
+    fn bee_frame() -> &'static Frame {
+        let sprite = swarm_creatures::sprite(0).expect("a sprite");
+
+        &sprite.frames(Motion::Still)[0]
+    }
+
+    fn run_count(frame: &Frame) -> usize {
+        (0..frame.side()).map(|row| frame.runs(row).len()).sum()
+    }
+
+    fn bar_quads(factor: f32, origin: Point<Pixels>) -> Vec<(Bounds<Pixels>, Rgb)> {
+        sprite_quads(bee_frame(), origin, BAR_UNIT, factor).collect()
+    }
+
+    /// True when every quad is at least one device pixel wide and high.
+    fn none_vanishes(quads: &[(Bounds<Pixels>, Rgb)], factor: f32) -> bool {
+        quads.iter().all(|(bounds, _)| {
+            f32::from(bounds.size.width) * factor > 0.99
+                && f32::from(bounds.size.height) * factor > 0.99
+        })
+    }
+
+    #[test]
+    fn on_a_retina_screen_the_bar_draws_each_run_of_the_full_frame() {
+        let quads = bar_quads(2., point(px(10.), px(4.)));
+
+        assert_eq!(quads.len(), run_count(bee_frame()));
+        assert!(none_vanishes(&quads, 2.));
+    }
+
+    #[test]
+    fn on_a_one_x_screen_the_bar_draws_the_frame_of_every_second_pixel() {
+        let quads = bar_quads(1., point(px(10.), px(4.)));
+
+        assert_eq!(quads.len(), run_count(bee_frame().halved()));
+        assert!(none_vanishes(&quads, 1.));
+    }
+
+    #[test]
+    fn between_one_x_and_two_x_no_run_of_the_bar_vanishes() {
+        let quads = bar_quads(1.5, point(px(10.), px(4.)));
+
+        assert_eq!(quads.len(), run_count(bee_frame().halved()));
+        assert!(none_vanishes(&quads, 1.5));
+    }
+
+    #[test]
+    fn the_sprite_origin_snaps_to_a_whole_device_pixel() {
+        for factor in [1., 1.5, 2.] {
+            let quads = bar_quads(factor, point(px(10.3), px(4.6)));
+
+            let whole = |value: Pixels| {
+                let device = f32::from(value) * factor;
+
+                (device - device.round()).abs() < 0.001
+            };
+            assert!(
+                quads
+                    .iter()
+                    .all(|(bounds, _)| whole(bounds.origin.x) && whole(bounds.origin.y)),
+                "scale factor {factor}"
+            );
+        }
     }
 
     /// A small seeded generator, so the odds can be counted.
@@ -1768,5 +1956,196 @@ mod tests {
 
         assert!(recorded, "the daemon's answer never arrived");
         assert_eq!(caught_slugs(&workspace, cx), ["apis-mellifera"]);
+    }
+
+    #[test]
+    fn the_cap_holds_with_the_start_times_the_daemon_kept() {
+        let mut schedule = Schedule::default();
+        let now = 10 * millis(DAY);
+        let kept: Vec<u64> = (1..=4).map(|hours| now - hours * 3_600_000).collect();
+
+        schedule.remember(&kept);
+
+        let mut came = false;
+        for minute in 0..120 {
+            came |= schedule.tick(now + minute * MINUTE, true, 0);
+        }
+        assert!(!came);
+    }
+
+    #[test]
+    fn the_gap_holds_with_the_start_time_the_daemon_kept() {
+        let mut schedule = Schedule::default();
+        let now = 10 * millis(DAY);
+        schedule.remember(&[now - 10 * MINUTE]);
+
+        let mut came = Vec::new();
+        for minute in 0..60 {
+            if schedule.tick(now + minute * MINUTE, true, 0) {
+                came.push(minute);
+            }
+        }
+
+        assert!(came.iter().all(|minute| *minute >= 35), "{came:?}");
+    }
+
+    #[test]
+    fn remembering_a_start_twice_keeps_it_once() {
+        let mut schedule = Schedule::default();
+
+        schedule.remember(&[5, 3]);
+        schedule.remember(&[3, 5, 9]);
+
+        assert_eq!(schedule.starts, [3, 5, 9]);
+    }
+
+    #[gpui::test]
+    fn the_start_times_come_from_the_daemon_at_connect(cx: &mut TestAppContext) {
+        let socket = fake_daemon_replying(|request| match request {
+            Request::Visits { call } => Some(Event::Visits {
+                call,
+                starts: vec![1, 2, 3, 4],
+            }),
+            _ => None,
+        });
+        let (workspace, cx) = setup(cx);
+        cx.executor().allow_parking();
+        let client = Client::connect(&socket).expect("connect to the fake daemon");
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.use_daemon(client.clone(), &[], window, cx);
+        });
+        let loaded = wait_until(cx, |cx| {
+            workspace.read_with(cx, |workspace, _| {
+                workspace.field_guide.schedule.starts == [1, 2, 3, 4]
+            })
+        });
+
+        assert!(loaded, "the start times never loaded");
+    }
+
+    #[gpui::test]
+    fn a_creature_that_comes_is_recorded_by_the_daemon(cx: &mut TestAppContext) {
+        let (sent, visits) = flume::unbounded();
+        let socket = fake_daemon_replying(move |request| match request {
+            Request::RecordVisit { call, at } => {
+                sent.send(at).ok();
+
+                Some(Event::Done { call })
+            }
+            _ => None,
+        });
+        let (workspace, cx) = setup(cx);
+        cx.executor().allow_parking();
+        let client = Client::connect(&socket).expect("connect to the fake daemon");
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.use_daemon(client.clone(), &[], window, cx);
+        });
+        work(&workspace, AgentStatus::Working, cx);
+
+        wait_for_a_creature(&workspace, cx);
+        let recorded = wait_until(cx, |_| !visits.is_empty());
+
+        assert!(recorded);
+        assert_eq!(visits.try_recv().ok(), Some(1_000_000 + MINUTE));
+    }
+
+    #[gpui::test]
+    fn a_catch_made_while_disconnected_is_sent_when_the_daemon_is_back(cx: &mut TestAppContext) {
+        let (sent, catches) = flume::unbounded();
+        let socket = fake_daemon_replying(move |request| match request {
+            Request::RecordCatch { call, creature } => {
+                sent.send(creature.clone()).ok();
+
+                Some(Event::CatchRecorded {
+                    call,
+                    caught: Catch {
+                        creature,
+                        first_caught_at: 5,
+                        count: 1,
+                    },
+                })
+            }
+            Request::Catches { call } => Some(Event::Catches {
+                call,
+                catches: Vec::new(),
+            }),
+            _ => None,
+        });
+        let (workspace, cx) = setup(cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.spawn_creature(0, cx);
+            workspace.catch_creature(cx);
+        });
+        cx.executor().allow_parking();
+        let client = Client::connect(&socket).expect("connect to the fake daemon");
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.use_daemon(client.clone(), &[], window, cx);
+        });
+        let sent_back = wait_until(cx, |_| !catches.is_empty());
+
+        assert!(sent_back);
+        assert_eq!(catches.try_recv().ok().as_deref(), Some("apis-mellifera"));
+    }
+
+    #[gpui::test]
+    fn loading_the_catches_keeps_the_ones_made_while_disconnected(cx: &mut TestAppContext) {
+        let socket = fake_daemon_replying(|request| match request {
+            Request::RecordCatch { call, .. } => Some(Event::Error {
+                call: Some(call),
+                id: None,
+                message: "busy".into(),
+            }),
+            Request::Catches { call } => Some(Event::Catches {
+                call,
+                catches: Vec::new(),
+            }),
+            _ => None,
+        });
+        let (workspace, cx) = setup(cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.spawn_creature(0, cx);
+            workspace.catch_creature(cx);
+        });
+        cx.executor().allow_parking();
+        let client = Client::connect(&socket).expect("connect to the fake daemon");
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.use_daemon(client.clone(), &[], window, cx);
+        });
+        let requeued = wait_until(cx, |cx| {
+            workspace.read_with(cx, |workspace, _| !workspace.field_guide.queued.is_empty())
+        });
+
+        assert!(requeued, "the unsent catch was dropped from the queue");
+        assert_eq!(caught_slugs(&workspace, cx), ["apis-mellifera"]);
+    }
+
+    #[test]
+    fn merging_keeps_the_higher_count_and_the_earlier_first_catch() {
+        let daemon = vec![Catch {
+            creature: "a".to_owned(),
+            first_caught_at: 9,
+            count: 1,
+        }];
+        let known = [
+            Catch {
+                creature: "a".to_owned(),
+                first_caught_at: 4,
+                count: 2,
+            },
+            Catch {
+                creature: "b".to_owned(),
+                first_caught_at: 7,
+                count: 1,
+            },
+        ];
+
+        let merged = merge_catches(daemon, &known);
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!((merged[0].count, merged[0].first_caught_at), (2, 4));
+        assert_eq!(merged[1].creature, "b");
     }
 }

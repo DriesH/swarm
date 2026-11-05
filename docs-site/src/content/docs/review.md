@@ -50,7 +50,7 @@ Workers in the shared task worktree commit their own files with `swarm commit`. 
 
 - A card shows the file, **Added** or **Deleted** when that applies, additions and deletions, the worker and the open comments.
 - Lock files, generated files (marked `linguist-generated` in `.gitattributes`, minified files, source maps) and files with more than 500 changed lines come folded. The card shows a tag, **Lock file**, **Generated** or **Large diff**, and **Show diff**, which loads that one file. Totals and approval still count every line.
-- Code has syntax colors for Rust, TypeScript, TSX, JavaScript, PHP, Python, Go, JSON, TOML, YAML, Markdown, CSS, HTML and shell. Swarm colors the whole file, not only the changed lines, so a string or comment that starts above a hunk is colored right. A card shows plain text first and gets its colors a moment later; the text does not move. Folded files, files over 1 MB or 20,000 lines, and other file types stay plain. The colors meet WCAG AA contrast on added and deleted lines too.
+- Code has syntax colors for Rust, TypeScript, TSX, JavaScript, PHP, Python, Go, JSON, TOML, YAML, Markdown, CSS, HTML and shell. Swarm colors the whole file, not only the changed lines, so a string or comment that starts above a hunk is colored right. A card shows plain text first and gets its colors a moment later; the text does not move. Swarm reads only the files you can see, at most four at a time. A file you scroll past stops loading, and loads again when you scroll back. Folded files, files over 1 MB or 20,000 lines, and other file types stay plain. The colors meet WCAG AA contrast on added and deleted lines too.
 - The header of the file you read stays at the top of the diff until the next file's header pushes it out. **Viewed**, the fold button and the other controls keep working there.
 - Tick **Viewed** on a card to fold it and count it as read. The mark and the fold reset when that file's diff changes. Swarm stores both per task, so they survive a restart.
 - Keys: `j` and `k` go to the next and previous file, `v` toggles **Viewed**. ↑ and ↓ move the line cursor in the diff.
@@ -113,7 +113,7 @@ The dialog, titled **Close** and the task name, says **Checking** while it asks 
 
 Choose **Close task** to go on. Swarm then stops the agents and all terminals, runs the project's teardown script if it has one, and removes the task worktree and the workers' own worktrees. Uncommitted work is lost. Every branch that is not merged into the base branch stays. A branch that GitHub merged by squash does not count as merged, so a normal **Close task** keeps it. Only **Close the task after merge** in the [pull request panel](/swarm/docs/pull-requests/#merge) deletes that branch.
 
-Before it deletes anything, the daemon checks again. If closing would now lose more than the dialog showed, it refuses and the cleanup screen shows the reason. Choose **Back to the task**, then **Close task** again to see the new list. A close that a crash interrupted finishes at the next daemon start.
+Before it deletes anything, the daemon checks again. If closing would now lose more than the dialog showed, it refuses and the cleanup screen shows the reason. Choose **Retry**: the **Close** dialog opens again with a new check, so you see the new list before you confirm. A close that a crash interrupted finishes at the next daemon start.
 
 ### The cleanup screen
 
@@ -123,15 +123,15 @@ Under the title, the steps show as the daemon reports them. Each has a mark: a c
 
 - **Stopping agents**
 - **Removing worktrees**
-- **Deleting the merged branch**, only when a merged branch goes
+- **Deleting the merged branch**, only when a merged branch goes. It shows when the daemon starts that step
 
 The task's tab shows a spinner, and the tab bar stays usable: you can open another task meanwhile. When the close ends, the tab goes and focus moves to the tab next to it, or to the Start tab.
 
-Keyboard focus moves to the screen. VoiceOver reads each step once as it starts.
+Keyboard focus moves to the screen. VoiceOver reads each step once as it starts. If the connection to the daemon is lost while a close runs, the screen reads **Cleanup stopped** with `Not connected to the daemon`.
 
 When the close fails, the screen reads **Cleanup stopped** and shows the reason. Three buttons follow:
 
-- **Retry** sends the same close again
+- **Retry** sends the same close again. A close that began with a merge has no check you confirmed, so Swarm checks first. If closing would delete uncommitted files or leave workers unmerged, the **Close** dialog opens and nothing is sent until you confirm
 - **Back to the task** leaves the screen. The task stays open
 - **Report an issue** opens the [report dialog](/swarm/docs/troubleshooting/#report-an-issue) with the reason filled in
 

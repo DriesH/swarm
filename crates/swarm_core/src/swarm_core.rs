@@ -21,6 +21,7 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -128,6 +129,37 @@ pub struct Projects {
     creating: Mutex<()>,
     /// One comment change runs at a time in a task, so a comment is never sent twice.
     comments: comments::TaskLocks,
+    /// The diff plans that file text requests reuse for a short time.
+    plans: Mutex<Vec<CachedPlan>>,
+    /// How many diff plans were built, so a test can tell that a burst built one.
+    plans_built: AtomicUsize,
+}
+
+/// How long file text requests of one task reuse a diff plan: a burst of requests builds
+/// it once.
+const PLAN_REUSE: Duration = Duration::from_secs(2);
+
+struct CachedPlan {
+    task: TaskId,
+    source: ReviewSource,
+    built: Instant,
+    plan: Arc<DiffPlan>,
+}
+
+/// Keeps `plan` as the plan of the task, instead of an older one.
+fn store_plan(
+    plans: &mut Vec<CachedPlan>,
+    task: TaskId,
+    source: ReviewSource,
+    plan: &Arc<DiffPlan>,
+) {
+    plans.retain(|cached| !(cached.task == task && cached.source == source));
+    plans.push(CachedPlan {
+        task,
+        source,
+        built: Instant::now(),
+        plan: Arc::clone(plan),
+    });
 }
 
 impl Projects {
@@ -136,7 +168,41 @@ impl Projects {
             store,
             creating: Mutex::new(()),
             comments: comments::TaskLocks::default(),
+            plans: Mutex::new(Vec::new()),
+            plans_built: AtomicUsize::new(0),
         }
+    }
+
+    /// How many diff plans were built since this value was made.
+    pub fn plans_built(&self) -> usize {
+        self.plans_built.load(Ordering::Relaxed)
+    }
+
+    /// The plan of the task's diff at `HEAD`. Requests that come within [`PLAN_REUSE`] of
+    /// each other share one plan; the lock is held while it is built, so a burst of
+    /// parallel requests builds it once.
+    fn reused_plan(&self, id: TaskId, source: ReviewSource) -> Result<Arc<DiffPlan>, Error> {
+        let mut plans = lock(&self.plans);
+        plans.retain(|cached| cached.built.elapsed() < PLAN_REUSE);
+
+        if let Some(cached) = plans
+            .iter()
+            .find(|cached| cached.task == id && cached.source == source)
+        {
+            return Ok(Arc::clone(&cached.plan));
+        }
+
+        let plan = Arc::new(self.plan_diff(id, source, None)?);
+        self.plans_built.fetch_add(1, Ordering::Relaxed);
+        store_plan(&mut plans, id, source, &plan);
+
+        Ok(plan)
+    }
+
+    /// A diff of the task at `HEAD` just read the plan fresh: later file text requests
+    /// take it instead of the older one.
+    fn keep_plan(&self, id: TaskId, source: ReviewSource, plan: &Arc<DiffPlan>) {
+        store_plan(&mut lock(&self.plans), id, source, plan);
     }
 
     pub fn list(&self) -> Result<Vec<ProjectInfo>, Error> {
@@ -778,7 +844,7 @@ impl Projects {
             return Ok(FileTexts::default());
         }
 
-        let plan = self.plan_diff(id, source, None)?;
+        let plan = self.reused_plan(id, source)?;
         let Some(section) = plan
             .sections
             .iter()
@@ -806,7 +872,11 @@ impl Projects {
         source: ReviewSource,
         commit: Option<&str>,
     ) -> Result<TaskDiff, Error> {
-        let plan = self.plan_diff(id, source, commit)?;
+        let plan = Arc::new(self.plan_diff(id, source, commit)?);
+        if commit.is_none() {
+            self.keep_plan(id, source, &plan);
+        }
+
         let scope = scope_of(source);
         let names = unique_names(&plan.agents);
         let mut budget = git::DiffBudget::default();
@@ -860,7 +930,7 @@ impl Projects {
             task: id,
             source,
             fingerprint: fingerprint.finish(),
-            head: plan.head,
+            head: plan.head.clone(),
             stat,
             files,
         })

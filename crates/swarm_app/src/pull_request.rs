@@ -1161,7 +1161,7 @@ impl Workspace {
             }
             PrEvent::Draft { task, draft } => self.draft_arrived(task, draft, cx),
             PrEvent::CloseStep { task, step } => self.close_step(task, step, cx),
-            PrEvent::CloseFailed { task, message } => self.close_failed(task, message, cx),
+            PrEvent::CloseFailed { task, reason } => self.close_failed(task, reason, cx),
         }
     }
 

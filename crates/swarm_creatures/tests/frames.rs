@@ -187,3 +187,37 @@ fn runs_cover_the_filled_pixels_of_a_row() {
         assert_eq!(covered, filled, "row {row}");
     }
 }
+
+#[test]
+fn the_halved_frame_takes_every_second_pixel() {
+    for index in 0..COUNT {
+        let frame = &sprite(index).expect("a sprite").frames(Motion::Still)[0];
+        let half = frame.halved();
+
+        assert_eq!(half.side(), SIDE / 2, "creature {index}");
+        for row in 0..half.side() {
+            for column in 0..half.side() {
+                assert_eq!(
+                    half.pixel(column, row),
+                    frame.pixel(column * 2, row * 2),
+                    "creature {index} at {column}, {row}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn the_runs_of_the_halved_frame_cover_its_filled_pixels() {
+    let frame = &sprite(0).expect("a sprite").frames(Motion::Still)[0];
+    let half = frame.halved();
+
+    for row in 0..half.side() {
+        let covered: usize = half.runs(row).iter().map(|run| run.length).sum();
+        let filled = (0..half.side())
+            .filter(|&column| half.pixel(column, row).is_some())
+            .count();
+
+        assert_eq!(covered, filled, "row {row}");
+    }
+}
