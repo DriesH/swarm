@@ -50,6 +50,9 @@ const CLAUDE_HOOK_TIMEOUT: u32 = 5;
 /// 600 s.
 const CODEX_TOOL_TIMEOUT_SECS: u32 = 660;
 
+/// Claude Code tools that start helpers outside Swarm.
+const CLAUDE_SUBAGENT_TOOLS: &[&str] = &["Agent", "Workflow"];
+
 /// Permission rules that let the harness run without asking (Claude Code): every call
 /// but the one that starts a program outside the sandbox.
 fn claude_allowed() -> Vec<String> {
@@ -95,6 +98,9 @@ pub struct LaunchSpec<'a> {
     /// Git folders outside the worktree that a Codex sandbox must be able to write for
     /// `git commit` to work in a linked worktree.
     pub writable_roots: &'a [PathBuf],
+    /// Orchestrators start every helper with `swarm spawn`. Claude Code then loses its
+    /// built-in subagent and workflow tools; Codex only gets the prompt line.
+    pub deny_subagents: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,6 +172,9 @@ fn claude(spec: &LaunchSpec<'_>) -> Launch {
         "permissions": { "allow": claude_allowed() },
         "statusLine": status_line,
     });
+    if spec.deny_subagents {
+        settings["permissions"]["deny"] = json!(CLAUDE_SUBAGENT_TOOLS);
+    }
     if spec.skip_permissions {
         // Else Claude Code asks once before it enters bypass mode.
         settings["skipDangerousModePermissionPrompt"] = json!(true);
@@ -407,6 +416,7 @@ mod tests {
             session: Session::New(Some("11111111-2222-4333-8444-555555555555")),
             harness_env: &[],
             writable_roots: &[],
+            deny_subagents: false,
         }
     }
 
@@ -812,6 +822,38 @@ mod tests {
             .expect("tools");
 
         assert_eq!(tools["commit"]["approval_mode"].as_str(), Some("approve"));
+    }
+
+    fn denied_rules(launch: &Launch) -> Vec<String> {
+        let settings: serde_json::Value =
+            serde_json::from_str(&launch.files[0].contents).expect("json");
+
+        settings["permissions"]["deny"]
+            .as_array()
+            .map(|rules| {
+                rules
+                    .iter()
+                    .filter_map(|rule| rule.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn claude_orchestrators_cannot_use_the_built_in_subagent_tools() {
+        let launch = build(&LaunchSpec {
+            deny_subagents: true,
+            ..spec(AgentKind::ClaudeCode)
+        });
+
+        assert_eq!(denied_rules(&launch), ["Agent", "Workflow"]);
+    }
+
+    #[test]
+    fn claude_workers_keep_the_built_in_subagent_tools() {
+        let launch = build(&spec(AgentKind::ClaudeCode));
+
+        assert!(denied_rules(&launch).is_empty());
     }
 
     #[test]

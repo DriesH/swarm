@@ -1,12 +1,15 @@
 use gpui::{
-    AnyElement, App, ElementId, FocusHandle, FontWeight, Hsla, Role, SharedString, Window, div, px,
-    relative,
+    AnyElement, App, ElementId, FocusHandle, FontWeight, Hsla, Pixels, Role, SharedString, Window,
+    div, px, relative,
 };
 
 use crate::a11y::accessible;
 use crate::component::{Component, example, example_group};
 use crate::fonts::MONO_FONT;
 use crate::prelude::*;
+
+/// The corner radius of a tile, its border and its focus border.
+pub const TILE_RADIUS: Pixels = px(10.);
 
 /// The color of the ring on a focused tile.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -38,6 +41,7 @@ pub struct TileFrame {
     focused: bool,
     attention: bool,
     focus_handle: Option<FocusHandle>,
+    debug_selector: Option<String>,
 }
 
 impl TileFrame {
@@ -58,6 +62,7 @@ impl TileFrame {
             focused: false,
             attention: false,
             focus_handle: None,
+            debug_selector: None,
         }
     }
 
@@ -120,6 +125,13 @@ impl TileFrame {
     /// are set, so the user always sees where they are.
     pub fn attention(mut self, attention: bool) -> Self {
         self.attention = attention;
+        self
+    }
+
+    /// Name for `VisualTestContext::debug_bounds` of the tile; the ring gets `<name>-ring`.
+    /// Only recorded in test builds.
+    pub fn debug_selector(mut self, selector: impl FnOnce() -> String) -> Self {
+        self.debug_selector = Some(selector());
         self
     }
 
@@ -194,10 +206,9 @@ impl RenderOnce for TileFrame {
             })
             .children(self.actions);
 
-        accessible(div().id(self.id), Role::Group, label)
-            .map(|tile| match &self.focus_handle {
-                Some(handle) => tile.track_focus(handle),
-                None => tile,
+        let tile = div()
+            .when_some(self.debug_selector.clone(), |tile, selector| {
+                tile.debug_selector(move || selector)
             })
             .relative()
             .size_full()
@@ -205,7 +216,7 @@ impl RenderOnce for TileFrame {
             .flex_col()
             .min_w_0()
             .min_h_0()
-            .rounded(px(10.))
+            .rounded(TILE_RADIUS)
             .border_1()
             .border_color(line)
             .bg(term)
@@ -223,17 +234,31 @@ impl RenderOnce for TileFrame {
                     .overflow_hidden()
                     .children(self.body),
             )
-            .children(self.footer.map(|footer| div().flex_none().child(footer)))
-            // Drawn last, above the header, as an overlay so the ring never
-            // moves the layout.
-            .when_some(ring, |tile, ring| {
-                tile.child(
+            .children(self.footer.map(|footer| div().flex_none().child(footer)));
+
+        // The ring is a sibling of the tile, so it spans the tile's border box and paints
+        // over the tile border: one border, and the layout never moves.
+        accessible(div().id(self.id), Role::Group, label)
+            .map(|wrapper| match &self.focus_handle {
+                Some(handle) => wrapper.track_focus(handle),
+                None => wrapper,
+            })
+            .relative()
+            .size_full()
+            .min_w_0()
+            .min_h_0()
+            .child(tile)
+            .when_some(ring, |wrapper, ring| {
+                wrapper.child(
                     div()
+                        .when_some(self.debug_selector, |ring, selector| {
+                            ring.debug_selector(move || format!("{selector}-ring"))
+                        })
                         .absolute()
                         .top_0()
                         .left_0()
                         .size_full()
-                        .rounded(px(10.))
+                        .rounded(TILE_RADIUS)
                         .border_2()
                         .border_color(ring),
                 )

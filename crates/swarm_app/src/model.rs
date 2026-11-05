@@ -132,6 +132,8 @@ pub(crate) struct Task {
     pub user_terminals: Vec<TerminalId>,
     /// The fingerprint of the Merged diff the user approved.
     pub approved: Option<u64>,
+    /// New work made the approval outdated, see [`TaskInfo::approval_stale`].
+    pub approval_stale: bool,
     /// The pull request made from the task branch, once it exists.
     pub pull_request: Option<PrLink>,
     /// Close the task once its pull request is merged.
@@ -893,6 +895,7 @@ impl Builder {
             processes: Vec::new(),
             user_terminals: Vec::new(),
             approved: None,
+            approval_stale: false,
             pull_request: None,
             close_after_merge: false,
             is_start: false,
@@ -1520,6 +1523,7 @@ impl FakeData {
             task.name = SharedString::new(&info.name);
             task.branch = SharedString::new(&info.branch);
             task.approved = info.approved;
+            task.approval_stale = info.approval_stale;
             task.pull_request.clone_from(&info.pull_request);
             task.close_after_merge = info.close_after_merge;
             let known = task.daemon.as_ref().and_then(|old| old.setup_terminal);
@@ -1553,6 +1557,7 @@ impl FakeData {
             processes: Vec::new(),
             user_terminals: Vec::new(),
             approved: info.approved,
+            approval_stale: info.approval_stale,
             pull_request: info.pull_request.clone(),
             close_after_merge: info.close_after_merge,
             is_start: false,
@@ -1813,6 +1818,7 @@ impl FakeData {
     }
 
     /// The fingerprint of the Merged diff the app has loaded for a tab.
+    #[cfg(any(test, feature = "snapshot"))]
     pub(crate) fn merged_fingerprint(&self, task: TaskId) -> Option<u64> {
         self.task_diff(task, ReviewSource::Merged)
             .map(|diff| diff.fingerprint)
@@ -1824,15 +1830,11 @@ impl FakeData {
             .map(|diff| diff.head.as_str())
     }
 
-    /// The approval counts: the task is approved and the loaded Merged diff, when there
-    /// is one, is the diff that was approved.
+    /// The approval counts: the task is approved and the daemon has not reported new work
+    /// since. It does not depend on a diff the app loaded.
     pub(crate) fn approval_holds(&self, task: TaskId) -> bool {
-        let Some(approved) = self.task(task).and_then(|task| task.approved) else {
-            return false;
-        };
-
-        self.merged_fingerprint(task)
-            .is_none_or(|loaded| loaded == approved)
+        self.task(task)
+            .is_some_and(|task| task.approved.is_some() && !task.approval_stale)
     }
 
     /// The GitHub setup of the project a tab belongs to, once known.
@@ -2530,6 +2532,7 @@ impl FakeData {
             processes: Vec::new(),
             user_terminals: Vec::new(),
             approved: None,
+            approval_stale: false,
             pull_request: None,
             close_after_merge: false,
             is_start: false,
@@ -2595,6 +2598,7 @@ impl FakeData {
             processes: Vec::new(),
             user_terminals: Vec::new(),
             approved: None,
+            approval_stale: false,
             pull_request: None,
             close_after_merge: false,
             is_start: false,
@@ -2923,6 +2927,7 @@ mod tests {
             created_by: None,
             briefed: false,
             approved: None,
+            approval_stale: false,
             closed: false,
             pull_request: None,
             close_after_merge: false,
@@ -3016,6 +3021,27 @@ mod tests {
         let task = live_task(&mut data, vec![agent_with(DaemonAgentStatus::Error, 1)]);
 
         assert_eq!(data.task(task).expect("task").status, TaskStatus::NeedsYou);
+    }
+
+    #[test]
+    fn a_renamed_task_keeps_its_tab_and_shows_the_new_name_and_branch() {
+        let mut data = FakeData::live();
+        let task = live_task(&mut data, vec![agent_with(DaemonAgentStatus::Idle, 1)]);
+        let project = data.task(task).expect("task").project;
+
+        let renamed = TaskInfo {
+            name: "clean-up-code".into(),
+            branch: "swarm/clean-up-code".into(),
+            ..task_with(vec![agent_with(DaemonAgentStatus::Idle, 2)])
+        };
+        let same = data.sync_task(project, &renamed);
+
+        let tab = data.task(task).expect("task");
+        assert_eq!(same, task);
+        assert_eq!(
+            (tab.name.as_ref(), tab.branch.as_ref()),
+            ("clean-up-code", "swarm/clean-up-code")
+        );
     }
 
     #[test]

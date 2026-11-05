@@ -52,6 +52,10 @@ pub(crate) enum Command {
     Merge {
         worker: String,
     },
+    /// `worker` is an agent ID or a worker name.
+    Stop {
+        worker: String,
+    },
     Agents,
     Confirm,
     PrDraft {
@@ -66,10 +70,13 @@ pub(crate) enum Command {
         agent: Option<String>,
     },
     TaskCreate {
-        name: String,
+        name: Option<String>,
         from: Option<String>,
         brief: String,
         kind: Option<AgentKind>,
+    },
+    TaskRename {
+        name: String,
     },
     TaskList,
     TaskWait {
@@ -166,6 +173,13 @@ impl Command {
 
                 merged(session.call(Call::Merge { worker })?)
             }
+            Self::Stop { worker } => {
+                let worker = resolve(session, &worker)?;
+                let result = session.call(Call::Stop { worker })?;
+                let stopped: AgentSummary = decode(&result)?;
+
+                Ok(output(result, format!("stopped worker {}", stopped.name)))
+            }
             Self::Agents => {
                 let result = session.call(Call::Agents)?;
                 let workers: Vec<AgentSummary> = decode(&result)?;
@@ -184,9 +198,11 @@ impl Command {
             }
             Self::TileGrow { agent } => tile(session, agent, true),
             Self::TileShrink { agent } => tile(session, agent, false),
-            Self::TaskCreate { .. } | Self::TaskList | Self::TaskWait { .. } | Self::Exit => {
-                self.run_task(session)
-            }
+            Self::TaskCreate { .. }
+            | Self::TaskRename { .. }
+            | Self::TaskList
+            | Self::TaskWait { .. }
+            | Self::Exit => self.run_task(session),
             Self::TerminalSpawn { .. }
             | Self::TerminalResize { .. }
             | Self::TerminalRead { .. }
@@ -219,6 +235,16 @@ impl Command {
                 );
                 let text = format!(
                     "created task {} ({})\nbranch: {}\norchestrator: {orchestrator}",
+                    task.id.0, task.name, task.branch
+                );
+
+                Ok(output(result, text))
+            }
+            Self::TaskRename { name } => {
+                let result = session.call(Call::TaskRename { name })?;
+                let task: TaskSummary = decode(&result)?;
+                let text = format!(
+                    "renamed task {} to {}\nbranch: {}",
                     task.id.0, task.name, task.branch
                 );
 

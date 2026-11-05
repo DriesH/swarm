@@ -12,8 +12,8 @@ use gpui::{
     uniform_list,
 };
 use swarm_protocol::{
-    CommentId, DiffLine, DiffLineKind, DiffSide, FileChange, FileDiff, Fold, ReviewComment,
-    ReviewSource, TaskDiff,
+    Client, CommentId, DiffLine, DiffLineKind, DiffSide, FileChange, FileDiff, Fold, ReviewComment,
+    ReviewMark, ReviewSource, TaskDiff,
 };
 use swarm_ui::fonts::MONO_FONT;
 use swarm_ui::prelude::*;
@@ -107,6 +107,23 @@ impl ReviewInput {
     }
 }
 
+/// Where the viewed and folded marks of Review stand against the daemon's copy.
+#[derive(Default)]
+pub(crate) struct MarksSync {
+    /// The tasks whose stored marks were asked for.
+    asked: HashSet<swarm_protocol::TaskId>,
+    /// Tasks with a read or a save on its way; `true` when marks changed since it began.
+    saving: HashMap<swarm_protocol::TaskId, bool>,
+}
+
+/// What the view tells the workspace.
+pub(crate) enum ReviewEvent {
+    /// The viewed or folded marks of a task changed, so the daemon stores them.
+    MarksChanged(TaskId),
+}
+
+impl gpui::EventEmitter<ReviewEvent> for ReviewView {}
+
 /// Where the top of the body sits, so a new diff keeps the reader in place.
 struct Anchor {
     key: FileKey,
@@ -121,7 +138,9 @@ pub(crate) struct ReviewView {
     selected: HashMap<TaskId, FileKey>,
     /// The digest each viewed file had when it was marked.
     viewed: HashMap<TaskId, HashMap<FileKey, u64>>,
-    collapsed: HashMap<TaskId, HashSet<FileKey>>,
+    /// The digest each folded file had when it was folded. A card is folded while its
+    /// file has that digest.
+    collapsed: HashMap<TaskId, HashMap<FileKey, u64>>,
     handled_jump: u64,
     infos: Rc<[FileInfo]>,
     shown: Rc<[usize]>,
@@ -279,7 +298,6 @@ impl ReviewView {
             .as_ref()
             .is_none_or(|old| old.changes_files(&input))
         {
-            self.forget_changed_files(&input);
             self.follow_composer();
             self.rebuild(same_scope);
         } else if previous
@@ -295,30 +313,68 @@ impl ReviewView {
         cx.notify();
     }
 
-    /// Forgets the viewed mark of every file present with another digest, and opens its card.
-    /// A file the diff does not hold keeps its mark.
-    fn forget_changed_files(&mut self, input: &ReviewInput) {
-        let Some(diff) = &input.diff else {
-            return;
-        };
-        let infos = file_infos(diff);
-        let (Some(viewed), collapsed) = (
-            self.viewed.get_mut(&input.task),
-            self.collapsed.entry(input.task).or_default(),
-        ) else {
-            return;
-        };
+    /// Marks every file of the approved diff viewed and folds it, each at its digest. A file
+    /// that changes later has another digest, so it is open and unviewed again.
+    pub(crate) fn mark_approved(&mut self, task: TaskId, diff: &TaskDiff, cx: &mut Context<Self>) {
+        let viewed = self.viewed.entry(task).or_default();
+        let collapsed = self.collapsed.entry(task).or_default();
 
-        viewed.retain(|key, digest| {
-            let current = infos.iter().find(|info| info.key == *key).map(|i| i.digest);
-            let keep = current.is_none_or(|current| current == *digest);
+        for info in file_infos(diff) {
+            viewed.insert(info.key.clone(), info.digest);
+            collapsed.insert(info.key, info.digest);
+        }
 
-            if !keep {
-                collapsed.remove(key);
+        self.after_card_change();
+        cx.emit(ReviewEvent::MarksChanged(task));
+        cx.notify();
+    }
+
+    /// Takes the marks the daemon stored. A mark made in this session wins.
+    pub(crate) fn load_marks(
+        &mut self,
+        task: TaskId,
+        marks: Vec<ReviewMark>,
+        cx: &mut Context<Self>,
+    ) {
+        let viewed = self.viewed.entry(task).or_default();
+        let collapsed = self.collapsed.entry(task).or_default();
+
+        for mark in marks {
+            let key = (mark.worktree, mark.path);
+
+            if let Some(digest) = mark.viewed {
+                viewed.entry(key.clone()).or_insert(digest);
             }
+            if let Some(digest) = mark.folded {
+                collapsed.entry(key).or_insert(digest);
+            }
+        }
 
-            keep
-        });
+        self.after_card_change();
+        cx.notify();
+    }
+
+    /// The marks of a task, for the daemon to store.
+    pub(crate) fn marks_of(&self, task: TaskId) -> Vec<ReviewMark> {
+        let viewed = self.viewed.get(&task);
+        let collapsed = self.collapsed.get(&task);
+
+        let mut keys: Vec<&FileKey> = viewed
+            .into_iter()
+            .chain(collapsed)
+            .flat_map(HashMap::keys)
+            .collect();
+        keys.sort();
+        keys.dedup();
+
+        keys.into_iter()
+            .map(|key| ReviewMark {
+                worktree: key.0.clone(),
+                path: key.1.clone(),
+                viewed: viewed.and_then(|marks| marks.get(key)).copied(),
+                folded: collapsed.and_then(|marks| marks.get(key)).copied(),
+            })
+            .collect()
     }
 
     /// Takes the viewer back to an empty state, for a tab with no diff.
@@ -393,9 +449,9 @@ impl ReviewView {
             &self.shown,
             (
                 |file| {
-                    self.infos
-                        .get(file)
-                        .is_some_and(|info| collapsed.is_some_and(|set| set.contains(&info.key)))
+                    self.infos.get(file).is_some_and(|info| {
+                        collapsed.and_then(|marks| marks.get(&info.key)) == Some(&info.digest)
+                    })
                 },
                 |file| {
                     diff.files
@@ -669,7 +725,8 @@ impl ReviewView {
 
         self.collapsed
             .get(&task)
-            .is_some_and(|set| set.contains(&info.key))
+            .and_then(|marks| marks.get(&info.key))
+            == Some(&info.digest)
     }
 
     #[cfg(test)]
@@ -720,10 +777,11 @@ impl ReviewView {
             collapsed.remove(&key);
         } else {
             marks.insert(key.clone(), digest);
-            collapsed.insert(key);
+            collapsed.insert(key, digest);
         }
 
         self.after_card_change();
+        cx.emit(ReviewEvent::MarksChanged(task));
         cx.notify();
     }
 
@@ -731,14 +789,17 @@ impl ReviewView {
         let (Some(task), Some(info)) = (self.task(), self.infos.get(file)) else {
             return;
         };
-        let key = info.key.clone();
+        let (key, digest) = (info.key.clone(), info.digest);
         let collapsed = self.collapsed.entry(task).or_default();
 
-        if !collapsed.remove(&key) {
-            collapsed.insert(key);
+        if collapsed.get(&key) == Some(&digest) {
+            collapsed.remove(&key);
+        } else {
+            collapsed.insert(key, digest);
         }
 
         self.after_card_change();
+        cx.emit(ReviewEvent::MarksChanged(task));
         cx.notify();
     }
 
@@ -1443,7 +1504,12 @@ impl ReviewView {
         colors: &ThemeColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let area = div().flex_1().min_h_0().bg(colors.term);
+        let area = div()
+            .relative()
+            .overflow_hidden()
+            .flex_1()
+            .min_h_0()
+            .bg(colors.term);
 
         let message = match (&input.diff, self.shown.is_empty()) {
             (None, _) => Some("Loading changes"),
@@ -1463,8 +1529,74 @@ impl ReviewView {
         )
         .size_full();
 
+        let sticky = self.sticky_header().and_then(|(file, push)| {
+            let diff = Rc::clone(self.diff()?);
+            let header = self.card_header(file, &diff, true, colors, cx);
+
+            Some(
+                div()
+                    .id("review-sticky-header")
+                    .debug_selector(|| "review-sticky-header".to_owned())
+                    .absolute()
+                    .top(push)
+                    .left_0()
+                    .right_0()
+                    .px(px(CARD_GAP))
+                    .child(
+                        v_flex()
+                            .bg(colors.panel)
+                            .border_l_1()
+                            .border_r_1()
+                            .border_color(colors.line)
+                            .child(header),
+                    ),
+            )
+        });
+
         area.child(self.diff_body(colors, cx).size_full().child(rows))
+            .children(sticky)
             .into_any_element()
+    }
+
+    /// The file whose header sticks to the top of the body, and how far (zero or negative)
+    /// the header of the next card has pushed it up. `None` while the header of the first
+    /// file in view is itself in view.
+    fn sticky_header(&self) -> Option<(usize, gpui::Pixels)> {
+        let top = self.body_list.logical_scroll_top();
+        let file = self.body.rows.get(top.item_ix)?.file()?;
+        let header = (*self.body.headers.get(file)?)?;
+
+        if top.item_ix <= header {
+            return None;
+        }
+
+        let range = self.body.range_of(file)?;
+        let viewport_top = self.body_list.viewport_bounds().top();
+        let push = self
+            .body_list
+            .bounds_for_item(range.end)
+            .map(|next| (next.top() - viewport_top - px(CARD_HEADER + 1.)).min(px(0.)))
+            .unwrap_or_default();
+
+        Some((file, push))
+    }
+
+    /// Scrolls a row into view. A row at the top edge would sit under the sticky header,
+    /// so it moves down by the header's height.
+    fn reveal_row(&self, row: usize) {
+        self.body_list.scroll_to_reveal_item(row);
+
+        let top = self.body_list.logical_scroll_top();
+        let at_top = top.item_ix == row && top.offset_in_item == px(0.);
+        let in_card = self
+            .body
+            .rows
+            .get(row)
+            .is_some_and(|row| !matches!(row, Row::Header { .. } | Row::End));
+
+        if at_top && in_card {
+            self.body_list.scroll_by(-px(CARD_HEADER + 1.));
+        }
     }
 
     /// The diff as a list: a screen reader reads the number of lines and the one with
@@ -1780,12 +1912,17 @@ impl ReviewView {
                     )
             }))
             .child(
-                Checkbox::new(("review-viewed", file), format!("Viewed, {}", info.name))
-                    .display_label("Viewed")
-                    .toggle_state(viewed)
-                    .on_toggle(move |_, _, cx| {
-                        toggle_view.update(cx, |this, cx| this.toggle_viewed(file, cx));
-                    }),
+                div()
+                    .flex_none()
+                    .debug_selector(|| format!("review-viewed-{file}"))
+                    .child(
+                        Checkbox::new(("review-viewed", file), format!("Viewed, {}", info.name))
+                            .display_label("Viewed")
+                            .toggle_state(viewed)
+                            .on_toggle(move |_, _, cx| {
+                                toggle_view.update(cx, |this, cx| this.toggle_viewed(file, cx));
+                            }),
+                    ),
             )
             .into_any_element()
     }
@@ -2030,21 +2167,29 @@ fn pick_cell(
         })
 }
 
-/// The **+** in a line's gutter: it shows while the row is hovered.
+/// The **+** in a line's gutter: it shows while the row is hovered. It covers the line
+/// number then, so the **+** never reads as part of the number.
 fn add_button(
     id: (&'static str, usize),
     ctx: &LineCtx,
     side: DiffSide,
     number: u32,
     group: &SharedString,
+    backdrop: gpui::Hsla,
 ) -> AnyElement {
     let view = ctx.view.clone();
     let pos = ctx.pos(side);
 
     div()
         .absolute()
-        .left(px(2.))
-        .top(px(-1.5))
+        .left_0()
+        .top_0()
+        .w(px(NUMBER_WIDTH))
+        .h(px(LINE_HEIGHT))
+        .flex()
+        .items_center()
+        .justify_center()
+        .group_hover(group.clone(), move |style| style.bg(backdrop))
         .child(
             IconButton::new(id, IconName::Plus, comment_label(side, number))
                 .debug_selector(move || format!("{}-{}", id.0, id.1))
@@ -2055,6 +2200,13 @@ fn add_button(
                 }),
         )
         .into_any_element()
+}
+
+/// The fill of a line as a solid color, for what must hide the line number.
+fn line_backdrop(tint: Option<gpui::Hsla>, colors: &ThemeColors) -> gpui::Hsla {
+    tint.map_or(colors.panel, |tint| {
+        swarm_ui::contrast::composite(colors.panel, tint)
+    })
 }
 
 fn unified_line(
@@ -2140,7 +2292,14 @@ fn unified_row(
                 .child(line_text(line)),
         )
         .when(commentable, |row| {
-            row.child(add_button(("review-add", index), ctx, side, number, &group))
+            row.child(add_button(
+                ("review-add", index),
+                ctx,
+                side,
+                number,
+                &group,
+                line_backdrop(tint, colors),
+            ))
         });
 
     Some(row)
@@ -2266,6 +2425,7 @@ fn split_line(
                             diff_side,
                             number,
                             &group,
+                            line_backdrop(tint, colors),
                         ))
                     });
 
@@ -2320,6 +2480,87 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Reads the marks the daemon stored for a task, once per session. A save waits for the
+    /// read, so it never replaces stored marks that the app has not seen yet.
+    fn load_review_marks_if_needed(
+        &mut self,
+        task: TaskId,
+        id: swarm_protocol::TaskId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.daemon.clone().filter(Client::is_connected) else {
+            return;
+        };
+        if !self.marks_sync.asked.insert(id) {
+            return;
+        }
+        self.marks_sync.saving.insert(id, false);
+
+        let reading = cx.background_spawn(async move { client.review_marks(id) });
+
+        cx.spawn(async move |this, cx| {
+            let result = reading.await;
+            let updated = this.update(cx, |workspace, cx| {
+                match result {
+                    Ok(marks) => {
+                        workspace
+                            .review
+                            .update(cx, |review, cx| review.load_marks(task, marks, cx));
+                    }
+                    Err(error) => log::debug!("cannot read the review marks: {error}"),
+                }
+
+                if workspace.marks_sync.saving.remove(&id).unwrap_or(false) {
+                    workspace.save_review_marks(task, cx);
+                }
+            });
+
+            if let Err(error) = updated {
+                log::debug!("the window closed before the review marks came: {error}");
+            }
+        })
+        .detach();
+    }
+
+    /// Sends the viewed and folded marks of a task to the daemon. One save runs per task;
+    /// marks that change meanwhile go in the next.
+    pub(crate) fn save_review_marks(&mut self, task: TaskId, cx: &mut Context<Self>) {
+        let Some(id) = self.data.diff_id(task) else {
+            return;
+        };
+        let Some(client) = self.daemon.clone().filter(Client::is_connected) else {
+            return;
+        };
+
+        if let Some(changed) = self.marks_sync.saving.get_mut(&id) {
+            *changed = true;
+
+            return;
+        }
+        self.marks_sync.saving.insert(id, false);
+
+        let marks = self.review.read(cx).marks_of(task);
+        let saving = cx.background_spawn(async move { client.set_review_marks(id, marks) });
+
+        cx.spawn(async move |this, cx| {
+            let result = saving.await;
+            let updated = this.update(cx, |workspace, cx| {
+                if let Err(error) = result {
+                    log::warn!("cannot save the review marks: {error}");
+                }
+
+                if workspace.marks_sync.saving.remove(&id).unwrap_or(false) {
+                    workspace.save_review_marks(task, cx);
+                }
+            });
+
+            if let Err(error) = updated {
+                log::debug!("the window closed before the review marks were saved: {error}");
+            }
+        })
+        .detach();
+    }
+
     /// Removes the agent filter that View diff set.
     pub(crate) fn clear_review_agent(&mut self, cx: &mut Context<Self>) {
         self.review_agent = None;
@@ -2348,6 +2589,7 @@ impl Workspace {
             .get(&(id, source))
             .map(|diff| diff.fingerprint);
         self.list_comments_if_needed((id, source, fingerprint), cx);
+        self.load_review_marks_if_needed(task, id, cx);
 
         let Some(entry) = self.data.task(task) else {
             self.review.update(cx, ReviewView::clear);
@@ -2389,7 +2631,7 @@ impl Workspace {
             working: self.data.working_workers(task),
             base,
             branch: entry.branch.clone(),
-            approved: entry.approved,
+            approved: entry.approved.filter(|_| !entry.approval_stale),
             offer: self.review_offer(task),
             approving: self.review_approving.contains(&task),
             approve_error: self
@@ -2426,7 +2668,10 @@ impl Workspace {
         let Some(diff) = self.data.diffs.get(&(id, ReviewSource::Merged)).cloned() else {
             return;
         };
-        let approved = self.data.task(task).and_then(|entry| entry.approved);
+        let approved = self
+            .data
+            .task(task)
+            .and_then(|entry| entry.approved.filter(|_| !entry.approval_stale));
 
         let pending = count_comments(&self.data.task_comments(task)).pending;
 
@@ -2445,7 +2690,11 @@ impl Workspace {
             if self.source == crate::workspace::DataSource::Sample {
                 if let Some(entry) = self.data.tasks.iter_mut().find(|entry| entry.id == task) {
                     entry.approved = Some(fingerprint);
+                    entry.approval_stale = false;
                 }
+
+                self.review
+                    .update(cx, |review, cx| review.mark_approved(task, &diff, cx));
             } else {
                 self.review_error = Some((task, "Not connected".into()));
             }
@@ -2463,9 +2712,16 @@ impl Workspace {
             let updated = this.update(cx, |workspace, cx| {
                 workspace.review_approving.remove(&task);
 
-                if let Err(error) = result {
-                    log::warn!("cannot approve the task: {error}");
-                    workspace.review_error = Some((task, refusal(&error)));
+                match result {
+                    Ok(()) => {
+                        workspace
+                            .review
+                            .update(cx, |review, cx| review.mark_approved(task, &diff, cx));
+                    }
+                    Err(error) => {
+                        log::warn!("cannot approve the task: {error}");
+                        workspace.review_error = Some((task, refusal(&error)));
+                    }
                 }
 
                 cx.notify();
@@ -5810,6 +6066,413 @@ mod tests {
         let mut expected = vec![forward[0].clone()];
         expected.extend(forward[1..].iter().rev().cloned());
         assert_eq!(backward, expected);
+    }
+
+    fn change_merged(
+        workspace: &Entity<Workspace>,
+        change: impl FnOnce(&mut TaskDiff),
+        cx: &mut VisualTestContext,
+    ) {
+        workspace.update(cx, |workspace, cx| {
+            let key = (swarm_protocol::TaskId(0), ReviewSource::Merged);
+            if let Some(diff) = workspace.data.diffs.get_mut(&key) {
+                let mut changed = (**diff).clone();
+                changed.fingerprint += 1;
+                change(&mut changed);
+                *diff = Rc::new(changed);
+            }
+            cx.notify();
+        });
+        redraw(cx);
+    }
+
+    /// How many shown files are viewed and how many are folded.
+    fn marked(review: &Entity<ReviewView>, cx: &VisualTestContext) -> (usize, usize, usize) {
+        review.read_with(cx, |review, _| {
+            let shown = review.shown_files();
+
+            (
+                shown.len(),
+                shown.iter().filter(|f| review.is_file_viewed(**f)).count(),
+                shown.iter().filter(|f| review.is_collapsed(**f)).count(),
+            )
+        })
+    }
+
+    fn approve_merged(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) {
+        workspace.update(cx, |workspace, _| workspace.data.comments.clear());
+        use_source(workspace, ReviewSource::Merged, cx);
+        click("review-approve", cx);
+    }
+
+    #[gpui::test]
+    fn approving_marks_every_file_viewed_and_folds_it(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = open_review(&workspace, cx);
+        let before = marked(&review, cx);
+
+        approve_merged(&workspace, cx);
+        let (files, viewed, folded) = marked(&review, cx);
+
+        assert_eq!(before.1, 0);
+        assert!(files > 1);
+        assert_eq!((viewed, folded), (files, files));
+    }
+
+    #[gpui::test]
+    fn after_new_work_changed_files_open_up_new_files_are_open_and_the_rest_stays_folded(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = setup(cx);
+        let review = open_review(&workspace, cx);
+        approve_merged(&workspace, cx);
+        let files = marked(&review, cx).0;
+
+        change_merged(
+            &workspace,
+            |diff| {
+                diff.files[0].digest += 1;
+                let mut added = diff.files[1].clone();
+                added.path = PathBuf::from("new.rs");
+                added.digest += 100;
+                diff.files.push(added);
+            },
+            cx,
+        );
+        let (total, viewed, folded) = marked(&review, cx);
+        let (changed, untouched, new) = review.read_with(cx, |review, _| {
+            (
+                (review.is_file_viewed(0), review.is_collapsed(0)),
+                (review.is_file_viewed(1), review.is_collapsed(1)),
+                (review.is_file_viewed(files), review.is_collapsed(files)),
+            )
+        });
+
+        assert_eq!(total, files + 1);
+        assert_eq!(
+            changed,
+            (false, false),
+            "a changed file is unviewed and open"
+        );
+        assert_eq!(
+            untouched,
+            (true, true),
+            "an unchanged file stays viewed and folded"
+        );
+        assert_eq!(new, (false, false), "a new file is open");
+        assert_eq!((viewed, folded), (files - 1, files - 1));
+    }
+
+    #[gpui::test]
+    fn a_fold_the_user_made_follows_the_digest_of_the_file(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = open_review(&workspace, cx);
+
+        let has_lines = |review: &Entity<ReviewView>, cx: &VisualTestContext| {
+            review.read_with(cx, |review, _| {
+                review
+                    .rows()
+                    .iter()
+                    .any(|row| matches!(row, Row::Line { file: 0, .. }))
+            })
+        };
+
+        review.update(cx, |review, cx| review.toggle_collapsed(0, cx));
+        let folded = (
+            review.read_with(cx, |review, _| review.is_collapsed(0)),
+            has_lines(&review, cx),
+        );
+        change_first_file(&workspace, cx);
+        let after = (
+            review.read_with(cx, |review, _| review.is_collapsed(0)),
+            has_lines(&review, cx),
+        );
+
+        assert_eq!(folded, (true, false));
+        assert_eq!(after, (false, true), "a file that changed is open again");
+    }
+
+    #[gpui::test]
+    fn marks_the_daemon_stored_count_only_for_files_that_still_have_their_digest(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = setup(cx);
+        let review = open_review(&workspace, cx);
+        let (worktree, path, digest) = workspace.read_with(cx, |workspace, _| {
+            let diff = &workspace.data.diffs[&(swarm_protocol::TaskId(0), ReviewSource::Live)];
+
+            (
+                diff.files[0].worktree.clone(),
+                diff.files[0].path.clone(),
+                diff.files[0].digest,
+            )
+        });
+        let stored = |digest| ReviewMark {
+            worktree: worktree.clone(),
+            path: path.clone(),
+            viewed: Some(digest),
+            folded: Some(digest),
+        };
+
+        review.update(cx, |review, cx| {
+            review.load_marks(TaskId(0), vec![stored(digest + 1)], cx);
+        });
+        let stale = review.read_with(cx, |review, _| {
+            (review.is_file_viewed(0), review.is_collapsed(0))
+        });
+        review.update(cx, |review, cx| {
+            review.load_marks(TaskId(0), vec![stored(digest)], cx);
+        });
+        let current = review.read_with(cx, |review, _| {
+            (review.is_file_viewed(0), review.is_collapsed(0))
+        });
+
+        assert_eq!(stale, (false, false));
+        assert_eq!(current, (false, false), "a mark made earlier wins");
+    }
+
+    #[gpui::test]
+    fn marks_the_daemon_stored_come_back_as_viewed_and_folded(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = open_review(&workspace, cx);
+        let (worktree, path, digest) = workspace.read_with(cx, |workspace, _| {
+            let diff = &workspace.data.diffs[&(swarm_protocol::TaskId(0), ReviewSource::Live)];
+
+            (
+                diff.files[0].worktree.clone(),
+                diff.files[0].path.clone(),
+                diff.files[0].digest,
+            )
+        });
+
+        review.update(cx, |review, cx| {
+            review.load_marks(
+                TaskId(0),
+                vec![ReviewMark {
+                    worktree,
+                    path,
+                    viewed: Some(digest),
+                    folded: Some(digest),
+                }],
+                cx,
+            );
+        });
+
+        let state = review.read_with(cx, |review, _| {
+            (review.is_file_viewed(0), review.is_collapsed(0))
+        });
+        assert_eq!(state, (true, true));
+    }
+
+    #[gpui::test]
+    fn the_marks_of_a_task_list_every_viewed_and_folded_file(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = open_review(&workspace, cx);
+
+        review.update(cx, |review, cx| {
+            review.toggle_viewed(0, cx);
+            review.toggle_collapsed(1, cx);
+        });
+
+        let marks = review.read_with(cx, |review, _| review.marks_of(TaskId(0)));
+        assert_eq!(marks.len(), 2);
+        assert!(
+            marks
+                .iter()
+                .any(|mark| mark.viewed.is_some() && mark.folded.is_some())
+        );
+        assert!(
+            marks
+                .iter()
+                .any(|mark| mark.viewed.is_none() && mark.folded.is_some())
+        );
+    }
+
+    /// A real task whose Merged diff holds one file, with Review open on it, against a
+    /// daemon that records the marks it is sent and answers `stored` when asked.
+    fn marks_workspace(
+        stored: Vec<ReviewMark>,
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<Workspace>,
+        Entity<ReviewView>,
+        &mut VisualTestContext,
+        flume::Receiver<Vec<ReviewMark>>,
+    ) {
+        use crate::daemon::tests::{fake_daemon_replying, real_task_workspace};
+        use swarm_protocol::{Event, Request};
+
+        let (sent, saved) = flume::unbounded();
+        let socket = fake_daemon_replying(move |request| match request {
+            Request::ReviewMarks { call, .. } => Some(Event::ReviewMarks {
+                call,
+                marks: stored.clone(),
+            }),
+            Request::SetReviewMarks { call, marks, .. } => {
+                sent.send(marks).ok();
+
+                Some(Event::Done { call })
+            }
+            Request::ApproveTask { call, .. } => Some(Event::Done { call }),
+            _ => None,
+        });
+        let (workspace, cx, _client) = real_task_workspace(&socket, cx);
+        cx.update(|window, _| window.activate_window());
+
+        workspace.update(cx, |workspace, cx| {
+            let mut diff = crate::daemon::tests::diff_of(7, ReviewSource::Merged, 5);
+            diff.files = vec![
+                FileDiff {
+                    digest: 11,
+                    ..file_diff(FileChange::Modified)
+                },
+                FileDiff {
+                    path: PathBuf::from("src/b.rs"),
+                    digest: 22,
+                    ..file_diff(FileChange::Modified)
+                },
+            ];
+            workspace.data.store_diff(diff);
+            workspace.data.comments.clear();
+            workspace
+                .review_sources
+                .insert(TaskId(0), ReviewSource::Merged);
+            workspace.set_view(View::Review, cx);
+        });
+        redraw(cx);
+        let review = workspace.read_with(cx, |workspace, _| workspace.review.clone());
+
+        (workspace, review, cx, saved)
+    }
+
+    fn next_saved(
+        saved: &flume::Receiver<Vec<ReviewMark>>,
+        cx: &mut VisualTestContext,
+    ) -> Option<Vec<ReviewMark>> {
+        let found = std::cell::RefCell::new(None);
+
+        crate::daemon::tests::wait_until(cx, |cx| {
+            redraw(cx);
+            *found.borrow_mut() = saved.try_recv().ok();
+
+            found.borrow().is_some()
+        });
+
+        found.into_inner()
+    }
+
+    #[gpui::test]
+    fn viewing_a_file_sends_the_marks_to_the_daemon(cx: &mut TestAppContext) {
+        let (_workspace, review, cx, saved) = marks_workspace(Vec::new(), cx);
+
+        review.update(cx, |review, cx| review.toggle_viewed(1, cx));
+
+        let marks = next_saved(&saved, cx).expect("the marks were sent");
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].path, PathBuf::from("src/b.rs"));
+        assert_eq!((marks[0].viewed, marks[0].folded), (Some(22), Some(22)));
+    }
+
+    #[gpui::test]
+    fn approving_sends_every_file_as_viewed_and_folded(cx: &mut TestAppContext) {
+        let (_workspace, review, cx, saved) = marks_workspace(Vec::new(), cx);
+
+        click("review-approve", cx);
+
+        let marks = next_saved(&saved, cx).expect("the marks were sent");
+        let state = review.read_with(cx, |review, _| {
+            (review.is_file_viewed(0), review.is_collapsed(0))
+        });
+        assert_eq!(marks.len(), 2);
+        assert!(
+            marks
+                .iter()
+                .all(|mark| mark.viewed.is_some() && mark.folded.is_some())
+        );
+        assert_eq!(state, (true, true));
+    }
+
+    #[gpui::test]
+    fn the_marks_the_daemon_stored_are_read_when_review_opens(cx: &mut TestAppContext) {
+        let stored = vec![ReviewMark {
+            worktree: PathBuf::from("/w"),
+            path: PathBuf::from("src/a.rs"),
+            viewed: Some(11),
+            folded: Some(11),
+        }];
+        let (_workspace, review, cx, _saved) = marks_workspace(stored, cx);
+
+        let loaded = crate::daemon::tests::wait_until(cx, |cx| {
+            redraw(cx);
+            review.read_with(cx, |review, _| review.is_file_viewed(0))
+        });
+
+        let (second, folded) = review.read_with(cx, |review, _| {
+            (review.is_file_viewed(1), review.is_collapsed(0))
+        });
+        assert!(loaded);
+        assert!(folded);
+        assert!(!second, "only the stored file is viewed");
+    }
+
+    /// Scrolls the body so that this row is the first one in view.
+    fn scroll_body_to(review: &Entity<ReviewView>, row: usize, cx: &mut VisualTestContext) {
+        review.update(cx, |review, cx| {
+            review.body_list.scroll_to(ListOffset {
+                item_ix: row,
+                offset_in_item: px(0.),
+            });
+            cx.notify();
+        });
+        redraw(cx);
+    }
+
+    #[gpui::test]
+    fn the_header_of_the_file_in_view_sticks_to_the_top_until_the_next_header_pushes_it_out(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = setup(cx);
+        let review = open_review(&workspace, cx);
+        let (inside, last) = review.read_with(cx, |review, _| {
+            let range = review.body.range_of(0).expect("the first file has rows");
+
+            (range.start + 2, range.end - 1)
+        });
+
+        let at_start = review.read_with(cx, |review, _| review.sticky_header());
+        scroll_body_to(&review, inside, cx);
+        let sticking = review.read_with(cx, |review, _| review.sticky_header());
+        let shown = cx.debug_bounds("review-sticky-header").is_some();
+        scroll_body_to(&review, last, cx);
+        let pushed = review.read_with(cx, |review, _| review.sticky_header());
+
+        assert_eq!(at_start, None, "the first header is in view");
+        assert_eq!(sticking, Some((0, px(0.))));
+        assert!(shown);
+        assert!(
+            pushed.is_some_and(|(file, push)| file == 0 && push < px(0.)),
+            "{pushed:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn the_controls_of_a_sticky_header_keep_working(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let review = open_review(&workspace, cx);
+        let inside = review.read_with(cx, |review, _| {
+            review
+                .body
+                .range_of(0)
+                .expect("the first file has rows")
+                .start
+                + 2
+        });
+        scroll_body_to(&review, inside, cx);
+
+        click("review-viewed-0", cx);
+
+        let viewed = review.read_with(cx, |review, _| review.is_file_viewed(0));
+        assert!(viewed);
     }
 
     #[test]

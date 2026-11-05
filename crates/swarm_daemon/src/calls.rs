@@ -205,6 +205,8 @@ impl Calls {
             }
             Call::Commit { message, paths } => Self::commit(caller, &message, &paths),
             Call::Merge { worker } => self.merge(caller, worker),
+            Call::Stop { worker } => self.stop(caller, worker),
+            Call::TaskRename { name } => self.task_rename(caller, &name),
             Call::Notify { text } => self.notify(caller, &text),
             Call::Agents => self.agents(caller),
             Call::Confirm => self.confirm(caller),
@@ -504,6 +506,43 @@ impl Calls {
         })
     }
 
+    /// Ends a worker the way the idle stop does: it stays resumable and tells nobody.
+    fn stop(&self, caller: &AgentInfo, worker: AgentId) -> Outcome {
+        self.orchestrated_task(caller, "stop a worker")?;
+        let worker = self.worker_of(caller, worker)?;
+
+        if self.services.projects.has_unmerged_work(&worker)? {
+            return refuse(format!(
+                "{} has its own worktree with work the task branch does not have; \
+                 run `swarm merge {}` first",
+                worker.name, worker.id.0
+            ));
+        }
+
+        self.services.agents.stop_one(worker.id);
+        let worker = self.services.agents.info(worker.id).unwrap_or(worker);
+
+        reply_with(summary(&worker))
+    }
+
+    /// Renames the caller's task, its tab and its branch.
+    fn task_rename(&self, caller: &AgentInfo, name: &str) -> Outcome {
+        let task = self.orchestrated_task(caller, "rename its task")?;
+        if name.trim().is_empty() {
+            return refuse("a task needs a name");
+        }
+
+        let renamed = self.services.projects.rename_task(task.id, name)?;
+        self.services
+            .agents
+            .follow_branch(task.id, &task.branch, &renamed.branch);
+        self.services.clients.broadcast(&Event::TaskChanged {
+            task: renamed.clone(),
+        });
+
+        reply_with(self.task_summary(&renamed))
+    }
+
     /// Tells the clients that a worker's tile should be large or small. The layout decides
     /// what happens, and no agent gets a message.
     fn tile_request(&self, caller: &AgentInfo, agent: Option<AgentId>, large: bool) -> Outcome {
@@ -565,7 +604,7 @@ impl Calls {
     fn task_create(
         &self,
         caller: &AgentInfo,
-        name: String,
+        name: Option<String>,
         from: Option<String>,
         brief: String,
         kind: Option<AgentKind>,
@@ -575,9 +614,6 @@ impl Calls {
             return refuse(STOPPED_BY_USER);
         }
 
-        if name.trim().is_empty() {
-            return refuse("a task needs a name");
-        }
         if brief.trim().is_empty() {
             return refuse("a task needs a brief");
         }
@@ -586,7 +622,7 @@ impl Calls {
         let kind = kind.unwrap_or_else(|| self.services.agents.default_kind());
         let request = CreateTask {
             project: caller.project,
-            name,
+            name: name.unwrap_or_default(),
             from,
             run_setup: true,
             orchestrator: Some(kind),
@@ -889,6 +925,7 @@ mod tests {
             created_by: None,
             briefed: true,
             approved: None,
+            approval_stale: false,
             closed: false,
             pr_base: "main".to_owned(),
             pull_request: None,

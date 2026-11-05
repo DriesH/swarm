@@ -2191,6 +2191,26 @@ pub fn track_origin(worktree: &Path, branch: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// Whether the local `branch` tracks a remote branch.
+pub fn has_upstream(root: &Path, branch: &str) -> Result<bool, Error> {
+    let key = format!("branch.{branch}.merge");
+    let (arguments, output) = execute(root, ["config", "--get", &key])?;
+
+    match (output.success, output.code) {
+        (true, _) => Ok(true),
+        (false, Some(1)) => Ok(false),
+        (false, _) => Err(failure(&arguments, &output)),
+    }
+}
+
+/// Renames the local branch `from` to `to`. Run in the worktree that has `from` checked
+/// out, which follows the new name.
+pub fn rename_branch(worktree: &Path, from: &str, to: &str) -> Result<(), Error> {
+    run(worktree, ["branch", "-m", "--end-of-options", from, to])?;
+
+    Ok(())
+}
+
 /// Deletes `branch` on `origin`. A branch that is not there is fine. The `pre-push` hook
 /// is skipped: it has nothing to check for a deletion.
 pub fn delete_remote_branch(worktree: &Path, branch: &str, timeout: Duration) -> Result<(), Error> {

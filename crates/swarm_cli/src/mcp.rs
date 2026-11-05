@@ -234,6 +234,22 @@ const TOOLS: &[Tool] = &[
         },
     },
     Tool {
+        name: "stop",
+        description: "End one of your workers when you have no follow-up for it. It stays resumable, and a message brings it back. Refused for a worker with its own worktree that is not merged.",
+        audience: Audience::Only(&[Role::Orchestrator]),
+        schema: || {
+            schema(
+                &[("worker", "string", "The worker's agent ID or name.")],
+                &["worker"],
+            )
+        },
+        build: |arguments| {
+            Ok(Command::Stop {
+                worker: identifier(arguments, "worker")?,
+            })
+        },
+    },
+    Tool {
         name: "notify",
         description: "Ask the user for attention with a short reason.",
         audience: Audience::Only(&[Role::Orchestrator]),
@@ -257,6 +273,26 @@ const TOOLS: &[Tool] = &[
         audience: Audience::Only(&[Role::Orchestrator]),
         schema: || schema(&[], &[]),
         build: |_| Ok(Command::Confirm),
+    },
+    Tool {
+        name: "task_rename",
+        description: "Rename your task, its tab and its branch so the name says what the task is about. The worktree folder keeps its name. Refused once the task has a pull request or a pushed branch, or when the name is taken.",
+        audience: Audience::Only(&[Role::Orchestrator]),
+        schema: || {
+            schema(
+                &[(
+                    "name",
+                    "string",
+                    "The new name; it becomes part of the branch.",
+                )],
+                &["name"],
+            )
+        },
+        build: |arguments| {
+            Ok(Command::TaskRename {
+                name: required(arguments, "name")?,
+            })
+        },
     },
     Tool {
         name: "pr_draft",
@@ -336,7 +372,7 @@ const TOOLS: &[Tool] = &[
                     (
                         "name",
                         "string",
-                        "The task's name; it becomes part of its branch.",
+                        "The task's name; it becomes part of its branch. Leave it out to name the task after a bee or wasp.",
                     ),
                     (
                         "brief",
@@ -354,12 +390,12 @@ const TOOLS: &[Tool] = &[
                         "claude or codex. Defaults to the orchestrator agent from the settings.",
                     ),
                 ],
-                &["name", "brief"],
+                &["brief"],
             )
         },
         build: |arguments| {
             Ok(Command::TaskCreate {
-                name: required(arguments, "name")?,
+                name: optional(arguments, "name")?,
                 from: optional(arguments, "from")?,
                 brief: required(arguments, "brief")?,
                 kind: optional(arguments, "kind")?
@@ -1145,9 +1181,11 @@ mod tests {
                 "read",
                 "wait",
                 "merge",
+                "stop",
                 "notify",
                 "agents",
                 "confirm",
+                "task_rename",
                 "pr_draft",
                 "tile_grow",
                 "tile_shrink"
@@ -1215,6 +1253,47 @@ mod tests {
             .expect("tool");
 
         (tool.build)(arguments.as_object().expect("object"))
+    }
+
+    #[test]
+    fn the_stop_tool_takes_a_worker_id_or_name() {
+        assert_eq!(
+            build("stop", &json!({ "worker": "api" })),
+            Ok(Command::Stop {
+                worker: "api".to_owned()
+            })
+        );
+        assert_eq!(
+            build("stop", &json!({ "worker": 4 })),
+            Ok(Command::Stop {
+                worker: "4".to_owned()
+            })
+        );
+        assert!(build("stop", &json!({})).is_err());
+    }
+
+    #[test]
+    fn the_task_rename_tool_takes_a_name() {
+        assert_eq!(
+            build("task_rename", &json!({ "name": "clean-up-code" })),
+            Ok(Command::TaskRename {
+                name: "clean-up-code".to_owned()
+            })
+        );
+        assert!(build("task_rename", &json!({})).is_err());
+    }
+
+    #[test]
+    fn the_task_create_tool_needs_no_name() {
+        assert_eq!(
+            build("task_create", &json!({ "brief": "build it" })),
+            Ok(Command::TaskCreate {
+                name: None,
+                from: None,
+                brief: "build it".to_owned(),
+                kind: None,
+            })
+        );
     }
 
     #[test]

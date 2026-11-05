@@ -50,7 +50,8 @@ Workers in the shared task worktree commit their own files with `swarm commit`. 
 
 - A card shows the file, **Added** or **Deleted** when that applies, additions and deletions, the worker and the open comments.
 - Lock files, generated files (marked `linguist-generated` in `.gitattributes`, minified files, source maps) and files with more than 500 changed lines come folded. The card shows a tag, **Lock file**, **Generated** or **Large diff**, and **Show diff**, which loads that one file. Totals and approval still count every line.
-- Tick **Viewed** on a card to fold it and count it as read. The mark resets when that file's diff changes.
+- The header of the file you read stays at the top of the diff until the next file's header pushes it out. **Viewed**, the fold button and the other controls keep working there.
+- Tick **Viewed** on a card to fold it and count it as read. The mark and the fold reset when that file's diff changes. Swarm stores both per task, so they survive a restart.
 - Keys: `j` and `k` go to the next and previous file, `v` toggles **Viewed**. ↑ and ↓ move the line cursor in the diff.
 
 ## Comment on the code
@@ -80,7 +81,16 @@ A comment keeps the text of its line and the lines around it. When the file chan
 
 **Approve** works only on **Merged**. It stays off while a comment is pending, and Swarm refuses it too.
 
-Swarm stores a fingerprint of the Merged diff when you approve. If the diff changes, for example after a new commit, the approval no longer counts and **Approve** shows again. A pull request needs an approval that still counts.
+Swarm stores a fingerprint of the Merged diff when you approve. **Approve** also marks every file of that diff as viewed and folds it.
+
+If the diff changes, for example after a new commit, the approval no longer counts and **Approve** shows again. Swarm notices within a few seconds, also when Review is not open. Then:
+
+- The **Pull request** button leaves the title bar. If the panel is open, it says **Changed since approval** and has a **Review** button. **Create PR** is gone.
+- The pull request draft is cleared.
+- The task's orchestrator gets an `approval reset` message. On your next approval it writes a new draft from the whole diff.
+- Files that did not change stay viewed and folded. A file that changed is open and unviewed. A new file is open.
+
+A pull request needs an approval that still counts.
 
 After you approve, the button changes with the GitHub status. See [Pull requests](/swarm/docs/pull-requests/).
 

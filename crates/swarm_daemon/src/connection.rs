@@ -301,6 +301,8 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
         request @ (Request::TaskDiff { .. }
         | Request::FileHunks { .. }
         | Request::ApproveTask { .. }
+        | Request::ReviewMarks { .. }
+        | Request::SetReviewMarks { .. }
         | Request::CheckClose { .. }
         | Request::CloseTask { .. }) => handle_review(services, sink, request),
         request @ (Request::ListComments { .. }
@@ -710,6 +712,25 @@ fn handle_review(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Requ
                     }
                     Err(error) => send_error(sink, call, &error),
                 }
+            });
+        }
+        Request::ReviewMarks { call, task } => {
+            let projects = Arc::clone(projects);
+            run_slow(sink, "review-marks", call, move |sink| {
+                match projects.review_marks(task) {
+                    Ok(marks) => {
+                        sink.send_event(&Event::ReviewMarks { call, marks });
+                    }
+                    Err(error) => send_error(sink, call, &error),
+                }
+            });
+        }
+        Request::SetReviewMarks { call, task, marks } => {
+            let projects = Arc::clone(projects);
+            run_slow(sink, "set-review-marks", call, move |sink| {
+                let saved = projects.set_review_marks(task, &marks);
+
+                done_or_error(sink, call, saved.map_err(Into::into));
             });
         }
         Request::CheckClose { call, task } => {

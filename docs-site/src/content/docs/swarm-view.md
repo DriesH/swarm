@@ -45,7 +45,7 @@ Three tabs follow. The window remembers the tab you picked, not one tab for each
 
 The agent's thread: every message it sent or received, oldest first. Each message shows who sent it, who received it, a tag for its kind, and the time. A message that was not delivered yet says **In flight**. The text is Markdown. A long message folds, and **Show more** opens it.
 
-Kinds are brief, task, question, report, comment, pr draft, terminal exited, user input and worker stopped.
+Kinds are brief, task, question, report, comment, pr draft, approval reset, terminal exited, user input and worker stopped.
 
 ### Changes
 

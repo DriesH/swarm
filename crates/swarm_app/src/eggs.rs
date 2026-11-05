@@ -13,7 +13,7 @@ use gpui::{
 use swarm_protocol::{Client, Notice, NoticeKind, SwarmStats};
 use swarm_settings::ProjectMode;
 use swarm_ui::prelude::*;
-use swarm_ui::{BeeFlight, FLIGHT_DURATION, motion};
+use swarm_ui::{BeeFlight, FLIGHT_DURATION, ToastPhase, ToastSlot, motion};
 
 use crate::model::Agent;
 use crate::settings;
@@ -46,7 +46,10 @@ pub(crate) struct HoneyToast {
     opener: Option<WeakFocusHandle>,
     /// True while the pointer is on the toast.
     hovered: bool,
+    phase: ToastPhase,
     _timeout: Task<()>,
+    /// Moves the toast on to its next phase.
+    phase_timer: Task<()>,
 }
 
 /// A flight of bees across the window.
@@ -95,6 +98,12 @@ impl Workspace {
         };
 
         self.place_toast(&notice, SharedString::from(task.to_owned()), None, cx);
+
+        // A snapshot shows the toast in its place, not on its way in.
+        if let Some(toast) = self.eggs.toast.as_mut() {
+            toast.phase = ToastPhase::Shown;
+            toast.phase_timer = Task::ready(());
+        }
     }
 
     /// Puts the bees of the buzz at `progress` of their flight and keeps them there.
@@ -295,8 +304,77 @@ impl Workspace {
             focus: cx.focus_handle(),
             opener,
             hovered: false,
+            phase: ToastPhase::start(motion::reduce_motion(cx)),
             _timeout: Self::count_down_toast(serial, cx),
+            phase_timer: Task::ready(()),
         });
+        self.run_toast_phase(cx);
+        cx.notify();
+    }
+
+    /// Moves the toast on to its next phase when the current one is over.
+    fn run_toast_phase(&mut self, cx: &mut Context<Self>) {
+        let Some(toast) = self.eggs.toast.as_mut() else {
+            return;
+        };
+        let (serial, phase) = (toast.serial, toast.phase);
+
+        toast.phase_timer = match phase.duration() {
+            Some(duration) => cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(duration).await;
+
+                let moved = this.update(cx, |workspace, cx| {
+                    workspace.advance_toast(serial, phase, cx);
+                });
+
+                if let Err(error) = moved {
+                    log::debug!("the workspace closed before the toast moved on: {error}");
+                }
+            }),
+            None => Task::ready(()),
+        };
+    }
+
+    /// Ends `phase` of the toast with this serial, unless the toast has moved on.
+    fn advance_toast(&mut self, serial: usize, phase: ToastPhase, cx: &mut Context<Self>) {
+        let Some(toast) = self
+            .eggs
+            .toast
+            .as_mut()
+            .filter(|toast| toast.serial == serial && toast.phase == phase)
+        else {
+            return;
+        };
+
+        toast.phase = phase.next();
+
+        if toast.phase.is_visible() {
+            self.run_toast_phase(cx);
+        } else {
+            self.eggs.toast = None;
+        }
+        cx.notify();
+    }
+
+    /// Starts the exit of the toast. Under Reduce Motion it is gone at once.
+    fn close_toast(&mut self, cx: &mut Context<Self>) {
+        let reduce_motion = motion::reduce_motion(cx);
+        let Some(toast) = self.eggs.toast.as_mut() else {
+            return;
+        };
+
+        let phase = toast.phase.leave(reduce_motion);
+        if phase == toast.phase {
+            return;
+        }
+
+        toast.phase = phase;
+
+        if phase.is_visible() {
+            self.run_toast_phase(cx);
+        } else {
+            self.eggs.toast = None;
+        }
         cx.notify();
     }
 
@@ -345,7 +423,9 @@ impl Workspace {
             return false;
         };
 
-        toast.hovered || window.is_some_and(|window| toast.focus.contains_focused(window, cx))
+        !toast.phase.is_leaving()
+            && (toast.hovered
+                || window.is_some_and(|window| toast.focus.contains_focused(window, cx)))
     }
 
     /// Gives the focus back to what had it before the toast, when it is in the toast that goes
@@ -372,22 +452,24 @@ impl Workspace {
 
     pub(crate) fn dismiss_toast(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
         self.leave_toast(window, cx);
-
-        if self.eggs.toast.take().is_some() {
-            cx.notify();
-        }
+        self.close_toast(cx);
     }
 
     /// The Review button of the toast: opens the task in Review.
     fn review_from_toast(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.leave_toast(Some(window), cx);
-
-        let Some(toast) = self.eggs.toast.take() else {
+        let Some(toast) = self
+            .eggs
+            .toast
+            .as_ref()
+            .filter(|toast| !toast.phase.is_leaving())
+        else {
             return;
         };
+        let notice = toast.notice.clone();
 
-        self.open_notice(&toast.notice, cx);
-        cx.notify();
+        self.leave_toast(Some(window), cx);
+        self.close_toast(cx);
+        self.open_notice(&notice, cx);
     }
 
     /// Sends the bees across the window once. Nothing flies with the eggs off or under
@@ -465,6 +547,7 @@ impl Workspace {
 
     fn toast_element(toast: &HoneyToast, cx: &mut Context<Self>) -> AnyElement {
         let element = Self::honey_toast(toast, cx);
+        let slot = ToastSlot::new(("toast-slide", toast.serial), toast.phase, element);
 
         // First in Tab order, so a keyboard user reaches the toast before it times out.
         div()
@@ -475,7 +558,7 @@ impl Workspace {
             .absolute()
             .right(px(TOAST_RIGHT))
             .bottom(px(TOAST_BOTTOM))
-            .child(element)
+            .child(slot)
             .into_any_element()
     }
 
@@ -538,16 +621,26 @@ mod tests {
     use gpui::{Focusable as _, TestAppContext, VisualTestContext};
     use swarm_protocol::{AgentId, Event, ProjectId, ProjectInfo, Request, TaskId};
 
+    use swarm_ui::{TOAST_ENTER, TOAST_LEAVE};
+
     use super::*;
     use crate::daemon::tests::redraw;
     use crate::daemon::tests::{
-        fake_daemon_replying, project_info, send_notice, setup, start_agent, task_info,
-        use_projects, wait_until,
+        fake_daemon_replying, project_info, send_notice, start_agent, task_info, use_projects,
+        wait_until,
     };
     use crate::model::{ProjectId as ModelProjectId, SAMPLE_NOW, TerminalId};
-    use crate::workspace::View;
+    use crate::workspace::{View, follow_test_reduce_motion};
 
     const HOUR: u64 = 3_600_000;
+
+    /// The workspace with Reduce Motion on, so a toast comes and goes at once.
+    fn setup(cx: &mut TestAppContext) -> (gpui::Entity<Workspace>, &mut VisualTestContext) {
+        let (workspace, cx) = crate::daemon::tests::setup(cx);
+        cx.update(|_, cx| follow_test_reduce_motion(true, cx));
+
+        (workspace, cx)
+    }
 
     fn stats_merged_at(at: Option<u64>) -> SwarmStats {
         SwarmStats {
@@ -787,6 +880,150 @@ mod tests {
                 .as_deref()
                 .is_some_and(|value| value.contains("login"))
         );
+    }
+
+    fn toast_phase(
+        workspace: &gpui::Entity<Workspace>,
+        cx: &VisualTestContext,
+    ) -> Option<ToastPhase> {
+        workspace.read_with(cx, |workspace, _| {
+            workspace.eggs.toast.as_ref().map(|toast| toast.phase)
+        })
+    }
+
+    fn open_projects_with_motion(
+        cx: &mut TestAppContext,
+    ) -> (gpui::Entity<Workspace>, &mut VisualTestContext) {
+        let (workspace, cx) = open_projects(cx);
+        cx.update(|_, cx| follow_test_reduce_motion(false, cx));
+
+        (workspace, cx)
+    }
+
+    fn ready_for_review() -> Notice {
+        notice(NoticeKind::ReadyForReview, 5, Some(8))
+    }
+
+    #[gpui::test]
+    fn a_toast_slides_in_and_is_shown_when_the_slide_ends(cx: &mut TestAppContext) {
+        let (workspace, cx) = open_projects_with_motion(cx);
+
+        receive(&workspace, &ready_for_review(), cx);
+        let sliding = toast_phase(&workspace, cx);
+
+        pass(TOAST_ENTER / 2, cx);
+        let almost = toast_phase(&workspace, cx);
+
+        pass(TOAST_ENTER / 2, cx);
+        let shown = toast_phase(&workspace, cx);
+
+        assert_eq!(
+            [sliding, almost, shown],
+            [
+                Some(ToastPhase::Entering),
+                Some(ToastPhase::Entering),
+                Some(ToastPhase::Shown)
+            ]
+        );
+    }
+
+    #[gpui::test]
+    fn a_closed_toast_fades_out_before_it_is_removed(cx: &mut TestAppContext) {
+        let (workspace, cx) = open_projects_with_motion(cx);
+        receive(&workspace, &ready_for_review(), cx);
+        pass(TOAST_ENTER, cx);
+
+        let dismiss = cx.debug_bounds("honey-toast-dismiss").expect("the button");
+        cx.simulate_click(dismiss.center(), gpui::Modifiers::none());
+        let leaving = (toast_is_up(cx), toast_phase(&workspace, cx));
+
+        pass(TOAST_LEAVE / 2, cx);
+        let almost = toast_is_up(cx);
+
+        pass(TOAST_LEAVE / 2, cx);
+        let gone = toast_is_up(cx);
+
+        assert_eq!(leaving, (true, Some(ToastPhase::Leaving)));
+        assert!(almost);
+        assert!(!gone);
+    }
+
+    #[gpui::test]
+    fn a_toast_that_times_out_fades_out_too(cx: &mut TestAppContext) {
+        let (workspace, cx) = open_projects_with_motion(cx);
+        receive(&workspace, &ready_for_review(), cx);
+
+        pass(TOAST_FOR, cx);
+        let leaving = toast_phase(&workspace, cx);
+
+        pass(TOAST_LEAVE, cx);
+
+        assert_eq!(leaving, Some(ToastPhase::Leaving));
+        assert!(!toast_is_up(cx));
+    }
+
+    #[gpui::test]
+    fn closing_a_toast_again_while_it_fades_does_not_extend_the_fade(cx: &mut TestAppContext) {
+        let (workspace, cx) = open_projects_with_motion(cx);
+        receive(&workspace, &ready_for_review(), cx);
+        pass(TOAST_ENTER, cx);
+        workspace.update(cx, |workspace, cx| workspace.dismiss_toast(None, cx));
+
+        pass(TOAST_LEAVE / 2, cx);
+        workspace.update(cx, |workspace, cx| workspace.dismiss_toast(None, cx));
+        pass(TOAST_LEAVE / 2, cx);
+
+        assert!(!toast_is_up(cx));
+    }
+
+    #[gpui::test]
+    fn review_opens_the_task_while_the_toast_fades(cx: &mut TestAppContext) {
+        let (workspace, cx) = open_projects_with_motion(cx);
+        receive(&workspace, &ready_for_review(), cx);
+        pass(TOAST_ENTER, cx);
+
+        let review = cx.debug_bounds("honey-toast-action").expect("the button");
+        cx.simulate_click(review.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        let view = workspace.read_with(cx, |workspace, _| workspace.view);
+        let leaving = toast_phase(&workspace, cx);
+
+        pass(TOAST_LEAVE, cx);
+
+        assert_eq!(view, View::Review);
+        assert_eq!(leaving, Some(ToastPhase::Leaving));
+        assert!(!toast_is_up(cx));
+    }
+
+    #[gpui::test]
+    fn a_new_toast_replaces_one_that_is_fading_out(cx: &mut TestAppContext) {
+        let (workspace, cx) = open_projects_with_motion(cx);
+        receive(&workspace, &ready_for_review(), cx);
+        pass(TOAST_ENTER, cx);
+        workspace.update(cx, |workspace, cx| workspace.dismiss_toast(None, cx));
+
+        receive(&workspace, &ready_for_review(), cx);
+        let new = toast_phase(&workspace, cx);
+
+        pass(TOAST_ENTER, cx);
+        let still = toast_phase(&workspace, cx);
+
+        assert_eq!(new, Some(ToastPhase::Entering));
+        assert_eq!(still, Some(ToastPhase::Shown));
+    }
+
+    #[gpui::test]
+    fn under_reduce_motion_a_toast_is_shown_and_removed_at_once(cx: &mut TestAppContext) {
+        let (workspace, cx) = open_projects(cx);
+
+        receive(&workspace, &ready_for_review(), cx);
+        let shown = toast_phase(&workspace, cx);
+
+        workspace.update(cx, |workspace, cx| workspace.dismiss_toast(None, cx));
+        let removed = toast_phase(&workspace, cx);
+
+        assert_eq!(shown, Some(ToastPhase::Shown));
+        assert_eq!(removed, None);
     }
 
     fn focus_is_on_the_workspace(

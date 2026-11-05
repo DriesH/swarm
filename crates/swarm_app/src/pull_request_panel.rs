@@ -11,8 +11,9 @@ use swarm_ui::prelude::*;
 use crate::model::Task;
 use crate::panels::{header, mono, pill};
 use crate::pull_request::{
-    ActionKind, Blocker, CreateState, CreateStatus, DraftWait, GithubSetup, PanelAction, PrForm,
-    exit_value, format_duration, parse_logins, run_is_over,
+    ActionKind, Blocker, CreateState, CreateStatus, DraftWait, GithubSetup, MergeBlock,
+    PanelAction, PrForm, can_merge, exit_value, format_duration, merge_block, parse_logins,
+    run_is_over, state_color,
 };
 use crate::workspace::{RightPanel, Workspace};
 
@@ -29,7 +30,9 @@ pub(crate) fn render(workspace: &Workspace, cx: &mut Context<Workspace>) -> AnyE
         return div().into_any_element();
     };
 
-    let panel = if workspace.shows_new_pull_request(task.id) {
+    let panel = if workspace.approval_outdated(task.id) {
+        outdated_panel(cx)
+    } else if workspace.shows_new_pull_request(task.id) {
         new_panel(workspace, task, form, cx)
     } else {
         status_panel(workspace, task, form, cx)
@@ -46,13 +49,18 @@ pub(crate) fn render(workspace: &Workspace, cx: &mut Context<Workspace>) -> AnyE
         .into_any_element()
 }
 
-fn panel_header(title: AnyElement, action: impl IntoElement, cx: &App) -> gpui::Div {
+fn panel_header(
+    title: AnyElement,
+    action: impl IntoElement,
+    icon_color: Color,
+    cx: &App,
+) -> gpui::Div {
     header(cx)
         .h(px(46.))
         .child(
             Icon::new(IconName::PullRequest)
                 .size(IconSize::Medium)
-                .color(Color::Default),
+                .color(icon_color),
         )
         .child(title)
         .child(div().flex_1())
@@ -218,6 +226,32 @@ fn state_tag(status: &PullRequest) -> Option<LiveRegion> {
     Some(LiveRegion::status("pull-request-state", text).child(tag))
 }
 
+// An approval that new work made outdated
+
+fn outdated_panel(cx: &mut Context<Workspace>) -> gpui::Div {
+    v_flex()
+        .child(panel_header(
+            Label::new("New pull request")
+                .weight(FontWeight::MEDIUM)
+                .into_any_element(),
+            close_button(cx),
+            Color::Default,
+            cx,
+        ))
+        .child(
+            body()
+                .child(status_label("Changed since approval", Color::Warn))
+                .child(
+                    div().flex().child(
+                        Button::new("review-outdated", "Review")
+                            .variant(ButtonVariant::Primary)
+                            .debug_selector(|| "review-outdated".to_owned())
+                            .on_click(cx.listener(|this, _, _, cx| this.review_for_approval(cx))),
+                    ),
+                ),
+        )
+}
+
 // A new pull request
 
 fn new_panel(
@@ -245,6 +279,7 @@ fn new_panel(
                 .weight(FontWeight::MEDIUM)
                 .into_any_element(),
             close_button(cx),
+            Color::Default,
             cx,
         ))
         .child(
@@ -257,7 +292,11 @@ fn new_panel(
                         .child(field_label("Title"))
                         .child(form.title.clone()),
                 )
-                .child(description_field(form, cx))
+                .child(description_field(
+                    form,
+                    workspace.data.approval_holds(task.id),
+                    cx,
+                ))
                 .children(local_checks(workspace, task, form, cx))
                 .child(options(form, creating, cx)),
         )
@@ -335,7 +374,32 @@ fn github_section(
     }
 }
 
-fn description_field(form: &PrForm, cx: &mut Context<Workspace>) -> gpui::Div {
+/// Asks the orchestrator for a new draft. While it writes, the label reads `Drafting…`.
+fn redraft_button(waiting: bool, cx: &mut Context<Workspace>) -> Button {
+    Button::new(
+        "redraft",
+        if waiting {
+            "Drafting\u{2026}"
+        } else {
+            "Redraft"
+        },
+    )
+    .variant(ButtonVariant::Ghost)
+    .debug_selector(|| "redraft".to_owned())
+    .loading(waiting)
+    .on_click(cx.listener(|this, _, _, cx| this.redraft(cx)))
+}
+
+fn description_field(form: &PrForm, redraftable: bool, cx: &mut Context<Workspace>) -> gpui::Div {
+    let drafted_by = || {
+        div().min_w_0().flex().child(
+            Label::new("Drafted by orchestrator")
+                .size(LabelSize::Small)
+                .color(Color::Faint)
+                .truncate(),
+        )
+    };
+
     let note: Option<AnyElement> = if form.newer.is_some() {
         Some(
             Button::new("new-draft", "New draft")
@@ -347,16 +411,28 @@ fn description_field(form: &PrForm, cx: &mut Context<Workspace>) -> gpui::Div {
         )
     } else {
         match &form.draft_wait {
+            DraftWait::Waiting if form.drafted() && redraftable => Some(
+                h_flex()
+                    .gap(px(8.))
+                    .child(drafted_by())
+                    .child(redraft_button(true, cx))
+                    .into_any_element(),
+            ),
             DraftWait::Waiting => {
                 Some(status_label("Drafting\u{2026}", Color::Faint).into_any_element())
             }
-            DraftWait::Refused(reason) => {
-                Some(status_label(reason.clone(), Color::Faint).into_any_element())
-            }
+            DraftWait::Refused(reason) => Some(
+                h_flex()
+                    .gap(px(8.))
+                    .child(status_label(reason.clone(), Color::Faint))
+                    .children(redraftable.then(|| redraft_button(false, cx)))
+                    .into_any_element(),
+            ),
             DraftWait::Idle if form.drafted() => Some(
-                Label::new("Drafted by orchestrator")
-                    .size(LabelSize::Small)
-                    .color(Color::Faint)
+                h_flex()
+                    .gap(px(8.))
+                    .child(drafted_by())
+                    .children(redraftable.then(|| redraft_button(false, cx)))
                     .into_any_element(),
             ),
             DraftWait::Idle => None,
@@ -370,8 +446,7 @@ fn description_field(form: &PrForm, cx: &mut Context<Workspace>) -> gpui::Div {
                 .gap(px(8.))
                 .min_h(px(28.))
                 .child(field_label("Description"))
-                .child(div().flex_1())
-                .children(note),
+                .child(div().flex_1().min_w_0().flex().justify_end().children(note)),
         )
         .child(form.description.clone())
 }
@@ -623,6 +698,7 @@ fn status_panel(
         .on_click(cx.listener(|this, _, _, cx| this.open_pull_request_url(cx)));
 
     let tag = status.and_then(state_tag);
+    let state_color = Color::Custom(state_color(status, cx.theme().colors()));
 
     let header = panel_header(
         h_flex()
@@ -632,11 +708,13 @@ fn status_panel(
                     .mono()
                     .size(LabelSize::Small)
                     .weight(FontWeight::MEDIUM)
+                    .color(state_color)
                     .accessible("pull-request-number"),
             )
             .children(tag)
             .into_any_element(),
         open_button,
+        state_color,
         cx,
     );
 
@@ -867,7 +945,8 @@ fn status_footer(
     cx: &mut Context<Workspace>,
 ) -> gpui::Div {
     let draft = status.is_some_and(|status| status.draft);
-    let mergeable = status.is_some_and(|status| status.mergeable);
+    let mergeable = status.is_some_and(can_merge);
+    let block = status.and_then(merge_block);
     let busy = form.busy();
     let merging = form.action == PanelAction::Busy(ActionKind::Merge);
     let readying = form.action == PanelAction::Busy(ActionKind::Ready);
@@ -895,7 +974,11 @@ fn status_footer(
     });
 
     let merge = Button::new("merge", if merging { "Merging\u{2026}" } else { "Merge" })
-        .variant(ButtonVariant::Primary)
+        .variant(if mergeable || merging {
+            ButtonVariant::Merge
+        } else {
+            ButtonVariant::Primary
+        })
         .size(ButtonSize::Medium)
         .full_width()
         .debug_selector(|| "merge".to_owned())
@@ -915,12 +998,24 @@ fn status_footer(
         CreateStatus::Idle | CreateStatus::Creating => None,
     };
     let working = busy_text(&form.action).map(|text| status_label(text, Color::Muted));
+    let blocked = block.map(|block| {
+        status_label(
+            block.label(),
+            if block == MergeBlock::ChecksFailed || block == MergeBlock::Conflicts {
+                Color::Warn
+            } else {
+                Color::Muted
+            },
+        )
+        .debug_selector(|| "merge-blocked".to_owned())
+    });
 
     footer(cx)
         .children(error)
         .children(push.map(|state| push_row(state, pushing, busy, cx)))
         .children(queued)
         .children(working)
+        .children(blocked)
         .child(
             h_flex()
                 .gap(px(8.))

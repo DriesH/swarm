@@ -693,6 +693,34 @@ impl Agents {
         stopping
     }
 
+    /// Stops one agent the way [`Agents::stop_idle`] does: with a confirmed session it
+    /// ends `Resumable`, and no orchestrator is told.
+    pub(crate) fn stop_one(&self, id: AgentId) {
+        let terminals = self.mark_stopped(
+            |agent| agent.info.id == id,
+            |agent| agent.stopped_by_user = true,
+        );
+
+        self.kill(terminals);
+    }
+
+    /// The agents of the task that worked on branch `from` now work on `to`.
+    pub(crate) fn follow_branch(&self, task: TaskId, from: &str, to: &str) {
+        let followers: Vec<AgentId> = lock(&self.live)
+            .values()
+            .filter(|agent| agent.info.task == Some(task) && agent.info.branch == from)
+            .map(|agent| agent.info.id)
+            .collect();
+
+        for id in followers {
+            self.update(id, |agent| {
+                to.clone_into(&mut agent.info.branch);
+
+                true
+            });
+        }
+    }
+
     /// True when the agent has unread messages or sits in a `wait` that takes them.
     /// A store error counts as mail: the agent keeps running.
     fn has_mail(&self, id: AgentId) -> bool {
@@ -1387,6 +1415,7 @@ impl Agents {
             session,
             harness_env: &harness_env,
             writable_roots: &writable_roots,
+            deny_subagents: plan.role != AgentRole::Worker,
         });
         write_files(&agent_dir, &launch.files)?;
 

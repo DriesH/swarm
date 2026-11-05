@@ -1133,6 +1133,7 @@ mod tests {
             briefed: false,
             agents: Vec::new(),
             approved: None,
+            approval_stale: false,
             closed: false,
             created_by: None,
             pr_base: "main".to_owned(),

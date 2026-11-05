@@ -12,6 +12,7 @@ pub mod github;
 mod process;
 pub mod prompts;
 pub mod store;
+pub use swarm_protocol::creatures;
 pub mod system_check;
 pub mod task;
 
@@ -26,7 +27,7 @@ use std::time::{Duration, Instant};
 use swarm_protocol::{
     AgentChange, AgentId, AgentInfo, AgentLifecycle, AgentRole, CloseCheck, CreateTask, DIFF_FILES,
     DiffStat, FileChange, FileDiff, GithubStatus, PrLink, ProjectConfigFields, ProjectId,
-    ProjectInfo, ReviewSource, TaskDiff, TaskId, TaskInfo, TerminalId,
+    ProjectInfo, ReviewMark, ReviewSource, TaskDiff, TaskId, TaskInfo, TerminalId,
 };
 use swarm_term::ExitStatus;
 
@@ -227,6 +228,20 @@ impl Projects {
         }
     }
 
+    /// True for a worker with its own worktree whose work the task branch does not have
+    /// yet: commits that are not merged, or uncommitted files.
+    pub fn has_unmerged_work(&self, worker: &AgentInfo) -> Result<bool, Error> {
+        let Some(task) = worker.task else {
+            return Ok(false);
+        };
+        let task = self.task(task)?;
+        if task.worktree == worker.worktree {
+            return Ok(false);
+        }
+
+        Ok(unmerged_section(&task, worker)?.is_some())
+    }
+
     /// True for a worker that works in its task's worktree.
     fn shares_task_worktree(&self, worker: &AgentInfo) -> bool {
         let Some(task) = worker.task else {
@@ -321,8 +336,6 @@ impl Projects {
             )));
         }
 
-        let name = request.name.trim();
-        let slug = task::slug(name)?;
         let base = match &request.from {
             Some(from) => from.clone(),
             None => git::default_base_branch(&root, config.worktrees.base_branch.as_deref()),
@@ -336,12 +349,25 @@ impl Projects {
         let folder = root.join(&config.worktrees.folder);
         task::create_folder_inside(&root, &folder)?;
 
-        let slug = task::first_free_slug(&slug, |candidate| {
+        let taken = |candidate: &str| {
             let worktree = folder.join(candidate);
 
             Ok(worktree.symlink_metadata().is_ok()
                 || git::branch_exists(&root, &format!("{BRANCH_PREFIX}{candidate}"))?)
-        })?;
+        };
+
+        // A task without a name is named after a creature, like its branch.
+        let (name, slug) = match request.name.trim() {
+            "" => {
+                let slug = creatures::pick_slug(creatures::random_seed(), taken)?;
+
+                (slug.clone(), slug)
+            }
+            given => (
+                given.to_owned(),
+                task::first_free_slug(&task::slug(given)?, taken)?,
+            ),
+        };
         let branch = format!("{BRANCH_PREFIX}{slug}");
         let worktree = folder.join(&slug);
 
@@ -356,7 +382,7 @@ impl Projects {
             &config,
             request,
             &TaskNames {
-                name,
+                name: &name,
                 branch: &branch,
                 base: &base,
                 pr_base: &pr_base,
@@ -379,6 +405,58 @@ impl Projects {
         let env = task_env(&task);
 
         Ok(PreparedTask { task, setup, env })
+    }
+
+    /// Renames an open task and its branch (`git branch -m` in the task worktree). The
+    /// worktree folder keeps its name, because agent sessions are stored by folder.
+    /// Refused when the task has a pull request or its branch was pushed, when another
+    /// open task or a branch has the name, or when the name makes no branch name.
+    pub fn rename_task(&self, id: TaskId, name: &str) -> Result<TaskInfo, Error> {
+        let _creating = lock(&self.creating);
+
+        let name = name.trim();
+        let slug = task::slug(name)?;
+        let branch = format!("{BRANCH_PREFIX}{slug}");
+
+        let task = self.task(id)?;
+        let root = self
+            .project_root(task.project)
+            .ok_or(Error::UnknownProject(task.project.0))?;
+
+        if task.pull_request.is_some() {
+            return Err(Error::Invalid(
+                "the task has a pull request, so its name stays".to_owned(),
+            ));
+        }
+        if git::has_upstream(&root, &task.branch)? || git::origin_has_branch(&root, &task.branch)? {
+            return Err(Error::Invalid(
+                "the branch was pushed, so its name stays".to_owned(),
+            ));
+        }
+
+        let others = self.open_tasks(task.project)?;
+        let used = others.iter().any(|other| {
+            other.id != task.id && (other.branch == branch || other.name.eq_ignore_ascii_case(name))
+        });
+        let renames_branch = branch != task.branch;
+        if used || (renames_branch && git::branch_exists(&root, &branch)?) {
+            return Err(Error::Invalid(format!("the name {name:?} is taken")));
+        }
+
+        if renames_branch {
+            git::rename_branch(&task.worktree, &task.branch, &branch)?;
+        }
+        if let Err(error) = lock(&self.store).rename_task(id, name, &branch) {
+            if renames_branch
+                && let Err(undo) = git::rename_branch(&task.worktree, &branch, &task.branch)
+            {
+                log::error!("cannot undo the rename of branch {branch}: {undo}");
+            }
+
+            return Err(error);
+        }
+
+        self.task(id)
     }
 
     /// Adds a worker that works in the task worktree on the task branch. Nothing is
@@ -824,6 +902,55 @@ impl Projects {
         self.task(id)
     }
 
+    /// The open tasks the user approved whose approval still counts, in every project.
+    pub fn approved_tasks(&self) -> Result<Vec<TaskInfo>, Error> {
+        let store = lock(&self.store);
+        let mut approved = Vec::new();
+
+        for project in store.list_projects()? {
+            approved.extend(
+                store
+                    .list_tasks(project.id)?
+                    .into_iter()
+                    .filter(|task| task.approved.is_some() && !task.approval_stale),
+            );
+        }
+
+        Ok(approved)
+    }
+
+    /// Marks the approval as outdated when the Merged diff is no longer the approved one.
+    /// Returns the task when it just went stale, `None` when nothing changed.
+    pub fn reset_stale_approval(&self, id: TaskId) -> Result<Option<TaskInfo>, Error> {
+        let task = self.task(id)?;
+        let Some(approved) = task.approved.filter(|_| !task.approval_stale) else {
+            return Ok(None);
+        };
+
+        let current = self.task_diff(id, ReviewSource::Merged)?;
+        if current.fingerprint == approved {
+            return Ok(None);
+        }
+
+        let marked = lock(&self.store).set_approval_stale(id, approved)?;
+
+        if marked {
+            self.task(id).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// The viewed and folded marks the user made in Review.
+    pub fn review_marks(&self, id: TaskId) -> Result<Vec<ReviewMark>, Error> {
+        lock(&self.store).review_marks(id)
+    }
+
+    /// Replaces the marks of the task.
+    pub fn set_review_marks(&self, id: TaskId, marks: &[ReviewMark]) -> Result<(), Error> {
+        lock(&self.store).set_review_marks(id, marks)
+    }
+
     /// The task, when the user approved the Merged changes as they are now.
     pub fn check_approved(&self, id: TaskId) -> Result<TaskInfo, Error> {
         let head = git::commit_of(&self.task(id)?.worktree, "HEAD")?;
@@ -841,7 +968,7 @@ impl Projects {
         };
 
         let current = self.diff_at(id, ReviewSource::Merged, Some(commit))?;
-        if current.fingerprint != approved {
+        if task.approval_stale || current.fingerprint != approved {
             return Err(Error::Invalid(
                 "the changes changed since you approved them: approve them again".to_owned(),
             ));

@@ -190,6 +190,28 @@ fn missing_command_is_reported() {
     assert!(matches!(result, Err(SpawnError::CommandNotFound(_))));
 }
 
+/// An agent runs as a bare program, like this one: when it quits, no shell takes over.
+#[test]
+fn typing_after_a_program_quit_reaches_nothing() {
+    let (terminal, emulator) = channels();
+    let _local = LocalTerminal::spawn(options(&["/usr/bin/true"]), emulator).expect("spawn");
+    run_to_exit(&terminal, Duration::from_secs(10)).expect("exit");
+
+    terminal
+        .input
+        .send(swarm_term::TerminalInput::Text("echo typed\r".to_owned()))
+        .expect("send");
+    let after = terminal.output.recv_timeout(Duration::from_millis(500));
+
+    assert!(
+        !matches!(
+            after,
+            Ok(TerminalOutput::Snapshot(_) | TerminalOutput::Update(_))
+        ),
+        "{after:?}"
+    );
+}
+
 #[test]
 fn dropping_the_view_ends_the_process() {
     let (terminal, emulator) = channels();

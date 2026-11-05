@@ -25,7 +25,7 @@ use swarm_ui::{ButtonVariant, Nudge, ThemeColors};
 use crate::actions::{
     FILE_TREE_CONTEXT, TreeActivate, TreeFirst, TreeLast, TreeNext, TreePrevious,
 };
-use crate::daemon::is_resumable;
+use crate::daemon::{has_ended, is_resumable};
 use crate::markdown::{self, Markdown, Parsed};
 use crate::model::{Agent, AgentId, AgentKind, Message, TerminalId};
 use crate::panels::empty_status;
@@ -130,9 +130,10 @@ fn kind_color(kind: MessageKind, colors: &ThemeColors) -> Hsla {
         }
         MessageKind::Question => colors.warn,
         MessageKind::Report => colors.ok,
-        MessageKind::TerminalExited | MessageKind::UserInput | MessageKind::WorkerStopped => {
-            colors.faint
-        }
+        MessageKind::TerminalExited
+        | MessageKind::UserInput
+        | MessageKind::WorkerStopped
+        | MessageKind::ApprovalReset => colors.faint,
     }
 }
 
@@ -1668,6 +1669,9 @@ fn card_frame(id: AgentId, label: String, selected: bool) -> gpui::Stateful<gpui
     .aria_selected(selected)
 }
 
+/// A stopped agent's card is dimmed; it stays in the graph for the task's history.
+const ENDED_CARD_OPACITY: f32 = 0.6;
+
 fn card(
     workspace: &Workspace,
     agent: &Agent,
@@ -1737,26 +1741,27 @@ fn card(
         card = card.track_focus(handle);
     }
 
-    card.child(
-        h_flex()
-            .gap(px(8. * zoom))
-            .child(Icon::new(kind_icon(agent.kind)).size(IconSize::Custom(px(16. * zoom))))
-            .child(
-                scaled(agent.name.clone(), 13., zoom, colors.fg)
-                    .font_weight(if is_orchestrator {
-                        FontWeight::SEMIBOLD
-                    } else {
-                        FontWeight::MEDIUM
-                    })
-                    .flex_1()
-                    .min_w_0()
-                    .truncate(),
-            )
-            .child(StatusDot::new(agent.status)),
-    )
-    .child(second_line)
-    .child(scaled(status_note(agent), 12., zoom, colors.muted).truncate())
-    .into_any_element()
+    card.when(has_ended(agent), |card| card.opacity(ENDED_CARD_OPACITY))
+        .child(
+            h_flex()
+                .gap(px(8. * zoom))
+                .child(Icon::new(kind_icon(agent.kind)).size(IconSize::Custom(px(16. * zoom))))
+                .child(
+                    scaled(agent.name.clone(), 13., zoom, colors.fg)
+                        .font_weight(if is_orchestrator {
+                            FontWeight::SEMIBOLD
+                        } else {
+                            FontWeight::MEDIUM
+                        })
+                        .flex_1()
+                        .min_w_0()
+                        .truncate(),
+                )
+                .child(StatusDot::new(agent.status)),
+        )
+        .child(second_line)
+        .child(scaled(status_note(agent), 12., zoom, colors.muted).truncate())
+        .into_any_element()
 }
 
 fn inspector(
@@ -2464,9 +2469,10 @@ fn kind_tag_colors(kind: MessageKind, colors: &ThemeColors) -> (Hsla, Hsla) {
         }
         MessageKind::Question => (colors.warn, colors.warn_bg),
         MessageKind::Report => (colors.ok, colors.ok_bg),
-        MessageKind::TerminalExited | MessageKind::UserInput | MessageKind::WorkerStopped => {
-            (colors.muted, colors.soft)
-        }
+        MessageKind::TerminalExited
+        | MessageKind::UserInput
+        | MessageKind::WorkerStopped
+        | MessageKind::ApprovalReset => (colors.muted, colors.soft),
     }
 }
 

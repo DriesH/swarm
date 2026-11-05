@@ -26,7 +26,7 @@ The footer names the reason in a short line.
 
 | Line | Meaning |
 |---|---|
-| **Not approved** | The task is not approved, or its diff changed since you approved it |
+| **Not approved** | The task is not approved, or its diff changed since you approved it. The panel then says **Changed since approval** with a **Review** button |
 | **Comments pending** | A [review comment](/swarm/docs/review/#comment-on-the-code) is pending |
 | **GitHub not set up** | `gh` is missing or not signed in. See [Set up GitHub](#set-up-github) |
 | **No title** | The title is empty |
@@ -37,6 +37,8 @@ Swarm checks the same rules again before it pushes.
 ### The draft
 
 When you open the panel for an approved task, Swarm asks the orchestrator for a draft. The orchestrator writes a title and a description and sends them back with `swarm pr draft`. The note **Drafting…** shows while it works, and **Drafted by orchestrator** after.
+
+**Redraft** next to **Drafted by orchestrator** asks for a new draft of the current diff. The button reads **Drafting…** while the orchestrator writes. It shows only while the approval still counts. If you edited the title or the description, the new draft waits behind **New draft** instead of replacing your text.
 
 The description follows a built-in format with four sections: **What**, **Why**, **Notes for reviewers** and **Open tasks**. A project can replace the format with a `pr.md` file in `.swarm/prompts/`. The Prompts page in Settings lists it.
 
@@ -53,7 +55,7 @@ A project can list commands that must pass before a pull request. They live in `
 
 ## After the pull request exists
 
-The **Pull request** button in the title bar shows the pull request number and its state, for example **#42 · checks running**. The states are checks running, checks failed, draft, ready to merge, open, merged and closed. The panel shows:
+The **Pull request** button in the title bar shows the pull request number and its state, for example **#42 · checks running**. The states are checks running, checks failed, draft, ready to merge, open, merged and closed. The icon and the number in the panel header use GitHub's state colors: green for open, purple for merged, red for closed and grey for draft. The panel shows:
 
 - **Open on GitHub**, the title, and a **Draft**, **Merged** or **Closed** tag
 - **GitHub checks**, read through `gh`, with a count such as `3 / 5`
@@ -69,7 +71,7 @@ New commits after the pull request exists, for example a CI fix, show **New comm
 ### Merge
 
 - **Ready for review** takes a draft out of draft.
-- **Merge** merges only the commit Swarm pushed. It stays off until GitHub says the pull request can merge, and while **New commits** wait to be pushed.
+- **Merge** merges only the commit Swarm pushed. It stays off while a GitHub check runs or failed, while GitHub says it cannot merge, and while **New commits** wait to be pushed. A line above it gives the reason: **Checks running**, **Checks failed** or **Conflicts**. The daemon refuses a merge while a check runs or failed, whatever the app shows. When the pull request can merge, **Merge** is GitHub's merge green.
 - **Merge method** is **Squash** by default. **Merge** and **Rebase** are the other choices.
 
 Swarm checks that GitHub really merged the commit. A merge queue can leave the pull request open, and the panel then shows **Merge queued**. After a merge, Swarm deletes the remote branch.

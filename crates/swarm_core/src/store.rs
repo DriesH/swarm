@@ -12,7 +12,7 @@ use swarm_protocol::agent::InboxMessage;
 use swarm_protocol::{
     AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, CommentAnchor,
     CommentId, CommentState, CreateTerminal, MessageId, MessageInfo, MessageKind, NewComment,
-    PrLink, ProjectId, ReviewComment, TaskId, TaskInfo, TerminalId, TerminalKind,
+    PrLink, ProjectId, ReviewComment, ReviewMark, TaskId, TaskInfo, TerminalId, TerminalKind,
 };
 use swarm_term::ExitStatus;
 
@@ -297,6 +297,17 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX comments_task ON comments (task)",
     // The plan the user has written for the Start orchestrator but not sent yet.
     "ALTER TABLE projects ADD COLUMN plan_draft TEXT;",
+    // The Merged diff changed after the approval, and the files the user viewed or folded
+    // in Review, each with the digest the file had then.
+    "ALTER TABLE tasks ADD COLUMN approval_stale INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE review_marks (
+        task INTEGER NOT NULL REFERENCES tasks(id),
+        worktree BLOB NOT NULL,
+        path BLOB NOT NULL,
+        viewed INTEGER,
+        folded INTEGER,
+        PRIMARY KEY (task, worktree, path)
+    )",
 ];
 
 /// The hundredth merge is the one that makes the queen bee.
@@ -759,6 +770,7 @@ impl Store {
             created_by,
             briefed: false,
             approved: None,
+            approval_stale: false,
             closed: false,
             pr_base: task.pr_base.to_owned(),
             pull_request: None,
@@ -804,6 +816,25 @@ impl Store {
         .transpose()
     }
 
+    /// Gives the task a new name and branch. The agents that work on the old branch follow.
+    pub fn rename_task(&mut self, id: TaskId, name: &str, branch: &str) -> Result<(), Error> {
+        let transaction = self.connection.transaction()?;
+        let task = to_row(id.0)?;
+
+        transaction.execute(
+            "UPDATE agents SET branch = ?1
+             WHERE task = ?2 AND branch = (SELECT branch FROM tasks WHERE id = ?2)",
+            params![branch, task],
+        )?;
+        transaction.execute(
+            "UPDATE tasks SET name = ?1, branch = ?2 WHERE id = ?3",
+            params![name, branch, task],
+        )?;
+        transaction.commit()?;
+
+        Ok(())
+    }
+
     /// Records that the task's orchestrator understood its brief.
     pub fn confirm_task(&self, id: TaskId) -> Result<(), Error> {
         self.connection.execute(
@@ -814,14 +845,82 @@ impl Store {
         Ok(())
     }
 
-    /// Records the fingerprint of the Merged diff the user approved.
+    /// Records the fingerprint of the Merged diff the user approved. A new approval
+    /// counts again.
     pub fn set_approved(&self, task: TaskId, fingerprint: u64) -> Result<(), Error> {
         let stored = i64::from_ne_bytes(fingerprint.to_ne_bytes());
 
         self.connection.execute(
-            "UPDATE tasks SET approved = ?1 WHERE id = ?2",
+            "UPDATE tasks SET approved = ?1, approval_stale = 0 WHERE id = ?2",
             params![stored, to_row(task.0)?],
         )?;
+
+        Ok(())
+    }
+
+    /// Marks the approval with this fingerprint as outdated. Returns false when the task
+    /// was approved again meanwhile or is marked already.
+    pub fn set_approval_stale(&self, task: TaskId, fingerprint: u64) -> Result<bool, Error> {
+        let stored = i64::from_ne_bytes(fingerprint.to_ne_bytes());
+
+        let changed = self.connection.execute(
+            "UPDATE tasks SET approval_stale = 1
+             WHERE id = ?1 AND approved = ?2 AND approval_stale = 0",
+            params![to_row(task.0)?, stored],
+        )?;
+
+        Ok(changed > 0)
+    }
+
+    /// The viewed and folded marks of a task.
+    pub fn review_marks(&self, task: TaskId) -> Result<Vec<ReviewMark>, Error> {
+        let mut statement = self.connection.prepare(
+            "SELECT worktree, path, viewed, folded FROM review_marks WHERE task = ?1
+             ORDER BY worktree, path",
+        )?;
+        let rows = statement.query_map(params![to_row(task.0)?], |row| {
+            let worktree: Vec<u8> = row.get(0)?;
+            let path: Vec<u8> = row.get(1)?;
+            let viewed: Option<i64> = row.get(2)?;
+            let folded: Option<i64> = row.get(3)?;
+
+            Ok(ReviewMark {
+                worktree: PathBuf::from(OsStr::from_bytes(&worktree)),
+                path: PathBuf::from(OsStr::from_bytes(&path)),
+                viewed: viewed.map(|stored| u64::from_ne_bytes(stored.to_ne_bytes())),
+                folded: folded.map(|stored| u64::from_ne_bytes(stored.to_ne_bytes())),
+            })
+        })?;
+
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Replaces the marks of a task. A mark with nothing set is not kept.
+    pub fn set_review_marks(&mut self, task: TaskId, marks: &[ReviewMark]) -> Result<(), Error> {
+        let task = to_row(task.0)?;
+        let transaction = self.connection.transaction()?;
+
+        transaction.execute("DELETE FROM review_marks WHERE task = ?1", params![task])?;
+        for mark in marks
+            .iter()
+            .filter(|mark| mark.viewed.is_some() || mark.folded.is_some())
+        {
+            transaction.execute(
+                "INSERT OR REPLACE INTO review_marks (task, worktree, path, viewed, folded)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    task,
+                    mark.worktree.as_os_str().as_bytes(),
+                    mark.path.as_os_str().as_bytes(),
+                    mark.viewed
+                        .map(|digest| i64::from_ne_bytes(digest.to_ne_bytes())),
+                    mark.folded
+                        .map(|digest| i64::from_ne_bytes(digest.to_ne_bytes())),
+                ],
+            )?;
+        }
+
+        transaction.commit()?;
 
         Ok(())
     }
@@ -1642,7 +1741,7 @@ fn agent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAgent> {
 
 const TASK_COLUMNS: &str = "SELECT id, project, name, branch, base, worktree, ports,
     setup_terminal, setup_exit, created_by, briefed, approved, closed_at, pr_number, pr_url,
-    close_after_merge, pr_head, pr_base FROM tasks";
+    close_after_merge, pr_head, pr_base, approval_stale FROM tasks";
 
 fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskInfo> {
     let id: i64 = row.get(0)?;
@@ -1676,6 +1775,7 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskInfo> {
         created_by: created_by.map(|id| AgentId(id.unsigned_abs())),
         briefed: row.get(10)?,
         approved: approved.map(|stored| u64::from_ne_bytes(stored.to_ne_bytes())),
+        approval_stale: row.get(18)?,
         closed: closed_at.is_some(),
         // Empty for a row from before the column existed; `Projects` fills it in.
         pr_base: pr_base.unwrap_or_default(),

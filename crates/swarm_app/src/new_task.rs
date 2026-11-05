@@ -4,7 +4,7 @@ use gpui::{
     AppContext as _, Context, Div, Entity, EventEmitter, FocusHandle, Focusable as _, SharedString,
     Subscription, WeakEntity, Window, div, px,
 };
-use swarm_protocol::{ClientError, CreateTask};
+use swarm_protocol::{ClientError, CreateTask, creatures};
 use swarm_ui::prelude::*;
 
 use crate::announce::announce;
@@ -45,6 +45,8 @@ pub(crate) struct NewTaskDialog {
     run_setup: bool,
     busy: bool,
     error: Option<SharedString>,
+    /// The creature name the task gets when the name field stays empty.
+    suggested: SharedString,
     name: Entity<TextInput>,
     message: Entity<TextArea>,
     focus_handle: FocusHandle,
@@ -70,9 +72,11 @@ impl NewTaskDialog {
         cx: &mut Context<Self>,
     ) -> Self {
         let opener = window.focused(cx);
+        let suggested = suggest_name(&branches, creatures::random_seed());
         let name = cx.new(|cx| {
             let mut input = TextInput::new(cx);
             input.set_label("Name", cx);
+            input.set_placeholder(suggested.clone(), cx);
             input.set_mono(true, cx);
             input
         });
@@ -106,6 +110,7 @@ impl NewTaskDialog {
             run_setup: true,
             busy: false,
             error: None,
+            suggested,
             name,
             message,
             focus_handle: cx.focus_handle(),
@@ -122,7 +127,19 @@ impl NewTaskDialog {
         self.branch = picked
             .and_then(|picked| self.branches.iter().position(|branch| *branch == picked))
             .unwrap_or(0);
+
+        if branch_is_taken(&self.branches, &self.suggested) {
+            self.suggested = suggest_name(&self.branches, creatures::random_seed());
+            let suggested = self.suggested.clone();
+            self.name
+                .update(cx, |input, cx| input.set_placeholder(suggested, cx));
+        }
         cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn suggested_name(&self) -> SharedString {
+        self.suggested.clone()
     }
 
     #[cfg(test)]
@@ -142,8 +159,8 @@ impl NewTaskDialog {
         self.branches.get(self.branch).cloned()
     }
 
-    fn can_create(&self, cx: &App) -> bool {
-        !self.busy && !self.name.read(cx).text().trim().is_empty()
+    fn can_create(&self) -> bool {
+        !self.busy
     }
 
     #[cfg(test)]
@@ -203,11 +220,15 @@ impl NewTaskDialog {
     }
 
     pub(crate) fn create(&mut self, cx: &mut Context<Self>) {
-        if !self.can_create(cx) {
+        if !self.can_create() {
             return;
         }
 
-        let name = SharedString::from(self.name.read(cx).text().trim().to_owned());
+        let typed = self.name.read(cx).text();
+        let name = match typed.trim() {
+            "" => self.suggested.clone(),
+            typed => SharedString::from(typed.to_owned()),
+        };
         let first_message = self.message.read(cx).text();
         let base_branch = self.branches.get(self.branch).cloned().unwrap_or_default();
         let kind = ORCHESTRATORS
@@ -246,6 +267,21 @@ pub(crate) fn branch_choices(
     }
 
     choices
+}
+
+fn branch_is_taken(branches: &[SharedString], slug: &str) -> bool {
+    let branch = format!("swarm/{slug}");
+
+    branches.iter().any(|existing| *existing == branch)
+}
+
+/// A creature name that no listed branch `swarm/<name>` uses.
+fn suggest_name(branches: &[SharedString], seed: u64) -> SharedString {
+    let picked = creatures::pick_slug(seed, |slug| {
+        Ok::<_, std::convert::Infallible>(branch_is_taken(branches, slug))
+    });
+
+    SharedString::from(picked.unwrap_or_default())
 }
 
 fn field(label: &'static str, control: impl IntoElement) -> Div {
@@ -318,7 +354,7 @@ impl Render for NewTaskDialog {
                 Button::new("new-task-create", create_label)
                     .variant(ButtonVariant::Primary)
                     .loading(self.busy)
-                    .disabled(!self.busy && !self.can_create(cx))
+                    .disabled(!self.busy && !self.can_create())
                     .on_click(cx.listener(|this, _, _, cx| this.create(cx))),
             );
 
@@ -642,6 +678,7 @@ mod tests {
                 "MultilineTextInput First message",
                 "CheckBox Run setup script",
                 "Button Cancel",
+                "Button Create task",
                 "Button Close dialog",
             ]
         );
@@ -659,6 +696,88 @@ mod tests {
         cx.simulate_keystrokes("escape");
 
         assert!(cx.update(|window, _| row.is_focused(window)));
+    }
+
+    #[test]
+    fn the_suggested_name_is_a_creature_that_no_branch_uses() {
+        let taken: Vec<SharedString> = creatures::CREATURES
+            .iter()
+            .skip(1)
+            .map(|creature| SharedString::from(format!("swarm/{}", creature.slug)))
+            .collect();
+
+        for seed in 0..30 {
+            assert_eq!(suggest_name(&taken, seed), creatures::CREATURES[0].slug);
+        }
+    }
+
+    #[gpui::test]
+    fn the_name_field_suggests_a_creature_name(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let view = open_dialog(&workspace, cx);
+
+        let suggested = view.read_with(cx, |dialog, _| dialog.suggested_name());
+
+        assert!(creatures::is_creature_slug(&suggested));
+    }
+
+    #[gpui::test]
+    fn a_suggestion_that_a_listed_branch_uses_is_replaced(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let view = open_dialog(&workspace, cx);
+        let suggested = view.read_with(cx, |dialog, _| dialog.suggested_name());
+
+        view.update(cx, |dialog, cx| {
+            dialog.set_branches(vec!["main".into(), format!("swarm/{suggested}").into()], cx);
+        });
+
+        let replaced = view.read_with(cx, |dialog, _| dialog.suggested_name());
+        assert_ne!(replaced, suggested);
+    }
+
+    #[gpui::test]
+    fn an_empty_name_creates_the_task_with_the_suggested_name(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let view = open_dialog(&workspace, cx);
+        let requests = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = std::rc::Rc::clone(&requests);
+        let _subscription = cx.update(|_, app| {
+            app.subscribe(&view, move |_, event: &NewTaskEvent, _| {
+                if let NewTaskEvent::Created(request) = event {
+                    seen.borrow_mut().push(request.clone());
+                }
+            })
+        });
+
+        view.update(cx, NewTaskDialog::create);
+
+        let suggested = view.read_with(cx, |dialog, _| dialog.suggested_name());
+        let names: Vec<SharedString> = requests
+            .borrow()
+            .iter()
+            .map(|request| request.name.clone())
+            .collect();
+        assert_eq!(names, [suggested]);
+    }
+
+    #[gpui::test]
+    fn a_typed_name_wins_over_the_suggestion(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let view = open_dialog(&workspace, cx);
+        let requests = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = std::rc::Rc::clone(&requests);
+        let _subscription = cx.update(|_, app| {
+            app.subscribe(&view, move |_, event: &NewTaskEvent, _| {
+                if let NewTaskEvent::Created(request) = event {
+                    seen.borrow_mut().push(request.name.clone());
+                }
+            })
+        });
+
+        cx.simulate_input("login");
+        view.update(cx, NewTaskDialog::create);
+
+        assert_eq!(*requests.borrow(), ["login"]);
     }
 
     #[gpui::test]

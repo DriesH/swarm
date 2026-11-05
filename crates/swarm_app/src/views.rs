@@ -9,9 +9,9 @@ use swarm_layout::{Activity, Layout, LayoutStyle, Rect, TileId, TileKind, TileSp
 use swarm_term_view::TerminalView;
 use swarm_ui::fonts::MONO_FONT;
 use swarm_ui::prelude::*;
-use swarm_ui::{FocusStyle, Nudge, ResizeAxis, TextFieldSize, TileRing};
+use swarm_ui::{FocusStyle, Nudge, ResizeAxis, TILE_RADIUS, TextFieldSize, TileRing};
 
-use crate::daemon::{CHROME_HEIGHT, CHROME_WIDTH, exit_failed};
+use crate::daemon::{CHROME_HEIGHT, CHROME_WIDTH, exit_failed, is_resumable};
 use crate::model::{Agent, AgentKind, FakeLine, Terminal, TerminalId, TerminalKind};
 use crate::sidebar::update_workspace;
 use crate::workspace::{DataSource, View, Workspace};
@@ -256,6 +256,7 @@ pub(crate) fn tile_specs(workspace: &Workspace) -> Vec<TileSpec> {
         .into_iter()
         .chain(task.workers.iter().copied())
         .filter_map(|id| data.agent(id))
+        .filter(|agent| task.orchestrator == Some(agent.id) || !is_resumable(agent))
         .filter_map(|agent| {
             let terminal = data.terminal(agent.terminal)?;
             Some((terminal, activity_of(agent.status), agent.tile_large))
@@ -1156,6 +1157,7 @@ fn tile_resize_handle(
 
     ResizeHandle::new(("resize", id.0), label.to_owned(), focus)
         .axis(ResizeAxis::Vertical)
+        .corner_radius(TILE_RADIUS)
         .value(f32::from(height), range.0, range.1)
         .dragging(dragging)
         .on_drag(TileDrag(id))
@@ -1582,6 +1584,43 @@ mod tests {
         redraw(cx);
 
         assert!(workspace.read_with(cx, |workspace, _| is_placed(workspace, worker)));
+    }
+
+    #[gpui::test]
+    fn a_stopped_worker_leaves_the_tile_layout_and_the_tray(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let worker = workspace.read_with(cx, |workspace, _| terminal_of(workspace, 0));
+        let id = workspace.read_with(cx, |workspace, _| workspace.active_task().workers[0]);
+        assert!(workspace.read_with(cx, |workspace, _| is_placed(workspace, worker)));
+
+        workspace.update(cx, |workspace, cx| {
+            if let Some(agent) = workspace
+                .data
+                .agents
+                .iter_mut()
+                .find(|agent| agent.id == id)
+            {
+                agent.daemon = Some(crate::model::DaemonAgent {
+                    id: swarm_protocol::AgentId(1),
+                    project: swarm_protocol::ProjectId(1),
+                    task: Some(swarm_protocol::TaskId(1)),
+                    terminal: None,
+                    status: swarm_protocol::AgentStatus::Idle,
+                    message: None,
+                    lifecycle: swarm_protocol::AgentLifecycle::Resumable,
+                    revision: 1,
+                    worktree: std::path::PathBuf::new(),
+                    branch: "swarm/x".into(),
+                });
+            }
+            cx.notify();
+        });
+        redraw(cx);
+
+        let (placed, tray) = workspace.read_with(cx, |workspace, _| {
+            (is_placed(workspace, worker), in_tray(workspace, worker))
+        });
+        assert!(!placed && !tray);
     }
 
     #[gpui::test]

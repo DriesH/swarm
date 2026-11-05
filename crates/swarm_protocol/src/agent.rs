@@ -66,6 +66,14 @@ pub enum Call {
     /// Orchestrator: merges a worker's branch into the task branch in the task
     /// worktree. Returns [`Merged`].
     Merge { worker: AgentId },
+    /// Orchestrator: ends one of its workers the way idle stop does, so the worker stays
+    /// resumable and a later message brings it back. Refused for a worker with its own
+    /// worktree that is not merged. Returns [`AgentSummary`].
+    Stop { worker: AgentId },
+    /// Orchestrator: renames its task, the task's tab and its branch (never the worktree
+    /// folder). Refused when the task has a pull request or a pushed branch, or when the
+    /// name is taken or makes no branch name. Returns [`TaskSummary`].
+    TaskRename { name: String },
     /// Orchestrator: makes one of its workers' tiles large; worker: its own (`None`).
     /// Changes the layout only, never sends a message. Returns nothing.
     TileGrow { agent: Option<AgentId> },
@@ -89,7 +97,9 @@ pub enum Call {
     /// Start orchestrator: makes a task (branch, task worktree, tab, setup) and starts
     /// its orchestrator with `brief` as the first message. Returns [`TaskSummary`].
     TaskCreate {
-        name: String,
+        /// `None` or blank names the task after a creature.
+        #[serde(default)]
+        name: Option<String>,
         /// Branch to start from; `None` uses the base branch.
         from: Option<String>,
         brief: String,
@@ -149,6 +159,7 @@ pub const HARNESS_CALLS: &[(&str, &str)] = &[
     ("wait", "wait"),
     ("commit", "commit"),
     ("merge", "merge"),
+    ("stop", "stop"),
     ("notify", "notify"),
     ("agents", "agents"),
     ("confirm", "confirm"),
@@ -156,6 +167,7 @@ pub const HARNESS_CALLS: &[(&str, &str)] = &[
     ("tile_grow", "tile grow"),
     ("tile_shrink", "tile shrink"),
     ("task_create", "task create"),
+    ("task_rename", "task rename"),
     ("task_list", "task list"),
     ("task_wait", "task wait"),
     ("agent_exit", "exit"),

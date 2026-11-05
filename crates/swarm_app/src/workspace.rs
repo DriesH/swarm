@@ -332,6 +332,8 @@ pub(crate) struct Workspace {
     /// The comments listing the daemon last answered, so a list is asked once per diff.
     pub(crate) comments_listed: Option<crate::review_comments::Listed>,
     pub(crate) comment_sync: crate::review_comments::CommentSync,
+    /// The viewed and folded marks of Review, kept in step with the daemon.
+    pub(crate) marks_sync: crate::review_view::MarksSync,
     /// Moves keyboard focus into Review at the next frame.
     pub(crate) pending_review_focus: bool,
     pub(crate) review_poll: Option<DiffPoll>,
@@ -413,6 +415,15 @@ impl Workspace {
         });
         let workspace = cx.weak_entity();
         let review = cx.new(|cx| ReviewView::new(workspace.clone(), cx));
+        cx.subscribe(
+            &review,
+            |this, _, event: &crate::review_view::ReviewEvent, cx| {
+                let crate::review_view::ReviewEvent::MarksChanged(task) = event;
+
+                this.save_review_marks(*task, cx);
+            },
+        )
+        .detach();
         let changes_list = cx.new(|cx| ChangesList::new(workspace, cx));
         let preview = cx.new(|_| TerminalPreview::new());
         let preview_subscription = cx.subscribe(&preview, |this, _, _: &Clicked, cx| {
@@ -503,6 +514,7 @@ impl Workspace {
             review_requesting: HashSet::new(),
             comments_listed: None,
             comment_sync: crate::review_comments::CommentSync::default(),
+            marks_sync: crate::review_view::MarksSync::default(),
             pending_review_focus: false,
             review_poll: None,
             live_poll: None,
@@ -1149,6 +1161,7 @@ static NO_TASK: Task = Task {
     processes: Vec::new(),
     user_terminals: Vec::new(),
     approved: None,
+    approval_stale: false,
     pull_request: None,
     close_after_merge: false,
     is_start: false,

@@ -9,3 +9,5 @@ You are the Start orchestrator of this project. You turn the user's plan into ta
 7. Run `swarm exit` to end your session.
 
 Use `swarm task list` to see the tasks of the project.
+
+Never use your built-in subagent or workflow tools. Each task's orchestrator starts its own workers with `swarm spawn`.

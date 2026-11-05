@@ -2,7 +2,7 @@ use std::rc::Rc;
 
 use gpui::{
     AnyElement, App, Context, Div, ElementId, Empty, FocusHandle, KeyDownEvent, MouseButton,
-    Orientation, Render, Role, SharedString, Stateful, Window, div, px,
+    Orientation, Pixels, Render, Role, SharedString, Stateful, Window, div, px,
 };
 
 use crate::a11y::accessible;
@@ -33,13 +33,14 @@ pub enum ResizeAxis {
     /// The handle sits on a left border and moves left and right.
     #[default]
     Horizontal,
-    /// The handle sits on a top border and moves up and down.
+    /// The handle is the bottom border of a panel and moves up and down. Its value is the
+    /// height of the panel, and the border follows the panel's corner radius.
     Vertical,
 }
 
-/// A drag handle on the left border of a panel, or on the top border with
+/// A drag handle on the left border of a panel, or on the bottom border with
 /// [`ResizeAxis::Vertical`]. Its parent must be positioned (`relative`). The hit area is
-/// 8 px thick and centered on the border.
+/// 8 px thick, on the border and inside the panel.
 #[derive(IntoElement)]
 #[must_use]
 pub struct ResizeHandle {
@@ -50,6 +51,8 @@ pub struct ResizeHandle {
     value: f32,
     range: (f32, f32),
     dragging: bool,
+    corner_radius: Pixels,
+    debug_selector: Option<String>,
     drag: Option<DragHook>,
     on_reset: Option<ResetHandler>,
     on_nudge: Option<NudgeHandler>,
@@ -69,10 +72,25 @@ impl ResizeHandle {
             value: 0.,
             range: (0., 0.),
             dragging: false,
+            corner_radius: px(0.),
+            debug_selector: None,
             drag: None,
             on_reset: None,
             on_nudge: None,
         }
+    }
+
+    /// Name for `VisualTestContext::debug_bounds` of the border a [`ResizeAxis::Vertical`]
+    /// handle paints. Only recorded in test builds.
+    pub fn debug_selector(mut self, selector: impl FnOnce() -> String) -> Self {
+        self.debug_selector = Some(selector());
+        self
+    }
+
+    /// The corner radius of the panel a [`ResizeAxis::Vertical`] handle closes.
+    pub fn corner_radius(mut self, radius: Pixels) -> Self {
+        self.corner_radius = radius;
+        self
     }
 
     /// The direction the handle moves. Left and right by default.
@@ -167,22 +185,36 @@ impl RenderOnce for ResizeHandle {
                     .h(px(8.))
                     .cursor_row_resize(),
             })
-            .child(
-                div()
-                    .map(|bar| match axis {
-                        ResizeAxis::Horizontal => bar.h_full().ml(line_offset).w(line_thickness),
-                        ResizeAxis::Vertical => bar.w_full().mt(line_offset).h(line_thickness),
-                    })
+            .child(match axis {
+                ResizeAxis::Horizontal => div()
+                    .h_full()
+                    .ml(line_offset)
+                    .w(line_thickness)
                     .bg(if thick { accent } else { line })
-                    .group_hover(group, move |style| {
-                        let style = match axis {
-                            ResizeAxis::Horizontal => style.ml(px(3.)).w(px(3.)),
-                            ResizeAxis::Vertical => style.mt(px(3.)).h(px(3.)),
-                        };
-
-                        style.bg(accent)
-                    }),
-            )
+                    .group_hover(group, |style| style.ml(px(3.)).w(px(3.)).bg(accent))
+                    .into_any_element(),
+                // Paints the bottom border of the whole panel: the handle is only 8 px
+                // high, so the box reaches up by the panel's height.
+                ResizeAxis::Vertical => div()
+                    .when_some(self.debug_selector, |edge, selector| {
+                        edge.debug_selector(move || selector)
+                    })
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .h(px(self.value))
+                    .rounded(self.corner_radius)
+                    .map(|edge| {
+                        if thick {
+                            edge.border_b_3().border_color(accent)
+                        } else {
+                            edge.border_b_1().border_color(gpui::transparent_black())
+                        }
+                    })
+                    .group_hover(group, |style| style.border_b_3().border_color(accent))
+                    .into_any_element(),
+            })
             .when_some(self.drag, |handle, apply| apply(handle))
             .when_some(self.on_reset, |handle, handler| {
                 handle.on_mouse_up(MouseButton::Left, move |event, window, cx| {

@@ -626,6 +626,7 @@ fn task_info() -> TaskInfo {
         created_by: None,
         briefed: false,
         approved: None,
+        approval_stale: false,
         closed: false,
         pr_base: "main".into(),
         pull_request: None,

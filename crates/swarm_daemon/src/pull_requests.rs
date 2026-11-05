@@ -3,7 +3,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
@@ -12,14 +13,17 @@ use swarm_core::github::{self, Github, NewPullRequest, Target};
 use swarm_core::prompts::{self, PromptFile};
 use swarm_core::store::{MAX_MESSAGE_BYTES, NewMessage};
 use swarm_protocol::{
-    AgentLifecycle, AgentRole, CheckState, Event, GH_SECS, MergeMethod, MessageKind, PUSH_SECS,
-    PrDraft, PrLink, PrPanel, PrState, PullRequest, TaskId, TaskInfo,
+    AgentLifecycle, AgentRole, CheckState, Event, GH_SECS, GithubCheckState, MergeMethod,
+    MessageKind, PUSH_SECS, PrDraft, PrLink, PrPanel, PrState, PullRequest, TaskId, TaskInfo,
 };
 
 use crate::{Services, stats, tasks};
 
 /// A push may run a pre-push hook, which can run the whole test suite.
 const PUSH_TIMEOUT: Duration = Duration::from_secs(PUSH_SECS);
+
+/// How often approved tasks are checked for work that came after the approval.
+const APPROVAL_CHECK: Duration = Duration::from_secs(2);
 
 /// Deleting a branch runs no hook, so it gets the time of one `gh` call.
 const DELETE_TIMEOUT: Duration = Duration::from_secs(GH_SECS);
@@ -154,6 +158,111 @@ pub(crate) fn request_draft(services: &Services, id: TaskId) -> Result<()> {
     services.agents.deliver_unread(orchestrator.id);
 
     Ok(())
+}
+
+/// Starts the thread that finds approvals that new work made outdated.
+pub(crate) fn watch_approvals(services: &Arc<Services>) {
+    let services = Arc::clone(services);
+    let spawned = thread::Builder::new()
+        .name("approval-watch".into())
+        .spawn(move || {
+            let mut verified = HashMap::new();
+
+            loop {
+                thread::park_timeout(APPROVAL_CHECK);
+
+                check_approvals(&services, &mut verified);
+            }
+        });
+
+    if let Err(error) = spawned {
+        log::error!("cannot start the approval watch thread: {error}");
+    }
+}
+
+/// Resets the approval of every approved task whose Merged diff changed. `verified` holds
+/// the commit each task was last checked at, so a task is read again only when its branch
+/// moved.
+pub(crate) fn check_approvals(services: &Services, verified: &mut HashMap<TaskId, String>) {
+    let tasks = match services.projects.approved_tasks() {
+        Ok(tasks) => tasks,
+        Err(error) => {
+            log::warn!("cannot list the approved tasks: {error}");
+
+            return;
+        }
+    };
+
+    verified.retain(|id, _| tasks.iter().any(|task| task.id == *id));
+
+    for task in tasks
+        .iter()
+        .filter(|task| !services.agents.is_closing(Some(task.id)))
+    {
+        let Ok(head) = git::commit_of(&task.worktree, "HEAD") else {
+            continue;
+        };
+        if verified.get(&task.id) == Some(&head) {
+            continue;
+        }
+
+        match services.projects.reset_stale_approval(task.id) {
+            Ok(Some(reset)) => {
+                verified.remove(&task.id);
+                approval_reset(services, &reset);
+            }
+            Ok(None) => {
+                verified.insert(task.id, head);
+            }
+            Err(error) => log::debug!("cannot check the approval of task {}: {error}", task.id.0),
+        }
+    }
+}
+
+/// Drops the draft of a task whose approval no longer counts, tells the clients and asks
+/// the orchestrator to wait for the next approval.
+fn approval_reset(services: &Services, task: &TaskInfo) {
+    services.pull_requests.forget(task.id);
+    services
+        .clients
+        .broadcast(&Event::TaskChanged { task: task.clone() });
+
+    // A task with a pull request needs no new draft, only a new approval to push.
+    if task.pull_request.is_some() {
+        return;
+    }
+
+    let Some(orchestrator) = task
+        .agents
+        .iter()
+        .find(|agent| agent.role == AgentRole::Orchestrator)
+    else {
+        return;
+    };
+
+    let text = format!(
+        "The task \"{name}\" changed after the user approved it. The approval is reset and \
+         the pull request draft is dropped. Keep working. When the user approves again, you \
+         get a `pr draft` message and write a new draft from the whole diff.",
+        name = task.name,
+    );
+    let posted = services.messages.post(&NewMessage {
+        project: task.project,
+        task: Some(task.id),
+        from: None,
+        to: orchestrator.id,
+        kind: MessageKind::ApprovalReset,
+        text: &text,
+        delivered: false,
+    });
+
+    match posted {
+        Ok(_) => services.agents.deliver_unread(orchestrator.id),
+        Err(error) => log::warn!(
+            "cannot tell the orchestrator of task {}: {error}",
+            task.id.0
+        ),
+    }
 }
 
 /// The message the orchestrator reads: what to do, then the `pr.md` format.
@@ -507,6 +616,16 @@ pub(crate) fn merge(services: &Services, id: TaskId, method: MergeMethod) -> Res
     };
     let github = &services.pull_requests.github;
 
+    // A failed read leaves the decision to GitHub, as before.
+    match github.pull_request(&target, number) {
+        Ok(status) => {
+            if let Some(reason) = merge_blocker(&status) {
+                bail!("{reason}");
+            }
+        }
+        Err(error) => log::warn!("cannot read the checks before the merge: {error}"),
+    }
+
     // Before `gh` runs: it can merge and still fail, and a queued merge lands later.
     lock(&services.store)
         .request_merge(id, number)
@@ -564,6 +683,24 @@ pub(crate) fn merge(services: &Services, id: TaskId, method: MergeMethod) -> Res
     }
 
     Ok(())
+}
+
+/// Why GitHub's checks forbid a merge now: a check still runs or one failed.
+fn merge_blocker(status: &PullRequest) -> Option<&'static str> {
+    if status.checks.iter().any(|check| {
+        matches!(
+            check.state,
+            GithubCheckState::Queued | GithubCheckState::Running
+        )
+    }) {
+        return Some("checks are still running on GitHub");
+    }
+
+    status
+        .checks
+        .iter()
+        .any(|check| check.state == GithubCheckState::Failed)
+        .then_some("checks failed on GitHub")
 }
 
 fn broadcast_task(services: &Services, id: TaskId) -> Result<()> {
@@ -646,6 +783,7 @@ mod tests {
             created_by: None,
             briefed: true,
             approved: Some(1),
+            approval_stale: false,
             closed: false,
             pr_base: "develop".to_owned(),
             pull_request: None,
