@@ -9,15 +9,17 @@ use gpui::{
     Focusable, Hsla, Pixels, Point, Role, SharedString, Size, Stateful, Subscription, Window, div,
     ease_out_quint, point, px,
 };
+use swarm_layout::Direction;
 use swarm_protocol::{Client, ReviewSource};
 use swarm_ui::fonts::UI_FONT;
 use swarm_ui::prelude::*;
 use swarm_ui::roving::RovingFocus;
 
 use crate::actions::{
-    About, AddProject, CloseTask, CreatePullRequest, FocusAgent, NewTask, NewTerminal,
-    OpenSettings, PlanWithOrchestrator, SetUpGithub, ShowReview, ShowSwarm, ShowTerminals,
-    ToggleChanges, ToggleCommandPalette, ToggleFiles, ToggleSidebar,
+    About, AddProject, CloseTask, CreatePullRequest, FocusAgent, MoveTileDown, MoveTileLeft,
+    MoveTileRight, MoveTileUp, NewTask, NewTerminal, OpenSettings, PlanWithOrchestrator,
+    SetUpGithub, ShowReview, ShowSwarm, ShowTerminals, ToggleChanges, ToggleCommandPalette,
+    ToggleFiles, ToggleSidebar,
 };
 use crate::daemon::DiffPoll;
 use crate::daemon::{DaemonLaunch, LiveTerminal};
@@ -231,6 +233,11 @@ pub(crate) struct Workspace {
     /// The Add project button of the empty state, a drawn control when no project exists.
     pub(crate) add_project_focus: FocusHandle,
     pub minimized: HashSet<TerminalId>,
+    /// The order of the tiles the user chose, per task. A task without an entry keeps the
+    /// default order.
+    pub(crate) tile_order: HashMap<TaskId, Vec<TerminalId>>,
+    /// What the screen reader says about the last tile command.
+    pub(crate) tile_status: SharedString,
     pub focused_terminal: Option<TerminalId>,
     /// The terminals that took the focus last, the latest first. A Start tab uses it to
     /// decide which tiles get a place in its band.
@@ -467,6 +474,8 @@ impl Workspace {
             sidebar_focus: cx.focus_handle(),
             add_project_focus: cx.focus_handle().tab_stop(true),
             minimized: HashSet::new(),
+            tile_order: HashMap::new(),
+            tile_status: SharedString::default(),
             focused_terminal,
             recent_focus: Vec::new(),
             focus_handle,
@@ -1261,6 +1270,18 @@ impl Workspace {
                 }))
                 .on_action(cx.listener(|this, _: &About, _, cx| {
                     this.open_settings(Some(Page::General), cx);
+                }))
+                .on_action(cx.listener(|this, _: &MoveTileLeft, window, cx| {
+                    this.move_tile(Direction::Left, window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &MoveTileRight, window, cx| {
+                    this.move_tile(Direction::Right, window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &MoveTileUp, window, cx| {
+                    this.move_tile(Direction::Up, window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &MoveTileDown, window, cx| {
+                    this.move_tile(Direction::Down, window, cx);
                 }))
                 .on_action(cx.listener(|this, _: &ToggleCommandPalette, window, cx| {
                     this.toggle_palette(window, cx);

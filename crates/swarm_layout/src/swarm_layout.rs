@@ -7,8 +7,11 @@
 //! The engine works in whole grid cells of [`CELL`] pixels. It turns the area into
 //! cells once, does all its work in integers and turns the result back into pixels.
 
+mod order;
 #[cfg(test)]
 mod tests;
+
+pub use order::{Direction, move_before, neighbour};
 
 /// Logical pixels per grid cell.
 pub const CELL: f32 = 8.0;

@@ -89,3 +89,10 @@ Island (area 1060 × 790): the user terminal is 81 × 59 cells at the top right.
 +--------------+----------------+----------------+
 tray: pty-io (working), ui-tokens (done), bench (idle)
 ```
+
+## Order helpers
+
+The tile order is the input order of `layout`. Two pure helpers change and read it:
+
+- `move_before(order, moved, target)` moves `moved` to the index of `target`. The tiles in between shift by one. `[a b c d]`, move `a` to `c`: `[b c a d]`. Move `d` to `b`: `[a d b c]`. Nothing changes when the tiles are equal or one is missing.
+- `neighbour(layout, from, direction, movable)` finds the nearest tile in `movable` whose center lies strictly on the `direction` side of `from`'s center. Nearest is by distance on that axis, then on the other axis, then by input order. It returns `None` for a tile in the tray or at an edge.
