@@ -192,7 +192,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "app_icon"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "image",
  "swarm_sprite",
@@ -1841,7 +1841,7 @@ dependencies = [
 
 [[package]]
 name = "gallery"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "env_logger",
@@ -5262,7 +5262,7 @@ dependencies = [
 
 [[package]]
 name = "swarm_app"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "block2 0.6.2",
@@ -5291,7 +5291,7 @@ dependencies = [
 
 [[package]]
 name = "swarm_cli"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "clap",
  "serde",
@@ -5304,7 +5304,7 @@ dependencies = [
 
 [[package]]
 name = "swarm_core"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "libc",
  "log",
@@ -5321,7 +5321,7 @@ dependencies = [
 
 [[package]]
 name = "swarm_creatures"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -5330,7 +5330,7 @@ dependencies = [
 
 [[package]]
 name = "swarm_daemon"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "core-foundation",
@@ -5352,11 +5352,11 @@ dependencies = [
 
 [[package]]
 name = "swarm_layout"
-version = "1.0.1"
+version = "1.0.2"
 
 [[package]]
 name = "swarm_protocol"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "flume",
  "libc",
@@ -5370,7 +5370,7 @@ dependencies = [
 
 [[package]]
 name = "swarm_settings"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "log",
  "serde",
@@ -5382,11 +5382,11 @@ dependencies = [
 
 [[package]]
 name = "swarm_sprite"
-version = "1.0.1"
+version = "1.0.2"
 
 [[package]]
 name = "swarm_syntax"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "tree-sitter",
  "tree-sitter-bash",
@@ -5407,7 +5407,7 @@ dependencies = [
 
 [[package]]
 name = "swarm_term"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "flume",
  "serde",
@@ -5415,7 +5415,7 @@ dependencies = [
 
 [[package]]
 name = "swarm_term_view"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "flume",
  "gpui",
@@ -5428,7 +5428,7 @@ dependencies = [
 
 [[package]]
 name = "swarm_term_vt"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "flume",
@@ -5442,7 +5442,7 @@ dependencies = [
 
 [[package]]
 name = "swarm_ui"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "gpui",
  "log",
@@ -5455,7 +5455,7 @@ dependencies = [
 
 [[package]]
 name = "swarm_update"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "block2 0.6.2",
  "core-foundation",
@@ -5472,7 +5472,7 @@ dependencies = [
 
 [[package]]
 name = "swarm_usage"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "libc",
  "log",
