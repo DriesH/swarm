@@ -3,7 +3,10 @@
 //! role and properties straight from each rendered element.
 
 use gpui::accesskit::{Node, Role, Toggled};
-use gpui::{App, Context, Element as _, Render, RenderOnce, TestAppContext, Window, div};
+use gpui::{
+    App, AppContext as _, Context, Element as _, Empty, Render, RenderOnce, TestAppContext, Window,
+    div,
+};
 use swarm_ui::prelude::*;
 
 struct A11yInfo {
@@ -221,6 +224,29 @@ fn tray_chip_says_what_it_restores() {
 fn tile_frame_is_a_named_group() {
     with_window(|window, cx| {
         let info = a11y_info(TileFrame::new("t", IconName::Codex, "pty-io"), window, cx);
+
+        assert_eq!(info.role, Some(Role::Group));
+        assert_eq!(info.node.label(), Some("pty-io terminal"));
+    });
+}
+
+struct NoGhost;
+
+impl Render for NoGhost {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
+
+#[test]
+fn a_header_drag_keeps_the_role_and_the_label_of_the_tile() {
+    with_window(|window, cx| {
+        let info = a11y_info(
+            TileFrame::new("t", IconName::Codex, "pty-io")
+                .on_header_drag(1_u32, |_, _, _, cx| cx.new(|_| NoGhost)),
+            window,
+            cx,
+        );
 
         assert_eq!(info.role, Some(Role::Group));
         assert_eq!(info.node.label(), Some("pty-io terminal"));

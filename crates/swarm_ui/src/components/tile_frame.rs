@@ -1,12 +1,14 @@
 use gpui::{
-    AnyElement, App, ElementId, FocusHandle, FontWeight, Hsla, Pixels, Role, SharedString, Window,
-    div, px, relative,
+    AnyElement, App, CursorStyle, Div, ElementId, Entity, FocusHandle, FontWeight, Hsla, Pixels,
+    Point, Render, Role, SharedString, Stateful, Window, div, px, relative,
 };
 
 use crate::a11y::accessible;
 use crate::component::{Component, example, example_group};
 use crate::fonts::MONO_FONT;
 use crate::prelude::*;
+
+type DragHook = Box<dyn FnOnce(Stateful<Div>) -> Stateful<Div>>;
 
 /// The corner radius of a tile, its border and its focus border.
 pub const TILE_RADIUS: Pixels = px(10.);
@@ -44,6 +46,7 @@ pub struct TileFrame {
     attention: bool,
     focus_handle: Option<FocusHandle>,
     debug_selector: Option<String>,
+    header_drag: Option<DragHook>,
 }
 
 impl TileFrame {
@@ -66,6 +69,7 @@ impl TileFrame {
             attention: false,
             focus_handle: None,
             debug_selector: None,
+            header_drag: None,
         }
     }
 
@@ -149,11 +153,65 @@ impl TileFrame {
         self.focus_handle = Some(handle.clone());
         self
     }
+
+    /// Makes the header a drag source with a grab cursor. The actions are not part of it, so
+    /// a press on a button never starts a drag. `constructor` makes the view that follows the
+    /// pointer.
+    pub fn on_header_drag<T: 'static, W: Render>(
+        mut self,
+        value: T,
+        constructor: impl Fn(&T, Point<Pixels>, &mut Window, &mut App) -> Entity<W> + 'static,
+    ) -> Self {
+        self.header_drag = Some(Box::new(move |area| {
+            area.cursor(CursorStyle::OpenHand)
+                .on_drag(value, constructor)
+        }));
+        self
+    }
 }
 
 impl ParentElement for TileFrame {
     fn extend(&mut self, elements: impl IntoIterator<Item = AnyElement>) {
         self.body.extend(elements);
+    }
+}
+
+/// The icon at the start of the header. The user's own terminal shows a lock badge, cut out
+/// of `cutout`.
+fn header_icon(icon: IconName, locked: bool, cutout: Hsla, selector: Option<String>) -> AnyElement {
+    if locked {
+        return LockedTerminalIcon::new()
+            .cutout(cutout)
+            .when_some(selector, |icon, selector| {
+                icon.debug_selector(move || format!("{selector}-lock"))
+            })
+            .into_any_element();
+    }
+
+    let color = if icon == IconName::Terminal || icon == IconName::User {
+        Color::Muted
+    } else {
+        Color::Default
+    };
+
+    Icon::new(icon)
+        .size(IconSize::Large)
+        .color(color)
+        .into_any_element()
+}
+
+/// Makes `lead` the drag source when the frame has one. It adds no role and no label: the
+/// move commands are the keyboard way.
+fn drag_area(lead: Div, drag: Option<DragHook>, selector: Option<String>) -> AnyElement {
+    match drag {
+        Some(apply) => apply(
+            lead.id("tile-header")
+                .when_some(selector, |area, selector| {
+                    area.debug_selector(move || format!("{selector}-header"))
+                }),
+        )
+        .into_any_element(),
+        None => lead.into_any_element(),
     }
 }
 
@@ -177,36 +235,19 @@ impl RenderOnce for TileFrame {
             .accessible_label
             .unwrap_or_else(|| SharedString::from(format!("{} terminal", self.name)));
 
-        let icon_color = if self.icon == IconName::Terminal || self.icon == IconName::User {
-            Color::Muted
-        } else {
-            Color::Default
-        };
-
-        let header = h_flex()
-            .flex_none()
-            .h(px(34.))
+        // Everything but the actions, so the drag area never holds a button.
+        let lead = h_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
             .gap(px(8.))
             .pl(px(12.))
-            .pr(px(8.))
-            .bg(panel)
-            .border_b_1()
-            .border_color(line)
-            .child(if self.locked {
-                let selector = self.debug_selector.clone();
-
-                LockedTerminalIcon::new()
-                    .cutout(panel)
-                    .when_some(selector, |icon, selector| {
-                        icon.debug_selector(move || format!("{selector}-lock"))
-                    })
-                    .into_any_element()
-            } else {
-                Icon::new(self.icon)
-                    .size(IconSize::Large)
-                    .color(icon_color)
-                    .into_any_element()
-            })
+            .child(header_icon(
+                self.icon,
+                self.locked,
+                panel,
+                self.debug_selector.clone(),
+            ))
             .child(Label::new(self.name).weight(FontWeight::MEDIUM))
             .children(self.name_suffix)
             .when_some(self.meta, |header, meta| {
@@ -227,7 +268,19 @@ impl RenderOnce for TileFrame {
                 } else {
                     header.child(StatusPill::new(status))
                 }
-            })
+            });
+
+        let lead = drag_area(lead, self.header_drag, self.debug_selector.clone());
+
+        let header = h_flex()
+            .flex_none()
+            .h(px(34.))
+            .gap(px(8.))
+            .pr(px(8.))
+            .bg(panel)
+            .border_b_1()
+            .border_color(line)
+            .child(lead)
             .children(self.actions);
 
         let tile = div()
@@ -390,5 +443,37 @@ impl Component for TileFrame {
                 )],
             ))
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::accesskit::{Node, Role};
+    use gpui::{AppContext as _, Context, Element as _, Empty};
+
+    use super::*;
+
+    struct NoGhost;
+
+    impl Render for NoGhost {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            Empty
+        }
+    }
+
+    #[test]
+    fn the_header_drag_area_has_no_role_and_no_label() {
+        let frame = TileFrame::new("t", IconName::Codex, "pty-io")
+            .on_header_drag(1_u32, |_, _, _, cx| cx.new(|_| NoGhost));
+        let Some(apply) = frame.header_drag else {
+            panic!("the frame has no header drag");
+        };
+
+        let area = apply(h_flex().id("tile-header"));
+        let mut node = Node::new(Role::Unknown);
+        area.write_a11y_info(&mut node);
+
+        assert_eq!(area.a11y_role(), None);
+        assert_eq!(node.label(), None);
     }
 }

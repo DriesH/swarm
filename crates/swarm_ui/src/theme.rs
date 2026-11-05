@@ -1005,8 +1005,8 @@ mod tests {
                 ("term", colors.term),
             ];
 
-            // Icons, status marks, the focus ring (accent) and the attention ring (warn). The
-            // fill of a usage bar sits on the soft track.
+            // Icons, status marks, the focus ring and the tile drop outline (accent) and the
+            // attention ring (warn). The fill of a usage bar sits on the soft track.
             // The Claude Code mark is left out: logos are exempt (WCAG 1.4.11).
             for glyph in [
                 ("fg", colors.fg),

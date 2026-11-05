@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     AnyWindowHandle, AppContext as _, Axis, Bounds, Context, Div, ElementId, Entity, FocusHandle,
-    Focusable, Hsla, Pixels, Point, Role, SharedString, Size, Stateful, Subscription, Window, div,
-    ease_out_quint, point, px,
+    Focusable, Hsla, KeyDownEvent, MouseButton, Pixels, Point, Role, SharedString, Size, Stateful,
+    Subscription, Window, div, ease_out_quint, point, px,
 };
 use swarm_layout::Direction;
 use swarm_protocol::{Client, ReviewSource};
@@ -238,6 +238,10 @@ pub(crate) struct Workspace {
     pub(crate) tile_order: HashMap<TaskId, Vec<TerminalId>>,
     /// What the screen reader says about the last tile command.
     pub(crate) tile_status: SharedString,
+    /// Counts the tile announcements; the live region takes it in its id.
+    pub(crate) tile_status_serial: u32,
+    /// The tile whose header drag runs. Ends on a drop, on Esc and on any mouse up.
+    pub(crate) tile_drag: Option<TerminalId>,
     pub focused_terminal: Option<TerminalId>,
     /// The terminals that took the focus last, the latest first. A Start tab uses it to
     /// decide which tiles get a place in its band.
@@ -476,6 +480,8 @@ impl Workspace {
             minimized: HashSet::new(),
             tile_order: HashMap::new(),
             tile_status: SharedString::default(),
+            tile_status_serial: 0,
+            tile_drag: None,
             focused_terminal,
             recent_focus: Vec::new(),
             focus_handle,
@@ -687,6 +693,7 @@ impl Workspace {
         self.welcome = None;
         self.overlay = None;
         self.resizing = None;
+        self.tile_drag = None;
         self.inspector_dragging = false;
         self.terminal_area = None;
         self.tray_width = None;
@@ -1286,6 +1293,24 @@ impl Workspace {
                 .on_action(cx.listener(|this, _: &ToggleCommandPalette, window, cx| {
                     this.toggle_palette(window, cx);
                 }))
+                .capture_any_mouse_up(cx.listener(|this, _, window, cx| {
+                    this.end_tile_drag_after_release(window, cx);
+                }))
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        this.end_tile_drag_after_release(window, cx);
+                    }),
+                )
+                // Only during a tile drag, so terminals keep their Esc at other times.
+                .when(self.tile_drag.is_some(), |root| {
+                    root.capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                        if event.keystroke.key == "escape" {
+                            cx.stop_propagation();
+                            this.cancel_tile_drag(window, cx);
+                        }
+                    }))
+                })
                 .size_full()
                 .relative()
                 .flex()

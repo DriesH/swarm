@@ -1,7 +1,9 @@
 //! The main area: terminals, swarm and review views.
 
+use std::any::Any;
+
 use gpui::{
-    AnyElement, AppContext as _, Bounds, Context, Div, DragMoveEvent, Entity, FocusHandle,
+    AnyElement, App, AppContext as _, Bounds, Context, Div, DragMoveEvent, Entity, FocusHandle,
     MouseButton, Pixels, Role, SharedString, Size, Stateful, Subscription, Window, div, px,
 };
 use swarm_layout::{
@@ -18,7 +20,7 @@ use crate::daemon::{CHROME_HEIGHT, CHROME_WIDTH, exit_failed, has_ended, is_resu
 use crate::model::{Agent, AgentKind, FakeLine, Terminal, TerminalId, TerminalKind};
 use crate::sidebar::update_workspace;
 use crate::swarm_view::resume_label;
-use crate::tile_order::arranged;
+use crate::tile_order::{NoGhost, TileMove, arranged};
 use crate::workspace::{DataSource, View, Workspace};
 
 /// The padding a terminal view leaves around its grid.
@@ -769,9 +771,9 @@ impl Workspace {
         self.resize_user_terminal(terminal, size, cx);
     }
 
-    /// Whether the content area shows the grid: while a tile is being resized.
-    pub(crate) fn grid_visible(&self) -> bool {
-        self.resizing.is_some()
+    /// Whether the content area shows the grid: while a tile is being resized or dragged.
+    pub(crate) fn grid_visible(&self, cx: &App) -> bool {
+        self.resizing.is_some() || self.dragged_tile(cx).is_some()
     }
 }
 
@@ -824,7 +826,7 @@ fn terminals(workspace: &Workspace, cx: &mut Context<Workspace>) -> impl IntoEle
         )
         // Fills the area so its bounds are the layout area.
         .child(div().absolute().size_full())
-        .when(workspace.grid_visible(), |area| {
+        .when(workspace.grid_visible(cx), |area| {
             area.child(dot_grid(workspace))
         })
         .when(on_terminal && crate::settings::easter_eggs(cx), |area| {
@@ -834,7 +836,10 @@ fn terminals(workspace: &Workspace, cx: &mut Context<Workspace>) -> impl IntoEle
         .children(tiles)
         .child(announce(
             "tile-status",
-            LiveRegion::status("tile-status", workspace.tile_status.clone()),
+            LiveRegion::status(
+                ("tile-status", workspace.tile_status_serial),
+                workspace.tile_status.clone(),
+            ),
         ))
 }
 
@@ -864,13 +869,27 @@ fn tile(
         height: px(rect.size.height),
     };
 
-    let frame = match terminal.kind {
+    let mut frame = match terminal.kind {
         TerminalKind::User => user_frame(workspace, terminal, cx),
         TerminalKind::Process if workspace.live_terminals.contains_key(&id) => {
             live_process_frame(workspace, terminal, cx)
         }
         _ => agent_frame(workspace, terminal, cx),
     };
+
+    if workspace.is_movable(id) {
+        let area = cx.weak_entity();
+        frame = frame.on_header_drag(TileMove(id), move |drag, _, _, cx| {
+            let dragged = drag.0;
+            update_workspace(&area, cx, |workspace, cx| {
+                workspace.start_tile_drag(dragged, cx);
+            });
+
+            cx.new(|_| NoGhost)
+        });
+    }
+
+    let dragged = workspace.dragged_tile(cx);
 
     let resizing = workspace
         .resizing
@@ -918,11 +937,50 @@ fn tile(
                 MouseButton::Left,
                 cx.listener(move |workspace, _, _, cx| workspace.focus_terminal(id, cx)),
             )
+            .on_drop(cx.listener(move |workspace, drag: &TileMove, _, cx| {
+                workspace.drop_tile_on(drag.0, id, cx);
+            }))
+            .can_drop(accepts_drop_on(id, cx))
+            .when(dragged == Some(id), |slot| slot.opacity(0.5))
             .child(frame)
             .children(handle)
             .children(badge)
+            .when(dragged.is_some(), |slot| slot.child(drop_outline(id, cx)))
             .into_any_element(),
     )
+}
+
+/// Whether a tile drag may drop on the tile of `target`. It reads the workspace at the drop,
+/// so it never goes stale.
+fn accepts_drop_on(
+    target: TerminalId,
+    cx: &Context<Workspace>,
+) -> impl Fn(&dyn Any, &mut Window, &mut App) -> bool + 'static {
+    let workspace = cx.weak_entity();
+
+    move |value, _, cx| {
+        value.downcast_ref::<TileMove>().is_some_and(|drag| {
+            workspace
+                .read_with(cx, |workspace, _| {
+                    workspace.accepts_tile_drop(drag.0, target)
+                })
+                .unwrap_or(false)
+        })
+    }
+}
+
+/// The accent outline on a tile a dragged tile may drop on. It lies over the tile, so the
+/// content does not move.
+fn drop_outline(target: TerminalId, cx: &Context<Workspace>) -> Div {
+    let accent = cx.theme().colors().accent;
+
+    div()
+        .debug_selector(move || format!("tile-drop-{}", target.0))
+        .absolute()
+        .inset_0()
+        .rounded(TILE_RADIUS)
+        .can_drop(accepts_drop_on(target, cx))
+        .drag_over::<TileMove>(move |style, _, _, _| style.border_2().border_color(accent))
 }
 
 fn lines(terminal: &Terminal, cx: &Context<Workspace>) -> Vec<AnyElement> {
@@ -967,7 +1025,7 @@ fn agent_frame(
         .iter()
         .find(|agent| agent.terminal == id);
     let focused = workspace.focused_terminal == Some(id);
-    let name = terminal.title.clone();
+    let name = workspace.tile_name(id);
 
     let icon = match (terminal.kind, agent.map(|agent| agent.kind)) {
         (TerminalKind::Process, _) => IconName::Terminal,
@@ -979,6 +1037,7 @@ fn agent_frame(
     let is_live_agent = agent.is_some_and(|agent| agent.daemon.is_some());
 
     let mut frame = TileFrame::new(("tile", id.0), icon, name.clone())
+        .debug_selector(move || format!("tile-{}", id.0))
         .focused(focused)
         .attention(agent.is_some_and(|agent| {
             matches!(agent.status, AgentStatus::Blocked | AgentStatus::Error)
@@ -1025,6 +1084,7 @@ fn agent_frame(
                 IconName::Minimize,
                 format!("Move {name} to tray"),
             )
+            .debug_selector(move || format!("tile-minimize-{}", id.0))
             .on_click(cx.listener(move |workspace, _, _, cx| workspace.minimize(id, cx))),
         );
     }
@@ -1088,9 +1148,10 @@ fn live_process_frame(
     cx: &mut Context<Workspace>,
 ) -> TileFrame {
     let id = terminal.id;
-    let name = terminal.title.clone();
+    let name = workspace.tile_name(id);
 
     let mut frame = TileFrame::new(("tile", id.0), IconName::Terminal, name.clone())
+        .debug_selector(move || format!("tile-{}", id.0))
         .accessible_label(process_tile_label(terminal))
         .focused(workspace.focused_terminal == Some(id))
         .status(process_status(terminal));
@@ -1165,7 +1226,7 @@ fn user_frame(
     let id = terminal.id;
     let focused = workspace.focused_terminal == Some(id);
 
-    let mut frame = TileFrame::new(("tile", id.0), IconName::Terminal, terminal.title.clone())
+    let mut frame = TileFrame::new(("tile", id.0), IconName::Terminal, workspace.tile_name(id))
         .locked(true)
         .debug_selector(move || format!("tile-{}", id.0))
         .accessible_label(user_tile_label(workspace, terminal))

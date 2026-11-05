@@ -10,7 +10,10 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
-use gpui::{AnyWindowHandle, App, AsyncApp, Context, Window};
+use gpui::{
+    AnyView, AnyWindowHandle, App, AsyncApp, Context, MouseButton, MouseDownEvent, MouseMoveEvent,
+    Pixels, PlatformInput, Point, Window, point, px,
+};
 use swarm_protocol::{
     CheckState, CloseCheck, RemoveCheck, ReviewSource, TaskCloseCheck, TaskId as DaemonTaskId,
     Usage, UsageProblem,
@@ -24,9 +27,70 @@ use crate::plan_editor::PlanEditor;
 use crate::remove_project::RemoveProjectDialog;
 use crate::review_model::{DiffStyle, LinePos};
 use crate::swarm_view::InspectorTab;
+use crate::tile_order::TileClass;
 use crate::workspace::{RightPanel, View, Workspace};
 
 type OpenOverlay = fn(&mut Workspace, &mut Window, &mut Context<Workspace>);
+/// Sends input to the window after it opened, outside any update of the workspace.
+type Drive = fn(AnyView, &mut Window, &mut App);
+
+/// Where the drag of the first movable tile starts on its header, and the body of the second
+/// one, where it ends.
+fn drag_points(workspace: &Workspace) -> Option<(Point<Pixels>, Point<Pixels>)> {
+    let area = workspace.terminal_area?.origin;
+    let movable = workspace.movable_tiles(TileClass::Other);
+    let dragged = workspace.layout.rect(*movable.first()?)?;
+    let target = workspace.layout.rect(*movable.get(1)?)?;
+
+    let header = area + point(px(dragged.origin.x + 40.), px(dragged.origin.y + 17.));
+    let body = area
+        + point(
+            px(target.origin.x + target.size.width / 2.),
+            px(target.origin.y + target.size.height - 40.),
+        );
+
+    Some((header, body))
+}
+
+/// A tile drag in progress: the first worker over the second one.
+fn drag_a_tile(root: AnyView, window: &mut Window, cx: &mut App) {
+    let Ok(workspace) = root.downcast::<Workspace>() else {
+        log::error!("root is not a Workspace");
+        return;
+    };
+
+    window.draw(cx).clear(cx);
+    let Some((from, to)) = drag_points(workspace.read(cx)) else {
+        log::error!("no two movable tiles to drag");
+        return;
+    };
+
+    let pressed = |position| {
+        PlatformInput::MouseMove(MouseMoveEvent {
+            position,
+            pressed_button: Some(MouseButton::Left),
+            ..MouseMoveEvent::default()
+        })
+    };
+
+    window.dispatch_event(
+        PlatformInput::MouseDown(MouseDownEvent {
+            button: MouseButton::Left,
+            position: from,
+            click_count: 1,
+            ..MouseDownEvent::default()
+        }),
+        cx,
+    );
+    window.dispatch_event(pressed(from + point(px(6.), px(6.))), cx);
+    window.draw(cx).clear(cx);
+    window.dispatch_event(pressed(to), cx);
+    window.draw(cx).clear(cx);
+
+    if workspace.read(cx).dragged_tile(cx).is_none() {
+        log::error!("the tile drag did not start");
+    }
+}
 
 fn open_island(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
     workspace.new_user_terminal(window, cx);
@@ -1458,7 +1522,26 @@ pub(crate) fn run(directory: PathBuf, cx: &mut App) {
             }
 
             cx.update(|cx| theme::set_appearance(appearance, cx));
-            snap(&directory.join(name), open, cx).await;
+            snap(&directory.join(name), open, None, cx).await;
+        }
+
+        for (appearance, name, drive) in [
+            (
+                Appearance::Light,
+                "workspace-dragging-light.png",
+                drag_a_tile as Drive,
+            ),
+            (Appearance::Dark, "workspace-dragging-dark.png", drag_a_tile),
+        ] {
+            if filter
+                .as_ref()
+                .is_some_and(|filter| !name.contains(filter.as_str()))
+            {
+                continue;
+            }
+
+            cx.update(|cx| theme::set_appearance(appearance, cx));
+            snap(&directory.join(name), None, Some(drive), cx).await;
         }
 
         cx.update(|cx| cx.quit());
@@ -1466,7 +1549,7 @@ pub(crate) fn run(directory: PathBuf, cx: &mut App) {
     .detach();
 }
 
-async fn snap(path: &Path, open: Option<OpenOverlay>, cx: &mut AsyncApp) {
+async fn snap(path: &Path, open: Option<OpenOverlay>, drive: Option<Drive>, cx: &mut AsyncApp) {
     let opened = cx.update(crate::open_workspace);
 
     // AnyWindowHandle: the typed handle leases the root view.
@@ -1506,6 +1589,14 @@ async fn snap(path: &Path, open: Option<OpenOverlay>, cx: &mut AsyncApp) {
         }
     }
 
+    if let Some(drive) = drive {
+        if let Err(error) = window.update(cx, drive) {
+            log::error!("cannot send the input: {error:#}");
+        }
+
+        cx.background_executor().timer(SETTLE).await;
+    }
+
     if let Err(error) = window.update(cx, |_, window, _| window.minimize_window()) {
         log::error!("cannot minimize: {error:#}");
     }
@@ -1519,6 +1610,13 @@ async fn snap(path: &Path, open: Option<OpenOverlay>, cx: &mut AsyncApp) {
         },
         Ok(Err(error)) => log::error!("cannot render {}: {error:#}", path.display()),
         Err(error) => log::error!("window closed: {error:#}"),
+    }
+
+    // A drag belongs to the app, not the window: one left running blocks the next window's.
+    if drive.is_some()
+        && let Err(error) = window.update(cx, |_, window, cx| cx.stop_active_drag(window))
+    {
+        log::error!("cannot stop the drag: {error:#}");
     }
 
     if let Err(error) = window.update(cx, |_, window, _| window.remove_window()) {

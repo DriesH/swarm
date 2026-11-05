@@ -177,4 +177,5 @@ Six parts (1–3 done): 1. Settings pages (Projects, Terminals, Prompts, Usage, 
 
 - Tile controls: drag, minimize, maximize and lock tiles, with a layout engine that works around locked tiles. Spec in [`specs/tile-controls.md`](specs/tile-controls.md).
   - [x] The tile grid: every tile sits on whole 8 px grid cells, a resize snaps to cells (↑/↓ 1 cell, ⇧ 5 cells) and dots show the grid while it runs (slice 0)
+  - [x] Tile order: a drag on the tile header or ⌃⌘ and an arrow key moves a tile among the tiles of its class, a drop on the tray minimizes it, Esc cancels, and VoiceOver reads the new position (slice 2, without the drop on empty space)
 - Multi-repo projects: a project that groups several repositories, such as a server and its client SDKs. First related repositories that orchestrators can read, then tasks with a worktree in each repository. Spec in [`specs/multi-repo-projects.md`](specs/multi-repo-projects.md).
