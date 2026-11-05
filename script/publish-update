@@ -173,7 +173,8 @@ else
 }
 MANIFEST
 fi
-plutil -lint "$manifest" >/dev/null
+# plutil -lint reads property lists only; converting reads JSON and fails on broken JSON.
+plutil -convert xml1 -o /dev/null "$manifest" || fail "$manifest is not valid JSON"
 cat "$manifest"
 
 step "Release notes"
