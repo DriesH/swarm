@@ -1,0 +1,16 @@
+[package]
+name = "swarm_creatures"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/swarm_creatures.rs"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true
+swarm_protocol.workspace = true

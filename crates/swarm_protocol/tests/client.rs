@@ -12,9 +12,10 @@ use std::time::{Duration, Instant};
 
 use swarm_protocol::{
     AgentChange, AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, CallId,
-    Client, ClientError, CreateTask, CreateTerminal, DiffStat, Event, FileStat, GridSize,
-    MessageEvent, MessageId, MessageInfo, MessageKind, PlanDraft, ProjectId, ProjectInfo, Request,
-    TaskId, TaskInfo, TerminalId, TerminalInfo, TerminalKind, VERSION, read, write,
+    Client, ClientError, CloseStep, CreateTask, CreateTerminal, DiffStat, Event, FileStat,
+    GridSize, MessageEvent, MessageId, MessageInfo, MessageKind, PlanDraft, PrEvent, ProjectId,
+    ProjectInfo, Request, TaskId, TaskInfo, TerminalId, TerminalInfo, TerminalKind, VERSION, read,
+    write,
 };
 use swarm_term::{Palette, Rgb, Size, TerminalInput, TerminalOutput};
 
@@ -973,6 +974,41 @@ fn save_plan_draft_without_text_clears_the_draft() {
     let result = client.save_plan_draft(ProjectId(2), None);
 
     assert!(result.is_ok());
+}
+
+#[test]
+fn close_steps_and_a_failed_close_reach_the_pull_request_listener() {
+    let socket = serve(|fake| {
+        fake.handshake(VERSION);
+        fake.send(&Event::CloseProgress {
+            task: TaskId(4),
+            step: CloseStep::RemovingWorktrees,
+        });
+        fake.send(&Event::CloseFailed {
+            task: TaskId(4),
+            message: "git: busy".to_owned(),
+        });
+        fake.drain();
+    });
+    let client = Client::connect(&socket).expect("connect");
+
+    let step = client.pr_events().recv_timeout(WAIT).expect("step");
+    let failed = client.pr_events().recv_timeout(WAIT).expect("failed");
+
+    assert_eq!(
+        step,
+        PrEvent::CloseStep {
+            task: TaskId(4),
+            step: CloseStep::RemovingWorktrees
+        }
+    );
+    assert_eq!(
+        failed,
+        PrEvent::CloseFailed {
+            task: TaskId(4),
+            message: "git: busy".to_owned()
+        }
+    );
 }
 
 #[test]

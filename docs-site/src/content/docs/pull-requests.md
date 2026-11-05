@@ -40,6 +40,19 @@ When you open the panel for an approved task, Swarm asks the orchestrator for a 
 
 **Redraft** next to **Drafted by orchestrator** asks for a new draft of the current diff. The button reads **Drafting…** while the orchestrator writes. It shows only while the approval still counts. If you edited the title or the description, the new draft waits behind **New draft** instead of replacing your text.
 
+### Read the description large
+
+The description field is small. The expand button at its top right, or ⇧⌘D, opens the description as a large tile over the app. The tile grows out of the field in 200 ms and shrinks back into it in 150 ms. With **Reduce motion** on in macOS, it shows and goes without movement.
+
+The tile has:
+
+- the pull request icon, **Description**, and **Drafted by orchestrator** when the orchestrator wrote it
+- the tabs **Preview** and **Edit**. **Preview** shows the title and the description as formatted Markdown. **Edit** shows the raw text. What you type there is the text of the panel field, so nothing is lost when you close the tile
+- **Redraft**, which works as in the panel. A new draft that arrives while the tile is open updates it, unless you edited the fields
+- a word count at the bottom and the esc **Close** hint
+
+Esc, the close button, or a click outside the tile closes it. Focus goes back to where it was. VoiceOver reads the tile as a dialog named **Pull request description**.
+
 The description follows a built-in format with four sections: **What**, **Why**, **Notes for reviewers** and **Open tasks**. A project can replace the format with a `pr.md` file in `.swarm/prompts/`. The Prompts page in Settings lists it.
 
 If a draft arrives after you edited the fields, your text stays and **New draft** appears. Click it to use the new draft. Without a running orchestrator, the panel says why there is no draft, and you write the fields yourself.
@@ -76,7 +89,7 @@ New commits after the pull request exists, for example a CI fix, show **New comm
 
 Swarm checks that GitHub really merged the commit. A merge queue can leave the pull request open, and the panel then shows **Merge queued**. After a merge, Swarm deletes the remote branch.
 
-With **Close the task after merge**, Swarm also closes the task as [Close task](/swarm/docs/review/#close-a-task) does, and then deletes the local task branch. A plain **Close task** keeps a branch that GitHub merged by squash, because git cannot tell it is merged. Here Swarm knows the pull request holds every commit, so it deletes the branch. The task stays open when closing would lose work: uncommitted files, or local commits that are not in the pull request.
+With **Close the task after merge**, Swarm also closes the task as [Close task](/swarm/docs/review/#close-a-task) does, and then deletes the local task branch. The task's tab then shows the [cleanup screen](/swarm/docs/review/#the-cleanup-screen) until the task is gone. A plain **Close task** keeps a branch that GitHub merged by squash, because git cannot tell it is merged. Here Swarm knows the pull request holds every commit, so it deletes the branch. The task stays open when closing would lose work: uncommitted files, or local commits that are not in the pull request.
 
 If someone closes the pull request without merging, the panel offers **Create PR** to replace it.
 

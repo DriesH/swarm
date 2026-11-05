@@ -111,6 +111,15 @@ pub struct ThemeColors {
     pub del: Hsla,
     pub add_bg: Hsla,
     pub del_bg: Hsla,
+    /// Code colors in Review. Each meets AA on the panel and on the add and delete tints.
+    pub syntax_keyword: Hsla,
+    pub syntax_string: Hsla,
+    pub syntax_comment: Hsla,
+    pub syntax_function: Hsla,
+    pub syntax_type: Hsla,
+    pub syntax_number: Hsla,
+    pub syntax_constant: Hsla,
+    pub syntax_punctuation: Hsla,
     /// Terminal background.
     pub term: Hsla,
     /// Faint decoration: graph dots, honeycomb pattern.
@@ -181,6 +190,14 @@ impl ThemeColors {
             del,
             add_bg,
             del_bg,
+            syntax_keyword,
+            syntax_string,
+            syntax_comment,
+            syntax_function,
+            syntax_type,
+            syntax_number,
+            syntax_constant,
+            syntax_punctuation,
             term,
             dot,
             hex,
@@ -228,6 +245,14 @@ impl ThemeColors {
             ("del", *del),
             ("add_bg", *add_bg),
             ("del_bg", *del_bg),
+            ("syntax_keyword", *syntax_keyword),
+            ("syntax_string", *syntax_string),
+            ("syntax_comment", *syntax_comment),
+            ("syntax_function", *syntax_function),
+            ("syntax_type", *syntax_type),
+            ("syntax_number", *syntax_number),
+            ("syntax_constant", *syntax_constant),
+            ("syntax_punctuation", *syntax_punctuation),
             ("term", *term),
             ("dot", *dot),
             ("hex", *hex),
@@ -297,6 +322,14 @@ impl Theme {
                 del: rgb(0xf2716a).into(),
                 add_bg: rgba(0x4ac26b1a).into(),
                 del_bg: rgba(0xf2716a1a).into(),
+                syntax_keyword: rgb(0xc792ea).into(),
+                syntax_string: rgb(0xe5c07b).into(),
+                syntax_comment: rgb(0x9393a0).into(),
+                syntax_function: rgb(0x82aaff).into(),
+                syntax_type: rgb(0x5ccfe6).into(),
+                syntax_number: rgb(0xf78c6c).into(),
+                syntax_constant: rgb(0xff8fa3).into(),
+                syntax_punctuation: rgb(0xa9a9b3).into(),
                 term: rgb(0x0d0d0f).into(),
                 dot: rgb(0x1f1f23).into(),
                 hex: rgb(0x17171a).into(),
@@ -371,6 +404,14 @@ impl Theme {
                 del: rgb(0xb63128).into(), // #c9362c
                 add_bg: rgba(0x1a7f3614).into(),
                 del_bg: rgba(0xc9362c12).into(),
+                syntax_keyword: rgb(0xa8236a).into(),
+                syntax_string: rgb(0x0a3069).into(),
+                syntax_comment: rgb(0x57606a).into(),
+                syntax_function: rgb(0x6639ba).into(),
+                syntax_type: rgb(0x953800).into(),
+                syntax_number: rgb(0x0550ae).into(),
+                syntax_constant: rgb(0x006b60).into(),
+                syntax_punctuation: rgb(0x57606a).into(),
                 term: rgb(0xfbfbfc).into(),
                 dot: rgb(0xe4e4e8).into(),
                 hex: rgb(0xe9e9ec).into(),
@@ -752,6 +793,42 @@ mod tests {
                 ] {
                     check(&mut failures, &theme, TEXT_AA, text, &tinted);
                 }
+            }
+        }
+
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn code_colors_meet_wcag_aa_on_the_panel_and_the_add_and_delete_lines() {
+        let mut failures = Vec::new();
+
+        for theme in themes() {
+            let colors = theme.colors();
+            let surfaces = [("panel", colors.panel), ("term", colors.term)];
+
+            let mut backgrounds: Vec<(String, Hsla)> = Vec::new();
+            for (name, surface) in surfaces {
+                backgrounds.push((name.to_owned(), surface));
+                backgrounds.push((format!("{name}+add_bg"), composite(surface, colors.add_bg)));
+                backgrounds.push((format!("{name}+del_bg"), composite(surface, colors.del_bg)));
+            }
+            let backgrounds: Vec<(&str, Hsla)> = backgrounds
+                .iter()
+                .map(|(name, color)| (name.as_str(), *color))
+                .collect();
+
+            for text in [
+                ("syntax_keyword", colors.syntax_keyword),
+                ("syntax_string", colors.syntax_string),
+                ("syntax_comment", colors.syntax_comment),
+                ("syntax_function", colors.syntax_function),
+                ("syntax_type", colors.syntax_type),
+                ("syntax_number", colors.syntax_number),
+                ("syntax_constant", colors.syntax_constant),
+                ("syntax_punctuation", colors.syntax_punctuation),
+            ] {
+                check(&mut failures, &theme, TEXT_AA, text, &backgrounds);
             }
         }
 

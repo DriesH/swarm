@@ -16,12 +16,13 @@ use std::time::{Duration, Instant};
 use swarm_term::{TerminalChannels, TerminalInput, TerminalOutput};
 
 use crate::{
-    AgentChange, AgentId, AgentInfo, AgentKind, CallId, ChecksRun, CloseCheck, CommentId,
-    CreateTask, CreateTerminal, Event, FileDiff, FrameError, GH_SECS, GithubStatus, MergeMethod,
-    MessageId, MessageInfo, NewComment, Notice, PUSH_SECS, Paths, PlanDraft, PrDraft, PrPanel,
-    ProjectConfigFields, ProjectId, ProjectInfo, PromptInfo, PullRequest, RemoveCheck, Request,
-    ReviewComment, ReviewMark, ReviewSource, StopError, SwarmStats, SystemCheck, TaskDiff, TaskId,
-    TaskInfo, TerminalId, TerminalInfo, Usage, VERSION, check_private_dir, read, write,
+    AgentChange, AgentId, AgentInfo, AgentKind, CallId, ChecksRun, CloseCheck, CloseStep,
+    CommentId, CreateTask, CreateTerminal, Event, FileDiff, FileTexts, FrameError, GH_SECS,
+    GithubStatus, MergeMethod, MessageId, MessageInfo, NewComment, Notice, PUSH_SECS, Paths,
+    PlanDraft, PrDraft, PrPanel, ProjectConfigFields, ProjectId, ProjectInfo, PromptInfo,
+    PullRequest, RemoveCheck, Request, ReviewComment, ReviewMark, ReviewSource, StopError,
+    SwarmStats, SystemCheck, TaskDiff, TaskId, TaskInfo, TerminalId, TerminalInfo, Usage, VERSION,
+    check_private_dir, read, write,
 };
 
 /// A project's config file as the daemon read it.
@@ -34,11 +35,14 @@ pub struct ProjectConfigRead {
     pub pre_push_hook: Option<String>,
 }
 
-/// Local checks moved on, or the orchestrator sent a pull request draft.
+/// Local checks moved on, the orchestrator sent a pull request draft, or a close of a
+/// task moved on. A close can start with a merge, so its events come here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrEvent {
     Checks(Box<ChecksRun>),
     Draft { task: TaskId, draft: PrDraft },
+    CloseStep { task: TaskId, step: CloseStep },
+    CloseFailed { task: TaskId, message: String },
 }
 
 /// A review comment was added, changed or deleted.
@@ -430,6 +434,25 @@ impl Client {
         }
     }
 
+    /// The creatures the user caught, with how often.
+    pub fn catches(&self) -> Result<Vec<crate::Catch>, ClientError> {
+        match self.call(|call| Request::Catches { call }, None)? {
+            Event::Catches { catches, .. } => Ok(catches),
+            other => Err(unexpected("Catches", &other)),
+        }
+    }
+
+    /// Records a catch of the creature with this slug. The answer is the catch after it:
+    /// a `count` of 1 means the first time.
+    pub fn record_catch(&self, creature: &str) -> Result<crate::Catch, ClientError> {
+        let creature = creature.to_owned();
+
+        match self.call(|call| Request::RecordCatch { call, creature }, None)? {
+            Event::CatchRecorded { caught, .. } => Ok(caught),
+            other => Err(unexpected("CatchRecorded", &other)),
+        }
+    }
+
     pub fn system_check(&self) -> Result<SystemCheck, ClientError> {
         let timeout = self.reply_timeout.max(GIT_TIMEOUT);
 
@@ -692,6 +715,34 @@ impl Client {
         match reply {
             Event::FileHunks { file, .. } => Ok(file),
             other => Err(unexpected("FileHunks", &other)),
+        }
+    }
+
+    /// The lines of one file on the old and the new side of a task diff, for syntax
+    /// highlighting. A side is `None` when the file is missing there or cannot be read.
+    pub fn file_texts(
+        &self,
+        task: TaskId,
+        source: ReviewSource,
+        worktree: PathBuf,
+        path: PathBuf,
+    ) -> Result<FileTexts, ClientError> {
+        let timeout = self.reply_timeout.max(GIT_TIMEOUT);
+        let reply = self.call_with_timeout(
+            |call| Request::FileTexts {
+                call,
+                task,
+                source,
+                worktree: worktree.clone(),
+                path: path.clone(),
+            },
+            None,
+            timeout,
+        )?;
+
+        match reply {
+            Event::FileTexts { old, new, .. } => Ok(FileTexts { old, new }),
+            other => Err(unexpected("FileTexts", &other)),
         }
     }
 
@@ -1368,6 +1419,9 @@ fn read_events(
             Event::FileHunks { call, file } => {
                 deliver(shared, call, Event::FileHunks { call, file });
             }
+            Event::FileTexts { call, old, new } => {
+                deliver(shared, call, Event::FileTexts { call, old, new });
+            }
             Event::CloseCheck { call, check } => {
                 deliver(shared, call, Event::CloseCheck { call, check });
             }
@@ -1442,6 +1496,24 @@ fn read_events(
                     log::debug!("draft event has no listener");
                 }
             }
+            Event::CloseProgress { task, step } => {
+                if shared
+                    .pull_requests
+                    .send(PrEvent::CloseStep { task, step })
+                    .is_err()
+                {
+                    log::debug!("close event has no listener");
+                }
+            }
+            Event::CloseFailed { task, message } => {
+                if shared
+                    .pull_requests
+                    .send(PrEvent::CloseFailed { task, message })
+                    .is_err()
+                {
+                    log::debug!("close event has no listener");
+                }
+            }
             Event::CommentDeleted { task, id } => {
                 if shared
                     .comments
@@ -1461,6 +1533,12 @@ fn read_events(
                 deliver(shared, call, Event::SystemCheck { call, check });
             }
             Event::Stats { call, stats } => deliver(shared, call, Event::Stats { call, stats }),
+            Event::Catches { call, catches } => {
+                deliver(shared, call, Event::Catches { call, catches });
+            }
+            Event::CatchRecorded { call, caught } => {
+                deliver(shared, call, Event::CatchRecorded { call, caught });
+            }
             Event::StatsChanged { stats } => {
                 if shared.stats.send(stats).is_err() {
                     log::debug!("stats event has no listener");

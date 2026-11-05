@@ -18,6 +18,7 @@ pub struct ListRow {
     detail: Option<SharedString>,
     accessible_label: Option<SharedString>,
     start: Option<AnyElement>,
+    name_suffix: Option<AnyElement>,
     end: Option<AnyElement>,
     selected: bool,
     compact: bool,
@@ -35,6 +36,7 @@ impl ListRow {
             detail: None,
             accessible_label: None,
             start: None,
+            name_suffix: None,
             end: None,
             selected: false,
             compact: false,
@@ -59,6 +61,12 @@ impl ListRow {
 
     pub fn start_slot(mut self, element: impl IntoElement) -> Self {
         self.start = Some(element.into_any_element());
+        self
+    }
+
+    /// Shown right after the label, for example a `Tag`.
+    pub fn name_suffix(mut self, element: impl IntoElement) -> Self {
+        self.name_suffix = Some(element.into_any_element());
         self
     }
 
@@ -137,7 +145,10 @@ impl RenderOnce for ListRow {
                 .flex_1()
                 .min_w_0()
                 .flex()
+                .items_center()
+                .gap(px(8.))
                 .child(label)
+                .children(self.name_suffix)
                 .into_any_element(),
         };
 

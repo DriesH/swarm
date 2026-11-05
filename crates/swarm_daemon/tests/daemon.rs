@@ -16,11 +16,11 @@ use std::time::{Duration, Instant};
 use swarm_core::store::{Status, Store, unix_millis};
 use swarm_protocol::{
     AgentChange, AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, CallId,
-    CloseCheck, CommentId, CommentState, CreateTask, CreateTerminal, DiffStat, Event, FileDiff,
-    FileStat, Fold, MessageInfo, MessageKind, Notice, NoticeKind, PlanDraft, ProjectConfigFields,
-    ProjectId, ProjectInfo, PromptInfo, PromptLayer, RemoveCheck, Request, ReviewSource,
-    SwarmStats, SystemCheck, TaskDiff, TaskId, TaskInfo, TerminalId, TerminalInfo, TerminalKind,
-    ToolCheck, ToolState, Usage, UsageProblem, VERSION, read, write,
+    CloseCheck, CloseStep, CommentId, CommentState, CreateTask, CreateTerminal, DiffStat, Event,
+    FileDiff, FileStat, FileTexts, Fold, MessageInfo, MessageKind, Notice, NoticeKind, PlanDraft,
+    ProjectConfigFields, ProjectId, ProjectInfo, PromptInfo, PromptLayer, RemoveCheck, Request,
+    ReviewSource, SwarmStats, SystemCheck, TaskDiff, TaskId, TaskInfo, TerminalId, TerminalInfo,
+    TerminalKind, ToolCheck, ToolState, Usage, UsageProblem, VERSION, read, write,
 };
 use swarm_term::{
     BlockedKind, ExitStatus, Palette, ProgramState, Rgb, Row, Size, TerminalInput, TerminalOutput,
@@ -4479,6 +4479,40 @@ impl Client {
         })
     }
 
+    /// The old and new lines of one file of a task diff, or the daemon's error text.
+    fn file_texts(
+        &mut self,
+        task: TaskId,
+        source: ReviewSource,
+        worktree: &Path,
+        path: &str,
+    ) -> Result<FileTexts, String> {
+        self.send(&Request::FileTexts {
+            call: CALL,
+            task,
+            source,
+            worktree: worktree.to_owned(),
+            path: PathBuf::from(path),
+        });
+
+        self.wait_for(|event| match event {
+            Event::FileTexts {
+                call: CALL,
+                old,
+                new,
+            } => Some(Ok(FileTexts {
+                old: old.clone(),
+                new: new.clone(),
+            })),
+            Event::Error {
+                call: Some(CALL),
+                message,
+                ..
+            } => Some(Err(message.clone())),
+            _ => None,
+        })
+    }
+
     fn check_close(&mut self, task: TaskId) -> CloseCheck {
         self.send(&Request::CheckClose { call: CALL, task });
 
@@ -4900,6 +4934,59 @@ fn file_hunks_loads_the_lines_of_a_folded_file() {
 }
 
 #[test]
+fn file_texts_sends_the_lines_of_both_sides_of_a_file() {
+    let repo = Repo::new("");
+    let daemon = Daemon::start();
+    let (mut client, task) = reviewed_task(&daemon, &repo);
+    std::fs::write(task.worktree.join("README.md"), "hello\nworld\n").expect("readme");
+    commit_all(&task.worktree);
+    std::fs::write(task.worktree.join("README.md"), "hello\nlive\nedit\n").expect("readme");
+
+    let lines = |text: &[&str]| Some(text.iter().map(|line| (*line).to_owned()).collect());
+    let texts = |old, new| FileTexts { old, new };
+
+    assert_eq!(
+        client
+            .file_texts(task.id, ReviewSource::Merged, &task.worktree, "README.md")
+            .expect("answer"),
+        texts(lines(&["hello"]), lines(&["hello", "world"]))
+    );
+    assert_eq!(
+        client
+            .file_texts(task.id, ReviewSource::Live, &task.worktree, "README.md")
+            .expect("answer"),
+        texts(lines(&["hello"]), lines(&["hello", "live", "edit"]))
+    );
+    assert_eq!(
+        client
+            .file_texts(task.id, ReviewSource::Merged, &task.worktree, "review.txt")
+            .expect("answer"),
+        texts(None, lines(&["one", "two"]))
+    );
+    assert_eq!(
+        client
+            .file_texts(
+                task.id,
+                ReviewSource::Merged,
+                &task.worktree,
+                "../outside.txt"
+            )
+            .expect("answer"),
+        texts(None, None)
+    );
+    assert!(
+        client
+            .file_texts(
+                TaskId(999),
+                ReviewSource::Merged,
+                &task.worktree,
+                "README.md"
+            )
+            .is_err()
+    );
+}
+
+#[test]
 fn three_file_loads_at_once_do_not_refuse_each_other() {
     let repo = Repo::new("");
     let daemon = Daemon::start();
@@ -5304,6 +5391,93 @@ fn closing_refuses_when_more_would_be_lost_than_shown_and_a_retry_works() {
         .close_task(task.id)
         .expect("closed after a new check");
     assert!(!task.worktree.exists());
+}
+
+fn close_steps(events: &[Event]) -> Vec<CloseStep> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::CloseProgress { step, .. } => Some(*step),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_close_reports_each_step_before_the_task_is_announced_closed() {
+    let repo = Repo::new("");
+    let daemon = Daemon::start();
+    let (mut client, task) = reviewed_task(&daemon, &repo);
+
+    let events = client.close_task(task.id).expect("closed");
+
+    assert_eq!(
+        close_steps(&events),
+        [CloseStep::StoppingAgents, CloseStep::RemovingWorktrees],
+        "the branch has a commit of its own, so it stays"
+    );
+    let last_step = events
+        .iter()
+        .rposition(|event| matches!(event, Event::CloseProgress { .. }))
+        .expect("a step");
+    let closed_at = events
+        .iter()
+        .position(|event| matches!(event, Event::TaskChanged { task } if task.closed))
+        .expect("TaskChanged with closed");
+    assert!(last_step < closed_at);
+}
+
+#[test]
+fn a_close_that_deletes_a_merged_branch_reports_that_step_last() {
+    let repo = Repo::new("");
+    let daemon = Daemon::start();
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let mut request = orchestrator_task(project.id, false);
+    request.orchestrator = None;
+    let task = client.create_task(request);
+
+    let events = client.close_task(task.id).expect("closed");
+
+    assert_eq!(
+        close_steps(&events),
+        [
+            CloseStep::StoppingAgents,
+            CloseStep::RemovingWorktrees,
+            CloseStep::DeletingBranch
+        ]
+    );
+}
+
+#[test]
+fn a_refused_close_reports_the_reason_to_every_client() {
+    let repo = Repo::new("");
+    let daemon = Daemon::start();
+    let (mut client, task) = reviewed_task(&daemon, &repo);
+    let shown = client.check_close(task.id);
+    std::fs::write(task.worktree.join("late.txt"), "new\n").expect("file");
+
+    client.send(&Request::CloseTask {
+        call: CALL,
+        task: task.id,
+        confirmed: shown,
+    });
+    let mut seen = Vec::new();
+    loop {
+        match client.next() {
+            Event::Error {
+                call: Some(CALL), ..
+            } => break,
+            other => seen.push(other),
+        }
+    }
+
+    assert!(seen.iter().any(|event| matches!(
+        event,
+        Event::CloseFailed { task: failed, message }
+            if *failed == task.id && message == "more would be lost than shown; check again"
+    )));
 }
 
 #[test]
@@ -11905,6 +12079,74 @@ esac"#,
 
     client.close_task(task.id).expect("closed");
     assert_eq!(watcher.stats().open_tasks, 0);
+}
+
+// The Field guide: `Request::Catches` and `Request::RecordCatch`.
+
+impl Client {
+    fn catches(&mut self) -> Vec<swarm_protocol::Catch> {
+        self.send(&Request::Catches { call: CALL });
+
+        self.wait_for(|event| match event {
+            Event::Catches {
+                call: CALL,
+                catches,
+            } => Some(catches.clone()),
+            _ => None,
+        })
+    }
+
+    fn record_catch(&mut self, creature: &str) -> swarm_protocol::Catch {
+        self.send(&Request::RecordCatch {
+            call: CALL,
+            creature: creature.to_owned(),
+        });
+
+        self.wait_for(|event| match event {
+            Event::CatchRecorded { call: CALL, caught } => Some(caught.clone()),
+            _ => None,
+        })
+    }
+}
+
+#[test]
+fn a_catch_is_recorded_and_counted_again_and_kept_across_clients() {
+    let daemon = Daemon::start();
+    let mut client = daemon.connect();
+    client.hello();
+    assert!(client.catches().is_empty());
+
+    assert_eq!(client.record_catch("vespa-crabro").count, 1);
+    assert_eq!(client.record_catch("vespa-crabro").count, 2);
+
+    let mut other = daemon.connect();
+    other.hello();
+    let catches = other.catches();
+
+    assert_eq!(catches.len(), 1);
+    assert_eq!(catches[0].creature, "vespa-crabro");
+    assert_eq!(catches[0].count, 2);
+}
+
+#[test]
+fn a_catch_of_an_unknown_creature_is_refused() {
+    let daemon = Daemon::start();
+    let mut client = daemon.connect();
+    client.hello();
+
+    client.send(&Request::RecordCatch {
+        call: CALL,
+        creature: "dragon".to_owned(),
+    });
+
+    assert!(matches!(
+        client.next(),
+        Event::Error {
+            call: Some(CALL),
+            ..
+        }
+    ));
+    assert!(client.catches().is_empty());
 }
 
 #[test]

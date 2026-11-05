@@ -1,6 +1,12 @@
 //! The pull request panel: a new pull request, or the status of the one that exists.
 
-use gpui::{AnyElement, Context, ElementId, FontWeight, Role, SharedString, Text, div, px};
+use std::cell::Cell;
+use std::rc::Rc;
+
+use gpui::{
+    AnyElement, Bounds, Context, ElementId, FontWeight, Pixels, Role, SharedString, Text, canvas,
+    div, px,
+};
 use swarm_protocol::{
     CheckState, GithubCheck, GithubCheckState, GithubStatus, LocalCheck, MergeMethod, PrState,
     PullRequest, ReviewState,
@@ -295,6 +301,7 @@ fn new_panel(
                 .child(description_field(
                     form,
                     workspace.data.approval_holds(task.id),
+                    &workspace.pull_requests.description_bounds,
                     cx,
                 ))
                 .children(local_checks(workspace, task, form, cx))
@@ -390,7 +397,13 @@ fn redraft_button(waiting: bool, cx: &mut Context<Workspace>) -> Button {
     .on_click(cx.listener(|this, _, _, cx| this.redraft(cx)))
 }
 
-fn description_field(form: &PrForm, redraftable: bool, cx: &mut Context<Workspace>) -> gpui::Div {
+fn description_field(
+    form: &PrForm,
+    redraftable: bool,
+    bounds: &Rc<Cell<Option<Bounds<Pixels>>>>,
+    cx: &mut Context<Workspace>,
+) -> gpui::Div {
+    let remember = Rc::clone(bounds);
     let drafted_by = || {
         div().min_w_0().flex().child(
             Label::new("Drafted by orchestrator")
@@ -448,7 +461,32 @@ fn description_field(form: &PrForm, redraftable: bool, cx: &mut Context<Workspac
                 .child(field_label("Description"))
                 .child(div().flex_1().min_w_0().flex().justify_end().children(note)),
         )
-        .child(form.description.clone())
+        .child(
+            div()
+                .relative()
+                .child(form.description.clone())
+                .child(
+                    canvas(
+                        move |field, _, _| remember.set(Some(field)),
+                        |_, (), _, _| {},
+                    )
+                    .absolute()
+                    .size_full(),
+                )
+                .child(
+                    div().absolute().top(px(6.)).right(px(6.)).child(
+                        IconButton::new(
+                            "description-expand",
+                            IconName::Expand,
+                            "Open the description large",
+                        )
+                        .debug_selector(|| "description-expand".to_owned())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_pr_description(window, cx);
+                        })),
+                    ),
+                ),
+        )
 }
 
 fn local_check_value(check: &LocalCheck) -> Option<String> {

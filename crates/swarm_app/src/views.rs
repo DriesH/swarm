@@ -2,8 +2,7 @@
 
 use gpui::{
     AnyElement, AppContext as _, Bounds, Context, Div, DragMoveEvent, Entity, FocusHandle,
-    FontWeight, MouseButton, Pixels, Role, SharedString, Size, Stateful, Subscription, Window, div,
-    px,
+    MouseButton, Pixels, Role, SharedString, Size, Stateful, Subscription, Window, div, px,
 };
 use swarm_layout::{Activity, Layout, LayoutStyle, Rect, TileId, TileKind, TileSpec};
 use swarm_term_view::TerminalView;
@@ -59,6 +58,10 @@ pub(crate) fn render(
 ) -> AnyElement {
     if workspace.has_no_projects() {
         return empty_state(workspace, cx).into_any_element();
+    }
+
+    if let Some(screen) = crate::cleanup::screen(workspace, window, cx) {
+        return screen;
     }
 
     match workspace.view {
@@ -1063,24 +1066,14 @@ fn process_tile_label(terminal: &Terminal) -> String {
 /// What the mark on a user terminal's tile says, and what a screen reader starts with.
 const MINE: &str = "Mine";
 
-/// The mark after the name in the header of a user terminal's tile: the user icon and "Mine".
+/// The pill after the name in the header of a user terminal's tile: "Mine".
 fn mine_mark(id: TerminalId) -> Stateful<Div> {
-    h_flex()
+    div()
         .id(("mine", id.0))
         .debug_selector(move || format!("tile-mine-{}", id.0))
         .role(Role::Group)
         .aria_label(format!("{MINE}, agents have no access"))
-        .gap(px(5.))
-        .child(
-            Icon::new(IconName::User)
-                .size(IconSize::Custom(px(13.)))
-                .color(Color::Muted),
-        )
-        .child(
-            Label::new(MINE)
-                .size(LabelSize::XSmall)
-                .weight(FontWeight::MEDIUM),
-        )
+        .child(Tag::new(MINE))
 }
 
 /// What VoiceOver reads for the tile of a user terminal: its number among the user terminals
@@ -1108,6 +1101,8 @@ fn user_frame(
     let focused = workspace.focused_terminal == Some(id);
 
     let mut frame = TileFrame::new(("tile", id.0), IconName::Terminal, terminal.title.clone())
+        .locked(true)
+        .debug_selector(move || format!("tile-{}", id.0))
         .accessible_label(user_tile_label(workspace, terminal))
         .ring(TileRing::Fg)
         .focused(focused)
@@ -2581,6 +2576,24 @@ mod tests {
         redraw(cx);
 
         assert!(cx.debug_bounds("tile-mine-14").is_some());
+    }
+
+    #[gpui::test]
+    fn the_user_terminal_header_has_a_lock_badge_and_the_pill_after_the_name(
+        cx: &mut TestAppContext,
+    ) {
+        let (_, cx) = setup(cx);
+        cx.dispatch_action(NewTerminal);
+        redraw(cx);
+
+        let lock = cx.debug_bounds("tile-14-lock");
+        let pill = cx.debug_bounds("tile-mine-14");
+
+        assert!(lock.is_some());
+        assert!(
+            lock.zip(pill)
+                .is_some_and(|(lock, pill)| lock.right() < pill.left())
+        );
     }
 
     #[gpui::test]

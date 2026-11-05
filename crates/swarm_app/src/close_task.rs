@@ -65,8 +65,6 @@ pub(crate) struct CloseTaskDialog {
     name: SharedString,
     branch: SharedString,
     check: CheckState,
-    busy: bool,
-    error: Option<SharedString>,
     focus_handle: FocusHandle,
     confirm_focus: FocusHandle,
     cancel_focus: FocusHandle,
@@ -98,8 +96,6 @@ impl CloseTaskDialog {
             name,
             branch,
             check: CheckState::Checking,
-            busy: false,
-            error: None,
             focus_handle,
             confirm_focus: cx.focus_handle().tab_stop(true),
             cancel_focus: cx.focus_handle().tab_stop(true),
@@ -112,18 +108,6 @@ impl CloseTaskDialog {
         cx.notify();
     }
 
-    pub(crate) fn set_busy(&mut self, cx: &mut Context<Self>) {
-        self.busy = true;
-        self.error = None;
-        cx.notify();
-    }
-
-    pub(crate) fn fail(&mut self, message: SharedString, cx: &mut Context<Self>) {
-        self.busy = false;
-        self.error = Some(message);
-        cx.notify();
-    }
-
     /// The check the user is looking at, once there is one.
     pub(crate) fn confirmed(&self) -> Option<CloseCheck> {
         match &self.check {
@@ -132,34 +116,26 @@ impl CloseTaskDialog {
         }
     }
 
-    fn dismiss(&mut self, cx: &mut Context<Self>) {
-        if !self.busy {
-            cx.emit(CloseTaskEvent::Dismissed);
-        }
-    }
-
     #[cfg(test)]
     pub(crate) fn check_state(&self) -> &CheckState {
         &self.check
     }
 
-    #[cfg(test)]
-    pub(crate) fn error_text(&self) -> Option<&str> {
-        self.error.as_deref()
-    }
-
-    /// Speaks "Checking" while the check runs. The focused Close button says the closing.
+    /// Speaks "Checking" while the check runs.
     fn status_region(&self) -> LiveRegion {
-        let checking = !self.busy && matches!(self.check, CheckState::Checking);
-        let value = if checking { "Checking" } else { "" };
+        let value = if matches!(self.check, CheckState::Checking) {
+            "Checking"
+        } else {
+            ""
+        };
 
         LiveRegion::status("close-task-status", value)
     }
 
-    /// Speaks a failed check or a task that did not close.
+    /// Speaks a failed check.
     fn alert_region(&self) -> LiveRegion {
-        let message = match (&self.error, &self.check) {
-            (Some(message), _) | (None, CheckState::Failed(message)) => message.clone(),
+        let message = match &self.check {
+            CheckState::Failed(message) => message.clone(),
             _ => SharedString::default(),
         };
 
@@ -167,7 +143,7 @@ impl CloseTaskDialog {
     }
 
     fn can_confirm(&self) -> bool {
-        !self.busy && matches!(self.check, CheckState::Ready(_))
+        matches!(self.check, CheckState::Ready(_))
     }
 
     #[cfg(test)]
@@ -217,9 +193,8 @@ impl CloseTaskDialog {
 impl Render for CloseTaskDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let on_dismiss = cx.entity();
-        let busy = self.busy;
 
-        if !busy && !self.can_confirm() {
+        if !self.can_confirm() {
             leave_confirm(&self.confirm_focus, &self.cancel_focus, window, cx);
         }
 
@@ -250,16 +225,6 @@ impl Render for CloseTaskDialog {
                 .into_any_element(),
         };
 
-        let error = self
-            .error
-            .clone()
-            .map(|message| Label::new(message).size(LabelSize::Small).color(Color::Del));
-
-        let (confirm_label, accessible_label) = if busy {
-            ("Closing\u{2026}", format!("Closing task {}", self.name))
-        } else {
-            ("Close task", format!("Close task {}", self.name))
-        };
         let footer = h_flex()
             .gap(px(8.))
             .child(
@@ -267,17 +232,15 @@ impl Render for CloseTaskDialog {
                     .variant(ButtonVariant::Secondary)
                     .debug_selector(|| "close-task-cancel".to_owned())
                     .track_focus(&self.cancel_focus)
-                    .disabled(busy)
-                    .on_click(cx.listener(|this, _, _, cx| this.dismiss(cx))),
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(CloseTaskEvent::Dismissed))),
             )
             .child(
-                Button::new("close-task-confirm", confirm_label)
+                Button::new("close-task-confirm", "Close task")
                     .variant(ButtonVariant::Destructive)
-                    .accessible_label(accessible_label)
+                    .accessible_label(format!("Close task {}", self.name))
                     .debug_selector(|| "close-task-confirm".to_owned())
                     .track_focus(&self.confirm_focus)
-                    .loading(busy)
-                    .disabled(!busy && !self.can_confirm())
+                    .disabled(!self.can_confirm())
                     .on_click(cx.listener(|this, _, _, cx| {
                         if this.can_confirm() {
                             cx.emit(CloseTaskEvent::Confirmed);
@@ -291,12 +254,10 @@ impl Render for CloseTaskDialog {
             &self.focus_handle,
         )
         .width(px(420.))
-        .close_disabled(busy)
         .on_dismiss(move |_, cx| {
-            on_dismiss.update(cx, Self::dismiss);
+            on_dismiss.update(cx, |_, cx| cx.emit(CloseTaskEvent::Dismissed));
         })
         .child(body)
-        .children(error)
         .child(announce("close-task-alert", self.alert_region()))
         .child(announce("close-task-status", self.status_region()))
         .footer(footer)
@@ -380,6 +341,8 @@ impl Workspace {
         .detach();
     }
 
+    /// Closes the dialog and swaps the task's surface for the cleanup screen at once. A
+    /// refusal shows on that screen.
     fn confirm_close(
         &mut self,
         dialog: Entity<CloseTaskDialog>,
@@ -396,55 +359,17 @@ impl Workspace {
             .filter(|entry| entry.daemon.is_some())
             .and_then(|_| self.data.diff_id(task));
 
-        let (Some(client), Some(daemon_id)) = (self.daemon.clone(), daemon_id) else {
+        let (Some(_), Some(daemon_id)) = (self.daemon.as_ref(), daemon_id) else {
             self.close_overlay(window, cx);
             self.remove_closed_task(task, cx);
             return;
         };
 
-        dialog.update(cx, CloseTaskDialog::set_busy);
-        let again = client.clone();
-        let closing = cx.background_spawn(async move { client.close_task(daemon_id, confirmed) });
+        let deletes_branch = !confirmed.merged_branches.is_empty();
 
-        cx.spawn_in(window, async move |this, cx| {
-            let result = closing.await;
-
-            let refused = result.is_err();
-
-            let updated = this.update_in(cx, |workspace, window, cx| match result {
-                Ok(()) => {
-                    if workspace.close_dialog_is_for(task, cx) {
-                        workspace.close_overlay(window, cx);
-                    }
-                }
-                Err(error) => {
-                    log::warn!("cannot close the task: {error}");
-                    dialog.update(cx, |dialog, cx| {
-                        dialog.fail(describe(&error), cx);
-                        dialog.set_check(CheckState::Checking, cx);
-                    });
-                }
-            });
-
-            if let Err(error) = updated {
-                log::debug!("the window closed before the task closed: {error}");
-                return;
-            }
-
-            if refused {
-                let state = match cx
-                    .background_executor()
-                    .spawn(async move { again.check_close(daemon_id) })
-                    .await
-                {
-                    Ok(check) => CheckState::Ready(check),
-                    Err(error) => CheckState::Failed(describe(&error)),
-                };
-
-                dialog.update(cx, |dialog, cx| dialog.set_check(state, cx));
-            }
-        })
-        .detach();
+        self.close_overlay(window, cx);
+        self.begin_cleanup(task, deletes_branch, Some(confirmed.clone()), cx);
+        self.send_close(task, daemon_id, Some(confirmed), cx);
     }
 }
 
@@ -514,19 +439,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn closing_is_spoken_by_the_button_and_not_the_status(cx: &mut TestAppContext) {
-        let (workspace, cx) = setup(cx);
-        let view = open_dialog(&workspace, cx);
-
-        view.update(cx, CloseTaskDialog::set_busy);
-        let busy = spoken(&view, CloseTaskDialog::status_region, cx);
-
-        assert!(is_quiet(&busy));
-        assert_eq!(busy.live, Some(Live::Polite));
-    }
-
-    #[gpui::test]
-    fn a_failed_check_and_a_failed_close_are_alerts(cx: &mut TestAppContext) {
+    fn a_failed_check_is_an_alert(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
         let view = open_dialog(&workspace, cx);
 
@@ -534,12 +447,9 @@ mod tests {
             dialog.set_check(CheckState::Failed("No daemon".into()), cx);
         });
         let check = spoken(&view, CloseTaskDialog::alert_region, cx);
-        view.update(cx, |dialog, cx| dialog.fail("Cannot close".into(), cx));
-        let close = spoken(&view, CloseTaskDialog::alert_region, cx);
 
         assert_eq!(check.value.as_deref(), Some("No daemon"));
         assert_eq!(check.live, Some(Live::Assertive));
-        assert_eq!(close.value.as_deref(), Some("Cannot close"));
     }
 
     #[gpui::test]

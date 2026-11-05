@@ -3045,3 +3045,246 @@ fn the_pull_request_state_picks_githubs_color() {
         colors.pr_draft
     );
 }
+
+// Large description view
+
+fn tile(
+    workspace: &Entity<Workspace>,
+    cx: &VisualTestContext,
+) -> Option<Entity<crate::pr_description::PrDescriptionTile>> {
+    workspace.read_with(cx, |workspace, _| match &workspace.overlay {
+        Some(Overlay::PrDescription { view, .. }) => Some(view.clone()),
+        _ => None,
+    })
+}
+
+fn drafted_workspace<'a>(
+    socket: &std::path::Path,
+    cx: &'a mut TestAppContext,
+) -> (Entity<Workspace>, &'a mut VisualTestContext, Client) {
+    let (workspace, cx, client) = approved(socket, cx);
+    cx.update(|_, cx| crate::workspace::follow_test_reduce_motion(true, cx));
+    send_draft(
+        &workspace,
+        draft("first title", "## What\n\n- first body"),
+        cx,
+    );
+
+    (workspace, cx, client)
+}
+
+#[gpui::test]
+fn the_expand_button_opens_the_description_as_a_large_dialog(cx: &mut TestAppContext) {
+    let (socket, _seen) = recording_daemon(github_reply);
+    let (workspace, cx, _client) = drafted_workspace(&socket, cx);
+    let before = tile(&workspace, cx).is_none();
+
+    click("description-expand", cx);
+
+    let open = tile(&workspace, cx).expect("the tile is open");
+    let (text, title) = open.read_with(cx, |tile, cx| (tile.shown_text(cx), tile.shown_title()));
+    assert!(before);
+    assert_eq!(text, "## What\n\n- first body");
+    assert_eq!(title, "first title");
+    assert!(cx.debug_bounds("pr-description-view").is_some());
+    assert!(cx.debug_bounds("pr-description-redraft").is_some());
+    assert!(cx.debug_bounds("pr-description-close").is_some());
+}
+
+#[gpui::test]
+fn the_tile_opens_in_the_preview_and_the_edit_tab_shows_the_raw_text(cx: &mut TestAppContext) {
+    let (socket, _seen) = recording_daemon(github_reply);
+    let (workspace, cx, _client) = drafted_workspace(&socket, cx);
+    click("description-expand", cx);
+    let open = tile(&workspace, cx).expect("the tile is open");
+    let preview = open.read_with(cx, |tile, _| tile.mode());
+
+    let bounds = cx.debug_bounds("pr-description-view").expect("the tabs");
+    cx.simulate_click(
+        gpui::point(bounds.right() - bounds.size.width * 0.2, bounds.center().y),
+        Modifiers::none(),
+    );
+    redraw(cx);
+
+    assert_eq!(preview, crate::pr_description::Mode::Preview);
+    assert_eq!(
+        open.read_with(cx, |tile, _| tile.mode()),
+        crate::pr_description::Mode::Edit
+    );
+}
+
+#[gpui::test]
+fn typing_in_the_edit_tab_changes_the_text_of_the_panel_field(cx: &mut TestAppContext) {
+    let (socket, _seen) = recording_daemon(github_reply);
+    let (workspace, cx, _client) = drafted_workspace(&socket, cx);
+    click("description-expand", cx);
+    let bounds = cx.debug_bounds("pr-description-view").expect("the tabs");
+    cx.simulate_click(
+        gpui::point(bounds.right() - bounds.size.width * 0.2, bounds.center().y),
+        Modifiers::none(),
+    );
+    redraw(cx);
+
+    cx.simulate_input("more ");
+    redraw(cx);
+
+    assert_eq!(body_of(&workspace, cx), "more ## What\n\n- first body");
+}
+
+#[gpui::test]
+fn a_new_draft_updates_the_text_of_the_open_tile(cx: &mut TestAppContext) {
+    let (socket, _seen) = recording_daemon(github_reply);
+    let (workspace, cx, _client) = drafted_workspace(&socket, cx);
+    click("description-expand", cx);
+
+    send_draft(&workspace, draft("second title", "second body"), cx);
+
+    let open = tile(&workspace, cx).expect("the tile is open");
+    let (text, title) = open.read_with(cx, |tile, cx| (tile.shown_text(cx), tile.shown_title()));
+    assert_eq!(text, "second body");
+    assert_eq!(title, "second title");
+}
+
+#[gpui::test]
+fn redraft_in_the_tile_asks_again_and_shows_that_it_waits(cx: &mut TestAppContext) {
+    let (socket, seen) = recording_daemon(|request| match request {
+        Request::DraftPr { call, .. } => Some(Event::Done { call: *call }),
+        other => github_reply(other),
+    });
+    let (workspace, cx, _client) = approved(&socket, cx);
+    cx.update(|_, cx| crate::workspace::follow_test_reduce_motion(true, cx));
+    wait_for(cx, &seen, |seen, _| {
+        seen.count(|request| matches!(request, Request::DraftPr { .. })) == 1
+    });
+    send_draft(&workspace, draft("first title", "first body"), cx);
+    click("description-expand", cx);
+
+    click("pr-description-redraft", cx);
+    let asked = wait_for(cx, &seen, |seen, _| {
+        seen.count(|request| matches!(request, Request::DraftPr { .. })) == 2
+    });
+
+    let open = tile(&workspace, cx).expect("the tile is open");
+    assert!(asked);
+    assert!(open.read_with(cx, |tile, _| tile.draft_state().waiting));
+}
+
+#[gpui::test]
+fn escape_closes_the_tile_and_gives_focus_back_to_the_field(cx: &mut TestAppContext) {
+    let (socket, _seen) = recording_daemon(github_reply);
+    let (workspace, cx, _client) = drafted_workspace(&socket, cx);
+    let field = workspace.read_with(cx, |workspace, cx| {
+        workspace
+            .pull_requests
+            .form(APP_TASK)
+            .map(|form| form.description.focus_handle(cx))
+    });
+    let field = field.expect("the field");
+    cx.update(|window, cx| window.focus(&field, cx));
+
+    cx.simulate_keystrokes("cmd-shift-d");
+    let open = tile(&workspace, cx).expect("the shortcut opens the tile");
+    let root = open.read_with(cx, |tile, _| tile.root_focus());
+    let focused_inside = cx.update(|window, cx| root.contains_focused(window, cx));
+    cx.simulate_keystrokes("escape");
+
+    assert!(focused_inside);
+    assert!(tile(&workspace, cx).is_none());
+    assert!(cx.update(|window, _| field.is_focused(window)));
+}
+
+#[gpui::test]
+fn the_close_button_closes_the_tile(cx: &mut TestAppContext) {
+    let (socket, _seen) = recording_daemon(github_reply);
+    let (workspace, cx, _client) = drafted_workspace(&socket, cx);
+    click("description-expand", cx);
+
+    click("pr-description-close", cx);
+
+    assert!(tile(&workspace, cx).is_none());
+}
+
+#[gpui::test]
+fn the_tile_opens_at_its_place_at_once_under_reduce_motion(cx: &mut TestAppContext) {
+    let (socket, _seen) = recording_daemon(github_reply);
+    let (workspace, cx, _client) = drafted_workspace(&socket, cx);
+
+    click("description-expand", cx);
+
+    let viewport = cx.update(|window, _| window.viewport_size());
+    assert!(tile(&workspace, cx).is_some());
+    assert_eq!(
+        cx.debug_bounds("pr-description"),
+        Some(crate::pr_description::target_bounds(viewport))
+    );
+}
+
+#[gpui::test]
+fn with_motion_the_tile_shrinks_back_before_it_goes(cx: &mut TestAppContext) {
+    let (socket, _seen) = recording_daemon(github_reply);
+    let (workspace, cx, _client) = drafted_workspace(&socket, cx);
+    cx.update(|_, cx| crate::workspace::follow_test_reduce_motion(false, cx));
+    click("description-expand", cx);
+    let open = tile(&workspace, cx).expect("the tile is open");
+
+    cx.simulate_keystrokes("escape");
+    let shrinking = (
+        tile(&workspace, cx).is_some(),
+        open.read_with(cx, |tile, _| tile.is_closing()),
+    );
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+
+    assert_eq!(shrinking, (true, true));
+    assert!(tile(&workspace, cx).is_none());
+}
+
+#[gpui::test]
+fn the_tile_without_a_known_field_still_opens_and_closes_at_once(cx: &mut TestAppContext) {
+    let (socket, _seen) = recording_daemon(github_reply);
+    let (workspace, cx, _client) = drafted_workspace(&socket, cx);
+    cx.update(|_, cx| crate::workspace::follow_test_reduce_motion(false, cx));
+    workspace.update(cx, |workspace, _| {
+        workspace.pull_requests.description_bounds.set(None);
+    });
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_pr_description(window, cx);
+    });
+    cx.simulate_keystrokes("escape");
+
+    assert!(tile(&workspace, cx).is_none());
+}
+
+#[gpui::test]
+fn tab_stays_inside_the_tile_and_every_stop_has_a_name(cx: &mut TestAppContext) {
+    let (socket, _seen) = recording_daemon(github_reply);
+    let (workspace, cx, _client) = drafted_workspace(&socket, cx);
+    click("description-expand", cx);
+    let open = tile(&workspace, cx).expect("the tile is open");
+    let root = open.read_with(cx, |tile, _| tile.root_focus());
+    cx.simulate_keystrokes("tab");
+
+    let forward = swarm_ui::test_support::tab_walk(cx, &root, "tab");
+    let backward = swarm_ui::test_support::tab_walk(cx, &root, "shift-tab");
+
+    assert!(forward.len() >= 3, "{forward:?}");
+    assert_eq!(backward, crate::live_probe::reversed(&forward));
+    crate::live_probe::assert_named(&forward);
+}
+
+#[gpui::test]
+fn the_description_opens_only_from_the_panel_of_a_new_pull_request(cx: &mut TestAppContext) {
+    let (socket, _seen) = recording_daemon(github_reply);
+    let (workspace, cx, _client) = drafted_workspace(&socket, cx);
+    workspace.update(cx, |workspace, cx| {
+        workspace.set_view(View::Swarm, cx);
+    });
+    redraw(cx);
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_pr_description(window, cx);
+    });
+
+    assert!(tile(&workspace, cx).is_none());
+}

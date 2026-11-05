@@ -25,9 +25,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use swarm_protocol::{
-    AgentChange, AgentId, AgentInfo, AgentLifecycle, AgentRole, CloseCheck, CreateTask, DIFF_FILES,
-    DiffStat, FileChange, FileDiff, GithubStatus, PrLink, ProjectConfigFields, ProjectId,
-    ProjectInfo, ReviewMark, ReviewSource, TaskDiff, TaskId, TaskInfo, TerminalId,
+    AgentChange, AgentId, AgentInfo, AgentLifecycle, AgentRole, CloseCheck, CloseStep, CreateTask,
+    DIFF_FILES, DiffStat, FileChange, FileDiff, FileTexts, GithubStatus, PrLink,
+    ProjectConfigFields, ProjectId, ProjectInfo, ReviewMark, ReviewSource, TaskDiff, TaskId,
+    TaskInfo, TerminalId,
 };
 use swarm_term::ExitStatus;
 
@@ -759,6 +760,44 @@ impl Projects {
         Ok(Some(file.diff))
     }
 
+    /// The lines of a file on the old side (the base) and the new side (the commit
+    /// `Merged` reads, or the worktree for `Live`), for syntax highlighting. A side is
+    /// `None` when the file is missing there, binary, over 1 MB or unreadable. `path` is
+    /// the [`FileDiff::path`] and must stay inside the worktree.
+    pub fn file_texts(
+        &self,
+        id: TaskId,
+        source: ReviewSource,
+        worktree: &Path,
+        path: &Path,
+    ) -> Result<FileTexts, Error> {
+        let inside = path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)));
+        if !inside {
+            return Ok(FileTexts::default());
+        }
+
+        let plan = self.plan_diff(id, source, None)?;
+        let Some(section) = plan
+            .sections
+            .iter()
+            .find(|section| section.worktree == worktree)
+        else {
+            return Ok(FileTexts::default());
+        };
+
+        let old = git::blob_lines(&section.worktree, &section.base, path)?;
+        let new = match source {
+            ReviewSource::Live => git::working_file_lines(&section.worktree, path),
+            ReviewSource::Merged => {
+                git::blob_lines(&section.worktree, section.tip(&plan.head), path)?
+            }
+        };
+
+        Ok(FileTexts { old, new })
+    }
+
     /// Like [`Projects::task_diff`]. With `commit`, `Merged` reads that commit instead of
     /// the current `HEAD` of the task worktree.
     fn diff_at(
@@ -1159,7 +1198,16 @@ impl Projects {
     /// the base branch and marks the task closed. The caller stopped the task's processes first. A failure leaves the
     /// task marked as closing, so a retry or the next daemon start finishes it.
     pub fn close_task(&self, id: TaskId) -> Result<ClosedTask, Error> {
-        self.finish_close(id, true)
+        self.close_task_reporting(id, &mut |_| {})
+    }
+
+    /// Like [`Self::close_task`], and calls `report` as each step starts.
+    pub fn close_task_reporting(
+        &self,
+        id: TaskId,
+        report: &mut dyn FnMut(CloseStep),
+    ) -> Result<ClosedTask, Error> {
+        self.finish_close(id, true, report)
     }
 
     /// Finishes every close that did not end, for example after a crash. No teardown
@@ -1175,14 +1223,19 @@ impl Projects {
         };
 
         for task in tasks {
-            match self.finish_close(task, false) {
+            match self.finish_close(task, false, &mut |_| {}) {
                 Ok(_) => log::info!("finished closing task {}", task.0),
                 Err(error) => log::error!("cannot finish closing task {}: {error}", task.0),
             }
         }
     }
 
-    fn finish_close(&self, id: TaskId, teardown: bool) -> Result<ClosedTask, Error> {
+    fn finish_close(
+        &self,
+        id: TaskId,
+        teardown: bool,
+        report: &mut dyn FnMut(CloseStep),
+    ) -> Result<ClosedTask, Error> {
         let (task, root) = {
             let store = lock(&self.store);
             let task = store
@@ -1200,6 +1253,7 @@ impl Projects {
         };
 
         lock(&self.store).begin_closing(id)?;
+        report(CloseStep::RemovingWorktrees);
 
         let LoadedConfig { config, .. } = config::load(&root);
         if teardown
@@ -1229,6 +1283,10 @@ impl Projects {
         // Checked again now: a branch merged since the check loses nothing either.
         match merged_branches(&root, &task) {
             Ok(branches) => {
+                if !branches.is_empty() {
+                    report(CloseStep::DeletingBranch);
+                }
+
                 for branch in branches {
                     if let Err(error) = git::branch_delete(&root, &branch) {
                         log::warn!("cannot delete the merged branch {branch}: {error}");

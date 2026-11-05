@@ -1,0 +1,27 @@
+# Swarm's Report an issue dialog opens this form with the field ids below as query keys.
+# Syntax: https://docs.github.com/en/communities/using-templates-to-encourage-useful-issues-and-pull-requests/syntax-for-issue-forms
+# Prefill: https://docs.github.com/en/issues/tracking-your-work-with-issues/using-issues/creating-an-issue
+name: Bug
+description: Something in Swarm does not work
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+  - type: textarea
+    id: log
+    attributes:
+      label: Daemon log
+      description: Paste the log here when Swarm copied it to your clipboard.
+      render: shell

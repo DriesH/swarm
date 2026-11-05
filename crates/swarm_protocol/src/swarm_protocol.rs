@@ -23,7 +23,7 @@ pub use client::{Client, ClientError, CommentEvent, MessageEvent, PrEvent, Proje
 pub use daemon_stop::{Host, Signal, StopError, System, stop_daemon};
 
 /// Bumped on every incompatible change; the daemon refuses other versions.
-pub const VERSION: u32 = 26;
+pub const VERSION: u32 = 27;
 
 /// The most messages [`Request::ListMessages`] returns.
 pub const MESSAGES_LISTED: usize = 500;
@@ -444,6 +444,13 @@ pub struct FileDiff {
     /// Set when the file comes without its lines: `hunks` is empty, and `additions`
     /// and `deletions` still count every line. Kept in a [`Event::FileHunks`] answer.
     pub fold: Option<Fold>,
+}
+
+/// The lines of a file on each side of a diff, see [`Event::FileTexts`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FileTexts {
+    pub old: Option<Vec<String>>,
+    pub new: Option<Vec<String>>,
 }
 
 /// The changes of a task from one [`ReviewSource`].
@@ -873,6 +880,17 @@ pub struct SwarmStats {
     pub hundredth_merge_at: Option<u64>,
 }
 
+/// A creature of the Field guide that the user caught at least once.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Catch {
+    /// The slug of the creature, from [`creatures::CREATURES`].
+    pub creature: String,
+    /// In milliseconds since the Unix epoch.
+    pub first_caught_at: u64,
+    /// How many times it was caught.
+    pub count: u32,
+}
+
 /// What closing a task would throw away, so the app can ask first.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct CloseCheck {
@@ -889,6 +907,15 @@ pub struct CloseCheck {
     /// The task branch and workers' own branches that are merged into the base branch.
     /// Closing deletes them; every other branch stays.
     pub merged_branches: Vec<String>,
+}
+
+/// A step of closing a task, in the order the daemon runs them.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CloseStep {
+    StoppingAgents,
+    RemovingWorktrees,
+    /// Only when a merged branch goes.
+    DeletingBranch,
 }
 
 /// What closing one open task of a project would throw away.
@@ -1064,6 +1091,16 @@ pub enum Request {
     /// Answered with [`Event::Stats`].
     Stats {
         call: CallId,
+    },
+    /// The creatures the user caught. Answered with [`Event::Catches`].
+    Catches {
+        call: CallId,
+    },
+    /// Records a catch of the creature with this slug. Refused for a slug that is not in
+    /// the list. Answered with [`Event::CatchRecorded`].
+    RecordCatch {
+        call: CallId,
+        creature: String,
     },
     /// Stops every running agent of every project, as the user's choice: an agent
     /// with a session becomes `Resumable`, and no orchestrator is told. Answered with
@@ -1252,6 +1289,15 @@ pub enum Request {
         task: TaskId,
         marks: Vec<ReviewMark>,
     },
+    /// The whole old and new text of one file of the diff, line by line, for syntax
+    /// highlighting. Answered with [`Event::FileTexts`].
+    FileTexts {
+        call: CallId,
+        task: TaskId,
+        source: ReviewSource,
+        worktree: PathBuf,
+        path: PathBuf,
+    },
     /// The answer to [`Event::Challenge`]; it must be the client's frame after `Hello`.
     Prove {
         nonce: String,
@@ -1404,6 +1450,15 @@ pub enum Event {
     StatsChanged {
         stats: SwarmStats,
     },
+    Catches {
+        call: CallId,
+        catches: Vec<Catch>,
+    },
+    /// The catch after it was recorded: `count` is 1 for a creature caught the first time.
+    CatchRecorded {
+        call: CallId,
+        caught: Catch,
+    },
     /// Sent to every client when an agent asked for a large or a small worker tile.
     TileRequest {
         agent: AgentId,
@@ -1451,6 +1506,17 @@ pub enum Event {
         task: TaskId,
         draft: PrDraft,
     },
+    /// Sent to every client when a close of the task starts a step. The first step is
+    /// sent before anything stops, also for a close after a merge.
+    CloseProgress {
+        task: TaskId,
+        step: CloseStep,
+    },
+    /// Sent to every client when a close of the task stopped. The task stays open.
+    CloseFailed {
+        task: TaskId,
+        message: String,
+    },
     PrStatus {
         call: CallId,
         pull_request: PullRequest,
@@ -1458,6 +1524,14 @@ pub enum Event {
     ReviewMarks {
         call: CallId,
         marks: Vec<ReviewMark>,
+    },
+    /// The lines of the file on each side of the diff: line `n` of a [`DiffLine`] on the
+    /// old side is `old[n - 1]`. `None` for a side without the file, or a text file
+    /// that is binary, over 1 MB, or cannot be read.
+    FileTexts {
+        call: CallId,
+        old: Option<Vec<String>>,
+        new: Option<Vec<String>>,
     },
     /// Sent right after the daemon's `Hello`. The client's next frame must be
     /// [`Request::Prove`] with the same `nonce`.

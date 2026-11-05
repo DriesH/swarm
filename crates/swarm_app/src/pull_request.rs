@@ -601,6 +601,9 @@ pub(crate) struct PullRequests {
     focus_wanted: bool,
     /// The panel itself, so focus can enter it when no field takes it.
     panel_focus: Option<FocusHandle>,
+    /// Where the description field was drawn last, in window coordinates. The large view
+    /// grows from it and shrinks back into it.
+    pub(crate) description_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
 }
 
 impl PullRequests {
@@ -889,6 +892,8 @@ impl Workspace {
             }
             _ => self.pull_requests.poll = None,
         }
+
+        self.sync_description_tile(cx);
     }
 
     /// Stops the status poll, which needs an active window.
@@ -1155,6 +1160,8 @@ impl Workspace {
                 cx.notify();
             }
             PrEvent::Draft { task, draft } => self.draft_arrived(task, draft, cx),
+            PrEvent::CloseStep { task, step } => self.close_step(task, step, cx),
+            PrEvent::CloseFailed { task, message } => self.close_failed(task, message, cx),
         }
     }
 
