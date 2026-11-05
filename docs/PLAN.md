@@ -424,7 +424,7 @@ See [`ROADMAP.md`](ROADMAP.md) for the phases, their scope and what "done" means
 
 ## Phase 0 spikes
 
-Reports in `docs/spikes/`. Code in `spikes/` (throwaway).
+Reports in `docs/spikes/`. The spike code was removed after v1.0.1; the tag `v1.0.1` still has it in `spikes/`.
 
 | Spike | Result | Report |
 |---|---|---|

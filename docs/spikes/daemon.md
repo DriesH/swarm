@@ -7,7 +7,7 @@ Limits:
 - All input was driven in-process (script runner), as in spike 1. Do a short hands-on check with a real keyboard.
 - Key-to-paint latency could not be compared with spike 1: spike 1 did not measure it, and in this spike it is dominated by GPUI frame pacing of a background window (see criterion 4).
 
-Code: [`spikes/daemon`](../../spikes/daemon) (about 3,200 lines in three crates: `proto`, `swarm-daemon`, `swarm-app`).
+Code: `spikes/daemon` in the tag `v1.0.1` (removed since), about 3,200 lines in three crates: `proto`, `swarm-daemon`, `swarm-app`.
 
 ## Pass criteria
 
