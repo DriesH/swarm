@@ -721,6 +721,10 @@ impl Workspace {
         let known = self.data.has_daemon_task(info.id);
         let task = self.data.sync_task(project, info);
 
+        if info.approval_stale && info.pull_request.is_none() {
+            self.clear_pr_draft(task, info.id, cx);
+        }
+
         match window.as_deref_mut() {
             Some(window) => self.attach_agents(window, cx),
             None => self.apply_pending_agents(None, cx),
@@ -1565,6 +1569,15 @@ impl Workspace {
         }
     }
 
+    fn is_agent(&self, terminal: TerminalId) -> bool {
+        self.data.terminal(terminal).is_some_and(|entry| {
+            matches!(
+                entry.kind,
+                TerminalKind::Orchestrator | TerminalKind::Worker
+            )
+        })
+    }
+
     fn is_process(&self, terminal: TerminalId) -> bool {
         self.data
             .tasks
@@ -1889,14 +1902,17 @@ impl Workspace {
 
         // Both the tile and the Swarm view's Terminal tab show this view, so this is the
         // only place that decides who may type.
-        let is_worker = self
-            .data
-            .terminal(terminal)
-            .is_some_and(|entry| entry.kind == TerminalKind::Worker);
-        if is_worker {
+        let kind = self.data.terminal(terminal).map(|entry| entry.kind);
+        if kind == Some(TerminalKind::Worker) {
             view.update(cx, |view, _| {
                 view.set_typing_gate(crate::settings::allow_worker_typing);
             });
+        }
+        if matches!(
+            kind,
+            Some(TerminalKind::Worker | TerminalKind::Orchestrator)
+        ) {
+            view.update(cx, |view, _| view.hold_back_quit_keys());
         }
 
         let subscription =
@@ -1915,6 +1931,14 @@ impl Workspace {
     }
 
     fn on_exited(&mut self, terminal: TerminalId, status: &ExitStatus, cx: &mut Context<Self>) {
+        if self.is_agent(terminal) {
+            // No shell is left behind an agent: the tile stops being a terminal at once.
+            // The daemon reports the agent as resumable.
+            self.drop_live_terminal(terminal);
+            cx.notify();
+            return;
+        }
+
         if !self.is_process(terminal) {
             self.close_user_terminal(terminal, cx);
             return;
@@ -2080,6 +2104,14 @@ fn is_ended(lifecycle: AgentLifecycle) -> bool {
         lifecycle,
         AgentLifecycle::Stopped | AgentLifecycle::Resumable
     )
+}
+
+/// The agent's process ended: it was stopped, or can be resumed.
+pub(crate) fn has_ended(agent: &Agent) -> bool {
+    agent
+        .daemon
+        .as_ref()
+        .is_some_and(|daemon| is_ended(daemon.lifecycle))
 }
 
 /// The daemon can start the agent again from its saved session.
@@ -2483,6 +2515,7 @@ pub(crate) mod tests {
             created_by: None,
             briefed: false,
             approved: None,
+            approval_stale: false,
             closed: false,
             pull_request: None,
             close_after_merge: false,
@@ -3778,7 +3811,7 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
-    fn a_worker_gets_a_live_view_and_keeps_its_tile_when_it_stops(cx: &mut TestAppContext) {
+    fn a_worker_gets_a_live_view_and_leaves_the_layout_when_it_stops(cx: &mut TestAppContext) {
         let socket = fake_daemon_replying(|_| None);
         let (workspace, cx, _client) = real_task_workspace(&socket, cx);
         let mut running = worker_info(2, 7, "api", DaemonAgentStatus::Working);
@@ -3792,7 +3825,29 @@ pub(crate) mod tests {
 
         let still_live = workspace.read_with(cx, |workspace, _| workspace.live_terminals.len());
         assert_eq!((live, still_live), (1, 0));
-        assert_eq!(tile_titles(&workspace, cx), ["api"]);
+        assert!(tile_titles(&workspace, cx).is_empty());
+    }
+
+    #[gpui::test]
+    fn a_worker_that_quits_by_itself_stops_being_a_terminal_at_once(cx: &mut TestAppContext) {
+        let socket = fake_daemon_replying(|_| None);
+        let (workspace, cx, _client) = real_task_workspace(&socket, cx);
+        let mut running = worker_info(2, 7, "api", DaemonAgentStatus::Working);
+        running.terminal = Some(swarm_protocol::TerminalId(21));
+        change_agent(&workspace, &running, cx);
+        let tile = workspace
+            .read_with(cx, |workspace, _| {
+                workspace.live_terminals.keys().next().copied()
+            })
+            .expect("a live worker tile");
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let exited = TerminalEvent::Exited(ExitStatus::Code(0));
+            workspace.on_terminal_event(tile, &exited, window, cx);
+        });
+
+        let live = workspace.read_with(cx, |workspace, _| workspace.live_terminals.len());
+        assert_eq!(live, 0);
     }
 
     fn process_info(id: u64, name: Option<&str>, title: &str) -> TerminalInfo {

@@ -10,8 +10,8 @@ use gpui::{
 };
 use swarm_protocol::{
     CheckState, ChecksRun, Client, ClientError, GithubCheckState, GithubStatus, MergeMethod,
-    PrDraft, PrEvent, PrLink, PrPanel, PrState, PullRequest, TaskId as DaemonTaskId,
-    TerminalId as DaemonTerminalId,
+    MergeState, PrDraft, PrEvent, PrLink, PrPanel, PrState, PullRequest, ReviewState,
+    TaskId as DaemonTaskId, TerminalId as DaemonTerminalId,
 };
 use swarm_term::ExitStatus;
 use swarm_ui::prelude::*;
@@ -220,6 +220,84 @@ pub(crate) fn checks_running(pull_request: &PullRequest) -> bool {
             GithubCheckState::Queued | GithubCheckState::Running
         )
     })
+}
+
+/// Why Merge is off, as the status text above it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MergeBlock {
+    ChecksRunning,
+    ChecksFailed,
+    Conflicts,
+    ReviewRequired,
+    Behind,
+    Blocked,
+}
+
+impl MergeBlock {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::ChecksRunning => "Checks running",
+            Self::ChecksFailed => "Checks failed",
+            Self::Conflicts => "Conflicts",
+            Self::ReviewRequired => "Review required",
+            Self::Behind => "Behind base",
+            Self::Blocked => "Blocked",
+        }
+    }
+}
+
+/// What stops a merge: a check that runs or failed, or GitHub saying why it cannot merge.
+/// A draft has its own button and no reason here, and a merge state GitHub has not worked
+/// out yet has none either; Merge stays off for it ([`can_merge`]).
+pub(crate) fn merge_block(pull_request: &PullRequest) -> Option<MergeBlock> {
+    if checks_running(pull_request) {
+        Some(MergeBlock::ChecksRunning)
+    } else if pull_request
+        .checks
+        .iter()
+        .any(|check| check.state == GithubCheckState::Failed)
+    {
+        Some(MergeBlock::ChecksFailed)
+    } else if pull_request.draft {
+        None
+    } else {
+        match pull_request.merge_state {
+            MergeState::Conflicts => Some(MergeBlock::Conflicts),
+            MergeState::Behind => Some(MergeBlock::Behind),
+            MergeState::Blocked if !approved(pull_request) => Some(MergeBlock::ReviewRequired),
+            MergeState::Blocked => Some(MergeBlock::Blocked),
+            MergeState::Clean
+            | MergeState::Unstable
+            | MergeState::HasHooks
+            | MergeState::Unknown => None,
+        }
+    }
+}
+
+fn approved(pull_request: &PullRequest) -> bool {
+    pull_request
+        .reviewers
+        .iter()
+        .any(|reviewer| reviewer.state == ReviewState::Approved)
+}
+
+/// The pull request can merge now: open, not a draft, no check running or failed, and
+/// GitHub agrees.
+pub(crate) fn can_merge(pull_request: &PullRequest) -> bool {
+    pull_request.mergeable && merge_block(pull_request).is_none()
+}
+
+/// GitHub's color for the state of a pull request: open, merged, closed or draft.
+pub(crate) fn state_color(
+    pull_request: Option<&PullRequest>,
+    colors: &swarm_ui::ThemeColors,
+) -> gpui::Hsla {
+    match pull_request {
+        Some(status) if status.state == PrState::Merged => colors.pr_merged,
+        Some(status) if status.state == PrState::Closed => colors.pr_closed,
+        Some(status) if status.draft => colors.pr_draft,
+        Some(_) | None => colors.pr_open,
+    }
 }
 
 /// The wait before the status is read again.
@@ -471,6 +549,19 @@ impl PrForm {
         self.newer = None;
     }
 
+    /// Empties the fields and forgets the draft, also one the user edited.
+    fn clear_draft(&mut self, cx: &mut App) {
+        self.title.update(cx, |input, cx| {
+            input.set_text_at_start(String::new(), cx);
+        });
+        self.description.update(cx, |area, cx| {
+            area.set_text_at_start(String::new(), cx);
+        });
+        self.applied = None;
+        self.newer = None;
+        self.draft_wait = DraftWait::Idle;
+    }
+
     fn lock(&self, locked: bool, cx: &mut App) {
         self.title
             .update(cx, |input, cx| input.set_disabled(locked, cx));
@@ -654,7 +745,8 @@ impl Workspace {
             .and_then(|_| self.data.diff_id(task))
     }
 
-    /// The task has been approved or has a pull request: its panel and header toggle exist.
+    /// The task has been approved or has a pull request: its panel exists. The header
+    /// toggle of a task without a pull request needs an approval that still holds.
     pub(crate) fn pr_available(&self, task: TaskId) -> bool {
         self.data.task(task).is_some_and(|task| {
             !task.is_start && (task.approved.is_some() || task.pull_request.is_some())
@@ -911,6 +1003,7 @@ impl Workspace {
             .is_some_and(|(asked, _)| *asked == id)
             && !self.pull_requests.loading.contains_key(&id);
         let wanted = self.pr_available(task)
+            && self.data.approval_holds(task)
             && panel_read
             && !self.data.drafts.contains_key(&id)
             && self
@@ -922,6 +1015,27 @@ impl Workspace {
             return;
         }
 
+        self.send_draft_request(task, id, cx);
+    }
+
+    /// The Redraft button: asks the orchestrator for a new draft of the current diff.
+    pub(crate) fn redraft(&mut self, cx: &mut Context<Self>) {
+        let task = self.active_task;
+        let Some(id) = self.data.diff_id(task) else {
+            return;
+        };
+        let idle = self
+            .pull_requests
+            .forms
+            .get(&task)
+            .is_some_and(|form| form.draft_wait != DraftWait::Waiting);
+
+        if idle && self.data.approval_holds(task) {
+            self.send_draft_request(task, id, cx);
+        }
+    }
+
+    fn send_draft_request(&mut self, task: TaskId, id: DaemonTaskId, cx: &mut Context<Self>) {
         let Some(client) = self.connected_client() else {
             if self.source == DataSource::Sample {
                 self.draft_arrived(id, sample_draft(), cx);
@@ -988,6 +1102,30 @@ impl Workspace {
         }
 
         cx.notify();
+    }
+
+    /// The task was approved, new work made the approval outdated, and no pull request
+    /// exists yet. The panel then asks for a new review.
+    pub(crate) fn approval_outdated(&self, task: TaskId) -> bool {
+        self.data.task(task).is_some_and(|entry| {
+            entry.approved.is_some() && entry.approval_stale && entry.pull_request.is_none()
+        })
+    }
+
+    /// Opens Review on the Merged diff, where the task can be approved again.
+    pub(crate) fn review_for_approval(&mut self, cx: &mut Context<Self>) {
+        self.set_review_source(swarm_protocol::ReviewSource::Merged, cx);
+        self.set_view(View::Review, cx);
+    }
+
+    /// Drops the draft of a task whose approval no longer holds: the form is empty again
+    /// and the next approval asks the orchestrator for a new draft.
+    pub(crate) fn clear_pr_draft(&mut self, task: TaskId, id: DaemonTaskId, cx: &mut App) {
+        self.data.drafts.remove(&id);
+
+        if let Some(form) = self.pull_requests.forms.get_mut(&task) {
+            form.clear_draft(cx);
+        }
     }
 
     /// Replaces the fields with the draft that came after the user changed them.
@@ -1805,7 +1943,7 @@ impl Workspace {
                     status.reviewers.extend(asked.into_iter().map(|login| {
                         swarm_protocol::Reviewer {
                             login,
-                            state: swarm_protocol::ReviewState::Requested,
+                            state: ReviewState::Requested,
                         }
                     }));
                 }
@@ -1943,7 +2081,7 @@ impl Workspace {
 
                 Some(toggle_label(link, status).into())
             }
-            None if entry.approved.is_some() => Some("Pull request".into()),
+            None if self.data.approval_holds(task) => Some("Pull request".into()),
             None => None,
         }
     }
@@ -1958,7 +2096,7 @@ impl Workspace {
 
                 Some(toggle_spoken(link, status).into())
             }
-            None if entry.approved.is_some() => Some("Pull request".into()),
+            None if self.data.approval_holds(task) => Some("Pull request".into()),
             None => None,
         }
     }

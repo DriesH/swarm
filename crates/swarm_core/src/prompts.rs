@@ -101,9 +101,11 @@ const ORCHESTRATOR_COMMANDS: &[&str] = &[
     "`swarm read`: take your unread messages",
     "`swarm wait [--timeout SECS]`: wait for a message (default 100, at most 600)",
     "`swarm merge <worker>`: merge the branch of a worker that has its own worktree into the task branch",
+    "`swarm stop <worker>`: end a worker you have no follow-up for; it stays resumable and a message brings it back (a worker with its own worktree must be merged first)",
     "`swarm agents`: list your workers",
     "`swarm notify <text>`: ask the user for attention",
     "`swarm confirm`: say that you understood your brief",
+    "`swarm task rename <name>`: rename your task, its tab and its branch to say what the task is about (refused once the task has a pull request or a pushed branch)",
     "`swarm tile grow <worker>`: ask for a large tile for one of your workers; the layout may ignore it, for example when the user minimized the tile",
     "`swarm tile shrink <worker>`: ask for a small tile again",
     "`swarm pr draft --title <title> (--body <text> | --body-file <path|->)`: send the pull request title and description the `pr draft` message asks for (only after the user approved the task)",
@@ -129,7 +131,7 @@ const WORKER_COMMANDS: &[&str] = &[
 ];
 
 const START_COMMANDS: &[&str] = &[
-    "`swarm task create <name> [--from BRANCH] [--kind claude|codex] [--brief TEXT]`: make a task and start its orchestrator with the brief (the brief comes from stdin without `--brief`)",
+    "`swarm task create [name] [--from BRANCH] [--kind claude|codex] [--brief TEXT]`: make a task and start its orchestrator with the brief (the brief comes from stdin without `--brief`; without a name the task is named after a bee or wasp)",
     "`swarm task list`: list the tasks of the project",
     "`swarm task wait <id>... --until briefed|done [--timeout SECS]`: wait until the task orchestrators confirmed their brief or finished (default 100, at most 600)",
     "`swarm exit`: end your own session",
@@ -650,6 +652,49 @@ mod tests {
         assert!(ORCHESTRATOR.contains("share the task worktree"));
         assert!(ORCHESTRATOR.contains("--own-worktree \"<reason>\""));
         assert!(ORCHESTRATOR.contains("only for a worker that has its own worktree"));
+    }
+
+    #[test]
+    fn the_orchestrator_starts_every_helper_with_swarm_spawn() {
+        assert!(ORCHESTRATOR.contains("Every helper agent is a worker started with `swarm spawn`"));
+        assert!(ORCHESTRATOR.contains("including read-only reviews and research"));
+        assert!(ORCHESTRATOR.contains("Never use your built-in subagent or workflow tools"));
+        assert!(START.contains("Never use your built-in subagent or workflow tools"));
+    }
+
+    #[test]
+    fn the_worker_may_use_its_own_subagents() {
+        assert!(!WORKER.contains("subagent"));
+    }
+
+    #[test]
+    fn the_orchestrator_renames_a_task_that_has_a_creature_name() {
+        assert!(ORCHESTRATOR.contains("After `swarm confirm`"));
+        assert!(ORCHESTRATOR.contains("creature's Latin name"));
+        assert!(ORCHESTRATOR.contains("swarm task rename <short-kebab-name>"));
+    }
+
+    #[test]
+    fn the_orchestrator_stops_a_worker_it_has_no_follow_up_for() {
+        assert!(ORCHESTRATOR.contains("have no follow-up for it, run `swarm stop <worker>`"));
+    }
+
+    #[test]
+    fn only_the_orchestrator_lists_stop_and_task_rename() {
+        let block = |role| {
+            Harness {
+                role,
+                ..harness(Path::new("/s"))
+            }
+            .block()
+        };
+
+        assert!(block(AgentRole::Orchestrator).contains("- `swarm stop <worker>`"));
+        assert!(block(AgentRole::Orchestrator).contains("- `swarm task rename <name>`"));
+        assert!(!block(AgentRole::Worker).contains("swarm stop"));
+        assert!(!block(AgentRole::Worker).contains("task rename"));
+        assert!(!block(AgentRole::StartOrchestrator).contains("swarm stop"));
+        assert!(!block(AgentRole::StartOrchestrator).contains("task rename"));
     }
 
     #[test]

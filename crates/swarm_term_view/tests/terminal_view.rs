@@ -15,7 +15,8 @@ use swarm_term::{
     Screen, Snapshot, TerminalInput, TerminalOutput, TextFlags, TextSpan, Update,
 };
 use swarm_term_view::{
-    DEFAULT_FONT_SIZE, TerminalEvent, TerminalView, hold_resizes_until, palette_for,
+    DEFAULT_FONT_SIZE, DOUBLE_INTERRUPT, TerminalEvent, TerminalView, hold_resizes_until,
+    palette_for,
 };
 use swarm_ui::{Appearance, Theme};
 
@@ -1035,4 +1036,179 @@ fn an_exit_is_not_followed_by_disconnected(cx: &mut TestAppContext) {
         *events.borrow(),
         [TerminalEvent::Exited(ExitStatus::Code(0))]
     );
+}
+
+fn texts(setup: &Setup<'_>) -> Vec<String> {
+    setup
+        .inputs()
+        .into_iter()
+        .filter_map(|input| match input {
+            TerminalInput::Text(text) => Some(text),
+            _ => None,
+        })
+        .collect()
+}
+
+#[gpui::test]
+fn command_left_and_right_jump_to_the_start_and_end_of_the_line(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    setup.focus();
+    setup.inputs();
+
+    setup.cx.simulate_keystrokes("cmd-left cmd-right");
+
+    assert_eq!(texts(&setup), ["\x01", "\x05"]);
+}
+
+#[gpui::test]
+fn command_backspace_deletes_to_the_start_of_the_line(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    setup.focus();
+    setup.inputs();
+
+    setup.cx.simulate_keystrokes("cmd-backspace");
+
+    assert_eq!(texts(&setup), ["\x15"]);
+}
+
+#[gpui::test]
+fn option_left_and_right_jump_a_word(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    setup.focus();
+    setup.inputs();
+
+    setup.cx.simulate_keystrokes("alt-left alt-right");
+
+    assert_eq!(texts(&setup), ["\x1bb", "\x1bf"]);
+}
+
+#[gpui::test]
+fn the_line_keys_do_not_reach_the_parent(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    setup.focus();
+
+    setup.cx.simulate_keystrokes("cmd-left alt-right");
+
+    assert!(setup.seen.borrow().is_empty());
+}
+
+#[gpui::test]
+fn shifted_arrows_keep_going_through_the_key_encoder(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    setup.focus();
+    setup.inputs();
+
+    setup.cx.simulate_keystrokes("shift-left");
+
+    assert_eq!(setup.keys().len(), 1);
+}
+
+fn guard_agent(setup: &mut Setup<'_>) {
+    setup
+        .terminal
+        .update(setup.cx, |view, _| view.hold_back_quit_keys());
+    setup.focus();
+    setup.inputs();
+}
+
+fn control_keys(setup: &Setup<'_>) -> Vec<String> {
+    setup
+        .keys()
+        .into_iter()
+        .filter(|key| key.modifiers.control)
+        .map(|key| key.name)
+        .collect()
+}
+
+#[gpui::test]
+fn an_agent_terminal_passes_the_first_control_c(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    guard_agent(&mut setup);
+
+    setup.cx.simulate_keystrokes("ctrl-c");
+
+    assert_eq!(control_keys(&setup), ["c"]);
+}
+
+#[gpui::test]
+fn an_agent_terminal_holds_back_a_second_control_c_within_two_seconds(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    guard_agent(&mut setup);
+
+    setup.cx.simulate_keystrokes("ctrl-c");
+    setup.cx.executor().advance_clock(DOUBLE_INTERRUPT / 2);
+    setup.cx.simulate_keystrokes("ctrl-c");
+
+    assert_eq!(control_keys(&setup), ["c"]);
+    assert!(setup.seen.borrow().is_empty());
+}
+
+#[gpui::test]
+fn an_agent_terminal_passes_a_control_c_after_two_seconds(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    guard_agent(&mut setup);
+
+    setup.cx.simulate_keystrokes("ctrl-c");
+    setup.cx.executor().advance_clock(DOUBLE_INTERRUPT);
+    setup.cx.simulate_keystrokes("ctrl-c");
+
+    assert_eq!(control_keys(&setup), ["c", "c"]);
+}
+
+#[gpui::test]
+fn a_held_back_control_c_does_not_restart_the_two_second_window(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    guard_agent(&mut setup);
+
+    setup.cx.simulate_keystrokes("ctrl-c");
+    setup.cx.executor().advance_clock(DOUBLE_INTERRUPT * 3 / 4);
+    setup.cx.simulate_keystrokes("ctrl-c");
+    setup.cx.executor().advance_clock(DOUBLE_INTERRUPT * 3 / 4);
+    setup.cx.simulate_keystrokes("ctrl-c");
+
+    assert_eq!(control_keys(&setup), ["c", "c"]);
+}
+
+#[gpui::test]
+fn an_agent_terminal_holds_back_control_d(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    guard_agent(&mut setup);
+
+    setup.cx.simulate_keystrokes("ctrl-d");
+
+    assert!(control_keys(&setup).is_empty());
+}
+
+#[gpui::test]
+fn an_agent_terminal_passes_escape_and_other_control_keys(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    guard_agent(&mut setup);
+
+    setup.cx.simulate_keystrokes("escape ctrl-a ctrl-e");
+
+    let names: Vec<String> = setup.keys().into_iter().map(|key| key.name).collect();
+    assert_eq!(names, ["escape", "a", "e"]);
+}
+
+#[gpui::test]
+fn a_terminal_that_is_not_an_agent_passes_every_control_c_and_control_d(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    setup.focus();
+    setup.inputs();
+
+    setup.cx.simulate_keystrokes("ctrl-c ctrl-c ctrl-d");
+
+    assert_eq!(control_keys(&setup), ["c", "c", "d"]);
+}
+
+#[gpui::test]
+fn a_terminal_that_exited_takes_no_more_keys(cx: &mut TestAppContext) {
+    let mut setup = setup(cx);
+    setup.focus();
+    setup.send(TerminalOutput::Exited(ExitStatus::Code(0)));
+    setup.inputs();
+
+    setup.cx.simulate_keystrokes("a enter");
+
+    assert!(setup.keys().is_empty());
 }

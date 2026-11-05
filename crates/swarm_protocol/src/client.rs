@@ -20,8 +20,8 @@ use crate::{
     CreateTask, CreateTerminal, Event, FileDiff, FrameError, GH_SECS, GithubStatus, MergeMethod,
     MessageId, MessageInfo, NewComment, Notice, PUSH_SECS, Paths, PlanDraft, PrDraft, PrPanel,
     ProjectConfigFields, ProjectId, ProjectInfo, PromptInfo, PullRequest, RemoveCheck, Request,
-    ReviewComment, ReviewSource, StopError, SwarmStats, SystemCheck, TaskDiff, TaskId, TaskInfo,
-    TerminalId, TerminalInfo, Usage, VERSION, check_private_dir, read, write,
+    ReviewComment, ReviewMark, ReviewSource, StopError, SwarmStats, SystemCheck, TaskDiff, TaskId,
+    TaskInfo, TerminalId, TerminalInfo, Usage, VERSION, check_private_dir, read, write,
 };
 
 /// A project's config file as the daemon read it.
@@ -875,6 +875,31 @@ impl Client {
         }
     }
 
+    /// The files of the task the user marked viewed or folded.
+    pub fn review_marks(&self, task: TaskId) -> Result<Vec<ReviewMark>, ClientError> {
+        match self.call(|call| Request::ReviewMarks { call, task }, None)? {
+            Event::ReviewMarks { marks, .. } => Ok(marks),
+            other => Err(unexpected("ReviewMarks", &other)),
+        }
+    }
+
+    /// Replaces the viewed and folded marks of the task.
+    pub fn set_review_marks(
+        &self,
+        task: TaskId,
+        marks: Vec<ReviewMark>,
+    ) -> Result<(), ClientError> {
+        self.done(
+            |call| Request::SetReviewMarks {
+                call,
+                task,
+                marks: marks.clone(),
+            },
+            "SetReviewMarks",
+            self.reply_timeout,
+        )
+    }
+
     /// Asks the orchestrator for a draft; it arrives through [`Client::pr_events`].
     pub fn draft_pr(&self, task: TaskId) -> Result<(), ClientError> {
         self.done(
@@ -1393,6 +1418,9 @@ fn read_events(
                 deliver(shared, call, Event::Branches { call, branches });
             }
             Event::PrPanel { call, panel } => deliver(shared, call, Event::PrPanel { call, panel }),
+            Event::ReviewMarks { call, marks } => {
+                deliver(shared, call, Event::ReviewMarks { call, marks });
+            }
             Event::PrStatus { call, pull_request } => {
                 deliver(shared, call, Event::PrStatus { call, pull_request });
             }

@@ -2541,6 +2541,173 @@ sleep 30"#,
 }
 
 #[test]
+fn a_task_created_without_a_name_is_named_after_a_creature() {
+    let fixture = fixture_with_helpers("idle\nsleep 30");
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+
+    let task = client.create_task(CreateTask {
+        name: "  ".to_owned(),
+        ..orchestrator_task(project.id, false)
+    });
+
+    assert!(swarm_protocol::creatures::is_creature_slug(&task.name));
+    assert_eq!(task.branch, format!("swarm/{}", task.name));
+}
+
+#[test]
+fn the_start_orchestrator_can_create_tasks_without_a_name() {
+    let fixture = fixture_with_helpers(
+        r#"case "$SWARM_ROLE" in
+start_orchestrator)
+  printf '{"hook_event_name":"SessionStart","session_id":"start-session"}' | "$SWARM" hook
+  swarm task create --brief "build it" > "$OUT/one.out" 2>&1
+  swarm task create --brief "build more" > "$OUT/two.out" 2>&1
+  sleep 30
+  ;;
+*)
+  idle
+  sleep 30
+  ;;
+esac"#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+
+    client.start_orchestrator(project.id);
+
+    let name_in = |file: &str| {
+        let text = fixture.read_when_written(file);
+        let name = text
+            .split_once('(')
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(name, _)| name.to_owned());
+
+        name.unwrap_or(text)
+    };
+    let (one, two) = (name_in("one.out"), name_in("two.out"));
+    assert!(swarm_protocol::creatures::is_creature_slug(&one), "{one}");
+    assert!(swarm_protocol::creatures::is_creature_slug(&two), "{two}");
+    assert_ne!(one, two);
+}
+
+#[test]
+fn an_orchestrator_renames_its_task_and_its_branch() {
+    let fixture = fixture_with_helpers(
+        r#"case "$SWARM_ROLE" in
+orchestrator)
+  idle
+  IFS= read -r line
+  working
+  swarm confirm > "$OUT/confirm.out" 2>&1
+  swarm task rename "Clean up code" > "$OUT/rename.out" 2>&1
+  echo $? > "$OUT/rename.code"
+  swarm task rename "???" > "$OUT/bad.out" 2>&1
+  echo $? > "$OUT/bad.code"
+  idle
+  sleep 30
+  ;;
+esac"#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, task) = start_task(&daemon, &repo);
+
+    let renamed = client.wait_for(|event| match event {
+        Event::TaskChanged { task } if task.name == "Clean up code" => Some(task.clone()),
+        _ => None,
+    });
+    let orchestrator = client.wait_for_agent(|agent| agent.branch == "swarm/clean-up-code");
+
+    assert_eq!(renamed.branch, "swarm/clean-up-code");
+    assert_eq!(renamed.worktree, task.worktree);
+    assert_eq!(orchestrator.id, task.agents[0].id);
+    assert_eq!(
+        git_output(&task.worktree, &["branch", "--show-current"]),
+        "swarm/clean-up-code"
+    );
+    assert_eq!(fixture.read_when_written("rename.code").trim(), "0");
+    assert!(
+        fixture
+            .read_when_written("rename.out")
+            .starts_with("renamed task "),
+    );
+    assert_eq!(fixture.read_when_written("bad.code").trim(), "1");
+    assert!(
+        fixture.read_when_written("bad.out").starts_with("swarm: "),
+        "a name without letters is refused"
+    );
+    assert_eq!(client.projects()[0].tasks[0].branch, "swarm/clean-up-code");
+}
+
+#[test]
+fn an_orchestrator_stops_a_worker_that_is_done_and_the_worker_stays_resumable() {
+    let fixture = fixture_with_helpers(
+        r#"case "$SWARM_ROLE" in
+orchestrator)
+  idle
+  IFS= read -r line
+  working
+  swarm confirm > "$OUT/confirm.out" 2>&1
+  swarm spawn api --brief "work" > "$OUT/spawn-api.out" 2>&1
+  swarm wait --timeout 60 > "$OUT/report-api.out" 2>&1
+  swarm spawn lonely --own-worktree "same files" --brief "work" > "$OUT/spawn-lonely.out" 2>&1
+  swarm wait --timeout 60 > "$OUT/report-lonely.out" 2>&1
+  swarm stop lonely > "$OUT/stop-lonely.out" 2>&1
+  echo $? > "$OUT/stop-lonely.code"
+  swarm stop api > "$OUT/stop-api.out" 2>&1
+  echo $? > "$OUT/stop-api.code"
+  swarm stop "$SWARM_AGENT_ID" > "$OUT/stop-self.out" 2>&1
+  echo $? > "$OUT/stop-self.code"
+  idle
+  sleep 30
+  ;;
+worker)
+  printf '{"hook_event_name":"SessionStart","session_id":"worker-%s"}' "$SWARM_AGENT_ID" | "$SWARM" hook
+  idle
+  IFS= read -r line
+  working
+  if [ "$SWARM_AGENT_NAME" = "lonely" ]; then echo change > lonely.txt; fi
+  swarm report "done" > "$OUT/report-$SWARM_AGENT_NAME.sent" 2>&1
+  idle
+  sleep 30
+  ;;
+esac"#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, task) = start_task(&daemon, &repo);
+
+    let stopped = client.wait_for_agent(|agent| {
+        agent.name == "api" && agent.lifecycle == AgentLifecycle::Resumable
+    });
+
+    assert_eq!(stopped.role, AgentRole::Worker);
+    assert_eq!(
+        fixture.read_when_written("stop-api.out").trim(),
+        "stopped worker api"
+    );
+    assert_eq!(fixture.read_when_written("stop-api.code").trim(), "0");
+    assert_eq!(fixture.read_when_written("stop-lonely.code").trim(), "1");
+    let refusal = fixture.read_when_written("stop-lonely.out");
+    assert!(refusal.contains("swarm merge"), "{refusal}");
+    assert_eq!(fixture.read_when_written("stop-self.code").trim(), "1");
+    let messages = client.list_messages(task.project, Some(task.id));
+    assert!(
+        messages
+            .iter()
+            .all(|message| message.kind != MessageKind::WorkerStopped),
+        "a stop on purpose tells nobody: {messages:?}"
+    );
+}
+
+#[test]
 fn the_mcp_server_serves_an_agent_through_the_daemon() {
     let fixture = fixture_with_helpers(
         r#"idle
@@ -2590,9 +2757,11 @@ sleep 30"#,
             "read",
             "wait",
             "merge",
+            "stop",
             "notify",
             "agents",
             "confirm",
+            "task_rename",
             "pr_draft",
             "tile_grow",
             "tile_shrink",
@@ -8244,13 +8413,17 @@ fn ready_reviewers_and_merge_call_gh_with_the_documented_arguments() {
         calls[1],
         ["pr", "edit", "42", "--add-reviewer", "alice,bob-2"]
     );
-    assert_eq!(calls[2], merge("--merge"));
-    assert!(view(&calls[3]));
-    assert_eq!(calls[4], merge("--rebase"));
+    // Each merge reads the checks first, then merges, then reads the result.
+    assert!(view(&calls[2]));
+    assert_eq!(calls[3], merge("--merge"));
+    assert!(view(&calls[4]));
     assert!(view(&calls[5]));
-    assert_eq!(calls[6], merge("--squash"));
+    assert_eq!(calls[6], merge("--rebase"));
     assert!(view(&calls[7]));
-    assert_eq!(calls.len(), 8);
+    assert!(view(&calls[8]));
+    assert_eq!(calls[9], merge("--squash"));
+    assert!(view(&calls[10]));
+    assert_eq!(calls.len(), 11);
     env.gh.assert_no_branch_deleted_by_gh();
 }
 
@@ -12495,4 +12668,83 @@ fn a_new_task_past_the_total_limit_is_refused_and_leaves_no_worktree() {
         "{message}"
     );
     assert!(!repo.root.join(".worktrees/second-task").exists());
+}
+
+#[test]
+fn a_merge_is_refused_while_a_check_runs_and_while_one_failed() {
+    let mut env = env_with_pull_request(false);
+
+    env.gh.answer("pr-view", VIEW_JSON);
+    let running = env.merge().expect_err("a check runs");
+    env.gh
+        .answer("pr-view", &VIEW_JSON.replace("PENDING", "FAILURE"));
+    let failed = env.merge().expect_err("a check failed");
+
+    assert!(running.contains("still running"), "{running}");
+    assert!(failed.contains("checks failed"), "{failed}");
+    assert!(env.gh.calls_of(&["pr", "merge"]).is_empty());
+}
+
+#[test]
+fn new_work_after_the_approval_resets_it_for_every_client_and_tells_the_orchestrator() {
+    let fixture = Fixture::new("exit 0");
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let task = client.create_task(orchestrator_task(project.id, false));
+    std::fs::write(task.worktree.join("review.txt"), "one\n").expect("file");
+    commit_all(&task.worktree);
+    client.approve(task.id);
+    let mut watcher = daemon.connect();
+    watcher.hello();
+
+    commit_more(&task.worktree, "more.txt");
+    let reset = watcher.wait_for(|event| match event {
+        Event::TaskChanged { task: changed } if changed.approval_stale => Some(changed.clone()),
+        _ => None,
+    });
+
+    assert_eq!(reset.id, task.id);
+    assert!(reset.approved.is_some(), "the approval stays recorded");
+    let messages = client.list_messages(task.project, Some(task.id));
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message.kind == MessageKind::ApprovalReset)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn review_marks_are_stored_by_the_daemon_and_read_back() {
+    let repo = Repo::new("");
+    let daemon = Daemon::start();
+    let (mut client, task) = reviewed_task(&daemon, &repo);
+    let marks = vec![swarm_protocol::ReviewMark {
+        worktree: task.worktree.clone(),
+        path: PathBuf::from("review.txt"),
+        viewed: Some(7),
+        folded: Some(7),
+    }];
+
+    client
+        .until_done(&Request::SetReviewMarks {
+            call: CALL,
+            task: task.id,
+            marks: marks.clone(),
+        })
+        .expect("saved");
+    client.send(&Request::ReviewMarks {
+        call: CALL,
+        task: task.id,
+    });
+    let read = client.wait_for(|event| match event {
+        Event::ReviewMarks { call: CALL, marks } => Some(marks.clone()),
+        _ => None,
+    });
+
+    assert_eq!(read, marks);
 }

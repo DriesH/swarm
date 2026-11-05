@@ -744,7 +744,7 @@ impl ReviewView {
         };
 
         self.set_cursor(pos, cx);
-        self.body_list.scroll_to_reveal_item(row);
+        self.reveal_row(row);
     }
 
     /// In split view, moves the cursor to the other side: the line next to it, else the
@@ -773,7 +773,7 @@ impl ReviewView {
 
         if let Some((row, pos)) = target.copied() {
             self.set_cursor(pos, cx);
-            self.body_list.scroll_to_reveal_item(row);
+            self.reveal_row(row);
         }
     }
 
@@ -846,7 +846,7 @@ impl ReviewView {
             .iter()
             .position(|row| matches!(row, Row::Composer { .. }));
         if let Some(row) = composer_row {
-            self.body_list.scroll_to_reveal_item(row);
+            self.reveal_row(row);
         }
 
         cx.notify();

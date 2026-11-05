@@ -136,6 +136,15 @@ pub struct ThemeColors {
     pub claude: Hsla,
     /// Letter on a project tile, which has a saturated per-project color.
     pub on_tile: Hsla,
+    /// A pull request's state, as GitHub colors it: open, merged, closed, draft. From
+    /// Primer's `fgColor` success, done, danger and muted.
+    pub pr_open: Hsla,
+    pub pr_merged: Hsla,
+    pub pr_closed: Hsla,
+    pub pr_draft: Hsla,
+    /// The merge button's fill (Primer `bgColor-success-emphasis`) and its label.
+    pub merge: Hsla,
+    pub on_merge: Hsla,
     /// Terminal colors 0-7 (black to white), then the bright 8-15.
     pub ansi: [Hsla; 16],
 }
@@ -187,6 +196,12 @@ impl ThemeColors {
             shadow_strong,
             claude,
             on_tile,
+            pr_open,
+            pr_merged,
+            pr_closed,
+            pr_draft,
+            merge,
+            on_merge,
             ansi,
         } = self;
 
@@ -228,6 +243,12 @@ impl ThemeColors {
             ("shadow_strong", *shadow_strong),
             ("claude", *claude),
             ("on_tile", *on_tile),
+            ("pr_open", *pr_open),
+            ("pr_merged", *pr_merged),
+            ("pr_closed", *pr_closed),
+            ("pr_draft", *pr_draft),
+            ("merge", *merge),
+            ("on_merge", *on_merge),
         ];
 
         tokens.extend(ANSI_NAMES.into_iter().zip(ansi.iter().copied()));
@@ -291,6 +312,14 @@ impl Theme {
                 shadow_strong: rgba(0x00000059).into(),
                 claude: rgb(0xd97757).into(),
                 on_tile: rgb(0xffffff).into(),
+                // Primer dark: fgColor success (green.3), done (purple.4), danger (red.4),
+                // muted (neutral.9); bgColor-success-emphasis (green.5).
+                pr_open: rgb(0x3fb950).into(),
+                pr_merged: rgb(0xab7df8).into(),
+                pr_closed: rgb(0xf85149).into(),
+                pr_draft: rgb(0x9198a1).into(),
+                merge: rgb(0x238636).into(),
+                on_merge: rgb(0xffffff).into(),
                 ansi: [
                     rgb(0x2a2a2e).into(),
                     rgb(0xff6369).into(),
@@ -359,6 +388,14 @@ impl Theme {
                 shadow_strong: rgba(0x00000059).into(),
                 claude: rgb(0xd97757).into(),
                 on_tile: rgb(0xffffff).into(),
+                // Primer light: fgColor success (green.5), done (purple.5), danger,
+                // muted (neutral.9); bgColor-success-emphasis.
+                pr_open: rgb(0x1a7f37).into(),
+                pr_merged: rgb(0x8250df).into(),
+                pr_closed: rgb(0xd1242f).into(),
+                pr_draft: rgb(0x59636e).into(),
+                merge: rgb(0x1f883d).into(),
+                on_merge: rgb(0xffffff).into(),
                 ansi: [
                     rgb(0x1f1f23).into(),
                     rgb(0xb63128).into(),
@@ -763,6 +800,41 @@ mod tests {
     }
 
     #[test]
+    fn pull_request_state_colors_and_the_merge_label_meet_wcag_aa() {
+        let mut failures = Vec::new();
+
+        for theme in themes() {
+            let colors = theme.colors();
+            let panel = [("panel", colors.panel), ("ground", colors.ground)];
+
+            for text in [
+                ("pr_open", colors.pr_open),
+                ("pr_merged", colors.pr_merged),
+                ("pr_closed", colors.pr_closed),
+                ("pr_draft", colors.pr_draft),
+            ] {
+                check(&mut failures, &theme, TEXT_AA, text, &panel);
+            }
+
+            check(
+                &mut failures,
+                &theme,
+                TEXT_AA,
+                ("on_merge", colors.on_merge),
+                &[
+                    ("merge", colors.merge),
+                    (
+                        "merge on hover",
+                        composite(colors.merge, gpui::black().opacity(0.12)),
+                    ),
+                ],
+            );
+        }
+
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
     fn button_labels_meet_wcag_aa_at_rest_and_on_hover() {
         use crate::components::ButtonVariant;
 
@@ -784,6 +856,7 @@ mod tests {
                 ButtonVariant::Ghost,
                 ButtonVariant::Destructive,
                 ButtonVariant::SecondaryDestructive,
+                ButtonVariant::Merge,
             ] {
                 let button = variant.colors_in(colors);
 

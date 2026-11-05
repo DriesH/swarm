@@ -551,6 +551,36 @@ mod tests {
     }
 
     #[test]
+    fn a_rename_during_a_pull_request_change_is_refused() {
+        let (calls, agent, token, _, _folder) = calls_with_an_agent();
+        let services = calls.services_for_test();
+        let task = services
+            .store
+            .lock()
+            .expect("lock")
+            .agent(AgentId(agent))
+            .expect("agent")
+            .and_then(|stored| stored.info.task)
+            .expect("task");
+        let _busy = services.pull_requests.begin(task).expect("begin");
+        let rename = format!(
+            r#"{{"agent":{agent},"token":"{token}","method":"task_rename","params":{{"name":"two"}}}}"#
+        );
+
+        let (reply, _) = answer(&calls, &RefusalLog::default(), &rename, &|| false);
+
+        assert!(!reply.ok);
+        assert!(
+            reply
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("pull request change")),
+            "{:?}",
+            reply.error
+        );
+    }
+
+    #[test]
     fn the_full_warning_comes_once_a_minute() {
         let throttle = Throttle::default();
         let start = Instant::now();

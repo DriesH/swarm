@@ -7,11 +7,12 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
+use swarm_core::creatures;
 use swarm_core::git;
 use swarm_core::store::{NewAgent, Store};
 use swarm_core::{Error, Projects, WorkerCheckout};
 use swarm_protocol::{
-    AgentChange, AgentId, AgentInfo, AgentKind, AgentRole, CreateTask, DiffStat, FileStat,
+    AgentChange, AgentId, AgentInfo, AgentKind, AgentRole, CreateTask, DiffStat, FileStat, PrLink,
     ProjectId, TaskInfo,
 };
 
@@ -337,6 +338,77 @@ fn the_same_name_gets_a_numbered_branch() {
 
     assert_eq!(second.task.branch, "swarm/same-2");
     assert!(is_dir(&repo.root.join(".worktrees/same-2")));
+}
+
+#[test]
+fn a_task_without_a_name_is_named_after_a_creature() {
+    let repo = Repo::new("");
+    let projects = projects();
+    let project = projects.add(&repo.root).expect("add");
+
+    let made = projects
+        .create_task(&request(project.id, "  "))
+        .expect("task");
+
+    assert!(creatures::is_creature_slug(&made.task.name));
+    assert_eq!(made.task.branch, format!("swarm/{}", made.task.name));
+}
+
+#[test]
+fn unnamed_tasks_skip_branches_in_use_and_then_get_a_number() {
+    let repo = Repo::new("");
+    let projects = projects();
+    let project = projects.add(&repo.root).expect("add");
+    repo.git(&["branch", "swarm/apis-mellifera"]);
+
+    let names: Vec<String> = (0..creatures::CREATURES.len())
+        .map(|_| {
+            projects
+                .create_task(&request(project.id, ""))
+                .expect("task")
+                .task
+                .name
+        })
+        .collect();
+
+    let plain = names
+        .iter()
+        .filter(|name| creatures::is_creature_slug(name))
+        .count();
+    assert_eq!(
+        (plain, names.contains(&"apis-mellifera".to_owned())),
+        (19, false)
+    );
+    assert!(names.iter().any(|name| name.ends_with("-2")));
+}
+
+#[test]
+fn a_taken_creature_name_gets_another_creature_not_a_number() {
+    let repo = Repo::new("");
+    let projects = projects();
+    let project = projects.add(&repo.root).expect("add");
+    projects
+        .create_task(&request(project.id, "apis-mellifera"))
+        .expect("first");
+    repo.git(&["branch", "swarm/bombus-terrestris"]);
+    std::fs::create_dir_all(repo.root.join(".worktrees/xylocopa-violacea")).expect("folder");
+
+    for _ in 0..3 {
+        let made = projects
+            .create_task(&request(project.id, "apis-mellifera"))
+            .expect("task");
+
+        assert!(
+            creatures::is_creature_slug(&made.task.name),
+            "{}",
+            made.task.name
+        );
+        assert_eq!(made.task.branch, format!("swarm/{}", made.task.name));
+        assert!(
+            !["apis-mellifera", "bombus-terrestris", "xylocopa-violacea"]
+                .contains(&made.task.name.as_str())
+        );
+    }
 }
 
 #[test]
@@ -1684,4 +1756,139 @@ fn a_commit_made_before_the_worker_started_is_not_counted() {
             files: Vec::new(),
         }]
     );
+}
+
+fn task_named(projects: &Projects, repo: &Repo, name: &str) -> TaskInfo {
+    let project = projects.add(&repo.root).expect("add");
+
+    projects
+        .create_task(&request(project.id, name))
+        .expect("task")
+        .task
+}
+
+#[test]
+fn renaming_a_task_renames_its_branch_and_keeps_its_worktree_folder() {
+    let repo = Repo::new("");
+    let (projects, store) = shared_projects();
+    let task = task_named(&projects, &repo, "apis-mellifera");
+    let worker = shared_worker(&projects, &store, &task, "api");
+
+    let renamed = projects
+        .rename_task(task.id, "Clean up code")
+        .expect("rename");
+
+    assert_eq!(
+        (renamed.name.as_str(), renamed.branch.as_str()),
+        ("Clean up code", "swarm/clean-up-code")
+    );
+    assert_eq!(renamed.worktree, task.worktree);
+    assert!(repo.branches().contains(&"swarm/clean-up-code".to_owned()));
+    assert!(!repo.branches().contains(&"swarm/apis-mellifera".to_owned()));
+    assert_eq!(
+        git_in(&task.worktree, &["branch", "--show-current"]),
+        "swarm/clean-up-code"
+    );
+    let stored = store.lock().expect("lock").agent(worker.id).expect("agent");
+    assert_eq!(
+        stored.map(|stored| stored.info.branch),
+        Some("swarm/clean-up-code".to_owned())
+    );
+}
+
+#[test]
+fn a_task_can_be_renamed_more_than_once() {
+    let repo = Repo::new("");
+    let projects = projects();
+    let task = task_named(&projects, &repo, "one");
+
+    projects.rename_task(task.id, "two").expect("first");
+    let renamed = projects.rename_task(task.id, "three").expect("second");
+
+    assert_eq!(renamed.branch, "swarm/three");
+}
+
+#[test]
+fn a_name_that_is_a_branch_or_an_open_task_is_refused() {
+    let repo = Repo::new("");
+    let projects = projects();
+    let task = task_named(&projects, &repo, "one");
+    task_named(&projects, &repo, "Other task");
+    repo.git(&["branch", "swarm/old-branch"]);
+
+    for taken in ["old-branch", "other TASK", "other-task"] {
+        let result = projects.rename_task(task.id, taken);
+
+        assert!(matches!(result, Err(Error::Invalid(_))), "{taken}");
+    }
+}
+
+#[test]
+fn a_name_without_letters_does_not_rename() {
+    let repo = Repo::new("");
+    let projects = projects();
+    let task = task_named(&projects, &repo, "one");
+
+    let result = projects.rename_task(task.id, "???");
+
+    assert!(matches!(result, Err(Error::Invalid(_))));
+}
+
+#[test]
+fn a_task_with_a_pull_request_keeps_its_name() {
+    let repo = Repo::new("");
+    let (projects, store) = shared_projects();
+    let task = task_named(&projects, &repo, "one");
+    let link = PrLink {
+        number: 3,
+        url: "https://example.com/pull/3".to_owned(),
+        head: "abc".to_owned(),
+    };
+    store
+        .lock()
+        .expect("lock")
+        .set_pull_request(task.id, &link, false)
+        .expect("pull request");
+
+    let result = projects.rename_task(task.id, "two");
+
+    assert!(matches!(result, Err(Error::Invalid(_))));
+}
+
+#[test]
+fn a_pushed_branch_keeps_its_name() {
+    let repo = Repo::new("");
+    let projects = projects();
+    let task = task_named(&projects, &repo, "one");
+    repo.git(&["config", "branch.swarm/one.merge", "refs/heads/swarm/one"]);
+
+    let result = projects.rename_task(task.id, "two");
+
+    assert!(matches!(result, Err(Error::Invalid(_))));
+    assert!(repo.branches().contains(&"swarm/one".to_owned()));
+}
+
+#[test]
+fn a_branch_with_an_automatic_upstream_can_be_renamed() {
+    let repo = Repo::new("");
+    let projects = projects();
+    let task = task_named(&projects, &repo, "one");
+    repo.git(&["config", "branch.swarm/one.remote", "origin"]);
+    repo.git(&["config", "branch.swarm/one.merge", "refs/heads/feature"]);
+
+    let renamed = projects.rename_task(task.id, "two").expect("rename");
+
+    assert_eq!(renamed.branch, "swarm/two");
+}
+
+#[test]
+fn a_branch_that_exists_on_origin_keeps_its_name() {
+    let repo = Repo::new("");
+    let projects = projects();
+    let task = task_named(&projects, &repo, "one");
+    repo.git(&["update-ref", "refs/remotes/origin/swarm/one", "HEAD"]);
+
+    let result = projects.rename_task(task.id, "two");
+
+    assert!(matches!(result, Err(Error::Invalid(_))));
 }

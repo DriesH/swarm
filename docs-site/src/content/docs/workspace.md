@@ -47,7 +47,7 @@ The layout engine places tiles as follows.
 - Your user terminals keep their size. The other tiles move around them.
 - A tile keeps its place when its status changes.
 
-A tile with focus has a 2 px border: the accent color for an agent, the text color for your own terminal. An agent that needs you has an amber border. Click a tile, click its row in the sidebar, or press ⌘1 for the orchestrator and ⌘2 to ⌘9 for workers.
+A tile with focus has a 2 px border in place of its normal border: the accent color for an agent, the text color for your own terminal. An agent that needs you has an amber border in the same place. Click a tile, click its row in the sidebar, or press ⌘1 for the orchestrator and ⌘2 to ⌘9 for workers.
 
 ## The tray
 
@@ -71,7 +71,7 @@ A user terminal is your own shell. Open one with the **Terminal** button in the 
 
 User terminals are off-limits to agents. No agent can see, read, type into, resize or close them, so a secret you type there never reaches an agent. Their tile header shows a user icon and **Mine** after the name.
 
-- **Resize**: drag the bottom edge of the tile. With the handle focused, use ↑ and ↓, or Home and End.
+- **Resize**: drag the bottom edge of the tile. The edge follows the rounded corners and changes color on hover, focus and drag. With the edge focused, use ↑ and ↓, or Home and End.
 - **Close**: use the close button on the tile or on its sidebar row. If a program still runs, Swarm asks **Close terminal “name”?** and says "The program in it stops." Focus starts on **Cancel**, and Esc cancels. Tick **Do not show this again** to stop the question. You can turn it back on with **Ask before closing a terminal** in Settings › Terminals.
 - A terminal whose program has ended closes at once. So does a close that Swarm starts, for example when you close the task.
 
@@ -116,6 +116,12 @@ Press ⌘K, or use the search button in the sidebar. Type to filter by name, use
 | Tab, ⇧Tab | Goes to the program in the terminal |
 | ⌃Tab, ⌃⇧Tab | Moves focus out of the terminal, to the next or previous place |
 | ⌘V | Pastes |
+| ⌘←, ⌘→ | Moves to the start or end of the line |
+| ⌥←, ⌥→ | Moves one word back or forward |
+| ⌘⌫ | Deletes to the start of the line |
+| ⌃C, ⌃D | In an agent terminal, ⌃D and a second ⌃C within 2 seconds of the first do nothing. The first ⌃C and Esc still reach the agent. |
+
+An agent that quits by itself, for example after `/exit`, stops taking keys at once. It shows as resumable when it has a saved conversation, and as stopped when it has none. An orchestrator keeps its tile, which shows the status and a **Resume** button when it can resume. A worker leaves the tile layout.
 
 The [Keyboard](/swarm/docs/keyboard/) page lists every shortcut.
 

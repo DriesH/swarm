@@ -41,6 +41,10 @@ Close a task with **File › Close Task** or the close button of its tab.
 | ⌘1 to ⌘9 | Focus the agent with that number |
 | Tab, ⇧Tab | Go to the program in the focused terminal, for example for shell completion |
 | ⌃Tab, ⌃⇧Tab | Move focus out of the terminal to the next or previous item |
+| ⌘←, ⌘→ | Move to the start or end of the line (sends ⌃A and ⌃E) |
+| ⌥←, ⌥→ | Move one word back or forward |
+| ⌘⌫ | Delete to the start of the line (sends ⌃U) |
+| ⌃C, ⌃D | In an agent terminal, a second ⌃C within 2 seconds of the first and every ⌃D do nothing. Use **Stop** to end an agent. |
 | ↑, ↓ | Make your terminal's tile shorter or taller, while its resize handle has focus |
 
 Tab does not leave a focused terminal. Use ⌃Tab.

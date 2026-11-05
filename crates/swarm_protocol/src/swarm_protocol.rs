@@ -16,13 +16,14 @@ use swarm_term::{Palette, Size, TerminalInput, TerminalOutput};
 
 pub mod agent;
 mod client;
+pub mod creatures;
 mod daemon_stop;
 
 pub use client::{Client, ClientError, CommentEvent, MessageEvent, PrEvent, ProjectConfigRead};
 pub use daemon_stop::{Host, Signal, StopError, System, stop_daemon};
 
 /// Bumped on every incompatible change; the daemon refuses other versions.
-pub const VERSION: u32 = 24;
+pub const VERSION: u32 = 26;
 
 /// The most messages [`Request::ListMessages`] returns.
 pub const MESSAGES_LISTED: usize = 500;
@@ -198,6 +199,10 @@ pub struct AgentInfo {
 
 /// One task: its own branch and task worktree.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent facts of a task, not one state"
+)]
 pub struct TaskInfo {
     pub id: TaskId,
     pub project: ProjectId,
@@ -220,6 +225,9 @@ pub struct TaskInfo {
     /// The [`TaskDiff::fingerprint`] of the Merged diff the user approved. The approval
     /// holds while the Merged diff still has this fingerprint.
     pub approved: Option<u64>,
+    /// The Merged diff changed after the approval. Sticks until the next approval, so
+    /// the approval no longer counts, whatever diff the app has loaded.
+    pub approval_stale: bool,
     /// The task was closed: its agents stopped and its worktrees are gone. Sent once in
     /// a `TaskChanged`; closed tasks are never listed.
     pub closed: bool,
@@ -285,6 +293,9 @@ pub enum MessageKind {
     /// From Swarm: asks the task orchestrator for a pull request title and description,
     /// which it sends back with `swarm pr draft`.
     PrDraft,
+    /// From Swarm: new work made the user's approval outdated, so the approval and the
+    /// pull request draft are gone. The next approval asks for a new draft.
+    ApprovalReset,
 }
 
 impl MessageKind {
@@ -300,6 +311,7 @@ impl MessageKind {
             Self::WorkerStopped => "worker stopped",
             Self::Comment => "comment",
             Self::PrDraft => "pr draft",
+            Self::ApprovalReset => "approval reset",
         }
     }
 }
@@ -590,6 +602,18 @@ pub struct PrDraft {
     pub body: String,
 }
 
+/// What the user did to one file of a task in Review. A mark counts while the file still
+/// has the digest it had then.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ReviewMark {
+    pub worktree: PathBuf,
+    pub path: PathBuf,
+    /// The [`FileDiff::digest`] when the user marked the file viewed.
+    pub viewed: Option<u64>,
+    /// The digest when the user folded the file.
+    pub folded: Option<u64>,
+}
+
 /// A pull request made from a task branch.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct PrLink {
@@ -662,6 +686,26 @@ pub struct Reviewer {
     pub state: ReviewState,
 }
 
+/// Whether GitHub can merge the pull request, from its `mergeable` and
+/// `mergeStateStatus`.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeState {
+    /// Mergeable with passing checks.
+    Clean,
+    /// Mergeable, but a commit status is not passing.
+    Unstable,
+    /// Mergeable, with pre-receive hooks.
+    HasHooks,
+    /// The branch has merge conflicts.
+    Conflicts,
+    /// The base branch moved on.
+    Behind,
+    /// A rule stops the merge, like a missing review.
+    Blocked,
+    /// GitHub is still working it out, or the pull request is a draft.
+    Unknown,
+}
+
 /// The pull request as GitHub reports it now.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct PullRequest {
@@ -674,6 +718,7 @@ pub struct PullRequest {
     pub reviewers: Vec<Reviewer>,
     /// GitHub would merge it now: no conflicts, required checks and reviews passed.
     pub mergeable: bool,
+    pub merge_state: MergeState,
     /// Milliseconds since the Unix epoch.
     pub read_at: u64,
 }
@@ -1195,6 +1240,18 @@ pub enum Request {
         task: TaskId,
         confirmed: CloseCheck,
     },
+    /// The files of the task the user marked viewed or folded in Review. Answered with
+    /// [`Event::ReviewMarks`].
+    ReviewMarks {
+        call: CallId,
+        task: TaskId,
+    },
+    /// Replaces the marks of the task with these. Answered with [`Event::Done`].
+    SetReviewMarks {
+        call: CallId,
+        task: TaskId,
+        marks: Vec<ReviewMark>,
+    },
     /// The answer to [`Event::Challenge`]; it must be the client's frame after `Hello`.
     Prove {
         nonce: String,
@@ -1397,6 +1454,10 @@ pub enum Event {
     PrStatus {
         call: CallId,
         pull_request: PullRequest,
+    },
+    ReviewMarks {
+        call: CallId,
+        marks: Vec<ReviewMark>,
     },
     /// Sent right after the daemon's `Hello`. The client's next frame must be
     /// [`Request::Prove`] with the same `nonce`.

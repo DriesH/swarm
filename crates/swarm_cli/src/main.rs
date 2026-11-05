@@ -26,7 +26,7 @@ use crate::session::Session;
     name = "swarm",
     version,
     about = "Talk to Swarm from an agent terminal",
-    long_about = "Talk to Swarm from an agent terminal.\n\nWhich commands work depends on your role: orchestrators spawn, send, merge, notify, agents, confirm, pr draft and tile (for their workers); workers ask, report and tile (for themselves); workers and orchestrators commit; the Start orchestrator makes tasks; every agent can read, wait, exit and run terminals.\nA text of - is read from stdin."
+    long_about = "Talk to Swarm from an agent terminal.\n\nWhich commands work depends on your role: orchestrators spawn, send, merge, stop, notify, agents, confirm, task rename, pr draft and tile (for their workers); workers ask, report and tile (for themselves); workers and orchestrators commit; the Start orchestrator makes tasks; every agent can read, wait, exit and run terminals.\nA text of - is read from stdin."
 )]
 struct Cli {
     /// Print the raw result as JSON.
@@ -105,6 +105,11 @@ enum Action {
         /// A worker's agent ID or name.
         worker: String,
     },
+    /// End one of your workers; a message brings it back (orchestrator).
+    Stop {
+        /// A worker's agent ID or name.
+        worker: String,
+    },
     /// List your workers (orchestrator).
     Agents,
     /// Say that you understood your brief (orchestrator).
@@ -120,7 +125,8 @@ enum Action {
         #[command(subcommand)]
         action: TileAction,
     },
-    /// Make, list and wait for tasks (Start orchestrator).
+    /// Make, list and wait for tasks (Start orchestrator); rename your own task
+    /// (orchestrator).
     Task {
         #[command(subcommand)]
         action: TaskAction,
@@ -205,8 +211,9 @@ enum TileAction {
 enum TaskAction {
     /// Make a task and start its orchestrator with a brief.
     Create {
-        /// The task's name; it becomes part of its branch.
-        name: String,
+        /// The task's name; it becomes part of its branch. Without one, the task is
+        /// named after a bee or wasp.
+        name: Option<String>,
         /// The branch to start from; the default is the base branch.
         #[arg(long)]
         from: Option<String>,
@@ -216,6 +223,11 @@ enum TaskAction {
         /// The goal, the scope and what done means; read from stdin when missing.
         #[arg(long)]
         brief: Option<String>,
+    },
+    /// Rename your own task, its tab and its branch (orchestrator).
+    Rename {
+        /// The new name; it becomes part of the branch.
+        name: String,
     },
     /// List the tasks of the project.
     List,
@@ -363,6 +375,7 @@ impl Action {
                 timeout_secs: timeout,
             },
             Self::Merge { worker } => Command::Merge { worker },
+            Self::Stop { worker } => Command::Stop { worker },
             Self::Agents => Command::Agents,
             Self::Confirm => Command::Confirm,
             Self::Pr { action } => action.command(stdin)?,
@@ -438,6 +451,7 @@ impl TaskAction {
                     kind: kind.map(KindArg::kind),
                 }
             }
+            Self::Rename { name } => Command::TaskRename { name },
             Self::List => Command::TaskList,
             Self::Wait {
                 ids,
@@ -818,7 +832,7 @@ mod tests {
         assert_eq!(
             command,
             Command::TaskCreate {
-                name: "login".to_owned(),
+                name: Some("login".to_owned()),
                 from: Some("develop".to_owned()),
                 brief: "build it".to_owned(),
                 kind: Some(AgentKind::Codex),
@@ -827,12 +841,48 @@ mod tests {
         assert_eq!(
             self::command(&["task", "create", "x"], "from stdin\n"),
             Command::TaskCreate {
-                name: "x".to_owned(),
+                name: Some("x".to_owned()),
                 from: None,
                 brief: "from stdin\n".to_owned(),
                 kind: None,
             }
         );
+    }
+
+    #[test]
+    fn task_create_needs_no_name() {
+        assert_eq!(
+            command(&["task", "create", "--brief", "build it"], ""),
+            Command::TaskCreate {
+                name: None,
+                from: None,
+                brief: "build it".to_owned(),
+                kind: None,
+            }
+        );
+    }
+
+    #[test]
+    fn task_rename_takes_a_name() {
+        assert_eq!(
+            command(&["task", "rename", "clean-up-code"], ""),
+            Command::TaskRename {
+                name: "clean-up-code".to_owned()
+            }
+        );
+        assert!(parse(&["task", "rename"]).is_err());
+    }
+
+    #[test]
+    fn stop_takes_one_worker() {
+        assert_eq!(
+            command(&["stop", "api"], ""),
+            Command::Stop {
+                worker: "api".to_owned()
+            }
+        );
+        assert!(parse(&["stop"]).is_err());
+        assert!(parse(&["stop", "api", "ui"]).is_err());
     }
 
     #[test]

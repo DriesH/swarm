@@ -1597,14 +1597,15 @@ mod tests {
     }
 
     #[gpui::test]
-    fn create_task_is_disabled_with_an_empty_name(cx: &mut TestAppContext) {
+    fn create_task_with_an_empty_name_uses_the_suggested_creature_name(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
         let before = task_count(&workspace, cx);
 
         cx.simulate_keystrokes("cmd-t enter");
 
-        assert_eq!(task_count(&workspace, cx), before);
-        assert!(dialog_is_open(&workspace, cx));
+        let name = workspace.read_with(cx, |workspace, _| workspace.active_task().name.clone());
+        assert_eq!(task_count(&workspace, cx), before + 1);
+        assert!(swarm_protocol::creatures::is_creature_slug(&name));
     }
 
     #[gpui::test]

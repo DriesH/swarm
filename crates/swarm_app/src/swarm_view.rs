@@ -25,7 +25,7 @@ use swarm_ui::{ButtonVariant, Nudge, ThemeColors};
 use crate::actions::{
     FILE_TREE_CONTEXT, TreeActivate, TreeFirst, TreeLast, TreeNext, TreePrevious,
 };
-use crate::daemon::is_resumable;
+use crate::daemon::{has_ended, is_resumable};
 use crate::markdown::{self, Markdown, Parsed};
 use crate::model::{Agent, AgentId, AgentKind, Message, TerminalId};
 use crate::panels::empty_status;
@@ -130,9 +130,10 @@ fn kind_color(kind: MessageKind, colors: &ThemeColors) -> Hsla {
         }
         MessageKind::Question => colors.warn,
         MessageKind::Report => colors.ok,
-        MessageKind::TerminalExited | MessageKind::UserInput | MessageKind::WorkerStopped => {
-            colors.faint
-        }
+        MessageKind::TerminalExited
+        | MessageKind::UserInput
+        | MessageKind::WorkerStopped
+        | MessageKind::ApprovalReset => colors.faint,
     }
 }
 
@@ -256,7 +257,7 @@ fn focus_label(agent: &str) -> String {
     format!("Focus {agent}")
 }
 
-fn resume_label(agent: &str) -> String {
+pub(crate) fn resume_label(agent: &str) -> String {
     format!("Resume {agent}")
 }
 
@@ -1668,6 +1669,20 @@ fn card_frame(id: AgentId, label: String, selected: bool) -> gpui::Stateful<gpui
     .aria_selected(selected)
 }
 
+/// A stopped agent's icon and border fade; it stays in the graph for the task's history.
+/// The text keeps its colors, because fading them would fail WCAG AA.
+const ENDED_DIM: f32 = 0.6;
+
+fn card_border(colors: &ThemeColors, selected: bool, ended: bool) -> Hsla {
+    if selected {
+        colors.fg
+    } else if ended {
+        colors.line.opacity(ENDED_DIM)
+    } else {
+        colors.line
+    }
+}
+
 fn card(
     workspace: &Workspace,
     agent: &Agent,
@@ -1681,6 +1696,7 @@ fn card(
     let zoom = workspace.swarm_zoom;
     let id = agent.id;
     let selected = data.selected == Some(id);
+    let ended = has_ended(agent);
     let in_flight = data
         .in_flight
         .get(&agent.protocol_id())
@@ -1720,7 +1736,7 @@ fn card(
         .py(px(10. * zoom))
         .rounded(px(10. * zoom))
         .border_1()
-        .border_color(if selected { colors.fg } else { colors.line })
+        .border_color(card_border(&colors, selected, ended))
         .bg(colors.panel)
         .cursor_pointer()
         .focus_visible(move |style| focus_ring(style, colors.accent))
@@ -1740,7 +1756,11 @@ fn card(
     card.child(
         h_flex()
             .gap(px(8. * zoom))
-            .child(Icon::new(kind_icon(agent.kind)).size(IconSize::Custom(px(16. * zoom))))
+            .child(
+                div()
+                    .when(ended, |icon| icon.opacity(ENDED_DIM))
+                    .child(Icon::new(kind_icon(agent.kind)).size(IconSize::Custom(px(16. * zoom)))),
+            )
             .child(
                 scaled(agent.name.clone(), 13., zoom, colors.fg)
                     .font_weight(if is_orchestrator {
@@ -2464,9 +2484,10 @@ fn kind_tag_colors(kind: MessageKind, colors: &ThemeColors) -> (Hsla, Hsla) {
         }
         MessageKind::Question => (colors.warn, colors.warn_bg),
         MessageKind::Report => (colors.ok, colors.ok_bg),
-        MessageKind::TerminalExited | MessageKind::UserInput | MessageKind::WorkerStopped => {
-            (colors.muted, colors.soft)
-        }
+        MessageKind::TerminalExited
+        | MessageKind::UserInput
+        | MessageKind::WorkerStopped
+        | MessageKind::ApprovalReset => (colors.muted, colors.soft),
     }
 }
 
@@ -2654,6 +2675,33 @@ mod tests {
     use crate::workspace::RightPanel;
     use gpui::{TestAppContext, VisualTestContext};
     use std::cell::Cell;
+
+    #[test]
+    fn an_ended_card_fades_its_border_and_keeps_text_that_passes_aa() {
+        use swarm_ui::Theme;
+        use swarm_ui::contrast::{TEXT_AA, contrast_ratio};
+
+        for theme in [Theme::light(), Theme::dark()] {
+            let colors = theme.colors();
+            let text = [
+                colors.fg,
+                colors.muted,
+                colors.faint,
+                colors.add,
+                colors.del,
+            ];
+
+            for color in text {
+                assert!(
+                    contrast_ratio(color, colors.panel) >= TEXT_AA,
+                    "{}",
+                    theme.name()
+                );
+            }
+            assert!(card_border(colors, false, true).a < card_border(colors, false, false).a);
+            assert_eq!(card_border(colors, true, true), colors.fg);
+        }
+    }
 
     fn setup(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
         cx.update(|cx| {

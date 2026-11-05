@@ -27,7 +27,7 @@ Swarm checks the caller's role on every call. A call from the wrong role fails w
 
 | Role | Commands |
 |---|---|
-| **Orchestrator** (leads one task) | `spawn`, `send`, `agents`, `merge`, `notify`, `confirm`, `pr draft`, `tile grow` and `tile shrink` for its workers, `commit`, `read`, `wait`, `terminal` |
+| **Orchestrator** (leads one task) | `spawn`, `send`, `agents`, `merge`, `stop`, `notify`, `confirm`, `task rename`, `pr draft`, `tile grow` and `tile shrink` for its workers, `commit`, `read`, `wait`, `terminal` |
 | **Worker** | `ask`, `report`, `tile grow` and `tile shrink` for itself, `commit`, `read`, `wait`, `terminal` |
 | **Start orchestrator** (splits your plan into tasks, then exits) | `task create`, `task list`, `task wait`, `read`, `wait`, `terminal` |
 
@@ -35,6 +35,7 @@ Every agent can run `swarm exit` in its shell. Only the Start orchestrator gets 
 
 - A worker cannot message another worker. It talks to its orchestrator with `ask` and `report`.
 - The orchestrator is the only agent that talks to its workers.
+- Every helper agent of an orchestrator is a worker started with `swarm spawn`. For a Claude Code orchestrator or Start orchestrator, Swarm denies the built-in `Agent` and `Workflow` tools. A Codex orchestrator gets the same rule in its prompt only. Workers keep their own subagents.
 - Every agent can run process terminals. See [Terminals](#terminals) for who may read and stop them.
 
 :::note
@@ -73,6 +74,7 @@ Swarm types a message you have not read into your terminal when you are idle. `r
 |---|---|---|---|
 | `swarm commit -m <message> <path>...` | Orchestrator, worker | `-m`, `--message` · one or more paths | Commits the named files, and nothing else, in your worktree. The author is `<name> (Swarm)`, and a `Swarm-Agent` trailer names you. Use it instead of `git commit`. Paths are relative to your worktree. |
 | `swarm merge <worker>` | Orchestrator | a worker's ID or name | Merges the branch of a worker that has its own worktree into the task branch. On conflicts it lists the files, leaves the merge open and exits non-zero. A worker in the task worktree has nothing to merge. |
+| `swarm stop <worker>` | Orchestrator | a worker's ID or name | Ends a worker you have no follow-up for. It stops the way [idle stop](/swarm/docs/how-work-starts/#idle-stop-and-resume) does: it stays resumable, you get no `worker stopped` message, and a later `send` brings it back. Refused for a worker with its own worktree that is not merged. |
 | `swarm agents` | Orchestrator | – | Lists your workers with status, branch and worktree. |
 | `swarm confirm` | Orchestrator | – | Says that you understood your brief. |
 | `swarm pr draft --title <title>` | Orchestrator | `--body TEXT` or `--body-file PATH` (`-` reads stdin); one of the two is required | Sends the pull request title and description that a `pr draft` message asks for. The title is one line of at most 256 characters. Refused until the user has approved the task. |
@@ -88,11 +90,12 @@ The layout decides. It ignores the request for a tile the user minimized. No age
 
 ## Tasks
 
-`task` commands are for the Start orchestrator. `exit` works for every agent.
+`task create`, `task list` and `task wait` are for the Start orchestrator. `task rename` is for a task's orchestrator. `exit` works for every agent.
 
 | Command | Arguments and flags | What it does |
 |---|---|---|
-| `swarm task create <name>` | `--brief TEXT` · `--from BRANCH` · `--kind claude\|codex` | Makes a task: a branch, a task worktree, a tab and an orchestrator that starts on the brief. The brief states the goal, the scope and what done means. Without `--brief` it is read from stdin and must not be empty. `--from` defaults to the base branch. `--kind` defaults to the orchestrator agent in Settings. |
+| `swarm task rename <name>` | – | Renames your task, its tab and its branch (`git branch -m`). The worktree folder keeps its name. You can rename more than once. Refused when the task has a pull request, when the branch was pushed, when the name is taken by an open task or a branch, and when the name has no letters or digits. |
+| `swarm task create [name]` | `--brief TEXT` · `--from BRANCH` · `--kind claude\|codex` | Makes a task: a branch, a task worktree, a tab and an orchestrator that starts on the brief. Without a name the task is named after a bee or wasp, such as `apis-mellifera`. The brief states the goal, the scope and what done means. Without `--brief` it is read from stdin and must not be empty. `--from` defaults to the base branch. `--kind` defaults to the orchestrator agent in Settings. |
 | `swarm task list` | – | Lists the tasks of the project. |
 | `swarm task wait <id>...` | `--until briefed\|done` (required) · `--timeout SECS` (default 100, at most 600) | Waits until every task is `briefed` (its orchestrator confirmed the brief) or `done`. Prints `timed out` and exits non-zero if not. |
 | `swarm exit` | – | Ends your agent. Call it when your work is done. |
@@ -134,14 +137,16 @@ The `swarm` MCP server lists only the tools your role may call. A tool has the n
 | `send` | Orchestrator | `to`\* (ID or name), `text`\* |
 | `agents` | Orchestrator | – |
 | `merge` | Orchestrator | `worker`\* |
+| `stop` | Orchestrator | `worker`\* |
 | `notify` | Orchestrator | `text`\* |
 | `confirm` | Orchestrator | – |
+| `task_rename` | Orchestrator | `name`\* |
 | `pr_draft` | Orchestrator | `title`\*, `body`\* |
 | `ask` | Worker | `question`\* |
 | `report` | Worker | `text`\* |
 | `commit` | Orchestrator, worker | `message`\*, `paths`\* (list of strings) |
 | `tile_grow`, `tile_shrink` | Orchestrator, worker | `agent` (an orchestrator names a worker; a worker leaves it out) |
-| `task_create` | Start orchestrator | `name`\*, `brief`\*, `from`, `kind` |
+| `task_create` | Start orchestrator | `brief`\*, `name`, `from`, `kind` |
 | `task_list` | Start orchestrator | – |
 | `task_wait` | Start orchestrator | `ids`\* (list of integers), `until`\* (`briefed` or `done`), `timeout_secs` |
 | `agent_exit` | Start orchestrator | – |
@@ -157,7 +162,7 @@ The `swarm` MCP server lists only the tools your role may call. A tool has the n
 ## Limits and resumable agents
 
 - `spawn` and `task create` fail when a start would go over an [agent limit](/swarm/docs/how-work-starts/#agent-limits). The error is `the task has N agents running, the limit is M (Settings › Agents)` or `N agents are running, the limit is M (Settings › Agents)`.
-- A worker that [idle stop](/swarm/docs/how-work-starts/#idle-stop-and-resume) stopped is resumable. `swarm agents` still lists it. Idle stop sends no `worker stopped` message.
+- A worker that [idle stop](/swarm/docs/how-work-starts/#idle-stop-and-resume) or `swarm stop` stopped is resumable. `swarm agents` still lists it. Neither sends a `worker stopped` message.
 - `send`, `ask` and `report` to a resumable agent resume it first. Swarm types the message in once the agent is ready. When the resume is refused, for example by a limit, the command fails with the reason.
 
 ## Messages from Swarm
@@ -174,3 +179,4 @@ Swarm sends these messages itself. They arrive like any other message, through `
 | `worker stopped` | The orchestrator | A worker failed to start, or its process ended. |
 | `comment` | The orchestrator | You left [review comments](/swarm/docs/review/). The orchestrator passes each one to the worker that owns the file. |
 | `pr draft` | The orchestrator | You asked for a [pull request](/swarm/docs/pull-requests/). It answers with `swarm pr draft`. |
+| `approval reset` | The orchestrator | The task changed after you [approved](/swarm/docs/review/#approve) it. The approval and the draft are gone. |

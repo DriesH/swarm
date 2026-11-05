@@ -1496,3 +1496,102 @@ fn the_pushed_commit_is_recorded_and_local_commits_outside_it_are_counted() {
     let stored = updated.pull_request.expect("link");
     assert_eq!((stored.number, stored.head), (7, newer));
 }
+
+#[test]
+fn new_commits_make_the_approval_outdated_once_and_a_new_approval_counts_again() {
+    let (projects, task, _repo) = project_with_task();
+    std::fs::write(task.worktree.join("login.rs"), "fn login() {}\n").expect("file");
+    git_in(&task.worktree, &["add", "login.rs"]);
+    git_in(&task.worktree, &["commit", "-q", "-m", "login"]);
+    let fingerprint = projects
+        .task_diff(task.id, ReviewSource::Merged)
+        .expect("diff")
+        .fingerprint;
+    projects.approve(task.id, fingerprint).expect("approve");
+
+    assert!(
+        projects
+            .reset_stale_approval(task.id)
+            .expect("check")
+            .is_none(),
+        "the same diff keeps the approval"
+    );
+
+    std::fs::write(task.worktree.join("login.rs"), "fn login() { todo() }\n").expect("edit");
+    git_in(&task.worktree, &["commit", "-q", "-am", "more"]);
+    let reset = projects
+        .reset_stale_approval(task.id)
+        .expect("check")
+        .expect("the approval went stale");
+    assert!(reset.approval_stale);
+    assert_eq!(reset.approved, Some(fingerprint));
+    assert!(
+        projects
+            .reset_stale_approval(task.id)
+            .expect("check")
+            .is_none(),
+        "it is reported once"
+    );
+
+    let fresh = projects
+        .task_diff(task.id, ReviewSource::Merged)
+        .expect("diff")
+        .fingerprint;
+    let approved = projects.approve(task.id, fresh).expect("approve again");
+    assert!(!approved.approval_stale);
+    assert_eq!(
+        projects.check_approved(task.id).expect("counts again").id,
+        task.id
+    );
+}
+
+#[test]
+fn a_stale_approval_is_refused_even_when_the_diff_went_back() {
+    let (projects, task, _repo) = project_with_task();
+    std::fs::write(task.worktree.join("login.rs"), "fn login() {}\n").expect("file");
+    git_in(&task.worktree, &["add", "login.rs"]);
+    git_in(&task.worktree, &["commit", "-q", "-m", "login"]);
+    let fingerprint = projects
+        .task_diff(task.id, ReviewSource::Merged)
+        .expect("diff")
+        .fingerprint;
+    projects.approve(task.id, fingerprint).expect("approve");
+    std::fs::write(task.worktree.join("login.rs"), "fn login() { todo() }\n").expect("edit");
+    git_in(&task.worktree, &["commit", "-q", "-am", "more"]);
+    projects.reset_stale_approval(task.id).expect("check");
+    std::fs::write(task.worktree.join("login.rs"), "fn login() {}\n").expect("undo");
+    git_in(&task.worktree, &["commit", "-q", "-am", "undo"]);
+
+    let error = projects.check_approved(task.id).expect_err("stale");
+
+    assert!(error.to_string().contains("changed since"), "{error}");
+}
+
+#[test]
+fn the_review_marks_of_a_task_are_replaced_as_a_whole() {
+    let (projects, task, _repo) = project_with_task();
+    let mark = |path: &str, viewed, folded| swarm_protocol::ReviewMark {
+        worktree: task.worktree.clone(),
+        path: PathBuf::from(path),
+        viewed,
+        folded,
+    };
+
+    projects
+        .set_review_marks(
+            task.id,
+            &[mark("a.rs", Some(1), Some(1)), mark("b.rs", None, Some(2))],
+        )
+        .expect("save");
+    projects
+        .set_review_marks(
+            task.id,
+            &[mark("b.rs", Some(3), None), mark("c.rs", None, None)],
+        )
+        .expect("replace");
+
+    assert_eq!(
+        projects.review_marks(task.id).expect("marks"),
+        [mark("b.rs", Some(3), None)]
+    );
+}

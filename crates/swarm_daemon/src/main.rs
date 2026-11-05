@@ -237,6 +237,8 @@ fn run() -> Result<()> {
         config_dir,
     });
 
+    pull_requests::watch_approvals(&services);
+
     let calls = Arc::new(Calls::new(Arc::clone(&services)));
     thread::Builder::new()
         .name("agent-socket".into())

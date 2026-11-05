@@ -10,7 +10,7 @@ mod element;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use gpui::{
     App, Bounds, ClipboardEntry, Context, EntityInputHandler, EventEmitter, ExternalPaths,
@@ -32,6 +32,9 @@ use crate::element::{
 /// The font size of a view until [`TerminalView::set_font_size`] says otherwise, in points.
 /// It is the settings' default, so the two never differ.
 pub const DEFAULT_FONT_SIZE: f32 = swarm_settings::FONT_SIZE_DEFAULT as f32;
+
+/// How soon after a ⌃C that reached an agent a second one is held back.
+pub const DOUBLE_INTERRUPT: Duration = Duration::from_secs(2);
 
 /// Key context of a focused terminal.
 pub const TERMINAL_CONTEXT: &str = "Terminal";
@@ -103,6 +106,10 @@ type TypingGate = Rc<dyn Fn(&App) -> bool>;
 pub struct TerminalView {
     input: flume::Sender<TerminalInput>,
     typing_gate: Option<TypingGate>,
+    /// Set for an agent terminal: ⌃D and a quick second ⌃C stay in the view.
+    guards_quit: bool,
+    /// When the last ⌃C reached the program, on the GPUI clock.
+    last_interrupt: Option<Instant>,
     focus_handle: FocusHandle,
     accessible_name: SharedString,
     metrics: Metrics,
@@ -190,6 +197,8 @@ impl TerminalView {
         let mut view = Self {
             input,
             typing_gate: None,
+            guards_quit: false,
+            last_interrupt: None,
             focus_handle,
             accessible_name,
             metrics: Metrics::measure(window, DEFAULT_FONT_SIZE),
@@ -270,7 +279,46 @@ impl TerminalView {
     }
 
     fn typing_allowed(&self, cx: &App) -> bool {
-        self.typing_gate.as_ref().is_none_or(|allowed| allowed(cx))
+        self.exit_status.is_none() && self.typing_gate.as_ref().is_none_or(|allowed| allowed(cx))
+    }
+
+    /// Makes this the terminal of an agent. The first ⌃C reaches the program, a second
+    /// one within [`DOUBLE_INTERRUPT`] of it does not, and ⌃D never does, so the agent
+    /// cannot quit from the keyboard. Esc and all other keys pass.
+    pub fn hold_back_quit_keys(&mut self) {
+        self.guards_quit = true;
+    }
+
+    /// Whether a quit key of an agent terminal stays in the view. A ⌃C that passes starts
+    /// the window of the next one.
+    fn holds_back(&mut self, keystroke: &Keystroke, cx: &App) -> bool {
+        let modifiers = keystroke.modifiers;
+        let plain_control = modifiers.control
+            && !modifiers.shift
+            && !modifiers.alt
+            && !modifiers.platform
+            && !modifiers.function;
+
+        if !self.guards_quit || !plain_control {
+            return false;
+        }
+
+        match keystroke.key.as_str() {
+            "d" => true,
+            "c" => {
+                let now = cx.background_executor().now();
+                let repeated = self
+                    .last_interrupt
+                    .is_some_and(|last| now.saturating_duration_since(last) < DOUBLE_INTERRUPT);
+
+                if !repeated {
+                    self.last_interrupt = Some(now);
+                }
+
+                repeated
+            }
+            _ => false,
+        }
     }
 
     /// How many times the view was painted. Tests use it to see that a view is drawn once
@@ -585,12 +633,25 @@ impl TerminalView {
             if plain_paste {
                 self.paste(window, cx);
                 cx.stop_propagation();
+            } else if let Some(text) = line_edit_text(keystroke) {
+                self.send(TerminalInput::Text(text.to_owned()));
+                self.scroll_to_bottom(cx);
+                cx.stop_propagation();
             }
 
             return;
         }
 
-        self.send(TerminalInput::Key(key_from(keystroke, event.is_held)));
+        if self.holds_back(keystroke, cx) {
+            cx.stop_propagation();
+            return;
+        }
+
+        if let Some(text) = line_edit_text(keystroke) {
+            self.send(TerminalInput::Text(text.to_owned()));
+        } else {
+            self.send(TerminalInput::Key(key_from(keystroke, event.is_held)));
+        }
         self.scroll_to_bottom(cx);
         cx.stop_propagation();
     }
@@ -720,6 +781,28 @@ fn key_from(keystroke: &Keystroke, repeat: bool) -> Key {
             .clone()
             .filter(|text| !text.chars().any(char::is_control)),
         repeat,
+    }
+}
+
+/// What macOS terminals send for the line-editing keys: ⌘← and ⌘→ jump to the start and
+/// the end of the line (⌃A, ⌃E), ⌘⌫ deletes to the start (⌃U), ⌥← and ⌥→ jump a word
+/// (Esc b, Esc f). Ghostty sends these by default; the key encoder would send CSI codes.
+fn line_edit_text(keystroke: &Keystroke) -> Option<&'static str> {
+    let modifiers = keystroke.modifiers;
+    if modifiers.shift || modifiers.function {
+        return None;
+    }
+
+    let only_command = modifiers.platform && !modifiers.alt && !modifiers.control;
+    let only_option = modifiers.alt && !modifiers.platform && !modifiers.control;
+
+    match keystroke.key.as_str() {
+        "left" if only_command => Some("\x01"),
+        "right" if only_command => Some("\x05"),
+        "backspace" if only_command => Some("\x15"),
+        "left" if only_option => Some("\x1bb"),
+        "right" if only_option => Some("\x1bf"),
+        _ => None,
     }
 }
 

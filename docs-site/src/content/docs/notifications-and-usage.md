@@ -22,6 +22,8 @@ Prompt and failure notices can come from any agent. Only `swarm notify` is orche
 
 A task has one notification at a time. A new one replaces the old one.
 
+When a task is ready for review, a notice also shows at the bottom right of the window. It slides in from the right. When you close it, press **Review**, or wait 20 seconds, it fades out. With **Reduce motion** on in macOS, it appears and leaves without movement.
+
 The same signal shows elsewhere: the **Needs you** pill on the project row, the ring on the task tab, and the dot on the menu bar icon.
 
 ### When Swarm stays quiet

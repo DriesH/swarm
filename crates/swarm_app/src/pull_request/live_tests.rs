@@ -627,17 +627,18 @@ fn the_create_button_waits_for_approval_comments_and_passing_checks(cx: &mut Tes
 
     workspace.update(cx, |workspace, _| {
         if let Some(task) = workspace.data.tasks.first_mut() {
-            task.approved = Some(MERGED + 5);
+            task.approval_stale = true;
         }
     });
     let outdated = create_state_of(&workspace, cx);
+    redraw(cx);
 
     assert_eq!(no_run, CreateState::Blocked(Blocker::ChecksNotRun));
     assert_eq!(failed, CreateState::Blocked(Blocker::ChecksFailed));
     assert_eq!(passed, CreateState::Ready);
     assert_eq!(pending, CreateState::Blocked(Blocker::CommentsPending));
     assert_eq!(outdated, CreateState::Blocked(Blocker::NotApproved));
-    assert!(cx.debug_bounds("create-pr-button").is_some());
+    assert!(cx.debug_bounds("create-pr-button").is_none());
 }
 
 fn panel_with(commands: &[&str], required: bool) -> PrPanel {
@@ -2211,6 +2212,7 @@ fn merge_waits_until_new_commits_are_pushed(cx: &mut TestAppContext) {
     let mergeable = Arc::new(Mutex::new(PullRequest {
         draft: false,
         mergeable: true,
+        checks: vec![github_check("build", GithubCheckState::Passed)],
         ..open_pull_request(42)
     }));
     let (workspace, cx, _client, seen) =
@@ -2275,7 +2277,7 @@ fn new_commits_offer_push_changes_under_the_same_rules_as_create(cx: &mut TestAp
 
     workspace.update(cx, |workspace, _| {
         if let Some(task) = workspace.data.tasks.first_mut() {
-            task.approved = Some(MERGED + 1);
+            task.approval_stale = true;
         }
     });
     let unapproved = update_state_of(&workspace, cx);
@@ -2655,4 +2657,391 @@ fn a_task_kept_open_after_a_merge_shows_the_daemons_text_and_the_merged_status(
 
     assert!(shown, "the status is read after a failed merge call too");
     assert_eq!(action, Some(PanelAction::Failed(text.into())));
+}
+
+// Approval that new work made outdated
+
+/// The daemon reports the task approved but outdated, as it does after new commits.
+fn outdated_info(stale: bool, approved: u64) -> swarm_protocol::TaskInfo {
+    swarm_protocol::TaskInfo {
+        approved: Some(approved),
+        approval_stale: stale,
+        ..crate::daemon::tests::task_info(7, 5, "login")
+    }
+}
+
+fn change_task(
+    workspace: &Entity<Workspace>,
+    info: &swarm_protocol::TaskInfo,
+    cx: &mut VisualTestContext,
+) {
+    workspace.update(cx, |workspace, cx| workspace.task_changed(info, None, cx));
+    redraw(cx);
+}
+
+#[gpui::test]
+fn new_work_after_the_approval_hides_the_button_and_the_panel_asks_for_a_review(
+    cx: &mut TestAppContext,
+) {
+    let (socket, _seen) = recording_daemon(github_reply);
+    let (workspace, cx, _client) = approved(&socket, cx);
+    let before = (
+        cx.debug_bounds("pull-request-button").is_some(),
+        cx.debug_bounds("create-pr-button").is_some(),
+    );
+
+    change_task(&workspace, &outdated_info(true, MERGED), cx);
+
+    let label = workspace.read_with(cx, |workspace, _| {
+        workspace.pull_request_toggle_label(APP_TASK)
+    });
+    assert_eq!(before, (true, true));
+    assert_eq!(label, None, "the title bar button is gone");
+    assert!(cx.debug_bounds("pull-request-button").is_none());
+    assert!(cx.debug_bounds("review-outdated").is_some());
+    assert!(cx.debug_bounds("create-pr-button").is_none());
+}
+
+#[gpui::test]
+fn the_review_button_of_an_outdated_approval_opens_the_merged_diff(cx: &mut TestAppContext) {
+    let (socket, _seen) = recording_daemon(github_reply);
+    let (workspace, cx, _client) = approved(&socket, cx);
+    change_task(&workspace, &outdated_info(true, MERGED), cx);
+
+    click("review-outdated", cx);
+
+    let (view, source) = workspace.read_with(cx, |workspace, _| {
+        (workspace.view, workspace.review_source(APP_TASK))
+    });
+    assert_eq!(view, View::Review);
+    assert_eq!(source, ReviewSource::Merged);
+}
+
+#[gpui::test]
+fn an_outdated_approval_clears_the_draft_and_a_new_approval_asks_for_a_fresh_one(
+    cx: &mut TestAppContext,
+) {
+    let (socket, seen) = recording_daemon(|request| match request {
+        Request::DraftPr { call, .. } => Some(Event::Done { call: *call }),
+        other => github_reply(other),
+    });
+    let (workspace, cx, _client) = approved(&socket, cx);
+    wait_for(cx, &seen, |seen, _| {
+        seen.count(|request| matches!(request, Request::DraftPr { .. })) == 1
+    });
+    send_draft(&workspace, draft("first title", "first body"), cx);
+    let drafted = title_of(&workspace, cx);
+
+    change_task(&workspace, &outdated_info(true, MERGED), cx);
+    let cleared = (
+        title_of(&workspace, cx),
+        body_of(&workspace, cx),
+        workspace.read_with(cx, |workspace, _| workspace.data.drafts.contains_key(&TASK)),
+    );
+
+    change_task(&workspace, &outdated_info(false, MERGED + 1), cx);
+    let asked_again = wait_for(cx, &seen, |seen, _| {
+        seen.count(|request| matches!(request, Request::DraftPr { .. })) == 2
+    });
+
+    assert_eq!(drafted, "first title");
+    assert_eq!(cleared, (String::new(), String::new(), false));
+    assert!(asked_again, "the next approval asks for a new draft");
+}
+
+#[gpui::test]
+fn an_outdated_approval_with_a_pull_request_keeps_its_panel(cx: &mut TestAppContext) {
+    let (workspace, cx, _client, _seen) =
+        with_pull_request(mergeable_pull_request(), Arc::new(AtomicUsize::new(0)), cx);
+    wait_until(cx, |cx| {
+        redraw(cx);
+        status_of(&workspace, cx).is_some()
+    });
+
+    change_task(
+        &workspace,
+        &swarm_protocol::TaskInfo {
+            pull_request: Some(PrLink {
+                number: 42,
+                url: "https://github.com/swarm-labs/swarm/pull/42".into(),
+                head: "abc".into(),
+            }),
+            ..outdated_info(true, MERGED)
+        },
+        cx,
+    );
+
+    assert!(cx.debug_bounds("pull-request-button").is_some());
+    assert!(cx.debug_bounds("review-outdated").is_none());
+    assert!(cx.debug_bounds("merge").is_some());
+}
+
+// Redraft
+
+#[gpui::test]
+fn redraft_asks_again_and_the_new_draft_replaces_the_form(cx: &mut TestAppContext) {
+    let (socket, seen) = recording_daemon(|request| match request {
+        Request::DraftPr { call, .. } => Some(Event::Done { call: *call }),
+        other => github_reply(other),
+    });
+    let (workspace, cx, _client) = approved(&socket, cx);
+    wait_for(cx, &seen, |seen, _| {
+        seen.count(|request| matches!(request, Request::DraftPr { .. })) == 1
+    });
+    send_draft(&workspace, draft("first title", "first body"), cx);
+    let offered = cx.debug_bounds("redraft").is_some();
+
+    click("redraft", cx);
+    let asked = wait_for(cx, &seen, |seen, _| {
+        seen.count(|request| matches!(request, Request::DraftPr { .. })) == 2
+    });
+    let waiting = workspace.read_with(cx, |workspace, _| {
+        workspace
+            .pull_requests
+            .form(APP_TASK)
+            .map(|form| form.draft_wait.clone())
+    });
+    send_draft(&workspace, draft("second title", "second body"), cx);
+
+    assert!(offered);
+    assert!(asked);
+    assert_eq!(waiting, Some(DraftWait::Waiting));
+    assert_eq!(title_of(&workspace, cx), "second title");
+    assert_eq!(body_of(&workspace, cx), "second body");
+}
+
+#[gpui::test]
+fn a_redraft_asks_first_when_the_user_edited_the_title(cx: &mut TestAppContext) {
+    let (socket, _seen) = recording_daemon(|request| match request {
+        Request::DraftPr { call, .. } => Some(Event::Done { call: *call }),
+        other => github_reply(other),
+    });
+    let (workspace, cx, _client) = approved(&socket, cx);
+    send_draft(&workspace, draft("first title", "first body"), cx);
+    type_title(&workspace, "my own title", cx);
+
+    click("redraft", cx);
+    send_draft(&workspace, draft("second title", "second body"), cx);
+
+    assert_eq!(title_of(&workspace, cx), "my own title");
+    assert!(cx.debug_bounds("new-draft").is_some());
+}
+
+#[gpui::test]
+fn redraft_is_only_offered_while_the_approval_holds(cx: &mut TestAppContext) {
+    let (socket, _seen) = recording_daemon(github_reply);
+    let (workspace, cx, _client) = approved(&socket, cx);
+    send_draft(&workspace, draft("first title", "first body"), cx);
+    let offered = cx.debug_bounds("redraft").is_some();
+
+    workspace.update(cx, |workspace, cx| {
+        workspace.redraft(cx);
+    });
+    change_task(&workspace, &outdated_info(true, MERGED), cx);
+
+    assert!(offered);
+    assert!(cx.debug_bounds("redraft").is_none());
+}
+
+// Merge
+
+fn show_status(workspace: &Entity<Workspace>, status: PullRequest, cx: &mut VisualTestContext) {
+    workspace.update(cx, |workspace, cx| {
+        workspace.data.pull_requests.insert(TASK, status);
+        cx.notify();
+    });
+    redraw(cx);
+}
+
+#[test]
+fn merge_waits_for_running_checks_failed_checks_and_conflicts_in_that_order() {
+    let clean = PullRequest {
+        draft: false,
+        mergeable: true,
+        checks: vec![github_check("build", GithubCheckState::Passed)],
+        ..open_pull_request(42)
+    };
+    let with = |state| PullRequest {
+        checks: vec![
+            github_check("build", state),
+            github_check("lint", GithubCheckState::Failed),
+        ],
+        ..clean.clone()
+    };
+
+    assert_eq!(merge_block(&clean), None);
+    assert!(can_merge(&clean));
+    assert_eq!(
+        merge_block(&with(GithubCheckState::Queued)),
+        Some(MergeBlock::ChecksRunning)
+    );
+    assert_eq!(
+        merge_block(&with(GithubCheckState::Passed)),
+        Some(MergeBlock::ChecksFailed)
+    );
+    assert_eq!(
+        merge_block(&PullRequest {
+            mergeable: false,
+            merge_state: MergeState::Conflicts,
+            ..clean.clone()
+        }),
+        Some(MergeBlock::Conflicts)
+    );
+    assert_eq!(
+        merge_block(&PullRequest {
+            draft: true,
+            mergeable: false,
+            merge_state: MergeState::Conflicts,
+            ..clean
+        }),
+        None,
+        "a draft has its own button"
+    );
+}
+
+#[test]
+fn every_merge_state_has_its_status_and_only_a_clean_one_merges() {
+    let state = |merge_state, approved: bool| PullRequest {
+        draft: false,
+        mergeable: matches!(
+            merge_state,
+            MergeState::Clean | MergeState::Unstable | MergeState::HasHooks
+        ),
+        merge_state,
+        checks: Vec::new(),
+        reviewers: approved
+            .then(|| swarm_protocol::Reviewer {
+                login: "jonas".to_owned(),
+                state: ReviewState::Approved,
+            })
+            .into_iter()
+            .collect(),
+        ..open_pull_request(42)
+    };
+    let shown = |merge_state, approved| {
+        let status = state(merge_state, approved);
+        (merge_block(&status), can_merge(&status))
+    };
+
+    assert_eq!(shown(MergeState::Clean, false), (None, true));
+    assert_eq!(shown(MergeState::HasHooks, false), (None, true));
+    assert_eq!(shown(MergeState::Unstable, false), (None, true));
+    assert_eq!(shown(MergeState::Unknown, false), (None, false));
+    assert_eq!(
+        shown(MergeState::Conflicts, false),
+        (Some(MergeBlock::Conflicts), false)
+    );
+    assert_eq!(
+        shown(MergeState::Behind, false),
+        (Some(MergeBlock::Behind), false)
+    );
+    assert_eq!(
+        shown(MergeState::Blocked, false),
+        (Some(MergeBlock::ReviewRequired), false)
+    );
+    assert_eq!(
+        shown(MergeState::Blocked, true),
+        (Some(MergeBlock::Blocked), false)
+    );
+}
+
+#[test]
+fn the_merge_blocks_read_as_status_words() {
+    let labels = [
+        MergeBlock::Conflicts,
+        MergeBlock::ReviewRequired,
+        MergeBlock::Behind,
+    ]
+    .map(MergeBlock::label);
+
+    assert_eq!(labels, ["Conflicts", "Review required", "Behind base"]);
+}
+
+#[gpui::test]
+fn merge_is_off_with_its_reason_while_checks_run_or_failed_or_github_cannot_merge(
+    cx: &mut TestAppContext,
+) {
+    let (workspace, cx, _client, seen) =
+        with_pull_request(mergeable_pull_request(), Arc::new(AtomicUsize::new(0)), cx);
+    wait_until(cx, |cx| {
+        redraw(cx);
+        status_of(&workspace, cx).is_some()
+    });
+    let clean = mergeable_pull_request()
+        .lock()
+        .map(|status| status.clone())
+        .expect("status");
+    let blocked = |state, merge_state| PullRequest {
+        mergeable: merge_state == MergeState::Clean,
+        merge_state,
+        checks: vec![github_check("build", state)],
+        ..clean.clone()
+    };
+
+    show_status(&workspace, clean.clone(), cx);
+    let ready = cx.debug_bounds("merge-blocked").is_none();
+
+    for status in [
+        blocked(GithubCheckState::Running, MergeState::Clean),
+        blocked(GithubCheckState::Failed, MergeState::Clean),
+        blocked(GithubCheckState::Passed, MergeState::Conflicts),
+        blocked(GithubCheckState::Passed, MergeState::Behind),
+        blocked(GithubCheckState::Passed, MergeState::Blocked),
+    ] {
+        show_status(&workspace, status, cx);
+
+        assert!(cx.debug_bounds("merge-blocked").is_some());
+        click("merge", cx);
+    }
+    wait_a_little();
+
+    assert!(ready);
+    assert_eq!(
+        seen.count(|request| matches!(request, Request::MergePr { .. })),
+        0
+    );
+}
+
+#[gpui::test]
+fn a_pull_request_that_can_merge_merges(cx: &mut TestAppContext) {
+    let (workspace, cx, _client, seen) =
+        with_pull_request(mergeable_pull_request(), Arc::new(AtomicUsize::new(0)), cx);
+    wait_until(cx, |cx| {
+        redraw(cx);
+        status_of(&workspace, cx).is_some()
+    });
+
+    click("merge", cx);
+    let sent = wait_for(cx, &seen, |seen, _| {
+        seen.count(|request| matches!(request, Request::MergePr { .. })) == 1
+    });
+
+    assert!(sent);
+}
+
+#[test]
+fn the_pull_request_state_picks_githubs_color() {
+    let colors = swarm_ui::Theme::light().colors().clone();
+    let state = |state, draft| PullRequest {
+        state,
+        draft,
+        ..open_pull_request(42)
+    };
+
+    assert_eq!(
+        state_color(Some(&state(PrState::Open, false)), &colors),
+        colors.pr_open
+    );
+    assert_eq!(
+        state_color(Some(&state(PrState::Merged, false)), &colors),
+        colors.pr_merged
+    );
+    assert_eq!(
+        state_color(Some(&state(PrState::Closed, false)), &colors),
+        colors.pr_closed
+    );
+    assert_eq!(
+        state_color(Some(&state(PrState::Open, true)), &colors),
+        colors.pr_draft
+    );
 }

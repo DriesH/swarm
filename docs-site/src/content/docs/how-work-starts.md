@@ -29,6 +29,10 @@ The **orchestrator** leads one task. It splits the task, starts **workers** and 
 - Workers share the task worktree by default. They work on parts that touch different files and commit only their own files.
 - The orchestrator gives a worker its own worktree and branch only with a stated reason. Two reasons exist: parts that must change the same files at the same time, and an experiment it may throw away. The orchestrator merges that branch back into the task branch.
 
+- Every helper of the orchestrator is a worker started with `swarm spawn`, including read-only reviews and research. Swarm denies the built-in subagent tools of a Claude Code orchestrator.
+- When a worker's report is checked and the orchestrator has nothing more for it, the orchestrator runs `swarm stop`. The worker stops like an idle agent and leaves the tile layout. It stays in the [Swarm view](/swarm/docs/swarm-view/) with a dimmed icon and border. With a saved conversation it is resumable, and **Resume** shows in the inspector.
+- A task without a name starts with a bee or wasp name. After it confirms its brief, the orchestrator renames the task, its tab and its branch to say what the task is about. The worktree folder keeps its first name. A task with a pull request or a pushed branch keeps its name.
+
 Review sorts the changed files by worktree, then by path. Each file card names the agent of the file's newest commit.
 
 ## Start work later
@@ -44,7 +48,7 @@ The **New task** sheet has these fields:
 
 | Field | What it does |
 |---|---|
-| **Name** | Names the task. Required. |
+| **Name** | Names the task. Optional. The field shows a name to use when you leave it empty: the Latin name of a bee or wasp, such as `apis-mellifera`, that no open task, branch or worktree folder uses. If you type such a name and it is taken by then, Swarm picks another bee or wasp name. Any other taken name gets `-2`, `-3` and so on. |
 | **Branch from** | The branch the task starts from. It lists your local branches, so you can pick up the kept branch of a closed task. |
 | **Orchestrator** | Claude Code or Codex. |
 | **First message** | Optional. The orchestrator starts with it. |

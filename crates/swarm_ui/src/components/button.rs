@@ -27,6 +27,8 @@ pub enum ButtonVariant {
     /// Raised with a border and a `del` label: a destructive action that is not the main
     /// action of the screen.
     SecondaryDestructive,
+    /// Filled with GitHub's merge green: the merge of a pull request that can merge.
+    Merge,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -125,6 +127,14 @@ impl ButtonVariant {
                 border: colors.line,
                 hover_background: colors.active,
                 hover_text: colors.del,
+            },
+            Self::Merge => ButtonColors {
+                background: colors.merge,
+                text: colors.on_merge,
+                border: colors.merge,
+                // Solid, toward black: the white label keeps its contrast.
+                hover_background: composite(colors.merge, gpui::black().opacity(0.12)),
+                hover_text: colors.on_merge,
             },
         }
     }
@@ -271,7 +281,7 @@ impl RenderOnce for Button {
         let (accent, ground) = (cx.theme().colors().accent, cx.theme().colors().ground);
         let filled = matches!(
             self.variant,
-            ButtonVariant::Primary | ButtonVariant::Destructive
+            ButtonVariant::Primary | ButtonVariant::Destructive | ButtonVariant::Merge
         );
         let toggled = self.toggle_state == Some(true);
 
@@ -400,6 +410,7 @@ impl Component for Button {
             ("Ghost", ButtonVariant::Ghost),
             ("Destructive", ButtonVariant::Destructive),
             ("Secondary destructive", ButtonVariant::SecondaryDestructive),
+            ("Merge", ButtonVariant::Merge),
         ];
 
         v_flex()
