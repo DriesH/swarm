@@ -214,6 +214,16 @@ pub(crate) struct Workspace {
     pub(crate) usage_expanded: bool,
     /// True while the pointer is on the rail's usage ring, which then shows the usage card.
     pub(crate) rail_usage_hovered: bool,
+    /// The version whose update card the user dismissed. Not saved across launches.
+    pub(crate) update_card_dismissed: Option<swarm_update::Version>,
+    /// True while the rail's update button shows the card.
+    pub(crate) rail_update_open: bool,
+    /// Where the rail's update button was drawn, so a click on it does not count as outside.
+    pub(crate) rail_update_trigger: Option<Bounds<Pixels>>,
+    /// Focus of the rail's update button, where focus returns when its card closes.
+    pub(crate) rail_update_button_focus: FocusHandle,
+    /// Focus of the rail's update card, which takes focus when it opens.
+    pub(crate) rail_update_card_focus: FocusHandle,
     /// The running collapse or expand animation, if any.
     pub(crate) sidebar_motion: Option<SidebarMotion>,
     /// Tracks focus inside the sidebar and the rail, so a toggle can take focus back.
@@ -448,6 +458,11 @@ impl Workspace {
             sidebar_collapsed: false,
             usage_expanded: false,
             rail_usage_hovered: false,
+            update_card_dismissed: None,
+            rail_update_open: false,
+            rail_update_trigger: None,
+            rail_update_button_focus: cx.focus_handle().tab_stop(true),
+            rail_update_card_focus: cx.focus_handle(),
             sidebar_motion: None,
             sidebar_focus: cx.focus_handle(),
             add_project_focus: cx.focus_handle().tab_stop(true),
@@ -821,6 +836,7 @@ impl Workspace {
         let from = self.sidebar_openness(now);
 
         self.sidebar_collapsed = !self.sidebar_collapsed;
+        self.rail_update_open = false;
         let to = if self.sidebar_collapsed { 0. } else { 1. };
 
         if swarm_ui::motion::reduce_motion(cx) || (to - from).abs() < f32::EPSILON {
@@ -838,6 +854,7 @@ impl Workspace {
     /// Opens the sidebar at once, for a message it has to show.
     pub(crate) fn show_sidebar(&mut self) {
         self.sidebar_collapsed = false;
+        self.rail_update_open = false;
         self.sidebar_motion = None;
     }
 
@@ -1496,6 +1513,7 @@ impl Render for Workspace {
                             ),
                     ),
             )
+            .child(crate::update_card::announcement(cx))
             .children(overlay)
             .children(self.eggs_layer(cx))
             .into_any_element()

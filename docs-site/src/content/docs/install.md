@@ -48,13 +48,13 @@ Both mean the screen does not show again. The same check stays in **Settings ›
 
 ## Updates
 
-Swarm checks [GitHub Releases](https://github.com/DriesH/swarm/releases) for a newer version. It checks 30 seconds after launch and then every 6 hours. Turn this off in **Settings › General**. **Check now** and **Swarm › Check for Updates…** always check.
+Swarm checks [GitHub Releases](https://github.com/DriesH/swarm/releases) for a newer version. It checks 3 seconds after launch and then every 6 hours. Turn this off in **Settings › General**. **Check now** and **Swarm › Check for Updates…** always check.
 
-Swarm downloads the new version in the background and checks its signature. The status bar then shows **Update ready**, with **Restart to update** and **Release notes**. Swarm installs the update when you press **Restart to update** or when you quit. The old app goes to the Trash.
+Swarm downloads the new version in the background and checks its signature. The sidebar then shows an **Update ready** card with the version, **Update now** and **Release notes**. You can dismiss the card. It stays hidden for that version until you restart Swarm. With the sidebar folded, a button above the usage ring opens the card. Swarm installs the update when you press **Update now** or when you quit. The old app goes to the Trash.
 
 An unsigned build, such as one you built yourself, never updates. If Swarm cannot replace itself in its folder, the button reads **Download** and opens the release page.
 
-Before it swaps the apps, the installer checks the new app and the old app again. If anything fails, your old Swarm opens again. The status bar then shows **Update failed** with the reason, and the button reads **Download** for that version. Swarm removes the downloads of versions that you run already.
+Before it swaps the apps, the installer checks the new app and the old app again. If anything fails, your old Swarm opens again. The update card then shows **Update failed** with the reason, and the button reads **Download** for that version. Swarm removes the downloads of versions that you run already.
 
 After an update, the daemon restarts when no agent works and no terminal runs. Else Swarm shows **Restart daemon**, and the daemon restarts only when you confirm. A restart stops every terminal.
 
