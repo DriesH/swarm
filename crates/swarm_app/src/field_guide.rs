@@ -25,7 +25,7 @@ use crate::settings;
 use crate::workspace::Workspace;
 
 /// How long a creature stays in the title bar, and how long its flight takes.
-pub(crate) const VISIT: Duration = Duration::from_secs(20);
+pub(crate) const VISIT: Duration = Duration::from_secs(45);
 
 /// At most this many creatures come in 24 hours.
 pub(crate) const MAX_PER_DAY: usize = 4;
@@ -41,6 +41,9 @@ const WAIT: (Duration, Duration) = (Duration::from_mins(1), Duration::from_mins(
 /// How often the app looks if a creature should come.
 const TICK: Duration = Duration::from_secs(15);
 
+/// The most one tick takes off the wait. A late tick still counts, a night of sleep does not.
+const MOST_PER_TICK: Duration = Duration::from_secs(30);
+
 /// Each sprite pixel in the title bar is half a logical pixel: 32 pixels for the sprite,
 /// which fits the 40 pixel bar and is one device pixel on a Retina screen. Below that, the
 /// frame of every second pixel is drawn.
@@ -52,6 +55,11 @@ const BAR_TOP: f32 = 4.;
 /// How long a wing frame shows, and a crawl frame.
 const WING_FRAME: f32 = 0.14;
 const CRAWL_FRAME: f32 = 0.18;
+
+/// A flier speeds up and slows down by this part of the bar, this many seconds a round. The
+/// wave never beats the pace across, so it hovers but never turns back.
+const WANDER: f32 = 0.025;
+const WANDER_PERIOD: f32 = 9.;
 
 /// How often the guide changes frames.
 const GUIDE_FRAME: Duration = Duration::from_millis(140);
@@ -73,12 +81,15 @@ fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// When creatures came and when the next one is due. Times are milliseconds since the Unix
-/// epoch, so a test sets the clock.
+/// When creatures came and how long until the next one. Times are milliseconds since the
+/// Unix epoch, so a test sets the clock.
 #[derive(Debug, Default)]
 pub(crate) struct Schedule {
     starts: Vec<u64>,
-    due: Option<u64>,
+    /// The wait left before the next creature.
+    left: Option<u64>,
+    /// The last tick that counted, while a creature may come.
+    counted: Option<u64>,
 }
 
 impl Schedule {
@@ -105,24 +116,31 @@ impl Schedule {
     }
 
     /// Looks if a creature comes now. `eligible` says agents work, the eggs are on and the
-    /// window is in front. The wait starts when `eligible` becomes true, and starts over
-    /// when it goes false. Returns true once, when the wait is over.
+    /// window is in front. The wait runs only while `eligible` is true: it pauses when it
+    /// goes false and goes on from there. Returns true once, when the wait is over.
     pub(crate) fn tick(&mut self, now: u64, eligible: bool, random: u64) -> bool {
         self.starts
             .retain(|start| now.saturating_sub(*start) < millis(DAY));
 
         if !eligible || !self.open(now) {
-            self.due = None;
+            self.counted = None;
 
             return false;
         }
 
-        let due = *self.due.get_or_insert_with(|| now + Self::wait(random));
-        if now < due {
+        let step = self
+            .counted
+            .map_or(0, |at| now.saturating_sub(at).min(millis(MOST_PER_TICK)));
+        self.counted = Some(now);
+
+        let left = self.left.get_or_insert_with(|| Self::wait(random));
+        *left = left.saturating_sub(step);
+        if *left > 0 {
             return false;
         }
 
-        self.due = None;
+        self.left = None;
+        self.counted = None;
         self.starts.push(now);
 
         true
@@ -293,6 +311,20 @@ fn frame_of(index: usize, motion: Motion, elapsed: f32) -> Option<&'static Frame
 // The creature in the title bar
 // ---------------------------------------------------------------------------------------
 
+/// Where the creature is at `delta` of its visit: 1 at the right end of the bar, 0 at the
+/// left end.
+fn place(delta: f32, motion: Motion) -> f32 {
+    let rest = 1. - delta;
+    if motion != Motion::Fly {
+        return rest;
+    }
+
+    let elapsed = delta * VISIT.as_secs_f32();
+    let wander = WANDER * (elapsed * std::f32::consts::TAU / WANDER_PERIOD).sin();
+
+    (rest - wander).clamp(0., 1.)
+}
+
 /// What the creature tells the workspace.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VisitEvent {
@@ -322,7 +354,9 @@ impl Render for Visit {
         let Some(creature) = self.creature() else {
             return div().into_any_element();
         };
-        let (index, motion, serial) = (self.creature, self.motion, self.serial);
+        let (index, serial) = (self.creature, self.serial);
+        let motion =
+            swarm_creatures::sprite(index).map_or(self.motion, |sprite| sprite.motion(self.motion));
         let side = Art::side(BAR_UNIT);
 
         let mover = div()
@@ -357,6 +391,7 @@ impl Render for Visit {
                     move |mover, delta| {
                         let elapsed = delta * VISIT.as_secs_f32();
                         let rest = 1. - delta;
+                        let at = place(delta, motion);
                         let fade = (delta / 0.05).min(rest / 0.05).min(1.);
                         let bob = if motion == Motion::Fly {
                             let wave = (elapsed * std::f32::consts::TAU / 1.6).sin();
@@ -369,8 +404,8 @@ impl Render for Visit {
                             frame_of(index, motion, elapsed).map(|frame| Art::new(frame, BAR_UNIT));
 
                         mover
-                            .left(relative(rest))
-                            .ml(px(-rest * side))
+                            .left(relative(at))
+                            .ml(px(-at * side))
                             .top(px(BAR_TOP + bob))
                             .opacity(fade)
                             .children(art)
@@ -1268,8 +1303,10 @@ mod tests {
     fn a_creature_comes_when_the_wait_is_over_and_only_once() {
         let mut schedule = Schedule::default();
 
-        assert!(!schedule.tick(0, true, 0), "the wait starts");
-        assert!(!schedule.tick(MINUTE - 1, true, 0), "the wait is not over");
+        assert!(
+            run(&mut schedule, 0, MINUTE, true, 0).is_empty(),
+            "the wait is not over"
+        );
         assert!(schedule.tick(MINUTE, true, 0));
         assert!(
             !schedule.tick(MINUTE + 1, true, 0),
@@ -1277,30 +1314,133 @@ mod tests {
         );
     }
 
+    /// Ticks every [`TICK`] from `from` until `to`, and gives the times a creature came.
+    fn run(schedule: &mut Schedule, from: u64, to: u64, eligible: bool, random: u64) -> Vec<u64> {
+        (from..to)
+            .step_by(usize::try_from(millis(TICK)).expect("a tick fits"))
+            .filter(|now| schedule.tick(*now, eligible, random))
+            .collect()
+    }
+
     #[test]
-    fn the_wait_starts_over_when_the_agents_stop_working() {
+    fn the_wait_pauses_while_a_creature_may_not_come_and_goes_on_after() {
+        let mut schedule = Schedule::default();
+        let random = 9 * MINUTE;
+        let wait = Schedule::wait(random);
+        assert_eq!(wait, 10 * MINUTE);
+
+        assert!(run(&mut schedule, 0, 6 * MINUTE, true, random).is_empty());
+        assert!(run(&mut schedule, 6 * MINUTE, 60 * MINUTE, false, random).is_empty());
+
+        // The ticks from 0 to 5:45 counted 5:45, so 4:15 is left.
+        let back = 60 * MINUTE;
+        let left = wait - (6 * MINUTE - millis(TICK));
+        assert!(run(&mut schedule, back, back + left, true, random).is_empty());
+        assert!(schedule.tick(back + left, true, random));
+    }
+
+    #[test]
+    fn a_pause_does_not_roll_a_new_wait() {
+        let mut schedule = Schedule::default();
+        run(&mut schedule, 0, 5 * MINUTE, true, 29 * MINUTE);
+        run(&mut schedule, 5 * MINUTE, 10 * MINUTE, false, 29 * MINUTE);
+
+        // A new roll of the dice would be the shortest wait, 1 minute.
+        let times = run(&mut schedule, 10 * MINUTE, 60 * MINUTE, true, 0);
+
+        assert_eq!(times.len(), 1);
+        assert!(times[0] > 30 * MINUTE, "{times:?}");
+    }
+
+    #[test]
+    fn short_pauses_do_not_keep_a_creature_away() {
+        let mut schedule = Schedule::default();
+        let mut times = Vec::new();
+
+        // In front for 2 minutes, in the back for 1, over and over.
+        for round in 0..20 {
+            let start = round * 3 * MINUTE;
+            times.extend(run(
+                &mut schedule,
+                start,
+                start + 2 * MINUTE,
+                true,
+                29 * MINUTE,
+            ));
+            run(
+                &mut schedule,
+                start + 2 * MINUTE,
+                start + 3 * MINUTE,
+                false,
+                0,
+            );
+        }
+
+        assert_eq!(times.len(), 1, "{times:?}");
+    }
+
+    #[test]
+    fn a_long_step_counts_as_a_short_one() {
         let mut schedule = Schedule::default();
         schedule.tick(0, true, 0);
 
-        schedule.tick(30_000, false, 0);
-
         assert!(
-            !schedule.tick(MINUTE, true, 0),
-            "the wait began again at once"
+            !schedule.tick(8 * 60 * MINUTE, true, 0),
+            "a night of sleep is not the wait"
         );
-        assert!(schedule.tick(2 * MINUTE, true, 0));
+        assert!(schedule.tick(8 * 60 * MINUTE + 30_000, true, 0));
+    }
+
+    #[test]
+    fn the_cap_and_the_gap_hold_across_pauses() {
+        let mut schedule = Schedule::default();
+        let mut times = Vec::new();
+
+        for hour in 0..24 {
+            let start = hour * 60 * MINUTE;
+            times.extend(run(&mut schedule, start, start + 40 * MINUTE, true, 0));
+            run(
+                &mut schedule,
+                start + 40 * MINUTE,
+                start + 60 * MINUTE,
+                false,
+                0,
+            );
+        }
+
+        assert_eq!(times.len(), MAX_PER_DAY);
+        for pair in times.windows(2) {
+            assert!(pair[1] - pair[0] >= millis(MIN_GAP), "{pair:?}");
+        }
+    }
+
+    #[test]
+    fn a_creature_stays_45_seconds() {
+        assert_eq!(VISIT, Duration::from_secs(45));
+    }
+
+    #[test]
+    fn a_flier_crosses_the_bar_from_right_to_left_and_never_turns_back() {
+        let places: Vec<f32> = (0..=1000_u16)
+            .map(|step| place(f32::from(step) / 1000., Motion::Fly))
+            .collect();
+
+        assert!((places[0] - 1.).abs() < 1e-4, "{}", places[0]);
+        assert!(places[1000].abs() < 1e-4, "{}", places[1000]);
+        for pair in places.windows(2) {
+            assert!(pair[1] <= pair[0], "{pair:?}");
+        }
+    }
+
+    #[test]
+    fn a_crawler_keeps_one_pace() {
+        assert!((place(0.25, Motion::Crawl) - 0.75).abs() < f32::EPSILON);
     }
 
     #[test]
     fn creatures_come_at_least_45_minutes_apart() {
         let mut schedule = Schedule::default();
-        let mut times = Vec::new();
-
-        for minute in 0..600 {
-            if schedule.tick(minute * MINUTE, true, 0) {
-                times.push(minute * MINUTE);
-            }
-        }
+        let times = run(&mut schedule, 0, 600 * MINUTE, true, 0);
 
         assert!(times.len() > 1);
         for pair in times.windows(2) {
@@ -1311,13 +1451,7 @@ mod tests {
     #[test]
     fn at_most_four_creatures_come_in_a_day() {
         let mut schedule = Schedule::default();
-        let mut times = Vec::new();
-
-        for minute in 0..(24 * 60) {
-            if schedule.tick(minute * MINUTE, true, 0) {
-                times.push(minute * MINUTE);
-            }
-        }
+        let times = run(&mut schedule, 0, 24 * 60 * MINUTE, true, 0);
 
         assert_eq!(times.len(), MAX_PER_DAY);
     }
@@ -1325,13 +1459,7 @@ mod tests {
     #[test]
     fn the_cap_lifts_a_day_after_the_first_creature() {
         let mut schedule = Schedule::default();
-        let mut times = Vec::new();
-
-        for minute in 0..(26 * 60) {
-            if schedule.tick(minute * MINUTE, true, 0) {
-                times.push(minute * MINUTE);
-            }
-        }
+        let times = run(&mut schedule, 0, 26 * 60 * MINUTE, true, 0);
 
         let day = millis(DAY);
         assert!(times.len() > MAX_PER_DAY);
@@ -1529,10 +1657,10 @@ mod tests {
         workspace.read_with(cx, |workspace, _| workspace.field_guide.visitor())
     }
 
-    /// Ticks until the first creature comes, one minute apart.
+    /// Ticks every [`TICK`] for two minutes. The first creature comes after one.
     fn wait_for_a_creature(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) {
-        for minute in 0..3 {
-            tick(workspace, 1_000_000 + minute * MINUTE, cx);
+        for step in 0..=8 {
+            tick(workspace, 1_000_000 + step * millis(TICK), cx);
         }
     }
 
@@ -1586,7 +1714,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_creature_leaves_after_twenty_seconds(cx: &mut TestAppContext) {
+    fn a_creature_leaves_after_its_visit(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
         work(&workspace, AgentStatus::Working, cx);
         wait_for_a_creature(&workspace, cx);

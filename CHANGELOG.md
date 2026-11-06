@@ -2,6 +2,12 @@
 
 Every release of Swarm. The newest is on top.
 
+## Unreleased
+
+### Fixed
+
+- Field guide: the wait for a creature pauses while the window is in the back or no agent works, and no longer starts again. A creature stays 45 seconds.
+
 ## 1.0.3 (2026-11-06)
 
 ### Added
