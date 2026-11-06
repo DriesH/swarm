@@ -55,7 +55,7 @@ const LINE_HEIGHT: f32 = 21.;
 const NUMBER_WIDTH: f32 = 40.;
 const SIGN_WIDTH: f32 = 14.;
 /// How far the add-comment button reaches into the gutter; the rest overlaps the code.
-const ADD_BUTTON_INSET: f32 = 12.;
+const ADD_BUTTON_INSET: f32 = 6.;
 /// The place gives way long before the status pill does when the header is short.
 const PLACE_SHRINK: f32 = 1_000.;
 const NO_NEWLINE: &str = "No newline at end of file";

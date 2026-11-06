@@ -140,15 +140,21 @@ impl RenderOnce for Scrollbar {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let handle = self.handle;
         let (max_offset, offset) = (handle.max_offset(), handle.offset());
+        let state = window.use_keyed_state(self.id.clone(), cx, |_, _| DragState::default());
 
         if max_offset <= px(0.) || handle.viewport_height() <= px(0.) {
+            // The content can stop overflowing mid-drag; no mouse up reaches us then.
+            if state.read(cx).grab.is_some() {
+                state.update(cx, |state, _| state.grab = None);
+                handle.drag_ended();
+            }
+
             return div().id(self.id);
         }
 
         let colors = cx.theme().colors();
         let (rest, strong) = (colors.scrollbar_thumb, colors.faint);
         let percent = (progress(max_offset, offset) * 100.).round();
-        let state = window.use_keyed_state(self.id.clone(), cx, |_, _| DragState::default());
 
         let prepaint_handle = Rc::clone(&handle);
         let prepaint = move |bounds: Bounds<Pixels>, window: &mut Window, _: &mut App| {

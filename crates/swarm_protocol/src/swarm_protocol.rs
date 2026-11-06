@@ -23,7 +23,7 @@ pub use client::{Client, ClientError, CommentEvent, MessageEvent, PrEvent, Proje
 pub use daemon_stop::{Host, Signal, StopError, System, stop_daemon};
 
 /// Bumped on every incompatible change; the daemon refuses other versions.
-pub const VERSION: u32 = 28;
+pub const VERSION: u32 = 29;
 
 /// The most messages [`Request::ListMessages`] returns.
 pub const MESSAGES_LISTED: usize = 500;
