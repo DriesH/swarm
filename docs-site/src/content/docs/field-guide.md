@@ -15,11 +15,13 @@ A creature comes only when all of this is true:
 - **Settings › Appearance › Easter eggs** is on
 - the Swarm window is in front
 
-At most 4 creatures come in 24 hours, and two creatures come at least 45 minutes apart. The time they come is random within those limits.
+When all of this is true, Swarm picks a random wait of 1 to 30 minutes. The wait counts down only while all of this stays true. When one of the conditions stops, for example when you switch to another app, the wait pauses. When all are true again, the wait continues from where it stopped. It does not start again.
 
-A creature stays for 20 seconds, then leaves. It flies along the empty part of the title bar, from right to left. It never covers a tab, a button or terminal text, and it never takes the keyboard focus. The velvet ant has no wings, so it crawls.
+At most 4 creatures come in 24 hours, and two creatures come at least 45 minutes apart.
 
-With **Reduce motion** on in macOS, the creature does not move. It sits in the title bar for 20 seconds.
+A creature stays for 45 seconds, then leaves. It flies along the empty part of the title bar, from right to left. It never covers a tab, a button or terminal text, and it never takes the keyboard focus. The velvet ant has no wings, so it crawls.
+
+With **Reduce motion** on in macOS, the creature does not move. It sits in the title bar for 45 seconds.
 
 ## Catch it
 
