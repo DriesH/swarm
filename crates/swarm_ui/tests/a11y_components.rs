@@ -498,6 +498,65 @@ fn the_pixel_bee_and_the_honey_fill_have_no_role() {
     });
 }
 
+struct FixedScroll {
+    max_offset: f32,
+    offset: f32,
+}
+
+impl swarm_ui::ScrollableHandle for FixedScroll {
+    fn max_offset(&self) -> gpui::Pixels {
+        px(self.max_offset)
+    }
+
+    fn offset(&self) -> gpui::Pixels {
+        px(self.offset)
+    }
+
+    fn set_offset(&self, _offset: gpui::Pixels) {}
+
+    fn viewport_height(&self) -> gpui::Pixels {
+        px(200.)
+    }
+}
+
+#[test]
+fn a_scrollbar_reads_how_far_the_view_is_scrolled() {
+    with_window(|window, cx| {
+        let scroll = FixedScroll {
+            max_offset: 600.,
+            offset: 150.,
+        };
+        let info = a11y_info(
+            swarm_ui::Scrollbar::vertical("bar", "Changes", scroll),
+            window,
+            cx,
+        );
+
+        assert_eq!(info.role, Some(Role::ScrollBar));
+        assert_eq!(info.node.label(), Some("Changes"));
+        assert_eq!(info.node.value(), Some("25%"));
+        assert_eq!(info.node.numeric_value(), Some(25.));
+        assert_eq!(info.node.orientation(), Some(Orientation::Vertical));
+    });
+}
+
+#[test]
+fn a_scrollbar_is_hidden_when_the_content_fits() {
+    with_window(|window, cx| {
+        let scroll = FixedScroll {
+            max_offset: 0.,
+            offset: 0.,
+        };
+        let info = a11y_info(
+            swarm_ui::Scrollbar::vertical("bar", "Changes", scroll),
+            window,
+            cx,
+        );
+
+        assert_eq!(info.role, None);
+    });
+}
+
 #[test]
 fn the_dot_grid_has_no_role_and_no_label() {
     with_window(|window, cx| {

@@ -9,7 +9,7 @@ use gpui::{
 };
 use swarm_protocol::{
     CheckState, GithubCheck, GithubCheckState, GithubStatus, LocalCheck, MergeMethod, PrState,
-    PullRequest, ReviewState,
+    PullRequest,
 };
 use swarm_ui::TagTone;
 use swarm_ui::prelude::*;
@@ -18,8 +18,8 @@ use crate::model::Task;
 use crate::panels::{header, mono, pill};
 use crate::pull_request::{
     ActionKind, Blocker, CreateState, CreateStatus, DraftWait, GithubSetup, MergeBlock,
-    PanelAction, PrForm, can_merge, exit_value, format_duration, merge_block, parse_logins,
-    run_is_over, state_color,
+    PanelAction, PrForm, can_merge, exit_value, format_duration, merge_block, run_is_over,
+    state_color,
 };
 use crate::workspace::{RightPanel, Workspace};
 
@@ -58,16 +58,13 @@ pub(crate) fn render(workspace: &Workspace, cx: &mut Context<Workspace>) -> AnyE
 fn panel_header(
     title: AnyElement,
     action: impl IntoElement,
+    icon: IconName,
     icon_color: Color,
     cx: &App,
 ) -> gpui::Div {
     header(cx)
         .h(px(46.))
-        .child(
-            Icon::new(IconName::PullRequest)
-                .size(IconSize::Medium)
-                .color(icon_color),
-        )
+        .child(Icon::new(icon).size(IconSize::Medium).color(icon_color))
         .child(title)
         .child(div().flex_1())
         .child(action)
@@ -210,15 +207,6 @@ fn error_block(
     )
 }
 
-/// The wait a busy action shows next to its button, else nothing. The merge and ready
-/// buttons say it themselves.
-fn busy_text(action: &PanelAction) -> Option<&'static str> {
-    match action {
-        PanelAction::Busy(ActionKind::Review) => Some("Requesting review\u{2026}"),
-        _ => None,
-    }
-}
-
 /// The tag of a pull request that is merged, closed or a draft. It is a status, so a
 /// merge that finishes is spoken.
 fn state_tag(status: &PullRequest) -> Option<LiveRegion> {
@@ -241,6 +229,7 @@ fn outdated_panel(cx: &mut Context<Workspace>) -> gpui::Div {
                 .weight(FontWeight::MEDIUM)
                 .into_any_element(),
             close_button(cx),
+            IconName::PullRequest,
             Color::Default,
             cx,
         ))
@@ -285,6 +274,11 @@ fn new_panel(
                 .weight(FontWeight::MEDIUM)
                 .into_any_element(),
             close_button(cx),
+            if form.as_draft {
+                IconName::PullRequestDraft
+            } else {
+                IconName::PullRequest
+            },
             Color::Default,
             cx,
         ))
@@ -752,6 +746,11 @@ fn status_panel(
             .children(tag)
             .into_any_element(),
         open_button,
+        if status.is_some_and(|status| status.draft) {
+            IconName::PullRequestDraft
+        } else {
+            IconName::PullRequest
+        },
         state_color,
         cx,
     );
@@ -775,8 +774,6 @@ fn status_panel(
     if push.is_some() {
         content = content.children(local_checks(workspace, task, form, cx));
     }
-
-    content = content.child(reviewers(status, form, cx));
 
     if open {
         content = content.child(merge_options(task, form, cx));
@@ -859,78 +856,6 @@ fn github_checks(status: Option<&PullRequest>) -> gpui::Stateful<gpui::Div> {
             checks
                 .is_empty()
                 .then(|| mono("No checks").color(Color::Faint)),
-        )
-}
-
-fn review_text(state: ReviewState) -> (&'static str, Color) {
-    match state {
-        ReviewState::Requested => ("Requested", Color::Faint),
-        ReviewState::Approved => ("Approved", Color::Ok),
-        ReviewState::ChangesRequested => ("Changes requested", Color::Warn),
-        ReviewState::Commented => ("Commented", Color::Muted),
-    }
-}
-
-fn reviewers(
-    status: Option<&PullRequest>,
-    form: &PrForm,
-    cx: &mut Context<Workspace>,
-) -> gpui::Div {
-    let list = status.map_or(&[][..], |status| status.reviewers.as_slice());
-    let asking = !parse_logins(&form.reviewers.read(cx).text()).is_empty();
-    let requesting = form.action == PanelAction::Busy(ActionKind::Review);
-    let (request_loading, request_disabled) = work_state(requesting, !asking || form.busy());
-
-    v_flex()
-        .gap(px(6.))
-        .child(section_heading("Reviewers"))
-        .child(
-            v_flex()
-                .id("reviewers")
-                .role(Role::List)
-                .aria_label("Reviewers")
-                .children(list.iter().enumerate().map(|(index, reviewer)| {
-                    let (text, color) = review_text(reviewer.state);
-
-                    h_flex()
-                        .id(("reviewer", index))
-                        .role(Role::ListItem)
-                        .aria_label(format!("{}, {text}", reviewer.login))
-                        .min_h(px(28.))
-                        .gap(px(8.))
-                        .child(
-                            div().flex_1().min_w_0().flex().child(
-                                Label::new(reviewer.login.clone())
-                                    .mono()
-                                    .size(LabelSize::Small)
-                                    .truncate(),
-                            ),
-                        )
-                        .child(Label::new(text).size(LabelSize::Small).color(color))
-                })),
-        )
-        .child(
-            h_flex()
-                .gap(px(8.))
-                .child(div().flex_1().min_w_0().child(form.reviewers.clone()))
-                .child(
-                    Button::new(
-                        "request-review",
-                        if requesting {
-                            "Requesting\u{2026}"
-                        } else {
-                            "Request review"
-                        },
-                    )
-                    .variant(ButtonVariant::Secondary)
-                    .debug_selector(|| "request-review".to_owned())
-                    .loading(request_loading)
-                    .disabled(request_disabled)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        let task = this.active_task;
-                        this.request_pr_review(task, cx);
-                    })),
-                ),
         )
 }
 
@@ -1035,7 +960,6 @@ fn status_footer(
         }
         CreateStatus::Idle | CreateStatus::Creating => None,
     };
-    let working = busy_text(&form.action).map(|text| status_label(text, Color::Muted));
     let blocked = block.map(|block| {
         status_label(
             block.label(),
@@ -1052,7 +976,6 @@ fn status_footer(
         .children(error)
         .children(push.map(|state| push_row(state, pushing, busy, cx)))
         .children(queued)
-        .children(working)
         .children(blocked)
         .child(
             h_flex()
@@ -1214,17 +1137,6 @@ mod tests {
                 Some(Live::Assertive)
             )
         );
-    }
-
-    #[test]
-    fn a_busy_action_names_its_wait_unless_its_button_does() {
-        assert_eq!(busy_text(&PanelAction::Busy(ActionKind::Merge)), None);
-        assert_eq!(busy_text(&PanelAction::Busy(ActionKind::Ready)), None);
-        assert_eq!(
-            busy_text(&PanelAction::Busy(ActionKind::Review)),
-            Some("Requesting review\u{2026}")
-        );
-        assert_eq!(busy_text(&PanelAction::Idle), None);
     }
 
     #[gpui::test]

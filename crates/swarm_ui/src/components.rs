@@ -23,6 +23,7 @@ mod popover_menu;
 mod project_tile;
 mod rail_button;
 mod resize_handle;
+mod scrollbar;
 mod segmented_control;
 mod status;
 mod stepper;
@@ -66,6 +67,7 @@ pub use popover_menu::*;
 pub use project_tile::*;
 pub use rail_button::*;
 pub use resize_handle::*;
+pub use scrollbar::*;
 pub use segmented_control::*;
 pub use status::*;
 pub use stepper::*;
@@ -105,6 +107,7 @@ pub fn all_components() -> Vec<ComponentEntry> {
         ComponentEntry::of::<TabBar>(),
         ComponentEntry::of::<TabStrip>(),
         ComponentEntry::of::<ResizeHandle>(),
+        ComponentEntry::of::<Scrollbar>(),
         ComponentEntry::of::<Menu>(),
         ComponentEntry::of::<PopoverMenu>(),
         ComponentEntry::of::<ContextMenu>(),

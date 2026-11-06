@@ -19,7 +19,7 @@ use swarm_protocol::{
 use swarm_ui::fonts::MONO_FONT;
 use swarm_ui::prelude::*;
 use swarm_ui::styles::focus_ring;
-use swarm_ui::{StatusPill, TagTone, ThemeColors};
+use swarm_ui::{IconButtonStyle, Scrollbar, StatusPill, TagTone, ThemeColors};
 
 use crate::actions::{
     CancelComment, CommentOnLine, CreatePullRequest, FILE_TREE_CONTEXT, NextFile, NextLine,
@@ -54,6 +54,8 @@ const CARD_GAP: f32 = 14.;
 const LINE_HEIGHT: f32 = 21.;
 const NUMBER_WIDTH: f32 = 40.;
 const SIGN_WIDTH: f32 = 14.;
+/// How far the add-comment button reaches into the gutter; the rest overlaps the code.
+const ADD_BUTTON_INSET: f32 = 6.;
 /// The place gives way long before the status pill does when the header is short.
 const PLACE_SHRINK: f32 = 1_000.;
 const NO_NEWLINE: &str = "No newline at end of file";
@@ -1580,6 +1582,11 @@ impl ReviewView {
 
         area.child(self.diff_body(colors, cx).size_full().child(rows))
             .children(sticky)
+            .child(Scrollbar::vertical(
+                "review-body-scrollbar",
+                "Changes",
+                self.body_list.clone(),
+            ))
             .into_any_element()
     }
 
@@ -2235,31 +2242,30 @@ fn pick_cell(
         })
 }
 
-/// The **+** in a line's gutter: it shows while the row is hovered. It covers the line
-/// number then, so the **+** never reads as part of the number.
+/// The **+** in a line's gutter: it shows while the row is hovered, at the right edge of
+/// the gutter, which is `gutter` wide.
 fn add_button(
     id: (&'static str, usize),
     ctx: &LineCtx,
     side: DiffSide,
     number: u32,
     group: &SharedString,
-    backdrop: gpui::Hsla,
+    gutter: f32,
 ) -> AnyElement {
     let view = ctx.view.clone();
     let pos = ctx.pos(side);
 
     div()
         .absolute()
-        .left_0()
         .top_0()
-        .w(px(NUMBER_WIDTH))
+        .left(px(gutter - ADD_BUTTON_INSET))
         .h(px(LINE_HEIGHT))
         .flex()
         .items_center()
-        .justify_center()
-        .group_hover(group.clone(), move |style| style.bg(backdrop))
         .child(
             IconButton::new(id, IconName::Plus, comment_label(side, number))
+                .size(IconButtonSize::XSmall)
+                .style(IconButtonStyle::Filled)
                 .debug_selector(move || format!("{}-{}", id.0, id.1))
                 .reveal_with_group(group.clone())
                 .skip_tab_stop()
@@ -2268,13 +2274,6 @@ fn add_button(
                 }),
         )
         .into_any_element()
-}
-
-/// The fill of a line as a solid color, for what must hide the line number.
-fn line_backdrop(tint: Option<gpui::Hsla>, colors: &ThemeColors) -> gpui::Hsla {
-    tint.map_or(colors.panel, |tint| {
-        swarm_ui::contrast::composite(colors.panel, tint)
-    })
 }
 
 fn unified_line(
@@ -2367,7 +2366,7 @@ fn unified_row(
                 side,
                 number,
                 &group,
-                line_backdrop(tint, colors),
+                NUMBER_WIDTH * 2.,
             ))
         });
 
@@ -2496,7 +2495,7 @@ fn split_line(
                             diff_side,
                             number,
                             &group,
-                            line_backdrop(tint, colors),
+                            NUMBER_WIDTH,
                         ))
                     });
 

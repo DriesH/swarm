@@ -362,21 +362,6 @@ pub(crate) fn toggle_spoken(link: &PrLink, status: Option<&PullRequest>) -> Stri
     }
 }
 
-/// The logins in a field: separated by commas or spaces, `@` dropped, no repeats.
-pub(crate) fn parse_logins(text: &str) -> Vec<String> {
-    let mut logins: Vec<String> = Vec::new();
-
-    for part in text.split([',', ' ', '\n', '\t']) {
-        let login = part.trim().trim_start_matches('@');
-
-        if !login.is_empty() && !logins.iter().any(|known| known.eq_ignore_ascii_case(login)) {
-            logins.push(login.to_owned());
-        }
-    }
-
-    logins
-}
-
 /// "412ms", "38s", "2m 10s", "1h 02m".
 pub(crate) fn format_duration(millis: u64) -> String {
     if millis < 1_000 {
@@ -479,7 +464,6 @@ pub(crate) enum DraftWait {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ActionKind {
     Ready,
-    Review,
     Merge,
 }
 
@@ -501,7 +485,6 @@ pub(crate) enum PanelAction {
 pub(crate) struct PrForm {
     pub(crate) title: Entity<TextInput>,
     pub(crate) description: Entity<TextArea>,
-    pub(crate) reviewers: Entity<TextInput>,
     /// What the last draft put in the fields. A field that differs was changed by the user.
     applied: Option<PrDraft>,
     /// A draft that came after the user changed a field.
@@ -516,7 +499,7 @@ pub(crate) struct PrForm {
     pub(crate) action: PanelAction,
     /// The closed pull request is being replaced, so the panel shows the new form.
     pub(crate) replacing: bool,
-    _subscriptions: [Subscription; 3],
+    _subscriptions: [Subscription; 2],
 }
 
 impl PrForm {
@@ -777,29 +760,14 @@ impl Workspace {
             area.set_rows(9, cx);
             area
         });
-        let reviewers = cx.new(|cx| {
-            let mut input = TextInput::new(cx);
-            input.set_label("Reviewers", cx);
-            input.set_placeholder("Logins", cx);
-            input.set_mono(true, cx);
-            input.set_size(swarm_ui::TextFieldSize::Small, cx);
-            input
-        });
-
         let on_title = cx.subscribe(&title, |_, _, _, cx| cx.notify());
         let on_description = cx.subscribe(&description, |_, _, _, cx| cx.notify());
-        let on_reviewers = cx.subscribe(&reviewers, move |this, _, event, cx| match event {
-            TextInputEvent::Changed(_) => cx.notify(),
-            TextInputEvent::Submitted(_) => this.request_pr_review(task, cx),
-        });
-
         let mut form = PrForm {
             title,
             description,
-            reviewers,
             applied: None,
             newer: None,
-            as_draft: true,
+            as_draft: crate::settings::open_pull_requests_as_draft(cx),
             close_after_merge: false,
             create: CreateStatus::Idle,
             draft_wait: DraftWait::Idle,
@@ -808,7 +776,7 @@ impl Workspace {
             method: MergeMethod::Squash,
             action: PanelAction::Idle,
             replacing: false,
-            _subscriptions: [on_title, on_description, on_reviewers],
+            _subscriptions: [on_title, on_description],
         };
 
         if let Some(draft) = self
@@ -1925,42 +1893,6 @@ impl Workspace {
         );
     }
 
-    /// Asks the logins in the reviewers field for a review.
-    pub(crate) fn request_pr_review(&mut self, task: TaskId, cx: &mut Context<Self>) {
-        let Some(id) = self.data.diff_id(task) else {
-            return;
-        };
-        let Some(form) = self.pull_requests.forms.get(&task) else {
-            return;
-        };
-
-        let logins = parse_logins(&form.reviewers.read(cx).text());
-        if logins.is_empty() {
-            return;
-        }
-
-        let reviewers = form.reviewers.clone();
-        let asked = logins.clone();
-
-        self.panel_call(
-            ActionKind::Review,
-            Box::new(move |client| client.request_review(id, logins)),
-            move |workspace| {
-                if let Some(status) = workspace.data.pull_requests.get_mut(&id) {
-                    status.reviewers.extend(asked.into_iter().map(|login| {
-                        swarm_protocol::Reviewer {
-                            login,
-                            state: ReviewState::Requested,
-                        }
-                    }));
-                }
-            },
-            cx,
-        );
-
-        reviewers.update(cx, |input, cx| input.set_text("", cx));
-    }
-
     pub(crate) fn merge_pull_request(&mut self, cx: &mut Context<Self>) {
         let task = self.active_task;
         let Some(id) = self.data.diff_id(task) else {
@@ -2091,6 +2023,17 @@ impl Workspace {
             None if self.data.approval_holds(task) => Some("Pull request".into()),
             None => None,
         }
+    }
+
+    /// The task has a pull request and it is a draft.
+    pub(crate) fn pull_request_is_draft(&self, task: TaskId) -> bool {
+        self.data
+            .task(task)
+            .is_some_and(|entry| entry.pull_request.is_some())
+            && self
+                .data
+                .pull_request_status(task)
+                .is_some_and(|status| status.draft)
     }
 
     /// What VoiceOver reads for the header's Pull request toggle.
@@ -2781,15 +2724,6 @@ mod tests {
         assert!(is_finished(Some(&with_state(PrState::Closed))));
         assert!(!is_finished(Some(&with_state(PrState::Open))));
         assert!(!is_finished(None));
-    }
-
-    #[test]
-    fn logins_are_split_cleaned_and_kept_once() {
-        assert_eq!(
-            parse_logins("@mara, jonas ,,MARA\nlee"),
-            ["mara", "jonas", "lee"]
-        );
-        assert!(parse_logins(" , ").is_empty());
     }
 
     #[test]

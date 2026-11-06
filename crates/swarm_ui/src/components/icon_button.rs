@@ -2,12 +2,15 @@ use gpui::{AnyElement, App, ClickEvent, ElementId, Pixels, Role, SharedString, W
 
 use crate::a11y::{accessible, ignore_press};
 use crate::component::{Component, example, example_group};
+use crate::contrast::composite;
 use crate::prelude::*;
-use crate::styles::focus_ring;
+use crate::styles::{filled_focus_ring, focus_ring};
 use crate::traits::ClickHandler;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum IconButtonSize {
+    /// 20px square, 14px icon: the add-comment button in a diff gutter.
+    XSmall,
     /// 24px square, 14px icon: tile header actions.
     #[default]
     Small,
@@ -19,6 +22,7 @@ impl IconButtonSize {
     /// The side of the button, in pixels.
     pub fn square(self) -> Pixels {
         match self {
+            Self::XSmall => px(20.),
             Self::Small => px(24.),
             Self::Medium => px(30.),
         }
@@ -26,17 +30,26 @@ impl IconButtonSize {
 
     fn icon(self) -> IconSize {
         match self {
-            Self::Small => IconSize::Medium,
+            Self::XSmall | Self::Small => IconSize::Medium,
             Self::Medium => IconSize::Large,
         }
     }
 
     fn radius(self) -> Pixels {
         match self {
-            Self::Small => px(5.),
+            Self::XSmall | Self::Small => px(5.),
             Self::Medium => px(7.),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IconButtonStyle {
+    /// No fill until hovered.
+    #[default]
+    Subtle,
+    /// An accent fill with the icon in the ground color.
+    Filled,
 }
 
 /// A button that shows only an icon. The label is required: VoiceOver reads it.
@@ -47,6 +60,7 @@ pub struct IconButton {
     icon: IconName,
     label: SharedString,
     size: IconButtonSize,
+    style: IconButtonStyle,
     debug_selector: Option<String>,
     color: Color,
     toggle_state: Option<bool>,
@@ -64,6 +78,7 @@ impl IconButton {
             icon,
             label: label.into(),
             size: IconButtonSize::default(),
+            style: IconButtonStyle::default(),
             color: Color::Faint,
             toggle_state: None,
             expanded: None,
@@ -77,6 +92,11 @@ impl IconButton {
 
     pub fn size(mut self, size: IconButtonSize) -> Self {
         self.size = size;
+        self
+    }
+
+    pub fn style(mut self, style: IconButtonStyle) -> Self {
+        self.style = style;
         self
     }
 
@@ -137,12 +157,25 @@ impl Toggleable for IconButton {
 impl RenderOnce for IconButton {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let colors = cx.theme().colors();
-        let (active, accent) = (colors.active, colors.accent);
+        let (active, accent, ground) = (colors.active, colors.accent, colors.ground);
+        let filled = self.style == IconButtonStyle::Filled;
+        // `shadow` is translucent black, so the hovered fill is darker in both themes.
+        let hover_fill = if filled {
+            composite(accent, colors.shadow)
+        } else {
+            active
+        };
 
         let pressed = self.toggle_state == Some(true);
         let reveals = self.reveal_group.is_some();
 
-        let color = if pressed { Color::Default } else { self.color };
+        let color = if filled {
+            Color::Inverse
+        } else if pressed {
+            Color::Default
+        } else {
+            self.color
+        };
 
         let disabled = self.disabled;
 
@@ -168,11 +201,16 @@ impl RenderOnce for IconButton {
             .justify_center()
             .size(self.size.square())
             .rounded(self.size.radius())
+            .when(filled, |button| button.bg(accent))
             .child(Icon::new(self.icon).size(self.size.icon()).color(color))
             .focusable()
             .tab_stop(self.tab_stop && !disabled)
             .focus_visible(|style| {
-                let style = focus_ring(style, accent);
+                let style = if filled {
+                    filled_focus_ring(style, accent, ground)
+                } else {
+                    focus_ring(style, accent)
+                };
 
                 if reveals { style.opacity(1.) } else { style }
             })
@@ -182,7 +220,7 @@ impl RenderOnce for IconButton {
                 } else {
                     button
                         .cursor_pointer()
-                        .hover(|style| style.bg(active))
+                        .hover(|style| style.bg(hover_fill))
                         .when_some(self.reveal_group.clone(), |button, group| {
                             button
                                 .opacity(0.)
@@ -249,6 +287,15 @@ impl Component for IconButton {
                 ],
             ))
             .child(example_group(
+                "Filled",
+                [example(
+                    "Add comment",
+                    IconButton::new("filled", IconName::Plus, "Comment on line 12")
+                        .size(IconButtonSize::XSmall)
+                        .style(IconButtonStyle::Filled),
+                )],
+            ))
+            .child(example_group(
                 "Disabled",
                 [example(
                     "Plus",
@@ -272,6 +319,11 @@ mod tests {
             h_flex()
                 .gap(px(8.))
                 .child(
+                    IconButton::new("xsmall", IconName::Plus, "XSmall")
+                        .size(IconButtonSize::XSmall)
+                        .debug_selector(|| "xsmall".to_owned()),
+                )
+                .child(
                     IconButton::new("small", IconName::Plus, "Small")
                         .debug_selector(|| "small".to_owned()),
                 )
@@ -284,21 +336,43 @@ mod tests {
     }
 
     #[test]
-    fn buttons_are_24_and_30_pixels_square() {
+    fn buttons_are_20_24_and_30_pixels_square() {
         let mut app = TestAppContext::single();
         app.update(crate::theme::init);
         let (_, cx) = app.add_window_view(|_, _| Buttons);
         cx.run_until_parked();
 
+        let xsmall = cx.debug_bounds("xsmall").map(|bounds| bounds.size);
         let small = cx.debug_bounds("small").map(|bounds| bounds.size);
         let medium = cx.debug_bounds("medium").map(|bounds| bounds.size);
 
+        assert_eq!(xsmall, Some(size(px(20.), px(20.))));
         assert_eq!(small, Some(size(px(24.), px(24.))));
         assert_eq!(medium, Some(size(px(30.), px(30.))));
     }
 
     #[test]
+    fn the_filled_icon_reaches_3_to_1_on_the_hovered_fill() {
+        use crate::contrast::{GRAPHIC_AA, contrast_ratio};
+        use crate::theme::{Accent, Theme};
+
+        for theme in [
+            Theme::light(),
+            Theme::dark(),
+            Theme::light().with_accent(Accent::Honey),
+            Theme::dark().with_accent(Accent::Honey),
+        ] {
+            let colors = theme.colors();
+            let hovered = composite(colors.accent, colors.shadow);
+            let ratio = contrast_ratio(colors.ground, hovered);
+
+            assert!(ratio >= GRAPHIC_AA, "{}: {ratio:.2}", theme.name());
+        }
+    }
+
+    #[test]
     fn icons_are_14_and_16_pixels() {
+        assert_eq!(IconButtonSize::XSmall.icon().pixels(), px(14.));
         assert_eq!(IconButtonSize::Small.icon().pixels(), px(14.));
         assert_eq!(IconButtonSize::Medium.icon().pixels(), px(16.));
     }

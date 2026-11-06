@@ -1030,13 +1030,6 @@ impl Client {
         )
     }
 
-    pub fn request_review(&self, task: TaskId, logins: Vec<String>) -> Result<(), ClientError> {
-        let timeout = self.reply_timeout.max(GIT_TIMEOUT);
-        let request = |call| Request::AddReviewers { call, task, logins };
-
-        self.done(request, "AddReviewers", timeout)
-    }
-
     /// Merges the pull request; with close after merge, the task may close too.
     pub fn merge_pr(&self, task: TaskId, method: MergeMethod) -> Result<(), ClientError> {
         let timeout = self.reply_timeout.max(MERGE_PR_TIMEOUT);

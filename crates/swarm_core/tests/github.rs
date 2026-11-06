@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use swarm_core::github::{Github, NewPullRequest, Target};
 use swarm_core::store::Store;
-use swarm_core::{Error, Projects, git};
+use swarm_core::{Projects, git};
 use swarm_protocol::{CreateTask, GithubCheckState, MergeMethod, PrLink, ReviewSource};
 
 static NEXT_FOLDER: AtomicU32 = AtomicU32::new(0);
@@ -862,7 +862,7 @@ fn the_status_reads_the_json_of_gh_pr_view() {
 }
 
 #[test]
-fn marking_ready_and_asking_reviewers_have_the_documented_arguments() {
+fn marking_ready_has_the_documented_arguments() {
     let gh = FakeGh::new("ready");
     let bin = Folder::new("ready-bin");
     let worktree = Folder::new("ready-worktree");
@@ -871,41 +871,8 @@ fn marking_ready_and_asking_reviewers_have_the_documented_arguments() {
     github
         .mark_ready(&target(worktree.path()), 42)
         .expect("ready");
-    github
-        .add_reviewers(
-            &target(worktree.path()),
-            42,
-            &["alice".to_owned(), "@bob-2".to_owned()],
-        )
-        .expect("reviewers");
 
-    assert_eq!(
-        gh.calls(),
-        [
-            vec!["pr", "ready", "42"],
-            vec!["pr", "edit", "42", "--add-reviewer", "alice,bob-2"],
-        ]
-    );
-}
-
-#[test]
-fn a_reviewer_that_is_not_a_login_never_reaches_gh() {
-    let gh = FakeGh::new("bad-login");
-    let bin = Folder::new("bad-login-bin");
-    let worktree = Folder::new("bad-login-worktree");
-    let github = github(&gh, bin.path());
-
-    for bad in ["--assignee", "a b", "", "alice,bob", "-x"] {
-        let result = github.add_reviewers(&target(worktree.path()), 1, &[bad.to_owned()]);
-        assert!(matches!(result, Err(Error::Invalid(_))), "{bad:?}");
-    }
-    assert!(
-        github
-            .add_reviewers(&target(worktree.path()), 1, &[])
-            .is_err()
-    );
-
-    assert!(gh.calls().is_empty());
+    assert_eq!(gh.calls(), [vec!["pr", "ready", "42"]]);
 }
 
 #[test]

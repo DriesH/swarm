@@ -580,22 +580,6 @@ pub(crate) fn mark_ready(services: &Services, id: TaskId) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn add_reviewers(services: &Services, id: TaskId, logins: &[String]) -> Result<()> {
-    let _busy = services.pull_requests.begin(id)?;
-    let (task, number, repository) = open_pull_request(services, id)?;
-
-    services.pull_requests.github.add_reviewers(
-        &Target {
-            worktree: &task.worktree,
-            repository: &repository,
-        },
-        number,
-        logins,
-    )?;
-
-    Ok(())
-}
-
 /// Merges on GitHub, but only the commit Swarm pushed, and checks that it really merged.
 /// Then the remote branch goes. With "close after merge" the task closes as Close task
 /// does, unless that would lose uncommitted files or local commits that are not in the
