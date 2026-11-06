@@ -228,7 +228,7 @@ A PR can only be created after the task is approved in Review. This makes the us
 
 1. **Review → Approve.** The Approve button turns into **Create PR**.
 2. **Create PR** opens the PR panel on the right (a header toggle next to Files and Changes): title and description drafted by the orchestrator (`pr.md` prompt), **local checks** from `.swarm/config.toml` (run in the task worktree; the PR can only be created when they pass), open as draft. Uses `gh`; pushes the branch first.
-3. **After creation** the header button shows the live PR state, e.g. **#42 · checks running** or **#42 · ready to merge**. Its panel shows **GitHub checks** (CI on the pushed branch, read through `gh`), reviewers, Ready for review, Merge, and after-merge options (remove agent worktrees, close the tab).
+3. **After creation** the header button shows the live PR state, e.g. **#42 · checks running** or **#42 · ready to merge**. Its panel shows **GitHub checks** (CI on the pushed branch, read through `gh`), Ready for review, Merge, and after-merge options (remove agent worktrees, close the tab).
 
 Other ways in: ⌘K "Create pull request"; `swarm pr draft` from the orchestrator opens the panel with its draft (still only after approval).
 

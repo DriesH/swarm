@@ -17,7 +17,7 @@ Swarm pushes the task branch first, exactly the commit you approved. The reposit
 
 The panel also has two options.
 
-- **Open as draft**: on by default.
+- **Open as draft**: on by default. Change the default in [Settings › General](/swarm/docs/settings/#general). With it on, the panel shows the draft pull request icon.
 - **Close the task after merge**: off by default.
 
 ### What keeps Create PR off
@@ -72,7 +72,6 @@ The **Pull request** button in the title bar shows the pull request number and i
 
 - **Open on GitHub**, the title, and a **Draft**, **Merged** or **Closed** tag
 - **GitHub checks**, read through `gh`, with a count such as `3 / 5`
-- **Reviewers**, with each state (**Requested**, **Approved**, **Changes requested**, **Commented**). Type GitHub logins, separated by commas or spaces, and click **Request review**.
 - **After merge**: **Close the task after merge** and **Merge method**
 
 Swarm reads the status with `gh pr view`: every 10 seconds while GitHub checks run, every 30 seconds otherwise, and every 60 seconds while the panel is hidden.
