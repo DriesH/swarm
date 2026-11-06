@@ -97,11 +97,16 @@ pub(crate) fn create(
         mut task,
         setup,
         env,
-    } = services.projects.create_task_by(request, created_by)?;
+        switched_project_folder,
+    } = services
+        .projects
+        .create_task_by(request, created_by, &services.agents.branch_prefix())?;
 
     // A removal that began while the task was made did not see it.
     if services.agents.is_removing(task.project) {
-        services.projects.discard_task(&task);
+        services
+            .projects
+            .discard_task(&task, switched_project_folder);
 
         bail!("the project is being removed");
     }
@@ -118,7 +123,9 @@ pub(crate) fn create(
                     Some(info.id)
                 }
                 Err(error) => {
-                    services.projects.discard_task(&task);
+                    services
+                        .projects
+                        .discard_task(&task, switched_project_folder);
 
                     return Err(error.context("cannot record the orchestrator"));
                 }
@@ -272,10 +279,7 @@ fn stop_and_close(
         if !deleting {
             report_step(services, id, CloseStep::DeletingBranch);
         }
-        if let Err(error) = services
-            .projects
-            .delete_merged_branch(closed.task.project, branch)
-        {
+        if let Err(error) = services.projects.delete_merged_branch(&closed.task, branch) {
             log::warn!("cannot delete the merged branch {branch}: {error}");
         }
     }

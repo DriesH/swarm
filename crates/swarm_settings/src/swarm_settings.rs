@@ -24,6 +24,7 @@ pub struct Settings {
     pub appearance: AppearanceSettings,
     pub updates: UpdateSettings,
     pub pull_requests: PullRequestSettings,
+    pub tasks: TaskSettings,
 }
 
 impl<'de> Deserialize<'de> for Settings {
@@ -56,6 +57,7 @@ impl Settings {
             appearance: AppearanceSettings::read(root.child("appearance")),
             updates: UpdateSettings::read(root.child("updates")),
             pull_requests: PullRequestSettings::read(root.child("pull_requests")),
+            tasks: TaskSettings::read(root.child("tasks")),
         }
     }
 }
@@ -189,6 +191,31 @@ impl PullRequestSettings {
 
         Self {
             open_as_draft: section.take("open_as_draft", defaults.open_as_draft, BOOL),
+        }
+    }
+}
+
+/// How new tasks are named.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct TaskSettings {
+    /// Starts the branch of a new task, before the slug of its name. May be empty.
+    pub branch_prefix: String,
+}
+
+impl Default for TaskSettings {
+    fn default() -> Self {
+        Self {
+            branch_prefix: "swarm/".to_owned(),
+        }
+    }
+}
+
+impl TaskSettings {
+    fn read(mut section: Section<'_>) -> Self {
+        let defaults = Self::default();
+
+        Self {
+            branch_prefix: section.take("branch_prefix", defaults.branch_prefix, TEXT),
         }
     }
 }
@@ -786,6 +813,11 @@ pub fn save(path: &Path, settings: &Settings) -> Result<(), SettingsError> {
         "open_as_draft",
         Value::from(settings.pull_requests.open_as_draft),
     );
+    set_value(
+        table_mut(document.as_table_mut(), "tasks"),
+        "branch_prefix",
+        Value::from(settings.tasks.branch_prefix.as_str()),
+    );
 
     if let Some(folder) = path.parent() {
         std::fs::create_dir_all(folder).map_err(io_error)?;
@@ -1145,6 +1177,55 @@ mod tests {
         std::fs::remove_dir_all(&folder).unwrap();
 
         assert_eq!(loaded.pull_requests, settings.pull_requests);
+    }
+
+    #[test]
+    fn the_branch_prefix_defaults_to_swarm() {
+        let settings: Settings = toml::from_str("").unwrap();
+
+        assert_eq!(settings.tasks.branch_prefix, "swarm/");
+    }
+
+    #[test]
+    fn the_branch_prefix_round_trips_through_a_file() {
+        let folder = temp_folder("tasks");
+        let path = folder.join("settings.toml");
+        let mut settings = Settings::default();
+        settings.tasks.branch_prefix = "dries/".to_owned();
+
+        save(&path, &settings).unwrap();
+        let loaded = load(&path).unwrap();
+        std::fs::remove_dir_all(&folder).unwrap();
+
+        assert_eq!(loaded.tasks, settings.tasks);
+    }
+
+    #[test]
+    fn an_empty_branch_prefix_stays_empty() {
+        let folder = temp_folder("tasks-empty");
+        let path = folder.join("settings.toml");
+        let mut settings = Settings::default();
+        settings.tasks.branch_prefix = String::new();
+
+        save(&path, &settings).unwrap();
+        let loaded = load(&path).unwrap();
+        std::fs::remove_dir_all(&folder).unwrap();
+
+        assert_eq!(loaded.tasks.branch_prefix, "");
+    }
+
+    #[test]
+    fn a_branch_prefix_of_the_wrong_type_falls_back_with_a_warning() {
+        let (settings, warnings) =
+            load_text("tasks-wrong-type", "[tasks]\nbranch_prefix = 3\n").unwrap();
+
+        assert_eq!(settings.tasks.branch_prefix, "swarm/");
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.starts_with("tasks.branch_prefix: ")),
+            "{warnings:?}"
+        );
     }
 
     fn temp_folder(name: &str) -> PathBuf {

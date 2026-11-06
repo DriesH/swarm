@@ -13,7 +13,7 @@ use swarm_core::{Error, Projects, WorkerCheckout, git};
 use swarm_protocol::{
     AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, CreateTask, DIFF_FILES,
     DIFF_LINE_BYTES, DIFF_LINES, DIFF_LINES_PER_FILE, DiffLineKind, FOLD_LINES, FileChange,
-    FileDiff, Fold, ReviewSource, TaskDiff, TaskInfo,
+    FileDiff, Fold, ReviewSource, TaskBranch, TaskDiff, TaskInfo,
 };
 
 static NEXT_FOLDER: AtomicU32 = AtomicU32::new(0);
@@ -114,14 +114,20 @@ fn setup_with(config: &str, files: &[(&str, &[u8])]) -> Setup {
     let (projects, store) = shared_projects();
     let project = projects.add(&repo.root).expect("add");
     let task = projects
-        .create_task(&CreateTask {
-            project: project.id,
-            name: "Login".to_owned(),
-            from: None,
-            run_setup: false,
-            orchestrator: None,
-            first_message: None,
-        })
+        .create_task(
+            &CreateTask {
+                project: project.id,
+                name: "Login".to_owned(),
+                branch: TaskBranch::New {
+                    name: None,
+                    from: None,
+                },
+                run_setup: false,
+                orchestrator: None,
+                first_message: None,
+            },
+            "swarm/",
+        )
         .expect("task")
         .task;
 
@@ -705,6 +711,7 @@ fn a_fingerprint_with_the_top_bit_set_survives_the_database() {
             pr_base: "main",
             worktree: Path::new("/repo/.worktrees/t"),
             ports: &[],
+            branch_source: swarm_protocol::BranchSource::Derived,
         })
         .expect("task");
 

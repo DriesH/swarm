@@ -912,6 +912,11 @@ impl Agents {
         .ok_or_else(|| CommandNotFound(command.to_owned()))
     }
 
+    /// The start of the branch of a new task, from the settings.
+    pub(crate) fn branch_prefix(&self) -> String {
+        self.settings().tasks.branch_prefix
+    }
+
     /// The agent kind the settings pick for orchestrators.
     pub(crate) fn default_kind(&self) -> AgentKind {
         self.settings().agents.orchestrator.into()
@@ -2985,6 +2990,7 @@ mod tests {
                 pr_base: "main",
                 worktree: Path::new("/repo/.worktrees/task"),
                 ports: &[],
+                branch_source: swarm_protocol::BranchSource::Derived,
             })
             .expect("task");
         let store = Arc::new(Mutex::new(store));
@@ -3630,6 +3636,7 @@ mod tests {
                     pr_base: "main",
                     worktree: Path::new("/other/.worktrees/other"),
                     ports: &[],
+                    branch_source: swarm_protocol::BranchSource::Derived,
                 })
                 .expect("other task");
 

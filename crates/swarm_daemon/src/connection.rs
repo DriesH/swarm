@@ -335,6 +335,7 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
         | Request::ResumeAgent { .. }
         | Request::PlanDraft { .. }
         | Request::SavePlanDraft { .. }
+        | Request::TaskBranches { .. }
         | Request::CreateTask { .. }) => handle_projects(services, sink, request),
     }
 }
@@ -456,6 +457,24 @@ impl SystemChecks {
 }
 
 /// Projects and the tasks made in them.
+fn task_branches(
+    projects: &Arc<Projects>,
+    sink: &Arc<ClientSink>,
+    call: CallId,
+    project: swarm_protocol::ProjectId,
+) {
+    let projects = Arc::clone(projects);
+
+    run_slow(sink, "task-branches", call, move |sink| {
+        match projects.task_branches(project) {
+            Ok(branches) => {
+                sink.send_event(&Event::TaskBranches { call, branches });
+            }
+            Err(error) => send_error(sink, call, &error),
+        }
+    });
+}
+
 fn handle_projects(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
     let projects = &services.projects;
 
@@ -476,6 +495,9 @@ fn handle_projects(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Re
                     Err(error) => send_error(sink, call, &error),
                 }
             });
+        }
+        Request::TaskBranches { call, project } => {
+            task_branches(projects, sink, call, project);
         }
         Request::CheckRemoveProject { call, project } => {
             let services = Arc::clone(services);

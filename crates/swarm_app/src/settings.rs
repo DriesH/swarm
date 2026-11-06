@@ -2,7 +2,7 @@
 
 mod general_page;
 mod keyboard_page;
-mod pages;
+pub(crate) mod pages;
 mod project;
 mod prompts_page;
 mod terminals_page;
@@ -438,6 +438,7 @@ struct Inputs {
     agents: [CliInputs; 2],
     max_agents_per_task: Entity<TextInput>,
     max_agents_total: Entity<TextInput>,
+    branch_prefix: Entity<TextInput>,
     projects: Vec<ProjectInputs>,
 }
 
@@ -628,6 +629,7 @@ impl SettingsWindow {
         }
 
         let agents = state.read(cx).settings.agents.clone();
+        let tasks = state.read(cx).settings.tasks.clone();
         let projects = state.read(cx).projects.clone();
 
         let agent_inputs = Self::agent_inputs(&state, &agents, &mut subscriptions, cx);
@@ -643,6 +645,14 @@ impl SettingsWindow {
 
                 state.max_agents_per_task_invalid
             },
+            cx,
+        );
+        let branch_prefix = field("Branch prefix", &tasks.branch_prefix, true, cx);
+        bind_text(
+            &mut subscriptions,
+            &branch_prefix,
+            &state,
+            |state, text| state.settings.tasks.branch_prefix = text,
             cx,
         );
         let max_agents_total = limit_field(
@@ -679,6 +689,7 @@ impl SettingsWindow {
                 agents: agent_inputs,
                 max_agents_per_task,
                 max_agents_total,
+                branch_prefix,
                 projects: Vec::new(),
             },
             prompts: cx.new(|cx| PromptsPage::new(state.clone(), cx)),
@@ -2218,6 +2229,7 @@ mod tests {
                 "Button Allow notifications",
                 "Switch Check for updates automatically",
                 "Button Check now",
+                "TextInput Branch prefix",
                 "Switch Open as draft",
                 "Link Repository, vscode-icons on GitHub",
                 "Link License, CC BY-SA 4.0",
@@ -2601,6 +2613,59 @@ mod tests {
             state.settings.agents.codex.command.clone()
         });
         assert_eq!(command, "codex-dev");
+    }
+
+    fn type_in_branch_prefix(name: &str, text: &str, cx: &mut TestAppContext) -> String {
+        cx.update(swarm_ui::init);
+        let path = temp_path(name);
+        let state = open_with(&path, cx);
+        let window = cx.windows()[0]
+            .downcast::<SettingsWindow>()
+            .expect("settings window");
+        let input = window
+            .read_with(cx, |settings, _| settings.inputs.branch_prefix.clone())
+            .expect("window is open");
+        window
+            .update(cx, |settings, _, cx| {
+                settings.select_page(Page::General, cx);
+            })
+            .expect("window is open");
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        if !text.is_empty() {
+            input.update(&mut visual, |input, cx| input.set_text("", cx));
+        }
+        let focus = input.read_with(&visual, Focusable::focus_handle);
+        visual.update(|window, cx| window.focus(&focus, cx));
+
+        if text.is_empty() {
+            visual.simulate_keystrokes("cmd-a backspace");
+        } else {
+            visual.simulate_input(text);
+        }
+        state.update(&mut visual, SettingsState::save);
+
+        let saved = std::fs::read_to_string(&path).expect("read the file");
+        std::fs::remove_file(&path).ok();
+
+        saved
+    }
+
+    #[gpui::test]
+    fn typing_a_branch_prefix_saves_it(cx: &mut TestAppContext) {
+        let saved = type_in_branch_prefix("prefix-typed", "dries/", cx);
+
+        assert!(
+            saved.contains("[tasks]\nbranch_prefix = \"dries/\""),
+            "{saved}"
+        );
+    }
+
+    #[gpui::test]
+    fn clearing_the_branch_prefix_saves_an_empty_text(cx: &mut TestAppContext) {
+        let saved = type_in_branch_prefix("prefix-cleared", "", cx);
+
+        assert!(saved.contains("[tasks]\nbranch_prefix = \"\""), "{saved}");
     }
 
     fn notifications_page(

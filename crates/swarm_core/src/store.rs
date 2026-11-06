@@ -10,9 +10,10 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use swarm_protocol::agent::InboxMessage;
 use swarm_protocol::{
-    AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, Catch, CommentAnchor,
-    CommentId, CommentState, CreateTerminal, MessageId, MessageInfo, MessageKind, NewComment,
-    PrLink, ProjectId, ReviewComment, ReviewMark, TaskId, TaskInfo, TerminalId, TerminalKind,
+    AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, BranchSource, Catch,
+    CommentAnchor, CommentId, CommentState, CreateTerminal, MessageId, MessageInfo, MessageKind,
+    NewComment, PrLink, ProjectId, ReviewComment, ReviewMark, TaskId, TaskInfo, TerminalId,
+    TerminalKind,
 };
 use swarm_term::ExitStatus;
 
@@ -322,6 +323,8 @@ const MIGRATIONS: &[&str] = &[
     "UPDATE agents SET status = '\"Unknown\"', message = NULL
      WHERE status = '\"Error\"' AND message = 'Exited with code 129'
        AND lifecycle IN ('\"Resumable\"', '\"Stopped\"')",
+    // How a task's branch was made decides whether a rename renames it.
+    "ALTER TABLE tasks ADD COLUMN branch_source TEXT NOT NULL DEFAULT 'derived'",
 ];
 
 /// The hundredth merge is the one that makes the queen bee.
@@ -383,6 +386,7 @@ pub struct NewTask<'a> {
     pub pr_base: &'a str,
     pub worktree: &'a Path,
     pub ports: &'a [u16],
+    pub branch_source: BranchSource,
 }
 
 /// An agent to record. It starts `Unknown` and `Starting`.
@@ -759,8 +763,8 @@ impl Store {
 
         self.connection.execute(
             "INSERT INTO tasks (project, name, branch, base, worktree, ports, created_at,
-                 created_by, pr_base)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 created_by, pr_base, branch_source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 to_row(task.project.0)?,
                 task.name,
@@ -770,7 +774,8 @@ impl Store {
                 ports,
                 now_seconds(),
                 creator,
-                task.pr_base
+                task.pr_base,
+                branch_source_name(task.branch_source)
             ],
         )?;
 
@@ -793,6 +798,7 @@ impl Store {
             pr_base: task.pr_base.to_owned(),
             pull_request: None,
             close_after_merge: false,
+            branch_source: task.branch_source,
         })
     }
 
@@ -1838,7 +1844,7 @@ fn agent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAgent> {
 
 const TASK_COLUMNS: &str = "SELECT id, project, name, branch, base, worktree, ports,
     setup_terminal, setup_exit, created_by, briefed, approved, closed_at, pr_number, pr_url,
-    close_after_merge, pr_head, pr_base, approval_stale FROM tasks";
+    close_after_merge, pr_head, pr_base, approval_stale, branch_source FROM tasks";
 
 fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskInfo> {
     let id: i64 = row.get(0)?;
@@ -1854,6 +1860,7 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskInfo> {
     let pr_url: Option<String> = row.get(14)?;
     let pr_head: Option<String> = row.get(16)?;
     let pr_base: Option<String> = row.get(17)?;
+    let branch_source: String = row.get(19)?;
 
     Ok(TaskInfo {
         id: TaskId(id.unsigned_abs()),
@@ -1882,7 +1889,24 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskInfo> {
             head: pr_head.unwrap_or_default(),
         }),
         close_after_merge: row.get(15)?,
+        branch_source: parse_branch_source(&branch_source),
     })
+}
+
+fn branch_source_name(source: BranchSource) -> &'static str {
+    match source {
+        BranchSource::Derived => "derived",
+        BranchSource::Custom => "custom",
+        BranchSource::Existing => "existing",
+    }
+}
+
+fn parse_branch_source(name: &str) -> BranchSource {
+    match name {
+        "custom" => BranchSource::Custom,
+        "existing" => BranchSource::Existing,
+        _ => BranchSource::Derived,
+    }
 }
 
 fn join_ports(ports: &[u16]) -> String {
@@ -2042,6 +2066,7 @@ mod tests {
             pr_base: "develop",
             worktree: Path::new("/repo/.worktrees/fix-it"),
             ports,
+            branch_source: BranchSource::Derived,
         }
     }
 
@@ -2432,32 +2457,59 @@ mod tests {
 
     #[test]
     fn the_hangup_migration_clears_errors_of_ended_agents_stopped_with_129() {
-        let (store, task) = store_with_task();
-        let ended = |lifecycle, message: &str| {
-            let mut agent = store.add_agent(&new_agent(task)).expect("agent");
-            agent.lifecycle = lifecycle;
-            agent.status = AgentStatus::Error;
-            agent.message = Some(message.to_owned());
-            store.save_agent(&agent).expect("save");
-
-            agent.id
-        };
-        let stopped = ended(AgentLifecycle::Resumable, "Exited with code 129");
-        let crashed = ended(AgentLifecycle::Resumable, "Exited with code 1");
-        let running = ended(AgentLifecycle::Running, "Exited with code 129");
-        let before = i64::try_from(MIGRATIONS.len() - 1).expect("count");
-        store
-            .connection
-            .pragma_update(None, "user_version", before)
+        let hangup = MIGRATIONS
+            .iter()
+            .position(|migration| migration.contains("Exited with code 129"))
+            .expect("migration");
+        let connection = Connection::open_in_memory().expect("connection");
+        for migration in &MIGRATIONS[..hangup] {
+            connection.execute_batch(migration).expect("old schema");
+        }
+        connection
+            .pragma_update(None, "user_version", i64::try_from(hangup).expect("count"))
             .expect("version");
+        connection
+            .execute(
+                "INSERT INTO projects (path, name, added_at) VALUES ('/repo', 'repo', 1)",
+                [],
+            )
+            .expect("project");
+        connection
+            .execute(
+                "INSERT INTO tasks (project, name, branch, base, worktree, ports, created_at)
+                 VALUES (1, 'old', 'swarm/old', 'main', '/repo/.worktrees/old', '', 1)",
+                [],
+            )
+            .expect("task");
+        for (lifecycle, message) in [
+            ("Resumable", "Exited with code 129"),
+            ("Resumable", "Exited with code 1"),
+            ("Running", "Exited with code 129"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO agents (project, task, role, kind, model, status, message,
+                         lifecycle, created_at, name, worktree, branch)
+                     VALUES (1, 1, '\"Orchestrator\"', '\"ClaudeCode\"', 'model',
+                         '\"Error\"', ?1, ?2, 1, 'agent', '/repo/.worktrees/old', 'swarm/old')",
+                    params![message, format!("\"{lifecycle}\"")],
+                )
+                .expect("agent");
+        }
 
-        let store = Store::migrated(store.connection).expect("migrate");
-        let info = |id| store.agent(id).expect("query").expect("agent").info;
+        let store = Store::migrated(connection).expect("migrate");
+        let info = |id| {
+            store
+                .agent(AgentId(id))
+                .expect("query")
+                .expect("agent")
+                .info
+        };
 
-        assert_eq!(info(stopped).status, AgentStatus::Unknown);
-        assert_eq!(info(stopped).message, None);
-        assert_eq!(info(crashed).status, AgentStatus::Error);
-        assert_eq!(info(running).status, AgentStatus::Error);
+        assert_eq!(info(1).status, AgentStatus::Unknown);
+        assert_eq!(info(1).message, None);
+        assert_eq!(info(2).status, AgentStatus::Error);
+        assert_eq!(info(3).status, AgentStatus::Error);
     }
 
     #[test]
@@ -4154,5 +4206,52 @@ mod tests {
 
         assert_eq!(project.name, "repo");
         assert_eq!(store.plan_draft(project.id).expect("draft"), None);
+    }
+
+    #[test]
+    fn a_database_from_before_branch_sources_is_derived_and_a_new_row_keeps_its_source() {
+        let migration = MIGRATIONS
+            .iter()
+            .position(|migration| migration.contains("branch_source"))
+            .expect("migration");
+        let connection = Connection::open_in_memory().expect("connection");
+        for migration in &MIGRATIONS[..migration] {
+            connection.execute_batch(migration).expect("old schema");
+        }
+        connection
+            .pragma_update(
+                None,
+                "user_version",
+                i64::try_from(migration).expect("count"),
+            )
+            .expect("version");
+        connection
+            .execute(
+                "INSERT INTO projects (path, name, added_at) VALUES ('/repo', 'repo', 1)",
+                [],
+            )
+            .expect("project");
+        connection
+            .execute(
+                "INSERT INTO tasks (project, name, branch, base, worktree, ports, created_at)
+                 VALUES (1, 'old', 'swarm/old', 'main', '/repo/.worktrees/old', '', 1)",
+                [],
+            )
+            .expect("task");
+
+        let store = Store::migrated(connection).expect("migrated");
+        let added = store
+            .add_task(&NewTask {
+                name: "kept",
+                branch: "feature",
+                branch_source: BranchSource::Existing,
+                ..new_task(ProjectId(1), &[])
+            })
+            .expect("added");
+
+        let tasks = store.list_tasks(ProjectId(1)).expect("tasks");
+        assert_eq!(tasks[0].branch_source, BranchSource::Derived);
+        assert_eq!(added.branch_source, BranchSource::Existing);
+        assert_eq!(tasks[1].branch_source, BranchSource::Existing);
     }
 }

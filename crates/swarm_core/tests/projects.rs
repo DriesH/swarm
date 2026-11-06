@@ -12,8 +12,8 @@ use swarm_core::git;
 use swarm_core::store::{NewAgent, Store};
 use swarm_core::{Error, Projects, WorkerCheckout};
 use swarm_protocol::{
-    AgentChange, AgentId, AgentInfo, AgentKind, AgentRole, CreateTask, DiffStat, FileStat, PrLink,
-    ProjectId, TaskInfo,
+    AgentChange, AgentId, AgentInfo, AgentKind, AgentRole, BranchSource, CreateTask, DiffStat,
+    FileStat, PrLink, ProjectId, TaskBranch, TaskInfo,
 };
 
 static NEXT_FOLDER: AtomicU32 = AtomicU32::new(0);
@@ -133,7 +133,10 @@ fn request(project: ProjectId, name: &str) -> CreateTask {
     CreateTask {
         project,
         name: name.to_owned(),
-        from: None,
+        branch: TaskBranch::New {
+            name: None,
+            from: None,
+        },
         run_setup: true,
         orchestrator: None,
         first_message: None,
@@ -230,7 +233,7 @@ fn a_blank_configured_base_branch_counts_as_the_default_branch() {
 
     let project = projects.add(&repo.root).expect("add");
     let prepared = projects
-        .create_task(&request(project.id, "Blank base"))
+        .create_task(&request(project.id, "Blank base"), "swarm/")
         .expect("task");
 
     assert_eq!(git::default_base_branch(&repo.root, Some(" \t")), current);
@@ -246,7 +249,7 @@ fn a_task_gets_a_branch_a_worktree_and_copied_files() {
     let project = projects.add(&repo.root).expect("add");
 
     let prepared = projects
-        .create_task(&request(project.id, "Fix the login"))
+        .create_task(&request(project.id, "Fix the login"), "swarm/")
         .expect("task");
 
     let worktree = repo.root.join(".worktrees/fix-the-login");
@@ -268,10 +271,10 @@ fn the_worktree_folder_is_excluded_once() {
     let project = projects.add(&repo.root).expect("add");
 
     projects
-        .create_task(&request(project.id, "one"))
+        .create_task(&request(project.id, "one"), "swarm/")
         .expect("first");
     projects
-        .create_task(&request(project.id, "two"))
+        .create_task(&request(project.id, "two"), "swarm/")
         .expect("second");
 
     assert_eq!(exclude_lines(&repo), 1);
@@ -285,7 +288,7 @@ fn the_task_keeps_its_ports_and_environment() {
     let project = projects.add(&repo.root).expect("add");
 
     let prepared = projects
-        .create_task(&request(project.id, "one"))
+        .create_task(&request(project.id, "one"), "swarm/")
         .expect("task");
 
     assert_eq!(prepared.task.ports, [5170, 5171, 5172]);
@@ -313,11 +316,11 @@ fn the_second_task_gets_the_next_port_block() {
     let projects = projects();
     let project = projects.add(&repo.root).expect("add");
     projects
-        .create_task(&request(project.id, "one"))
+        .create_task(&request(project.id, "one"), "swarm/")
         .expect("first");
 
     let second = projects
-        .create_task(&request(project.id, "two"))
+        .create_task(&request(project.id, "two"), "swarm/")
         .expect("second");
 
     assert_eq!(second.task.ports, [5173, 5174, 5175]);
@@ -329,11 +332,11 @@ fn the_same_name_gets_a_numbered_branch() {
     let projects = projects();
     let project = projects.add(&repo.root).expect("add");
     projects
-        .create_task(&request(project.id, "Same"))
+        .create_task(&request(project.id, "Same"), "swarm/")
         .expect("first");
 
     let second = projects
-        .create_task(&request(project.id, "same"))
+        .create_task(&request(project.id, "same"), "swarm/")
         .expect("second");
 
     assert_eq!(second.task.branch, "swarm/same-2");
@@ -347,7 +350,7 @@ fn a_task_without_a_name_is_named_after_a_creature() {
     let project = projects.add(&repo.root).expect("add");
 
     let made = projects
-        .create_task(&request(project.id, "  "))
+        .create_task(&request(project.id, "  "), "swarm/")
         .expect("task");
 
     assert!(creatures::is_creature_slug(&made.task.name));
@@ -364,7 +367,7 @@ fn unnamed_tasks_skip_branches_in_use_and_then_get_a_number() {
     let names: Vec<String> = (0..creatures::CREATURES.len())
         .map(|_| {
             projects
-                .create_task(&request(project.id, ""))
+                .create_task(&request(project.id, ""), "swarm/")
                 .expect("task")
                 .task
                 .name
@@ -388,14 +391,14 @@ fn a_taken_creature_name_gets_another_creature_not_a_number() {
     let projects = projects();
     let project = projects.add(&repo.root).expect("add");
     projects
-        .create_task(&request(project.id, "apis-mellifera"))
+        .create_task(&request(project.id, "apis-mellifera"), "swarm/")
         .expect("first");
     repo.git(&["branch", "swarm/bombus-terrestris"]);
     std::fs::create_dir_all(repo.root.join(".worktrees/xylocopa-violacea")).expect("folder");
 
     for _ in 0..3 {
         let made = projects
-            .create_task(&request(project.id, "apis-mellifera"))
+            .create_task(&request(project.id, "apis-mellifera"), "swarm/")
             .expect("task");
 
         assert!(
@@ -419,7 +422,7 @@ fn no_setup_is_returned_when_not_asked_for() {
     let mut task = request(project.id, "one");
     task.run_setup = false;
 
-    let prepared = projects.create_task(&task).expect("task");
+    let prepared = projects.create_task(&task, "swarm/").expect("task");
 
     assert_eq!(prepared.setup, None);
 }
@@ -431,9 +434,12 @@ fn a_task_can_start_from_another_branch() {
     let projects = projects();
     let project = projects.add(&repo.root).expect("add");
     let mut task = request(project.id, "one");
-    task.from = Some("release".to_owned());
+    task.branch = TaskBranch::New {
+        name: None,
+        from: Some("release".to_owned()),
+    };
 
-    let prepared = projects.create_task(&task).expect("task");
+    let prepared = projects.create_task(&task, "swarm/").expect("task");
 
     assert_eq!(prepared.task.base, "release");
 }
@@ -444,7 +450,7 @@ fn tasks_are_listed_under_their_project() {
     let projects = projects();
     let project = projects.add(&repo.root).expect("add");
     projects
-        .create_task(&request(project.id, "one"))
+        .create_task(&request(project.id, "one"), "swarm/")
         .expect("task");
 
     let listed = projects.list().expect("list");
@@ -458,16 +464,16 @@ fn the_open_tasks_of_a_project_are_listed_oldest_first_and_closed_ones_are_not()
     let projects = projects();
     let project = projects.add(&repo.root).expect("add");
     let first = projects
-        .create_task(&request(project.id, "one"))
+        .create_task(&request(project.id, "one"), "swarm/")
         .expect("first")
         .task;
     let second = projects
-        .create_task(&request(project.id, "two"))
+        .create_task(&request(project.id, "two"), "swarm/")
         .expect("second")
         .task;
     projects.close_task(second.id).expect("closed");
     let third = projects
-        .create_task(&request(project.id, "three"))
+        .create_task(&request(project.id, "three"), "swarm/")
         .expect("third")
         .task;
 
@@ -529,13 +535,13 @@ fn a_full_port_range_fails_before_any_checkout() {
     let projects = projects();
     let project = projects.add(&repo.root).expect("add");
     projects
-        .create_task(&request(project.id, "one"))
+        .create_task(&request(project.id, "one"), "swarm/")
         .expect("first");
     projects
-        .create_task(&request(project.id, "two"))
+        .create_task(&request(project.id, "two"), "swarm/")
         .expect("second");
 
-    let result = projects.create_task(&request(project.id, "three"));
+    let result = projects.create_task(&request(project.id, "three"), "swarm/");
 
     assert!(matches!(result, Err(Error::NoFreePorts)));
     assert!(!repo.branches().contains(&"swarm/three".to_owned()));
@@ -551,11 +557,11 @@ fn ports_are_unique_across_projects() {
     let first = projects.add(&first_repo.root).expect("add");
     let second = projects.add(&second_repo.root).expect("add");
     projects
-        .create_task(&request(first.id, "one"))
+        .create_task(&request(first.id, "one"), "swarm/")
         .expect("first");
 
     let prepared = projects
-        .create_task(&request(second.id, "one"))
+        .create_task(&request(second.id, "one"), "swarm/")
         .expect("second");
 
     assert_eq!(prepared.task.ports, [5173, 5174, 5175]);
@@ -575,9 +581,12 @@ fn a_failure_after_the_worktree_leaves_nothing_behind() {
     let projects = projects();
     let project = projects.add(&repo.root).expect("add");
     let mut task = request(project.id, "one");
-    task.from = Some("release".to_owned());
+    task.branch = TaskBranch::New {
+        name: None,
+        from: Some("release".to_owned()),
+    };
 
-    let result = projects.create_task(&task);
+    let result = projects.create_task(&task, "swarm/");
 
     assert!(matches!(result, Err(Error::Io { .. })), "{result:?}");
     assert!(!repo.branches().contains(&"swarm/one".to_owned()));
@@ -591,7 +600,7 @@ fn a_broken_config_stops_task_creation() {
     let projects = projects();
     let project = projects.add(&repo.root).expect("add");
 
-    let result = projects.create_task(&request(project.id, "one"));
+    let result = projects.create_task(&request(project.id, "one"), "swarm/");
 
     let Err(Error::Invalid(message)) = result else {
         panic!("expected a config error, got {result:?}");
@@ -606,9 +615,12 @@ fn a_start_point_that_looks_like_an_option_is_refused() {
     let projects = projects();
     let project = projects.add(&repo.root).expect("add");
     let mut task = request(project.id, "one");
-    task.from = Some("--no-checkout".to_owned());
+    task.branch = TaskBranch::New {
+        name: None,
+        from: Some("--no-checkout".to_owned()),
+    };
 
-    let result = projects.create_task(&task);
+    let result = projects.create_task(&task, "swarm/");
 
     assert!(matches!(result, Err(Error::Invalid(_))), "{result:?}");
     assert!(!repo.branches().contains(&"swarm/one".to_owned()));
@@ -621,9 +633,12 @@ fn a_start_point_that_is_not_a_commit_is_refused() {
     let projects = projects();
     let project = projects.add(&repo.root).expect("add");
     let mut task = request(project.id, "one");
-    task.from = Some("no-such-branch".to_owned());
+    task.branch = TaskBranch::New {
+        name: None,
+        from: Some("no-such-branch".to_owned()),
+    };
 
-    let result = projects.create_task(&task);
+    let result = projects.create_task(&task, "swarm/");
 
     assert!(matches!(result, Err(Error::Invalid(_))), "{result:?}");
     assert!(!repo.root.join(".worktrees/one").exists());
@@ -638,7 +653,7 @@ fn a_worktree_folder_that_is_a_symlink_out_of_the_project_is_refused() {
     let projects = projects();
     let project = projects.add(&repo.root).expect("add");
 
-    let result = projects.create_task(&request(project.id, "one"));
+    let result = projects.create_task(&request(project.id, "one"), "swarm/");
 
     assert!(matches!(result, Err(Error::Invalid(_))), "{result:?}");
     assert_eq!(std::fs::read_dir(&outside.0).expect("read").count(), 0);
@@ -660,9 +675,12 @@ fn a_copy_does_not_write_through_a_symlinked_folder() {
     let projects = projects();
     let project = projects.add(&repo.root).expect("add");
     let mut task = request(project.id, "one");
-    task.from = Some("release".to_owned());
+    task.branch = TaskBranch::New {
+        name: None,
+        from: Some("release".to_owned()),
+    };
 
-    projects.create_task(&task).expect("task");
+    projects.create_task(&task, "swarm/").expect("task");
 
     assert_eq!(std::fs::read_dir(&outside.0).expect("read").count(), 0);
 }
@@ -682,9 +700,12 @@ fn a_copy_does_not_write_through_a_symlinked_file() {
     let projects = projects();
     let project = projects.add(&repo.root).expect("add");
     let mut task = request(project.id, "one");
-    task.from = Some("release".to_owned());
+    task.branch = TaskBranch::New {
+        name: None,
+        from: Some("release".to_owned()),
+    };
 
-    projects.create_task(&task).expect("task");
+    projects.create_task(&task, "swarm/").expect("task");
 
     assert_eq!(std::fs::read_to_string(&target).expect("read"), "old");
 }
@@ -693,7 +714,7 @@ fn a_copy_does_not_write_through_a_symlinked_file() {
 fn an_unknown_project_is_an_error() {
     let projects = projects();
 
-    let result = projects.create_task(&request(ProjectId(99), "one"));
+    let result = projects.create_task(&request(ProjectId(99), "one"), "swarm/");
 
     assert!(matches!(result, Err(Error::UnknownProject(99))));
 }
@@ -704,7 +725,7 @@ fn a_name_without_letters_is_an_error() {
     let projects = projects();
     let project = projects.add(&repo.root).expect("add");
 
-    let result = projects.create_task(&request(project.id, "???"));
+    let result = projects.create_task(&request(project.id, "???"), "swarm/");
 
     assert!(matches!(result, Err(Error::Invalid(_))));
 }
@@ -736,7 +757,7 @@ fn register_worker(
 fn task_with_a_commit(projects: &Projects, repo: &Repo) -> TaskInfo {
     let project = projects.add(&repo.root).expect("add");
     let task = projects
-        .create_task(&request(project.id, "Login"))
+        .create_task(&request(project.id, "Login"), "swarm/")
         .expect("task")
         .task;
     std::fs::write(task.worktree.join("task-file"), "from the task").expect("file");
@@ -995,11 +1016,11 @@ fn a_discarded_task_leaves_no_branch_folder_or_row() {
     let (projects, store) = shared_projects();
     let project = projects.add(&repo.root).expect("add");
     let task = projects
-        .create_task(&request(project.id, "login"))
+        .create_task(&request(project.id, "login"), "swarm/")
         .expect("task")
         .task;
 
-    projects.discard_task(&task);
+    projects.discard_task(&task, false);
 
     assert!(!repo.branches().contains(&task.branch));
     assert!(!task.worktree.exists());
@@ -1020,7 +1041,7 @@ fn a_task_made_by_an_agent_records_it() {
     let project = projects.add(&repo.root).expect("add");
 
     let task = projects
-        .create_task_by(&request(project.id, "login"), Some(AgentId(9)))
+        .create_task_by(&request(project.id, "login"), Some(AgentId(9)), "swarm/")
         .expect("task")
         .task;
 
@@ -1762,7 +1783,7 @@ fn task_named(projects: &Projects, repo: &Repo, name: &str) -> TaskInfo {
     let project = projects.add(&repo.root).expect("add");
 
     projects
-        .create_task(&request(project.id, name))
+        .create_task(&request(project.id, name), "swarm/")
         .expect("task")
         .task
 }
@@ -1775,7 +1796,7 @@ fn renaming_a_task_renames_its_branch_and_keeps_its_worktree_folder() {
     let worker = shared_worker(&projects, &store, &task, "api");
 
     let renamed = projects
-        .rename_task(task.id, "Clean up code")
+        .rename_task(task.id, "Clean up code", "swarm/")
         .expect("rename");
 
     assert_eq!(
@@ -1802,8 +1823,12 @@ fn a_task_can_be_renamed_more_than_once() {
     let projects = projects();
     let task = task_named(&projects, &repo, "one");
 
-    projects.rename_task(task.id, "two").expect("first");
-    let renamed = projects.rename_task(task.id, "three").expect("second");
+    projects
+        .rename_task(task.id, "two", "swarm/")
+        .expect("first");
+    let renamed = projects
+        .rename_task(task.id, "three", "swarm/")
+        .expect("second");
 
     assert_eq!(renamed.branch, "swarm/three");
 }
@@ -1817,7 +1842,7 @@ fn a_name_that_is_a_branch_or_an_open_task_is_refused() {
     repo.git(&["branch", "swarm/old-branch"]);
 
     for taken in ["old-branch", "other TASK", "other-task"] {
-        let result = projects.rename_task(task.id, taken);
+        let result = projects.rename_task(task.id, taken, "swarm/");
 
         assert!(matches!(result, Err(Error::Invalid(_))), "{taken}");
     }
@@ -1829,7 +1854,7 @@ fn a_name_without_letters_does_not_rename() {
     let projects = projects();
     let task = task_named(&projects, &repo, "one");
 
-    let result = projects.rename_task(task.id, "???");
+    let result = projects.rename_task(task.id, "???", "swarm/");
 
     assert!(matches!(result, Err(Error::Invalid(_))));
 }
@@ -1850,7 +1875,7 @@ fn a_task_with_a_pull_request_keeps_its_name() {
         .set_pull_request(task.id, &link, false)
         .expect("pull request");
 
-    let result = projects.rename_task(task.id, "two");
+    let result = projects.rename_task(task.id, "two", "swarm/");
 
     assert!(matches!(result, Err(Error::Invalid(_))));
 }
@@ -1862,7 +1887,7 @@ fn a_pushed_branch_keeps_its_name() {
     let task = task_named(&projects, &repo, "one");
     repo.git(&["config", "branch.swarm/one.merge", "refs/heads/swarm/one"]);
 
-    let result = projects.rename_task(task.id, "two");
+    let result = projects.rename_task(task.id, "two", "swarm/");
 
     assert!(matches!(result, Err(Error::Invalid(_))));
     assert!(repo.branches().contains(&"swarm/one".to_owned()));
@@ -1876,7 +1901,9 @@ fn a_branch_with_an_automatic_upstream_can_be_renamed() {
     repo.git(&["config", "branch.swarm/one.remote", "origin"]);
     repo.git(&["config", "branch.swarm/one.merge", "refs/heads/feature"]);
 
-    let renamed = projects.rename_task(task.id, "two").expect("rename");
+    let renamed = projects
+        .rename_task(task.id, "two", "swarm/")
+        .expect("rename");
 
     assert_eq!(renamed.branch, "swarm/two");
 }
@@ -1888,7 +1915,676 @@ fn a_branch_that_exists_on_origin_keeps_its_name() {
     let task = task_named(&projects, &repo, "one");
     repo.git(&["update-ref", "refs/remotes/origin/swarm/one", "HEAD"]);
 
-    let result = projects.rename_task(task.id, "two");
+    let result = projects.rename_task(task.id, "two", "swarm/");
 
     assert!(matches!(result, Err(Error::Invalid(_))));
+}
+
+fn branch_request(project: ProjectId, name: &str, branch: TaskBranch) -> CreateTask {
+    CreateTask {
+        branch,
+        ..request(project, name)
+    }
+}
+
+fn existing(name: &str, switch_project_folder: bool) -> TaskBranch {
+    TaskBranch::Existing {
+        name: name.to_owned(),
+        switch_project_folder,
+    }
+}
+
+fn named(name: &str) -> TaskBranch {
+    TaskBranch::New {
+        name: Some(name.to_owned()),
+        from: None,
+    }
+}
+
+/// A repository whose files are all committed or ignored, with its base branch set in the
+/// config so that it stays the base while another branch is checked out.
+fn clean_repo() -> (Repo, String) {
+    let repo = Repo::new("");
+    let base = repo.git(&["branch", "--show-current"]);
+    std::fs::write(
+        repo.root.join(".swarm/config.toml"),
+        format!("[worktrees]\nbase_branch = \"{base}\"\n"),
+    )
+    .expect("config");
+    let exclude = repo.root.join(".git/info/exclude");
+    std::fs::create_dir_all(exclude.parent().expect("folder")).expect("folder");
+    std::fs::write(exclude, ".swarm/\n.env\n").expect("exclude");
+
+    (repo, base)
+}
+
+/// A bare repository as `origin` of `repo`, with `branch` pushed.
+fn push_branch_to_origin(repo: &Repo, branch: &str) -> Outside {
+    let origin = Outside::new();
+    git_in(&origin.0, &["init", "-q", "--bare"]);
+    repo.git(&["remote", "add", "origin", origin.0.to_str().expect("utf8")]);
+    repo.git(&["branch", branch]);
+    repo.git(&["push", "-q", "origin", branch]);
+
+    origin
+}
+
+#[test]
+fn a_custom_branch_name_is_used_as_it_is() {
+    let repo = Repo::new("");
+    let projects = projects();
+    let project = projects.add(&repo.root).expect("add");
+
+    let task = projects
+        .create_task(
+            &branch_request(project.id, "Login", named("dries/login-fix")),
+            "swarm/",
+        )
+        .expect("task")
+        .task;
+
+    assert_eq!(task.branch, "dries/login-fix");
+    assert_eq!(task.branch_source, BranchSource::Custom);
+    assert_eq!(task.worktree, repo.root.join(".worktrees/login"));
+    assert!(repo.branches().contains(&"dries/login-fix".to_owned()));
+}
+
+#[test]
+fn a_custom_branch_name_that_exists_is_refused() {
+    let repo = Repo::new("");
+    repo.git(&["branch", "taken"]);
+    let projects = projects();
+    let project = projects.add(&repo.root).expect("add");
+
+    let result = projects.create_task(
+        &branch_request(project.id, "Login", named("taken")),
+        "swarm/",
+    );
+
+    assert!(matches!(result, Err(Error::Invalid(message)) if message.contains("already exists")));
+}
+
+#[test]
+fn an_invalid_custom_branch_name_is_refused() {
+    let repo = Repo::new("");
+    let projects = projects();
+    let project = projects.add(&repo.root).expect("add");
+
+    for bad in ["a..b", "-x", "has space", "@{-1}"] {
+        let result =
+            projects.create_task(&branch_request(project.id, "Login", named(bad)), "swarm/");
+
+        assert!(
+            matches!(result, Err(Error::Invalid(_))),
+            "{bad:?} was accepted"
+        );
+    }
+    assert!(!repo.root.join(".worktrees/login").exists());
+}
+
+#[test]
+fn an_empty_prefix_makes_the_branch_the_bare_slug() {
+    let repo = Repo::new("");
+    let projects = projects();
+    let project = projects.add(&repo.root).expect("add");
+
+    let task = projects
+        .create_task(&request(project.id, "Fix the login"), "")
+        .expect("task")
+        .task;
+
+    assert_eq!(task.branch, "fix-the-login");
+}
+
+#[test]
+fn a_custom_prefix_starts_the_branch() {
+    let repo = Repo::new("");
+    let projects = projects();
+    let project = projects.add(&repo.root).expect("add");
+
+    let task = projects
+        .create_task(&request(project.id, "Fix the login"), "dries/")
+        .expect("task")
+        .task;
+
+    assert_eq!(task.branch, "dries/fix-the-login");
+}
+
+#[test]
+fn a_prefix_that_makes_a_bad_branch_name_is_refused() {
+    let repo = Repo::new("");
+    let projects = projects();
+    let project = projects.add(&repo.root).expect("add");
+
+    let result = projects.create_task(&request(project.id, "Login"), "a..b/");
+
+    assert!(matches!(result, Err(Error::Invalid(_))));
+}
+
+#[test]
+fn an_existing_local_branch_gets_a_worktree_on_that_branch() {
+    let repo = Repo::new("");
+    repo.git(&["branch", "feature/login"]);
+    let base = repo.git(&["branch", "--show-current"]);
+    let branches_before = repo.branches();
+    let projects = projects();
+    let project = projects.add(&repo.root).expect("add");
+
+    let task = projects
+        .create_task(
+            &branch_request(project.id, "Login", existing("feature/login", false)),
+            "swarm/",
+        )
+        .expect("task")
+        .task;
+
+    assert_eq!(task.branch, "feature/login");
+    assert_eq!(task.branch_source, BranchSource::Existing);
+    assert_eq!(task.base, base);
+    assert_eq!(task.pr_base, base);
+    assert_eq!(repo.branches(), branches_before);
+    assert_eq!(
+        git_in(&task.worktree, &["branch", "--show-current"]),
+        "feature/login"
+    );
+}
+
+#[test]
+fn an_existing_branch_task_without_a_name_is_named_after_the_branch() {
+    let repo = Repo::new("");
+    repo.git(&["branch", "feature/login"]);
+    let projects = projects();
+    let project = projects.add(&repo.root).expect("add");
+
+    let task = projects
+        .create_task(
+            &branch_request(project.id, " ", existing(" feature/login ", false)),
+            "swarm/",
+        )
+        .expect("task")
+        .task;
+
+    assert_eq!(task.name, "feature/login");
+    assert_eq!(task.worktree, repo.root.join(".worktrees/feature-login"));
+}
+
+#[test]
+fn a_branch_checked_out_in_the_project_folder_needs_the_switch() {
+    let (repo, base) = clean_repo();
+    repo.git(&["switch", "-q", "-c", "feature"]);
+    let projects = projects();
+    let project = projects.add(&repo.root).expect("add");
+
+    let refused = projects.create_task(
+        &branch_request(project.id, "Login", existing("feature", false)),
+        "swarm/",
+    );
+    let task = projects
+        .create_task(
+            &branch_request(project.id, "Login", existing("feature", true)),
+            "swarm/",
+        )
+        .expect("task")
+        .task;
+
+    assert!(matches!(refused, Err(Error::Invalid(message)) if message.contains("project folder")));
+    assert_eq!(task.branch, "feature");
+    assert_eq!(repo.git(&["branch", "--show-current"]), base);
+}
+
+#[test]
+fn a_dirty_project_folder_is_not_switched() {
+    let (repo, _) = clean_repo();
+    repo.git(&["switch", "-q", "-c", "feature"]);
+    std::fs::write(repo.root.join("README.md"), "work").expect("file");
+    let projects = projects();
+    let project = projects.add(&repo.root).expect("add");
+
+    let result = projects.create_task(
+        &branch_request(project.id, "Login", existing("feature", true)),
+        "swarm/",
+    );
+
+    assert!(
+        matches!(result, Err(Error::Invalid(message)) if message.contains("uncommitted changes"))
+    );
+    assert_eq!(repo.git(&["branch", "--show-current"]), "feature");
+}
+
+#[test]
+fn an_untracked_file_does_not_stop_the_switch() {
+    let (repo, base) = clean_repo();
+    repo.git(&["switch", "-q", "-c", "feature"]);
+    std::fs::write(repo.root.join("notes.txt"), "mine").expect("file");
+    let projects = projects();
+    let project = projects.add(&repo.root).expect("add");
+
+    let task = projects
+        .create_task(
+            &branch_request(project.id, "Login", existing("feature", true)),
+            "swarm/",
+        )
+        .expect("task")
+        .task;
+
+    assert_eq!(task.branch, "feature");
+    assert_eq!(repo.git(&["branch", "--show-current"]), base);
+    assert!(repo.root.join("notes.txt").exists());
+}
+
+#[test]
+fn a_branch_checked_out_in_another_worktree_is_refused() {
+    let repo = Repo::new("");
+    let other = repo.root.join("elsewhere");
+    repo.git(&[
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "feature",
+        other.to_str().expect("utf8"),
+    ]);
+    let projects = projects();
+    let project = projects.add(&repo.root).expect("add");
+
+    let result = projects.create_task(
+        &branch_request(project.id, "Login", existing("feature", true)),
+        "swarm/",
+    );
+
+    assert!(
+        matches!(result, Err(Error::Invalid(message)) if message.contains("is checked out in"))
+    );
+}
+
+#[test]
+fn a_branch_only_on_origin_gets_a_local_tracking_branch() {
+    let repo = Repo::new("");
+    let _origin = push_branch_to_origin(&repo, "feature");
+    repo.git(&["branch", "-q", "-D", "feature"]);
+    let projects = projects();
+    let project = projects.add(&repo.root).expect("add");
+
+    let task = projects
+        .create_task(
+            &branch_request(project.id, "Login", existing("feature", false)),
+            "swarm/",
+        )
+        .expect("task")
+        .task;
+
+    assert_eq!(task.branch_source, BranchSource::Existing);
+    assert!(repo.branches().contains(&"feature".to_owned()));
+    assert!(git::tracks_own_name(&repo.root, "feature").expect("tracks"));
+}
+
+#[test]
+fn the_base_branch_and_a_branch_of_an_open_task_are_refused() {
+    let repo = Repo::new("");
+    let base = repo.git(&["branch", "--show-current"]);
+    let projects = projects();
+    let project = projects.add(&repo.root).expect("add");
+    let open = projects
+        .create_task(&request(project.id, "Login"), "swarm/")
+        .expect("task")
+        .task;
+
+    let base_refused = projects.create_task(
+        &branch_request(project.id, "Other", existing(&base, false)),
+        "swarm/",
+    );
+    let open_refused = projects.create_task(
+        &branch_request(project.id, "Other", existing(&open.branch, false)),
+        "swarm/",
+    );
+    let missing = projects.create_task(
+        &branch_request(project.id, "Other", existing("nope", false)),
+        "swarm/",
+    );
+
+    assert!(matches!(base_refused, Err(Error::Invalid(_))));
+    assert!(
+        matches!(open_refused, Err(Error::Invalid(message)) if message.contains("belongs to the task"))
+    );
+    assert!(matches!(missing, Err(Error::Invalid(_))));
+}
+
+#[test]
+fn closing_an_existing_branch_task_keeps_a_merged_branch() {
+    let repo = Repo::new("");
+    repo.git(&["branch", "feature"]);
+    let projects = projects();
+    let project = projects.add(&repo.root).expect("add");
+    let task = projects
+        .create_task(
+            &branch_request(project.id, "Login", existing("feature", false)),
+            "swarm/",
+        )
+        .expect("task")
+        .task;
+
+    let check = projects.close_check(task.id).expect("check");
+    projects.close_task(task.id).expect("close");
+
+    assert!(check.merged_branches.is_empty());
+    assert!(repo.branches().contains(&"feature".to_owned()));
+    assert!(!task.worktree.exists());
+}
+
+#[test]
+fn discarding_an_existing_branch_task_keeps_the_local_branch() {
+    let repo = Repo::new("");
+    repo.git(&["branch", "feature"]);
+    let projects = projects();
+    let project = projects.add(&repo.root).expect("add");
+    let task = projects
+        .create_task(
+            &branch_request(project.id, "Login", existing("feature", false)),
+            "swarm/",
+        )
+        .expect("task")
+        .task;
+
+    projects.discard_task(&task, false);
+
+    assert!(repo.branches().contains(&"feature".to_owned()));
+    assert!(!task.worktree.exists());
+}
+
+#[test]
+fn renaming_keeps_an_existing_branch_and_a_custom_branch() {
+    let repo = Repo::new("");
+    repo.git(&["branch", "feature"]);
+    let projects = projects();
+    let project = projects.add(&repo.root).expect("add");
+    let continued = projects
+        .create_task(
+            &branch_request(project.id, "Login", existing("feature", false)),
+            "swarm/",
+        )
+        .expect("task")
+        .task;
+    let custom = projects
+        .create_task(
+            &branch_request(project.id, "Menu", named("dries/menu")),
+            "swarm/",
+        )
+        .expect("task")
+        .task;
+
+    let continued = projects
+        .rename_task(continued.id, "Sign in", "swarm/")
+        .expect("rename");
+    let custom = projects
+        .rename_task(custom.id, "Navigation", "swarm/")
+        .expect("rename");
+
+    assert_eq!(
+        (continued.name.as_str(), continued.branch.as_str()),
+        ("Sign in", "feature")
+    );
+    assert_eq!(
+        (custom.name.as_str(), custom.branch.as_str()),
+        ("Navigation", "dries/menu")
+    );
+}
+
+#[test]
+fn renaming_still_renames_a_derived_branch_with_the_given_prefix() {
+    let repo = Repo::new("");
+    let projects = projects();
+    let project = projects.add(&repo.root).expect("add");
+    let task = projects
+        .create_task(&request(project.id, "one"), "dries/")
+        .expect("task")
+        .task;
+
+    let renamed = projects
+        .rename_task(task.id, "two", "dries/")
+        .expect("rename");
+
+    assert_eq!(renamed.branch, "dries/two");
+}
+
+#[test]
+fn task_branches_lists_local_then_remote_only_branches() {
+    let (repo, base) = clean_repo();
+    let outside = Outside::new();
+    let _origin = push_branch_to_origin(&repo, "remote-one");
+    repo.git(&["branch", "-q", "-D", "remote-one"]);
+    repo.git(&["branch", "local-one"]);
+    repo.git(&["branch", "busy"]);
+    let other = outside.0.join("elsewhere");
+    repo.git(&[
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "away",
+        other.to_str().expect("utf8"),
+    ]);
+    std::fs::write(repo.root.join("README.md"), "work").expect("file");
+    std::fs::write(repo.root.join("scratch.txt"), "work").expect("file");
+    let (projects, store) = shared_projects();
+    let project = projects.add(&repo.root).expect("add");
+    let busy = projects
+        .create_task(
+            &branch_request(project.id, "Busy", existing("busy", false)),
+            "swarm/",
+        )
+        .expect("task")
+        .task;
+
+    let worker = projects
+        .create_worker(&busy, "api", |checkout| register_worker(&store, checkout))
+        .expect("worker")
+        .agent;
+
+    let list = projects.task_branches(project.id).expect("list");
+
+    let names: Vec<&str> = list
+        .branches
+        .iter()
+        .map(|branch| branch.name.as_str())
+        .collect();
+    assert!(!names.contains(&base.as_str()));
+    assert_eq!(names.last(), Some(&"remote-one"));
+    assert_eq!(names.len(), 5);
+    let find = |name: &str| list.branches.iter().find(|branch| branch.name == name);
+    assert_eq!(find("busy").and_then(|branch| branch.task), Some(busy.id));
+    assert_eq!(
+        find("busy").and_then(|branch| branch.checked_out.clone()),
+        Some(busy.worktree.clone())
+    );
+    assert_eq!(
+        find(&worker.branch).and_then(|branch| branch.task),
+        Some(busy.id)
+    );
+    assert!(find("away").is_some_and(|branch| branch.checked_out.is_some()));
+    assert_eq!(
+        find("remote-one").map(|branch| branch.remote_only),
+        Some(true)
+    );
+    assert_eq!(
+        find("local-one").map(|branch| branch.remote_only),
+        Some(false)
+    );
+    assert_eq!(list.project_folder, repo.root);
+    assert_eq!(list.project_folder_changes, 1);
+    assert_eq!(list.base_branch, base);
+}
+
+#[test]
+fn the_git_helpers_read_branches_and_worktrees() {
+    let repo = Repo::new("");
+    let base = repo.git(&["branch", "--show-current"]);
+    let _origin = push_branch_to_origin(&repo, "feature");
+    let other = repo.root.join("elsewhere");
+    repo.git(&[
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "away",
+        other.to_str().expect("utf8"),
+    ]);
+
+    let current = git::current_branch(&repo.root).expect("current");
+    let origin = git::origin_branches(&repo.root).expect("origin");
+    let worktrees = git::worktree_branches(&repo.root).expect("worktrees");
+    repo.git(&["switch", "-q", "--detach"]);
+    let detached = git::current_branch(&repo.root).expect("detached");
+    git::switch_branch(&repo.root, &base).expect("switch");
+    let refused = git::switch_branch(&repo.root, "--detach");
+
+    assert_eq!(current.as_deref(), Some(base.as_str()));
+    assert_eq!(origin, vec!["feature".to_owned()]);
+    assert_eq!(
+        worktrees
+            .get("away")
+            .map(|path| path.ends_with("elsewhere")),
+        Some(true)
+    );
+    assert!(worktrees.contains_key(&base));
+    assert_eq!(detached, None);
+    assert!(refused.is_err());
+    assert_eq!(repo.git(&["branch", "--show-current"]), base);
+}
+
+#[test]
+fn a_branch_name_is_checked_by_git() {
+    let repo = Repo::new("");
+
+    assert!(git::check_branch_name(&repo.root, "dries/fix-1").is_ok());
+    assert!(git::check_branch_name(&repo.root, "a..b").is_err());
+    assert!(git::check_branch_name(&repo.root, "--x").is_err());
+}
+
+#[test]
+fn two_tasks_with_one_name_get_numbered_branches_and_a_rename_follows_the_name() {
+    let repo = Repo::new("");
+    let projects = projects();
+    let project = projects.add(&repo.root).expect("add");
+    projects
+        .create_task(&request(project.id, "Login"), "swarm/")
+        .expect("first");
+    let second = projects
+        .create_task(&request(project.id, "Login"), "swarm/")
+        .expect("second")
+        .task;
+
+    let renamed = projects
+        .rename_task(second.id, "Signup", "swarm/")
+        .expect("rename");
+
+    assert_eq!(second.branch, "swarm/login-2");
+    assert_eq!(second.branch_source, BranchSource::Derived);
+    assert_eq!(renamed.branch, "swarm/signup");
+}
+
+#[test]
+fn discarding_a_task_made_with_the_switch_puts_the_project_folder_back() {
+    let (repo, base) = clean_repo();
+    repo.git(&["switch", "-q", "-c", "feature"]);
+    let projects = projects();
+    let project = projects.add(&repo.root).expect("add");
+    let prepared = projects
+        .create_task(
+            &branch_request(project.id, "Login", existing("feature", true)),
+            "swarm/",
+        )
+        .expect("task");
+    assert!(prepared.switched_project_folder);
+    assert_eq!(repo.git(&["branch", "--show-current"]), base);
+
+    projects.discard_task(&prepared.task, prepared.switched_project_folder);
+
+    assert_eq!(repo.git(&["branch", "--show-current"]), "feature");
+    assert!(repo.branches().contains(&"feature".to_owned()));
+    assert!(!prepared.task.worktree.exists());
+}
+
+#[test]
+fn a_tag_named_like_a_branch_does_not_change_the_branch_name() {
+    let repo = Repo::new("");
+    repo.git(&["branch", "foo"]);
+    repo.git(&["tag", "foo"]);
+    let _origin = push_branch_to_origin(&repo, "bar");
+    repo.git(&["tag", "bar"]);
+
+    let local = git::local_branches(&repo.root).expect("local");
+    let origin = git::origin_branches(&repo.root).expect("origin");
+
+    assert!(local.contains(&"foo".to_owned()));
+    assert!(!local.iter().any(|name| name.starts_with("heads/")));
+    assert_eq!(origin, vec!["bar".to_owned()]);
+}
+
+#[test]
+fn a_project_added_through_a_symlink_marks_its_own_folder() {
+    let (repo, base) = clean_repo();
+    repo.git(&["switch", "-q", "-c", "feature"]);
+    let outside = Outside::new();
+    let link = outside.0.join("link");
+    std::os::unix::fs::symlink(&repo.root, &link).expect("symlink");
+    let projects = projects();
+    let project = projects.add(&link).expect("add");
+
+    let list = projects.task_branches(project.id).expect("list");
+    let task = projects
+        .create_task(
+            &branch_request(project.id, "Login", existing("feature", true)),
+            "swarm/",
+        )
+        .expect("task")
+        .task;
+
+    let feature = list.branches.iter().find(|branch| branch.name == "feature");
+    assert!(feature.is_some_and(|branch| branch.in_project_folder));
+    assert_eq!(task.branch, "feature");
+    assert_eq!(repo.git(&["branch", "--show-current"]), base);
+}
+
+#[test]
+fn a_prefix_that_makes_no_branch_name_is_explained() {
+    let repo = Repo::new("");
+    let projects = projects();
+    let project = projects.add(&repo.root).expect("add");
+    let task = projects
+        .create_task(&request(project.id, "one"), "swarm/")
+        .expect("task")
+        .task;
+
+    let created = projects.create_task(&request(project.id, "two"), "a..b/");
+    let renamed = projects.rename_task(task.id, "three", "a..b/");
+
+    assert!(
+        matches!(&created, Err(Error::Invalid(message)) if message.contains("the branch prefix \"a..b/\"")),
+        "{created:?}"
+    );
+    assert!(
+        matches!(&renamed, Err(Error::Invalid(message)) if message.contains("Settings")),
+        "{renamed:?}"
+    );
+}
+
+#[test]
+fn the_branch_of_an_existing_branch_task_is_never_deleted_as_merged() {
+    let repo = Repo::new("");
+    repo.git(&["branch", "feature"]);
+    let projects = projects();
+    let project = projects.add(&repo.root).expect("add");
+    let task = projects
+        .create_task(
+            &branch_request(project.id, "Login", existing("feature", false)),
+            "swarm/",
+        )
+        .expect("task")
+        .task;
+    projects.close_task(task.id).expect("close");
+
+    let result = projects.delete_merged_branch(&task, &task.branch);
+
+    assert!(matches!(result, Err(Error::Invalid(_))));
+    assert!(repo.branches().contains(&"feature".to_owned()));
 }

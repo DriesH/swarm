@@ -23,7 +23,7 @@ pub use client::{Client, ClientError, CommentEvent, MessageEvent, PrEvent, Proje
 pub use daemon_stop::{Host, Signal, StopError, System, stop_daemon};
 
 /// Bumped on every incompatible change; the daemon refuses other versions.
-pub const VERSION: u32 = 29;
+pub const VERSION: u32 = 30;
 
 /// The most messages [`Request::ListMessages`] returns.
 pub const MESSAGES_LISTED: usize = 500;
@@ -238,14 +238,70 @@ pub struct TaskInfo {
     pub pull_request: Option<PrLink>,
     /// Close the task (as [`Request::CloseTask`] does) once its pull request is merged.
     pub close_after_merge: bool,
+    pub branch_source: BranchSource,
+}
+
+/// How a task's branch was made.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BranchSource {
+    /// `<branch prefix><slug of the name>`, maybe with a `-N` suffix. A rename renames it.
+    #[default]
+    Derived,
+    /// A name the user typed. A rename keeps it.
+    Custom,
+    /// A branch that existed before the task. Swarm never renames or deletes it.
+    Existing,
+}
+
+/// Where a new task's branch comes from.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum TaskBranch {
+    /// Makes a new branch from `from` (`None`: the project's base branch). `name: None`
+    /// makes `<branch prefix><slug of the task name>`.
+    New {
+        name: Option<String>,
+        from: Option<String>,
+    },
+    /// Checks out a branch that already exists: a local branch, or a branch on `origin`
+    /// with no local copy, which gets a local branch that tracks it.
+    Existing {
+        name: String,
+        /// Switches the project folder to the base branch first when it has `name` checked out.
+        switch_project_folder: bool,
+    },
+}
+
+/// A branch a new task can continue.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ExistingBranch {
+    /// The local name, or the name on `origin` for a branch with no local copy.
+    pub name: String,
+    pub remote_only: bool,
+    /// The open task on this branch. Such a branch cannot be picked.
+    pub task: Option<TaskId>,
+    /// The worktree that has it checked out: the project folder or another worktree.
+    pub checked_out: Option<PathBuf>,
+    /// `checked_out` is the project folder.
+    pub in_project_folder: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct TaskBranchList {
+    /// Local branches newest commit first, then the branches only on `origin`, newest first.
+    /// The base branch is left out.
+    pub branches: Vec<ExistingBranch>,
+    /// The project folder, as `checked_out` names it.
+    pub project_folder: PathBuf,
+    /// Files git tracks that have uncommitted changes in the project folder.
+    pub project_folder_changes: u32,
+    pub base_branch: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct CreateTask {
     pub project: ProjectId,
     pub name: String,
-    /// Branch to start from; `None` uses the project's base branch.
-    pub from: Option<String>,
+    pub branch: TaskBranch,
     pub run_setup: bool,
     /// Starts an orchestrator of this kind once setup is done; `None` starts none.
     pub orchestrator: Option<AgentKind>,
@@ -1174,6 +1230,11 @@ pub enum Request {
         call: CallId,
         project: ProjectId,
     },
+    /// Answered with [`Event::TaskBranches`].
+    TaskBranches {
+        call: CallId,
+        project: ProjectId,
+    },
     /// The project's `.swarm/config.toml` as it is on disk now. Answered with
     /// [`Event::ProjectConfig`].
     ProjectConfig {
@@ -1496,6 +1557,10 @@ pub enum Event {
         call: CallId,
         branches: Vec<String>,
     },
+    TaskBranches {
+        call: CallId,
+        branches: TaskBranchList,
+    },
     /// `error` says why the file does not parse; `fields` are the defaults then.
     /// `pre_push_hook` names the tool behind the project's git pre-push hook, if it has one.
     ProjectConfig {
@@ -1684,9 +1749,71 @@ pub fn check_private_dir(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+const MAX_SLUG_CHARS: usize = 50;
+
+/// Lowercase letters and digits, with runs of anything else turned into one `-`, cut at
+/// 50 characters. `None` when the name has no letters or digits.
+#[must_use]
+pub fn task_slug(name: &str) -> Option<String> {
+    let mut slug = String::new();
+    let mut pending_dash = false;
+
+    for character in name.chars().flat_map(char::to_lowercase) {
+        if character.is_ascii_lowercase() || character.is_ascii_digit() {
+            if pending_dash && !slug.is_empty() {
+                slug.push('-');
+            }
+            pending_dash = false;
+            slug.push(character);
+        } else {
+            pending_dash = true;
+        }
+    }
+
+    slug.truncate(MAX_SLUG_CHARS);
+    let slug = slug.trim_end_matches('-').to_owned();
+
+    (!slug.is_empty()).then_some(slug)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_name_becomes_a_slug() {
+        assert_eq!(
+            task_slug("Fix the Login  bug!").as_deref(),
+            Some("fix-the-login-bug")
+        );
+    }
+
+    #[test]
+    fn edge_characters_are_trimmed() {
+        assert_eq!(
+            task_slug("--Hello, World--").as_deref(),
+            Some("hello-world")
+        );
+    }
+
+    #[test]
+    fn a_slug_is_cut_at_fifty_characters() {
+        let name = "a".repeat(80);
+
+        assert_eq!(task_slug(&name).map(|slug| slug.len()), Some(50));
+    }
+
+    #[test]
+    fn a_cut_slug_does_not_end_in_a_dash() {
+        let name = format!("{} b", "a".repeat(49));
+
+        assert_eq!(task_slug(&name).as_deref(), Some("a".repeat(49).as_str()));
+    }
+
+    #[test]
+    fn a_name_without_letters_has_no_slug() {
+        assert_eq!(task_slug("!!! ???"), None);
+    }
 
     #[test]
     fn a_frame_round_trips() {

@@ -274,7 +274,7 @@ fn dropdown_row(
     )
 }
 
-fn input_row(label: &'static str, input: &Entity<impl Render>, width: f32) -> PanelRow {
+pub(super) fn input_row(label: &'static str, input: &Entity<impl Render>, width: f32) -> PanelRow {
     PanelRow::new(label).end_slot(div().w(px(width)).child(input.clone()))
 }
 

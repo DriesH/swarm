@@ -1,10 +1,12 @@
 //! The New task dialog.
 
 use gpui::{
-    AppContext as _, Context, Div, Entity, EventEmitter, FocusHandle, Focusable as _, SharedString,
-    Subscription, WeakEntity, Window, div, px,
+    AnyElement, AppContext as _, Context, Div, Entity, EventEmitter, FocusHandle, Focusable as _,
+    SharedString, Subscription, WeakEntity, Window, div, px,
 };
-use swarm_protocol::{ClientError, CreateTask, creatures};
+use swarm_protocol::{
+    ClientError, CreateTask, ExistingBranch, TaskBranch, TaskBranchList, creatures, task_slug,
+};
 use swarm_ui::prelude::*;
 
 use crate::announce::announce;
@@ -24,9 +26,7 @@ pub(crate) struct NewTaskRequest {
     pub name: SharedString,
     pub kind: AgentKind,
     pub first_message: SharedString,
-    pub base_branch: SharedString,
-    /// The branch to start from; `None` is the project's base branch.
-    pub from: Option<SharedString>,
+    pub branch: TaskBranch,
     pub run_setup: bool,
 }
 
@@ -39,8 +39,15 @@ pub(crate) enum NewTaskEvent {
 /// The open dialog. It reports the request and leaves closing to its owner.
 pub(crate) struct NewTaskDialog {
     project: ProjectId,
+    prefix: String,
     branches: Vec<SharedString>,
     branch: usize,
+    /// 0 makes a new branch, 1 continues an existing one.
+    mode: usize,
+    task_branches: BranchListState,
+    /// Index into the branches that have no task.
+    existing: usize,
+    switch_folder: bool,
     orchestrator: usize,
     run_setup: bool,
     busy: bool,
@@ -48,10 +55,11 @@ pub(crate) struct NewTaskDialog {
     /// The creature name the task gets when the name field stays empty.
     suggested: SharedString,
     name: Entity<TextInput>,
+    branch_name: Entity<TextInput>,
     message: Entity<TextArea>,
     focus_handle: FocusHandle,
     pub(crate) opener: Option<FocusHandle>,
-    _subscriptions: [Subscription; 2],
+    _subscriptions: [Subscription; 3],
 }
 
 impl EventEmitter<NewTaskEvent> for NewTaskDialog {}
@@ -66,17 +74,25 @@ impl NewTaskDialog {
     /// `branches` are the branches a task can start from; the first is chosen.
     pub(crate) fn new(
         project: ProjectId,
+        prefix: String,
         branches: Vec<SharedString>,
         default_kind: AgentKind,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let opener = window.focused(cx);
-        let suggested = suggest_name(&branches, creatures::random_seed());
+        let suggested = suggest_name(&branches, &prefix, creatures::random_seed());
         let name = cx.new(|cx| {
             let mut input = TextInput::new(cx);
             input.set_label("Name", cx);
             input.set_placeholder(suggested.clone(), cx);
+            input.set_mono(true, cx);
+            input
+        });
+        let branch_name = cx.new(|cx| {
+            let mut input = TextInput::new(cx);
+            input.set_label("Branch name", cx);
+            input.set_placeholder(placeholder_for(&prefix, &suggested), cx);
             input.set_mono(true, cx);
             input
         });
@@ -90,6 +106,13 @@ impl NewTaskDialog {
         window.focus(&name.focus_handle(cx), cx);
 
         let on_name = cx.subscribe(&name, |this, _, event, cx| match event {
+            TextInputEvent::Changed(_) => {
+                this.refresh_placeholders(cx);
+                cx.notify();
+            }
+            TextInputEvent::Submitted(_) => this.create(cx),
+        });
+        let on_branch_name = cx.subscribe(&branch_name, |this, _, event, cx| match event {
             TextInputEvent::Changed(_) => cx.notify(),
             TextInputEvent::Submitted(_) => this.create(cx),
         });
@@ -101,8 +124,13 @@ impl NewTaskDialog {
 
         Self {
             project,
+            prefix,
             branches,
             branch: 0,
+            mode: 0,
+            task_branches: BranchListState::Loading,
+            existing: 0,
+            switch_folder: true,
             orchestrator: ORCHESTRATORS
                 .iter()
                 .position(|(_, kind)| *kind == default_kind)
@@ -112,10 +140,11 @@ impl NewTaskDialog {
             error: None,
             suggested,
             name,
+            branch_name,
             message,
             focus_handle: cx.focus_handle(),
             opener,
-            _subscriptions: [on_name, on_message],
+            _subscriptions: [on_name, on_branch_name, on_message],
         }
     }
 
@@ -128,12 +157,210 @@ impl NewTaskDialog {
             .and_then(|picked| self.branches.iter().position(|branch| *branch == picked))
             .unwrap_or(0);
 
-        if branch_is_taken(&self.branches, &self.suggested) {
-            self.suggested = suggest_name(&self.branches, creatures::random_seed());
-            let suggested = self.suggested.clone();
-            self.name
-                .update(cx, |input, cx| input.set_placeholder(suggested, cx));
+        if branch_is_taken(&self.branches, &self.prefix, &self.suggested) {
+            self.suggested = suggest_name(&self.branches, &self.prefix, creatures::random_seed());
         }
+        self.refresh_placeholders(cx);
+        cx.notify();
+    }
+
+    /// Takes the branches a task can continue, and keeps the branch the user picked.
+    pub(crate) fn set_task_branches(&mut self, list: TaskBranchList, cx: &mut Context<Self>) {
+        let picked = self.chosen().map(|branch| branch.name.clone());
+
+        self.task_branches = BranchListState::Loaded(list);
+
+        let kept =
+            picked.and_then(|picked| self.available().position(|branch| branch.name == picked));
+        self.existing = kept.unwrap_or(0);
+        if kept.is_none() {
+            self.switch_folder = true;
+        }
+
+        self.refresh_placeholders(cx);
+        cx.notify();
+    }
+
+    /// Shows why the branches to continue are missing.
+    pub(crate) fn set_task_branches_failed(&mut self, error: SharedString, cx: &mut Context<Self>) {
+        self.task_branches = BranchListState::Failed(error);
+        self.existing = 0;
+
+        cx.notify();
+    }
+
+    fn task_branch_list(&self) -> Option<&TaskBranchList> {
+        match &self.task_branches {
+            BranchListState::Loaded(list) => Some(list),
+            BranchListState::Loading | BranchListState::Failed(_) => None,
+        }
+    }
+
+    /// The branches without a task, in the daemon's order.
+    fn available(&self) -> impl Iterator<Item = &ExistingBranch> {
+        self.task_branch_list()
+            .into_iter()
+            .flat_map(|list| &list.branches)
+            .filter(|branch| branch.task.is_none())
+    }
+
+    fn chosen(&self) -> Option<&ExistingBranch> {
+        self.available().nth(self.existing)
+    }
+
+    fn existing_labels(&self) -> Vec<SharedString> {
+        self.available()
+            .map(|branch| {
+                if branch.remote_only {
+                    SharedString::from(format!("origin/{}", branch.name))
+                } else {
+                    SharedString::from(branch.name.clone())
+                }
+            })
+            .collect()
+    }
+
+    /// Where the chosen existing branch is checked out.
+    fn occupancy(&self) -> Option<Occupancy> {
+        let list = self.task_branch_list()?;
+        let branch = self.chosen()?;
+
+        let Some(path) = &branch.checked_out else {
+            return Some(Occupancy::Free);
+        };
+
+        if branch.in_project_folder {
+            Some(match list.project_folder_changes {
+                0 => Occupancy::ProjectFolderClean,
+                changes => Occupancy::ProjectFolderChanged(changes),
+            })
+        } else {
+            Some(Occupancy::Elsewhere(path.clone()))
+        }
+    }
+
+    /// The Branch dropdown with the line about where the branch is checked out.
+    fn existing_branch_view(&self, cx: &mut Context<Self>) -> AnyElement {
+        let this = cx.entity();
+        let (on_existing, on_switch) = (this.clone(), this);
+
+        let labels = self.existing_labels();
+
+        let control = match &self.task_branches {
+            BranchListState::Loading => Label::new(self.list_message())
+                .color(Color::Muted)
+                .into_any_element(),
+            BranchListState::Failed(_) => Label::new(self.list_message())
+                .size(LabelSize::Small)
+                .color(Color::Del)
+                .into_any_element(),
+            BranchListState::Loaded(_) if labels.is_empty() => Label::new(self.list_message())
+                .color(Color::Muted)
+                .into_any_element(),
+            BranchListState::Loaded(_) => Dropdown::new(
+                "new-task-existing-branch",
+                "Existing branch",
+                labels,
+                self.existing,
+            )
+            .full_width()
+            .on_change(move |index, _, cx| {
+                on_existing.update(cx, |this, cx| this.choose_existing(index, cx));
+            })
+            .into_any_element(),
+        };
+
+        let switch = matches!(self.occupancy(), Some(Occupancy::ProjectFolderClean)).then(|| {
+            let base = self
+                .task_branch_list()
+                .map(|list| list.base_branch.clone())
+                .unwrap_or_default();
+
+            Checkbox::new(
+                "new-task-switch-folder",
+                format!("Switch project folder to {base}"),
+            )
+            .toggle_state(self.switch_folder)
+            .on_toggle(move |checked, _, cx| {
+                on_switch.update(cx, |this, cx| {
+                    this.switch_folder = checked;
+                    cx.notify();
+                });
+            })
+        });
+        let line = self
+            .occupancy_line()
+            .map(|line| Label::new(line).size(LabelSize::Small).color(Color::Del));
+
+        v_flex()
+            .gap(px(8.))
+            .child(field("Existing branch", control))
+            .children(switch)
+            .children(line)
+            .into_any_element()
+    }
+
+    /// What stands in place of the dropdown while it has no branch to offer.
+    fn list_message(&self) -> String {
+        match &self.task_branches {
+            BranchListState::Loading => "Loading branches\u{2026}".to_owned(),
+            BranchListState::Failed(error) => format!("Cannot list branches: {error}"),
+            BranchListState::Loaded(_) => "No branches".to_owned(),
+        }
+    }
+
+    /// The line under the existing branch dropdown.
+    fn occupancy_line(&self) -> Option<String> {
+        match self.occupancy()? {
+            Occupancy::ProjectFolderChanged(1) => {
+                Some("Checked out in the project folder \u{b7} 1 file changed".to_owned())
+            }
+            Occupancy::ProjectFolderChanged(changes) => Some(format!(
+                "Checked out in the project folder \u{b7} {changes} files changed"
+            )),
+            Occupancy::Elsewhere(path) => Some(format!(
+                "Checked out in {}",
+                crate::settings::pages::tilde(&path)
+            )),
+            Occupancy::Free | Occupancy::ProjectFolderClean => None,
+        }
+    }
+
+    /// The placeholder of the branch name field.
+    fn branch_placeholder(&self, cx: &App) -> SharedString {
+        let typed = self.name.read(cx).text();
+
+        placeholder_for(&self.prefix, &name_or(&typed, &self.suggested))
+    }
+
+    /// The placeholder of the name field.
+    fn name_placeholder(&self) -> SharedString {
+        match (self.mode, self.chosen()) {
+            (1, Some(branch)) => SharedString::from(branch.name.clone()),
+            _ => self.suggested.clone(),
+        }
+    }
+
+    fn refresh_placeholders(&mut self, cx: &mut Context<Self>) {
+        let branch_name = self.branch_placeholder(cx);
+        let name = self.name_placeholder();
+
+        self.branch_name
+            .update(cx, |input, cx| input.set_placeholder(branch_name, cx));
+        self.name
+            .update(cx, |input, cx| input.set_placeholder(name, cx));
+    }
+
+    fn set_mode(&mut self, mode: usize, cx: &mut Context<Self>) {
+        self.mode = mode;
+        self.refresh_placeholders(cx);
+        cx.notify();
+    }
+
+    fn choose_existing(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.existing = index;
+        self.switch_folder = true;
+        self.refresh_placeholders(cx);
         cx.notify();
     }
 
@@ -160,7 +387,19 @@ impl NewTaskDialog {
     }
 
     fn can_create(&self) -> bool {
-        !self.busy
+        if self.busy {
+            return false;
+        }
+
+        if self.mode == 0 {
+            return true;
+        }
+
+        match self.occupancy() {
+            Some(Occupancy::Free) => true,
+            Some(Occupancy::ProjectFolderClean) => self.switch_folder,
+            _ => false,
+        }
     }
 
     #[cfg(test)]
@@ -184,6 +423,12 @@ impl NewTaskDialog {
     pub(crate) fn type_message(&self, text: &str, cx: &mut Context<Self>) {
         self.message
             .update(cx, |area, cx| area.set_text(text.to_owned(), cx));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn type_branch_name(&self, text: &str, cx: &mut Context<Self>) {
+        self.branch_name
+            .update(cx, |input, cx| input.set_text(text.to_owned(), cx));
     }
 
     #[cfg(test)]
@@ -225,23 +470,47 @@ impl NewTaskDialog {
         }
 
         let typed = self.name.read(cx).text();
-        let name = match typed.trim() {
-            "" => self.suggested.clone(),
-            typed => SharedString::from(typed.to_owned()),
-        };
         let first_message = self.message.read(cx).text();
-        let base_branch = self.branches.get(self.branch).cloned().unwrap_or_default();
         let kind = ORCHESTRATORS
             .get(self.orchestrator)
             .map_or(AgentKind::ClaudeCode, |(_, kind)| *kind);
+
+        let (fallback, branch) = if self.mode == 0 {
+            let typed_branch = self.branch_name.read(cx).text();
+            let from = self.branches.get(self.branch).filter(|_| self.branch > 0);
+
+            (
+                self.suggested.clone(),
+                TaskBranch::New {
+                    name: Some(typed_branch.trim().to_owned()).filter(|name| !name.is_empty()),
+                    from: from.map(ToString::to_string),
+                },
+            )
+        } else {
+            let Some(chosen) = self.chosen() else {
+                return;
+            };
+            let in_folder = matches!(
+                self.occupancy(),
+                Some(Occupancy::ProjectFolderClean | Occupancy::ProjectFolderChanged(_))
+            );
+
+            (
+                SharedString::from(chosen.name.clone()),
+                TaskBranch::Existing {
+                    name: chosen.name.clone(),
+                    switch_project_folder: self.switch_folder && in_folder,
+                },
+            )
+        };
+        let name = SharedString::from(name_or(&typed, &fallback));
 
         cx.emit(NewTaskEvent::Created(NewTaskRequest {
             project: self.project,
             name,
             kind,
             first_message,
-            from: (self.branch > 0).then(|| base_branch.clone()),
-            base_branch,
+            branch,
             run_setup: self.run_setup,
         }));
     }
@@ -269,16 +538,45 @@ pub(crate) fn branch_choices(
     choices
 }
 
-fn branch_is_taken(branches: &[SharedString], slug: &str) -> bool {
-    let branch = format!("swarm/{slug}");
+/// Where the chosen existing branch is checked out.
+enum Occupancy {
+    Free,
+    ProjectFolderClean,
+    ProjectFolderChanged(u32),
+    Elsewhere(std::path::PathBuf),
+}
+
+/// The branches a task can continue, as the sheet knows them.
+enum BranchListState {
+    Loading,
+    Failed(SharedString),
+    Loaded(TaskBranchList),
+}
+
+/// The typed text, or `fallback` when it is blank.
+fn name_or(typed: &str, fallback: &str) -> String {
+    match typed.trim() {
+        "" => fallback.to_owned(),
+        typed => typed.to_owned(),
+    }
+}
+
+fn placeholder_for(prefix: &str, name: &str) -> SharedString {
+    let slug = task_slug(name).unwrap_or_default();
+
+    SharedString::from(format!("{prefix}{slug}"))
+}
+
+fn branch_is_taken(branches: &[SharedString], prefix: &str, slug: &str) -> bool {
+    let branch = format!("{prefix}{slug}");
 
     branches.iter().any(|existing| *existing == branch)
 }
 
-/// A creature name that no listed branch `swarm/<name>` uses.
-fn suggest_name(branches: &[SharedString], seed: u64) -> SharedString {
+/// A creature name that no listed branch `<prefix><name>` uses.
+fn suggest_name(branches: &[SharedString], prefix: &str, seed: u64) -> SharedString {
     let picked = creatures::pick_slug(seed, |slug| {
-        Ok::<_, std::convert::Infallible>(branch_is_taken(branches, slug))
+        Ok::<_, std::convert::Infallible>(branch_is_taken(branches, prefix, slug))
     });
 
     SharedString::from(picked.unwrap_or_default())
@@ -296,6 +594,7 @@ impl Render for NewTaskDialog {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let this = cx.entity();
         let (on_branch, on_orchestrator, on_toggle) = (this.clone(), this.clone(), this.clone());
+        let on_mode = this.clone();
         let on_dismiss = this.clone();
 
         let branch = Dropdown::new(
@@ -338,6 +637,31 @@ impl Render for NewTaskDialog {
                 });
             });
 
+        let mode = SegmentedControl::new(
+            "new-task-branch-mode",
+            "Branch",
+            ["New branch", "Existing branch"],
+        )
+        .selected(self.mode)
+        .on_select(move |index, _, cx| {
+            on_mode.update(cx, |this, cx| this.set_mode(index, cx));
+        });
+
+        let branch_row = if self.mode == 0 {
+            h_flex()
+                .gap(px(12.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(field("Branch name", self.branch_name.clone())),
+                )
+                .child(div().flex_1().min_w_0().child(field("Branch from", branch)))
+                .into_any_element()
+        } else {
+            self.existing_branch_view(cx)
+        };
+
         let create_label = if self.busy {
             "Creating task"
         } else {
@@ -363,17 +687,9 @@ impl Render for NewTaskDialog {
                 on_dismiss.update(cx, |_, cx| cx.emit(NewTaskEvent::Dismissed));
             })
             .child(field("Name", self.name.clone()))
-            .child(
-                h_flex()
-                    .gap(px(12.))
-                    .child(div().flex_1().min_w_0().child(field("Branch from", branch)))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(field("Orchestrator", orchestrator)),
-                    ),
-            )
+            .child(field("Branch", mode))
+            .child(branch_row)
+            .child(div().w_1_2().child(field("Orchestrator", orchestrator)))
             .child(field("First message", self.message.clone()))
             .child(setup)
             .children(
@@ -408,7 +724,9 @@ impl Workspace {
 
         let project = self.active_project;
         let default_kind = self.default_orchestrator();
-        let view = cx.new(|cx| NewTaskDialog::new(project, branches, default_kind, window, cx));
+        let prefix = self.branch_prefix();
+        let view =
+            cx.new(|cx| NewTaskDialog::new(project, prefix, branches, default_kind, window, cx));
         let subscription =
             cx.subscribe_in(&view, window, |this, view, event, window, cx| match event {
                 NewTaskEvent::Dismissed => this.close_overlay(window, cx),
@@ -422,7 +740,57 @@ impl Workspace {
             _subscription: subscription,
         });
         self.list_branches(project, base, current, view.downgrade(), cx);
+        self.list_task_branches(project, view.downgrade(), cx);
         cx.notify();
+    }
+
+    /// Asks the daemon for the branches a task can continue and gives the open sheet the list.
+    fn list_task_branches(
+        &mut self,
+        project: ProjectId,
+        dialog: WeakEntity<NewTaskDialog>,
+        cx: &mut Context<Self>,
+    ) {
+        let daemon = self
+            .data
+            .project(project)
+            .and_then(|project| project.daemon);
+        let (Some(client), Some(daemon)) = (self.daemon.clone(), daemon) else {
+            let updated = dialog.update(cx, |dialog, cx| {
+                dialog.set_task_branches_failed("No daemon".into(), cx);
+            });
+            if let Err(error) = updated {
+                log::debug!("the sheet closed before the task branches failed: {error}");
+            }
+
+            return;
+        };
+
+        let listing = cx.background_spawn(async move { client.task_branches(daemon) });
+
+        cx.spawn(async move |_, cx| {
+            let list = match listing.await {
+                Ok(list) => list,
+                Err(error) => {
+                    log::debug!("cannot list the branches to continue: {error}");
+                    let updated = dialog.update(cx, |dialog, cx| {
+                        dialog.set_task_branches_failed(error.to_string().into(), cx);
+                    });
+                    if let Err(error) = updated {
+                        log::debug!("the sheet closed before the task branches failed: {error}");
+                    }
+
+                    return;
+                }
+            };
+
+            let updated = dialog.update(cx, |dialog, cx| dialog.set_task_branches(list, cx));
+
+            if let Err(error) = updated {
+                log::debug!("the sheet closed before the task branches came: {error}");
+            }
+        })
+        .detach();
     }
 
     /// Asks the daemon for every local branch and gives the open sheet the list.
@@ -478,6 +846,22 @@ impl Workspace {
         }
     }
 
+    /// The branch prefix from the settings file, the default when there is none.
+    pub(crate) fn branch_prefix(&self) -> String {
+        let default = || swarm_settings::TaskSettings::default().branch_prefix;
+        let Some(path) = &self.settings_path else {
+            return default();
+        };
+
+        match swarm_settings::load(path) {
+            Ok(settings) => settings.tasks.branch_prefix,
+            Err(error) => {
+                log::warn!("cannot read the settings: {error}");
+                default()
+            }
+        }
+    }
+
     /// With a daemon the task is real and the sheet stays open until it answers.
     /// Without one the task is fake.
     fn create_task(
@@ -507,7 +891,7 @@ impl Workspace {
         let task = CreateTask {
             project,
             name: request.name.to_string(),
-            from: request.from.as_ref().map(ToString::to_string),
+            branch: request.branch.clone(),
             run_setup: request.run_setup,
             orchestrator: Some(request.kind.into()),
             first_message: Some(request.first_message.trim().to_owned())
@@ -660,6 +1044,62 @@ mod tests {
         view.read_with(cx, |dialog, _| dialog.focus_handle.clone())
     }
 
+    fn listed(
+        name: &str,
+        remote_only: bool,
+        task: Option<u64>,
+        checked_out: Option<&str>,
+    ) -> ExistingBranch {
+        ExistingBranch {
+            name: name.to_owned(),
+            remote_only,
+            task: task.map(swarm_protocol::TaskId),
+            checked_out: checked_out.map(std::path::PathBuf::from),
+            in_project_folder: checked_out == Some("/tmp/demo"),
+        }
+    }
+
+    fn task_branch_list(branches: Vec<ExistingBranch>, changes: u32) -> TaskBranchList {
+        TaskBranchList {
+            branches,
+            project_folder: "/tmp/demo".into(),
+            project_folder_changes: changes,
+            base_branch: "main".to_owned(),
+        }
+    }
+
+    fn continue_branches(
+        view: &Entity<NewTaskDialog>,
+        branches: Vec<ExistingBranch>,
+        changes: u32,
+        cx: &mut VisualTestContext,
+    ) {
+        view.update(cx, |dialog, cx| {
+            dialog.set_task_branches(task_branch_list(branches, changes), cx);
+            dialog.set_mode(1, cx);
+        });
+        redraw(cx);
+    }
+
+    fn collect_requests(
+        view: &Entity<NewTaskDialog>,
+        cx: &mut VisualTestContext,
+    ) -> (
+        std::rc::Rc<std::cell::RefCell<Vec<NewTaskRequest>>>,
+        Subscription,
+    ) {
+        let requests = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = std::rc::Rc::clone(&requests);
+        let subscription = cx.update(|_, app| {
+            app.subscribe(view, move |_, event: &NewTaskEvent, _| {
+                if let NewTaskEvent::Created(request) = event {
+                    seen.borrow_mut().push(request.clone());
+                }
+            })
+        });
+        (requests, subscription)
+    }
+
     #[gpui::test]
     fn tab_walks_the_dialog_in_order_and_never_leaves_it(cx: &mut TestAppContext) {
         let (workspace, cx) = setup(cx);
@@ -673,6 +1113,8 @@ mod tests {
             forward,
             [
                 "TextInput Name",
+                "RadioButton New branch",
+                "TextInput Branch name",
                 "ComboBox Branch from",
                 "ComboBox Orchestrator",
                 "MultilineTextInput First message",
@@ -684,6 +1126,315 @@ mod tests {
         );
         assert_eq!(backward, reversed(&forward));
         assert_named(&forward);
+    }
+
+    #[gpui::test]
+    fn tab_walks_the_existing_branch_mode_in_order(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let view = open_dialog(&workspace, cx);
+        continue_branches(
+            &view,
+            vec![listed("feature/x", false, None, Some("/tmp/demo"))],
+            0,
+            cx,
+        );
+        let root = dialog_root(&view, cx);
+
+        let forward = tab_walk(cx, &root, "tab");
+        let backward = tab_walk(cx, &root, "shift-tab");
+
+        assert_eq!(
+            forward,
+            [
+                "TextInput Name",
+                "RadioButton Existing branch",
+                "ComboBox Existing branch",
+                "CheckBox Switch project folder to main",
+                "ComboBox Orchestrator",
+                "MultilineTextInput First message",
+                "CheckBox Run setup script",
+                "Button Cancel",
+                "Button Create task",
+                "Button Close dialog",
+            ]
+        );
+        assert_eq!(backward, reversed(&forward));
+        assert_named(&forward);
+    }
+
+    #[gpui::test]
+    fn the_branch_name_placeholder_is_the_prefix_and_the_slug_of_the_suggestion(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = setup(cx);
+        let view = open_dialog(&workspace, cx);
+
+        let placeholder = view.read_with(cx, NewTaskDialog::branch_placeholder);
+        let suggested = view.read_with(cx, |dialog, _| dialog.suggested_name());
+
+        assert_eq!(placeholder, format!("swarm/{suggested}"));
+    }
+
+    #[gpui::test]
+    fn an_empty_prefix_leaves_the_slug_alone(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let view = open_dialog(&workspace, cx);
+
+        view.update(cx, |dialog, _| dialog.prefix = String::new());
+        let placeholder = view.read_with(cx, NewTaskDialog::branch_placeholder);
+        let suggested = view.read_with(cx, |dialog, _| dialog.suggested_name());
+
+        assert_eq!(placeholder, suggested);
+    }
+
+    #[gpui::test]
+    fn the_branch_name_placeholder_follows_the_typed_name(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let view = open_dialog(&workspace, cx);
+
+        cx.simulate_input("Fix the Login");
+
+        let placeholder = view.read_with(cx, NewTaskDialog::branch_placeholder);
+        assert_eq!(placeholder, "swarm/fix-the-login");
+    }
+
+    #[gpui::test]
+    fn a_typed_branch_name_is_sent_and_a_blank_one_is_not(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let view = open_dialog(&workspace, cx);
+        let (requests, _subscription) = collect_requests(&view, cx);
+
+        view.update(cx, NewTaskDialog::create);
+        view.update(cx, |dialog, cx| {
+            dialog
+                .branch_name
+                .update(cx, |input, cx| input.set_text("  dries/login ", cx));
+            dialog.create(cx);
+        });
+
+        let branches: Vec<TaskBranch> = requests
+            .borrow()
+            .iter()
+            .map(|request| request.branch.clone())
+            .collect();
+        assert_eq!(
+            branches,
+            [
+                TaskBranch::New {
+                    name: None,
+                    from: None
+                },
+                TaskBranch::New {
+                    name: Some("dries/login".to_owned()),
+                    from: None
+                },
+            ]
+        );
+    }
+
+    #[gpui::test]
+    fn the_existing_mode_lists_only_branches_without_a_task(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let view = open_dialog(&workspace, cx);
+        let branches = vec![
+            listed("busy", false, Some(3), None),
+            listed("local", false, None, None),
+            listed("remote", true, None, None),
+        ];
+
+        continue_branches(&view, branches, 0, cx);
+
+        let labels = view.read_with(cx, |dialog, _| dialog.existing_labels());
+        assert_eq!(names(&labels), ["local", "origin/remote"]);
+    }
+
+    #[gpui::test]
+    fn a_branch_in_the_clean_project_folder_is_sent_with_the_switch(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let view = open_dialog(&workspace, cx);
+        let (requests, _subscription) = collect_requests(&view, cx);
+        continue_branches(
+            &view,
+            vec![listed("feature/x", false, None, Some("/tmp/demo"))],
+            0,
+            cx,
+        );
+
+        let line = view.read_with(cx, |dialog, _| dialog.occupancy_line());
+        view.update(cx, NewTaskDialog::create);
+
+        let branches: Vec<TaskBranch> = requests
+            .borrow()
+            .iter()
+            .map(|request| request.branch.clone())
+            .collect();
+        assert_eq!(line, None);
+        assert_eq!(
+            branches,
+            [TaskBranch::Existing {
+                name: "feature/x".to_owned(),
+                switch_project_folder: true
+            }]
+        );
+    }
+
+    #[gpui::test]
+    fn turning_the_switch_off_disables_create(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let view = open_dialog(&workspace, cx);
+        continue_branches(
+            &view,
+            vec![listed("feature/x", false, None, Some("/tmp/demo"))],
+            0,
+            cx,
+        );
+
+        let before = view.read_with(cx, |dialog, _| dialog.can_create());
+        view.update(cx, |dialog, _| dialog.switch_folder = false);
+        let after = view.read_with(cx, |dialog, _| dialog.can_create());
+
+        assert!(before);
+        assert!(!after);
+    }
+
+    #[gpui::test]
+    fn changes_in_the_project_folder_block_the_branch(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let view = open_dialog(&workspace, cx);
+        continue_branches(
+            &view,
+            vec![listed("feature/x", false, None, Some("/tmp/demo"))],
+            2,
+            cx,
+        );
+
+        let line = view.read_with(cx, |dialog, _| dialog.occupancy_line());
+        let can_create = view.read_with(cx, |dialog, _| dialog.can_create());
+
+        assert_eq!(
+            line.as_deref(),
+            Some("Checked out in the project folder \u{b7} 2 files changed")
+        );
+        assert!(!can_create);
+    }
+
+    #[gpui::test]
+    fn a_branch_in_another_worktree_blocks_the_branch(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let view = open_dialog(&workspace, cx);
+        continue_branches(
+            &view,
+            vec![listed("feature/x", false, None, Some("/tmp/elsewhere"))],
+            0,
+            cx,
+        );
+
+        let line = view.read_with(cx, |dialog, _| dialog.occupancy_line());
+        let can_create = view.read_with(cx, |dialog, _| dialog.can_create());
+
+        assert_eq!(line.as_deref(), Some("Checked out in /tmp/elsewhere"));
+        assert!(!can_create);
+    }
+
+    #[gpui::test]
+    fn an_empty_name_in_the_existing_mode_uses_the_branch_name(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let view = open_dialog(&workspace, cx);
+        let (requests, _subscription) = collect_requests(&view, cx);
+        continue_branches(&view, vec![listed("remote", true, None, None)], 0, cx);
+
+        view.update(cx, NewTaskDialog::create);
+
+        let sent: Vec<(SharedString, TaskBranch)> = requests
+            .borrow()
+            .iter()
+            .map(|request| (request.name.clone(), request.branch.clone()))
+            .collect();
+        assert_eq!(
+            sent,
+            [(
+                "remote".into(),
+                TaskBranch::Existing {
+                    name: "remote".to_owned(),
+                    switch_project_folder: false
+                }
+            )]
+        );
+    }
+
+    #[gpui::test]
+    fn the_existing_mode_shows_the_chosen_branch_as_the_name_placeholder(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let view = open_dialog(&workspace, cx);
+        continue_branches(&view, vec![listed("remote", true, None, None)], 0, cx);
+
+        let existing = view.read_with(cx, |dialog, _| dialog.name_placeholder());
+        view.update(cx, |dialog, cx| dialog.set_mode(0, cx));
+        let new = view.read_with(cx, |dialog, _| dialog.name_placeholder());
+        let suggested = view.read_with(cx, |dialog, _| dialog.suggested_name());
+
+        assert_eq!(existing, "remote");
+        assert_eq!(new, suggested);
+    }
+
+    #[gpui::test]
+    fn without_branches_the_existing_mode_says_so(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let view = open_dialog(&workspace, cx);
+        continue_branches(&view, vec![listed("busy", false, Some(3), None)], 0, cx);
+
+        let can_create = view.read_with(cx, |dialog, _| dialog.can_create());
+
+        assert!(cx.debug_bounds("new-task-existing-branch").is_none());
+        assert!(!can_create);
+    }
+
+    #[gpui::test]
+    fn while_the_branches_load_the_existing_mode_says_so_and_cannot_create(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = setup(cx);
+        let view = open_dialog(&workspace, cx);
+
+        view.update(cx, |dialog, cx| {
+            dialog.task_branches = BranchListState::Loading;
+            dialog.set_mode(1, cx);
+        });
+        redraw(cx);
+
+        let message = view.read_with(cx, |dialog, _| dialog.list_message());
+        let can_create = view.read_with(cx, |dialog, _| dialog.can_create());
+        assert_eq!(message, "Loading branches\u{2026}");
+        assert!(cx.debug_bounds("new-task-existing-branch").is_none());
+        assert!(!can_create);
+    }
+
+    #[gpui::test]
+    fn a_failed_branch_list_shows_the_error_and_cannot_create(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let view = open_dialog(&workspace, cx);
+
+        view.update(cx, |dialog, cx| {
+            dialog.set_task_branches_failed("connection lost".into(), cx);
+            dialog.set_mode(1, cx);
+        });
+        redraw(cx);
+
+        let message = view.read_with(cx, |dialog, _| dialog.list_message());
+        let can_create = view.read_with(cx, |dialog, _| dialog.can_create());
+        assert_eq!(message, "Cannot list branches: connection lost");
+        assert!(cx.debug_bounds("new-task-existing-branch").is_none());
+        assert!(!can_create);
+    }
+
+    #[gpui::test]
+    fn a_sheet_without_a_daemon_fails_the_branch_list(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        let view = open_dialog(&workspace, cx);
+
+        let message = view.read_with(cx, |dialog, _| dialog.list_message());
+
+        assert_eq!(message, "Cannot list branches: No daemon");
     }
 
     #[gpui::test]
@@ -707,7 +1458,10 @@ mod tests {
             .collect();
 
         for seed in 0..30 {
-            assert_eq!(suggest_name(&taken, seed), creatures::CREATURES[0].slug);
+            assert_eq!(
+                suggest_name(&taken, "swarm/", seed),
+                creatures::CREATURES[0].slug
+            );
         }
     }
 

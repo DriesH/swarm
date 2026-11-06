@@ -14,8 +14,8 @@ use swarm_protocol::{
     AgentChange, AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, CallId,
     Client, ClientError, CloseFailure, CloseStep, CreateTask, CreateTerminal, DiffStat, Event,
     FileStat, GridSize, MessageEvent, MessageId, MessageInfo, MessageKind, PlanDraft, PrEvent,
-    ProjectId, ProjectInfo, Request, TaskId, TaskInfo, TerminalId, TerminalInfo, TerminalKind,
-    VERSION, read, write,
+    ProjectId, ProjectInfo, Request, TaskBranch, TaskBranchList, TaskId, TaskInfo, TerminalId,
+    TerminalInfo, TerminalKind, VERSION, read, write,
 };
 use swarm_term::{Palette, Rgb, Size, TerminalInput, TerminalOutput};
 
@@ -632,6 +632,7 @@ fn task_info() -> TaskInfo {
         pr_base: "main".into(),
         pull_request: None,
         close_after_merge: false,
+        branch_source: swarm_protocol::BranchSource::Derived,
     }
 }
 
@@ -718,7 +719,10 @@ fn create_task_request() -> CreateTask {
     CreateTask {
         project: ProjectId(2),
         name: "login".into(),
-        from: None,
+        branch: TaskBranch::New {
+            name: None,
+            from: None,
+        },
         run_setup: true,
         orchestrator: Some(AgentKind::Codex),
         first_message: Some("start with the tests".into()),
@@ -767,6 +771,34 @@ fn create_task_reports_a_daemon_error() {
     let result = client.create_task(create_task_request());
 
     assert!(matches!(result, Err(ClientError::Daemon(message)) if message == "branch exists"));
+}
+
+#[test]
+fn task_branches_sends_the_request_and_returns_the_list() {
+    let list = TaskBranchList {
+        branches: Vec::new(),
+        project_folder: PathBuf::from("/tmp/project"),
+        project_folder_changes: 2,
+        base_branch: "main".into(),
+    };
+    let reply = list.clone();
+    let socket = serve(move |fake| {
+        fake.handshake(VERSION);
+        let Some(Request::TaskBranches { call, project }) = fake.request() else {
+            panic!("expected a TaskBranches request");
+        };
+        assert_eq!(project, ProjectId(2));
+        fake.send(&Event::TaskBranches {
+            call,
+            branches: reply,
+        });
+        fake.drain();
+    });
+    let client = Client::connect(&socket).expect("connect");
+
+    let branches = client.task_branches(ProjectId(2)).expect("task branches");
+
+    assert_eq!(branches, list);
 }
 
 fn agent_info(status: AgentStatus) -> AgentInfo {

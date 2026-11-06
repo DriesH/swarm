@@ -21,8 +21,8 @@ use crate::{
     GH_SECS, GithubStatus, MergeMethod, MessageId, MessageInfo, NewComment, Notice, PUSH_SECS,
     Paths, PlanDraft, PrDraft, PrPanel, ProjectConfigFields, ProjectId, ProjectInfo, PromptInfo,
     PullRequest, RemoveCheck, Request, ReviewComment, ReviewMark, ReviewSource, StopError,
-    SwarmStats, SystemCheck, TaskDiff, TaskId, TaskInfo, TerminalId, TerminalInfo, Usage, VERSION,
-    check_private_dir, read, write,
+    SwarmStats, SystemCheck, TaskBranchList, TaskDiff, TaskId, TaskInfo, TerminalId, TerminalInfo,
+    Usage, VERSION, check_private_dir, read, write,
 };
 
 /// A project's config file as the daemon read it.
@@ -849,6 +849,17 @@ impl Client {
         }
     }
 
+    /// The branches a new task can continue, with the project folder's state.
+    pub fn task_branches(&self, project: ProjectId) -> Result<TaskBranchList, ClientError> {
+        let timeout = self.reply_timeout.max(GIT_TIMEOUT);
+        let request = |call| Request::TaskBranches { call, project };
+
+        match self.call_with_timeout(request, None, timeout)? {
+            Event::TaskBranches { branches, .. } => Ok(branches),
+            other => Err(unexpected("TaskBranches", &other)),
+        }
+    }
+
     pub fn project_config(
         &self,
         project: ProjectId,
@@ -1479,6 +1490,9 @@ fn read_events(
             }
             Event::Branches { call, branches } => {
                 deliver(shared, call, Event::Branches { call, branches });
+            }
+            Event::TaskBranches { call, branches } => {
+                deliver(shared, call, Event::TaskBranches { call, branches });
             }
             Event::PrPanel { call, panel } => deliver(shared, call, Event::PrPanel { call, panel }),
             Event::ReviewMarks { call, marks } => {

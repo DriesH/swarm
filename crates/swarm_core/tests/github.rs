@@ -14,7 +14,7 @@ use std::time::Duration;
 use swarm_core::github::{Github, NewPullRequest, Target};
 use swarm_core::store::Store;
 use swarm_core::{Projects, git};
-use swarm_protocol::{CreateTask, GithubCheckState, MergeMethod, PrLink, ReviewSource};
+use swarm_protocol::{CreateTask, GithubCheckState, MergeMethod, PrLink, ReviewSource, TaskBranch};
 
 static NEXT_FOLDER: AtomicU32 = AtomicU32::new(0);
 
@@ -1193,14 +1193,20 @@ fn project_with_task() -> (Projects, swarm_protocol::TaskInfo, Folder) {
     let projects = Projects::new(store);
     let project = projects.add(repo.path()).expect("project");
     let task = projects
-        .create_task(&CreateTask {
-            project: project.id,
-            name: "Login".to_owned(),
-            from: None,
-            run_setup: false,
-            orchestrator: None,
-            first_message: None,
-        })
+        .create_task(
+            &CreateTask {
+                project: project.id,
+                name: "Login".to_owned(),
+                branch: TaskBranch::New {
+                    name: None,
+                    from: None,
+                },
+                run_setup: false,
+                orchestrator: None,
+                first_message: None,
+            },
+            "swarm/",
+        )
         .expect("task")
         .task;
 
@@ -1302,10 +1308,10 @@ fn a_merged_branch_is_deleted_from_the_project_and_a_missing_one_is_fine() {
     assert!(git::branch_exists(repo.path(), &task.branch).expect("exists"));
 
     projects
-        .delete_merged_branch(task.project, &task.branch)
+        .delete_merged_branch(&task, &task.branch)
         .expect("delete");
     projects
-        .delete_merged_branch(task.project, &task.branch)
+        .delete_merged_branch(&task, &task.branch)
         .expect("again");
 
     assert!(!git::branch_exists(repo.path(), &task.branch).expect("gone"));
@@ -1368,14 +1374,20 @@ fn a_pull_request_goes_into_the_branch_the_task_started_from_when_origin_has_it(
     let project = projects.add(repo.path()).expect("project");
     let make = |name: &str, from: Option<&str>| {
         projects
-            .create_task(&CreateTask {
-                project: project.id,
-                name: name.to_owned(),
-                from: from.map(str::to_owned),
-                run_setup: false,
-                orchestrator: None,
-                first_message: None,
-            })
+            .create_task(
+                &CreateTask {
+                    project: project.id,
+                    name: name.to_owned(),
+                    branch: TaskBranch::New {
+                        name: None,
+                        from: from.map(str::to_owned),
+                    },
+                    run_setup: false,
+                    orchestrator: None,
+                    first_message: None,
+                },
+                "swarm/",
+            )
             .expect("task")
             .task
     };
@@ -1411,14 +1423,20 @@ fn a_task_from_before_the_pr_base_was_recorded_gets_the_project_base_branch() {
     let projects = Projects::new(Arc::new(Mutex::new(Store::open(&path).expect("store"))));
     let project = projects.add(repo.path()).expect("project");
     let task = projects
-        .create_task(&CreateTask {
-            project: project.id,
-            name: "Old".to_owned(),
-            from: None,
-            run_setup: false,
-            orchestrator: None,
-            first_message: None,
-        })
+        .create_task(
+            &CreateTask {
+                project: project.id,
+                name: "Old".to_owned(),
+                branch: TaskBranch::New {
+                    name: None,
+                    from: None,
+                },
+                run_setup: false,
+                orchestrator: None,
+                first_message: None,
+            },
+            "swarm/",
+        )
         .expect("task")
         .task;
     rusqlite::Connection::open(&path)

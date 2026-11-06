@@ -19,8 +19,9 @@ use swarm_protocol::{
     CloseCheck, CloseStep, CommentId, CommentState, CreateTask, CreateTerminal, DiffStat, Event,
     FileDiff, FileStat, FileTexts, Fold, MessageInfo, MessageKind, Notice, NoticeKind, PlanDraft,
     ProjectConfigFields, ProjectId, ProjectInfo, PromptInfo, PromptLayer, RemoveCheck, Request,
-    ReviewSource, SwarmStats, SystemCheck, TaskDiff, TaskId, TaskInfo, TerminalId, TerminalInfo,
-    TerminalKind, ToolCheck, ToolState, Usage, UsageProblem, VERSION, read, write,
+    ReviewSource, SwarmStats, SystemCheck, TaskBranch, TaskBranchList, TaskDiff, TaskId, TaskInfo,
+    TerminalId, TerminalInfo, TerminalKind, ToolCheck, ToolState, Usage, UsageProblem, VERSION,
+    read, write,
 };
 use swarm_term::{
     BlockedKind, ExitStatus, Palette, ProgramState, Rgb, Row, Size, TerminalInput, TerminalOutput,
@@ -894,7 +895,10 @@ fn a_task_runs_its_setup_script_in_a_process_terminal() {
     let task = client.create_task(CreateTask {
         project: project.id,
         name: "First task".to_owned(),
-        from: None,
+        branch: TaskBranch::New {
+            name: None,
+            from: None,
+        },
         run_setup: true,
         orchestrator: None,
         first_message: None,
@@ -943,7 +947,10 @@ fn a_slow_task_does_not_block_other_requests() {
         task: CreateTask {
             project: project.id,
             name: "Big".to_owned(),
-            from: None,
+            branch: TaskBranch::New {
+                name: None,
+                from: None,
+            },
             run_setup: false,
             orchestrator: None,
             first_message: None,
@@ -994,7 +1001,10 @@ fn a_task_for_an_unknown_project_is_reported_on_its_call() {
         task: CreateTask {
             project: ProjectId(42),
             name: "x".to_owned(),
-            from: None,
+            branch: TaskBranch::New {
+                name: None,
+                from: None,
+            },
             run_setup: false,
             orchestrator: None,
             first_message: None,
@@ -1197,7 +1207,10 @@ fn orchestrator_task(project: ProjectId, run_setup: bool) -> CreateTask {
     CreateTask {
         project,
         name: "Agent task".to_owned(),
-        from: None,
+        branch: TaskBranch::New {
+            name: None,
+            from: None,
+        },
         run_setup,
         orchestrator: Some(AgentKind::ClaudeCode),
         first_message: None,
@@ -8288,7 +8301,10 @@ fn a_pull_request_goes_into_the_branch_the_task_started_from_when_origin_has_it(
     let make = |client: &mut Client, name: &str, from: &str| {
         let mut request = orchestrator_task(project.id, false);
         request.name = name.to_owned();
-        request.from = Some(from.to_owned());
+        request.branch = TaskBranch::New {
+            name: None,
+            from: Some(from.to_owned()),
+        };
         request.orchestrator = None;
 
         client.create_task(request)
@@ -8649,6 +8665,71 @@ fn merging_with_close_after_merge_closes_the_task_and_deletes_both_branches() {
         "the task is closed"
     );
     env.gh.assert_no_branch_deleted_by_gh();
+}
+
+/// Like [`env_with_pull_request`], for a task that continues the branch `feature`.
+fn env_with_pull_request_on_existing_branch(close_after_merge: bool) -> PrEnv {
+    let gh = FakeGh::new();
+    gh.answer("pr-create", "https://github.com/acme/widgets/pull/42\n");
+    let (repo, bare) = github_repo("");
+    repo.git(&["branch", "feature"]);
+    let daemon = Daemon::start_with_gh(&gh.path());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let task = client.create_task(CreateTask {
+        branch: TaskBranch::Existing {
+            name: "feature".to_owned(),
+            switch_project_folder: false,
+        },
+        orchestrator: None,
+        ..task_named(project.id, "Continue")
+    });
+    std::fs::write(task.worktree.join("review.txt"), "one\ntwo\n").expect("file");
+    commit_all(&task.worktree);
+    let mut env = PrEnv {
+        client,
+        task,
+        repo,
+        bare,
+        gh,
+        daemon,
+    };
+
+    env.approve_task();
+    env.create_with("Add review file", true, close_after_merge, false)
+        .expect("created");
+    env.view("MERGED");
+
+    env
+}
+
+#[test]
+fn merging_a_continued_branch_keeps_it_local_and_remote() {
+    let mut env = env_with_pull_request_on_existing_branch(false);
+    assert!(env.pushed());
+
+    env.merge().expect("merged");
+
+    assert!(env.pushed(), "Swarm did not delete the remote branch");
+    assert!(env.local_branches().contains(&"feature".to_owned()));
+}
+
+#[test]
+fn merging_a_continued_branch_with_close_after_merge_keeps_its_branches() {
+    let mut env = env_with_pull_request_on_existing_branch(true);
+    assert!(env.pushed());
+
+    let events = env.merge().expect("merged");
+
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::TaskChanged { task } if task.closed))
+    );
+    assert!(!env.task.worktree.exists());
+    assert!(env.pushed(), "Swarm did not delete the remote branch");
+    assert!(env.local_branches().contains(&"feature".to_owned()));
 }
 
 #[test]
@@ -13014,4 +13095,83 @@ fn review_marks_are_stored_by_the_daemon_and_read_back() {
     });
 
     assert_eq!(read, marks);
+}
+
+impl Client {
+    fn task_branches(&mut self, project: ProjectId) -> TaskBranchList {
+        self.send(&Request::TaskBranches {
+            call: CALL,
+            project,
+        });
+
+        self.wait_for(|event| match event {
+            Event::TaskBranches {
+                call: CALL,
+                branches,
+            } => Some(branches.clone()),
+            _ => None,
+        })
+    }
+}
+
+#[test]
+fn the_branches_a_task_can_continue_are_listed() {
+    let repo = Repo::new("");
+    repo.git(&["branch", "feature"]);
+    let daemon = Daemon::start();
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+
+    let list = client.task_branches(project.id);
+
+    assert_eq!(
+        list.branches
+            .iter()
+            .map(|branch| (branch.name.as_str(), branch.remote_only, branch.task))
+            .collect::<Vec<_>>(),
+        vec![("feature", false, None)]
+    );
+    assert_eq!(list.project_folder, repo.root);
+    assert_eq!(list.base_branch, project.base_branch);
+}
+
+#[test]
+fn a_task_can_continue_an_existing_branch() {
+    let repo = Repo::new("");
+    repo.git(&["branch", "feature"]);
+    let daemon = Daemon::start();
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+
+    let task = client.create_task(CreateTask {
+        branch: TaskBranch::Existing {
+            name: "feature".to_owned(),
+            switch_project_folder: false,
+        },
+        ..task_named(project.id, "Login")
+    });
+
+    assert_eq!(task.branch, "feature");
+    assert_eq!(task.branch_source, swarm_protocol::BranchSource::Existing);
+    assert_eq!(
+        client.task_branches(project.id).branches[0].task,
+        Some(task.id)
+    );
+}
+
+#[test]
+fn an_empty_branch_prefix_in_the_settings_makes_a_bare_slug_branch() {
+    let fixture = Fixture::new("sleep 30");
+    std::fs::write(fixture.settings(), "[tasks]\nbranch_prefix = \"\"\n").expect("settings");
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+
+    let task = client.create_task(task_named(project.id, "Fix the login"));
+
+    assert_eq!(task.branch, "fix-the-login");
 }
