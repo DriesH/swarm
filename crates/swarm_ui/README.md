@@ -30,6 +30,7 @@ Focus an element when the window opens. With nothing focused, GPUI sends Tab now
 | `Label` | none: the interactive parent carries the label |
 | `Button` | `Button` |
 | `IconButton` | `Button`; the label is a required argument |
+| `Scrollbar` | `ScrollBar`, "label", value in percent; not a Tab stop |
 | `Switch` | `Switch` with toggled state |
 | `SegmentedControl` | `RadioGroup` of `RadioButton`s |
 | `Tab` | `Tab` with selected state; label is "name, status" |

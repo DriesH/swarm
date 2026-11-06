@@ -122,6 +122,8 @@ pub struct ThemeColors {
     pub syntax_punctuation: Hsla,
     /// Terminal background.
     pub term: Hsla,
+    /// The scrollbar thumb at rest. Hovered or dragged, it is `faint`.
+    pub scrollbar_thumb: Hsla,
     /// Faint decoration: graph dots, honeycomb pattern.
     pub dot: Hsla,
     pub hex: Hsla,
@@ -199,6 +201,7 @@ impl ThemeColors {
             syntax_constant,
             syntax_punctuation,
             term,
+            scrollbar_thumb,
             dot,
             hex,
             honey,
@@ -254,6 +257,7 @@ impl ThemeColors {
             ("syntax_constant", *syntax_constant),
             ("syntax_punctuation", *syntax_punctuation),
             ("term", *term),
+            ("scrollbar_thumb", *scrollbar_thumb),
             ("dot", *dot),
             ("hex", *hex),
             ("honey", *honey),
@@ -331,6 +335,7 @@ impl Theme {
                 syntax_constant: rgb(0xff8fa3).into(),
                 syntax_punctuation: rgb(0xa9a9b3).into(),
                 term: rgb(0x0d0d0f).into(),
+                scrollbar_thumb: rgb(0x6a6a73).into(),
                 dot: rgb(0x1f1f23).into(),
                 hex: rgb(0x17171a).into(),
                 honey: rgb(0xe8a838).into(),
@@ -413,6 +418,7 @@ impl Theme {
                 syntax_constant: rgb(0x006b60).into(),
                 syntax_punctuation: rgb(0x57606a).into(),
                 term: rgb(0xfbfbfc).into(),
+                scrollbar_thumb: rgb(0x86868f).into(),
                 dot: rgb(0xe4e4e8).into(),
                 hex: rgb(0xe9e9ec).into(),
                 honey: rgb(0xeaa93f).into(),
@@ -1012,6 +1018,7 @@ mod tests {
                 ("fg", colors.fg),
                 ("muted", colors.muted),
                 ("faint", colors.faint),
+                ("scrollbar_thumb", colors.scrollbar_thumb),
                 ("accent", colors.accent),
                 ("working", colors.working),
                 ("ok", colors.ok),
@@ -1033,6 +1040,18 @@ mod tests {
                     ],
                 );
             }
+
+            // The scrollbar thumb also lies over the diff tints in Review.
+            check(
+                &mut failures,
+                &theme,
+                GRAPHIC_AA,
+                ("scrollbar_thumb", colors.scrollbar_thumb),
+                &[
+                    ("add_bg", composite(colors.panel, colors.add_bg)),
+                    ("del_bg", composite(colors.panel, colors.del_bg)),
+                ],
+            );
 
             // The check mark in a checked box: the ground on the accent.
             check(
