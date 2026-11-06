@@ -1,8 +1,5 @@
 use super::*;
 
-const MOCKUP_TOLERANCE: f32 = 1.0;
-const FLOAT_TOLERANCE: f32 = 0.05;
-
 fn tile(id: u32, kind: TileKind, activity: Activity) -> TileSpec {
     TileSpec::new(TileId(id), kind, activity)
 }
@@ -26,7 +23,7 @@ fn process(id: u32, activity: Activity) -> TileSpec {
     tile(id, TileKind::Process, activity)
 }
 
-fn user(id: u32, fixed: Size) -> TileSpec {
+fn user(id: u32, fixed: Cells) -> TileSpec {
     TileSpec {
         fixed: Some(fixed),
         ..tile(id, TileKind::User, Activity::Running)
@@ -37,55 +34,155 @@ fn area(width: f32, height: f32) -> Rect {
     Rect::new(0.0, 0.0, width, height)
 }
 
-fn near(actual: Rect, expected: Rect, tolerance: f32) -> bool {
-    (actual.origin.x - expected.origin.x).abs() <= tolerance
-        && (actual.origin.y - expected.origin.y).abs() <= tolerance
-        && (actual.size.width - expected.size.width).abs() <= tolerance
-        && (actual.size.height - expected.size.height).abs() <= tolerance
+/// Whole cells to pixels.
+fn c(cells: u16) -> f32 {
+    f32::from(cells) * CELL
+}
+
+/// A rect given in cells from the top-left corner of the area. The padding is part of
+/// the position: the first cell inside the default padding is 1.
+fn cell_rect(x: u16, y: u16, width: u16, height: u16) -> Rect {
+    Rect::new(c(x), c(y), c(width), c(height))
 }
 
 fn assert_rect(layout: &Layout, id: u32, expected: Rect) {
-    let actual = layout.rect(TileId(id));
-    assert!(
-        actual.is_some_and(|actual| near(actual, expected, MOCKUP_TOLERANCE)),
-        "tile {id}: expected {expected:?}, got {actual:?}"
-    );
+    assert_eq!(layout.rect(TileId(id)), Some(expected), "tile {id}");
 }
 
 fn tray(ids: &[u32]) -> Vec<TileId> {
     ids.iter().copied().map(TileId).collect()
 }
 
-/// A worker box in the default 1030 × 790 area with the orchestrator beside it:
-/// 65 % of the 1010 px content width, then a 10 px gap.
-const COLUMN_WIDTH: f32 = 656.5;
-const RIGHT_X: f32 = 676.5;
-const RIGHT_WIDTH: f32 = 343.5;
-const SMALL: f32 = 286.0;
-const PROCESS: f32 = 218.0;
-const GAP: f32 = 10.0;
-const TALL: f32 = 2.0 * SMALL + GAP;
-const TOP: f32 = 10.0;
+/// The default 1030 × 790 area: 126 × 96 cells of content. The orchestrator takes 65 %
+/// of the width (81 cells), then a gap; the right side is 44 cells wide.
+const COLUMN_WIDTH: u16 = 81;
+const FULL_WIDTH: u16 = 126;
+const FULL_HEIGHT: u16 = 96;
+const RIGHT_X: u16 = 83;
+const RIGHT_WIDTH: u16 = 44;
+const SMALL: u16 = 36;
+const PROCESS: u16 = 28;
+const GAP: u16 = 1;
+const TALL: u16 = 2 * SMALL + GAP;
+const TOP: u16 = 1;
 
 fn default_layout(tiles: &[TileSpec]) -> Layout {
     layout(area(1030.0, 790.0), tiles, &LayoutStyle::default())
 }
 
 /// A box in the first column on the right of the default layout.
-fn box_at(top: f32, height: f32) -> Rect {
-    Rect::new(RIGHT_X, top, RIGHT_WIDTH, height)
+fn box_at(top: u16, height: u16) -> Rect {
+    cell_rect(RIGHT_X, top, RIGHT_WIDTH, height)
+}
+
+/// The orchestrator column of the default layout.
+fn column() -> Rect {
+    cell_rect(1, 1, COLUMN_WIDTH, FULL_HEIGHT)
+}
+
+// The grid.
+
+#[test]
+fn the_content_area_is_whole_cells_and_the_rest_goes_right_and_bottom() {
+    let exact = content_rect(area(1030.0, 790.0), &LayoutStyle::default());
+    let spare = content_rect(area(1037.0, 797.0), &LayoutStyle::default());
+    let moved = content_rect(Rect::new(5.0, 3.0, 1037.0, 797.0), &LayoutStyle::default());
+
+    // 1030 - 16 = 1014 px is 126 cells and 6 px; 790 - 16 = 774 px is 96 cells and 6 px.
+    assert_eq!(exact, Rect::new(8.0, 8.0, 1008.0, 768.0));
+    assert_eq!(spare, Rect::new(8.0, 8.0, 1016.0, 776.0));
+    assert_eq!(moved.origin, Point::new(13.0, 11.0));
+}
+
+#[test]
+fn the_content_area_of_a_tiny_area_is_empty() {
+    let content = content_rect(area(10.0, 20.0), &LayoutStyle::default());
+
+    assert_eq!(content.size, Size::default());
+}
+
+#[test]
+fn a_lone_orchestrator_fills_the_content_area() {
+    let sizes = [(1030.0, 790.0), (1037.0, 797.0), (1100.0, 700.0)];
+
+    for (width, height) in sizes {
+        let area = Rect::new(4.0, 6.0, width, height);
+
+        let layout = layout(area, &[orchestrator(0)], &LayoutStyle::default());
+
+        assert_rect(&layout, 0, content_rect(area, &LayoutStyle::default()));
+    }
+}
+
+#[test]
+fn font_sized_boxes_round_up_to_whole_cells() {
+    // 250 px is 31.25 cells: a 12-row box of 250 px needs 32 cells.
+    let style = LayoutStyle {
+        small_tile_height: cells_up(250.0),
+        process_tile_height: cells_up(201.0),
+        ..LayoutStyle::default()
+    };
+    let tiles = [
+        orchestrator(0),
+        worker(1, Activity::Working),
+        process(2, Activity::Running),
+    ];
+
+    let layout = layout(area(1030.0, 790.0), &tiles, &style);
+
+    assert_eq!(cells_up(250.0), 32);
+    assert_eq!(cells_up(201.0), 26);
+    assert_eq!(cells_up(8.0), 1);
+    assert_eq!(cells_up(8.1), 2);
+    assert_eq!(cells_up(0.0), 0);
+    assert_eq!(cells_up(286.0), LayoutStyle::default().small_tile_height);
+    assert_eq!(cells_up(218.0), LayoutStyle::default().process_tile_height);
+    assert_rect(&layout, 1, box_at(TOP, 32));
+    assert_rect(&layout, 2, box_at(34, 26));
+}
+
+#[test]
+fn pixels_round_to_the_nearest_whole_cells() {
+    assert_eq!(cells_nearest(3.9), 0);
+    assert_eq!(cells_nearest(4.0), 1);
+    assert_eq!(cells_nearest(11.9), 1);
+    assert_eq!(cells_nearest(12.0), 2);
+    assert_eq!(cells_nearest(-5.0), 0);
+    assert_eq!(Cells::nearest(Size::new(300.0, 163.0)), Cells::new(38, 20));
+    assert_eq!(Cells::new(38, 20).to_size(), Size::new(304.0, 160.0));
+}
+
+#[test]
+fn gap_and_padding_are_one_cell() {
+    let style = LayoutStyle::default();
+    let tiles = [
+        orchestrator(0),
+        worker(1, Activity::Working),
+        worker(2, Activity::Working),
+    ];
+
+    let layout = default_layout(&tiles);
+    let first = layout.rect(TileId(1)).unwrap();
+    let second = layout.rect(TileId(2)).unwrap();
+    let orchestrator = layout.rect(TileId(0)).unwrap();
+
+    assert_eq!((style.gap, style.padding), (1, 1));
+    assert_eq!(orchestrator.origin, Point::new(CELL, CELL));
+    assert!((first.origin.x - orchestrator.right() - CELL).abs() < f32::EPSILON);
+    assert!((second.origin.y - first.bottom() - CELL).abs() < f32::EPSILON);
 }
 
 // Orchestrator width.
 
 #[test]
 fn orchestrator_takes_65_percent_of_the_width() {
-    for (width, expected) in [(1030.0, 656.5), (1300.0, 832.0), (800.0, 507.0)] {
+    // Content widths of 126, 160 and 98 cells.
+    for (width, expected) in [(1030.0, 81), (1300.0, 104), (800.0, 63)] {
         let tiles = [orchestrator(0), worker(1, Activity::Working)];
 
         let layout = layout(area(width, 790.0), &tiles, &LayoutStyle::default());
 
-        assert_rect(&layout, 0, Rect::new(10.0, 10.0, expected, 770.0));
+        assert_rect(&layout, 0, cell_rect(1, 1, expected, FULL_HEIGHT));
     }
 }
 
@@ -95,9 +192,9 @@ fn the_right_side_keeps_room_for_one_minimum_tile() {
 
     let layout = layout(area(700.0, 790.0), &tiles, &LayoutStyle::default());
 
-    // 65 % of 680 is 442, but that leaves less than 260 + 10.
-    assert_rect(&layout, 0, Rect::new(10.0, 10.0, 410.0, 770.0));
-    assert_rect(&layout, 1, Rect::new(430.0, 10.0, 260.0, SMALL));
+    // 65 % of 85 cells is 55, but that leaves less than 33 + 1.
+    assert_rect(&layout, 0, cell_rect(1, 1, 51, FULL_HEIGHT));
+    assert_rect(&layout, 1, cell_rect(53, 1, 33, SMALL));
 }
 
 #[test]
@@ -110,7 +207,7 @@ fn orchestrator_is_never_narrower_than_its_minimum() {
 
     let layout = layout(area(1030.0, 790.0), &tiles, &style);
 
-    assert_rect(&layout, 0, Rect::new(10.0, 10.0, 320.0, 770.0));
+    assert_rect(&layout, 0, cell_rect(1, 1, 40, FULL_HEIGHT));
 }
 
 #[test]
@@ -119,7 +216,7 @@ fn orchestrator_takes_all_the_width_when_no_tile_fits_beside_it() {
 
     let layout = layout(area(600.0, 790.0), &tiles, &LayoutStyle::default());
 
-    assert_rect(&layout, 0, Rect::new(10.0, 10.0, 580.0, 770.0));
+    assert_rect(&layout, 0, cell_rect(1, 1, 73, FULL_HEIGHT));
     assert_eq!(layout.tray, tray(&[1]));
 }
 
@@ -135,7 +232,7 @@ fn orchestrator_takes_all_the_width_when_the_other_tiles_are_minimized() {
 
     let layout = default_layout(&tiles);
 
-    assert_rect(&layout, 0, Rect::new(10.0, 10.0, 1010.0, 770.0));
+    assert_rect(&layout, 0, cell_rect(1, 1, FULL_WIDTH, FULL_HEIGHT));
     assert_eq!(layout.tray, tray(&[1]));
 }
 
@@ -143,7 +240,7 @@ fn orchestrator_takes_all_the_width_when_the_other_tiles_are_minimized() {
 fn lone_orchestrator_fills_the_area() {
     let layout = default_layout(&[orchestrator(0)]);
 
-    assert_rect(&layout, 0, Rect::new(10.0, 10.0, 1010.0, 770.0));
+    assert_rect(&layout, 0, cell_rect(1, 1, FULL_WIDTH, FULL_HEIGHT));
 }
 
 #[test]
@@ -159,11 +256,12 @@ fn orchestrator_goes_to_the_tray_when_shorter_than_its_minimum() {
 
 #[test]
 fn orchestrator_shrinks_to_make_room_for_a_user_terminal() {
-    let tiles = [orchestrator(0), user(1, Size::new(650.0, 470.0))];
+    let tiles = [orchestrator(0), user(1, Cells::new(81, 59))];
 
     let layout = default_layout(&tiles);
 
-    assert_rect(&layout, 0, Rect::new(10.0, 10.0, 350.0, 770.0));
+    // 126 - 81 - 1 cells are left of the user terminal.
+    assert_rect(&layout, 0, cell_rect(1, 1, 44, FULL_HEIGHT));
 }
 
 #[test]
@@ -222,27 +320,27 @@ fn a_box_that_does_not_fit_below_the_others_goes_to_the_tray() {
 #[test]
 fn the_style_sets_the_small_box_height() {
     let style = LayoutStyle {
-        small_tile_height: 200.0,
+        small_tile_height: 25,
         ..LayoutStyle::default()
     };
     let tiles = [orchestrator(0), worker(1, Activity::Working)];
 
     let layout = layout(area(1030.0, 790.0), &tiles, &style);
 
-    assert_rect(&layout, 1, box_at(TOP, 200.0));
+    assert_rect(&layout, 1, box_at(TOP, 25));
 }
 
 #[test]
 fn a_small_box_is_never_shorter_than_the_minimum_tile() {
     let style = LayoutStyle {
-        small_tile_height: 100.0,
+        small_tile_height: 12,
         ..LayoutStyle::default()
     };
     let tiles = [orchestrator(0), worker(1, Activity::Working)];
 
     let layout = layout(area(1030.0, 790.0), &tiles, &style);
 
-    assert_rect(&layout, 1, box_at(TOP, 160.0));
+    assert_rect(&layout, 1, box_at(TOP, 20));
 }
 
 #[test]
@@ -251,7 +349,8 @@ fn the_first_box_of_a_column_is_cut_to_a_short_area() {
 
     let layout = layout(area(600.0, 250.0), &tiles, &LayoutStyle::default());
 
-    assert_rect(&layout, 0, Rect::new(10.0, 10.0, 285.0, 230.0));
+    // Content of 73 × 29 cells: two lanes of 36.
+    assert_rect(&layout, 0, cell_rect(1, 1, 36, 29));
 }
 
 #[test]
@@ -275,12 +374,12 @@ fn wide_tiles(workers: u32) -> Vec<TileSpec> {
 fn a_wide_right_side_holds_two_columns() {
     let layout = layout(area(1700.0, 790.0), &wide_tiles(5), &LayoutStyle::default());
 
-    // Content 1680 wide: the orchestrator takes 1092, two columns of 284 share the 578 left.
-    assert_rect(&layout, 0, Rect::new(10.0, 10.0, 1092.0, 770.0));
-    assert_rect(&layout, 1, Rect::new(1112.0, 10.0, 284.0, SMALL));
-    assert_rect(&layout, 2, Rect::new(1112.0, 306.0, 284.0, SMALL));
-    assert_rect(&layout, 3, Rect::new(1406.0, 10.0, 284.0, SMALL));
-    assert_rect(&layout, 4, Rect::new(1406.0, 306.0, 284.0, SMALL));
+    // Content 210 wide: the orchestrator takes 136, two columns of 36 share the 73 left.
+    assert_rect(&layout, 0, cell_rect(1, 1, 136, FULL_HEIGHT));
+    assert_rect(&layout, 1, cell_rect(138, 1, 36, SMALL));
+    assert_rect(&layout, 2, cell_rect(138, 38, 36, SMALL));
+    assert_rect(&layout, 3, cell_rect(175, 1, 36, SMALL));
+    assert_rect(&layout, 4, cell_rect(175, 38, 36, SMALL));
     assert_eq!(layout.tray, tray(&[5]));
 }
 
@@ -295,24 +394,34 @@ fn boxes_fill_a_column_from_top_to_bottom_before_the_next_column() {
         .map(|id| layout.rect(TileId(id)).map(|rect| rect.origin.x))
         .collect();
 
-    assert_eq!(tops, [Some(10.0), Some(306.0), Some(10.0)]);
-    assert_eq!(lefts, [Some(1112.0), Some(1112.0), Some(1406.0)]);
+    assert_eq!(tops, [Some(c(1)), Some(c(38)), Some(c(1))]);
+    assert_eq!(lefts, [Some(c(138)), Some(c(138)), Some(c(175))]);
 }
 
 #[test]
 fn a_second_column_needs_a_right_side_of_two_minimum_tiles() {
-    let one_column = layout(area(1560.0, 790.0), &wide_tiles(3), &LayoutStyle::default());
-    let two_columns = layout(area(1563.0, 790.0), &wide_tiles(3), &LayoutStyle::default());
+    let one_column = layout(area(1544.0, 790.0), &wide_tiles(3), &LayoutStyle::default());
+    let two_columns = layout(area(1552.0, 790.0), &wide_tiles(3), &LayoutStyle::default());
 
-    // The right side is 529 px wide, then 530.05 px.
+    // The right side is 66 cells wide, then 67: two lanes of 33 and the gap.
     assert_eq!(one_column.tray, tray(&[3]));
     assert!(two_columns.tray.is_empty());
-    assert_rect(&one_column, 1, Rect::new(1021.0, 10.0, 529.0, SMALL));
-    assert!(
-        two_columns
-            .rect(TileId(1))
-            .is_some_and(|rect| (rect.size.width - 260.025).abs() < 0.1)
-    );
+    assert_rect(&one_column, 1, cell_rect(126, 1, 66, SMALL));
+    assert_rect(&two_columns, 1, cell_rect(126, 1, 33, SMALL));
+}
+
+#[test]
+fn lanes_share_cells_that_do_not_divide_with_the_first_lanes() {
+    let workers: Vec<TileSpec> = (0..5).map(|id| worker(id, Activity::Working)).collect();
+
+    let layout = default_layout(&workers);
+
+    // 126 cells less two gaps are 124 cells for three lanes. Each lane holds two boxes.
+    let widths: Vec<f32> = [0, 2, 4]
+        .into_iter()
+        .filter_map(|id| layout.rect(TileId(id)).map(|rect| rect.size.width))
+        .collect();
+    assert_eq!(widths, [c(42), c(41), c(41)]);
 }
 
 // Tiles that need attention.
@@ -337,7 +446,7 @@ fn an_attention_box_is_never_taller_than_two_small_boxes() {
     let layout = layout(area(1030.0, 1410.0), &tiles, &LayoutStyle::default());
 
     assert_rect(&layout, 1, box_at(TOP, SMALL));
-    assert_rect(&layout, 2, box_at(306.0, TALL));
+    assert_rect(&layout, 2, box_at(38, TALL));
 }
 
 #[test]
@@ -359,10 +468,10 @@ fn an_attention_box_does_not_push_a_working_worker_to_the_tray() {
 
     let layout = default_layout(&tiles);
 
-    // A small box and a tall one need 878 of the 770 px, so the box that needs attention
-    // stays small.
+    // A small box and a tall one need 110 of the 96 cells, so the box that needs
+    // attention stays small.
     assert_rect(&layout, 1, box_at(TOP, SMALL));
-    assert_rect(&layout, 2, box_at(306.0, SMALL));
+    assert_rect(&layout, 2, box_at(38, SMALL));
     assert!(layout.tray.is_empty());
 }
 
@@ -383,8 +492,8 @@ fn an_attention_box_shrinks_back_when_the_worker_works_again() {
     let before = layout(area(1030.0, 1000.0), &blocked, &style).rect(TileId(2));
     let after = layout(area(1030.0, 1000.0), &working, &style).rect(TileId(2));
 
-    assert_eq!(before.map(|rect| rect.size.height), Some(TALL));
-    assert_eq!(after.map(|rect| rect.size.height), Some(SMALL));
+    assert_eq!(before.map(|rect| rect.size.height), Some(c(TALL)));
+    assert_eq!(after.map(|rect| rect.size.height), Some(c(SMALL)));
     assert_eq!(
         before.map(|rect| rect.origin),
         after.map(|rect| rect.origin)
@@ -402,7 +511,7 @@ fn two_attention_boxes_start_small_when_tall_boxes_would_send_one_to_the_tray() 
     let layout = default_layout(&tiles);
 
     assert_rect(&layout, 1, box_at(TOP, SMALL));
-    assert_rect(&layout, 2, box_at(306.0, SMALL));
+    assert_rect(&layout, 2, box_at(38, SMALL));
 }
 
 #[test]
@@ -416,7 +525,7 @@ fn two_attention_boxes_are_both_tall_when_there_is_room() {
     let layout = layout(area(1030.0, 1410.0), &tiles, &LayoutStyle::default());
 
     assert_rect(&layout, 1, box_at(TOP, TALL));
-    assert_rect(&layout, 2, box_at(602.0, TALL));
+    assert_rect(&layout, 2, box_at(75, TALL));
 }
 
 #[test]
@@ -429,8 +538,8 @@ fn an_attention_box_gets_its_own_column_when_the_right_side_is_wide() {
 
     let layout = layout(area(1700.0, 790.0), &tiles, &LayoutStyle::default());
 
-    assert_rect(&layout, 1, Rect::new(1112.0, 10.0, 284.0, SMALL));
-    assert_rect(&layout, 2, Rect::new(1406.0, 10.0, 284.0, TALL));
+    assert_rect(&layout, 1, cell_rect(138, 1, 36, SMALL));
+    assert_rect(&layout, 2, cell_rect(175, 1, 36, TALL));
 }
 
 #[test]
@@ -488,7 +597,7 @@ fn a_running_process_stacks_below_a_tall_attention_box() {
     let layout = layout(area(1030.0, 1000.0), &tiles, &LayoutStyle::default());
 
     assert_rect(&layout, 1, box_at(TOP, TALL));
-    assert_rect(&layout, 2, box_at(602.0, PROCESS));
+    assert_rect(&layout, 2, box_at(75, PROCESS));
     assert!(layout.tray.is_empty());
 }
 
@@ -518,7 +627,7 @@ fn done_and_idle_workers_stack_below_a_tall_attention_box() {
     let layout = layout(area(1030.0, 1000.0), &tiles, &LayoutStyle::default());
 
     assert_rect(&layout, 1, box_at(TOP, TALL));
-    assert_rect(&layout, 2, box_at(602.0, SMALL));
+    assert_rect(&layout, 2, box_at(75, SMALL));
     assert_eq!(layout.tray, tray(&[3]));
 }
 
@@ -584,9 +693,9 @@ fn a_large_worker_does_not_push_a_working_worker_to_the_tray() {
     let cramped = default_layout(&tiles);
     let tall = layout(area(1030.0, 1000.0), &tiles, &LayoutStyle::default());
 
-    assert_rect(&cramped, 2, box_at(306.0, SMALL));
+    assert_rect(&cramped, 2, box_at(38, SMALL));
     assert!(cramped.tray.is_empty());
-    assert_rect(&tall, 2, box_at(306.0, TALL));
+    assert_rect(&tall, 2, box_at(38, TALL));
 }
 
 #[test]
@@ -607,7 +716,7 @@ fn a_large_request_does_not_change_the_priority() {
 fn the_orchestrator_keeps_its_share_when_a_worker_asks_for_a_large_tile() {
     let layout = default_layout(&[orchestrator(0), large_worker(1, Activity::Working)]);
 
-    assert_rect(&layout, 0, Rect::new(10.0, 10.0, COLUMN_WIDTH, 770.0));
+    assert_rect(&layout, 0, column());
 }
 
 #[test]
@@ -620,7 +729,7 @@ fn the_orchestrator_ignores_the_large_request() {
 
     let layout = default_layout(&tiles);
 
-    assert_rect(&layout, 0, Rect::new(10.0, 10.0, COLUMN_WIDTH, 770.0));
+    assert_rect(&layout, 0, column());
     assert_rect(&layout, 1, box_at(TOP, SMALL));
 }
 
@@ -658,7 +767,7 @@ fn a_minimized_worker_stays_in_the_tray_whatever_it_asks() {
     let layout = default_layout(&[orchestrator(0), minimized]);
 
     assert_eq!(layout.tray, tray(&[1]));
-    assert_rect(&layout, 0, Rect::new(10.0, 10.0, 1010.0, 770.0));
+    assert_rect(&layout, 0, cell_rect(1, 1, FULL_WIDTH, FULL_HEIGHT));
 }
 
 // Workspace mockup: orchestrator, two workers, two processes, a done and an idle worker.
@@ -679,9 +788,9 @@ fn workspace_tiles() -> Vec<TileSpec> {
 fn workspace_mockup_shows_both_workers() {
     let layout = default_layout(&workspace_tiles());
 
-    assert_rect(&layout, 0, Rect::new(10.0, 10.0, COLUMN_WIDTH, 770.0));
+    assert_rect(&layout, 0, column());
     assert_rect(&layout, 1, box_at(TOP, SMALL));
-    assert_rect(&layout, 2, box_at(306.0, SMALL));
+    assert_rect(&layout, 2, box_at(38, SMALL));
 }
 
 #[test]
@@ -698,9 +807,9 @@ fn workspace_mockup_in_a_tall_area_stacks_the_processes_below_the_tall_box() {
     );
 
     assert_rect(&layout, 1, box_at(TOP, SMALL));
-    assert_rect(&layout, 2, box_at(306.0, TALL));
-    assert_rect(&layout, 3, box_at(898.0, PROCESS));
-    assert_rect(&layout, 4, box_at(1126.0, PROCESS));
+    assert_rect(&layout, 2, box_at(38, TALL));
+    assert_rect(&layout, 3, box_at(112, PROCESS));
+    assert_rect(&layout, 4, box_at(141, PROCESS));
     assert_eq!(layout.tray, tray(&[5, 6]));
 }
 
@@ -717,18 +826,18 @@ fn processes_stack_under_the_workers_when_none_needs_attention() {
     let layout = layout(area(1030.0, 1400.0), &tiles, &LayoutStyle::default());
 
     assert_rect(&layout, 1, box_at(TOP, SMALL));
-    assert_rect(&layout, 2, box_at(306.0, SMALL));
-    assert_rect(&layout, 3, box_at(602.0, PROCESS));
-    assert_rect(&layout, 4, box_at(830.0, PROCESS));
+    assert_rect(&layout, 2, box_at(38, SMALL));
+    assert_rect(&layout, 3, box_at(75, PROCESS));
+    assert_rect(&layout, 4, box_at(104, PROCESS));
     assert!(layout.tray.is_empty());
 }
 
-// Island mockup: a 650 × 470 user terminal next to the orchestrator column.
+// Island mockup: an 81 × 59 cell user terminal (648 × 472 px) next to the orchestrator column.
 
 fn island_layout() -> Layout {
     let tiles = vec![
         orchestrator(0),
-        user(1, Size::new(650.0, 470.0)),
+        user(1, Cells::new(81, 59)),
         worker(2, Activity::Working),
         process(3, Activity::Working),
         worker(4, Activity::Working),
@@ -741,20 +850,20 @@ fn island_layout() -> Layout {
 
 #[test]
 fn island_mockup_puts_user_terminal_top_right_at_its_fixed_size() {
-    assert_rect(&island_layout(), 1, Rect::new(400.0, 10.0, 650.0, 470.0));
+    assert_rect(&island_layout(), 1, cell_rect(50, 1, 81, 59));
 }
 
 #[test]
 fn island_mockup_puts_orchestrator_in_the_left_column() {
-    assert_rect(&island_layout(), 0, Rect::new(10.0, 10.0, 380.0, 770.0));
+    assert_rect(&island_layout(), 0, cell_rect(1, 1, 48, FULL_HEIGHT));
 }
 
 #[test]
 fn island_mockup_puts_other_tiles_below_the_user_terminal() {
     let layout = island_layout();
 
-    assert_rect(&layout, 2, Rect::new(400.0, 490.0, 320.0, SMALL));
-    assert_rect(&layout, 3, Rect::new(730.0, 490.0, 320.0, PROCESS));
+    assert_rect(&layout, 2, cell_rect(50, 61, 40, SMALL));
+    assert_rect(&layout, 3, cell_rect(91, 61, 40, PROCESS));
 }
 
 #[test]
@@ -768,16 +877,16 @@ fn a_tall_user_terminal_leaves_a_lane_beside_it_for_the_workers() {
         orchestrator(0),
         worker(1, Activity::Working),
         worker(2, Activity::Attention),
-        user(3, Size::new(650.0, 878.0)),
+        user(3, Cells::new(81, 110)),
     ];
 
     let layout = layout(area(1340.0, 898.0), &tiles, &LayoutStyle::default());
 
     assert!(layout.tray.is_empty());
-    assert_rect(&layout, 3, Rect::new(680.0, 10.0, 650.0, 878.0));
-    assert_rect(&layout, 0, Rect::new(10.0, 10.0, 390.0, 878.0));
-    assert_rect(&layout, 1, Rect::new(410.0, 10.0, 260.0, SMALL));
-    assert_rect(&layout, 2, Rect::new(410.0, 306.0, 260.0, TALL));
+    assert_rect(&layout, 3, cell_rect(85, 1, 81, 110));
+    assert_rect(&layout, 0, cell_rect(1, 1, 49, 110));
+    assert_rect(&layout, 1, cell_rect(51, 1, 33, SMALL));
+    assert_rect(&layout, 2, cell_rect(51, 38, 33, TALL));
 }
 
 #[test]
@@ -785,56 +894,51 @@ fn a_user_terminal_with_room_below_it_keeps_the_orchestrator_wide() {
     let tiles = [
         orchestrator(0),
         worker(1, Activity::Working),
-        user(2, Size::new(300.0, 300.0)),
+        user(2, Cells::new(37, 37)),
     ];
 
     let layout = layout(area(1340.0, 898.0), &tiles, &LayoutStyle::default());
 
-    assert_rect(&layout, 0, Rect::new(10.0, 10.0, 858.0, 878.0));
+    assert_rect(&layout, 0, cell_rect(1, 1, 107, 110));
     assert!(layout.tray.is_empty());
 }
 
 #[test]
 fn tiles_flow_beside_a_user_terminal_when_space_allows() {
     let tiles = [
-        user(0, Size::new(600.0, 400.0)),
+        user(0, Cells::new(75, 50)),
         worker(1, Activity::Working),
         worker(2, Activity::Working),
     ];
 
     let layout = layout(area(1220.0, 800.0), &tiles, &LayoutStyle::default());
 
-    assert_rect(&layout, 1, Rect::new(10.0, 10.0, 290.0, SMALL));
-    assert_rect(&layout, 2, Rect::new(310.0, 10.0, 290.0, SMALL));
+    // 74 cells beside the user terminal: two lanes of 37 and 36.
+    assert_rect(&layout, 1, cell_rect(1, 1, 37, SMALL));
+    assert_rect(&layout, 2, cell_rect(39, 1, 36, SMALL));
 }
 
 #[test]
 fn second_user_terminal_goes_left_of_the_first() {
-    let tiles = [
-        user(0, Size::new(400.0, 300.0)),
-        user(1, Size::new(300.0, 200.0)),
-    ];
+    let tiles = [user(0, Cells::new(50, 37)), user(1, Cells::new(37, 25))];
 
     let layout = layout(area(1220.0, 800.0), &tiles, &LayoutStyle::default());
 
-    assert_rect(&layout, 1, Rect::new(500.0, 10.0, 300.0, 200.0));
+    assert_rect(&layout, 1, cell_rect(63, 1, 37, 25));
 }
 
 #[test]
 fn user_terminal_wraps_below_when_the_top_row_is_full() {
-    let tiles = [
-        user(0, Size::new(700.0, 300.0)),
-        user(1, Size::new(600.0, 200.0)),
-    ];
+    let tiles = [user(0, Cells::new(88, 37)), user(1, Cells::new(75, 25))];
 
     let layout = layout(area(1220.0, 800.0), &tiles, &LayoutStyle::default());
 
-    assert_rect(&layout, 1, Rect::new(610.0, 320.0, 600.0, 200.0));
+    assert_rect(&layout, 1, cell_rect(76, 39, 75, 25));
 }
 
 #[test]
 fn user_terminal_larger_than_the_area_goes_to_the_tray() {
-    let tiles = [user(0, Size::new(1300.0, 300.0))];
+    let tiles = [user(0, Cells::new(163, 37))];
 
     let layout = layout(area(1220.0, 800.0), &tiles, &LayoutStyle::default());
 
@@ -859,7 +963,7 @@ fn user_terminal_without_fixed_size_flows_ahead_of_agents() {
 fn tiny_area_keeps_only_orchestrator_and_user_terminal() {
     let tiles = [
         orchestrator(0),
-        user(1, Size::new(600.0, 480.0)),
+        user(1, Cells::new(75, 60)),
         worker(2, Activity::Attention),
         worker(3, Activity::Working),
         process(4, Activity::Running),
@@ -874,13 +978,13 @@ fn tiny_area_keeps_only_orchestrator_and_user_terminal() {
 fn tiny_area_gives_the_orchestrator_all_width_left_of_the_user_terminal() {
     let tiles = [
         orchestrator(0),
-        user(1, Size::new(600.0, 480.0)),
+        user(1, Cells::new(75, 60)),
         worker(2, Activity::Working),
     ];
 
     let layout = layout(area(1000.0, 500.0), &tiles, &LayoutStyle::default());
 
-    assert_rect(&layout, 0, Rect::new(10.0, 10.0, 370.0, 480.0));
+    assert_rect(&layout, 0, cell_rect(1, 1, 47, 60));
 }
 
 #[test]
@@ -917,7 +1021,7 @@ fn minimized_tile_goes_to_the_tray_even_when_space_is_free() {
 fn minimized_user_terminal_goes_to_the_tray() {
     let tiles = [TileSpec {
         minimized: true,
-        ..user(0, Size::new(300.0, 200.0))
+        ..user(0, Cells::new(37, 25))
     }];
 
     let layout = default_layout(&tiles);
@@ -1068,12 +1172,13 @@ fn tiles_keep_their_place_when_their_activity_changes() {
     let before = default_layout(&working);
     let after = default_layout(&attention);
 
-    assert_rect(&before, 0, Rect::new(10.0, 10.0, 330.0, SMALL));
+    // Three lanes share 124 cells: 42, 41 and 41.
+    assert_rect(&before, 0, cell_rect(1, 1, 42, SMALL));
     assert_eq!(before.rect(TileId(0)), after.rect(TileId(0)));
 }
 
 #[test]
-fn processes_go_after_agents() {
+fn input_order_is_final_a_process_above_a_worker_stays_above() {
     let tiles = [
         process(0, Activity::Attention),
         worker(1, Activity::Idle),
@@ -1082,8 +1187,8 @@ fn processes_go_after_agents() {
 
     let layout = layout(area(350.0, 790.0), &tiles, &LayoutStyle::default());
 
-    assert_rect(&layout, 2, Rect::new(10.0, 10.0, 330.0, SMALL));
-    assert_rect(&layout, 0, Rect::new(10.0, 306.0, 330.0, PROCESS));
+    assert_rect(&layout, 0, cell_rect(1, 1, 41, PROCESS));
+    assert_rect(&layout, 2, cell_rect(1, 30, 41, SMALL));
     assert_eq!(layout.tray, tray(&[1]));
 }
 
@@ -1101,14 +1206,14 @@ fn a_process_is_the_smallest_box() {
 #[test]
 fn a_process_shorter_than_the_minimum_gets_the_minimum_height() {
     let style = LayoutStyle {
-        process_tile_height: 100.0,
+        process_tile_height: 12,
         ..LayoutStyle::default()
     };
     let tiles = [orchestrator(0), process(1, Activity::Running)];
 
     let layout = layout(area(1030.0, 790.0), &tiles, &style);
 
-    assert_rect(&layout, 1, box_at(TOP, 160.0));
+    assert_rect(&layout, 1, box_at(TOP, 20));
 }
 
 #[test]
@@ -1117,21 +1222,21 @@ fn a_process_taller_than_the_lane_is_cut_to_it_when_it_is_first_in_its_column() 
 
     let layout = layout(area(300.0, 220.0), &tiles, &LayoutStyle::default());
 
-    assert_rect(&layout, 0, Rect::new(10.0, 10.0, 280.0, 200.0));
+    assert_rect(&layout, 0, cell_rect(1, 1, 35, 25));
 }
 
 #[test]
 fn a_process_stacks_below_the_workers() {
     let tiles = [
         orchestrator(0),
-        process(1, Activity::Running),
-        worker(2, Activity::Working),
+        worker(1, Activity::Working),
+        process(2, Activity::Running),
     ];
 
     let layout = default_layout(&tiles);
 
-    assert_rect(&layout, 2, box_at(TOP, SMALL));
-    assert_rect(&layout, 1, box_at(306.0, PROCESS));
+    assert_rect(&layout, 1, box_at(TOP, SMALL));
+    assert_rect(&layout, 2, box_at(38, PROCESS));
 }
 
 #[test]
@@ -1147,11 +1252,7 @@ fn a_process_never_takes_width_from_the_orchestrator() {
     let after = default_layout(&with).rect(TileId(0));
 
     assert_eq!(before, after);
-    assert_rect(
-        &default_layout(&with),
-        0,
-        Rect::new(10.0, 10.0, COLUMN_WIDTH, 770.0),
-    );
+    assert_rect(&default_layout(&with), 0, column());
 }
 
 #[test]
@@ -1159,14 +1260,14 @@ fn a_process_with_a_fixed_size_is_still_a_small_box_and_not_an_island() {
     let tiles = [
         orchestrator(0),
         TileSpec {
-            fixed: Some(Size::new(700.0, 400.0)),
+            fixed: Some(Cells::new(87, 50)),
             ..process(1, Activity::Running)
         },
     ];
 
     let layout = default_layout(&tiles);
 
-    assert_rect(&layout, 0, Rect::new(10.0, 10.0, COLUMN_WIDTH, 770.0));
+    assert_rect(&layout, 0, column());
     assert_rect(&layout, 1, box_at(TOP, PROCESS));
 }
 
@@ -1188,14 +1289,14 @@ fn a_process_that_does_not_fit_below_two_workers_goes_to_the_tray() {
 fn a_process_beside_a_user_terminal_island_flows_below_it_like_a_worker() {
     let tiles = [
         orchestrator(0),
-        user(1, Size::new(650.0, 470.0)),
+        user(1, Cells::new(81, 59)),
         process(2, Activity::Running),
     ];
 
     let layout = layout(area(1060.0, 790.0), &tiles, &LayoutStyle::default());
 
-    assert_rect(&layout, 1, Rect::new(400.0, 10.0, 650.0, 470.0));
-    assert_rect(&layout, 2, Rect::new(400.0, 490.0, 320.0, PROCESS));
+    assert_rect(&layout, 1, cell_rect(50, 1, 81, 59));
+    assert_rect(&layout, 2, cell_rect(50, 61, 40, PROCESS));
 }
 
 // Properties over many random inputs.
@@ -1220,12 +1321,16 @@ impl Random {
         self.below(100) < percent
     }
 
-    fn pixels(&mut self, low: u16, high: u16) -> f32 {
-        f32::from(low + self.below(high - low + 1))
+    fn between(&mut self, low: u16, high: u16) -> u16 {
+        low + self.below(high - low + 1)
     }
 
-    fn size(&mut self, low: u16, high: u16) -> Size {
-        Size::new(self.pixels(low, high), self.pixels(low, high))
+    fn pixels(&mut self, low: u16, high: u16) -> f32 {
+        f32::from(self.between(low, high))
+    }
+
+    fn cells(&mut self, low: u16, high: u16) -> Cells {
+        Cells::new(self.between(low, high), self.between(low, high))
     }
 
     fn pick<T: Copy>(&mut self, items: &[T]) -> T {
@@ -1246,7 +1351,7 @@ impl Case {
     }
 
     fn content(&self) -> Rect {
-        self.area.inset(self.style.padding)
+        content_rect(self.area, &self.style)
     }
 
     /// The orchestrator that gets the left column, if it is placed.
@@ -1286,8 +1391,10 @@ fn random_tile(random: &mut Random, id: u32) -> TileSpec {
         Activity::Done,
         Activity::Idle,
     ]);
-    let fixed = (kind == TileKind::User && random.chance(70))
-        .then(|| Size::new(random.pixels(80, 1200), random.pixels(60, 900)));
+    let fixed = (kind == TileKind::User && random.chance(70)).then(|| {
+        let width = random.between(10, 150);
+        Cells::new(width, random.between(8, 112))
+    });
 
     TileSpec {
         id: TileId(id),
@@ -1305,16 +1412,16 @@ fn random_style(random: &mut Random) -> LayoutStyle {
         return LayoutStyle::default();
     }
 
-    let small_tile_height = 40 + random.below(461);
+    let small_tile_height = random.between(5, 63);
 
     LayoutStyle {
-        gap: random.pixels(0, 24),
-        padding: random.pixels(0, 24),
+        gap: random.below(4),
+        padding: random.below(4),
         orchestrator_share: f32::from(random.below(101)) / 100.0,
-        min_tile: random.size(60, 400),
-        min_orchestrator: random.size(100, 500),
-        small_tile_height: f32::from(small_tile_height),
-        process_tile_height: random.pixels(40, small_tile_height),
+        min_tile: random.cells(8, 50),
+        min_orchestrator: random.cells(12, 63),
+        small_tile_height,
+        process_tile_height: random.between(5, small_tile_height),
     }
 }
 
@@ -1345,7 +1452,8 @@ fn random_case(seed: u64) -> Case {
 /// status bar (38) and the right panel (320).
 const APP_MIN_AREA: (u16, u16) = (522, 598);
 
-/// A case like the app makes: the default style and an area of at least [`APP_MIN_AREA`].
+/// A case like the app makes: the default style, a font-sized box height and an area of
+/// at least [`APP_MIN_AREA`].
 fn app_case(seed: u64) -> Case {
     let mut random = Random(seed);
     let (min_width, min_height) = APP_MIN_AREA;
@@ -1357,8 +1465,8 @@ fn app_case(seed: u64) -> Case {
     );
     let small_tile_height = random.pixels(200, 400);
     let style = LayoutStyle {
-        small_tile_height,
-        process_tile_height: (small_tile_height * 0.75).round(),
+        small_tile_height: cells_up(small_tile_height),
+        process_tile_height: cells_up((small_tile_height * 0.75).round()),
         ..LayoutStyle::default()
     };
     let tiles = random_tiles(&mut random);
@@ -1402,6 +1510,11 @@ fn activity_rank(activity: Activity) -> u8 {
     }
 }
 
+/// The least a style lets a tile be, in pixels.
+fn at_least_one_cell(cells: Cells) -> Size {
+    Cells::new(cells.width.max(1), cells.height.max(1)).to_size()
+}
+
 #[test]
 fn layout_is_deterministic() {
     for case in cases() {
@@ -1429,16 +1542,49 @@ fn every_tile_is_placed_or_in_the_tray_exactly_once() {
 }
 
 #[test]
+fn every_placed_rect_starts_and_ends_on_a_cell_edge() {
+    for case in cases() {
+        let content = case.content();
+
+        for (id, rect) in case.layout().placed {
+            let edges = [
+                rect.origin.x - content.origin.x,
+                rect.origin.y - content.origin.y,
+                rect.size.width,
+                rect.size.height,
+            ];
+
+            assert!(
+                edges.iter().all(|edge| edge % CELL == 0.0),
+                "{id:?} at {rect:?} is off the grid of {content:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_content_area_is_never_larger_than_the_area_less_the_padding() {
+    for case in cases() {
+        let content = case.content();
+        let padding = f32::from(case.style.padding) * CELL;
+
+        assert!(content.size.width <= (case.area.size.width - 2.0 * padding).max(0.0));
+        assert!(content.size.height <= (case.area.size.height - 2.0 * padding).max(0.0));
+        assert!(content.size.width % CELL == 0.0 && content.size.height % CELL == 0.0);
+    }
+}
+
+#[test]
 fn placed_tiles_lie_inside_the_padded_area() {
     for case in cases() {
         let content = case.content();
 
         for (id, rect) in case.layout().placed {
             assert!(
-                rect.origin.x >= content.origin.x - FLOAT_TOLERANCE
-                    && rect.origin.y >= content.origin.y - FLOAT_TOLERANCE
-                    && rect.right() <= content.right() + FLOAT_TOLERANCE
-                    && rect.bottom() <= content.bottom() + FLOAT_TOLERANCE,
+                rect.origin.x >= content.origin.x
+                    && rect.origin.y >= content.origin.y
+                    && rect.right() <= content.right()
+                    && rect.bottom() <= content.bottom(),
                 "{id:?} at {rect:?} is outside {content:?}"
             );
         }
@@ -1449,11 +1595,12 @@ fn placed_tiles_lie_inside_the_padded_area() {
 fn placed_tiles_never_overlap_and_keep_at_least_the_gap() {
     for case in cases() {
         let placed = case.layout().placed;
+        let gap = f32::from(case.style.gap) * CELL;
 
         for (position, (first_id, first)) in placed.iter().enumerate() {
             for (second_id, second) in &placed[position + 1..] {
                 assert!(
-                    separation(*first, *second) >= case.style.gap - FLOAT_TOLERANCE,
+                    separation(*first, *second) >= gap,
                     "{first_id:?} {first:?} and {second_id:?} {second:?} are too close"
                 );
             }
@@ -1471,7 +1618,7 @@ fn fixed_sizes_never_change() {
                 continue;
             };
             if tile.kind == TileKind::User {
-                assert_eq!(rect.size, fixed);
+                assert_eq!(rect.size, fixed.to_size());
             }
         }
     }
@@ -1503,10 +1650,10 @@ fn placed_tiles_are_at_least_their_minimum_size() {
             } else {
                 case.style.min_tile
             };
+            let min = at_least_one_cell(min);
 
             assert!(
-                rect.size.width >= min.width - FLOAT_TOLERANCE
-                    && rect.size.height >= min.height - FLOAT_TOLERANCE,
+                rect.size.width >= min.width && rect.size.height >= min.height,
                 "{:?} is {:?}, smaller than {min:?}",
                 tile.id,
                 rect.size
@@ -1534,11 +1681,11 @@ fn no_placed_tile_is_smaller_than_the_minimum_tile_in_an_app_sized_area() {
                 case.style.min_orchestrator
             } else {
                 case.style.min_tile
-            };
+            }
+            .to_size();
 
             assert!(
-                rect.size.width >= min.width - FLOAT_TOLERANCE
-                    && rect.size.height >= min.height - FLOAT_TOLERANCE,
+                rect.size.width >= min.width && rect.size.height >= min.height,
                 "{:?} ({:?}, fixed {:?}) is {:?}, smaller than {min:?} in {:?}",
                 tile.id,
                 tile.kind,
@@ -1618,16 +1765,15 @@ fn placed_orchestrator_column_spans_the_full_height() {
         };
 
         let content = case.content();
-        assert!(near(
+        assert_eq!(
             Rect::new(
                 content.origin.x,
                 content.origin.y,
                 rect.size.width,
                 content.size.height
             ),
-            rect,
-            FLOAT_TOLERANCE
-        ));
+            rect
+        );
     }
 }
 
@@ -1636,10 +1782,10 @@ fn boxes_without_a_size_of_their_own_are_never_taller_than_a_small_box() {
     for case in cases() {
         let layout = case.layout();
         let column = case.column_orchestrator();
-        let small = case
+        let small = c(case
             .style
             .small_tile_height
-            .max(case.style.min_tile.height.max(1.0));
+            .max(case.style.min_tile.height.max(1)));
 
         for tile in case.tiles.iter().filter(|tile| {
             tile.fixed.is_none()
@@ -1652,7 +1798,7 @@ fn boxes_without_a_size_of_their_own_are_never_taller_than_a_small_box() {
             };
 
             assert!(
-                rect.size.height <= small + FLOAT_TOLERANCE,
+                rect.size.height <= small,
                 "{:?} is {:?} high, a small box is {small}",
                 tile.id,
                 rect.size.height
@@ -1681,10 +1827,12 @@ fn the_orchestrator_is_never_wider_than_its_share_when_a_tile_sits_beside_it() {
             continue;
         }
 
-        let share = case.content().size.width * case.style.orchestrator_share.clamp(0.0, 1.0);
+        let share = (case.content().size.width / CELL
+            * case.style.orchestrator_share.clamp(0.0, 1.0))
+        .floor()
+            * CELL;
         assert!(
-            rect.size.width
-                <= share.max(case.style.min_orchestrator.width.max(1.0)) + FLOAT_TOLERANCE,
+            rect.size.width <= share.max(at_least_one_cell(case.style.min_orchestrator).width),
             "{rect:?} is wider than {share}"
         );
     }
@@ -1739,13 +1887,13 @@ fn a_lane_that_is_free_at_the_minimum_orchestrator_width_is_used() {
 
         let (content, style) = (case.content(), case.style);
         let block = island_block(&case, &layout).unwrap_or_default();
-        let left = content.size.width - style.min_orchestrator.width.max(1.0) - style.gap;
-        let lane_width = style.min_tile.width.max(1.0);
-        let lane_height = style.min_tile.height.max(1.0);
+        let gap = c(style.gap);
+        let min_tile = at_least_one_cell(style.min_tile);
+        let left = content.size.width - at_least_one_cell(style.min_orchestrator).width - gap;
         let lane_below =
-            left >= lane_width && content.size.height - block.height - style.gap >= lane_height;
+            left >= min_tile.width && content.size.height - block.height - gap >= min_tile.height;
         let lane_beside =
-            left - block.width - style.gap >= lane_width && block.height >= lane_height;
+            left - block.width - gap >= min_tile.width && block.height >= min_tile.height;
         if !(lane_below || lane_beside) {
             continue;
         }
@@ -1778,10 +1926,10 @@ fn random_cases_place_some_tiles() {
 fn a_process_is_never_taller_than_its_box_unless_it_needs_attention() {
     for case in cases() {
         let layout = case.layout();
-        let wanted = case
+        let wanted = c(case
             .style
             .process_tile_height
-            .max(case.style.min_tile.height.max(1.0));
+            .max(case.style.min_tile.height.max(1)));
 
         for tile in case
             .tiles
@@ -1793,7 +1941,7 @@ fn a_process_is_never_taller_than_its_box_unless_it_needs_attention() {
             };
 
             assert!(
-                rect.size.height <= wanted + FLOAT_TOLERANCE,
+                rect.size.height <= wanted,
                 "{:?} is {:?} high, a process box is {wanted}",
                 tile.id,
                 rect.size.height
@@ -1805,7 +1953,7 @@ fn a_process_is_never_taller_than_its_box_unless_it_needs_attention() {
 #[test]
 fn a_process_ignores_a_fixed_size() {
     for case in cases() {
-        let fixed = Some(Size::new(700.0, 400.0));
+        let fixed = Some(Cells::new(87, 50));
         let sized = Case {
             tiles: case
                 .tiles
@@ -1849,12 +1997,11 @@ fn the_large_request_only_counts_for_unpinned_workers() {
 fn a_worker_that_asks_to_grow_is_never_taller_than_two_small_boxes() {
     for case in cases() {
         let layout = case.layout();
-        let tall = 2.0
-            * case
-                .style
-                .small_tile_height
-                .max(case.style.min_tile.height.max(1.0))
-            + case.style.gap.max(0.0);
+        let tall = c(2 * case
+            .style
+            .small_tile_height
+            .max(case.style.min_tile.height.max(1))
+            + case.style.gap);
 
         for tile in case.tiles.iter().filter(|tile| asks_to_grow(tile)) {
             let Some(rect) = layout.rect(tile.id) else {
@@ -1862,7 +2009,7 @@ fn a_worker_that_asks_to_grow_is_never_taller_than_two_small_boxes() {
             };
 
             assert!(
-                rect.size.height <= tall + FLOAT_TOLERANCE,
+                rect.size.height <= tall,
                 "{:?} is {:?} high, a tall box is {tall}",
                 tile.id,
                 rect.size.height

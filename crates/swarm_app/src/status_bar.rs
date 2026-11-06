@@ -6,6 +6,7 @@ use swarm_ui::prelude::*;
 use crate::actions::NewTerminal;
 use crate::model::{AgentKind, TerminalId, TerminalKind};
 use crate::review_model::count_comments;
+use crate::tile_order::TileMove;
 use crate::views::process_status;
 use crate::workspace::{View, Workspace};
 
@@ -57,7 +58,13 @@ pub(crate) fn render(
         .size_full()
         .gap(px(6.))
         .px(px(10.))
-        .child(tray(entries, hidden, workspace.tray_width, cx))
+        .child(tray(
+            entries,
+            hidden,
+            workspace.tray_width,
+            workspace.dragged_tile(cx).is_some(),
+            cx,
+        ))
         .child(
             div().flex_none().child(
                 Button::new("new-terminal", "Terminal")
@@ -172,21 +179,24 @@ fn tray_entry(workspace: &Workspace, id: TerminalId) -> Option<TrayEntry> {
 
     Some(TrayEntry {
         id,
-        title: terminal.title.clone(),
+        title: workspace.tile_name(id),
         icon,
         status: agent.map_or_else(|| process_status(terminal), |agent| agent.status),
     })
 }
 
 /// The chips that fit in the tray, then a "+N" chip for the tiles that do not. The tray
-/// clips what is left, so a width that is not known yet shows every chip.
+/// clips what is left, so a width that is not known yet shows every chip. A tile dropped on
+/// it is minimized.
 fn tray(
     shown: Vec<TrayEntry>,
     hidden: Vec<TrayEntry>,
     known_width: Option<Pixels>,
+    dragging: bool,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement + use<> {
     let workspace = cx.entity();
+    let accent = cx.theme().colors().accent;
     let more = (!hidden.is_empty()).then(|| more_chip(hidden, cx));
 
     let measure = canvas(
@@ -220,8 +230,12 @@ fn tray(
         .relative()
         .flex_1()
         .min_w_0()
+        .h_full()
         .overflow_hidden()
         .gap(px(TRAY_GAP))
+        .on_drop(cx.listener(|workspace, drag: &TileMove, _, cx| {
+            workspace.drop_tile_on_tray(drag.0, cx);
+        }))
         .children(shown.into_iter().map(|entry| {
             let id = entry.id;
 
@@ -234,6 +248,19 @@ fn tray(
         }))
         .children(more)
         .child(measure)
+        // Over the chips, so the outline does not move them.
+        .when(dragging, |tray| {
+            tray.child(
+                div()
+                    .debug_selector(|| "tray-drop".to_owned())
+                    .absolute()
+                    .inset_0()
+                    .rounded(px(6.))
+                    .drag_over::<TileMove>(move |style, _, _, _| {
+                        style.border_2().border_color(accent)
+                    }),
+            )
+        })
 }
 
 /// The "+N" chip, which says whether its menu is open.
@@ -422,7 +449,7 @@ mod tests {
         let (workspace, cx) = setup(cx);
 
         let (role, label) = workspace.update(cx, |_, cx| {
-            let element = tray(Vec::new(), Vec::new(), None, cx).into_element();
+            let element = tray(Vec::new(), Vec::new(), None, false, cx).into_element();
             let mut node = gpui::accesskit::Node::new(Role::Unknown);
             element.write_a11y_info(&mut node);
 

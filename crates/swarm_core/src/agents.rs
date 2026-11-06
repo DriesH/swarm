@@ -220,6 +220,12 @@ impl StatusMerge {
         self.set(status, message) | had_notice
     }
 
+    /// Applies the end of a process that Swarm stopped on purpose. Its exit code comes
+    /// from the stop signal, so it is never an error.
+    pub fn process_stopped(&mut self) -> bool {
+        self.process_exited(None)
+    }
+
     /// Marks the agent as waiting for the user's answer to the folder trust dialog.
     /// Only applies while nothing else has reported.
     pub fn trust_prompt_visible(&mut self) -> bool {
@@ -645,6 +651,19 @@ mod tests {
 
         assert!(!changed);
         assert_eq!(merge.status(), AgentStatus::Idle);
+    }
+
+    #[test]
+    fn a_stopped_process_is_no_error_whatever_its_exit_code() {
+        for state in [ProgramState::Idle, ProgramState::Working] {
+            let mut merge = StatusMerge::default();
+            merge.program_status(&osc(state));
+
+            merge.process_stopped();
+
+            assert_ne!(merge.status(), AgentStatus::Error);
+            assert_eq!(merge.message(), None);
+        }
     }
 
     #[test]

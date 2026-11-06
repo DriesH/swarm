@@ -8,6 +8,18 @@ Swarm runs a group of coding agents on one task. One agent leads, the others do 
 A git repository opened in Swarm.
 _Avoid_: Workspace, space, repo
 
+**Home**:
+The place above Projects for quick work outside a project. Its tabs are scratches.
+_Avoid_: Hub, scratchpad, dashboard
+
+**Scratch**:
+One Home tab: terminals that start in the scratch folder, with no branch or worktree. It has its own agents, which work alone.
+_Avoid_: Scratchpad, playground, sandbox, session
+
+**Make project**:
+Adding the folder of a scratch's terminal as a project, with a git repository and a first commit when it has none. No files move.
+_Avoid_: Promote, convert, graduate
+
 **Task**:
 One feature inside a project, with its own branch and its own swarm.
 _Avoid_: Job, session, thread
@@ -115,6 +127,10 @@ _Avoid_: Pane, shell
 **Tile**:
 A terminal's place in the workspace layout: its position, size and frame. The layout engine arranges tiles; tiles that don't fit go to the tray.
 _Avoid_: Pane, window, panel
+
+**Grid cell**:
+The 8 px unit that every tile's place and size is made of. Tiles move and resize in whole cells only.
+_Avoid_: Snap unit, step, pixel grid
 
 **Process terminal**:
 A terminal running a command an agent started, such as a dev server or a test run.

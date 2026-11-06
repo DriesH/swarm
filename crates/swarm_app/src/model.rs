@@ -2233,11 +2233,20 @@ impl FakeData {
         }
     }
 
-    /// A real task needs you when any agent is blocked or in error, and works when any agent works.
+    /// A real task needs you when any agent is blocked or in error, and works when any agent
+    /// works. An ended agent counts only when it broke: its other statuses are stale.
     fn refresh_task_status(&mut self, task: TaskId) {
         let statuses: Vec<DaemonAgentStatus> = self
             .agents_of(task)
-            .filter_map(|agent| agent.daemon.as_ref().map(|daemon| daemon.status))
+            .filter_map(|agent| agent.daemon.as_ref())
+            .filter(|daemon| {
+                daemon.status == DaemonAgentStatus::Error
+                    || matches!(
+                        daemon.lifecycle,
+                        AgentLifecycle::Starting | AgentLifecycle::Running
+                    )
+            })
+            .map(|daemon| daemon.status)
             .collect();
 
         let status = if statuses.iter().any(|status| {
@@ -3023,6 +3032,36 @@ mod tests {
     fn an_agent_in_error_makes_the_task_need_you() {
         let mut data = FakeData::live();
         let task = live_task(&mut data, vec![agent_with(DaemonAgentStatus::Error, 1)]);
+
+        assert_eq!(data.task(task).expect("task").status, TaskStatus::NeedsYou);
+    }
+
+    #[test]
+    fn an_ended_agent_with_a_stale_prompt_does_not_make_the_task_need_you() {
+        let mut data = FakeData::live();
+        let mut ended = agent_with(DaemonAgentStatus::Blocked(BlockedKind::Permission), 1);
+        ended.lifecycle = AgentLifecycle::Resumable;
+        ended.terminal = None;
+
+        let task = live_task(&mut data, vec![ended]);
+
+        assert_eq!(data.task(task).expect("task").status, TaskStatus::Idle);
+    }
+
+    #[test]
+    fn a_stopped_worker_beside_a_blocked_orchestrator_keeps_the_task_needing_you() {
+        let mut data = FakeData::live();
+        let blocked = agent_with(DaemonAgentStatus::Blocked(BlockedKind::Question), 1);
+        let stopped = AgentInfo {
+            id: DaemonAgentId(4),
+            role: AgentRole::Worker,
+            name: "grid".into(),
+            terminal: None,
+            lifecycle: AgentLifecycle::Resumable,
+            ..agent_with(DaemonAgentStatus::Unknown, 1)
+        };
+
+        let task = live_task(&mut data, vec![blocked, stopped]);
 
         assert_eq!(data.task(task).expect("task").status, TaskStatus::NeedsYou);
     }

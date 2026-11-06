@@ -5,6 +5,7 @@ mod checkbox;
 mod confirm_row;
 mod context_menu;
 mod dialog;
+mod dot_grid;
 mod dropdown;
 mod file_icon;
 mod honeycomb;
@@ -48,6 +49,7 @@ pub use checkbox::*;
 pub use confirm_row::*;
 pub use context_menu::*;
 pub use dialog::*;
+pub use dot_grid::*;
 pub use dropdown::*;
 pub use file_icon::*;
 pub use honeycomb::*;
@@ -129,6 +131,7 @@ pub fn all_components() -> Vec<ComponentEntry> {
         ComponentEntry::of::<Honeycomb>(),
         ComponentEntry::of::<HoneyFill>(),
         ComponentEntry::of::<PixelBee>(),
+        ComponentEntry::of::<DotGrid>(),
         ComponentEntry::of::<ConfirmRow>(),
         ComponentEntry::of::<ProjectTile>(),
         ComponentEntry::of::<TileFrame>(),

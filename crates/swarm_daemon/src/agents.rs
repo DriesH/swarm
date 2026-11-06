@@ -1930,7 +1930,11 @@ impl Agents {
         self.messages.clear_queued(id);
 
         let failure_told = agent.merge.failure_told();
-        agent.merge.process_exited(exit);
+        if self.is_ending(&agent) {
+            agent.merge.process_stopped();
+        } else {
+            agent.merge.process_exited(exit);
+        }
         agent.info.terminal = None;
         agent.info.lifecycle = agent.ended_lifecycle();
         agent.info.ended_at = Some(unix_millis());
@@ -3345,6 +3349,67 @@ mod tests {
                 (NoticeKind::Broke, "first"),
                 (NoticeKind::Broke, "Exited with code 1")
             ]
+        );
+    }
+
+    fn stored_status(agents: &Agents, id: AgentId) -> AgentStatus {
+        lock(&agents.store)
+            .agent(id)
+            .expect("read")
+            .expect("stored")
+            .info
+            .status
+    }
+
+    /// Claude Code catches the stop's SIGHUP and exits with 128 + 1.
+    const HANGUP_EXIT: u32 = 129;
+
+    #[test]
+    fn a_worker_stopped_on_purpose_that_exits_non_zero_is_no_error() {
+        type Ending = (&'static str, fn(&Arc<Agents>, &TaskInfo, AgentId));
+        let endings: [Ending; 4] = [
+            ("swarm stop", |agents, _, id| agents.stop_one(id)),
+            ("swarm exit", |agents, _, id| agents.exit(id)),
+            ("the task is closing", |agents, task, _| {
+                assert!(agents.begin_close(task.id));
+            }),
+            ("the daemon stops", |agents, _, _| agents.begin_shutdown()),
+        ];
+
+        for (name, end) in endings {
+            let (agents, task, frames) = agents_with_a_client();
+            let (_, worker) = a_swarm(&agents, &task);
+            start_without_a_hub(&agents, worker.id);
+            report(&agents, worker.id, ProgramState::Working, None);
+            end(&agents, &task, worker.id);
+
+            crash(&agents, worker.id, HANGUP_EXIT);
+
+            assert_ne!(
+                stored_status(&agents, worker.id),
+                AgentStatus::Error,
+                "{name}"
+            );
+            let broke = texts(&notices(&frames))
+                .into_iter()
+                .any(|(kind, _)| kind == NoticeKind::Broke);
+            assert!(!broke, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_worker_that_exits_non_zero_by_itself_is_an_error() {
+        let (agents, task, frames) = agents_with_a_client();
+        let (_, worker) = a_swarm(&agents, &task);
+        start_without_a_hub(&agents, worker.id);
+        report(&agents, worker.id, ProgramState::Working, None);
+
+        crash(&agents, worker.id, HANGUP_EXIT);
+
+        assert_eq!(stored_status(&agents, worker.id), AgentStatus::Error);
+        assert_eq!(
+            texts(&notices(&frames)),
+            [(NoticeKind::Broke, "Exited with code 129")]
         );
     }
 

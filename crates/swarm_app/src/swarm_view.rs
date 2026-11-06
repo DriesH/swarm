@@ -476,6 +476,8 @@ impl Workspace {
         let width = match nudge {
             Nudge::Left => self.shown_inspector_width() + INSPECTOR_KEY_STEP,
             Nudge::Right => self.shown_inspector_width() - INSPECTOR_KEY_STEP,
+            // Shift and an arrow key did nothing here before; it still does nothing.
+            Nudge::LeftLarge | Nudge::RightLarge => return,
             Nudge::Smallest => INSPECTOR_MIN_WIDTH,
             Nudge::Largest => self.inspector_max_width(),
         };

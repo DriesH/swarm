@@ -14,6 +14,7 @@ Each phase ends with a pull request into `main`. A phase is done when every box 
 | 7 | Menu bar, usage and notifications | Built; the checks on the real app are left |
 | 8 | Polish and first release | In progress |
 | 9 | After first release | Not started |
+| 10 | Home and scratches | Not started |
 
 ## 0. Plan, design, spikes
 
@@ -167,13 +168,35 @@ Six parts (1–3 done): 1. Settings pages (Projects, Terminals, Prompts, Usage, 
 - [ ] Turning it off removes the login item
 - [ ] The setting shows the state macOS reports, also when the user changed it in System Settings › General › Login Items
 
+## 10. Home and scratches
+
+**Goal:** quick work outside a project, and a way to turn it into one.
+
+**Scope:** Home above Projects, scratches as Home tabs, scratch agents, the scratch folder setting and Make project. Details in [`PLAN.md`](PLAN.md#home) and ADR 0012.
+
+**Done when:**
+
+- [ ] Home sits above Projects, shows the number of open scratches, and ⌘⇧H opens it; the rail shows it as the first tile
+- [ ] **+** on the Home tab bar opens a scratch at once, with one terminal in the scratch folder (Settings › Terminals, default `~`)
+- [ ] A scratch shows user terminals, agents and process terminals, and no Swarm view, Review, Changes or pull request
+- [ ] A scratch agent runs alone, reports its status and resumes after a daemon restart
+- [ ] Scratches and their terminals keep running when the app quits and come back in the same order
+- [ ] Close scratch asks while programs run, stops the terminals and leaves the files
+- [ ] Make project lists each terminal's folder (OSC 7 for shells, the process folder for agents and processes), leaves out `~` and `/`, and blocks a folder that is already a project
+- [ ] Make project creates a repository and a first commit when there is none, commits changed files when asked, adds the project and opens its Start tab
+- [ ] Every new control has a role and label, works from the keyboard and meets WCAG AA
+
 ## Designs still to make
 
 - Settings › Terminals and Prompts (phase 8)
 - Menu bar usage popover (phase 7)
 - Settings: Launch at login (phase 9)
+- Home boards in light (phase 10)
+- Close scratch dialog and the empty Home (phase 10)
 
 ## Parked
 
 - Tile controls: drag, minimize, maximize and lock tiles, with a layout engine that works around locked tiles. Spec in [`specs/tile-controls.md`](specs/tile-controls.md).
+  - [x] The tile grid: every tile sits on whole 8 px grid cells, a resize snaps to cells (↑/↓ 1 cell, ⇧ 5 cells) and dots show the grid while it runs (slice 0)
+  - [x] Tile order: a drag on the tile header or ⌃⌘ and an arrow key moves a tile among the tiles of its class, a drop on the tray minimizes it, Esc cancels, and VoiceOver reads the new position (slice 2, without the drop on empty space)
 - Multi-repo projects: a project that groups several repositories, such as a server and its client SDKs. First related repositories that orchestrators can read, then tasks with a worktree in each repository. Spec in [`specs/multi-repo-projects.md`](specs/multi-repo-projects.md).

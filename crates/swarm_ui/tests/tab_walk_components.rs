@@ -272,3 +272,19 @@ fn home_and_end_work_on_both_axes(cx: &mut TestAppContext) {
         [Nudge::Smallest, Nudge::Largest]
     );
 }
+
+#[gpui::test]
+fn shift_and_an_arrow_key_is_a_large_nudge(cx: &mut TestAppContext) {
+    assert_eq!(
+        nudges_for(cx, ResizeAxis::Vertical, "shift-up shift-down shift-left"),
+        [Nudge::LeftLarge, Nudge::RightLarge]
+    );
+    assert_eq!(
+        nudges_for(
+            cx,
+            ResizeAxis::Horizontal,
+            "shift-left shift-right shift-up"
+        ),
+        [Nudge::LeftLarge, Nudge::RightLarge]
+    );
+}

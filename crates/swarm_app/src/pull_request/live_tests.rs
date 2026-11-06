@@ -1793,6 +1793,7 @@ fn the_palette_offers_create_pull_request_only_when_allowed(cx: &mut TestAppCont
                 workspace.active_project,
                 workspace.active_task,
                 workspace.view,
+                false,
             )
             .iter()
             .any(|row| row.label() == "Create pull request")

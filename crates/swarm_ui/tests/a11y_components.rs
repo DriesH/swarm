@@ -556,3 +556,13 @@ fn a_scrollbar_is_hidden_when_the_content_fits() {
         assert_eq!(info.role, None);
     });
 }
+
+#[test]
+fn the_dot_grid_has_no_role_and_no_label() {
+    with_window(|window, cx| {
+        let info = a11y_info(DotGrid::new(8.), window, cx);
+
+        assert_eq!(info.role, None);
+        assert_eq!(info.node.label(), None);
+    });
+}

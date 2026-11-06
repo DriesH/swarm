@@ -38,7 +38,15 @@ actions!(
         /// Starts a report of an issue with Swarm.
         ReportIssue,
         /// Opens the pull request description as a large tile.
-        ExpandDescription
+        ExpandDescription,
+        /// Moves the focused tile to the place of its neighbour on the left.
+        MoveTileLeft,
+        /// Moves the focused tile to the place of its neighbour on the right.
+        MoveTileRight,
+        /// Moves the focused tile to the place of its neighbour above.
+        MoveTileUp,
+        /// Moves the focused tile to the place of its neighbour below.
+        MoveTileDown
     ]
 );
 
@@ -234,6 +242,29 @@ pub(crate) fn shortcuts() -> Vec<Shortcut> {
         ),
     ];
 
+    shortcuts.extend([
+        shortcut(
+            Terminals,
+            "Move tile left",
+            KeyBinding::new("ctrl-cmd-left", MoveTileLeft, root),
+        ),
+        shortcut(
+            Terminals,
+            "Move tile right",
+            KeyBinding::new("ctrl-cmd-right", MoveTileRight, root),
+        ),
+        shortcut(
+            Terminals,
+            "Move tile up",
+            KeyBinding::new("ctrl-cmd-up", MoveTileUp, root),
+        ),
+        shortcut(
+            Terminals,
+            "Move tile down",
+            KeyBinding::new("ctrl-cmd-down", MoveTileDown, root),
+        ),
+    ]);
+
     shortcuts.extend(FOCUS_KEYS.iter().enumerate().map(|(index, key)| {
         shortcut(
             Terminals,
@@ -397,6 +428,41 @@ mod tests {
         assert_eq!(
             keys,
             Some(vec![Keystroke::parse("cmd-b").expect("a valid keystroke")])
+        );
+    }
+
+    #[test]
+    fn the_move_tile_keys_are_listed_under_terminals() {
+        let listed: Vec<(ShortcutGroup, &str, Keystroke)> = shortcuts()
+            .into_iter()
+            .filter(|shortcut| shortcut.name.starts_with("Move tile"))
+            .map(|shortcut| {
+                let keystroke = shortcut.binding.keystrokes()[0].inner().clone();
+                (shortcut.group, shortcut.name, keystroke)
+            })
+            .collect();
+        let key = |keys: &'static str| Keystroke::parse(keys).expect("a valid keystroke");
+
+        assert_eq!(
+            listed,
+            [
+                (
+                    ShortcutGroup::Terminals,
+                    "Move tile left",
+                    key("ctrl-cmd-left")
+                ),
+                (
+                    ShortcutGroup::Terminals,
+                    "Move tile right",
+                    key("ctrl-cmd-right")
+                ),
+                (ShortcutGroup::Terminals, "Move tile up", key("ctrl-cmd-up")),
+                (
+                    ShortcutGroup::Terminals,
+                    "Move tile down",
+                    key("ctrl-cmd-down")
+                ),
+            ]
         );
     }
 }

@@ -13,7 +13,8 @@ type DragHook = Box<dyn FnOnce(Stateful<Div>) -> Stateful<Div>>;
 type ResetHandler = Rc<dyn Fn(&mut Window, &mut App) + 'static>;
 type NudgeHandler = Rc<dyn Fn(Nudge, &mut Window, &mut App) + 'static>;
 
-/// How a key moves the border: an arrow key a step, Home and End to the limits.
+/// How a key moves the border: an arrow key a step, Shift and an arrow key a large step,
+/// Home and End to the limits.
 ///
 /// On a vertical handle ([`ResizeAxis::Vertical`]) `Left` is the Up key and `Right` the
 /// Down key: the start and the end of the axis.
@@ -21,6 +22,10 @@ type NudgeHandler = Rc<dyn Fn(Nudge, &mut Window, &mut App) + 'static>;
 pub enum Nudge {
     Left,
     Right,
+    /// Shift and Left (Up).
+    LeftLarge,
+    /// Shift and Right (Down).
+    RightLarge,
     /// Home: the smallest size.
     Smallest,
     /// End: the largest size.
@@ -226,19 +231,27 @@ impl RenderOnce for ResizeHandle {
             })
             .when_some(self.on_nudge, |handle, handler| {
                 handle.on_key_down(move |event: &KeyDownEvent, window, cx| {
-                    if event.keystroke.modifiers.modified() {
+                    let modifiers = event.keystroke.modifiers;
+                    if modifiers.control
+                        || modifiers.alt
+                        || modifiers.platform
+                        || modifiers.function
+                    {
                         return;
                     }
 
-                    let nudge = match (axis, event.keystroke.key.as_str()) {
-                        (ResizeAxis::Horizontal, "left") | (ResizeAxis::Vertical, "up") => {
-                            Nudge::Left
-                        }
-                        (ResizeAxis::Horizontal, "right") | (ResizeAxis::Vertical, "down") => {
-                            Nudge::Right
-                        }
-                        (_, "home") => Nudge::Smallest,
-                        (_, "end") => Nudge::Largest,
+                    let large = modifiers.shift;
+                    let nudge = match (axis, event.keystroke.key.as_str(), large) {
+                        (ResizeAxis::Horizontal, "left", false)
+                        | (ResizeAxis::Vertical, "up", false) => Nudge::Left,
+                        (ResizeAxis::Horizontal, "left", true)
+                        | (ResizeAxis::Vertical, "up", true) => Nudge::LeftLarge,
+                        (ResizeAxis::Horizontal, "right", false)
+                        | (ResizeAxis::Vertical, "down", false) => Nudge::Right,
+                        (ResizeAxis::Horizontal, "right", true)
+                        | (ResizeAxis::Vertical, "down", true) => Nudge::RightLarge,
+                        (_, "home", false) => Nudge::Smallest,
+                        (_, "end", false) => Nudge::Largest,
                         _ => return,
                     };
 
