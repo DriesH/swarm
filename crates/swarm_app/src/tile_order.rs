@@ -250,8 +250,8 @@ impl Workspace {
         self.move_tile_before(dragged, TileId(target.0), cx);
     }
 
-    /// A drop on the tray minimizes the tile. Focus goes to the tile beside it, else the
-    /// orchestrator.
+    /// A drop on the tray minimizes the tile. Focus goes to the next movable tile, else the
+    /// previous one, else the orchestrator (M7).
     pub(crate) fn drop_tile_on_tray(&mut self, dragged: TerminalId, cx: &mut Context<Self>) {
         if !self.is_movable(dragged) {
             self.tile_drag_ended(cx);
@@ -259,12 +259,7 @@ impl Workspace {
         }
 
         self.tile_drag = None;
-        let orchestrator = self
-            .active_task()
-            .orchestrator
-            .and_then(|agent| self.data.agent(agent))
-            .map(|agent| agent.terminal);
-        let next = self.neighbor_tile(dragged).or(orchestrator);
+        let next = self.focus_after_leaving(dragged);
 
         self.minimize(dragged, cx);
         let name = self.tile_name(dragged);
@@ -297,7 +292,45 @@ impl Workspace {
         };
 
         self.say_tile_status(MOVE_CANCELLED, cx);
-        self.claim_focus(dragged, cx);
+
+        let target = if self.is_movable(dragged) {
+            Some(dragged)
+        } else {
+            self.focus_after_leaving(dragged)
+        };
+        if let Some(target) = target {
+            self.claim_focus(target, cx);
+        }
+    }
+
+    /// Where focus goes when `terminal` leaves the layout: the next movable tile in the
+    /// order, else the previous one, else the orchestrator.
+    fn focus_after_leaving(&self, terminal: TerminalId) -> Option<TerminalId> {
+        let movable: Vec<TerminalId> = self
+            .layout
+            .placed
+            .iter()
+            .map(|(id, _)| TerminalId(id.0))
+            .filter(|id| *id == terminal || self.is_movable(*id))
+            .collect();
+        let beside = movable
+            .iter()
+            .position(|id| *id == terminal)
+            .and_then(|at| {
+                movable
+                    .get(at + 1)
+                    .or_else(|| at.checked_sub(1).and_then(|before| movable.get(before)))
+            });
+        let orchestrator = self
+            .active_task()
+            .orchestrator
+            .and_then(|agent| self.data.agent(agent))
+            .map(|agent| agent.terminal);
+
+        beside
+            .or_else(|| movable.iter().find(|id| **id != terminal))
+            .copied()
+            .or(orchestrator)
     }
 }
 
@@ -1017,7 +1050,7 @@ mod tests {
             assert!(!still_dragging);
             assert_eq!(current_order(&workspace, cx), before);
             assert_eq!(focused(&workspace, cx), Some(worker));
-            assert_eq!(after, 1, "Esc after the drag does not reach the terminal");
+            assert_eq!(after, 1, "Esc after the drag reaches the terminal");
         }
 
         #[gpui::test]
@@ -1046,6 +1079,22 @@ mod tests {
 
             assert_eq!(current_order(&workspace, cx), before);
             assert_eq!(status(&workspace, cx), "Move cancelled");
+        }
+
+        #[gpui::test]
+        fn a_cancel_after_the_dragged_tile_left_focuses_a_drawn_tile(cx: &mut TestAppContext) {
+            let (workspace, cx) = wide(cx);
+            let [a, ..] = four(&workspace, cx);
+            let sidebar = point(px(40.), px(300.));
+
+            drag(header(a, cx), sidebar, cx);
+            workspace.update(cx, |workspace, cx| workspace.minimize(a, cx));
+            redraw(cx);
+            release(sidebar, cx);
+
+            let focused = focused(&workspace, cx).expect("a focused tile");
+            assert_ne!(focused, a);
+            assert!(movable(&workspace, cx).contains(&focused));
         }
 
         #[gpui::test]
