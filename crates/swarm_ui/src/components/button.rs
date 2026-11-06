@@ -140,6 +140,16 @@ impl ButtonVariant {
     }
 }
 
+/// A disabled button is drawn at half opacity, and GPUI paints the border over the fill,
+/// so a border in the fill's color would show as a darker ring.
+fn disabled_border(colors: &ButtonColors) -> Hsla {
+    if colors.border == colors.background {
+        gpui::transparent_black()
+    } else {
+        composite(colors.background, colors.border.opacity(0.5))
+    }
+}
+
 /// A text button. The label never wraps.
 #[derive(IntoElement)]
 #[must_use]
@@ -298,6 +308,10 @@ impl RenderOnce for Button {
             colors.border = theme_colors.line;
             colors.text = Color::Default.hsla(cx);
             colors.hover_text = colors.text;
+        }
+
+        if self.disabled {
+            colors.border = disabled_border(&colors);
         }
 
         let size = self.size;
@@ -547,6 +561,21 @@ mod tests {
                     .debug_selector(|| "remove".to_owned())
                     .on_click(move |_, _, _| clicks.set(clicks.get() + 1)),
             )
+        }
+    }
+
+    #[test]
+    fn a_disabled_button_has_no_ring_in_its_fill_color() {
+        for theme in [crate::theme::Theme::light(), crate::theme::Theme::dark()] {
+            let colors = theme.colors();
+
+            for variant in [ButtonVariant::Primary, ButtonVariant::Merge] {
+                let border = disabled_border(&variant.colors_in(colors));
+                assert_eq!(border, gpui::transparent_black());
+            }
+
+            let secondary = ButtonVariant::Secondary.colors_in(colors);
+            assert_ne!(disabled_border(&secondary), secondary.border);
         }
     }
 
