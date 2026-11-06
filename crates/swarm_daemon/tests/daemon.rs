@@ -8538,7 +8538,7 @@ fn the_status_of_a_task_without_a_pull_request_is_an_error() {
 }
 
 #[test]
-fn ready_reviewers_and_merge_call_gh_with_the_documented_arguments() {
+fn ready_and_merge_call_gh_with_the_documented_arguments() {
     let mut env = env_with_pull_request(false);
     let task = env.task.id;
     let pushed = head_of(&env.task.worktree);
@@ -8546,13 +8546,6 @@ fn ready_reviewers_and_merge_call_gh_with_the_documented_arguments() {
     env.client
         .until_done(&Request::MarkPrReady { call: CALL, task })
         .expect("ready");
-    env.client
-        .until_done(&Request::AddReviewers {
-            call: CALL,
-            task,
-            logins: vec!["alice".to_owned(), "bob-2".to_owned()],
-        })
-        .expect("reviewers");
     env.view("MERGED");
     for method in [
         swarm_protocol::MergeMethod::Merge,
@@ -8583,40 +8576,18 @@ fn ready_reviewers_and_merge_call_gh_with_the_documented_arguments() {
     };
     let view = |call: &[String]| call[..3] == ["pr", "view", "42"];
     assert_eq!(calls[0], ["pr", "ready", "42"]);
-    assert_eq!(
-        calls[1],
-        ["pr", "edit", "42", "--add-reviewer", "alice,bob-2"]
-    );
     // Each merge reads the checks first, then merges, then reads the result.
-    assert!(view(&calls[2]));
-    assert_eq!(calls[3], merge("--merge"));
+    assert!(view(&calls[1]));
+    assert_eq!(calls[2], merge("--merge"));
+    assert!(view(&calls[3]));
     assert!(view(&calls[4]));
-    assert!(view(&calls[5]));
-    assert_eq!(calls[6], merge("--rebase"));
+    assert_eq!(calls[5], merge("--rebase"));
+    assert!(view(&calls[6]));
     assert!(view(&calls[7]));
-    assert!(view(&calls[8]));
-    assert_eq!(calls[9], merge("--squash"));
-    assert!(view(&calls[10]));
-    assert_eq!(calls.len(), 11);
+    assert_eq!(calls[8], merge("--squash"));
+    assert!(view(&calls[9]));
+    assert_eq!(calls.len(), 10);
     env.gh.assert_no_branch_deleted_by_gh();
-}
-
-#[test]
-fn a_reviewer_that_is_not_a_login_is_refused_before_gh_runs() {
-    let mut env = env_with_pull_request(false);
-
-    let refused = env.client.until_done(&Request::AddReviewers {
-        call: CALL,
-        task: env.task.id,
-        logins: vec!["--assignee".to_owned()],
-    });
-
-    assert!(
-        refused
-            .expect_err("refused")
-            .contains("is not a GitHub login")
-    );
-    assert!(env.gh.calls_of(&["pr", "edit"]).is_empty());
 }
 
 #[test]

@@ -867,7 +867,6 @@ fn with_pull_request_replying(
                 })
             }
             Request::MarkPrReady { call, .. }
-            | Request::AddReviewers { call, .. }
             | Request::MergePr { call, .. }
             | Request::SetCloseAfterMerge { call, .. } => Some(Event::Done { call: *call }),
             other => github_reply(other),
@@ -1247,9 +1246,7 @@ fn merge_waits_until_github_says_the_pull_request_is_mergeable(cx: &mut TestAppC
 }
 
 #[gpui::test]
-fn ready_for_review_review_requests_and_close_after_merge_reach_the_daemon(
-    cx: &mut TestAppContext,
-) {
+fn ready_for_review_and_close_after_merge_reach_the_daemon(cx: &mut TestAppContext) {
     let status = Arc::new(Mutex::new(open_pull_request(42)));
     let (workspace, cx, _client, seen) =
         with_pull_request(status, Arc::new(AtomicUsize::new(0)), cx);
@@ -1261,29 +1258,6 @@ fn ready_for_review_review_requests_and_close_after_merge_reach_the_daemon(
     click("ready-for-review", cx);
     let ready = wait_for(cx, &seen, |seen, _| {
         seen.count(|request| matches!(request, Request::MarkPrReady { .. })) == 1
-    });
-
-    let reviewers = workspace.read_with(cx, |workspace, _| {
-        workspace
-            .pull_requests
-            .form(APP_TASK)
-            .map(|form| form.reviewers.clone())
-    });
-    if let Some(reviewers) = reviewers {
-        reviewers.update(cx, |input, cx| input.set_text("@mara, jonas", cx));
-    }
-    redraw(cx);
-    click("request-review", cx);
-    let asked = wait_for(cx, &seen, |seen, _| {
-        seen.first(|request| match request {
-            Request::AddReviewers { logins, .. } => Some(logins.clone()),
-            _ => None,
-        })
-        .is_some()
-    });
-    let logins = seen.first(|request| match request {
-        Request::AddReviewers { logins, .. } => Some(logins.clone()),
-        _ => None,
     });
 
     workspace.update(cx, |workspace, cx| {
@@ -1301,8 +1275,6 @@ fn ready_for_review_review_requests_and_close_after_merge_reach_the_daemon(
     });
 
     assert!(ready);
-    assert!(asked);
-    assert_eq!(logins, Some(vec!["mara".to_owned(), "jonas".to_owned()]));
     assert!(closed_after);
     assert!(flag);
 }

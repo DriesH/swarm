@@ -23,6 +23,7 @@ pub struct Settings {
     pub notifications: NotificationSettings,
     pub appearance: AppearanceSettings,
     pub updates: UpdateSettings,
+    pub pull_requests: PullRequestSettings,
 }
 
 impl<'de> Deserialize<'de> for Settings {
@@ -54,6 +55,7 @@ impl Settings {
             notifications: NotificationSettings::read(root.child("notifications")),
             appearance: AppearanceSettings::read(root.child("appearance")),
             updates: UpdateSettings::read(root.child("updates")),
+            pull_requests: PullRequestSettings::read(root.child("pull_requests")),
         }
     }
 }
@@ -162,6 +164,31 @@ impl UpdateSettings {
 
         Self {
             auto_check: section.take("auto_check", defaults.auto_check, BOOL),
+        }
+    }
+}
+
+/// How new pull requests start.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PullRequestSettings {
+    /// The form for a new pull request starts with "Open as draft" on.
+    pub open_as_draft: bool,
+}
+
+impl Default for PullRequestSettings {
+    fn default() -> Self {
+        Self {
+            open_as_draft: true,
+        }
+    }
+}
+
+impl PullRequestSettings {
+    fn read(mut section: Section<'_>) -> Self {
+        let defaults = Self::default();
+
+        Self {
+            open_as_draft: section.take("open_as_draft", defaults.open_as_draft, BOOL),
         }
     }
 }
@@ -754,6 +781,11 @@ pub fn save(path: &Path, settings: &Settings) -> Result<(), SettingsError> {
         "auto_check",
         Value::from(settings.updates.auto_check),
     );
+    set_value(
+        table_mut(document.as_table_mut(), "pull_requests"),
+        "open_as_draft",
+        Value::from(settings.pull_requests.open_as_draft),
+    );
 
     if let Some(folder) = path.parent() {
         std::fs::create_dir_all(folder).map_err(io_error)?;
@@ -1092,6 +1124,27 @@ mod tests {
 
         assert!(text.contains("auto_check = false"), "{text}");
         assert_eq!(loaded.updates, settings.updates);
+    }
+
+    #[test]
+    fn pull_requests_open_as_draft_when_the_file_has_no_such_key() {
+        let settings: Settings = toml::from_str("[updates]\nauto_check = false\n").unwrap();
+
+        assert!(settings.pull_requests.open_as_draft);
+    }
+
+    #[test]
+    fn open_as_draft_round_trips_through_a_file() {
+        let folder = temp_folder("pull-requests");
+        let path = folder.join("settings.toml");
+        let mut settings = Settings::default();
+        settings.pull_requests.open_as_draft = false;
+
+        save(&path, &settings).unwrap();
+        let loaded = load(&path).unwrap();
+        std::fs::remove_dir_all(&folder).unwrap();
+
+        assert_eq!(loaded.pull_requests, settings.pull_requests);
     }
 
     fn temp_folder(name: &str) -> PathBuf {

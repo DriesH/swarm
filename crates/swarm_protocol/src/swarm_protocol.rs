@@ -1263,12 +1263,6 @@ pub enum Request {
         call: CallId,
         task: TaskId,
     },
-    /// Asks these GitHub logins for a review. Answered with [`Event::Done`].
-    AddReviewers {
-        call: CallId,
-        task: TaskId,
-        logins: Vec<String>,
-    },
     /// Merges the pull request on GitHub, but only when its head is still
     /// [`PrLink::head`], confirms the merge, and deletes the remote branch. With
     /// `close_after_merge`, the task then closes only when nothing would be lost: no

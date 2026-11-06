@@ -18,8 +18,8 @@ use gpui::{
     WeakEntity, Window, WindowBounds, WindowHandle, WindowOptions, actions, div, point, px, size,
 };
 use swarm_settings::{
-    AccentSetting, AppearanceSettings, CliSettings, NotificationSettings, ProjectMode, Settings,
-    ThemeSetting, UpdateSettings,
+    AccentSetting, AppearanceSettings, CliSettings, NotificationSettings, ProjectMode,
+    PullRequestSettings, Settings, ThemeSetting, UpdateSettings,
 };
 use swarm_ui::a11y::ignore_press;
 use swarm_ui::fonts::UI_FONT;
@@ -1353,6 +1353,14 @@ pub(crate) fn auto_check_updates(cx: &App) -> bool {
     )
 }
 
+/// Whether new pull requests start as drafts. On until the settings say otherwise.
+pub(crate) fn open_pull_requests_as_draft(cx: &App) -> bool {
+    cx.try_global::<Registry>().map_or_else(
+        || PullRequestSettings::default().open_as_draft,
+        |registry| registry.state.read(cx).settings.pull_requests.open_as_draft,
+    )
+}
+
 /// Changes the update settings the way the page does.
 #[cfg(test)]
 pub(crate) fn change_updates(edit: impl FnOnce(&mut UpdateSettings), cx: &mut App) {
@@ -2210,6 +2218,7 @@ mod tests {
                 "Button Allow notifications",
                 "Switch Check for updates automatically",
                 "Button Check now",
+                "Switch Open as draft",
                 "Link Repository, vscode-icons on GitHub",
                 "Link License, CC BY-SA 4.0",
             ]

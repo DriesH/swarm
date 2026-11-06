@@ -43,6 +43,11 @@ pub(crate) fn render(
     let changes_disabled = workspace.view != View::Terminals;
     let pull_request = workspace.pull_request_toggle_label(task.id);
     let pull_request_spoken = workspace.pull_request_toggle_spoken(task.id);
+    let pull_request_icon = if workspace.pull_request_is_draft(task.id) {
+        IconName::PullRequestDraft
+    } else {
+        IconName::PullRequest
+    };
 
     h_flex()
         .flex_1()
@@ -90,7 +95,7 @@ pub(crate) fn render(
                             panel_toggle(
                                 "pull-request",
                                 label,
-                                IconName::PullRequest,
+                                pull_request_icon,
                                 panel == Some(RightPanel::PullRequest),
                                 panels_disabled,
                                 cx.listener(|workspace, _, _, cx| {

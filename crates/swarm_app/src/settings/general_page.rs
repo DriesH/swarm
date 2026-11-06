@@ -186,6 +186,21 @@ fn update_button(cx: &App) -> Button {
         .on_click(|_, _, cx| crate::updates::check_now(cx))
 }
 
+/// The Pull requests section: the draft switch.
+fn pull_requests(state: &gpui::Entity<super::SettingsState>, cx: &App) -> impl IntoElement {
+    let open_as_draft = state.read(cx).settings.pull_requests.open_as_draft;
+
+    let switch = switch_row(
+        state,
+        "open-as-draft",
+        "Open as draft",
+        open_as_draft,
+        |state, on| state.settings.pull_requests.open_as_draft = on,
+    );
+
+    section("Pull requests", Panel::new().row(switch))
+}
+
 impl SettingsWindow {
     pub(super) fn general_page(&self, cx: &Context<Self>) -> PageBlocks {
         let check = self.system_check.clone();
@@ -217,6 +232,7 @@ impl SettingsWindow {
             .child(page_title("General"))
             .child(system)
             .child(updates(&self.state, cx))
+            .child(pull_requests(&self.state, cx))
             .child(about())
     }
 }
@@ -618,6 +634,22 @@ mod tests {
 
         assert!(before, "on by default");
         assert!(!settings.update(|_, cx| crate::settings::auto_check_updates(cx)));
+    }
+
+    #[gpui::test]
+    fn the_switch_turns_open_as_draft_off(cx: &mut TestAppContext) {
+        let (_workspace, main) = setup(cx);
+        main.dispatch_action(OpenSettings);
+        let window = settings_window(main);
+        let mut settings = open_general(window, main);
+        redraw(&mut settings);
+        let before = settings.update(|_, cx| crate::settings::open_pull_requests_as_draft(cx));
+
+        click_on("open-as-draft", &mut settings);
+        redraw(&mut settings);
+
+        assert!(before, "on by default");
+        assert!(!settings.update(|_, cx| crate::settings::open_pull_requests_as_draft(cx)));
     }
 
     #[gpui::test]

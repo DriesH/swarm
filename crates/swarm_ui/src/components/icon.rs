@@ -36,6 +36,7 @@ pub enum IconName {
     Plus,
     PlusSquare,
     PullRequest,
+    PullRequestDraft,
     Restore,
     Search,
     Settings,
@@ -68,7 +69,7 @@ macro_rules! fill_icon {
 }
 
 impl IconName {
-    pub const ALL: [Self; 32] = [
+    pub const ALL: [Self; 33] = [
         Self::Agent,
         Self::Alert,
         Self::Bee,
@@ -94,6 +95,7 @@ impl IconName {
         Self::Plus,
         Self::PlusSquare,
         Self::PullRequest,
+        Self::PullRequestDraft,
         Self::Restore,
         Self::Search,
         Self::Settings,
@@ -130,6 +132,7 @@ impl IconName {
             Self::Plus => "plus",
             Self::PlusSquare => "plus_square",
             Self::PullRequest => "pull_request",
+            Self::PullRequestDraft => "pull_request_draft",
             Self::Restore => "restore",
             Self::Search => "search",
             Self::Settings => "settings",
@@ -214,6 +217,10 @@ impl IconName {
             Self::PullRequest => stroke_icon!(
                 "1.8",
                 r#"<circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="M6 8.5v7M18 15.5V11a3 3 0 0 0-3-3h-4"/><path d="m13 5-2 3 2 3"/>"#
+            ),
+            Self::PullRequestDraft => stroke_icon!(
+                "1.8",
+                r##"<circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="M6 8.5v7M18 15.5V13"/><circle cx="18" cy="9" r="0.6" fill="#000"/><circle cx="18" cy="5" r="0.6" fill="#000"/>"##
             ),
             Self::Restore => stroke_icon!("2", r#"<path d="M7 17 17 7M9 7h8v8"/>"#),
             Self::Search => stroke_icon!(

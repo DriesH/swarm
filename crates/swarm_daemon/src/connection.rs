@@ -325,7 +325,6 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
         | Request::UpdatePr { .. }
         | Request::PrStatus { .. }
         | Request::MarkPrReady { .. }
-        | Request::AddReviewers { .. }
         | Request::MergePr { .. }
         | Request::SetCloseAfterMerge { .. }) => handle_pull_requests(services, sink, request),
         request @ (Request::ListProjects { .. }
@@ -949,15 +948,6 @@ fn handle_pull_requests(services: &Arc<Services>, sink: &Arc<ClientSink>, reques
         Request::MarkPrReady { call, task } => {
             run_slow(sink, "mark-pr-ready", call, move |sink| {
                 done_or_error(sink, call, pull_requests::mark_ready(&services, task));
-            });
-        }
-        Request::AddReviewers { call, task, logins } => {
-            run_slow(sink, "add-reviewers", call, move |sink| {
-                done_or_error(
-                    sink,
-                    call,
-                    pull_requests::add_reviewers(&services, task, &logins),
-                );
             });
         }
         Request::MergePr { call, task, method } => {

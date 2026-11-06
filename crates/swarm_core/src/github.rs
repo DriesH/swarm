@@ -355,25 +355,6 @@ impl Github {
         Ok(())
     }
 
-    /// Asks the logins for a review. They must be valid GitHub logins.
-    pub fn add_reviewers(
-        &self,
-        target: &Target<'_>,
-        number: u64,
-        logins: &[String],
-    ) -> Result<(), Error> {
-        let logins = check_logins(logins)?;
-        let joined = logins.join(",");
-
-        self.run(
-            target,
-            &["pr", "edit", &number.to_string(), "--add-reviewer", &joined],
-            None,
-        )?;
-
-        Ok(())
-    }
-
     /// Merges the pull request, but only when its head is still `head`. It deletes no
     /// branch: `gh` would also touch the local branch, which a worktree has checked out.
     /// A merge queue or auto-merge can leave the pull request open, so the caller reads
@@ -565,34 +546,6 @@ fn parse_link(stdout: &str, head: &str) -> Option<PrLink> {
         url: url.to_owned(),
         head: head.to_owned(),
     })
-}
-
-/// Logins that GitHub accepts: letters, digits and hyphens, at most 39, not starting with
-/// a hyphen. One leading `@` is allowed and dropped.
-fn check_logins(logins: &[String]) -> Result<Vec<String>, Error> {
-    if logins.is_empty() {
-        return Err(Error::Invalid("name at least one reviewer".to_owned()));
-    }
-
-    logins
-        .iter()
-        .map(|login| {
-            let login = login.trim();
-            let login = login.strip_prefix('@').unwrap_or(login);
-
-            let valid = !login.is_empty()
-                && login.len() <= 39
-                && !login.starts_with('-')
-                && login
-                    .chars()
-                    .all(|character| character.is_ascii_alphanumeric() || character == '-');
-            if valid {
-                Ok(login.to_owned())
-            } else {
-                Err(Error::Invalid(format!("{login:?} is not a GitHub login")))
-            }
-        })
-        .collect()
 }
 
 /// A title GitHub accepts: one line, 1 to [`TITLE_CHARS`] characters.
@@ -1022,26 +975,6 @@ mod tests {
             parse_link("https://github.com/acme/widgets/pull/x", "abc"),
             None
         );
-    }
-
-    #[test]
-    fn logins_must_look_like_github_logins() {
-        let ok = check_logins(&["alice".to_owned(), "@bob-2".to_owned()]).expect("logins");
-        assert_eq!(ok, ["alice", "bob-2"]);
-
-        for bad in [
-            "",
-            "-flag",
-            "--add-reviewer",
-            "a b",
-            "a,b",
-            "a/b",
-            "ali;ce",
-            "x".repeat(40).as_str(),
-        ] {
-            assert!(check_logins(&[bad.to_owned()]).is_err(), "{bad:?}");
-        }
-        assert!(check_logins(&[]).is_err());
     }
 
     #[test]
