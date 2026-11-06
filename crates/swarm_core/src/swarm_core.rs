@@ -26,17 +26,16 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use swarm_protocol::{
-    AgentChange, AgentId, AgentInfo, AgentLifecycle, AgentRole, CloseCheck, CloseStep, CreateTask,
-    DIFF_FILES, DiffStat, FileChange, FileDiff, FileTexts, GithubStatus, PrLink,
-    ProjectConfigFields, ProjectId, ProjectInfo, ReviewMark, ReviewSource, TaskDiff, TaskId,
-    TaskInfo, TerminalId,
+    AgentChange, AgentId, AgentInfo, AgentLifecycle, AgentRole, BranchSource, CloseCheck,
+    CloseStep, CreateTask, DIFF_FILES, DiffStat, ExistingBranch, FileChange, FileDiff, FileTexts,
+    GithubStatus, PrLink, ProjectConfigFields, ProjectId, ProjectInfo, ReviewMark, ReviewSource,
+    TaskBranch, TaskBranchList, TaskDiff, TaskId, TaskInfo, TerminalId,
 };
 use swarm_term::ExitStatus;
 
 use crate::config::{ChecksConfig, LoadedConfig, ProjectConfig};
 use crate::github::Github;
 use crate::store::{NewTask, Store, StoredProject};
-use crate::task::BRANCH_PREFIX;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -87,6 +86,9 @@ pub struct PreparedTask {
     pub setup: Option<String>,
     /// `SWARM_TASK`, `SWARM_PORT` and `SWARM_PORTS`.
     pub env: Vec<(String, String)>,
+    /// The create moved the project folder to the base branch, because it had the task
+    /// branch checked out.
+    pub switched_project_folder: bool,
 }
 
 /// Where a worker works, as [`Projects::create_worker`] made it.
@@ -267,12 +269,21 @@ impl Projects {
     }
 
     /// Undoes [`Projects::create_task`] for a task that never started: removes its
-    /// worktree, branch and row, which frees its ports.
-    pub fn discard_task(&self, task: &TaskInfo) {
+    /// worktree, branch and row, which frees its ports. A branch that existed before the
+    /// task stays; with `switched_project_folder` the project folder goes back to it.
+    pub fn discard_task(&self, task: &TaskInfo, switched_project_folder: bool) {
         let _creating = lock(&self.creating);
 
         if let Some(root) = self.project_root(task.project) {
-            remove_task_leftovers(&root, &task.branch, &task.worktree);
+            let existing = task.branch_source == BranchSource::Existing;
+            remove_task_leftovers(&root, &task.branch, &task.worktree, !existing);
+
+            if switched_project_folder && let Err(error) = git::switch_branch(&root, &task.branch) {
+                log::error!(
+                    "cannot switch the project folder back to {}: {error}",
+                    task.branch
+                );
+            }
         }
         if let Err(error) = lock(&self.store).delete_task(task.id) {
             log::error!("cannot delete task {}: {error}", task.id.0);
@@ -288,7 +299,7 @@ impl Projects {
         if !self.shares_task_worktree(worker)
             && let Some(root) = self.project_root(worker.project)
         {
-            remove_task_leftovers(&root, &worker.branch, &worker.worktree);
+            remove_task_leftovers(&root, &worker.branch, &worker.worktree, true);
         }
         if let Err(error) = lock(&self.store).delete_agent(worker.id) {
             log::error!("cannot delete agent {}: {error}", worker.id.0);
@@ -376,10 +387,15 @@ impl Projects {
         Ok((register(&stored.path, &base)?, true))
     }
 
-    /// Makes the task branch and task worktree, copies files, reserves ports and
-    /// records the task. Nothing is left behind when a step fails.
-    pub fn create_task(&self, request: &CreateTask) -> Result<PreparedTask, Error> {
-        self.create_task_by(request, None)
+    /// Makes the task branch (or checks out an existing one) and task worktree, copies
+    /// files, reserves ports and records the task. Nothing is left behind when a step
+    /// fails. `branch_prefix` starts the name of a new branch the request does not name.
+    pub fn create_task(
+        &self,
+        request: &CreateTask,
+        branch_prefix: &str,
+    ) -> Result<PreparedTask, Error> {
+        self.create_task_by(request, None, branch_prefix)
     }
 
     /// Like [`Projects::create_task`]; the row records `created_by`, the Start
@@ -388,6 +404,7 @@ impl Projects {
         &self,
         request: &CreateTask,
         created_by: Option<AgentId>,
+        branch_prefix: &str,
     ) -> Result<PreparedTask, Error> {
         let _creating = lock(&self.creating);
 
@@ -403,24 +420,73 @@ impl Projects {
             )));
         }
 
-        let base = match &request.from {
-            Some(from) => from.clone(),
-            None => git::default_base_branch(&root, config.worktrees.base_branch.as_deref()),
-        };
-        git::verify_start_point(&root, &base)?;
-        let pr_base = match &request.from {
-            Some(from) if git::origin_has_branch(&root, from).unwrap_or(false) => from.clone(),
-            _ => git::default_base_branch(&root, config.worktrees.base_branch.as_deref()),
-        };
-
         let folder = root.join(&config.worktrees.folder);
         task::create_folder_inside(&root, &folder)?;
+
+        let plan = match &request.branch {
+            TaskBranch::New { name, from } => Self::plan_new_branch(
+                request,
+                &root,
+                &config,
+                &folder,
+                name.as_deref(),
+                from.as_deref(),
+                branch_prefix,
+            )?,
+            TaskBranch::Existing {
+                name,
+                switch_project_folder,
+            } => self.plan_existing_branch(
+                request,
+                &root,
+                &config,
+                &folder,
+                name,
+                *switch_project_folder,
+            )?,
+        };
+
+        self.make_task(&root, &config, request, &plan, created_by)
+    }
+
+    fn plan_new_branch(
+        request: &CreateTask,
+        root: &Path,
+        config: &ProjectConfig,
+        folder: &Path,
+        custom_branch: Option<&str>,
+        from: Option<&str>,
+        branch_prefix: &str,
+    ) -> Result<TaskPlan, Error> {
+        let default_base =
+            || git::default_base_branch(root, config.worktrees.base_branch.as_deref());
+
+        let base = match from {
+            Some(from) => from.to_owned(),
+            None => default_base(),
+        };
+        git::verify_start_point(root, &base)?;
+        let pr_base = match from {
+            Some(from) if git::origin_has_branch(root, from).unwrap_or(false) => from.to_owned(),
+            _ => default_base(),
+        };
+
+        let custom_branch = custom_branch.map(str::trim).filter(|name| !name.is_empty());
+        if let Some(branch) = custom_branch {
+            git::check_branch_name(root, branch)?;
+            if git::branch_exists(root, branch)? {
+                return Err(Error::Invalid(format!(
+                    "the branch {branch:?} already exists"
+                )));
+            }
+        }
 
         let taken = |candidate: &str| {
             let worktree = folder.join(candidate);
 
             Ok(worktree.symlink_metadata().is_ok()
-                || git::branch_exists(&root, &format!("{BRANCH_PREFIX}{candidate}"))?)
+                || (custom_branch.is_none()
+                    && git::branch_exists(root, &format!("{branch_prefix}{candidate}"))?))
         };
 
         // A task without a name is named after a creature, like its branch.
@@ -442,33 +508,187 @@ impl Projects {
                 task::first_free_slug(&task::slug(given)?, taken)?,
             ),
         };
-        let branch = format!("{BRANCH_PREFIX}{slug}");
-        let worktree = folder.join(&slug);
 
-        let ports = self.reserve_ports(&config)?;
+        let branch = if let Some(branch) = custom_branch {
+            branch.to_owned()
+        } else {
+            let branch = format!("{branch_prefix}{slug}");
+            check_derived_branch(root, branch_prefix, &branch)?;
+
+            branch
+        };
+
+        Ok(TaskPlan {
+            name,
+            branch,
+            base: base.clone(),
+            pr_base,
+            worktree: folder.join(&slug),
+            branch_source: if custom_branch.is_some() {
+                BranchSource::Custom
+            } else {
+                BranchSource::Derived
+            },
+            origin: BranchOrigin::New { from: base },
+            switch_project_folder_to: None,
+        })
+    }
+
+    fn plan_existing_branch(
+        &self,
+        request: &CreateTask,
+        root: &Path,
+        config: &ProjectConfig,
+        folder: &Path,
+        name: &str,
+        switch_project_folder: bool,
+    ) -> Result<TaskPlan, Error> {
+        let name = name.trim();
+        if name.starts_with('-') {
+            return Err(Error::Invalid(format!(
+                "the branch {name:?} must not start with \"-\""
+            )));
+        }
+
+        let base = git::default_base_branch(root, config.worktrees.base_branch.as_deref());
+        if name == base {
+            return Err(Error::Invalid(
+                "the base branch cannot be a task branch".into(),
+            ));
+        }
+
+        if let Some(task) = self
+            .open_tasks(request.project)?
+            .iter()
+            .find(|task| task.branch == name)
+        {
+            return Err(Error::Invalid(format!(
+                "the branch {name:?} belongs to the task {:?}",
+                task.name
+            )));
+        }
+
+        let local = git::branch_exists(root, name)?;
+        let remote = !local && git::origin_has_branch(root, name)?;
+        if !local && !remote {
+            return Err(Error::Invalid(format!(
+                "{name:?} is not a branch in this project"
+            )));
+        }
+
+        let mut switch_project_folder_to = None;
+        if local && let Some(path) = git::worktree_branches(root)?.get(name) {
+            if same_path(path, root) {
+                if !switch_project_folder {
+                    return Err(Error::Invalid(format!(
+                        "{name:?} is checked out in the project folder"
+                    )));
+                }
+                if git::tracked_changes(root)? > 0 {
+                    return Err(Error::Invalid(format!(
+                        "the project folder has uncommitted changes, so it stays on {name:?}"
+                    )));
+                }
+
+                switch_project_folder_to = Some(base.clone());
+            } else {
+                return Err(Error::Invalid(format!(
+                    "{name:?} is checked out in {}",
+                    path.display()
+                )));
+            }
+        }
+
+        let task_name = match request.name.trim() {
+            "" => name,
+            given => given,
+        };
+        let slug = task::first_free_slug(&task::slug(task_name)?, |candidate| {
+            Ok(folder.join(candidate).symlink_metadata().is_ok())
+        })?;
+
+        Ok(TaskPlan {
+            name: task_name.to_owned(),
+            branch: name.to_owned(),
+            base: base.clone(),
+            pr_base: base,
+            worktree: folder.join(slug),
+            branch_source: BranchSource::Existing,
+            origin: if local {
+                BranchOrigin::Local
+            } else {
+                BranchOrigin::Remote
+            },
+            switch_project_folder_to,
+        })
+    }
+
+    /// The steps both kinds of task share: ports, worktree, record. Undoes what it did
+    /// when a step fails.
+    fn make_task(
+        &self,
+        root: &Path,
+        config: &ProjectConfig,
+        request: &CreateTask,
+        plan: &TaskPlan,
+        created_by: Option<AgentId>,
+    ) -> Result<PreparedTask, Error> {
+        let ports = self.reserve_ports(config)?;
 
         let folder_line = format!("/{}/", config.worktrees.folder.trim_matches('/'));
-        git::add_exclude_line(&root, &folder_line)?;
-        git::worktree_add(&root, &branch, &worktree, &base)?;
+        git::add_exclude_line(root, &folder_line)?;
+
+        let switched = match &plan.switch_project_folder_to {
+            Some(base) => {
+                git::switch_branch(root, base)?;
+                true
+            }
+            None => false,
+        };
+        let restore_project_folder = || {
+            if switched && let Err(error) = git::switch_branch(root, &plan.branch) {
+                log::error!(
+                    "cannot switch the project folder back to {}: {error}",
+                    plan.branch
+                );
+            }
+        };
+
+        let added = match &plan.origin {
+            BranchOrigin::New { from } => {
+                git::worktree_add(root, &plan.branch, &plan.worktree, from)
+            }
+            BranchOrigin::Local => git::worktree_add_existing(root, &plan.branch, &plan.worktree),
+            BranchOrigin::Remote => git::worktree_add_tracking(root, &plan.branch, &plan.worktree),
+        };
+        if let Err(error) = added {
+            restore_project_folder();
+
+            return Err(error);
+        }
 
         let recorded = self.record(
-            &root,
-            &config,
+            root,
+            config,
             request,
             &TaskNames {
-                name: &name,
-                branch: &branch,
-                base: &base,
-                pr_base: &pr_base,
+                name: &plan.name,
+                branch: &plan.branch,
+                base: &plan.base,
+                pr_base: &plan.pr_base,
+                branch_source: plan.branch_source,
             },
-            &worktree,
+            &plan.worktree,
             &ports,
             created_by,
         );
         let task = match recorded {
             Ok(task) => task,
             Err(error) => {
-                remove_task_leftovers(&root, &branch, &worktree);
+                // A local branch that existed before the task stays.
+                let delete_branch = !matches!(plan.origin, BranchOrigin::Local);
+                remove_task_leftovers(root, &plan.branch, &plan.worktree, delete_branch);
+                restore_project_folder();
 
                 return Err(error);
             }
@@ -478,43 +698,67 @@ impl Projects {
             .then(|| config.worktrees.setup.clone());
         let env = task_env(&task);
 
-        Ok(PreparedTask { task, setup, env })
+        Ok(PreparedTask {
+            task,
+            setup,
+            env,
+            switched_project_folder: switched,
+        })
     }
 
-    /// Renames an open task and its branch (`git branch -m` in the task worktree). The
-    /// worktree folder keeps its name, because agent sessions are stored by folder.
-    /// Refused when the task has a pull request or its branch was pushed, when another
-    /// open task or a branch has the name, or when the name makes no branch name.
-    pub fn rename_task(&self, id: TaskId, name: &str) -> Result<TaskInfo, Error> {
+    /// Renames an open task and, when its branch was derived from its name
+    /// (`<branch_prefix><slug>`), its branch too (`git branch -m` in the task worktree).
+    /// A typed or existing branch keeps its name. The worktree folder keeps its name, because agent
+    /// sessions are stored by folder. A branch rename is refused when the task has a pull
+    /// request or its branch was pushed. Refused as well when another open task or a
+    /// branch has the name, or when the name makes no branch name.
+    pub fn rename_task(
+        &self,
+        id: TaskId,
+        name: &str,
+        branch_prefix: &str,
+    ) -> Result<TaskInfo, Error> {
         let _creating = lock(&self.creating);
 
         let name = name.trim();
         let slug = task::slug(name)?;
-        let branch = format!("{BRANCH_PREFIX}{slug}");
 
         let task = self.task(id)?;
         let root = self
             .project_root(task.project)
             .ok_or(Error::UnknownProject(task.project.0))?;
 
-        if task.pull_request.is_some() {
-            return Err(Error::Invalid(
-                "the task has a pull request, so its name stays".to_owned(),
-            ));
-        }
-        if git::tracks_own_name(&root, &task.branch)?
-            || git::origin_has_branch(&root, &task.branch)?
-        {
-            return Err(Error::Invalid(
-                "the branch was pushed, so its name stays".to_owned(),
-            ));
+        let renames_branch = task.branch_source == BranchSource::Derived;
+        let branch = if renames_branch {
+            format!("{branch_prefix}{slug}")
+        } else {
+            task.branch.clone()
+        };
+        let renames_branch = renames_branch && branch != task.branch;
+
+        if renames_branch {
+            check_derived_branch(&root, branch_prefix, &branch)?;
+
+            if task.pull_request.is_some() {
+                return Err(Error::Invalid(
+                    "the task has a pull request, so its name stays".to_owned(),
+                ));
+            }
+            if git::tracks_own_name(&root, &task.branch)?
+                || git::origin_has_branch(&root, &task.branch)?
+            {
+                return Err(Error::Invalid(
+                    "the branch was pushed, so its name stays".to_owned(),
+                ));
+            }
         }
 
         let others = self.open_tasks(task.project)?;
         let used = others.iter().any(|other| {
-            other.id != task.id && (other.branch == branch || other.name.eq_ignore_ascii_case(name))
+            other.id != task.id
+                && ((renames_branch && other.branch == branch)
+                    || other.name.eq_ignore_ascii_case(name))
         });
-        let renames_branch = branch != task.branch;
         if used || (renames_branch && git::branch_exists(&root, &branch)?) {
             return Err(Error::Invalid(format!("the name {name:?} is taken")));
         }
@@ -650,7 +894,7 @@ impl Projects {
         let agent = match recorded {
             Ok(agent) => agent,
             Err(error) => {
-                remove_task_leftovers(&root, &checkout.branch, &checkout.worktree);
+                remove_task_leftovers(&root, &checkout.branch, &checkout.worktree, true);
 
                 return Err(error);
             }
@@ -1129,6 +1373,68 @@ impl Projects {
         git::local_branches(&self.project_path(project)?)
     }
 
+    /// The branches a new task can continue, and what the project folder looks like.
+    pub fn task_branches(&self, project: ProjectId) -> Result<TaskBranchList, Error> {
+        let root = self.project_path(project)?;
+
+        let LoadedConfig { config, .. } = config::load(&root);
+        let base_branch = git::default_base_branch(&root, config.worktrees.base_branch.as_deref());
+
+        let tasks = self.open_tasks(project)?;
+        let task_of = |branch: &str| {
+            tasks
+                .iter()
+                .find(|task| {
+                    task.branch == branch
+                        || task
+                            .agents
+                            .iter()
+                            .any(|agent| agent.role == AgentRole::Worker && agent.branch == branch)
+                })
+                .map(|task| task.id)
+        };
+        let checked_out = git::worktree_branches(&root)?;
+
+        let local = git::local_branches(&root)?;
+        let remote_only: Vec<String> = git::origin_branches(&root)?
+            .into_iter()
+            .filter(|branch| !local.contains(branch))
+            .collect();
+
+        let mut branches = Vec::new();
+        for name in local.into_iter().filter(|branch| *branch != base_branch) {
+            let checked_out = checked_out.get(&name).cloned();
+            branches.push(ExistingBranch {
+                task: task_of(&name),
+                in_project_folder: checked_out
+                    .as_deref()
+                    .is_some_and(|path| same_path(path, &root)),
+                checked_out,
+                name,
+                remote_only: false,
+            });
+        }
+        for name in remote_only
+            .into_iter()
+            .filter(|branch| *branch != base_branch)
+        {
+            branches.push(ExistingBranch {
+                task: task_of(&name),
+                checked_out: None,
+                in_project_folder: false,
+                name,
+                remote_only: true,
+            });
+        }
+
+        Ok(TaskBranchList {
+            branches,
+            project_folder_changes: git::tracked_changes(&root)?,
+            project_folder: root,
+            base_branch,
+        })
+    }
+
     /// `owner/name` of the project's `origin`, when it is on github.com.
     pub fn repository(&self, project: ProjectId) -> Result<Option<String>, Error> {
         let root = self.project_path(project)?;
@@ -1209,9 +1515,16 @@ impl Projects {
 
     /// Deletes a local branch whose commits are all in a merged pull request. A squash
     /// merge leaves the branch looking unmerged, so closing a task keeps it. The caller
-    /// checked that no commit is lost. Missing branches are fine.
-    pub fn delete_merged_branch(&self, project: ProjectId, branch: &str) -> Result<(), Error> {
-        let root = self.project_path(project)?;
+    /// checked that no commit is lost. Missing branches are fine. The branch of a task
+    /// that continued an existing branch is never deleted.
+    pub fn delete_merged_branch(&self, task: &TaskInfo, branch: &str) -> Result<(), Error> {
+        if task.branch_source == BranchSource::Existing {
+            return Err(Error::Invalid(format!(
+                "the branch {branch:?} existed before the task, so it stays"
+            )));
+        }
+
+        let root = self.project_path(task.project)?;
 
         if git::branch_exists(&root, branch)? {
             git::branch_delete(&root, branch)?;
@@ -1412,6 +1725,7 @@ impl Projects {
                 pr_base: names.pr_base,
                 worktree,
                 ports,
+                branch_source: names.branch_source,
             },
             created_by,
         )
@@ -1446,6 +1760,30 @@ struct TaskNames<'a> {
     branch: &'a str,
     base: &'a str,
     pr_base: &'a str,
+    branch_source: BranchSource,
+}
+
+/// How a task gets its branch.
+enum BranchOrigin {
+    /// A new branch cut from this start point.
+    New { from: String },
+    /// A local branch that already exists.
+    Local,
+    /// A branch only on `origin`; the task gets a local branch that tracks it.
+    Remote,
+}
+
+/// Everything decided about a new task before anything is made on disk.
+struct TaskPlan {
+    name: String,
+    branch: String,
+    base: String,
+    pr_base: String,
+    worktree: PathBuf,
+    branch_source: BranchSource,
+    origin: BranchOrigin,
+    /// The project folder has the task branch checked out; it moves to this branch first.
+    switch_project_folder_to: Option<String>,
 }
 
 /// The branch the project's pull requests merge into: the configured one, else the one
@@ -1593,7 +1931,9 @@ fn merged_branches(root: &Path, task: &TaskInfo) -> Result<Vec<String>, Error> {
         .map(|agent| agent.branch.as_str());
 
     let mut merged = Vec::new();
-    for branch in [task.branch.as_str()].into_iter().chain(own) {
+    let task_branch =
+        (task.branch_source != BranchSource::Existing).then_some(task.branch.as_str());
+    for branch in task_branch.into_iter().chain(own) {
         if merged.iter().any(|known| known == branch) || !git::branch_exists(root, branch)? {
             continue;
         }
@@ -1659,13 +1999,30 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn remove_task_leftovers(root: &Path, branch: &str, worktree: &Path) {
+fn check_derived_branch(root: &Path, prefix: &str, branch: &str) -> Result<(), Error> {
+    git::check_branch_name(root, branch).map_err(|error| match error {
+        Error::Invalid(_) => Error::Invalid(format!(
+            "the branch prefix {prefix:?} (Settings › General) makes {branch:?}, which is not a valid branch name"
+        )),
+        other => other,
+    })
+}
+
+fn remove_task_leftovers(root: &Path, branch: &str, worktree: &Path, delete_branch: bool) {
     if let Err(error) = git::worktree_remove(root, worktree) {
         log::error!("cannot remove the worktree {}: {error}", worktree.display());
     }
-    if let Err(error) = git::branch_delete(root, branch) {
+    if delete_branch && let Err(error) = git::branch_delete(root, branch) {
         log::error!("cannot delete the branch {branch}: {error}");
     }
+}
+
+/// True when both paths name the same folder. Falls back to the paths as given when one
+/// cannot be resolved.
+fn same_path(first: &Path, second: &Path) -> bool {
+    let resolve = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+
+    resolve(first) == resolve(second)
 }
 
 /// `SWARM_TASK`, `SWARM_PORT` and `SWARM_PORTS` of a task: the environment of its setup

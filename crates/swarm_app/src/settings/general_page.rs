@@ -6,7 +6,7 @@ use swarm_ui::prelude::*;
 use swarm_ui::styles::focus_ring;
 
 use super::SettingsWindow;
-use super::pages::{PageBlocks, page_title, plain_row, section, switch_row};
+use super::pages::{PageBlocks, input_row, page_title, plain_row, section, switch_row};
 use crate::system_check::SystemCheckView;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -186,6 +186,14 @@ fn update_button(cx: &App) -> Button {
         .on_click(|_, _, cx| crate::updates::check_now(cx))
 }
 
+/// The Branches section: the prefix of new task branches.
+fn branches(inputs: &super::Inputs) -> impl IntoElement {
+    section(
+        "Branches",
+        Panel::new().row(input_row("Branch prefix", &inputs.branch_prefix, 160.)),
+    )
+}
+
 /// The Pull requests section: the draft switch.
 fn pull_requests(state: &gpui::Entity<super::SettingsState>, cx: &App) -> impl IntoElement {
     let open_as_draft = state.read(cx).settings.pull_requests.open_as_draft;
@@ -232,6 +240,7 @@ impl SettingsWindow {
             .child(page_title("General"))
             .child(system)
             .child(updates(&self.state, cx))
+            .child(branches(&self.inputs))
             .child(pull_requests(&self.state, cx))
             .child(about())
     }

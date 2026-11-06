@@ -78,7 +78,10 @@ Every agent terminal gets `SWARM_SOCKET`, `SWARM_AGENT_ID`, `SWARM_AGENT_NAME`, 
 
 **Starting new work later.** The **+** in the tab bar opens a menu with two choices:
 
-- **New task**: a sheet with name, branch from (default: base branch; any local branch, so a kept branch of a closed task can be picked up again), orchestrator agent, optional first message, run setup script. Swarm creates the worktree and tab and starts one orchestrator.
+- **New task**: a sheet with name, **New branch | Existing branch**, orchestrator agent, optional first message, run setup script. Swarm creates the worktree and tab and starts one orchestrator.
+  - **New branch**: branch name (optional; empty gives `<branch prefix><slug of the name>`) and branch from (default: base branch; any local branch, so a kept branch of a closed task can be picked up again).
+  - **Existing branch**: continues a branch the user already has, so work from another app can move into Swarm. It lists local branches, then branches only on `origin`, which get a local branch that tracks them. The base branch and branches of open tasks are left out. When the branch is checked out in the project folder and that folder is clean, **Switch project folder to <base>** (on) switches it first; with uncommitted changes to tracked files (untracked files stay in the project folder), or when another worktree has the branch, the task cannot be created. The task's base and PR base are the project's base branch. Swarm never renames or deletes a continued branch: Close task, a rename and a merge (local and remote) keep it.
+  - **Branch prefix**: Settings › General, default `swarm/`, may be empty. Each task records how its branch was made: derived (`<prefix><slug>`), custom (typed in the sheet) or existing. The orchestrator's `task.rename` renames only a derived branch.
 - **Plan with orchestrator**: opens a Plan tab with the plan editor, for work that the Start orchestrator turns into tasks. It is the Start tab under another name, because the project already has tasks. Only one Start or Plan tab can be open per project.
 
 Harness calls for the Start orchestrator:
@@ -260,11 +263,11 @@ Other ways in: ⌘K "Create pull request"; `swarm pr draft` from the orchestrato
 - **Local checks:** run one after the other, each in its own process terminal in the task worktree, so a failure can be read. After a failure the rest are skipped. A result belongs to the commit it ran on, and counts only when the worktree had no uncommitted changes from start to end; a new commit makes it stale. Without configured checks the section is hidden.
 - **Create PR** reads the task's HEAD once and pushes exactly that commit (the repository's pre-push hook runs as usual), then runs `gh pr create` into the task's PR base: the branch the task started from when `origin` has it, else the project's base branch. The daemon refuses it when HEAD is not the task branch, the approval does not match the Merged diff at that commit, a comment is pending, or required checks did not pass cleanly on that commit. A push or `gh` failure shows its output. An open pull request from the branch that Swarm did not record is taken over; a closed one can be replaced.
 - **Update PR:** new commits after the pull request exists (for example a CI fix) go through Review and the checks again, then **Push changes** sends them under the same rules.
-- **Merge** merges only the commit Swarm pushed (`--match-head-commit`), checks that GitHub really merged it (a merge queue leaves it open), then deletes the remote branch. Squash by default, with merge and rebase as other choices.
+- **Merge** merges only the commit Swarm pushed (`--match-head-commit`), checks that GitHub really merged it (a merge queue leaves it open), then deletes the remote branch (not a continued branch). Squash by default, with merge and rebase as other choices.
 - **After merge:** one option, **Close the task after merge**, which closes the task as Close task does. It stays open when that would lose work: uncommitted files or local commits that are not in the pull request.
 - **Status** is read with `gh pr view` while the panel shows: every 10 s while GitHub checks run, every 30 s otherwise.
 - **Set up GitHub:** without `gh`, **Create PR** becomes **Set up GitHub**. It installs `gh` in a visible user terminal (Homebrew when it exists, else the official release, checked against its published checksums, into Swarm's own bin folder), then runs `gh auth login --web` the same way. Agents get the same `gh` on their `PATH`.
-- **New task from any branch:** the New task sheet's "branch from" lists every local branch, so a closed task's kept branch can be picked up again.
+- **New task from any branch:** the New task sheet's "branch from" lists every local branch, so a closed task's kept branch can be picked up again. **Existing branch** continues a branch as it is.
 
 ### Notifications
 

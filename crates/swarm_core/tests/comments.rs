@@ -13,7 +13,7 @@ use swarm_core::{Error, Projects, WorkerCheckout, git};
 use swarm_protocol::{
     AgentInfo, AgentKind, AgentLifecycle, AgentRole, COMMENT_BYTES, CommentAnchor, CommentId,
     CommentState, CreateTask, DiffSide, MessageInfo, MessageKind, NewComment, ReviewComment,
-    ReviewSource, TaskId, TaskInfo,
+    ReviewSource, TaskBranch, TaskId, TaskInfo,
 };
 
 static NEXT_FOLDER: AtomicU32 = AtomicU32::new(0);
@@ -94,14 +94,20 @@ fn build(file: &str, store: impl FnOnce(&Path) -> Store) -> Setup {
 
 fn new_task(projects: &Projects, project: swarm_protocol::ProjectId, name: &str) -> TaskInfo {
     projects
-        .create_task(&CreateTask {
-            project,
-            name: name.to_owned(),
-            from: None,
-            run_setup: false,
-            orchestrator: None,
-            first_message: None,
-        })
+        .create_task(
+            &CreateTask {
+                project,
+                name: name.to_owned(),
+                branch: TaskBranch::New {
+                    name: None,
+                    from: None,
+                },
+                run_setup: false,
+                orchestrator: None,
+                first_message: None,
+            },
+            "swarm/",
+        )
         .expect("task")
         .task
 }

@@ -18,7 +18,7 @@ use swarm_protocol::agent::{
 };
 use swarm_protocol::{
     AgentId, AgentInfo, AgentKind, AgentLifecycle, AgentRole, AgentStatus, CreateTask, Event,
-    MessageKind, PrDraft, TaskId, TaskInfo, TerminalId, UsageWindow,
+    MessageKind, PrDraft, TaskBranch, TaskId, TaskInfo, TerminalId, UsageWindow,
 };
 
 use crate::Services;
@@ -539,10 +539,13 @@ impl Calls {
 
         let _busy = self.services.pull_requests.begin(task.id)?;
 
-        let renamed = self.services.projects.rename_task(task.id, name)?;
-        self.services
-            .agents
-            .follow_branch(task.id, &task.branch, &renamed.branch);
+        let prefix = self.services.agents.branch_prefix();
+        let renamed = self.services.projects.rename_task(task.id, name, &prefix)?;
+        if renamed.branch != task.branch {
+            self.services
+                .agents
+                .follow_branch(task.id, &task.branch, &renamed.branch);
+        }
         self.services.clients.broadcast(&Event::TaskChanged {
             task: renamed.clone(),
         });
@@ -630,7 +633,7 @@ impl Calls {
         let request = CreateTask {
             project: caller.project,
             name: name.unwrap_or_default(),
-            from,
+            branch: TaskBranch::New { name: None, from },
             run_setup: true,
             orchestrator: Some(kind),
             first_message: Some(brief.clone()),
@@ -937,6 +940,7 @@ mod tests {
             pr_base: "main".to_owned(),
             pull_request: None,
             close_after_merge: false,
+            branch_source: swarm_protocol::BranchSource::Derived,
         }
     }
 

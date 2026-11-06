@@ -16,7 +16,7 @@ The **Start orchestrator** reads your plan. It counts the features in it. A feat
 3. For each task, Swarm makes the task branch and the **task worktree**, a separate checkout of the project. Then it opens a tab and starts that task's orchestrator.
 4. The Start orchestrator waits until every task orchestrator confirms its brief. Then it exits.
 
-The task branch name starts with `swarm/`.
+The task branch name starts with the [branch prefix](/swarm/docs/settings/#general), `swarm/` by default.
 
 ## The brief
 
@@ -31,7 +31,7 @@ The **orchestrator** leads one task. It splits the task, starts **workers** and 
 
 - Every helper of the orchestrator is a worker started with `swarm spawn`, including read-only reviews and research. Swarm denies the built-in subagent tools of a Claude Code orchestrator.
 - When a worker's report is checked and the orchestrator has nothing more for it, the orchestrator runs `swarm stop`. The worker stops like an idle agent and leaves the tile layout. It stays in the [Swarm view](/swarm/docs/swarm-view/) with a dimmed icon and border. With a saved conversation it is resumable, and **Resume** shows in the inspector.
-- A task without a name starts with a bee or wasp name. After it confirms its brief, the orchestrator renames the task, its tab and its branch to say what the task is about. The worktree folder keeps its first name. A task with a pull request or a pushed branch keeps its name.
+- A task without a name starts with a bee or wasp name. After it confirms its brief, the orchestrator renames the task, its tab and its branch to say what the task is about. The worktree folder keeps its first name. A task with a pull request or a pushed branch keeps its branch name. A branch you named yourself or continued always keeps its name; only the task and tab are renamed.
 
 Review sorts the changed files by worktree, then by path. Each file card names the agent of the file's newest commit.
 
@@ -48,13 +48,22 @@ The **New task** sheet has these fields:
 
 | Field | What it does |
 |---|---|
-| **Name** | Names the task. Optional. The field shows a name to use when you leave it empty: the Latin name of a bee or wasp, such as `apis-mellifera`, that no open task, branch or worktree folder uses. If you type such a name and it is taken by then, Swarm picks another bee or wasp name. Any other taken name gets `-2`, `-3` and so on. |
-| **Branch from** | The branch the task starts from. It lists your local branches, so you can pick up the kept branch of a closed task. |
+| **Name** | Names the task. Optional. The field shows a name to use when you leave it empty: the Latin name of a bee or wasp, such as `apis-mellifera`, that no open task, branch or worktree folder uses. If you type such a name and it is taken by then, Swarm picks another bee or wasp name. Any other taken name gets `-2`, `-3` and so on. With **Existing branch**, an empty name gives the task the branch's name. |
+| **New branch** or **Existing branch** | **New branch** makes a branch for the task. **Existing branch** continues a branch you already have, for example one you worked on in another app. |
+| **Branch name** | With **New branch**. Optional. The field shows the name Swarm uses when you leave it empty: the [branch prefix](/swarm/docs/settings/#general) and the task name, such as `swarm/fix-login`. Type any other name to use it as is. |
+| **Branch from** | With **New branch**. The branch the task starts from. It lists your local branches, so you can pick up the kept branch of a closed task. |
+| **Existing branch** | With **Existing branch**. Your local branches, then the branches that exist only on `origin` (shown as `origin/<name>`). For those, Swarm makes a local branch that tracks it. The base branch and the branches of open tasks and their workers are not listed. The field shows **Loading branches…** until the list comes. |
 | **Orchestrator** | Claude Code or Codex. |
 | **First message** | Optional. The orchestrator starts with it. |
 | **Run setup script** | On by default. Runs the project's setup script in the new worktree. |
 
 Click **Create task**. Swarm makes the worktree and the tab, and starts one orchestrator.
+
+### Continue an existing branch
+
+Git can check out a branch in only one place. If the branch you pick is checked out in the project folder, the sheet shows **Switch project folder to main** (with your base branch), and it is on. Swarm then switches the project folder to the base branch and checks out your branch in the task worktree. The sheet does not offer this when tracked files in the project folder have uncommitted changes. Commit or stash them first, or switch the folder yourself. Untracked files do not block it. They stay in the project folder and do not move to the task worktree. A branch checked out in another worktree cannot be picked until you remove that worktree.
+
+Swarm never renames or deletes a branch you continue. Closing the task keeps it, even when it is merged. If the branch already has an open pull request on GitHub, **Create PR** takes it over instead of opening a new one. See [Pull requests](/swarm/docs/pull-requests/).
 
 ## Messages
 

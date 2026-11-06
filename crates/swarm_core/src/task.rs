@@ -2,40 +2,15 @@
 
 use std::path::{Path, PathBuf};
 
+use swarm_protocol::task_slug;
+
 use crate::Error;
 use crate::config::{self, PortRange};
 
-const MAX_SLUG_CHARS: usize = 50;
-
-pub(crate) const BRANCH_PREFIX: &str = "swarm/";
-
 /// Lowercase letters and digits, with runs of anything else turned into one `-`.
 pub fn slug(name: &str) -> Result<String, Error> {
-    let mut slug = String::new();
-    let mut pending_dash = false;
-
-    for character in name.chars().flat_map(char::to_lowercase) {
-        if character.is_ascii_lowercase() || character.is_ascii_digit() {
-            if pending_dash && !slug.is_empty() {
-                slug.push('-');
-            }
-            pending_dash = false;
-            slug.push(character);
-        } else {
-            pending_dash = true;
-        }
-    }
-
-    slug.truncate(MAX_SLUG_CHARS);
-    let slug = slug.trim_end_matches('-').to_owned();
-
-    if slug.is_empty() {
-        return Err(Error::Invalid(format!(
-            "the task name {name:?} has no letters or digits"
-        )));
-    }
-
-    Ok(slug)
+    task_slug(name)
+        .ok_or_else(|| Error::Invalid(format!("the task name {name:?} has no letters or digits")))
 }
 
 /// The first of `slug`, `slug-2`, `slug-3`, … that `taken` does not refuse.
@@ -196,36 +171,6 @@ mod tests {
             range: range.to_owned(),
             per_worktree,
         }
-    }
-
-    #[test]
-    fn a_name_becomes_a_slug() {
-        assert_eq!(
-            slug("Fix the Login  bug!").as_deref().ok(),
-            Some("fix-the-login-bug")
-        );
-    }
-
-    #[test]
-    fn edge_characters_are_trimmed() {
-        assert_eq!(
-            slug("--Hello, World--").as_deref().ok(),
-            Some("hello-world")
-        );
-    }
-
-    #[test]
-    fn a_slug_is_cut_at_fifty_characters() {
-        let name = "a".repeat(80);
-
-        assert_eq!(slug(&name).map(|slug| slug.len()).ok(), Some(50));
-    }
-
-    #[test]
-    fn a_cut_slug_does_not_end_in_a_dash() {
-        let name = format!("{} b", "a".repeat(49));
-
-        assert_eq!(slug(&name).as_deref().ok(), Some("a".repeat(49).as_str()));
     }
 
     #[test]

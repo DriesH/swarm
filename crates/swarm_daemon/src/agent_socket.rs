@@ -341,6 +341,7 @@ mod tests {
                 pr_base: "main",
                 worktree: Path::new("/repo/.worktrees/task"),
                 ports: &[],
+                branch_source: swarm_protocol::BranchSource::Derived,
             })
             .expect("task");
         let store = Arc::new(Mutex::new(store));

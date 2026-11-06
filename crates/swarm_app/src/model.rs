@@ -2944,6 +2944,7 @@ mod tests {
             closed: false,
             pull_request: None,
             close_after_merge: false,
+            branch_source: swarm_protocol::BranchSource::Derived,
         }
     }
 

@@ -13,8 +13,9 @@ use swarm_core::github::{self, Github, NewPullRequest, Target};
 use swarm_core::prompts::{self, PromptFile};
 use swarm_core::store::{MAX_MESSAGE_BYTES, NewMessage};
 use swarm_protocol::{
-    AgentLifecycle, AgentRole, CheckState, Event, GH_SECS, GithubCheckState, MergeMethod,
-    MessageKind, PUSH_SECS, PrDraft, PrLink, PrPanel, PrState, PullRequest, TaskId, TaskInfo,
+    AgentLifecycle, AgentRole, BranchSource, CheckState, Event, GH_SECS, GithubCheckState,
+    MergeMethod, MessageKind, PUSH_SECS, PrDraft, PrLink, PrPanel, PrState, PullRequest, TaskId,
+    TaskInfo,
 };
 
 use crate::{Services, stats, tasks};
@@ -628,7 +629,10 @@ pub(crate) fn merge(services: &Services, id: TaskId, method: MergeMethod) -> Res
         return Ok(());
     }
 
-    if let Err(error) = git::delete_remote_branch(&task.worktree, &task.branch, DELETE_TIMEOUT) {
+    let continued = task.branch_source == BranchSource::Existing;
+    if !continued
+        && let Err(error) = git::delete_remote_branch(&task.worktree, &task.branch, DELETE_TIMEOUT)
+    {
         log::warn!("cannot delete the remote branch {}: {error}", task.branch);
     }
 
@@ -657,7 +661,8 @@ pub(crate) fn merge(services: &Services, id: TaskId, method: MergeMethod) -> Res
         return broadcast_task(services, id);
     }
 
-    tasks::close_with_branch(services, id, &check, Some(&task.branch))
+    let merged_branch = (!continued).then_some(task.branch.as_str());
+    tasks::close_with_branch(services, id, &check, merged_branch)
         .context("the pull request is merged, but the task did not close")?;
 
     Ok(())
@@ -766,6 +771,7 @@ mod tests {
             pr_base: "develop".to_owned(),
             pull_request: None,
             close_after_merge: false,
+            branch_source: BranchSource::Derived,
         };
 
         let text = draft_request(&task, "## What\n\n- the format");

@@ -1944,6 +1944,32 @@ pub fn uncommitted_files(worktree: &Path) -> Result<u32, Error> {
     Ok(u32::try_from(count).unwrap_or(u32::MAX))
 }
 
+/// Files with uncommitted changes that git tracks. Untracked files do not count: a branch
+/// switch leaves them where they are.
+pub fn tracked_changes(worktree: &Path) -> Result<u32, Error> {
+    let (arguments, output) = execute(
+        worktree,
+        [
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--no-renames",
+            "--untracked-files=no",
+        ],
+    )?;
+    if !output.success {
+        return Err(failure(&arguments, &output));
+    }
+
+    let count = output
+        .raw
+        .split(|byte| *byte == 0)
+        .filter(|entry| entry.len() > 3)
+        .count();
+
+    Ok(u32::try_from(count).unwrap_or(u32::MAX))
+}
+
 /// The paths behind [`uncommitted_files`], as git printed them.
 pub fn uncommitted_paths(worktree: &Path) -> Result<HashSet<Vec<u8>>, Error> {
     let (arguments, output) = execute(
@@ -2019,13 +2045,14 @@ pub fn local_branches(root: &Path) -> Result<Vec<String>, Error> {
             "for-each-ref",
             "--sort=-committerdate",
             "refs/heads",
-            "--format=%(refname:short)",
+            "--format=%(refname)",
         ],
     )?;
 
     Ok(listed
         .lines()
         .map(str::trim)
+        .filter_map(|reference| reference.strip_prefix("refs/heads/"))
         .filter(|branch| !branch.is_empty())
         .map(str::to_owned)
         .collect())
@@ -2259,6 +2286,117 @@ pub fn origin_has_branch(root: &Path, branch: &str) -> Result<bool, Error> {
         (false, Some(1)) => Ok(false),
         (false, _) => Err(failure(&arguments, &output)),
     }
+}
+
+/// Refuses a `name` that git does not accept as a branch name, or that git would read as
+/// an option or expand (`@{-1}`).
+pub fn check_branch_name(root: &Path, name: &str) -> Result<(), Error> {
+    let invalid = || Error::Invalid(format!("{name:?} is not a valid branch name"));
+
+    if name.starts_with('-') {
+        return Err(invalid());
+    }
+
+    let (_, output) = execute(root, ["check-ref-format", "--branch", name])?;
+
+    if output.success && output.stdout == name {
+        Ok(())
+    } else {
+        Err(invalid())
+    }
+}
+
+/// The branch checked out in `root`; `None` on a detached HEAD.
+pub fn current_branch(root: &Path) -> Result<Option<String>, Error> {
+    let branch = run(root, ["branch", "--show-current"])?;
+
+    Ok((!branch.is_empty()).then_some(branch))
+}
+
+/// The branches of `origin` that this repository knows, newest commit first.
+pub fn origin_branches(root: &Path) -> Result<Vec<String>, Error> {
+    let listed = run(
+        root,
+        [
+            "for-each-ref",
+            "--sort=-committerdate",
+            "refs/remotes/origin",
+            "--format=%(refname)",
+        ],
+    )?;
+
+    Ok(listed
+        .lines()
+        .map(str::trim)
+        .filter_map(|reference| reference.strip_prefix("refs/remotes/origin/"))
+        .filter(|branch| !branch.is_empty() && *branch != "HEAD")
+        .map(str::to_owned)
+        .collect())
+}
+
+/// Each branch that a worktree has checked out, with the path of that worktree. The
+/// project folder is one of the worktrees.
+pub fn worktree_branches(root: &Path) -> Result<HashMap<String, PathBuf>, Error> {
+    let listed = run(root, ["worktree", "list", "--porcelain"])?;
+
+    let mut branches = HashMap::new();
+    let mut path: Option<PathBuf> = None;
+    for line in listed.lines() {
+        if let Some(worktree) = line.strip_prefix("worktree ") {
+            path = Some(PathBuf::from(worktree));
+        } else if let Some(branch) = line.strip_prefix("branch refs/heads/")
+            && let Some(path) = &path
+        {
+            branches.insert(branch.to_owned(), path.clone());
+        }
+    }
+
+    Ok(branches)
+}
+
+/// Checks out the existing local `branch` in a new worktree at `path`.
+pub fn worktree_add_existing(root: &Path, branch: &str, path: &Path) -> Result<(), Error> {
+    let arguments = [
+        OsStr::new("worktree"),
+        OsStr::new("add"),
+        OsStr::new("--end-of-options"),
+        path.as_os_str(),
+        OsStr::new(branch),
+    ];
+    run(root, arguments)?;
+
+    Ok(())
+}
+
+/// Makes the local `branch` from `origin/<branch>`, tracking it, in a new worktree at `path`.
+pub fn worktree_add_tracking(root: &Path, branch: &str, path: &Path) -> Result<(), Error> {
+    let remote = format!("origin/{branch}");
+    let arguments = [
+        OsStr::new("worktree"),
+        OsStr::new("add"),
+        OsStr::new("--track"),
+        OsStr::new("-b"),
+        OsStr::new(branch),
+        OsStr::new("--end-of-options"),
+        path.as_os_str(),
+        OsStr::new(&remote),
+    ];
+    run(root, arguments)?;
+
+    Ok(())
+}
+
+/// Checks out the existing local `branch` in `root`.
+pub fn switch_branch(root: &Path, branch: &str) -> Result<(), Error> {
+    if branch.starts_with('-') {
+        return Err(Error::Invalid(format!(
+            "the branch {branch:?} must not start with \"-\""
+        )));
+    }
+
+    run(root, ["switch", "--end-of-options", branch])?;
+
+    Ok(())
 }
 
 /// Forgets worktrees whose folder is gone.

@@ -30,6 +30,7 @@ A file that is not valid TOML at all, for example with a missing quote, does not
 | **Check for updates automatically** | On | Checks GitHub Releases 3 seconds after launch and every 6 hours. Off leaves only **Check now** and **Swarm › Check for Updates…**. |
 | **Check now** | – | Checks for an update now. The button shows a spinner while Swarm checks or downloads. When an update is ready, it becomes **Update now**, or **Download** if Swarm cannot replace itself. |
 | **Updates** status | – | One line: **Up to date**, **Checking…**, **Downloading 1.2.0…**, **Update ready: 1.2.0**, **Update failed** with the reason, **Swarm 1.2.0 needs macOS 14.0**, **Updates need a signed build** or **Check failed** with the reason. |
+| **Branch prefix** | `swarm/` | Goes in front of the branch name of every new task, so the task `Fix login` gets the branch `swarm/fix-login`. Leave it empty for no prefix. Branches you name yourself in the New task sheet, and branches you continue, do not get it. |
 | **Open as draft** | On | New pull requests start with **Open as draft** on. |
 | **About** | – | Shows the app version and the credit for the file icons, with links to their repository and licence. |
 

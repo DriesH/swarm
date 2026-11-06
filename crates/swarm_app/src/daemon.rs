@@ -2204,6 +2204,15 @@ pub(crate) mod tests {
                     template: crate::model::SAMPLE_PLAN_TEMPLATE.to_owned(),
                 },
             }),
+            Request::TaskBranches { call, .. } => Some(Event::TaskBranches {
+                call: *call,
+                branches: swarm_protocol::TaskBranchList {
+                    branches: Vec::new(),
+                    project_folder: PathBuf::from("/tmp"),
+                    project_folder_changes: 0,
+                    base_branch: "main".to_owned(),
+                },
+            }),
             Request::List { call } => Some(Event::Terminals {
                 call: *call,
                 terminals: Vec::new(),
@@ -2558,6 +2567,7 @@ pub(crate) mod tests {
             closed: false,
             pull_request: None,
             close_after_merge: false,
+            branch_source: swarm_protocol::BranchSource::Derived,
         }
     }
 
@@ -3349,6 +3359,55 @@ pub(crate) mod tests {
             Some(swarm_protocol::AgentKind::ClaudeCode)
         );
         assert_eq!(task.first_message.as_deref(), Some("start with the tests"));
+    }
+
+    #[gpui::test]
+    fn the_new_task_sheet_sends_the_typed_branch_name(cx: &mut TestAppContext) {
+        let (sent, requests) = flume::unbounded();
+        let socket = fake_daemon_replying(move |request| match request {
+            Request::CreateTask { call, task } => {
+                sent.send(task).ok();
+
+                Some(Event::TaskCreated {
+                    call,
+                    task: task_info(8, 5, "login"),
+                })
+            }
+            Request::List { call } => Some(Event::Terminals {
+                call,
+                terminals: Vec::new(),
+            }),
+            _ => None,
+        });
+        let (workspace, cx) = setup(cx);
+        cx.executor().allow_parking();
+        let client = Client::connect(&socket).expect("connect to the fake daemon");
+        use_projects(&workspace, &[project_info(5, "demo", Vec::new())], cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.use_daemon(client.clone(), &[], window, cx);
+        });
+
+        cx.simulate_keystrokes("cmd-t");
+        let dialog = workspace.read_with(cx, |workspace, _| match &workspace.overlay {
+            Some(Overlay::NewTask { view, .. }) => Some(view.clone()),
+            _ => None,
+        });
+        let dialog = dialog.expect("the sheet is open");
+        dialog.update(cx, |dialog, cx| {
+            dialog.type_branch_name("dries/login", cx);
+            dialog.create(cx);
+        });
+        cx.executor().allow_parking();
+        cx.run_until_parked();
+
+        let task = requests.try_recv().expect("the daemon got CreateTask");
+        assert_eq!(
+            task.branch,
+            swarm_protocol::TaskBranch::New {
+                name: Some("dries/login".to_owned()),
+                from: None
+            }
+        );
     }
 
     #[gpui::test]
