@@ -40,6 +40,7 @@ mod status_bar;
 mod swarm_view;
 mod system_check;
 mod tab_bar;
+mod tile_order;
 mod update_card;
 mod updates;
 mod usage_pace;

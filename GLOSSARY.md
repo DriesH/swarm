@@ -128,6 +128,10 @@ _Avoid_: Pane, shell
 A terminal's place in the workspace layout: its position, size and frame. The layout engine arranges tiles; tiles that don't fit go to the tray.
 _Avoid_: Pane, window, panel
 
+**Grid cell**:
+The 8 px unit that every tile's place and size is made of. Tiles move and resize in whole cells only.
+_Avoid_: Snap unit, step, pixel grid
+
 **Process terminal**:
 A terminal running a command an agent started, such as a dev server or a test run.
 _Avoid_: Job, task terminal, background terminal

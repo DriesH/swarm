@@ -442,8 +442,8 @@ mod tests {
 
         let height = |cell: Option<(f32, f32)>| cell.map(|(_, height)| height).unwrap_or_default();
         assert!(height(larger_cell) > height(cell), "the cell did not grow");
-        assert!((larger_small - small).abs() < f32::EPSILON);
-        assert!((larger_process - process).abs() < f32::EPSILON);
+        assert_eq!(larger_small, small);
+        assert_eq!(larger_process, process);
     }
 
     #[gpui::test]

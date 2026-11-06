@@ -497,3 +497,13 @@ fn the_pixel_bee_and_the_honey_fill_have_no_role() {
         assert_eq!(a11y_info(HoneyFill::new("honey"), window, cx).role, None);
     });
 }
+
+#[test]
+fn the_dot_grid_has_no_role_and_no_label() {
+    with_window(|window, cx| {
+        let info = a11y_info(DotGrid::new(8.), window, cx);
+
+        assert_eq!(info.role, None);
+        assert_eq!(info.node.label(), None);
+    });
+}

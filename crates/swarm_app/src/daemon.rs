@@ -1846,10 +1846,10 @@ impl Workspace {
     }
 
     fn initial_grid(&self, window: &mut Window, cx: &Context<Self>) -> swarm_term::Size {
-        let planned = self.planned_user_size();
+        let planned = self.planned_user_size().to_size();
         let body = Size {
-            width: planned.width - px(CHROME_WIDTH),
-            height: planned.height - px(CHROME_HEIGHT),
+            width: px(planned.width) - px(CHROME_WIDTH),
+            height: px(planned.height) - px(CHROME_HEIGHT),
         };
         let font_size = crate::settings::terminal_font_size(cx);
         let measured = TerminalView::size_for(body, font_size, window, cx);
@@ -4018,7 +4018,8 @@ pub(crate) mod tests {
             (
                 spec,
                 layout.rect(spec.id).map(|rect| rect.size.height),
-                crate::views::layout_style(workspace).process_tile_height,
+                f32::from(crate::views::layout_style(workspace).process_tile_height)
+                    * swarm_layout::CELL,
             )
         });
         assert_eq!(spec.kind, swarm_layout::TileKind::Process);
@@ -4134,7 +4135,8 @@ pub(crate) mod tests {
 
             (
                 height.expect("the process tile is placed"),
-                crate::views::layout_style(workspace).process_tile_height,
+                f32::from(crate::views::layout_style(workspace).process_tile_height)
+                    * swarm_layout::CELL,
             )
         })
     }
@@ -6320,6 +6322,7 @@ pub(crate) mod tests {
             ProjectId(0),
             workspace.read_with(cx, |workspace, _| workspace.active_task),
             View::Terminals,
+            false,
         );
         assert!(opened);
         assert!(!lines.is_empty());
