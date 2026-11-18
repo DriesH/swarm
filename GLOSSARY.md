@@ -61,8 +61,12 @@ The first message a worker or a task's orchestrator starts with: what to do and 
 _Avoid_: Prompt, instructions, ticket
 
 **Plan**:
-What the user writes for the Start orchestrator: what the feature is, its requirements and its definition of done. A plan not sent yet is a **plan draft**.
+What the Start orchestrator gets: what the feature is, its requirements and its definition of done. The user writes it, or a grill agent writes it from the user's answers. A plan not sent yet is a **plan draft**.
 _Avoid_: Prompt, spec, request
+
+**Grill agent**:
+The agent that asks the user questions about an idea, one at a time, and writes the plan from the answers. It ends before the plan is sent.
+_Avoid_: Planner, interviewer
 
 **Worktree**:
 A separate checkout of the project. Each task has a task worktree; a worker gets its own worktree only when the orchestrator has a reason.
@@ -85,7 +89,7 @@ A message that was sent but not yet delivered to its recipient.
 _Avoid_: Pending, queued, unread
 
 **Review**:
-The step where a person reads the combined diff of a task and approves it or requests changes.
+The part of a task where a person reads its changes, by file or as a story, and approves them or requests changes.
 _Avoid_: Code review session, check
 
 **Live**:
@@ -101,8 +105,32 @@ The user's sign-off on the Merged changes of a task. It holds only while those c
 _Avoid_: Accept, sign off, LGTM
 
 **Comment**:
-A note the user leaves on one line in Review. It goes through the orchestrator to the worker that owns the file. It becomes outdated when its line is gone.
+A note the user leaves in Review, on one line, on a step or on a story. It goes through the orchestrator to the worker that owns the code. It becomes outdated when its line or step is gone.
 _Avoid_: Review note, annotation, feedback
+
+**Story**:
+A walk through the Merged changes of a task, written by an agent: flows of steps that together cover every changed line.
+_Avoid_: Walkthrough, tour, narrative
+
+**Flow**:
+One path through the code in a story, from one entry point such as a request, a job or a command.
+_Avoid_: Scenario, path
+
+**Step**:
+One part of a flow: a few lines of code in one lane, with what they do and the tests that cover them.
+_Avoid_: Stage, node, item
+
+**Lane**:
+One part of the system that the steps of a story run in, such as a web app, a queue worker or a storage service.
+_Avoid_: Column, track, swimlane
+
+**Finding**:
+A possible problem in a task's changes that the story writer reports and the user raises or dismisses.
+_Avoid_: Issue, warning, flag
+
+**Story writer**:
+The worker that writes a task's story after the other workers are done.
+_Avoid_: Narrator, explainer
 
 **Local checks**:
 The project's own commands (tests, linters) that must pass on a task's branch before Swarm opens its pull request.

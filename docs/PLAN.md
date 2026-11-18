@@ -68,6 +68,8 @@ Every agent terminal gets `SWARM_SOCKET`, `SWARM_AGENT_ID`, `SWARM_AGENT_NAME`, 
 4. For each task it calls `task.create`: Swarm makes the task worktree and branch, runs the setup script, opens a tab and starts that task's orchestrator with the Start orchestrator's brief as its first message. The brief keeps the user's own requirements and definition of done for that task.
 5. When every orchestrator confirms its brief, the Start orchestrator exits and the Start tab closes (unless it holds user terminals). Focus moves to the first task tab.
 
+**Grill me** (phase 11). Instead of writing the plan, the user can type an idea, as short as one line, and press **Grill me**. A grill agent starts in a terminal next to the plan editor, asks its questions one at a time and writes the plan draft with `plan.write`. The editor is read-only while it runs, and **Write plan** makes it write the plan and end. The user then edits the plan and sends it as above, so a fresh Start orchestrator gets only the plan, not the questions. Details: [`specs/plan-grilling-and-review-stories.md`](specs/plan-grilling-and-review-stories.md).
+
 **When the Start tab shows.**
 
 - A project with no active tasks opens on the Start tab.
@@ -203,7 +205,7 @@ Four kinds:
 ### Prompts
 
 Layers, later wins: built-in → `~/.config/swarm/prompts/` → `.swarm/prompts/`.
-Files: `orchestrator.md`, `worker.md`, `start.md`, `pr.md`.
+Files: `orchestrator.md`, `worker.md`, `start.md`, `pr.md`; phase 11 adds `grill.md` and `story.md`.
 The harness block is always added first and is not editable.
 
 ### Agent lifecycle
@@ -248,6 +250,15 @@ Live comments are anchored to the code text, not line numbers. If the agent rewr
 - Anchors: a comment keeps the line's text and its neighbors. Each time the comments are listed, the daemon finds the line again in the file as it is now, preferring a match with the same neighbors and the one nearest to where it was. When the text is gone, the comment is **Outdated** and shows at the top of its file card.
 - Agents do not reply to comments in v1; they answer through the orchestrator's normal messages.
 - Large diffs: at most 1,000 files, 5,000 lines per file and 50,000 lines in total are sent; the totals still count everything. The list is virtualized.
+
+**Stories** (phase 11, ADR 0013). On Merged, Review can show a task's changes as a story: flows by entry point, each a list of steps along lanes, with the code, the tests that cover it and a reviewed check per step. Details: [`specs/plan-grilling-and-review-stories.md`](specs/plan-grilling-and-review-stories.md).
+
+- When every worker is done, the orchestrator spawns a fresh story writer. It posts the story with `story.post`, and the daemon refuses a story that leaves a changed line out.
+- **Story | Files** in the Review header on Merged; Story first when one exists. Live has no story.
+- Line comments work as in Files. Step comments and raised findings go to the orchestrator the same way.
+- Step checks show progress only; Approve does not change.
+- When the Merged diff changes, changed steps and **Not in story** show, and the next "ready for review" rewrites only the changed steps.
+- Settings › General › **Write review stories** (on by default).
 
 ### Pull requests
 
