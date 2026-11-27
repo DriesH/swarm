@@ -8,6 +8,7 @@ Line numbers drift. Search by name.
 
 ### Read first
 
+- Design: the "Review stories (phase 11)" row on the [design canvas](https://claude.ai/artifact/6r2WfEmYoTDCWCTJckxVkt), board "Review story — a flow with one step open", dark and light.
 - `CLAUDE.md`, `GLOSSARY.md` (Plan, Start orchestrator, Review, Live, Merged, Comment, Approve), `docs/CONVENTIONS.md`.
 - ADRs 0002 (messages go through the orchestrator), 0004 (append prompts, never replace), 0005 (daemon owns SQLite state), 0013 (review stories are data that the daemon checks).
 - `docs/PLAN.md`: "How work starts", "Prompts", "Review".
@@ -214,6 +215,8 @@ Limits to start with: 1 MiB per story, 30 flows, 50 steps per flow, 8 lanes.
 
 ### 6.5 Story view
 
+Design: board "Review story — a flow with one step open" on the canvas.
+
 On **Merged**, the Review header gets a **Story | Files** switch. It opens on Story when a current story exists. Live has no switch and stays the file diff.
 
 - **Left column** (272 px, like the file tree): the story title, the commit, a progress bar (reviewed steps of all steps), then:
@@ -280,7 +283,7 @@ On **Merged**, the Review header gets a **Story | Files** switch. It opens on St
 
 ## 8. Open details
 
-- Designs on the canvas (direction A, light and dark): the split Start tab, the Story view and the lane colors.
+- Designs still to make (direction A, light and dark): the split Start tab; the Overview, Findings and out-of-date states of the Story view; lane colors 6–8 (the board has 1–5).
 - A timeout for the ready-for-review wait when the story writer hangs. Start with 20 minutes.
 - Very large diffs: the story writer may need more than one pass.
 - Later: a story summary in the PR description, and lanes set in `.swarm/config.toml`.
