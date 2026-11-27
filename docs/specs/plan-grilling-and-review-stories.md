@@ -11,7 +11,7 @@ Line numbers drift. Search by name.
 - Designs on the [design canvas](https://claude.ai/artifact/6r2WfEmYoTDCWCTJckxVkt), dark and light:
   - "Plan grilling (phase 11)" row: "Start — Grill me on the plan editor" and "Start — grilling: grill agent and read-only plan".
   - "Review stories (phase 11)" row: "Review story — a flow with one step open".
-  - "Story view proposals" row: "Findings B — on their steps (chosen)", "Out of date A — banner and marked steps (chosen)" and "Out of date banner". The other proposals there were not chosen.
+  - "Story view proposals" rows: "Findings B — on their steps (chosen)", "Out of date A — banner and marked steps (chosen)", "Out of date banner" and "Overview B — flow map and side panel (chosen)". The other proposals there were not chosen.
 - `CLAUDE.md`, `GLOSSARY.md` (Plan, Start orchestrator, Review, Live, Merged, Comment, Approve), `docs/CONVENTIONS.md`.
 - ADRs 0002 (messages go through the orchestrator), 0004 (append prompts, never replace), 0005 (daemon owns SQLite state), 0013 (review stories are data that the daemon checks).
 - `docs/PLAN.md`: "How work starts", "Prompts", "Review".
@@ -220,16 +220,20 @@ Limits to start with: 1 MiB per story, 30 flows, 50 steps per flow, 8 lanes.
 
 ### 6.5 Story view
 
-Design: board "Review story — a flow with one step open" on the canvas.
+Design: boards "Review story — a flow with one step open" and "Overview B — flow map and side panel (chosen)" on the canvas.
 
-On **Merged**, the Review header gets a **Story | Files** switch. It opens on Story when a current story exists. Live has no switch and stays the file diff.
+On **Merged**, the Review header gets a **Story | Files** switch. It opens on Story when a current story exists: on Overview the first time, then on the flow that was open last. Live has no switch and stays the file diff.
 
 - **Left column** (272 px, like the file tree): the story title, the commit, a progress bar (reviewed steps of all steps), then:
-  - **Overview**: the `overview` Markdown.
+  - **Overview**: the Overview page.
   - **Findings**, with "N to decide".
   - **Flows**: one row per flow, with its title and "reviewed / steps".
   - **Other changes**, and **Not in story** when the story is out of date.
 - **Main area** for the chosen flow: the title, the summary, the lane legend, then the steps.
+- **Overview page**, in two columns:
+  - The story title, its facts (commit, flows, steps, files) and the `overview` Markdown.
+  - The **flow map**: a table with one row per flow and one column per lane, then "reviewed / steps". A cell holds one dot per step of that flow in that lane: filled when reviewed, a ring when not. A dot is a 24 × 24 px target with a tooltip such as "Step 5 · Find the worker that owns the file · not reviewed", and opens the step. The map is one tab stop: ← → move between the dots of a flow, ↑ ↓ between flows, ↩ opens the step. `RovingFocus` has one axis, so the map needs a two-axis version. No legend: the tooltips and the Reviewed column say what the dots mean.
+  - A side panel (320 px): **To decide**, then **Other changes** with their reasons, then the story facts.
 - **Step row**: number, title, symbols in mono, a **1 finding** tag when it has findings, a **changed** or **unchanged** pill and the reviewed check, with the lane rail on its left. A step is unchanged when its ranges hold no changed line; it is there for context.
 - **Open step**: What happens (Markdown), its findings, Code, Tests, comments and **Mark as reviewed**.
 - **Code block**: a header with the symbol and `path:line`, then the diff rows that Review already uses, with syntax colors. Unchanged lines inside the range come from the file text. Changed lines get the changed bar. Code already reviewed in another step folds to one row, **Reviewed in <flow> #n**, with **Show**.
@@ -265,7 +269,7 @@ On **Merged**, the Review header gets a **Story | Files** switch. It opens on St
 Design: board "Findings B — on their steps (chosen)".
 
 - A finding shows on its step. The step row gets a **1 finding** tag (or **N findings**). The open step shows the finding above Code: its title, body and lines, with **Raise it** and **Not an issue**. The finding's lines get a warning tint in the code.
-- A finding without a step shows in **Overview**.
+- **To decide** on the Overview page lists every finding that is not decided yet. A row shows the title and where it is ("Step 2 · <flow>" or "Story"). The first 5 show, then **Show N more**. A row of a finding on a step opens that step. A row of a finding on the story opens in place, with **Raise it** and **Not an issue**; one row is open at a time.
 - **Findings** in the left column shows "N to decide", the findings that are not raised or dismissed yet. It opens the next one to decide.
 - **Raise it** creates a Pending step comment with the finding's text, on its step or, without a step, on the story. The user can edit it before sending.
 - **Not an issue** dismisses the finding. It folds to one row on its step, with **Raise it** and **Show**.
@@ -296,7 +300,7 @@ Design: boards "Out of date A — banner and marked steps (chosen)" and "Out of 
 
 ## 8. Open details
 
-- Designs still to make (direction A, light and dark): the Overview page, with findings that have no step; lane colors 6–8 (the boards have 1–5).
+- Designs still to make (direction A, light and dark): lane colors 6–8 (the boards have 1–5).
 - A timeout for the ready-for-review wait when the story writer hangs. Start with 20 minutes.
 - Very large diffs: the story writer may need more than one pass.
 - Later: a story summary in the PR description, and lanes set in `.swarm/config.toml`.
