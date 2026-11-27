@@ -182,7 +182,7 @@ outside the file: crates/swarm_app/src/review_model.rs line 9000 (step keep-anch
 The check:
 
 - The JSON matches the schema, ids are unique and every lane exists.
-- Every step has at least one `code` ref. A story shows only code in the repository; the flow's summary names any outside system.
+- Every step has at least one `code` ref. A story shows only code in the repository.
 - Every path and line range exists in the file at HEAD, also those of tests.
 - **Coverage**: every changed line is covered.
   - An added line is covered when a `code` range holds its new line number.
@@ -203,6 +203,7 @@ Limits to start with: 1 MiB per story, 30 flows, 50 steps per flow, 8 lanes.
 
 - Make one flow per entry point. Follow the calls and make one step per change that a reader takes in at once.
 - Write titles and `what` in plain words: what happens and why it matters, not the code again.
+- When a step's code calls another system, such as GitHub or an agent, say so in its `what`: what goes out and what comes back.
 - Name the tests that cover each step.
 - Put every change in a step or in `other`, and run `swarm story post` until it passes.
 - Report findings (bugs, missing tests, risky choices) and fix none of them.
