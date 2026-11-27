@@ -15,6 +15,7 @@ Each phase ends with a pull request into `main`. A phase is done when every box 
 | 8 | Polish and first release | In progress |
 | 9 | After first release | Not started |
 | 10 | Home and scratches | Not started |
+| 11 | Plan grilling and review stories | Not started |
 
 ## 0. Plan, design, spikes
 
@@ -185,6 +186,23 @@ Six parts (1–3 done): 1. Settings pages (Projects, Terminals, Prompts, Usage, 
 - [ ] Make project lists each terminal's folder (OSC 7 for shells, the process folder for agents and processes), leaves out `~` and `/`, and blocks a folder that is already a project
 - [ ] Make project creates a repository and a first commit when there is none, commits changed files when asked, adds the project and opens its Start tab
 - [ ] Every new control has a role and label, works from the keyboard and meets WCAG AA
+
+## 11. Plan grilling and review stories
+
+**Goal:** a plan that an agent helps write, and a review that reads like a story.
+
+**Scope:** **Grill me** on the Start tab, the grill agent and `grill.md`, `plan.write`; stories on Merged: the story schema, `story.post` and its coverage check, the story writer and `story.md`, the Story view (flows, lane rail, steps, code, step checks), step comments, findings, and refreshing a story after Merged changes. Details in [`specs/plan-grilling-and-review-stories.md`](specs/plan-grilling-and-review-stories.md) and ADR 0013.
+
+Five parts, in this order: 1. Plan grilling. 2. Story data and check. 3. Story view. 4. Comments and findings. 5. Out of date and refresh.
+
+**Done when:**
+
+- [ ] **Grill me** starts a grill agent next to the plan editor; it writes the plan draft and ends, and **Send plan** gives a fresh Start orchestrator only the plan
+- [ ] When every worker is done, a story writer posts a story, and `story.post` refuses a story that leaves a changed line out
+- [ ] Merged shows **Story | Files**; steps show their code from the real diff, their tests and a reviewed check, and `j` `k` `o` `v` `[` `]` work
+- [ ] Line comments, step comments and raised findings reach the orchestrator
+- [ ] After a change to the Merged diff, out-of-date steps and **Not in story** show, and the next "ready for review" or **Refresh story** rewrites only those parts
+- [ ] Every new control has a role and label, works from the keyboard and meets WCAG AA, and a lane's color is never its only sign
 
 ## Designs still to make
 
