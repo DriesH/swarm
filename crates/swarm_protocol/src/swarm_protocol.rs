@@ -19,11 +19,13 @@ mod client;
 pub mod creatures;
 mod daemon_stop;
 
-pub use client::{Client, ClientError, CommentEvent, MessageEvent, PrEvent, ProjectConfigRead};
+pub use client::{
+    Client, ClientError, CommentEvent, MessageEvent, PlanDraftEvent, PrEvent, ProjectConfigRead,
+};
 pub use daemon_stop::{Host, Signal, StopError, System, stop_daemon};
 
 /// Bumped on every incompatible change; the daemon refuses other versions.
-pub const VERSION: u32 = 30;
+pub const VERSION: u32 = 31;
 
 /// The most messages [`Request::ListMessages`] returns.
 pub const MESSAGES_LISTED: usize = 500;
@@ -124,6 +126,8 @@ pub struct ProjectInfo {
     pub tasks: Vec<TaskInfo>,
     /// The project's Start orchestrator while it has not stopped.
     pub start: Option<AgentInfo>,
+    /// The project's grill agent while it has not stopped.
+    pub grill: Option<AgentInfo>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -142,6 +146,8 @@ pub enum AgentRole {
     Worker,
     /// Splits a request into tasks in the project root, then exits. Has no task.
     StartOrchestrator,
+    /// Helps the user write the plan of a project. It has no task.
+    Grill,
 }
 
 /// What an agent is doing, merged from OSC 7501, hooks and the process exit.
@@ -349,6 +355,8 @@ pub enum MessageKind {
     /// From Swarm: asks the task orchestrator for a pull request title and description,
     /// which it sends back with `swarm pr draft`.
     PrDraft,
+    /// From Swarm: asks the grill agent to write the plan now and end.
+    WritePlan,
     /// From Swarm: new work made the user's approval outdated, so the approval and the
     /// pull request draft are gone. The next approval asks for a new draft.
     ApprovalReset,
@@ -367,6 +375,7 @@ impl MessageKind {
             Self::WorkerStopped => "worker stopped",
             Self::Comment => "comment",
             Self::PrDraft => "pr draft",
+            Self::WritePlan => "write plan",
             Self::ApprovalReset => "approval reset",
         }
     }
@@ -1081,6 +1090,26 @@ pub enum Request {
         /// the plan was typed in. Refused while a Start orchestrator already runs.
         plan: Option<String>,
     },
+    /// Starts the project's grill agent with the idea as its first message. Refused
+    /// while the Start orchestrator or a grill agent runs. Answered with
+    /// [`Event::AgentStarted`].
+    StartGrill {
+        call: CallId,
+        project: ProjectId,
+        /// `None` uses the default from the settings.
+        kind: Option<AgentKind>,
+        idea: String,
+    },
+    /// Asks the grill agent to write the plan and end. Answered with [`Event::Done`].
+    FinishGrill {
+        call: CallId,
+        project: ProjectId,
+    },
+    /// Stops the grill agent. The plan draft stays. Answered with [`Event::Done`].
+    StopGrill {
+        call: CallId,
+        project: ProjectId,
+    },
     /// Starts a `Resumable` agent again in its worktree with its saved session, without
     /// a new first message. Refused for any other agent and past the agent limits.
     /// Answered with [`Event::AgentStarted`].
@@ -1590,6 +1619,11 @@ pub enum Event {
     PrDraftChanged {
         task: TaskId,
         draft: PrDraft,
+    },
+    /// The grill agent wrote the project's plan draft.
+    PlanDraftChanged {
+        project: ProjectId,
+        text: String,
     },
     /// Sent to every client when a close of the task starts a step. The first step is
     /// sent before anything stops, also for a close after a merge.

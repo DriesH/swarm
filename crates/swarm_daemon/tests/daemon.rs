@@ -3876,6 +3876,373 @@ fn a_plan_draft_survives_a_daemon_restart() {
     assert_eq!(draft.text.as_deref(), Some("a plan"));
 }
 
+impl Client {
+    fn try_start_grill(&mut self, project: ProjectId, idea: &str) -> Result<AgentInfo, String> {
+        self.send(&Request::StartGrill {
+            call: CALL,
+            project,
+            kind: None,
+            idea: idea.to_owned(),
+        });
+
+        self.wait_for(|event| match event {
+            Event::AgentStarted { call: CALL, agent } => Some(Ok(agent.clone())),
+            Event::Error {
+                call: Some(CALL),
+                message,
+                ..
+            } => Some(Err(message.clone())),
+            _ => None,
+        })
+    }
+
+    fn try_start_orchestrator(&mut self, project: ProjectId) -> Result<AgentInfo, String> {
+        self.send(&Request::StartOrchestrator {
+            call: CALL,
+            project,
+            kind: None,
+            plan: None,
+        });
+
+        self.wait_for(|event| match event {
+            Event::AgentStarted { call: CALL, agent } => Some(Ok(agent.clone())),
+            Event::Error {
+                call: Some(CALL),
+                message,
+                ..
+            } => Some(Err(message.clone())),
+            _ => None,
+        })
+    }
+
+    fn finish_grill(&mut self, project: ProjectId) -> Result<(), String> {
+        self.until_done(&Request::FinishGrill {
+            call: CALL,
+            project,
+        })
+        .map(|_| ())
+    }
+
+    fn stop_grill(&mut self, project: ProjectId) -> Result<(), String> {
+        self.until_done(&Request::StopGrill {
+            call: CALL,
+            project,
+        })
+        .map(|_| ())
+    }
+
+    /// Reads events until the grill agent wrote a plan draft.
+    fn wait_for_plan_draft(&mut self, project: ProjectId) -> String {
+        self.wait_for(|event| match event {
+            Event::PlanDraftChanged {
+                project: changed,
+                text,
+            } if *changed == project => Some(text.clone()),
+            _ => None,
+        })
+    }
+}
+
+/// A grill agent that reads its idea, then runs `swarm plan write` for every
+/// `req-*.md` file the test drops in the output folder. Other roles only rest.
+fn grill_fixture() -> Fixture {
+    fixture_with_helpers(
+        r#"case "$SWARM_ROLE" in
+grill)
+  idle
+  IFS= read -r line
+  printf '%s\n' "$line" > "$OUT/idea"
+  while :; do
+    for file in "$OUT"/req-*.md; do
+      [ -e "$file" ] || continue
+      swarm plan write "$file" > "$file.out" 2>&1
+      mv "$file" "$file.done"
+    done
+    sleep 0.05
+  done
+  ;;
+start_orchestrator)
+  idle
+  sleep 30
+  ;;
+esac"#,
+    )
+}
+
+#[test]
+fn a_grill_agent_starts_without_a_task_gets_the_idea_and_keeps_it_as_the_plan_draft() {
+    let fixture = grill_fixture();
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    assert_eq!(project.grill, None);
+
+    let grill = client
+        .try_start_grill(project.id, "a login page")
+        .expect("started");
+
+    assert_eq!(grill.role, AgentRole::Grill);
+    assert_eq!(grill.task, None);
+    assert_eq!(grill.name, "grill");
+    assert_eq!(grill.worktree, repo.root);
+    assert_eq!(grill.branch, project.base_branch);
+    assert_eq!(fixture.read_when_written("idea"), "a login page\n");
+    let draft = client.plan_draft(project.id).expect("draft").text;
+    assert_eq!(draft.as_deref(), Some("a login page"));
+    let listed = client.projects().remove(0);
+    assert_eq!(listed.grill.map(|agent| agent.id), Some(grill.id));
+    assert_eq!(listed.start, None);
+}
+
+#[test]
+fn a_grill_agent_and_the_start_orchestrator_never_run_together() {
+    let fixture = grill_fixture();
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let other = Repo::new("");
+    let other_project = client.add_project(&other.root);
+
+    client.start_orchestrator(project.id);
+    let with_start = client.try_start_grill(project.id, "idea");
+    client
+        .try_start_grill(other_project.id, "idea")
+        .expect("started");
+    let second = client.try_start_grill(other_project.id, "again");
+    let with_grill = client.try_start_orchestrator(other_project.id);
+
+    assert_eq!(
+        with_start,
+        Err("the Start orchestrator already runs".to_owned())
+    );
+    assert_eq!(second, Err("a grill agent already runs".to_owned()));
+    assert_eq!(
+        with_grill,
+        Err("a grill agent runs: wait for it to end or stop it".to_owned())
+    );
+}
+
+#[test]
+fn a_blank_idea_is_refused() {
+    let fixture = grill_fixture();
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+
+    let refused = client.try_start_grill(project.id, "  \n");
+
+    assert_eq!(refused, Err("an idea needs text".to_owned()));
+    assert_eq!(client.projects()[0].grill, None);
+}
+
+#[test]
+fn an_oversized_idea_is_refused_and_the_draft_is_unchanged() {
+    let fixture = grill_fixture();
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    client
+        .save_plan_draft(project.id, Some("kept"))
+        .expect("saved");
+
+    let refused = client.try_start_grill(project.id, &"a".repeat(70_000));
+
+    assert!(refused.is_err(), "{refused:?}");
+    assert_eq!(client.projects()[0].grill, None);
+    let draft = client.plan_draft(project.id).expect("draft").text;
+    assert_eq!(draft.as_deref(), Some("kept"));
+}
+
+#[test]
+fn plan_write_from_the_grill_agent_replaces_the_draft_and_tells_the_clients() {
+    let fixture = grill_fixture();
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    client.try_start_grill(project.id, "idea").expect("started");
+
+    std::fs::write(fixture.out.join("req-1.md"), "## What\n\nlogin\n").expect("request");
+    let text = client.wait_for_plan_draft(project.id);
+
+    assert_eq!(text, "## What\n\nlogin\n");
+    let draft = client.plan_draft(project.id).expect("draft").text;
+    assert_eq!(draft.as_deref(), Some("## What\n\nlogin\n"));
+}
+
+#[test]
+fn plan_write_refuses_blank_and_oversized_text_and_keeps_the_draft() {
+    let fixture = grill_fixture();
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    client.try_start_grill(project.id, "idea").expect("started");
+
+    std::fs::write(fixture.out.join("req-1.md"), "  \n").expect("blank");
+    let blank = fixture.read_when_written("req-1.md.out");
+    std::fs::write(fixture.out.join("req-2.md"), "a".repeat(70_000)).expect("big");
+    let big = fixture.read_when_written("req-2.md.out");
+
+    assert_eq!(blank.trim(), "swarm: the plan needs text");
+    assert_eq!(big.trim(), "swarm: the plan is 69 KiB; the limit is 64 KiB");
+    let draft = client.plan_draft(project.id).expect("draft").text;
+    assert_eq!(draft.as_deref(), Some("idea"));
+}
+
+#[test]
+fn only_the_grill_agent_may_write_the_plan() {
+    let fixture = fixture_with_helpers(
+        r#"case "$SWARM_ROLE" in
+start_orchestrator)
+  idle
+  printf 'x' | swarm plan write - > "$OUT/start.out" 2>&1
+  sleep 30
+  ;;
+orchestrator)
+  idle
+  IFS= read -r line
+  printf 'x' | swarm plan write - > "$OUT/orchestrator.out" 2>&1
+  swarm spawn api --brief "build the api" > "$OUT/spawn.out" 2>&1
+  sleep 30
+  ;;
+worker)
+  idle
+  IFS= read -r line
+  printf 'x' | swarm plan write - > "$OUT/worker.out" 2>&1
+  sleep 30
+  ;;
+esac"#,
+    );
+    let repo = repo_for_merges();
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let (mut client, task) = start_task(&daemon, &repo);
+    client.start_orchestrator(task.project);
+
+    for name in ["start", "orchestrator", "worker"] {
+        assert_eq!(
+            fixture.read_when_written(&format!("{name}.out")).trim(),
+            "swarm: only the grill agent can write the plan",
+            "{name}"
+        );
+    }
+    let draft = client.plan_draft(task.project).expect("draft").text;
+    assert_eq!(draft, None);
+}
+
+#[test]
+fn finishing_the_grill_agent_posts_a_write_plan_message() {
+    let fixture = fixture_with_helpers(
+        r#"case "$SWARM_ROLE" in
+grill)
+  idle
+  IFS= read -r line
+  working
+  idle
+  while IFS= read -r asked; do
+    printf '%s\n' "$asked" >> "$OUT/asked"
+  done
+  ;;
+esac"#,
+    );
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let grill = client.try_start_grill(project.id, "idea").expect("started");
+
+    client.finish_grill(project.id).expect("finished");
+
+    let messages = client.list_messages(project.id, None);
+    let asked: Vec<_> = messages
+        .iter()
+        .filter(|message| message.kind == MessageKind::WritePlan)
+        .collect();
+    assert_eq!(asked.len(), 1);
+    assert_eq!(
+        (asked[0].to, asked[0].from, asked[0].task),
+        (grill.id, None, None)
+    );
+    let pasted = fixture.read_when("asked", |text| text.contains("swarm plan write -"));
+    assert!(pasted.contains("Write the plan now"), "{pasted}");
+}
+
+#[test]
+fn stopping_the_grill_agent_ends_it_stopped_and_keeps_the_draft() {
+    let fixture = grill_fixture();
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let grill = client.try_start_grill(project.id, "idea").expect("started");
+
+    let events = client
+        .until_done(&Request::StopGrill {
+            call: CALL,
+            project: project.id,
+        })
+        .expect("stopped");
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::AgentChanged { agent }
+            if agent.id == grill.id && agent.lifecycle == AgentLifecycle::Stopped
+    )));
+    assert_eq!(client.projects()[0].grill, None);
+    let draft = client.plan_draft(project.id).expect("draft").text;
+    assert_eq!(draft.as_deref(), Some("idea"));
+}
+
+#[test]
+fn finishing_or_stopping_without_a_grill_agent_is_refused() {
+    let repo = Repo::new("");
+    let daemon = Daemon::start();
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+
+    assert_eq!(
+        client.finish_grill(project.id),
+        Err("no grill agent runs".to_owned())
+    );
+    assert_eq!(
+        client.stop_grill(project.id),
+        Err("no grill agent runs".to_owned())
+    );
+}
+
+#[test]
+fn removing_the_project_stops_the_grill_agent() {
+    let fixture = grill_fixture();
+    let repo = Repo::new("");
+    let daemon = Daemon::start_with_settings(&fixture.settings());
+    let mut client = daemon.connect();
+    client.hello();
+    let project = client.add_project(&repo.root);
+    let grill = client.try_start_grill(project.id, "idea").expect("started");
+
+    let events = client.remove_project(project.id).expect("removed");
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::AgentChanged { agent }
+            if agent.id == grill.id && agent.lifecycle == AgentLifecycle::Stopped
+    )));
+    assert!(client.projects().is_empty());
+}
+
 #[test]
 fn only_the_start_orchestrator_may_use_the_task_calls() {
     let fixture = fixture_with_helpers(
@@ -11344,7 +11711,10 @@ fn outside_any_project_every_prompt_is_built_in_and_its_user_path_is_in_the_conf
     let prompts = client.prompts(None).expect("prompts");
 
     let names: Vec<_> = prompts.iter().map(|prompt| prompt.name.as_str()).collect();
-    assert_eq!(names, ["orchestrator", "worker", "start", "plan", "pr"]);
+    assert_eq!(
+        names,
+        ["orchestrator", "worker", "start", "plan", "pr", "grill"]
+    );
     for prompt in &prompts {
         assert_eq!(prompt.layer, PromptLayer::BuiltIn, "{}", prompt.name);
         assert_eq!(prompt.user_path, config.prompt(&prompt.name));

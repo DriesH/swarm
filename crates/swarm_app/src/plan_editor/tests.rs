@@ -5,12 +5,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gpui::{Modifiers, TestAppContext, VisualTestContext};
-use swarm_protocol::{AgentKind as DaemonKind, Event, PlanDraft, Request, TerminalId};
+use swarm_protocol::{
+    AgentKind as DaemonKind, Event, PlanDraft, PlanDraftEvent, Request, TerminalId,
+};
 
 use super::*;
 use crate::daemon::tests::{
-    answer_late, drawn_quad, fake_daemon_replying, project_info, redraw, setup, start_agent,
-    temp_settings_path, use_projects, wait_until,
+    answer_late, drawn_quad, fake_daemon_replying, grill_agent, project_info, redraw, setup,
+    start_agent, temp_settings_path, use_projects, wait_until,
 };
 
 type Requests = Arc<Mutex<Vec<Request>>>;
@@ -76,6 +78,16 @@ fn open_with<'a>(
                     ..start_agent(100, project.0, swarm_protocol::AgentStatus::Idle)
                 },
             }),
+            Request::StartGrill { call, project, .. } => Some(Event::AgentStarted {
+                call: *call,
+                agent: AgentInfo {
+                    terminal: Some(TerminalId(901)),
+                    ..grill_agent(101, project.0)
+                },
+            }),
+            Request::FinishGrill { call, .. } | Request::StopGrill { call, .. } => {
+                Some(Event::Done { call: *call })
+            }
             _ => None,
         })
     });
@@ -288,6 +300,52 @@ fn starts(rig: &Rig) -> Vec<(Option<DaemonKind>, Option<String>)> {
             _ => None,
         })
         .collect()
+}
+
+/// The kind and the idea of every `StartGrill` the daemon got.
+fn grills(rig: &Rig) -> Vec<(Option<DaemonKind>, String)> {
+    rig.requests
+        .lock()
+        .expect("lock the requests")
+        .iter()
+        .filter_map(|request| match request {
+            Request::StartGrill { kind, idea, .. } => Some((*kind, idea.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn finishes(rig: &Rig) -> usize {
+    rig.requests
+        .lock()
+        .expect("lock the requests")
+        .iter()
+        .filter(|request| matches!(request, Request::FinishGrill { .. }))
+        .count()
+}
+
+fn is_grilling(rig: &Rig, cx: &VisualTestContext) -> bool {
+    rig.editor.read_with(cx, |editor, _| editor.is_grilling())
+}
+
+fn read_only(rig: &Rig, cx: &VisualTestContext) -> bool {
+    rig.editor
+        .read_with(cx, |editor, cx| editor.text.read(cx).is_read_only())
+}
+
+/// Grills as Grill me does, then waits until the grill agent runs.
+fn grill_and_wait(rig: &Rig, cx: &mut VisualTestContext) {
+    rig.editor.update(cx, PlanEditor::grill);
+
+    assert!(
+        wait_until(cx, |cx| {
+            redraw(cx);
+
+            is_grilling(rig, cx)
+        }),
+        "the grill agent did not start"
+    );
+    redraw(cx);
 }
 
 fn focused(rig: &Rig, cx: &mut VisualTestContext) -> bool {
@@ -952,37 +1010,33 @@ fn the_editor_takes_the_focus_when_the_start_tab_opens(cx: &mut TestAppContext) 
 }
 
 #[gpui::test]
-fn tab_goes_from_the_editor_to_the_orchestrator_and_then_to_send_plan(cx: &mut TestAppContext) {
+fn tab_goes_from_the_editor_to_the_orchestrator_then_grill_me_and_send_plan(
+    cx: &mut TestAppContext,
+) {
     let (rig, cx) = rig(None, no_reply, cx);
     edit(&rig, "A plan", cx);
     redraw(cx);
     let send = rig
         .editor
         .read_with(cx, |editor, _| editor.send_focus.clone());
-    let start = (
-        focused(&rig, cx),
-        cx.update(|window, _| send.is_focused(window)),
-    );
+    let mut stops = Vec::new();
 
-    cx.simulate_keystrokes("tab");
-    redraw(cx);
-    let middle = (
-        focused(&rig, cx),
-        cx.update(|window, _| send.is_focused(window)),
-    );
-    cx.simulate_keystrokes("tab");
-    redraw(cx);
-    let end = (
-        focused(&rig, cx),
-        cx.update(|window, _| send.is_focused(window)),
-    );
+    for step in 0..4 {
+        stops.push((
+            focused(&rig, cx),
+            cx.update(|window, _| send.is_focused(window)),
+        ));
 
-    assert_eq!(start, (true, false));
-    assert_eq!(middle, (false, false), "the orchestrator is not next");
+        if step < 3 {
+            cx.simulate_keystrokes("tab");
+            redraw(cx);
+        }
+    }
+
     assert_eq!(
-        end,
-        (false, true),
-        "Send plan is not after the orchestrator"
+        stops,
+        [(true, false), (false, false), (false, false), (false, true)],
+        "the order is not text, Orchestrator, Grill me, Send plan"
     );
 }
 
@@ -1168,4 +1222,187 @@ fn the_text_box_has_a_line_border_that_turns_accent_while_the_text_has_focus(
         without_focus.is_some_and(|quad| quad.border_widths.top.0 > 0.),
         "the box has no border"
     );
+}
+
+#[gpui::test]
+fn grill_me_starts_the_grill_agent_with_the_kind_and_the_text(cx: &mut TestAppContext) {
+    let (rig, cx) = rig(None, no_reply, cx);
+    rig.editor
+        .update(cx, |editor, _| editor.choose_orchestrator(AgentKind::Codex));
+    edit(&rig, "Build the login page", cx);
+
+    click("plan-grill", cx);
+    flush(&rig, cx);
+
+    assert_eq!(
+        grills(&rig),
+        [(Some(DaemonKind::Codex), "Build the login page".to_owned())]
+    );
+}
+
+#[gpui::test]
+fn grill_me_is_off_for_empty_text_and_for_the_bare_template(cx: &mut TestAppContext) {
+    let (rig, cx) = rig(None, no_reply, cx);
+
+    click("plan-grill", cx);
+    edit(&rig, "", cx);
+    click("plan-grill", cx);
+    flush(&rig, cx);
+
+    assert!(grills(&rig).is_empty(), "an empty idea was sent");
+}
+
+#[gpui::test]
+fn a_refused_grill_shows_the_error_and_the_text_stays_editable(cx: &mut TestAppContext) {
+    let (rig, cx) = rig(
+        None,
+        |request| match request {
+            Request::StartGrill { call, .. } => Some(Event::Error {
+                call: Some(*call),
+                id: None,
+                message: "a grill agent already runs".into(),
+            }),
+            _ => None,
+        },
+        cx,
+    );
+    edit(&rig, "Build the login page", cx);
+
+    click("plan-grill", cx);
+    let failed = wait_until(cx, |cx| {
+        redraw(cx);
+
+        rig.editor
+            .read_with(cx, |editor, _| editor.error_text().is_some())
+    });
+    let text = rig.editor.read_with(cx, PlanEditor::text_focus);
+    cx.update(|window, cx| window.focus(&text, cx));
+    cx.simulate_input("!");
+
+    assert!(failed, "the refusal did not show");
+    assert!(!is_grilling(&rig, cx));
+    assert!(!read_only(&rig, cx));
+    assert_eq!(text_of(&rig, cx), "Build the login page!");
+}
+
+#[gpui::test]
+fn while_the_grill_runs_the_text_is_read_only_and_nothing_sends_or_saves(cx: &mut TestAppContext) {
+    let (rig, cx) = rig(None, no_reply, cx);
+    edit(&rig, "Build the login page", cx);
+    grill_and_wait(&rig, cx);
+
+    let read_only = read_only(&rig, cx);
+    let sendable = can_send(&rig, cx);
+    cx.simulate_keystrokes("cmd-enter");
+    edit(&rig, "Changed while grilling", cx);
+    advance(SAVE_DELAY * 2, cx);
+    flush(&rig, cx);
+
+    assert!(read_only);
+    assert!(!sendable);
+    assert!(starts(&rig).is_empty(), "the plan was sent");
+    assert!(saves(&rig).is_empty(), "an edit was saved");
+    assert!(cx.debug_bounds("plan-write").is_some());
+    assert!(cx.debug_bounds("plan-grill").is_none());
+}
+
+#[gpui::test]
+fn tab_goes_from_the_read_only_text_to_write_plan(cx: &mut TestAppContext) {
+    let (rig, cx) = rig(None, no_reply, cx);
+    edit(&rig, "Build the login page", cx);
+    grill_and_wait(&rig, cx);
+    let write = rig
+        .editor
+        .read_with(cx, |editor, _| editor.write_focus.clone());
+    let text = rig.editor.read_with(cx, PlanEditor::text_focus);
+    cx.update(|window, cx| window.focus(&text, cx));
+    redraw(cx);
+
+    let before = focused(&rig, cx);
+    cx.simulate_keystrokes("tab");
+    redraw(cx);
+
+    let after = focused(&rig, cx);
+    assert!(before, "the text did not have the focus");
+    assert!(!after, "the focus stayed in the text");
+    assert!(cx.update(|window, _| write.is_focused(window)));
+}
+
+#[gpui::test]
+fn a_plan_from_the_grill_agent_replaces_the_text_and_saves_nothing(cx: &mut TestAppContext) {
+    let (rig, cx) = rig(None, no_reply, cx);
+    edit(&rig, "Build the login page", cx);
+    grill_and_wait(&rig, cx);
+    let saved = saves(&rig).len();
+
+    rig.workspace.update(cx, |workspace, cx| {
+        workspace.plan_draft_changed(
+            PlanDraftEvent {
+                project: DaemonProjectId(5),
+                text: "## What\n\nA grilled plan".to_owned(),
+            },
+            cx,
+        );
+    });
+    advance(SAVE_DELAY * 2, cx);
+    flush(&rig, cx);
+
+    assert_eq!(text_of(&rig, cx), "## What\n\nA grilled plan");
+    assert_eq!(saves(&rig).len(), saved, "the written plan was saved");
+}
+
+#[gpui::test]
+fn write_plan_asks_the_grill_agent_to_finish_once_and_shows_a_spinner(cx: &mut TestAppContext) {
+    let (rig, cx) = rig(None, no_reply, cx);
+    edit(&rig, "Build the login page", cx);
+    grill_and_wait(&rig, cx);
+
+    click("plan-write", cx);
+    click("plan-write", cx);
+    flush(&rig, cx);
+
+    assert_eq!(finishes(&rig), 1);
+    assert!(rig.editor.read_with(cx, |editor, _| editor.is_writing()));
+}
+
+#[gpui::test]
+fn when_the_grill_ends_the_editor_is_editable_focused_and_the_tab_stays(cx: &mut TestAppContext) {
+    let (rig, cx) = rig(None, no_reply, cx);
+    edit(&rig, "Build the login page", cx);
+    grill_and_wait(&rig, cx);
+    let before = rig
+        .workspace
+        .read_with(cx, |workspace, _| workspace.active_task);
+
+    rig.workspace.update_in(cx, |workspace, window, cx| {
+        let ended = AgentInfo {
+            terminal: Some(TerminalId(901)),
+            lifecycle: swarm_protocol::AgentLifecycle::Stopped,
+            revision: u64::MAX,
+            ..grill_agent(101, 5)
+        };
+
+        workspace.agent_changed(&ended, Some(window), cx);
+    });
+    redraw(cx);
+    redraw(cx);
+
+    let after = rig
+        .workspace
+        .read_with(cx, |workspace, _| workspace.active_task);
+    let shown = rig
+        .workspace
+        .read_with(cx, |workspace, _| workspace.shown_plan_editor());
+    let regions = rig.workspace.read_with(cx, |workspace, _| {
+        crate::views::start_regions(workspace, &crate::views::tile_specs(workspace))
+    });
+    assert_eq!(before, after, "the Start tab closed");
+    assert_eq!(shown.as_ref(), Some(&rig.editor));
+    assert!(!is_grilling(&rig, cx));
+    assert!(!read_only(&rig, cx));
+    assert!(
+        regions.editor.is_none(),
+        "the editor does not fill the column"
+    );
+    assert!(focused(&rig, cx), "the editor text has no focus");
 }

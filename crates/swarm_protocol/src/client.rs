@@ -45,6 +45,13 @@ pub enum PrEvent {
     CloseFailed { task: TaskId, reason: CloseFailure },
 }
 
+/// The grill agent wrote the project's plan draft.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanDraftEvent {
+    pub project: ProjectId,
+    pub text: String,
+}
+
 /// A review comment was added, changed or deleted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommentEvent {
@@ -145,6 +152,7 @@ struct Shared {
     messages: flume::Sender<MessageEvent>,
     comments: flume::Sender<CommentEvent>,
     pull_requests: flume::Sender<PrEvent>,
+    plan_drafts: flume::Sender<PlanDraftEvent>,
     usage: flume::Sender<Usage>,
     notices: flume::Sender<Notice>,
     tiles: flume::Sender<(AgentId, bool)>,
@@ -197,6 +205,7 @@ struct Inner {
     message_events: flume::Receiver<MessageEvent>,
     comment_events: flume::Receiver<CommentEvent>,
     pr_events: flume::Receiver<PrEvent>,
+    plan_draft_events: flume::Receiver<PlanDraftEvent>,
     usage_events: flume::Receiver<Usage>,
     notices: flume::Receiver<Notice>,
     tiles: flume::Receiver<(AgentId, bool)>,
@@ -302,6 +311,7 @@ impl Client {
         let (message_sender, message_receiver) = flume::unbounded();
         let (comment_sender, comment_receiver) = flume::unbounded();
         let (pr_sender, pr_receiver) = flume::unbounded();
+        let (plan_draft_sender, plan_draft_receiver) = flume::unbounded();
         let (usage_sender, usage_receiver) = flume::unbounded();
         let (notice_sender, notice_receiver) = flume::unbounded();
         let (tile_sender, tile_receiver) = flume::unbounded();
@@ -319,6 +329,7 @@ impl Client {
             messages: message_sender,
             comments: comment_sender,
             pull_requests: pr_sender,
+            plan_drafts: plan_draft_sender,
             usage: usage_sender,
             notices: notice_sender,
             tiles: tile_sender,
@@ -360,6 +371,7 @@ impl Client {
                 message_events: message_receiver,
                 comment_events: comment_receiver,
                 pr_events: pr_receiver,
+                plan_draft_events: plan_draft_receiver,
                 usage_events: usage_receiver,
                 notices: notice_receiver,
                 tiles: tile_receiver,
@@ -501,6 +513,11 @@ impl Client {
         self.inner.pr_events.clone()
     }
 
+    /// Every `PlanDraftChanged` the daemon sends. Use one consumer.
+    pub fn plan_draft_events(&self) -> flume::Receiver<PlanDraftEvent> {
+        self.inner.plan_draft_events.clone()
+    }
+
     /// Changes how long calls wait (`create_task` waits at least 60 s) for the daemon.
     #[must_use]
     pub fn with_reply_timeout(mut self, timeout: Duration) -> Self {
@@ -602,6 +619,45 @@ impl Client {
         match reply {
             Event::AgentStarted { agent, .. } => Ok(agent),
             other => Err(unexpected("StartOrchestrator", &other)),
+        }
+    }
+
+    /// Starts the project's grill agent with the idea as its first message.
+    pub fn start_grill(
+        &self,
+        project: ProjectId,
+        kind: Option<AgentKind>,
+        idea: String,
+    ) -> Result<AgentInfo, ClientError> {
+        let reply = self.call(
+            |call| Request::StartGrill {
+                call,
+                project,
+                kind,
+                idea,
+            },
+            None,
+        )?;
+
+        match reply {
+            Event::AgentStarted { agent, .. } => Ok(agent),
+            other => Err(unexpected("StartGrill", &other)),
+        }
+    }
+
+    /// Asks the grill agent to write the plan and end.
+    pub fn finish_grill(&self, project: ProjectId) -> Result<(), ClientError> {
+        match self.call(|call| Request::FinishGrill { call, project }, None)? {
+            Event::Done { .. } => Ok(()),
+            other => Err(unexpected("FinishGrill", &other)),
+        }
+    }
+
+    /// Stops the grill agent. The plan draft stays.
+    pub fn stop_grill(&self, project: ProjectId) -> Result<(), ClientError> {
+        match self.call(|call| Request::StopGrill { call, project }, None)? {
+            Event::Done { .. } => Ok(()),
+            other => Err(unexpected("StopGrill", &other)),
         }
     }
 
@@ -1517,6 +1573,15 @@ fn read_events(
                     .is_err()
                 {
                     log::debug!("draft event has no listener");
+                }
+            }
+            Event::PlanDraftChanged { project, text } => {
+                if shared
+                    .plan_drafts
+                    .send(PlanDraftEvent { project, text })
+                    .is_err()
+                {
+                    log::debug!("plan draft event has no listener");
                 }
             }
             Event::CloseProgress { task, step } => {

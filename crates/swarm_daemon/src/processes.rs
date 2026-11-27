@@ -239,6 +239,7 @@ fn describe(agent: &AgentInfo) -> String {
         AgentRole::Orchestrator => "orchestrator".to_owned(),
         AgentRole::Worker => format!("worker {}", agent.name),
         AgentRole::StartOrchestrator => "the Start orchestrator".to_owned(),
+        AgentRole::Grill => "the grill agent".to_owned(),
     }
 }
 

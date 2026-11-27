@@ -1168,6 +1168,15 @@ impl Store {
 
     /// The project's Start orchestrator while its process starts or runs.
     pub fn start_agent(&self, project: ProjectId) -> Result<Option<AgentInfo>, Error> {
+        self.project_agent(project, AgentRole::StartOrchestrator)
+    }
+
+    /// The project's task-less agent of `role` while its process starts or runs.
+    pub fn project_agent(
+        &self,
+        project: ProjectId,
+        role: AgentRole,
+    ) -> Result<Option<AgentInfo>, Error> {
         let alive = [
             to_json(&AgentLifecycle::Starting)?,
             to_json(&AgentLifecycle::Running)?,
@@ -1180,12 +1189,7 @@ impl Store {
                     "{AGENT_COLUMNS} WHERE project = ?1 AND role = ?2 AND lifecycle IN (?3, ?4)
                      ORDER BY id DESC LIMIT 1"
                 ),
-                params![
-                    to_row(project.0)?,
-                    to_json(&AgentRole::StartOrchestrator)?,
-                    alive[0],
-                    alive[1]
-                ],
+                params![to_row(project.0)?, to_json(&role)?, alive[0], alive[1]],
                 agent_from_row,
             )
             .optional()?
@@ -2829,6 +2833,27 @@ mod tests {
             store.start_agent(ProjectId(2)).expect("other project"),
             None
         );
+    }
+
+    #[test]
+    fn a_project_agent_is_found_by_its_role() {
+        let (store, task) = store_with_task();
+        let project = ProjectId(1);
+        let mut new = new_agent(task);
+        new.task = None;
+        new.role = AgentRole::Grill;
+        new.name = "grill";
+
+        let grill = store.add_agent(&new).expect("grill");
+
+        assert_eq!(
+            store
+                .project_agent(project, AgentRole::Grill)
+                .expect("grill")
+                .map(|agent| agent.id),
+            Some(grill.id)
+        );
+        assert_eq!(store.start_agent(project).expect("start"), None);
     }
 
     #[test]

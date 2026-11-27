@@ -14,10 +14,10 @@ use gpui::{
     SharedString, Size, Subscription, WeakEntity, Window, px,
 };
 use swarm_protocol::{
-    AgentChange, AgentId as DaemonAgentId, AgentInfo, AgentLifecycle, Client, ClientError,
-    CreateTerminal, Host, MessageEvent, Paths, ProjectInfo, ReviewSource, System, TaskDiff,
-    TaskInfo, TerminalId as DaemonTerminalId, TerminalInfo, TerminalKind as DaemonKind, Usage,
-    stop_daemon,
+    AgentChange, AgentId as DaemonAgentId, AgentInfo, AgentLifecycle, AgentRole, Client,
+    ClientError, CreateTerminal, Host, MessageEvent, Paths, PlanDraftEvent, ProjectInfo,
+    ReviewSource, System, TaskDiff, TaskInfo, TerminalId as DaemonTerminalId, TerminalInfo,
+    TerminalKind as DaemonKind, Usage, stop_daemon,
 };
 use swarm_term::{ExitStatus, TerminalChannels, TerminalInput};
 use swarm_term_view::{TerminalEvent, TerminalView, palette_for};
@@ -28,6 +28,7 @@ use crate::model::{
     Agent, AgentChanges, AgentId, FakeData, ProjectId, TaskFileList, TaskId, TerminalId,
     TerminalKind,
 };
+use crate::plan_editor::PlanFocus;
 use crate::pull_request::SetupStep;
 use crate::workspace::{DataSource, RightPanel, View, Workspace};
 
@@ -534,6 +535,9 @@ impl Workspace {
         Self::forward(client.pr_events(), cx, |workspace, event, _, cx| {
             workspace.pr_event(event, cx);
         });
+        Self::forward(client.plan_draft_events(), cx, |workspace, event, _, cx| {
+            workspace.plan_draft_changed(event, cx);
+        });
         Self::forward(client.usage_events(), cx, |workspace, usage, _, cx| {
             workspace.usage_changed(usage, cx);
         });
@@ -597,7 +601,11 @@ impl Workspace {
         }
 
         if info.task.is_none() {
-            self.start_agent_changed(info, terminal, cx);
+            if info.role == AgentRole::Grill {
+                self.grill_agent_changed(info, terminal, cx);
+            } else {
+                self.start_agent_changed(info, terminal, cx);
+            }
         }
 
         cx.notify();
@@ -625,6 +633,111 @@ impl Workspace {
         if on_active_tab && self.focused_terminal.is_none() {
             self.claim_focus(terminal, cx);
         }
+    }
+
+    /// A grill agent that ended loses its tile and the editor gets the focus back. The tab
+    /// stays. A new one takes focus when nothing on its tab has it.
+    fn grill_agent_changed(
+        &mut self,
+        info: &AgentInfo,
+        terminal: TerminalId,
+        cx: &mut Context<Self>,
+    ) {
+        let known = self.data.agent_with_daemon_id(info.id);
+        let ended = known
+            .and_then(|agent| agent.daemon.as_ref())
+            .is_some_and(|daemon| is_ended(daemon.lifecycle));
+        let on_active_tab = known.is_some_and(|agent| agent.task == self.active_task);
+
+        if !ended {
+            if on_active_tab && self.focused_terminal.is_none() {
+                self.claim_focus(terminal, cx);
+            }
+            return;
+        }
+
+        let Some(tab) = self
+            .data
+            .project_with_daemon_id(info.project)
+            .and_then(|project| self.data.start_task(project))
+        else {
+            return;
+        };
+
+        self.grill_ended(tab, cx);
+    }
+
+    /// The grill agent of a Start tab is gone: drops its tile and gives the focus back to
+    /// the editor.
+    fn grill_ended(&mut self, tab: TaskId, cx: &mut Context<Self>) {
+        for gone in self.data.remove_grill_of(tab) {
+            self.forget_terminal(gone, cx);
+        }
+
+        if self.active_task == tab {
+            self.plan_focus = PlanFocus::Asked;
+        }
+    }
+
+    /// The grill agent wrote the plan: the project's editor shows it at once.
+    pub(crate) fn plan_draft_changed(&mut self, event: PlanDraftEvent, cx: &mut Context<Self>) {
+        let Some(project) = self.data.project_with_daemon_id(event.project) else {
+            return;
+        };
+        let Some(editor) = self.plan_editors.get(&project).cloned() else {
+            return;
+        };
+        let now = self.now_ms();
+
+        editor.update(cx, |editor, cx| editor.plan_written(event.text, now, cx));
+    }
+
+    /// The daemon started the grill agent: its terminal takes the focus.
+    pub(crate) fn grill_started(
+        &mut self,
+        agent: &AgentInfo,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        self.agent_changed(agent, window, cx);
+
+        let terminal = self
+            .data
+            .agent_with_daemon_id(agent.id)
+            .filter(|known| known.task == self.active_task)
+            .map(|known| known.terminal);
+
+        if let Some(terminal) = terminal {
+            self.focus_terminal(terminal, cx);
+        }
+    }
+
+    /// Asks the daemon to stop the project's grill agent. A refusal shows in the sidebar.
+    pub(crate) fn stop_grill(&mut self, project: ProjectId, cx: &mut Context<Self>) {
+        let Some(daemon_project) = self.data.project(project).and_then(|entry| entry.daemon) else {
+            return;
+        };
+        let Some(client) = self.daemon.clone().filter(Client::is_connected) else {
+            self.report_sidebar_error(NOT_RUNNING.to_owned(), cx);
+            return;
+        };
+
+        let stopping = cx.background_spawn(async move { client.stop_grill(daemon_project) });
+
+        cx.spawn(async move |this, cx| {
+            let result = stopping.await;
+
+            let updated = this.update(cx, |workspace, cx| {
+                if let Err(error) = result {
+                    workspace.report_sidebar_error(error.to_string(), cx);
+                }
+            });
+
+            if let Err(error) = updated {
+                log::debug!("the window closed before the grill agent stopped: {error}");
+            }
+        })
+        .detach();
     }
 
     /// Closes a project's Start tab after its orchestrator exited. Focus moves to the
@@ -682,12 +795,26 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Closes the Start tabs whose orchestrator the listing no longer shows running.
+    /// Closes the Start tabs whose orchestrator the listing no longer shows running, and
+    /// drops the grill agent the listing no longer shows running.
     fn close_ended_start_tabs(&mut self, projects: &[ProjectInfo], cx: &mut Context<Self>) {
         for info in projects {
             let Some(project) = self.data.project_with_daemon_id(info.id) else {
                 continue;
             };
+
+            let grill_gone = self.data.start_task(project).filter(|tab| {
+                self.data.grill_agent_of(*tab).is_some_and(|agent| {
+                    !info
+                        .grill
+                        .as_ref()
+                        .is_some_and(|grill| grill.id == agent && !is_ended(grill.lifecycle))
+                })
+            });
+            if let Some(tab) = grill_gone {
+                self.grill_ended(tab, cx);
+            }
+
             let Some(agent) = self
                 .data
                 .start_task(project)
@@ -2360,12 +2487,21 @@ pub(crate) mod tests {
     pub(crate) fn start_agent(id: u64, project: u64, status: DaemonAgentStatus) -> AgentInfo {
         AgentInfo {
             task: None,
-            role: swarm_protocol::AgentRole::StartOrchestrator,
+            role: AgentRole::StartOrchestrator,
             name: "start".into(),
             worktree: PathBuf::from("/tmp/demo"),
             branch: "main".into(),
             project: DaemonProjectId(project),
             ..agent_info(id, 0, status)
+        }
+    }
+
+    /// A grill agent: like the Start orchestrator, with its own role and name.
+    pub(crate) fn grill_agent(id: u64, project: u64) -> AgentInfo {
+        AgentInfo {
+            role: AgentRole::Grill,
+            name: "grill".into(),
+            ..start_agent(id, project, DaemonAgentStatus::Idle)
         }
     }
 
@@ -2580,6 +2716,7 @@ pub(crate) mod tests {
             config_error: None,
             tasks,
             start: None,
+            grill: None,
         }
     }
 
@@ -3072,7 +3209,7 @@ pub(crate) mod tests {
             id: swarm_protocol::AgentId(id),
             project: DaemonProjectId(5),
             task: Some(DaemonTaskId(task)),
-            role: swarm_protocol::AgentRole::Orchestrator,
+            role: AgentRole::Orchestrator,
             kind: swarm_protocol::AgentKind::ClaudeCode,
             model: "opus".into(),
             name: "orchestrator".into(),
@@ -3893,7 +4030,7 @@ pub(crate) mod tests {
 
     fn worker_info(id: u64, task: u64, name: &str, status: DaemonAgentStatus) -> AgentInfo {
         AgentInfo {
-            role: swarm_protocol::AgentRole::Worker,
+            role: AgentRole::Worker,
             name: name.into(),
             ..agent_info(id, task, status)
         }
@@ -4954,6 +5091,100 @@ pub(crate) mod tests {
 
             Some(workspace.data.task(tab)?.user_terminals.clone())
         })
+    }
+
+    #[gpui::test]
+    fn a_reconnect_listing_without_the_grill_agent_drops_its_tile_and_frees_the_editor(
+        cx: &mut TestAppContext,
+    ) {
+        let socket = fake_daemon_replying(|_| None);
+        let (workspace, cx) = setup(cx);
+        cx.executor().allow_parking();
+        let client = Client::connect(&socket).expect("connect to the fake daemon");
+        let project = ProjectInfo {
+            grill: Some(grill_agent(101, 5)),
+            ..project_info(5, "demo", vec![task_info(7, 5, "one")])
+        };
+        use_projects(&workspace, &[project], cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.use_daemon(client, &[], window, cx);
+        });
+        workspace.update(cx, Workspace::open_start_task);
+        redraw(cx);
+        let grilling = workspace.read_with(cx, |workspace, _| {
+            workspace.data.grill_runs(workspace.active_task().project)
+        });
+        assert!(grilling, "the grill agent does not run");
+
+        use_projects(&workspace, &[project_info(5, "demo", Vec::new())], cx);
+        redraw(cx);
+
+        let (tile, runs, editing) = workspace.read_with(cx, |workspace, cx| {
+            let task = workspace.active_task();
+            let editor = workspace.shown_plan_editor();
+
+            (
+                task.grill,
+                workspace.data.grill_runs(task.project),
+                editor.is_some_and(|editor| !editor.read(cx).is_grilling()),
+            )
+        });
+        assert_eq!(tile, None, "the grill tile is still there");
+        assert!(!runs);
+        assert!(editing, "the editor is still read-only");
+    }
+
+    #[gpui::test]
+    fn a_listed_grill_agent_shows_its_tile_and_its_stop_button_sends_stop_grill(
+        cx: &mut TestAppContext,
+    ) {
+        let (stopped, stops) = flume::unbounded();
+        let socket = fake_daemon_replying(move |request| match request {
+            Request::StopGrill { call, project } => {
+                stopped.send(project).ok();
+
+                Some(Event::Done { call })
+            }
+            _ => None,
+        });
+        let (workspace, cx) = setup(cx);
+        cx.executor().allow_parking();
+        let client = Client::connect(&socket).expect("connect to the fake daemon");
+        let project = ProjectInfo {
+            grill: Some(grill_agent(101, 5)),
+            ..project_info(5, "demo", vec![task_info(7, 5, "one")])
+        };
+        use_projects(&workspace, &[project], cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.use_daemon(client, &[], window, cx);
+        });
+        workspace.update(cx, Workspace::open_start_task);
+        redraw(cx);
+
+        let terminal = workspace.read_with(cx, |workspace, _| {
+            let task = workspace.active_task();
+
+            (
+                task.is_start,
+                workspace.data.grill_runs(task.project),
+                task.grill
+                    .and_then(|id| workspace.data.agent(id))
+                    .map(|agent| agent.terminal.0),
+            )
+        });
+        assert!(terminal.0, "the Start tab is not open");
+        assert!(terminal.1, "the grill agent does not run");
+        let placed = workspace.read_with(cx, |workspace, _| {
+            terminal
+                .2
+                .and_then(|id| workspace.layout.rect(swarm_layout::TileId(id)))
+        });
+        assert!(placed.is_some(), "the grill tile is not placed");
+
+        click_selector("tile-stop-0", cx);
+        let stopped = stops.recv_timeout(Duration::from_secs(5));
+
+        assert_eq!(stopped, Ok(DaemonProjectId(5)));
     }
 
     #[gpui::test]

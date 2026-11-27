@@ -327,6 +327,9 @@ fn handle(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
         | Request::MarkPrReady { .. }
         | Request::MergePr { .. }
         | Request::SetCloseAfterMerge { .. }) => handle_pull_requests(services, sink, request),
+        request @ (Request::StartGrill { .. }
+        | Request::FinishGrill { .. }
+        | Request::StopGrill { .. }) => handle_grill(services, sink, request),
         request @ (Request::ListProjects { .. }
         | Request::AddProject { .. }
         | Request::CheckRemoveProject { .. }
@@ -473,6 +476,41 @@ fn task_branches(
             Err(error) => send_error(sink, call, &error),
         }
     });
+}
+
+/// The app asks to start, finish or stop the project's grill agent.
+fn handle_grill(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {
+    match request {
+        Request::StartGrill {
+            call,
+            project,
+            kind,
+            idea,
+        } => {
+            let services = Arc::clone(services);
+            run_slow(
+                sink,
+                "start-grill",
+                call,
+                move |sink| match tasks::start_grill(&services, project, kind, idea) {
+                    Ok(agent) => {
+                        sink.send_event(&Event::AgentStarted { call, agent });
+                    }
+                    Err(error) => send_error(sink, call, &error),
+                },
+            );
+        }
+        Request::FinishGrill { call, project } => {
+            done_or_error(sink, call, tasks::finish_grill(services, project));
+        }
+        Request::StopGrill { call, project } => {
+            let services = Arc::clone(services);
+            run_slow(sink, "stop-grill", call, move |sink| {
+                done_or_error(sink, call, tasks::stop_grill(&services, project));
+            });
+        }
+        _ => log::error!("handle_grill got a request it does not own"),
+    }
 }
 
 fn handle_projects(services: &Arc<Services>, sink: &Arc<ClientSink>, request: Request) {

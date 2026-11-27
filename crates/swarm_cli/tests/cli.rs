@@ -395,7 +395,7 @@ fn help_lists_every_command() {
     let text = String::from_utf8_lossy(&output.stdout);
     for command in [
         "spawn", "send", "ask", "report", "commit", "notify", "read", "wait", "merge", "agents",
-        "confirm", "pr", "tile", "mcp", "hook",
+        "confirm", "pr", "plan", "tile", "mcp", "hook",
     ] {
         assert!(text.contains(command), "{command} is missing:\n{text}");
     }

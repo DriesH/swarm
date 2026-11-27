@@ -498,7 +498,7 @@ fn waiting_for_creations_returns_once_the_start_agent_being_made_is_recorded() {
 
     std::thread::scope(|scope| {
         scope.spawn(move || {
-            let made = projects.start_agent_or(project, |_, _| {
+            let made = projects.start_agent_or(project, AgentRole::StartOrchestrator, |_, _| {
                 entered.send(()).expect("entered");
                 release_receiver.recv().expect("release");
 

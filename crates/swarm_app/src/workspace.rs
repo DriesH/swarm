@@ -1210,6 +1210,7 @@ static NO_TASK: Task = Task {
     pull_request: None,
     close_after_merge: false,
     is_start: false,
+    grill: None,
     daemon: None,
 };
 

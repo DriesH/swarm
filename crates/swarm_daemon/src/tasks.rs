@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use swarm_core::prompts::{self, PromptFile};
 use swarm_core::store::NewMessage;
 use swarm_core::{PreparedTask, PreparedWorker};
@@ -19,7 +19,9 @@ use swarm_term::TerminalInput;
 use swarm_term::{ExitStatus, Palette, Rgb, Size};
 
 use crate::Services;
-use crate::agents::{AfterFirstMessage, Agents, CommandNotFound, Place, Start, start_key};
+use crate::agents::{
+    AfterFirstMessage, Agents, CommandNotFound, Place, Start, grill_key, lock, start_key,
+};
 use crate::hub::Extras;
 use crate::messages::check_plan_size;
 
@@ -66,6 +68,9 @@ const CLOSE_POLL: Duration = Duration::from_millis(25);
 
 /// The name of a Start orchestrator.
 const START_NAME: &str = "start";
+
+/// The name of a grill agent.
+const GRILL_NAME: &str = "grill";
 
 /// How the setup script went, as the orchestrator needs to know it.
 enum Setup {
@@ -296,20 +301,22 @@ fn stop_and_close(
     Ok(())
 }
 
-/// Who a stop reaches: the agents and terminals of a task, or the Start orchestrator
-/// and the terminals of a project's Start tab.
+/// Who a stop reaches: the agents and terminals of a task, the Start orchestrator, the
+/// grill agent and the terminals of a project's Start tab, or only the grill agent.
 #[derive(Debug, Clone, Copy)]
 enum Scope {
     Task(TaskId),
     Start(ProjectId),
+    Grill(ProjectId),
 }
 
 impl Scope {
-    /// The `task` key of the terminals in this scope.
-    fn key(self) -> String {
+    /// The `task` keys of the terminals in this scope.
+    fn keys(self) -> Vec<String> {
         match self {
-            Self::Task(task) => task.terminal_key(),
-            Self::Start(project) => start_key(project),
+            Self::Task(task) => vec![task.terminal_key()],
+            Self::Start(project) => vec![start_key(project), grill_key(project)],
+            Self::Grill(project) => vec![grill_key(project)],
         }
     }
 
@@ -317,14 +324,21 @@ impl Scope {
     fn stop_agents(self, agents: &Agents) -> Vec<TerminalId> {
         match self {
             Self::Task(task) => agents.stop_task_agents(task),
-            Self::Start(project) => agents.stop_start_agents(project),
+            Self::Start(project) => {
+                let mut terminals = agents.stop_start_agents(project);
+                terminals.extend(agents.stop_grill_agents(project));
+
+                terminals
+            }
+            Self::Grill(project) => agents.stop_grill_agents(project),
         }
     }
 
     fn has_live(self, agents: &Agents) -> bool {
         match self {
             Self::Task(task) => agents.has_live(task),
-            Self::Start(project) => agents.has_live_start(project),
+            Self::Start(project) => agents.has_live_start_or_grill(project),
+            Self::Grill(project) => agents.has_live_grill(project),
         }
     }
 }
@@ -333,7 +347,7 @@ impl Scope {
 /// [`CLOSE_GRACE`]. Repeats while new ones show up from a request that was under way.
 /// False when something of the scope is still alive at the end.
 fn stop_processes(services: &Services, scope: Scope) -> bool {
-    let key = scope.key();
+    let keys = scope.keys();
 
     for _ in 0..3 {
         let mut running = scope.stop_agents(&services.agents);
@@ -342,7 +356,7 @@ fn stop_processes(services: &Services, scope: Scope) -> bool {
                 .terminals
                 .list()
                 .into_iter()
-                .filter(|info| info.task.as_deref() == Some(key.as_str()))
+                .filter(|info| info.task.as_ref().is_some_and(|key| keys.contains(key)))
                 .map(|info| info.id),
         );
         running.sort_unstable();
@@ -379,15 +393,15 @@ fn stop_processes(services: &Services, scope: Scope) -> bool {
         }
     }
 
-    !scope.has_live(&services.agents) && !has_terminals(services, &key)
+    !scope.has_live(&services.agents) && !has_terminals(services, &keys)
 }
 
-fn has_terminals(services: &Services, key: &str) -> bool {
+fn has_terminals(services: &Services, keys: &[String]) -> bool {
     services
         .terminals
         .list()
         .iter()
-        .any(|info| info.task.as_deref() == Some(key))
+        .any(|info| info.task.as_ref().is_some_and(|key| keys.contains(key)))
 }
 
 /// True when the terminals are gone and their agents have ended, within `timeout`.
@@ -494,26 +508,35 @@ pub(crate) fn start_orchestrator(
         }
         check_plan_size(plan)?;
     }
+    if lock(&services.store)
+        .project_agent(project, AgentRole::Grill)?
+        .is_some()
+    {
+        bail!("a grill agent runs: wait for it to end or stop it");
+    }
 
     let kind = kind.unwrap_or_else(|| services.agents.default_kind());
     let launch = services.agents.plan(kind, AgentRole::StartOrchestrator)?;
 
-    let (agent, created) = services.projects.start_agent_or(project, |root, base| {
+    let (agent, created) =
         services
-            .agents
-            .register(
-                &Place {
-                    project,
-                    task: None,
-                    name: START_NAME,
-                    worktree: root,
-                    branch: base,
-                    ports: &[],
-                },
-                launch,
-            )
-            .map_err(|error| swarm_core::Error::Invalid(format!("{error:#}")))
-    })?;
+            .projects
+            .start_agent_or(project, AgentRole::StartOrchestrator, |root, base| {
+                services
+                    .agents
+                    .register(
+                        &Place {
+                            project,
+                            task: None,
+                            name: START_NAME,
+                            worktree: root,
+                            branch: base,
+                            ports: &[],
+                        },
+                        launch,
+                    )
+                    .map_err(|error| swarm_core::Error::Invalid(format!("{error:#}")))
+            })?;
     if !created {
         if plan.is_some() {
             bail!("the Start orchestrator already runs");
@@ -539,6 +562,102 @@ pub(crate) fn start_orchestrator(
     start_agent(services, start, Setup::None);
 
     Ok(services.agents.info(agent.id).unwrap_or(agent))
+}
+
+/// Starts the project's grill agent in the project root with the idea as its first
+/// message. The idea is also the plan draft, so it stays even if the agent never writes.
+/// It is refused while the Start orchestrator or a grill agent runs.
+pub(crate) fn start_grill(
+    services: &Services,
+    project: ProjectId,
+    kind: Option<AgentKind>,
+    idea: String,
+) -> Result<AgentInfo> {
+    if idea.trim().is_empty() {
+        bail!("an idea needs text");
+    }
+    check_plan_size(&idea)?;
+    if lock(&services.store)
+        .project_agent(project, AgentRole::StartOrchestrator)?
+        .is_some()
+    {
+        bail!("the Start orchestrator already runs");
+    }
+
+    let kind = kind.unwrap_or_else(|| services.agents.default_kind());
+    let launch = services.agents.plan(kind, AgentRole::Grill)?;
+
+    let (agent, created) =
+        services
+            .projects
+            .start_agent_or(project, AgentRole::Grill, |root, base| {
+                services.projects.set_plan_draft(project, Some(&idea))?;
+
+                services
+                    .agents
+                    .register(
+                        &Place {
+                            project,
+                            task: None,
+                            name: GRILL_NAME,
+                            worktree: root,
+                            branch: base,
+                            ports: &[],
+                        },
+                        launch,
+                    )
+                    .map_err(|error| swarm_core::Error::Invalid(format!("{error:#}")))
+            })?;
+    if !created {
+        bail!("a grill agent already runs");
+    }
+
+    services.agents.announce(agent.id);
+    let start = Start {
+        agent: agent.id,
+        task_name: String::new(),
+        env: Vec::new(),
+        first_message: Some(idea),
+        after_first_message: None,
+    };
+    start_agent(services, start, Setup::None);
+
+    Ok(services.agents.info(agent.id).unwrap_or(agent))
+}
+
+/// Asks the grill agent to write the plan now and end.
+pub(crate) fn finish_grill(services: &Services, project: ProjectId) -> Result<()> {
+    let grill = running_grill(services, project)?;
+
+    services.messages.post(&NewMessage {
+        project,
+        task: None,
+        from: None,
+        to: grill.id,
+        kind: MessageKind::WritePlan,
+        text: "Write the plan now with what you know: run `swarm plan write -` with the plan on stdin, then run `swarm exit`.",
+        delivered: false,
+    })?;
+    services.agents.deliver_unread(grill.id);
+
+    Ok(())
+}
+
+/// Stops the grill agent for good, as the user's choice. The plan draft stays.
+pub(crate) fn stop_grill(services: &Services, project: ProjectId) -> Result<()> {
+    running_grill(services, project)?;
+
+    if !stop_processes(services, Scope::Grill(project)) {
+        bail!("the grill agent did not end; try again");
+    }
+
+    Ok(())
+}
+
+fn running_grill(services: &Services, project: ProjectId) -> Result<AgentInfo> {
+    lock(&services.store)
+        .project_agent(project, AgentRole::Grill)?
+        .ok_or_else(|| anyhow!("no grill agent runs"))
 }
 
 /// Keeps the plan as the brief of the Start orchestrator. A failure is logged: the agent

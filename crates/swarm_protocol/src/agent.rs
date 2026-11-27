@@ -91,6 +91,9 @@ pub enum Call {
     /// asked for. Refused unless the user approved the task as it is now. The app shows
     /// the draft in its pull request panel. Returns nothing.
     PrDraft { title: String, body: String },
+    /// Grill agent: replaces the plan draft of the project with `text`. The user sees
+    /// it at once. Returns nothing.
+    PlanWrite { text: String },
     /// Claude Code agent: the rate limits from its status line input. Returns nothing.
     RateLimits { windows: Vec<UsageWindow> },
 
@@ -164,6 +167,7 @@ pub const HARNESS_CALLS: &[(&str, &str)] = &[
     ("agents", "agents"),
     ("confirm", "confirm"),
     ("pr_draft", "pr draft"),
+    ("plan_write", "plan write"),
     ("tile_grow", "tile grow"),
     ("tile_shrink", "tile shrink"),
     ("task_create", "task create"),

@@ -62,6 +62,9 @@ pub(crate) enum Command {
         title: String,
         body: String,
     },
+    PlanWrite {
+        text: String,
+    },
     /// `agent` is an agent ID or a worker name; `None` is the caller's own tile.
     TileGrow {
         agent: Option<String>,
@@ -195,6 +198,11 @@ impl Command {
                 let result = session.call(Call::PrDraft { title, body })?;
 
                 Ok(output(result, "pull request draft sent".to_owned()))
+            }
+            Self::PlanWrite { text } => {
+                let result = session.call(Call::PlanWrite { text })?;
+
+                Ok(output(result, "plan draft written".to_owned()))
             }
             Self::TileGrow { agent } => tile(session, agent, true),
             Self::TileShrink { agent } => tile(session, agent, false),
