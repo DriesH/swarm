@@ -211,7 +211,6 @@ Five parts, in this order: 1. Plan grilling. 2. Story data and check. 3. Story v
 - Settings: Launch at login (phase 9)
 - Home boards in light (phase 10)
 - Close scratch dialog and the empty Home (phase 10)
-- Lane colors 6–8 for the Story view (phase 11)
 
 ## Parked
 

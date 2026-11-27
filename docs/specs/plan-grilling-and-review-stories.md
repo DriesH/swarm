@@ -10,7 +10,7 @@ Line numbers drift. Search by name.
 
 - Designs on the [design canvas](https://claude.ai/artifact/6r2WfEmYoTDCWCTJckxVkt), dark and light:
   - "Plan grilling (phase 11)" row: "Start — Grill me on the plan editor" and "Start — grilling: grill agent and read-only plan".
-  - "Review stories (phase 11)" row: "Review story — a flow with one step open".
+  - "Review stories (phase 11)" row: "Review story — a flow with one step open" and "Lane colors — 8 lanes, dark and light".
   - "Story view proposals" rows: "Findings B — on their steps (chosen)", "Out of date A — banner and marked steps (chosen)", "Out of date banner" and "Overview B — flow map and side panel (chosen)". The other proposals there were not chosen.
 - `CLAUDE.md`, `GLOSSARY.md` (Plan, Start orchestrator, Review, Live, Merged, Comment, Approve), `docs/CONVENTIONS.md`.
 - ADRs 0002 (messages go through the orchestrator), 0004 (append prompts, never replace), 0005 (daemon owns SQLite state), 0013 (review stories are data that the daemon checks).
@@ -240,7 +240,22 @@ On **Merged**, the Review header gets a **Story | Files** switch. It opens on St
 - **Lane legend**: horizontal chips with a color dot and the label. No rotated labels.
 - **Other changes** and **Not in story** show as the file cards of Files, with the reason as a tag.
 
-**Lane rail**: each row paints its own part with `canvas` and `PathBuilder`: the line through the row in its lane's color, the dot, and an elbow at the top when the lane changes from the step before. Because each row paints its own part, the steps can be a virtualized `list` with rows of different heights. Lane colors come from 8 new theme tokens that meet contrast in both themes.
+**Lane rail**: each row paints its own part with `canvas` and `PathBuilder`: the line through the row in its lane's color, the dot, and an elbow at the top when the lane changes from the step before. Because each row paints its own part, the steps can be a virtualized `list` with rows of different heights. Lane colors come from 8 new theme tokens, `lane1` to `lane8`, given to the lanes in the story's order. Design: board "Lane colors — 8 lanes, dark and light".
+
+| Token | Name | Dark | Light |
+|---|---|---|---|
+| `lane1` | Blue | `#6e9bff` | `#285acb` |
+| `lane2` | Teal | `#3fb8a8` | `#0f766e` |
+| `lane3` | Amber | `#d9a441` | `#9a6200` |
+| `lane4` | Violet | `#b48cf2` | `#6d4ad6` |
+| `lane5` | Pink | `#ec7fb0` | `#b4326e` |
+| `lane6` | Orange | `#f0894a` | `#c2410c` |
+| `lane7` | Lime | `#a6c94b` | `#4d7c0f` |
+| `lane8` | Sky | `#5cb8f0` | `#0369a1` |
+
+- Every color is at least 5:1 on `panel` in both themes. Lines and dots need 3:1 (WCAG 1.4.11, `GRAPHIC_AA`).
+- Lanes 6–8 stay apart from the status colors `ok`, `warn` and `del`. A gray lane was left out because it reads as disabled next to `muted`.
+- With red-green color blindness some lanes look alike, such as Orange and Amber. Each lane has its own column on the rail and in the flow map, and its name is in the labels, so color is never the only sign.
 
 **Keys**, the same as in Files where they overlap: `j` / `k` next or previous step, `o` open or close the step, `v` reviewed, `[` / `]` previous or next flow, `c` line comment on the line cursor, `⇧C` step comment.
 
@@ -300,7 +315,6 @@ Design: boards "Out of date A — banner and marked steps (chosen)" and "Out of 
 
 ## 8. Open details
 
-- Designs still to make (direction A, light and dark): lane colors 6–8 (the boards have 1–5).
 - A timeout for the ready-for-review wait when the story writer hangs. Start with 20 minutes.
 - Very large diffs: the story writer may need more than one pass.
 - Later: a story summary in the PR description, and lanes set in `.swarm/config.toml`.
