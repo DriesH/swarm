@@ -10,6 +10,7 @@ use swarm_layout::{
     Activity, CELL, Cells, Layout, LayoutStyle, Rect, TileId, TileKind, TileSpec, cells_nearest,
     cells_up, content_rect,
 };
+use swarm_protocol::AgentRole;
 use swarm_term_view::TerminalView;
 use swarm_ui::fonts::MONO_FONT;
 use swarm_ui::prelude::*;
@@ -230,14 +231,22 @@ fn tile_spec(
 }
 
 /// The open task's tiles in layout order: orchestrator, workers, processes, user terminals.
-/// A Start task has no workers: its orchestrator, then the processes and user terminals.
+/// A Start task has no workers: its grill agent or orchestrator, then the processes and
+/// user terminals.
 pub(crate) fn tile_specs(workspace: &Workspace) -> Vec<TileSpec> {
     let data = &workspace.data;
     let task = workspace.active_task();
 
     if task.is_start {
+        let grill = task
+            .grill
+            .and_then(|id| data.agent(id))
+            .filter(|agent| !has_ended(agent))
+            .and_then(|agent| data.terminal(agent.terminal))
+            .map(|terminal| tile_spec(workspace, terminal, Activity::Working, false));
         let orchestrator = task
             .orchestrator
+            .filter(|_| grill.is_none())
             .and_then(|id| data.agent(id))
             .and_then(|agent| data.terminal(agent.terminal))
             .map(|terminal| tile_spec(workspace, terminal, Activity::Working, false));
@@ -248,7 +257,11 @@ pub(crate) fn tile_specs(workspace: &Workspace) -> Vec<TileSpec> {
             .filter_map(|id| data.terminal(*id))
             .map(|terminal| tile_spec(workspace, terminal, process_activity(terminal), false));
 
-        return orchestrator.into_iter().chain(others).collect();
+        return grill
+            .into_iter()
+            .chain(orchestrator)
+            .chain(others)
+            .collect();
     }
 
     let agents = task
@@ -322,7 +335,12 @@ pub(crate) enum StartMain {
     Editor,
     /// The tile of the running Start orchestrator.
     Terminal,
+    /// The tile of the grill agent on the left, the read-only plan editor on the right.
+    Grill,
 }
+
+/// How wide the plan editor is beside the grill agent's tile.
+const GRILL_EDITOR_WIDTH: f32 = 560.;
 
 impl StartMain {
     /// The widest the column grows.
@@ -330,13 +348,14 @@ impl StartMain {
         match self {
             Self::Editor => 760.,
             Self::Terminal => 880.,
+            Self::Grill => 1600.,
         }
     }
 
     /// The space between the area and the column, across and down.
     fn padding(self) -> (f32, f32) {
         match self {
-            Self::Editor => (24., 20.),
+            Self::Editor | Self::Grill => (24., 20.),
             Self::Terminal => (24., 28.),
         }
     }
@@ -346,8 +365,10 @@ impl StartMain {
 /// editor both read it, so the editor never runs under the tiles.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct StartRegions {
-    /// The plan editor, or the tile of the Start orchestrator.
+    /// The plan editor, or the tile of the Start orchestrator or grill agent.
     pub(crate) main: Rect,
+    /// The plan editor beside the grill agent's tile. `None` in the other modes.
+    pub(crate) editor: Option<Rect>,
     /// The tiles that fit in the band under the main area, left to right. Empty when no
     /// other tile is shown: the main area then takes the whole column.
     pub(crate) band: Vec<Rect>,
@@ -376,25 +397,46 @@ impl StartRegions {
             .min(slots_in(width, style));
         let band_top = pad_y + height - small_height;
         let main_height = band_top - gap - pad_y;
-        if shown == 0 || main_height < min_tile.height {
-            return Self {
-                main: Rect::new(x, pad_y, width, height),
-                band: Vec::new(),
-            };
-        }
-
-        let band_height = small_height;
-        let tile_width = (width - f32::from(shown - 1) * gap) / f32::from(shown);
-
-        Self {
-            main: Rect::new(x, pad_y, width, main_height),
-            band: (0..shown)
+        let (main_rect, band) = if shown == 0 || main_height < min_tile.height {
+            (Rect::new(x, pad_y, width, height), Vec::new())
+        } else {
+            let tile_width = (width - f32::from(shown - 1) * gap) / f32::from(shown);
+            let band = (0..shown)
                 .map(|index| {
                     let left = x + f32::from(index) * (tile_width + gap);
 
-                    Rect::new(left, band_top, tile_width, band_height)
+                    Rect::new(left, band_top, tile_width, small_height)
                 })
-                .collect(),
+                .collect();
+
+            (Rect::new(x, pad_y, width, main_height), band)
+        };
+
+        if main != StartMain::Grill {
+            return Self {
+                main: main_rect,
+                editor: None,
+                band,
+            };
+        }
+
+        let editor_width = GRILL_EDITOR_WIDTH.min((main_rect.size.width - gap) / 2.);
+        let (left, top, full, tall) = (
+            main_rect.origin.x,
+            main_rect.origin.y,
+            main_rect.size.width,
+            main_rect.size.height,
+        );
+
+        Self {
+            main: Rect::new(left, top, full - gap - editor_width, tall),
+            editor: Some(Rect::new(
+                left + full - editor_width,
+                top,
+                editor_width,
+                tall,
+            )),
+            band,
         }
     }
 }
@@ -418,11 +460,15 @@ fn slots_in(width: f32, style: &LayoutStyle) -> u16 {
 }
 
 /// The regions of the open Start tab. The plan editor shows until the Start orchestrator
-/// runs. The tiles in the tray do not take a place in the band.
+/// runs, beside the grill agent's tile while that runs. The tiles in the tray do not take
+/// a place in the band.
 pub(crate) fn start_regions(workspace: &Workspace, specs: &[TileSpec]) -> StartRegions {
     let area = workspace.terminal_area_size().unwrap_or(FIRST_FRAME_AREA);
-    let main = if workspace.data.start_runs(workspace.active_task().project) {
+    let project = workspace.active_task().project;
+    let main = if workspace.data.start_runs(project) {
         StartMain::Terminal
+    } else if workspace.data.grill_runs(project) {
+        StartMain::Grill
     } else {
         StartMain::Editor
     };
@@ -781,7 +827,8 @@ fn terminals(workspace: &Workspace, cx: &mut Context<Workspace>) -> impl IntoEle
     let area = cx.entity();
     let term = cx.theme().colors().term;
     let editor = workspace.shown_plan_editor().map(|editor| {
-        let main = start_regions(workspace, &tile_specs(workspace)).main;
+        let regions = start_regions(workspace, &tile_specs(workspace));
+        let main = regions.editor.unwrap_or(regions.main);
 
         div()
             .absolute()
@@ -1092,6 +1139,24 @@ fn agent_frame(
         frame = frame.action(
             IconButton::new(("stop", id.0), IconName::Close, format!("Stop {name}"))
                 .on_click(cx.listener(move |workspace, _, _, cx| workspace.stop_process(id, cx))),
+        );
+    }
+    if let Some(agent) = agent
+        && agent
+            .daemon
+            .as_ref()
+            .is_some_and(|daemon| daemon.role == AgentRole::Grill)
+    {
+        let project = workspace.data.task(agent.task).map(|task| task.project);
+
+        frame = frame.action(
+            IconButton::new(("stop", id.0), IconName::Close, format!("Stop {name}"))
+                .debug_selector(move || format!("tile-stop-{}", id.0))
+                .on_click(cx.listener(move |workspace, _, _, cx| {
+                    if let Some(project) = project {
+                        workspace.stop_grill(project, cx);
+                    }
+                })),
         );
     }
 
@@ -1770,6 +1835,7 @@ mod tests {
                     id: swarm_protocol::AgentId(1),
                     project: swarm_protocol::ProjectId(1),
                     task: Some(swarm_protocol::TaskId(1)),
+                    role: AgentRole::Worker,
                     terminal: None,
                     status: swarm_protocol::AgentStatus::Idle,
                     message: None,
@@ -2177,6 +2243,122 @@ mod tests {
 
         assert_eq!(layout.rect(TileId(1)), regions.band.first().copied());
         assert_eq!(layout.rect(TileId(2)), regions.band.get(1).copied());
+    }
+
+    #[test]
+    fn the_grill_splits_the_column_into_a_tile_and_the_plan_editor() {
+        let area = area_of(1200., 700.);
+        let gap = start_gap();
+
+        let regions = StartRegions::new(area, StartMain::Grill, 0, &start_style());
+
+        let editor = regions.editor.expect("the grill shows the editor");
+        let (column, editor_width) = (1152., GRILL_EDITOR_WIDTH.min((1152. - gap) / 2.));
+        assert_eq!(
+            regions.main,
+            Rect::new(24., 20., column - gap - editor_width, 660.)
+        );
+        assert_eq!(
+            editor,
+            Rect::new(24. + column - editor_width, 20., editor_width, 660.)
+        );
+        assert!((regions.main.size.height - editor.size.height).abs() < 0.01);
+    }
+
+    #[test]
+    fn the_other_modes_have_no_editor_region() {
+        let area = area_of(1200., 700.);
+
+        let editor = StartRegions::new(area, StartMain::Editor, 0, &start_style());
+        let terminal = StartRegions::new(area, StartMain::Terminal, 0, &start_style());
+
+        assert_eq!(editor.editor, None);
+        assert_eq!(terminal.editor, None);
+    }
+
+    #[test]
+    fn in_a_narrow_column_the_grill_editor_is_at_most_half_the_column_minus_the_gap() {
+        let gap = start_gap();
+
+        let regions = StartRegions::new(area_of(700., 700.), StartMain::Grill, 0, &start_style());
+
+        let editor = regions.editor.expect("the grill shows the editor");
+        assert!((editor.size.width - (652. - gap) / 2.).abs() < 0.01);
+        assert!(regions.main.right() + gap <= editor.origin.x + 0.01);
+    }
+
+    #[test]
+    fn the_band_sits_under_both_parts_of_the_grill() {
+        let regions = StartRegions::new(area_of(1200., 900.), StartMain::Grill, 1, &start_style());
+
+        let band = regions.band.first().copied().expect("one tile in the band");
+        let editor = regions.editor.expect("the grill shows the editor");
+
+        assert!((band.size.width - 1152.).abs() < 0.01);
+        assert!(band.origin.y >= regions.main.bottom());
+        assert!(band.origin.y >= editor.bottom());
+    }
+
+    /// Opens a running grill agent on the project without tasks.
+    fn run_grill(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) {
+        workspace.update(cx, |workspace, cx| {
+            let task = workspace.data.add_running_grill(crate::model::ProjectId(3));
+            workspace.select_task(task, cx);
+        });
+        redraw(cx);
+    }
+
+    #[gpui::test]
+    fn the_grill_tile_sits_in_the_main_region_beside_the_drawn_plan_editor(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, cx) = setup(cx);
+        run_grill(&workspace, cx);
+
+        let (tile, regions, terminal, origin) = workspace.read_with(cx, |workspace, _| {
+            let regions = start_regions(workspace, &tile_specs(workspace));
+            let terminal = workspace
+                .active_task()
+                .grill
+                .and_then(|id| workspace.data.agent(id))
+                .map_or(TerminalId(u32::MAX), |agent| agent.terminal);
+            let area = workspace.terminal_area.expect("the area is measured");
+
+            (
+                workspace.layout.rect(TileId(terminal.0)),
+                regions,
+                terminal,
+                (f32::from(area.origin.x), f32::from(area.origin.y)),
+            )
+        });
+
+        let editor = bounds_rect("plan-editor", cx);
+        let expected = regions.editor.expect("the grill shows the editor");
+        assert_eq!(tile, Some(regions.main));
+        assert!((editor.origin.x - origin.0 - expected.origin.x).abs() < 0.5);
+        assert!((editor.size.width - expected.size.width).abs() < 0.5);
+        assert_eq!(terminal, TerminalId(USER_TERMINAL));
+        assert!(
+            cx.debug_bounds("tile-stop-14").is_some(),
+            "the tile has no stop button"
+        );
+    }
+
+    #[gpui::test]
+    fn a_user_terminal_under_the_grill_sits_under_the_tile_and_the_editor(cx: &mut TestAppContext) {
+        let (workspace, cx) = setup(cx);
+        run_grill(&workspace, cx);
+        workspace.update_in(cx, Workspace::new_user_terminal);
+        redraw(cx);
+        let terminal = user_terminals(&workspace, cx)[0];
+
+        let (tile, _) = on_screen(&workspace, terminal, cx);
+
+        let editor = bounds_rect("plan-editor", cx);
+        assert!(
+            tile.origin.y >= editor.bottom(),
+            "{tile:?} under {editor:?}"
+        );
     }
 
     /// A user terminal on the Start tab of the project without tasks.

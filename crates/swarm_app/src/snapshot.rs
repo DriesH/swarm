@@ -110,6 +110,9 @@ fn open_close_terminal(
     }
 }
 
+/// The plan the grill agent wrote in the snapshot.
+const GRILLED_PLAN: &str = "## What\n\n- add a story to every merged task\n\n## Requirements\n\n- a story covers only Merged\n\n## Definition of done\n\n- the story shows in the review\n";
+
 /// The Start tab with the plan editor and user terminals in the band under it, one more
 /// than the band holds.
 fn open_start_terminal(
@@ -153,6 +156,18 @@ fn open_start_sending(workspace: &mut Workspace, window: &mut Window, cx: &mut C
     workspace
         .plan_editor(project, cx)
         .update(cx, PlanEditor::show_sending);
+}
+
+/// The Start tab while the grill agent runs: its terminal beside the read-only plan.
+fn open_start_grilling(workspace: &mut Workspace, _: &mut Window, cx: &mut Context<Workspace>) {
+    let project = workspace.active_project;
+    let task = workspace.data.add_running_grill(project);
+    let now = workspace.now_ms();
+
+    workspace.select_task(task, cx);
+    workspace.plan_editor(project, cx).update(cx, |editor, cx| {
+        editor.show_written(GRILLED_PLAN, now, cx);
+    });
 }
 
 /// The Start tab after the daemon refused the plan.
@@ -1153,6 +1168,16 @@ pub(crate) fn run(directory: PathBuf, cx: &mut App) {
                 Appearance::Dark,
                 "workspace-start-sending-dark.png",
                 Some(open_start_sending),
+            ),
+            (
+                Appearance::Light,
+                "workspace-start-grilling-light.png",
+                Some(open_start_grilling),
+            ),
+            (
+                Appearance::Dark,
+                "workspace-start-grilling-dark.png",
+                Some(open_start_grilling),
             ),
             (
                 Appearance::Light,

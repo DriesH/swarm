@@ -364,12 +364,13 @@ impl Projects {
         })
     }
 
-    /// The project's running Start orchestrator, or the one `register` makes in the
-    /// project root on the base branch. The flag is true for a new one. Only one runs
-    /// per project, even when two callers ask at once.
+    /// The project's running agent of `role` (a Start orchestrator or a grill agent),
+    /// or the one `register` makes in the project root on the base branch. The flag is
+    /// true for a new one. Only one runs per project, even when two callers ask at once.
     pub fn start_agent_or(
         &self,
         project: ProjectId,
+        role: AgentRole,
         register: impl FnOnce(&Path, &str) -> Result<AgentInfo, Error>,
     ) -> Result<(AgentInfo, bool), Error> {
         let _creating = lock(&self.creating);
@@ -377,7 +378,7 @@ impl Projects {
         let stored = lock(&self.store)
             .project(project)?
             .ok_or(Error::UnknownProject(project.0))?;
-        if let Some(agent) = lock(&self.store).start_agent(project)? {
+        if let Some(agent) = lock(&self.store).project_agent(project, role)? {
             return Ok((agent, false));
         }
 
@@ -982,7 +983,7 @@ impl Projects {
                 Some(base) => Some(git::merge_base(&agent.worktree, &base)?),
                 None => None,
             },
-            AgentRole::StartOrchestrator => None,
+            AgentRole::StartOrchestrator | AgentRole::Grill => None,
         };
         let Some(base) = base else {
             return Ok(None);
@@ -1742,6 +1743,15 @@ impl Projects {
             }
         }
 
+        let (start, grill) = {
+            let store = lock(&self.store);
+
+            (
+                store.start_agent(project.id)?,
+                store.project_agent(project.id, AgentRole::Grill)?,
+            )
+        };
+
         Ok(ProjectInfo {
             id: project.id,
             name: project.name,
@@ -1749,7 +1759,8 @@ impl Projects {
             base_branch,
             config_error: error,
             tasks,
-            start: lock(&self.store).start_agent(project.id)?,
+            start,
+            grill,
         })
     }
 }

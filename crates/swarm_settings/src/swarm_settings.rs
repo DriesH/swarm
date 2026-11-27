@@ -613,7 +613,9 @@ impl AgentSettings {
         let cli = self.cli(kind);
 
         match role {
-            AgentRole::Orchestrator | AgentRole::StartOrchestrator => &cli.orchestrator_model,
+            AgentRole::Orchestrator | AgentRole::StartOrchestrator | AgentRole::Grill => {
+                &cli.orchestrator_model
+            }
             AgentRole::Worker => &cli.worker_model,
         }
     }

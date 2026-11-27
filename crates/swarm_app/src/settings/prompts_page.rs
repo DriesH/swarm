@@ -20,7 +20,7 @@ use crate::workspace::DataSource;
 fn sample_prompts() -> Vec<PromptInfo> {
     let folder = Path::new("/Users/sam/.config/swarm/prompts");
 
-    ["orchestrator", "worker", "start", "plan", "pr"]
+    ["orchestrator", "worker", "start", "plan", "pr", "grill"]
         .into_iter()
         .map(|name| PromptInfo {
             name: name.to_owned(),

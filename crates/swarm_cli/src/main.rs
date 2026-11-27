@@ -119,6 +119,11 @@ enum Action {
         #[command(subcommand)]
         action: PrAction,
     },
+    /// Write the plan draft of the project (grill agent).
+    Plan {
+        #[command(subcommand)]
+        action: PlanAction,
+    },
     /// Make a worker's tile large or small again (orchestrator for its workers, worker
     /// for itself).
     Tile {
@@ -187,6 +192,15 @@ enum PrAction {
         /// A file that holds the description; - reads stdin.
         #[arg(long, value_name = "PATH")]
         body_file: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PlanAction {
+    /// Replace the plan draft with the text of FILE, or of stdin with `-`.
+    Write {
+        /// The file that holds the plan; - reads stdin.
+        file: std::path::PathBuf,
     },
 }
 
@@ -379,6 +393,7 @@ impl Action {
             Self::Agents => Command::Agents,
             Self::Confirm => Command::Confirm,
             Self::Pr { action } => action.command(stdin)?,
+            Self::Plan { action } => action.command(stdin)?,
             Self::Tile { action } => action.command(),
             Self::Task { action } => action.command(stdin)?,
             Self::Exit => Command::Exit,
@@ -415,6 +430,23 @@ impl PrAction {
         };
 
         Ok(Command::PrDraft { title, body })
+    }
+}
+
+impl PlanAction {
+    fn command(self, stdin: &mut impl std::io::Read) -> Result<Command, String> {
+        let Self::Write { file } = self;
+
+        let text = if file.as_os_str() == "-" {
+            read_all(stdin)?
+        } else {
+            let mut file_handle = std::fs::File::open(&file)
+                .map_err(|error| format!("cannot read {}: {error}", file.display()))?;
+
+            read_all(&mut file_handle)?
+        };
+
+        Ok(Command::PlanWrite { text })
     }
 }
 
@@ -1017,6 +1049,32 @@ mod tests {
             Command::PrDraft {
                 title: "Add login".to_owned(),
                 body: "## What".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn plan_write_reads_the_plan_from_stdin_with_a_dash() {
+        assert_eq!(
+            command(&["plan", "write", "-"], "## What\n"),
+            Command::PlanWrite {
+                text: "## What\n".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn plan_write_reads_the_plan_from_a_file() {
+        let path = std::env::temp_dir().join(format!("swarm-cli-plan-{}.md", std::process::id()));
+        std::fs::write(&path, "## What\nlogin\n").expect("write");
+
+        let parsed = command(&["plan", "write", path.to_str().expect("utf8")], "");
+
+        std::fs::remove_file(&path).expect("remove");
+        assert_eq!(
+            parsed,
+            Command::PlanWrite {
+                text: "## What\nlogin\n".to_owned(),
             }
         );
     }

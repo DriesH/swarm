@@ -5,7 +5,7 @@ use std::convert::Infallible;
 use std::time::Duration;
 
 use gpui::{
-    AppContext as _, Context, Entity, FocusHandle, Focusable as _, Role, SharedString,
+    AppContext as _, Context, Entity, FocusHandle, Focusable as _, FontWeight, Role, SharedString,
     Subscription, Task, WeakEntity, Window, div, px,
 };
 use swarm_protocol::{AgentInfo, Client, ClientError, PlanDraft, ProjectId as DaemonProjectId};
@@ -14,6 +14,7 @@ use swarm_ui::prelude::*;
 use crate::daemon::NOT_RUNNING;
 use crate::model::{AgentKind, ProjectId, SAMPLE_PLAN, SAMPLE_PLAN_TEMPLATE};
 use crate::new_task::ORCHESTRATORS;
+use crate::review_model::ago;
 use crate::workspace::{View, Workspace};
 
 #[cfg(test)]
@@ -25,6 +26,8 @@ const SAVE_DELAY: Duration = Duration::from_secs(1);
 const BOX_RADIUS: f32 = 8.;
 /// The space between the box and the text, as in a bordered text field.
 const BOX_PADDING: f32 = 10.;
+/// How often the time of the last written plan refreshes.
+const CLOCK_TICK: Duration = Duration::from_secs(10);
 
 /// What a call to the daemon needs.
 struct Link {
@@ -63,6 +66,21 @@ pub(crate) enum PlanFocus {
     Waiting(Option<FocusHandle>),
 }
 
+/// What the editor waits for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Editing,
+    /// Send plan waits for the daemon to start the orchestrator.
+    Sending,
+    /// Grill me waits for the daemon to start the grill agent.
+    StartingGrill,
+    /// The grill agent runs: the text is read-only and the agent writes the plan.
+    /// `writing` is set once Write plan asked it to finish.
+    Grilling {
+        writing: bool,
+    },
+}
+
 /// The plan of one project, from a blank template to the moment it is sent.
 pub(crate) struct PlanEditor {
     workspace: WeakEntity<Workspace>,
@@ -73,7 +91,13 @@ pub(crate) struct PlanEditor {
     orchestrator: usize,
     template: String,
     load: Load,
-    sending: bool,
+    phase: Phase,
+    /// When the grill agent last wrote the plan.
+    written_at: Option<u64>,
+    /// The workspace's clock, as of its last draw.
+    now: u64,
+    /// Redraws the workspace so the time of the last write stays current.
+    ticker: Option<Task<()>>,
     /// Why the draft did not load or the plan did not go out.
     error: Option<SharedString>,
     /// Why the last save failed.
@@ -89,6 +113,8 @@ pub(crate) struct PlanEditor {
     /// quit, wait for it. The quit cannot wait for `work`: that needs the main thread.
     saving: Option<Ended>,
     send_focus: FocusHandle,
+    /// After the text in the Tab order, though its button sits above it.
+    write_focus: FocusHandle,
     _subscriptions: [Subscription; 2],
 }
 
@@ -131,7 +157,10 @@ impl PlanEditor {
                 SAMPLE_PLAN_TEMPLATE.to_owned()
             },
             load: if live { Load::Loading } else { Load::Loaded },
-            sending: false,
+            phase: Phase::Editing,
+            written_at: None,
+            now: 0,
+            ticker: None,
             error: None,
             save_error: None,
             saved: None,
@@ -139,6 +168,7 @@ impl PlanEditor {
             work: None,
             saving: None,
             send_focus: cx.focus_handle().tab_stop(true),
+            write_focus: cx.focus_handle().tab_index(1).tab_stop(true),
             _subscriptions: [on_text, on_quit],
         };
 
@@ -197,7 +227,7 @@ impl PlanEditor {
 
     /// The plan that Send plan would send now.
     fn sendable(&self, cx: &App) -> Option<String> {
-        if !self.live || self.load != Load::Loaded || self.sending {
+        if !self.live || self.load != Load::Loaded || self.phase != Phase::Editing {
             return None;
         }
 
@@ -232,7 +262,7 @@ impl PlanEditor {
 
     /// A daemon link is back: asks again when the draft did not load.
     fn retry_load(&mut self, cx: &mut Context<Self>) {
-        if self.load != Load::Failed || self.sending {
+        if self.load != Load::Failed || self.sending() {
             return;
         }
 
@@ -282,7 +312,22 @@ impl PlanEditor {
     /// Whether the text may go to the daemon as a draft.
     fn may_save(&self, cx: &App) -> bool {
         // The daemon clears the draft when the plan starts. A save now would bring it back.
-        self.live && self.load == Load::Loaded && !self.sending && !self.start_runs(cx)
+        self.live
+            && self.load == Load::Loaded
+            && self.phase == Phase::Editing
+            && !self.start_runs(cx)
+    }
+
+    fn sending(&self) -> bool {
+        self.phase == Phase::Sending
+    }
+
+    fn starting_grill(&self) -> bool {
+        self.phase == Phase::StartingGrill
+    }
+
+    fn grilling(&self) -> bool {
+        matches!(self.phase, Phase::Grilling { .. })
     }
 
     /// Shows the template with the cursor where the user starts to write.
@@ -303,7 +348,7 @@ impl PlanEditor {
     }
 
     fn schedule_save(&mut self, cx: &mut Context<Self>) {
-        if !self.live || self.load != Load::Loaded {
+        if !self.live || self.load != Load::Loaded || self.grilling() {
             return;
         }
 
@@ -425,7 +470,7 @@ impl PlanEditor {
 
         // A save that is still to come would bring the plan back after the daemon cleared it.
         self.save_timer = None;
-        self.sending = true;
+        self.phase = Phase::Sending;
         self.error = None;
         self.save_error = None;
         self.text.update(cx, |area, cx| area.set_disabled(true, cx));
@@ -465,7 +510,9 @@ impl PlanEditor {
     }
 
     fn sent(&mut self, outcome: Result<(), ClientError>, cx: &mut Context<Self>) {
-        self.sending = false;
+        if self.sending() {
+            self.phase = Phase::Editing;
+        }
 
         match outcome {
             Ok(()) => self.forget(cx),
@@ -484,6 +531,216 @@ impl PlanEditor {
         }
 
         cx.notify();
+    }
+
+    /// Starts the grill agent with the text as the idea.
+    fn grill(&mut self, cx: &mut Context<Self>) {
+        let Some(idea) = self.sendable(cx) else {
+            return;
+        };
+        if self.is_being_removed(cx) {
+            return;
+        }
+        let Some(link) = self.link(cx) else {
+            self.error = Some(NOT_RUNNING.into());
+            cx.notify();
+            return;
+        };
+
+        let kind = ORCHESTRATORS
+            .get(self.orchestrator)
+            .map_or(AgentKind::ClaudeCode, |(_, kind)| *kind);
+        let workspace = self.workspace.clone();
+        let previous = self.work.take();
+
+        self.save_timer = None;
+        self.phase = Phase::StartingGrill;
+        self.error = None;
+        self.save_error = None;
+        self.text.update(cx, |area, cx| area.set_disabled(true, cx));
+
+        self.work = Some(cx.spawn(async move |this, cx| {
+            if let Some(previous) = previous {
+                previous.await;
+            }
+
+            let kept = idea.clone();
+            let starting = cx.background_executor().spawn(async move {
+                link.client
+                    .start_grill(link.project, Some(kind.into()), idea)
+            });
+
+            let outcome = starting.await;
+            let grilling = outcome.as_ref().ok().cloned();
+            let outcome = outcome.map(|_| kept);
+
+            if let Err(error) = this.update(cx, |editor, cx| editor.grill_started(outcome, cx)) {
+                log::debug!("the plan editor is gone after it started the grill: {error}");
+            }
+
+            if let Some(agent) = grilling {
+                let shown =
+                    Workspace::update_with_window(&workspace, cx, |workspace, window, cx| {
+                        workspace.grill_started(&agent, window, cx);
+                    });
+
+                if let Err(error) = shown {
+                    log::debug!("the workspace is gone before the grill was shown: {error}");
+                }
+            }
+        }));
+
+        cx.notify();
+    }
+
+    fn grill_started(&mut self, outcome: Result<String, ClientError>, cx: &mut Context<Self>) {
+        if self.starting_grill() {
+            self.phase = Phase::Editing;
+        }
+
+        match outcome {
+            Ok(idea) => {
+                self.saved = Some(idea);
+                self.text
+                    .update(cx, |area, cx| area.set_disabled(false, cx));
+                self.start_grilling(cx);
+            }
+            Err(error) => {
+                log::warn!("cannot start the grill agent: {error}");
+                self.error = Some(error.to_string().into());
+                self.text
+                    .update(cx, |area, cx| area.set_disabled(false, cx));
+            }
+        }
+
+        cx.notify();
+    }
+
+    /// Asks the grill agent to write the plan and end.
+    fn write_plan(&mut self, cx: &mut Context<Self>) {
+        if self.phase != (Phase::Grilling { writing: false }) {
+            return;
+        }
+        let Some(link) = self.link(cx) else {
+            self.error = Some(NOT_RUNNING.into());
+            cx.notify();
+            return;
+        };
+
+        let previous = self.work.take();
+
+        self.phase = Phase::Grilling { writing: true };
+        self.error = None;
+
+        self.work = Some(cx.spawn(async move |this, cx| {
+            if let Some(previous) = previous {
+                previous.await;
+            }
+
+            let finishing = cx
+                .background_executor()
+                .spawn(async move { link.client.finish_grill(link.project) });
+
+            if let Err(error) = finishing.await {
+                log::warn!("cannot ask the grill agent to write the plan: {error}");
+
+                let shown = this.update(cx, |editor, cx| {
+                    if editor.grilling() {
+                        editor.phase = Phase::Grilling { writing: false };
+                    }
+                    editor.error = Some(error.to_string().into());
+                    cx.notify();
+                });
+
+                if let Err(error) = shown {
+                    log::debug!("the plan editor is gone after the write failed: {error}");
+                }
+            }
+        }));
+
+        cx.notify();
+    }
+
+    /// The workspace tells whether the grill agent runs, and its clock. The text is
+    /// read-only while the agent runs.
+    pub(crate) fn set_grill_state(&mut self, grilling: bool, now: u64, cx: &mut Context<Self>) {
+        let before = self.written_label();
+        self.now = now;
+        let moved = self.written_label() != before;
+
+        if self.grilling() == grilling {
+            if moved {
+                cx.notify();
+            }
+            return;
+        }
+
+        if grilling {
+            self.start_grilling(cx);
+        } else {
+            self.stop_grilling(cx);
+        }
+
+        cx.notify();
+    }
+
+    /// The text turns read-only, no save is pending and the clock of the last write ticks.
+    fn start_grilling(&mut self, cx: &mut Context<Self>) {
+        if self.grilling() {
+            return;
+        }
+
+        self.phase = Phase::Grilling { writing: false };
+        self.save_timer = None;
+        self.text
+            .update(cx, |area, cx| area.set_read_only(true, cx));
+
+        let workspace = self.workspace.clone();
+        self.ticker = Some(cx.spawn(async move |_, cx| {
+            loop {
+                cx.background_executor().timer(CLOCK_TICK).await;
+
+                if workspace.update(cx, |_, cx| cx.notify()).is_err() {
+                    return;
+                }
+            }
+        }));
+    }
+
+    /// The text is editable again and the clock stops.
+    fn stop_grilling(&mut self, cx: &mut Context<Self>) {
+        self.phase = Phase::Editing;
+        self.written_at = None;
+        self.ticker = None;
+        self.text
+            .update(cx, |area, cx| area.set_read_only(false, cx));
+    }
+
+    /// The grill agent wrote the plan: it replaces the text. A read-only text ignores
+    /// typing, so nothing the user did is lost.
+    pub(crate) fn plan_written(&mut self, text: String, now: u64, cx: &mut Context<Self>) {
+        if self.load != Load::Loaded {
+            return;
+        }
+
+        self.text
+            .update(cx, |area, cx| area.set_text_at_start(text.clone(), cx));
+
+        self.saved = Some(text);
+        self.written_at = Some(now);
+
+        cx.notify();
+    }
+
+    /// When the grill agent last wrote the plan, as shown beside the title.
+    fn written_label(&self) -> Option<String> {
+        let ago = ago(self.written_at?, self.now);
+
+        Some(if ago == "now" {
+            "grill \u{b7} now".to_owned()
+        } else {
+            format!("grill \u{b7} {ago} ago")
+        })
     }
 
     /// The daemon started the orchestrator for this plan. The workspace drops the editor: the
@@ -518,8 +775,18 @@ impl PlanEditor {
     }
 
     #[cfg(test)]
+    pub(crate) fn is_grilling(&self) -> bool {
+        self.grilling()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_writing(&self) -> bool {
+        self.phase == (Phase::Grilling { writing: true })
+    }
+
+    #[cfg(test)]
     pub(crate) fn is_sending(&self) -> bool {
-        self.sending
+        self.sending()
     }
 
     #[cfg(test)]
@@ -535,9 +802,15 @@ impl PlanEditor {
     /// Shows the Send plan button as it looks while the plan goes out.
     #[cfg(feature = "snapshot")]
     pub(crate) fn show_sending(&mut self, cx: &mut Context<Self>) {
-        self.sending = true;
+        self.phase = Phase::Sending;
         self.text.update(cx, |area, cx| area.set_disabled(true, cx));
         cx.notify();
+    }
+
+    /// Shows the plan the grill agent wrote.
+    #[cfg(feature = "snapshot")]
+    pub(crate) fn show_written(&mut self, text: &str, now: u64, cx: &mut Context<Self>) {
+        self.plan_written(text.to_owned(), now, cx);
     }
 
     /// Shows the error line as it looks when the daemon refuses.
@@ -568,7 +841,7 @@ impl Render for PlanEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let editor = cx.entity();
         let colors = cx.theme().colors();
-        let (line, accent) = (colors.line, colors.accent);
+        let (line, accent, raised) = (colors.line, colors.accent, colors.raised);
 
         let orchestrator = Dropdown::new(
             "plan-orchestrator",
@@ -580,7 +853,7 @@ impl Render for PlanEditor {
             self.orchestrator,
         )
         .debug_selector(|| "plan-orchestrator".to_owned())
-        .disabled(self.sending)
+        .disabled(self.phase != Phase::Editing)
         .on_change(move |index, _, cx| {
             editor.update(cx, |editor, cx| {
                 editor.orchestrator = index;
@@ -588,7 +861,7 @@ impl Render for PlanEditor {
             });
         });
 
-        let send_label = if self.sending {
+        let send_label = if self.sending() {
             "Sending\u{2026}"
         } else {
             "Send plan"
@@ -596,19 +869,52 @@ impl Render for PlanEditor {
         let send = Button::new("plan-send", send_label)
             .variant(ButtonVariant::Primary)
             .track_focus(&self.send_focus)
-            .loading(self.sending)
-            .disabled(!self.sending && self.sendable(cx).is_none())
+            .loading(self.sending())
+            .disabled(!self.sending() && self.sendable(cx).is_none())
             .debug_selector(|| "plan-send".to_owned())
             .on_click(cx.listener(|this, _, _, cx| this.send(cx)));
 
+        let grill = Button::new("plan-grill", "Grill me")
+            .loading(self.starting_grill())
+            .disabled(!self.starting_grill() && self.sendable(cx).is_none())
+            .debug_selector(|| "plan-grill".to_owned())
+            .on_click(cx.listener(|this, _, _, cx| this.grill(cx)));
+
+        let header = self.grilling().then(|| {
+            let write = Button::new("plan-write", "Write plan")
+                .track_focus(&self.write_focus)
+                .loading(self.phase == (Phase::Grilling { writing: true }))
+                .debug_selector(|| "plan-write".to_owned())
+                .on_click(cx.listener(|this, _, _, cx| this.write_plan(cx)));
+            let written = self
+                .written_label()
+                .map(|label| Label::new(label).size(LabelSize::Small).color(Color::Faint));
+
+            h_flex()
+                .items_center()
+                .gap(px(8.))
+                .h(px(30.))
+                .child(Label::new("Plan").weight(FontWeight::SEMIBOLD))
+                .child(Tag::new("Read-only"))
+                .children(written)
+                .child(div().flex_1())
+                .child(write)
+        });
+
         let focused = self.text.focus_handle(cx).contains_focused(window, cx);
+        let border = if focused && !self.grilling() {
+            accent
+        } else {
+            line
+        };
         let text_box = div()
             .flex_1()
             .min_h_0()
             .px(px(BOX_PADDING))
             .rounded(px(BOX_RADIUS))
             .border_1()
-            .border_color(if focused { accent } else { line })
+            .border_color(border)
+            .when(self.grilling(), |text_box| text_box.bg(raised))
             .debug_selector(|| "plan-text".to_owned())
             .child(self.text.clone());
 
@@ -628,14 +934,17 @@ impl Render for PlanEditor {
             .items_center()
             .gap(px(8.))
             .child(orchestrator)
+            .when(!self.grilling(), |footer| footer.child(grill))
             .child(send);
 
         // The workspace sizes the editor: its column, down to the band of terminals under it.
         v_flex()
             .id("plan-editor")
+            .tab_group()
             .debug_selector(|| "plan-editor".to_owned())
             .size_full()
             .gap(px(12.))
+            .children(header)
             .child(text_box)
             .children(error)
             .child(footer)
@@ -688,7 +997,12 @@ impl Workspace {
             return;
         }
 
-        let editor = self.plan_editor(task.project, cx);
+        let project = task.project;
+        let editor = self.plan_editor(project, cx);
+        let grilling = self.data.grill_runs(project);
+        let now = self.now_ms();
+        editor.update(cx, |editor, cx| editor.set_grill_state(grilling, now, cx));
+
         let focused = window.focused(cx);
 
         let first = match std::mem::take(&mut self.plan_focus) {

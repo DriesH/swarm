@@ -140,6 +140,8 @@ pub(crate) struct Task {
     pub close_after_merge: bool,
     /// A Start or Plan task: its orchestrator splits a request into tasks. It has no worktree.
     pub is_start: bool,
+    /// The grill agent of a Start or Plan tab while the app knows it.
+    pub grill: Option<AgentId>,
     /// Set for a task the daemon knows.
     pub daemon: Option<DaemonTask>,
 }
@@ -182,8 +184,9 @@ impl From<AgentKind> for swarm_protocol::AgentKind {
 pub(crate) struct DaemonAgent {
     pub id: DaemonAgentId,
     pub project: swarm_protocol::ProjectId,
-    /// `None` for a Start orchestrator.
+    /// `None` for a Start orchestrator and a grill agent.
     pub task: Option<swarm_protocol::TaskId>,
+    pub role: AgentRole,
     /// The agent's terminal while it runs.
     pub terminal: Option<DaemonTerminalId>,
     pub status: DaemonAgentStatus,
@@ -902,6 +905,7 @@ impl Builder {
             pull_request: None,
             close_after_merge: false,
             is_start: false,
+            grill: None,
             daemon: None,
         });
 
@@ -1500,6 +1504,9 @@ impl FakeData {
         if let Some(start) = &info.start {
             self.sync_agent(start);
         }
+        if let Some(grill) = &info.grill {
+            self.sync_agent(grill);
+        }
 
         id
     }
@@ -1564,6 +1571,7 @@ impl FakeData {
             pull_request: info.pull_request.clone(),
             close_after_merge: info.close_after_merge,
             is_start: false,
+            grill: None,
             daemon: Some(daemon),
         });
 
@@ -1591,6 +1599,7 @@ impl FakeData {
             id: info.id,
             project: info.project,
             task: info.task,
+            role: info.role,
             terminal: info.terminal,
             status: info.status,
             message: info.message.as_deref().map(SharedString::new),
@@ -1649,7 +1658,9 @@ impl FakeData {
         let terminal = self.next_terminal_id();
         let name = SharedString::new(&info.name);
         let kind = match info.role {
-            AgentRole::Orchestrator | AgentRole::StartOrchestrator => TerminalKind::Orchestrator,
+            AgentRole::Orchestrator | AgentRole::StartOrchestrator | AgentRole::Grill => {
+                TerminalKind::Orchestrator
+            }
             AgentRole::Worker => TerminalKind::Worker,
         };
 
@@ -1686,6 +1697,7 @@ impl FakeData {
                     entry.orchestrator = Some(id);
                 }
                 AgentRole::Worker => entry.workers.push(id),
+                AgentRole::Grill => entry.grill = Some(id),
             }
         }
 
@@ -1960,7 +1972,11 @@ impl FakeData {
 
         match self.start_task(project) {
             Some(task) => {
-                let known = self.start_agent_of(task);
+                let known = if info.role == AgentRole::Grill {
+                    self.grill_agent_of(task)
+                } else {
+                    self.start_agent_of(task)
+                };
 
                 (!ended || known == Some(info.id)).then_some(task)
             }
@@ -1983,6 +1999,28 @@ impl FakeData {
             .and_then(|id| self.agent(id))
             .and_then(|agent| agent.daemon.as_ref())
             .map(|daemon| daemon.id)
+    }
+
+    /// The daemon id of the grill agent on a Start tab.
+    pub(crate) fn grill_agent_of(&self, task: TaskId) -> Option<DaemonAgentId> {
+        self.task(task)?
+            .grill
+            .and_then(|id| self.agent(id))
+            .and_then(|agent| agent.daemon.as_ref())
+            .map(|daemon| daemon.id)
+    }
+
+    /// True while the grill agent of the project's Start tab runs.
+    pub(crate) fn grill_runs(&self, project: ProjectId) -> bool {
+        self.start_task(project)
+            .and_then(|task| self.task(task)?.grill)
+            .and_then(|id| self.agent(id)?.daemon.as_ref())
+            .is_some_and(|daemon| {
+                matches!(
+                    daemon.lifecycle,
+                    AgentLifecycle::Starting | AgentLifecycle::Running
+                )
+            })
     }
 
     /// True while the Start orchestrator of the project's Start tab runs.
@@ -2054,6 +2092,31 @@ impl FakeData {
         if let Some(entry) = self.tasks.iter_mut().find(|entry| entry.id == task) {
             entry.orchestrator = None;
             entry.workers.clear();
+            entry.grill = None;
+        }
+
+        gone
+    }
+
+    /// Removes the grill agent of a Start tab with its terminal. Returns the terminals.
+    pub(crate) fn remove_grill_of(&mut self, task: TaskId) -> Vec<TerminalId> {
+        let Some(grill) = self.task(task).and_then(|entry| entry.grill) else {
+            return Vec::new();
+        };
+
+        let gone: Vec<TerminalId> = self
+            .agents
+            .iter()
+            .filter(|agent| agent.id == grill)
+            .map(|agent| agent.terminal)
+            .collect();
+
+        self.agents.retain(|agent| agent.id != grill);
+        self.terminals
+            .retain(|terminal| !gone.contains(&terminal.id));
+
+        if let Some(entry) = self.tasks.iter_mut().find(|entry| entry.id == task) {
+            entry.grill = None;
         }
 
         gone
@@ -2509,6 +2572,7 @@ impl FakeData {
                 id: DaemonAgentId(100),
                 project: swarm_protocol::ProjectId(0),
                 task: None,
+                role: AgentRole::StartOrchestrator,
                 terminal: None,
                 status: DaemonAgentStatus::Idle,
                 message: None,
@@ -2517,6 +2581,83 @@ impl FakeData {
                 worktree: PathBuf::new(),
                 branch: "main".into(),
             });
+        }
+
+        task
+    }
+
+    /// The project's Start tab with a grill agent running and no orchestrator. The tab
+    /// shows the grill terminal beside the read-only plan editor.
+    #[cfg(any(test, feature = "snapshot"))]
+    pub(crate) fn add_running_grill(&mut self, project: ProjectId) -> TaskId {
+        let task = self.ensure_start_task(project);
+        let id = AgentId(
+            self.agents
+                .iter()
+                .map(|agent| agent.id.0 + 1)
+                .max()
+                .unwrap_or(0),
+        );
+        let terminal = self.next_terminal_id();
+        let lines = [
+            (
+                "\u{203a} Add a story to every merged task".to_owned(),
+                Color::Muted,
+            ),
+            (
+                "\u{25cf} Should a story cover Live too, or only Merged?".to_owned(),
+                Color::Default,
+            ),
+            ("  Recommended: only Merged.".to_owned(), Color::Muted),
+        ];
+
+        self.terminals.push(Terminal {
+            id: terminal,
+            kind: TerminalKind::Orchestrator,
+            title: "grill".into(),
+            meta: None,
+            owner: Some(id),
+            link: None,
+            daemon_owner: None,
+            exit: None,
+            lines: lines
+                .into_iter()
+                .map(|(text, color)| FakeLine {
+                    text: text.into(),
+                    color,
+                })
+                .collect(),
+        });
+        self.agents.push(Agent {
+            id,
+            task,
+            name: "grill".into(),
+            kind: AgentKind::ClaudeCode,
+            model: "opus 5.5".into(),
+            status: AgentStatus::Working,
+            terminal,
+            created_at: 0,
+            started_at: None,
+            ended_at: None,
+            note: None,
+            daemon: Some(DaemonAgent {
+                id: DaemonAgentId(101),
+                project: swarm_protocol::ProjectId(0),
+                task: None,
+                role: AgentRole::Grill,
+                terminal: None,
+                status: DaemonAgentStatus::Idle,
+                message: None,
+                lifecycle: AgentLifecycle::Running,
+                revision: 1,
+                worktree: PathBuf::new(),
+                branch: "main".into(),
+            }),
+            tile_large: false,
+        });
+
+        if let Some(entry) = self.tasks.iter_mut().find(|entry| entry.id == task) {
+            entry.grill = Some(id);
         }
 
         task
@@ -2548,6 +2689,7 @@ impl FakeData {
             pull_request: None,
             close_after_merge: false,
             is_start: false,
+            grill: None,
             daemon: None,
         });
 
@@ -2614,6 +2756,7 @@ impl FakeData {
             pull_request: None,
             close_after_merge: false,
             is_start: false,
+            grill: None,
             daemon: None,
         });
 
@@ -2885,6 +3028,7 @@ mod tests {
             config_error: config_error.map(str::to_owned),
             tasks: Vec::new(),
             start: None,
+            grill: None,
         }
     }
 

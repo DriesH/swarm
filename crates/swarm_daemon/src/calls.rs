@@ -24,7 +24,7 @@ use swarm_protocol::{
 use crate::Services;
 use crate::agent_socket::{MAX_WAITS, Slot, Throttle};
 use crate::agents::{Place, Refused, STOPPED_BY_USER, lock};
-use crate::messages::{Claim, check_size};
+use crate::messages::{Claim, check_plan_size, check_size};
 use crate::processes::Spawn;
 use crate::{pull_requests, stats, tasks};
 
@@ -216,6 +216,7 @@ impl Calls {
             Call::Agents => self.agents(caller),
             Call::Confirm => self.confirm(caller),
             Call::PrDraft { title, body } => self.pr_draft(caller, &title, &body),
+            Call::PlanWrite { text } => self.plan_write(caller, &text),
 
             Call::TaskCreate {
                 name,
@@ -426,7 +427,7 @@ impl Calls {
             AgentRole::Worker => {
                 return refuse("workers can only message their orchestrator (use ask or report)");
             }
-            AgentRole::StartOrchestrator => {
+            AgentRole::StartOrchestrator | AgentRole::Grill => {
                 return refuse("only a task's orchestrator can send messages to workers");
             }
         }
@@ -574,7 +575,7 @@ impl Calls {
                 }
                 _ => caller.id,
             },
-            AgentRole::StartOrchestrator => {
+            AgentRole::StartOrchestrator | AgentRole::Grill => {
                 return refuse("only a task's orchestrator or a worker can resize a tile");
             }
         };
@@ -802,6 +803,29 @@ impl Calls {
                 body: body.to_owned(),
             },
         );
+
+        Ok(Value::Null)
+    }
+
+    fn plan_write(&self, caller: &AgentInfo, text: &str) -> Outcome {
+        if caller.role != AgentRole::Grill {
+            return refuse("only the grill agent can write the plan");
+        }
+        if self.services.agents.is_stopped(caller.id) {
+            return refuse(STOPPED_BY_USER);
+        }
+        if text.trim().is_empty() {
+            return refuse("the plan needs text");
+        }
+        check_plan_size(text)?;
+
+        self.services
+            .projects
+            .set_plan_draft(caller.project, Some(text))?;
+        self.services.clients.broadcast(&Event::PlanDraftChanged {
+            project: caller.project,
+            text: text.to_owned(),
+        });
 
         Ok(Value::Null)
     }

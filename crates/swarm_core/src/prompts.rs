@@ -17,6 +17,7 @@ const WORKER: &str = include_str!("../prompts/worker.md");
 const START: &str = include_str!("../prompts/start.md");
 const PLAN: &str = include_str!("../prompts/plan.md");
 const PR: &str = include_str!("../prompts/pr.md");
+const GRILL: &str = include_str!("../prompts/grill.md");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptFile {
@@ -27,16 +28,19 @@ pub enum PromptFile {
     Plan,
     /// The pull request description, sent to the orchestrator inside a `pr draft` message.
     Pr,
+    /// Helps the user write the plan of a project.
+    Grill,
 }
 
 impl PromptFile {
     /// Every prompt, in the order Settings lists them.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Orchestrator,
         Self::Worker,
         Self::Start,
         Self::Plan,
         Self::Pr,
+        Self::Grill,
     ];
 
     pub fn for_role(role: AgentRole) -> Self {
@@ -44,6 +48,7 @@ impl PromptFile {
             AgentRole::Orchestrator => Self::Orchestrator,
             AgentRole::Worker => Self::Worker,
             AgentRole::StartOrchestrator => Self::Start,
+            AgentRole::Grill => Self::Grill,
         }
     }
 
@@ -54,6 +59,7 @@ impl PromptFile {
             Self::Start => "start.md",
             Self::Plan => "plan.md",
             Self::Pr => "pr.md",
+            Self::Grill => "grill.md",
         }
     }
 
@@ -76,6 +82,7 @@ impl PromptFile {
             Self::Start => START,
             Self::Plan => PLAN,
             Self::Pr => PR,
+            Self::Grill => GRILL,
         }
     }
 }
@@ -139,6 +146,11 @@ const START_COMMANDS: &[&str] = &[
     "`swarm wait [--timeout SECS]`: wait for a message (default 100, at most 600)",
 ];
 
+const GRILL_COMMANDS: &[&str] = &[
+    "`swarm plan write <file|->`: replace the plan draft with the text of a file, or of stdin with `-`; the user sees it at once (at most 64 KiB)",
+    "`swarm exit`: end your own session",
+];
+
 /// Claude Code's Bash tool stops a command after 120 s unless told otherwise.
 const WAIT_NOTE: &str = "The waiting commands (`swarm wait`, `swarm task wait`, `swarm terminal wait`) \
      end after `--timeout` seconds. When you wait longer than 100 seconds in a shell, give the \
@@ -150,6 +162,7 @@ impl Harness<'_> {
             AgentRole::Orchestrator => ("orchestrator", ORCHESTRATOR_COMMANDS),
             AgentRole::Worker => ("worker", WORKER_COMMANDS),
             AgentRole::StartOrchestrator => ("start orchestrator", START_COMMANDS),
+            AgentRole::Grill => ("grill agent", GRILL_COMMANDS),
         };
         let task = self.task.map_or_else(
             || "none".to_owned(),
@@ -854,10 +867,30 @@ mod tests {
         let prompts = list(Some(&folders.config()), None).expect("list");
 
         let names: Vec<_> = prompts.iter().map(|prompt| prompt.name.as_str()).collect();
-        assert_eq!(names, ["orchestrator", "worker", "start", "plan", "pr"]);
+        assert_eq!(
+            names,
+            ["orchestrator", "worker", "start", "plan", "pr", "grill"]
+        );
         for file in PromptFile::ALL {
             assert_eq!(format!("{}.md", file.name()), file.file_name());
         }
+    }
+
+    #[test]
+    fn the_grill_prompt_is_for_the_grill_role_and_its_block_lists_plan_write() {
+        assert_eq!(PromptFile::for_role(AgentRole::Grill), PromptFile::Grill);
+        assert_eq!(PromptFile::Grill.file_name(), "grill.md");
+        assert_eq!(PromptFile::Grill.name(), "grill");
+        let block = |role| {
+            Harness {
+                role,
+                ..harness(Path::new("/s"))
+            }
+            .block()
+        };
+
+        assert!(block(AgentRole::Grill).contains("swarm plan write"));
+        assert!(!block(AgentRole::StartOrchestrator).contains("swarm plan write"));
     }
 
     #[test]

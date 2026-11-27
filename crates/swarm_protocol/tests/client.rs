@@ -645,6 +645,7 @@ fn project_info() -> ProjectInfo {
         config_error: None,
         tasks: vec![task_info()],
         start: None,
+        grill: None,
     }
 }
 

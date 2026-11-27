@@ -45,6 +45,7 @@ pub(crate) enum Role {
     Orchestrator,
     Worker,
     StartOrchestrator,
+    Grill,
     /// No role or one we do not know: only the tools every agent has.
     Unknown,
 }
@@ -55,6 +56,7 @@ impl Role {
             Some("orchestrator") => Self::Orchestrator,
             Some("worker") => Self::Worker,
             Some("start_orchestrator") => Self::StartOrchestrator,
+            Some("grill") => Self::Grill,
             _ => Self::Unknown,
         }
     }
@@ -323,6 +325,26 @@ const TOOLS: &[Tool] = &[
         },
     },
     Tool {
+        name: "plan_write",
+        description: "Replace the plan draft of the project with this text. The user sees it at once (at most 64 KiB).",
+        audience: Audience::Only(&[Role::Grill]),
+        schema: || {
+            schema(
+                &[(
+                    "text",
+                    "string",
+                    "The plan, in the shape of the plan template.",
+                )],
+                &["text"],
+            )
+        },
+        build: |arguments| {
+            Ok(Command::PlanWrite {
+                text: required(arguments, "text")?,
+            })
+        },
+    },
+    Tool {
         name: "tile_grow",
         description: "Make the tile of a worker large, so the user sees more of it. The layout decides, and it ignores the request for a tile the user minimized. No agent gets a message.",
         audience: Audience::Only(&[Role::Orchestrator, Role::Worker]),
@@ -443,7 +465,7 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "agent_exit",
         description: "End your own session. Call it when your work is done.",
-        audience: Audience::Only(&[Role::StartOrchestrator]),
+        audience: Audience::Only(&[Role::StartOrchestrator, Role::Grill]),
         schema: || schema(&[], &[]),
         build: |_| Ok(Command::Exit),
     },
@@ -1246,6 +1268,26 @@ mod tests {
         assert_eq!(Role::parse(Some("admin")), Role::Unknown);
     }
 
+    #[test]
+    fn only_the_grill_agent_lists_plan_write() {
+        assert_eq!(
+            tool_names(Role::Grill),
+            ["read", "wait", "plan_write", "agent_exit"]
+                .into_iter()
+                .chain(TERMINAL_TOOLS)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(Role::parse(Some("grill")), Role::Grill);
+        for role in [
+            Role::Orchestrator,
+            Role::Worker,
+            Role::StartOrchestrator,
+            Role::Unknown,
+        ] {
+            assert!(!tool_names(role).contains(&"plan_write".to_owned()));
+        }
+    }
+
     fn build(tool: &str, arguments: &Value) -> Result<Command, String> {
         let tool = TOOLS
             .iter()
@@ -1529,10 +1571,15 @@ mod tests {
 
     #[test]
     fn the_tools_are_the_harness_calls_the_adapters_know() {
-        let mut tools: Vec<String> = [Role::Orchestrator, Role::Worker, Role::StartOrchestrator]
-            .into_iter()
-            .flat_map(tool_names)
-            .collect();
+        let mut tools: Vec<String> = [
+            Role::Orchestrator,
+            Role::Worker,
+            Role::StartOrchestrator,
+            Role::Grill,
+        ]
+        .into_iter()
+        .flat_map(tool_names)
+        .collect();
         tools.sort();
         tools.dedup();
         let mut calls: Vec<String> = swarm_protocol::agent::HARNESS_CALLS

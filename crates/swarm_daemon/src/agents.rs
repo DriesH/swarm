@@ -367,9 +367,9 @@ impl Live {
         self.rest.observe(resting, now);
     }
 
-    /// Whether the agent stops for resting too long: the Start orchestrator, an agent
-    /// with a process terminal of its own, an orchestrator whose workers run (their
-    /// task is in `supervising`) and an agent whose user types keep running.
+    /// Whether the agent stops for resting too long. The Start orchestrator, the grill
+    /// agent, an agent with a process terminal of its own, an orchestrator whose workers
+    /// run (their task is in `supervising`) and an agent whose user types keep running.
     fn stops_when_idle(
         &self,
         now: Instant,
@@ -383,8 +383,10 @@ impl Live {
                 .task
                 .is_some_and(|task| supervising.contains(&task));
 
-        self.info.role != AgentRole::StartOrchestrator
-            && !busy.contains(&self.info.id)
+        !matches!(
+            self.info.role,
+            AgentRole::StartOrchestrator | AgentRole::Grill
+        ) && !busy.contains(&self.info.id)
             && !leads_workers
             && !self.stopped_by_user
             && !self.typing.drafting(now)
@@ -592,7 +594,10 @@ impl Agents {
             return false;
         }
 
-        if removing.iter().any(|project| start_key(*project) == key) {
+        if removing
+            .iter()
+            .any(|project| start_key(*project) == key || grill_key(*project) == key)
+        {
             return true;
         }
 
@@ -631,10 +636,17 @@ impl Agents {
     /// Stops the project's Start orchestrator for good, as the user's choice: it ends
     /// `Stopped`, tells nobody and can start nothing new. Returns its terminal if it runs.
     pub(crate) fn stop_start_agents(&self, project: ProjectId) -> Vec<TerminalId> {
+        self.stop_project_agents(project, AgentRole::StartOrchestrator)
+    }
+
+    /// Like [`Self::stop_start_agents`], for the project's grill agent.
+    pub(crate) fn stop_grill_agents(&self, project: ProjectId) -> Vec<TerminalId> {
+        self.stop_project_agents(project, AgentRole::Grill)
+    }
+
+    fn stop_project_agents(&self, project: ProjectId, role: AgentRole) -> Vec<TerminalId> {
         self.mark_stopped(
-            |agent| {
-                agent.info.project == project && agent.info.role == AgentRole::StartOrchestrator
-            },
+            |agent| agent.info.project == project && agent.info.role == role,
             |agent| {
                 agent.stop_requested = true;
                 agent.stopped_by_user = true;
@@ -824,11 +836,22 @@ impl Agents {
             .any(|agent| agent.info.task == Some(task))
     }
 
-    /// True while the project's Start orchestrator still has a live entry.
-    pub(crate) fn has_live_start(&self, project: ProjectId) -> bool {
+    /// True while the project's Start orchestrator or grill agent still has a live entry.
+    pub(crate) fn has_live_start_or_grill(&self, project: ProjectId) -> bool {
         lock(&self.live).values().any(|agent| {
-            agent.info.project == project && agent.info.role == AgentRole::StartOrchestrator
+            agent.info.project == project
+                && matches!(
+                    agent.info.role,
+                    AgentRole::StartOrchestrator | AgentRole::Grill
+                )
         })
+    }
+
+    /// True while the project's grill agent still has a live entry.
+    pub(crate) fn has_live_grill(&self, project: ProjectId) -> bool {
+        lock(&self.live)
+            .values()
+            .any(|agent| agent.info.project == project && agent.info.role == AgentRole::Grill)
     }
 
     /// Calls `observer` for every agent whose process ends.
@@ -973,7 +996,8 @@ impl Agents {
                     .then_some(STOPPED_BY_USER)
             })
             .map(str::to_owned)
-            .or_else(|| limit_refusal(&live, place.task, &plan));
+            .or_else(|| limit_refusal(&live, place.task, &plan))
+            .or_else(|| role_refusal(&live, place.project, plan.role).map(str::to_owned));
         if let Some(reason) = refusal {
             drop(live);
             if let Err(error) = lock(&self.store).delete_agent(info.id) {
@@ -1047,13 +1071,8 @@ impl Agents {
             if let Some(running) = live.get(&id) {
                 return running_agent(running);
             }
-            if info.role == AgentRole::StartOrchestrator
-                && live.values().any(|agent| {
-                    agent.info.project == info.project
-                        && agent.info.role == AgentRole::StartOrchestrator
-                })
-            {
-                bail!("the Start orchestrator already runs");
+            if let Some(reason) = role_refusal(&live, info.project, info.role) {
+                bail!(reason);
             }
 
             let place = Place {
@@ -2029,7 +2048,7 @@ impl Agents {
             }
             AgentRole::Worker if !self.is_halted(agent) => self.send_review_if_ready(task),
             AgentRole::Orchestrator => self.check_review(agent, task),
-            AgentRole::Worker | AgentRole::StartOrchestrator => {}
+            AgentRole::Worker | AgentRole::StartOrchestrator | AgentRole::Grill => {}
         }
     }
 
@@ -2129,6 +2148,33 @@ fn running_agent(agent: &Live) -> Result<AgentInfo> {
     }
 
     Ok(agent.info.clone())
+}
+
+/// Why the project may not run one more agent of `role`: the Start orchestrator and the
+/// grill agent each run at most once per project, and never together.
+fn role_refusal(
+    live: &HashMap<AgentId, Live>,
+    project: ProjectId,
+    role: AgentRole,
+) -> Option<&'static str> {
+    let runs = |other| {
+        live.values()
+            .any(|agent| agent.info.project == project && agent.info.role == other)
+    };
+
+    match role {
+        AgentRole::Grill if runs(AgentRole::StartOrchestrator) => {
+            Some("the Start orchestrator already runs")
+        }
+        AgentRole::Grill if runs(AgentRole::Grill) => Some("a grill agent already runs"),
+        AgentRole::StartOrchestrator if runs(AgentRole::Grill) => {
+            Some("a grill agent runs: wait for it to end or stop it")
+        }
+        AgentRole::StartOrchestrator if runs(AgentRole::StartOrchestrator) => {
+            Some("the Start orchestrator already runs")
+        }
+        _ => None,
+    }
 }
 
 /// Why one more agent may not start: the task, or all tasks together, already have as
@@ -2269,6 +2315,7 @@ pub(crate) fn role_name(role: AgentRole) -> &'static str {
         AgentRole::Orchestrator => "orchestrator",
         AgentRole::Worker => "worker",
         AgentRole::StartOrchestrator => "start_orchestrator",
+        AgentRole::Grill => "grill",
     }
 }
 
@@ -2336,12 +2383,18 @@ impl ScreenText {
     }
 }
 
-/// The key the app finds an agent's task by: the task, or the project's Start tab.
+/// The key the app finds an agent's task by: the task, the project's grill agent or
+/// the project's Start tab.
 pub(crate) fn terminal_key(info: &AgentInfo) -> String {
-    match info.task {
-        Some(task) => task.terminal_key(),
-        None => start_key(info.project),
+    match (info.task, info.role) {
+        (Some(task), _) => task.terminal_key(),
+        (None, AgentRole::Grill) => grill_key(info.project),
+        (None, _) => start_key(info.project),
     }
+}
+
+pub(crate) fn grill_key(project: ProjectId) -> String {
+    format!("project:{}/grill", project.0)
 }
 
 /// Keeps in step with `start_key` in the app's model.
@@ -3759,7 +3812,7 @@ mod tests {
         let start = register_start(&agents, task.project);
         let other_start = register_start(&agents, other.id);
         start_without_a_hub(&agents, start.id);
-        assert!(agents.has_live_start(task.project));
+        assert!(agents.has_live_start_or_grill(task.project));
 
         let terminals = agents.stop_start_agents(task.project);
 
@@ -3767,7 +3820,7 @@ mod tests {
         assert!(agents.is_stopped(start.id), "it can start nothing new");
         assert!(!agents.is_stopped(orchestrator.id));
         assert!(!agents.is_stopped(other_start.id));
-        assert!(agents.has_live_start(other.id));
+        assert!(agents.has_live_start_or_grill(other.id));
         assert!(agents.has_live(task.id));
     }
 
@@ -3779,7 +3832,7 @@ mod tests {
         let terminals = agents.stop_start_agents(task.project);
 
         assert!(terminals.is_empty());
-        assert!(!agents.has_live_start(task.project));
+        assert!(!agents.has_live_start_or_grill(task.project));
         let stored = lock(&agents.store)
             .agent(start.id)
             .expect("read")
@@ -4169,33 +4222,73 @@ mod tests {
         assert_eq!(refused.to_string(), "the agent is stopping");
     }
 
+    /// A saved agent of `role` in `project` that waits to be resumed.
+    fn add_resumable(agents: &Agents, project: ProjectId, role: AgentRole) -> AgentInfo {
+        let store = lock(&agents.store);
+        let mut info = store
+            .add_agent(&NewAgent {
+                project,
+                task: None,
+                role,
+                kind: AgentKind::ClaudeCode,
+                model: "model",
+                session_id: Some("old-session"),
+                name: "old",
+                worktree: Path::new("/repo"),
+                branch: "main",
+                ports: &[],
+            })
+            .expect("old agent");
+        store.confirm_agent_session(info.id).expect("confirm");
+        info.lifecycle = AgentLifecycle::Resumable;
+        store.save_agent(&info).expect("save");
+
+        info
+    }
+
     #[test]
     fn a_resumed_start_orchestrator_is_refused_while_the_project_has_one() {
         let folder = crate::temp_folder::TempFolder::new("resume-start-twice");
         let (agents, task, _) = agents_with_settings(Some(settings_with_a_cli(&folder)));
         register_start(&agents, task.project);
-        let old = {
-            let store = lock(&agents.store);
-            let mut info = store
-                .add_agent(&NewAgent {
-                    project: task.project,
-                    task: None,
-                    role: AgentRole::StartOrchestrator,
-                    kind: AgentKind::ClaudeCode,
-                    model: "model",
-                    session_id: Some("old-session"),
-                    name: "old start",
-                    worktree: Path::new("/repo"),
-                    branch: "main",
-                    ports: &[],
-                })
-                .expect("old start agent");
-            store.confirm_agent_session(info.id).expect("confirm");
-            info.lifecycle = AgentLifecycle::Resumable;
-            store.save_agent(&info).expect("save");
+        let old = add_resumable(&agents, task.project, AgentRole::StartOrchestrator);
 
-            info
+        let refused = agents.resume(old.id).expect_err("refused");
+
+        assert_eq!(refused.to_string(), "the Start orchestrator already runs");
+    }
+
+    #[test]
+    fn a_resumed_start_orchestrator_is_refused_while_a_grill_agent_runs() {
+        let folder = crate::temp_folder::TempFolder::new("resume-start-grill");
+        let (agents, task, _) = agents_with_settings(Some(settings_with_a_cli(&folder)));
+        let place = Place {
+            project: task.project,
+            task: None,
+            name: "grill",
+            worktree: Path::new("/repo"),
+            branch: "main",
+            ports: &[],
         };
+        agents
+            .register(&place, test_plan(AgentKind::ClaudeCode, AgentRole::Grill))
+            .expect("grill agent");
+        let old = add_resumable(&agents, task.project, AgentRole::StartOrchestrator);
+
+        let refused = agents.resume(old.id).expect_err("refused");
+
+        assert_eq!(
+            refused.to_string(),
+            "a grill agent runs: wait for it to end or stop it"
+        );
+    }
+
+    #[test]
+    fn a_resumed_grill_agent_is_refused_while_the_start_orchestrator_runs() {
+        let folder = crate::temp_folder::TempFolder::new("resume-grill-start");
+        let (agents, task, _) = agents_with_settings(Some(settings_with_a_cli(&folder)));
+        register_start(&agents, task.project);
+        let old = add_resumable(&agents, task.project, AgentRole::Grill);
 
         let refused = agents.resume(old.id).expect_err("refused");
 
