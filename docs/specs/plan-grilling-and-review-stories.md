@@ -8,7 +8,10 @@ Line numbers drift. Search by name.
 
 ### Read first
 
-- Design: the "Review stories (phase 11)" row on the [design canvas](https://claude.ai/artifact/6r2WfEmYoTDCWCTJckxVkt), board "Review story — a flow with one step open", dark and light.
+- Designs on the [design canvas](https://claude.ai/artifact/6r2WfEmYoTDCWCTJckxVkt), dark and light:
+  - "Plan grilling (phase 11)" row: "Start — Grill me on the plan editor" and "Start — grilling: grill agent and read-only plan".
+  - "Review stories (phase 11)" row: "Review story — a flow with one step open".
+  - "Story view proposals" row: "Findings B — on their steps (chosen)", "Out of date A — banner and marked steps (chosen)" and "Out of date banner". The other proposals there were not chosen.
 - `CLAUDE.md`, `GLOSSARY.md` (Plan, Start orchestrator, Review, Live, Merged, Comment, Approve), `docs/CONVENTIONS.md`.
 - ADRs 0002 (messages go through the orchestrator), 0004 (append prompts, never replace), 0005 (daemon owns SQLite state), 0013 (review stories are data that the daemon checks).
 - `docs/PLAN.md`: "How work starts", "Prompts", "Review".
@@ -60,7 +63,7 @@ The key idea: agents do not make the UI. They write the story as data, and Swarm
 | 6 | Coverage | Every changed line is in a step, or in **Other changes** with a reason; else the post fails |
 | 7 | One change in more flows | Allowed; the reviewed state of that code is shared |
 | 8 | Findings | Yes: the story writer also reports possible problems |
-| 9 | Refresh | Only the steps whose code changed are rewritten, at the next "ready for review"; no **Refresh story** button |
+| 9 | Refresh | Only the steps whose code changed are rewritten: at the next "ready for review", or with **Refresh story** when all agents are done |
 | 10 | Story or diff | A **Story \| Files** switch on Merged, opening on Story when one exists |
 | 11 | Comments without a line | Step comments, sent like line comments |
 | 12 | Step checks and Approve | Step checks show progress only, like Viewed |
@@ -68,6 +71,8 @@ The key idea: agents do not make the UI. They write the story as data, and Swarm
 Also agreed: no story on Live, and a fresh worker writes the story, not the orchestrator.
 
 ## 5. Plan grilling
+
+Design: boards "Start — Grill me on the plan editor" and "Start — grilling: grill agent and read-only plan".
 
 ### Flow
 
@@ -225,8 +230,8 @@ On **Merged**, the Review header gets a **Story | Files** switch. It opens on St
   - **Flows**: one row per flow, with its title and "reviewed / steps".
   - **Other changes**, and **Not in story** when the story is out of date.
 - **Main area** for the chosen flow: the title, the summary, the lane legend, then the steps.
-- **Step row**: number, title, symbols in mono, a **changed** or **unchanged** pill and the reviewed check, with the lane rail on its left. A step is unchanged when its ranges hold no changed line; it is there for context.
-- **Open step**: What happens (Markdown), Code, Tests, comments and **Mark as reviewed**.
+- **Step row**: number, title, symbols in mono, a **1 finding** tag when it has findings, a **changed** or **unchanged** pill and the reviewed check, with the lane rail on its left. A step is unchanged when its ranges hold no changed line; it is there for context.
+- **Open step**: What happens (Markdown), its findings, Code, Tests, comments and **Mark as reviewed**.
 - **Code block**: a header with the symbol and `path:line`, then the diff rows that Review already uses, with syntax colors. Unchanged lines inside the range come from the file text. Changed lines get the changed bar. Code already reviewed in another step folds to one row, **Reviewed in <flow> #n**, with **Show**.
 - **Lane legend**: horizontal chips with a color dot and the label. No rotated labels.
 - **Other changes** and **Not in story** show as the file cards of Files, with the reason as a tag.
@@ -257,20 +262,28 @@ On **Merged**, the Review header gets a **Story | Files** switch. It opens on St
 
 ### 6.8 Findings
 
-- **Findings** lists each finding with its title, body, code and step.
+Design: board "Findings B — on their steps (chosen)".
+
+- A finding shows on its step. The step row gets a **1 finding** tag (or **N findings**). The open step shows the finding above Code: its title, body and lines, with **Raise it** and **Not an issue**. The finding's lines get a warning tint in the code.
+- A finding without a step shows in **Overview**.
+- **Findings** in the left column shows "N to decide", the findings that are not raised or dismissed yet. It opens the next one to decide.
 - **Raise it** creates a Pending step comment with the finding's text, on its step or, without a step, on the story. The user can edit it before sending.
-- **Not an issue** dismisses the finding. Dismissed findings stay listed and folded, and can be raised later.
-- "N to decide" counts the findings that are not raised or dismissed yet.
+- **Not an issue** dismisses the finding. It folds to one row on its step, with **Raise it** and **Show**.
 
 ### 6.9 Out of date and refresh
 
+Design: boards "Out of date A — banner and marked steps (chosen)" and "Out of date banner".
+
 - A story belongs to one commit. When the Merged diff changes, the daemon maps each range from that commit to the new HEAD with `git diff` between the two commits:
   - A range whose lines did not change moves to its new line numbers.
-  - A step with a changed line in its ranges is **stale**. It gets a **Changed** tag and its check resets.
+  - A step with a changed line in its ranges is **stale**. It gets an **Out of date** tag and its check resets. **Changed** would clash with the **changed** pill.
   - Changed lines that no range and no `other` entry covers go to **Not in story**.
-- The Review header shows **Story out of date**.
+- A banner under the Review header shows **Story out of date**, the story's commit and HEAD, and the number of stale steps and of files not in the story. In the left column, flows with a stale step get a dot.
 - While the setting is on, the next "ready for review" sends the orchestrator a `story refresh` message with the stale step ids and the uncovered ranges. A fresh story writer gets the old story, rewrites only those parts and posts a full story. Steps with the same id and the same code keep their checks.
-- There is no **Refresh story** button. Changes to Merged after a story almost always come from agents, and their work ends in a new "ready for review". A commit the user makes by hand shows as stale steps and **Not in story** until the next refresh, so nothing is hidden.
+- The right side of the banner:
+  - **Refresh queued** while agents work. Their next "ready for review" refreshes the story, so a button would only start a story writer too early.
+  - **Refresh story** when all agents are done, for example after a commit the user made by hand. No "ready for review" comes then. The button sends the same `story refresh` at once.
+  - **Refreshing…** while the story writer runs.
 - Live does not touch the story. Mapping runs only when Merged changes.
 
 ## 7. Docs
@@ -283,7 +296,7 @@ On **Merged**, the Review header gets a **Story | Files** switch. It opens on St
 
 ## 8. Open details
 
-- Designs still to make (direction A, light and dark): the split Start tab; the Overview, Findings and out-of-date states of the Story view; lane colors 6–8 (the board has 1–5).
+- Designs still to make (direction A, light and dark): the Overview page, with findings that have no step; lane colors 6–8 (the boards have 1–5).
 - A timeout for the ready-for-review wait when the story writer hangs. Start with 20 minutes.
 - Very large diffs: the story writer may need more than one pass.
 - Later: a story summary in the PR description, and lanes set in `.swarm/config.toml`.

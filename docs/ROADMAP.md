@@ -201,7 +201,7 @@ Five parts, in this order: 1. Plan grilling. 2. Story data and check. 3. Story v
 - [ ] When every worker is done, a story writer posts a story, and `story.post` refuses a story that leaves a changed line out
 - [ ] Merged shows **Story | Files**; steps show their code from the real diff, their tests and a reviewed check, and `j` `k` `o` `v` `[` `]` work
 - [ ] Line comments, step comments and raised findings reach the orchestrator
-- [ ] After a change to the Merged diff, changed steps and **Not in story** show, and the next "ready for review" rewrites only the changed steps
+- [ ] After a change to the Merged diff, out-of-date steps and **Not in story** show, and the next "ready for review" or **Refresh story** rewrites only those parts
 - [ ] Every new control has a role and label, works from the keyboard and meets WCAG AA, and a lane's color is never its only sign
 
 ## Designs still to make
@@ -211,7 +211,7 @@ Five parts, in this order: 1. Plan grilling. 2. Story data and check. 3. Story v
 - Settings: Launch at login (phase 9)
 - Home boards in light (phase 10)
 - Close scratch dialog and the empty Home (phase 10)
-- Start tab with the grill agent, the Story view's Overview, Findings and out-of-date states, and lane colors 6–8 (phase 11)
+- The Story view's Overview page and lane colors 6–8 (phase 11)
 
 ## Parked
 
