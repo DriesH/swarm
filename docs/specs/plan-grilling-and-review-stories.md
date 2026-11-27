@@ -117,9 +117,7 @@ A story is JSON that an agent posts for the Merged diff of a task at one commit.
   "lanes": [
     { "id": "app", "label": "App" },
     { "id": "daemon", "label": "Daemon" },
-    { "id": "store", "label": "Store" },
-    { "id": "orchestrator", "label": "Orchestrator", "outside": true },
-    { "id": "worker", "label": "Worker", "outside": true }
+    { "id": "store", "label": "Store" }
   ],
   "flows": [
     {
@@ -161,7 +159,7 @@ A story is JSON that an agent posts for the Merged diff of a task at one commit.
 }
 ```
 
-- `lanes`: the parts of the system that the code runs in, in the order they show. `outside` marks a part outside the project; its steps draw as a hollow dot. At most 8 lanes.
+- `lanes`: the parts of the repository that the code runs in, in the order they show. At most 8 lanes.
 - `flows`: one per entry point, such as a request, a job, a command or a user action.
 - `steps`: in call order. `depth` is the call depth and sets the indent. `what` is Markdown.
 - `code`: a path in the repository and an inclusive line range on the new side. A ref without `lines` is the whole file. Deleted, binary and mode-only files need one.
@@ -184,6 +182,7 @@ outside the file: crates/swarm_app/src/review_model.rs line 9000 (step keep-anch
 The check:
 
 - The JSON matches the schema, ids are unique and every lane exists.
+- Every step has at least one `code` ref. A story shows only code in the repository; the flow's summary names any outside system.
 - Every path and line range exists in the file at HEAD, also those of tests.
 - **Coverage**: every changed line is covered.
   - An added line is covered when a `code` range holds its new line number.
