@@ -78,10 +78,10 @@ Design: boards "Start — Grill me on the plan editor" and "Start — grilling: 
 
 1. The Start tab (or a Plan tab) opens on the plan editor, as today.
 2. The user types an idea, as short as one line, picks the agent and presses **Grill me**. **Send plan** (⌘↩) still sends the text as a finished plan.
-3. Swarm starts a **grill agent** in the project root, on the base branch, with the `grill.md` prompt and the user's text as its first message. The main area splits: the grill agent's terminal on the left, the plan editor on the right.
+3. Swarm saves the text as the plan draft, then starts a **grill agent** in the project root, on the base branch, with the `grill.md` prompt and the text as its first message. The main area splits: the grill agent's terminal on the left, the plan editor on the right.
 4. The grill agent asks its questions in its terminal, one at a time.
 5. It writes the plan with `swarm plan write <file>` (MCP `plan_write`). The call replaces the plan draft and the editor shows it at once. The agent may call it more than once while it learns.
-6. **Write plan** in the editor header sends the grill agent a message: write the plan now, then end.
+6. **Write plan** in the editor header sends the grill agent a `write plan` message: write the plan now, then end.
 7. After the last write, the grill agent runs `swarm exit`. Its terminal closes and the plan editor takes the main area again.
 8. The user edits the plan and presses **Send plan**. A fresh Start orchestrator gets only the plan, not the grilling. This tests that the plan stands on its own.
 
@@ -89,7 +89,10 @@ Design: boards "Start — Grill me on the plan editor" and "Start — grilling: 
 
 - While the grill agent runs, the plan editor is read-only and **Send plan** is off, so the agent and the user never write over each other.
 - Only the grill agent can call `plan write`, and only for its own project. The text is at most 64 KiB.
-- The grill agent lives like the Start orchestrator: the daemon keeps it running when the app quits. Closing the tab stops it and keeps the draft.
+- One grill agent per project, and never while the Start orchestrator runs. **Send plan** is off while it runs, and the daemon refuses a Start orchestrator too.
+- The grill agent lives like the Start orchestrator: the daemon keeps it running when the app quits, and never stops it for being idle.
+- A Start tab cannot close, so the grill agent's tile has a **Stop** button. It stops the agent and keeps the draft.
+- "Never write code" is a rule of the prompt only. The grill agent runs with the same tools as other agents.
 
 ### The `grill.md` prompt
 
@@ -108,6 +111,8 @@ A new prompt file with the usual layers (built in → `~/.config/swarm/prompts/`
 |---|---|---|
 | `plan.write {text}` | grill agent | Replaces the project's plan draft. The app shows it at once. |
 | `agent.exit` | grill agent | Ends its own session (exists). |
+
+The app asks the daemon with `StartGrill` (the idea and the agent kind), `FinishGrill` (**Write plan**) and `StopGrill` (**Stop**). Each `plan.write` broadcasts `PlanDraftChanged`, so the editor shows the text at once.
 
 ## 6. Review stories
 
